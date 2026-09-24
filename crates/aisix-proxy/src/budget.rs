@@ -16,6 +16,9 @@
 use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const CACHE_TTL: Duration = Duration::from_secs(5);
@@ -101,6 +104,9 @@ impl Decision {
 struct CacheEntry {
     decision: Decision,
     fetched_at: Instant,
+    /// Which insertion produced this entry, so the expiry queue can tell
+    /// its own record of a key from a later refresh of the same key.
+    seq: u64,
 }
 
 /// Mode for the client: live (talks to cp-api) or disabled (allow-all).
@@ -116,6 +122,25 @@ enum Mode {
 pub struct BudgetClient {
     mode: Mode,
     cache: DashMap<String, CacheEntry>,
+    /// The cached keys in insertion order, which is also expiry order:
+    /// every entry carries the same TTL, so the entry inserted first is
+    /// the one to drop when the cache is full.
+    ///
+    /// The map alone cannot answer that without reading all of it, and
+    /// at capacity every miss is an insert — a deployment with more
+    /// active api_keys than [`CACHE_CAPACITY`] would scan ten thousand
+    /// entries on a request worker for each one.
+    ///
+    /// A key refreshed while it is already cached leaves its earlier
+    /// record behind; such a record names a `seq` the map no longer
+    /// holds, and is discarded when it reaches the front rather than
+    /// evicting a key that is not in fact the oldest.
+    expiry: Mutex<VecDeque<(u64, String)>>,
+    inserts: AtomicU64,
+    /// Cached entries inspected while choosing one to evict. The point
+    /// of the queue is that this stays flat as the cache fills.
+    #[cfg(test)]
+    inspected: AtomicU64,
 }
 
 impl std::fmt::Debug for BudgetClient {
@@ -151,6 +176,10 @@ impl BudgetClient {
                 stale_max: Duration::from_secs(stale_max),
             },
             cache: DashMap::new(),
+            expiry: Mutex::new(VecDeque::new()),
+            inserts: AtomicU64::new(0),
+            #[cfg(test)]
+            inspected: AtomicU64::new(0),
         }
     }
 
@@ -160,6 +189,10 @@ impl BudgetClient {
         Self {
             mode: Mode::Disabled,
             cache: DashMap::new(),
+            expiry: Mutex::new(VecDeque::new()),
+            inserts: AtomicU64::new(0),
+            #[cfg(test)]
+            inspected: AtomicU64::new(0),
         }
     }
 
@@ -219,27 +252,60 @@ impl BudgetClient {
     }
 
     fn insert(&self, api_key_id: &str, decision: Decision) {
-        if self.cache.len() >= CACHE_CAPACITY {
-            self.evict_oldest();
+        let seq = self.inserts.fetch_add(1, Ordering::Relaxed);
+        let mut expiry = self.expiry.lock().expect("budget cache expiry order");
+        // Drop records the map has moved past, and — only when the cache
+        // is full — the oldest key still in it. Both walk the front of
+        // the same queue, and each record is looked at once in its life,
+        // so an insert costs a constant number of entries however large
+        // the cache is.
+        // Refreshing a key already in the cache takes no new room, so it
+        // must not cost another key its decision.
+        let mut evicting =
+            self.cache.len() >= CACHE_CAPACITY && !self.cache.contains_key(api_key_id);
+        while let Some((recorded, key)) = expiry.front() {
+            #[cfg(test)]
+            self.inspected.fetch_add(1, Ordering::Relaxed);
+            let current = self
+                .cache
+                .get(key)
+                .is_some_and(|entry| entry.seq == *recorded);
+            if !current {
+                expiry.pop_front();
+                continue;
+            }
+            if !evicting {
+                break;
+            }
+            let (_, oldest) = expiry.pop_front().expect("a front that was just read");
+            self.cache.remove(&oldest);
+            evicting = false;
         }
+        // The walk above only reaches records behind a current one when
+        // it is evicting, so a key that is cached and never fetched
+        // again pins the front while every refresh behind it leaves a
+        // superseded record. Compact when they outnumber what the cache
+        // can hold: at most once per `CACHE_CAPACITY` inserts, which
+        // keeps the cost per insert constant and the queue bounded.
+        if expiry.len() >= 2 * CACHE_CAPACITY {
+            #[cfg(test)]
+            self.inspected
+                .fetch_add(expiry.len() as u64, Ordering::Relaxed);
+            expiry.retain(|(recorded, key)| {
+                self.cache
+                    .get(key)
+                    .is_some_and(|entry| entry.seq == *recorded)
+            });
+        }
+        expiry.push_back((seq, api_key_id.to_string()));
         self.cache.insert(
             api_key_id.to_string(),
             CacheEntry {
                 decision,
                 fetched_at: Instant::now(),
+                seq,
             },
         );
-    }
-
-    fn evict_oldest(&self) {
-        let oldest_key = self
-            .cache
-            .iter()
-            .min_by_key(|e| e.value().fetched_at)
-            .map(|e| e.key().clone());
-        if let Some(k) = oldest_key {
-            self.cache.remove(&k);
-        }
     }
 }
 
@@ -289,6 +355,10 @@ fn apply_fail_mode(prev: &Decision) -> Decision {
 //
 // We surface only `message` to ProxyError::BudgetExceeded; the other
 // fields exist for the dashboard banner once we plumb them through.
+/// A data plane can run against a control plane many releases newer than
+/// itself, so this struct — and every other one that decodes a control-plane
+/// response — never carries `#[serde(deny_unknown_fields)]`, and every field
+/// except `allow`, the one the decision hinges on, is `#[serde(default)]`.
 #[derive(Debug, Deserialize)]
 struct WireDecision {
     allow: bool,
@@ -338,12 +408,16 @@ struct WireBudget {
     reset_seconds: Option<Value>,
 }
 
+/// Path the budget gate asks cp-api on, under the dpmgr origin the
+/// heartbeat worker uses.
+pub const BUDGET_CHECK_PATH: &str = "/dp/budget_check";
+
 async fn fetch_decision(
     http: &reqwest::Client,
     base_url: &str,
     api_key_id: &str,
 ) -> Result<Decision, reqwest::Error> {
-    let url = format!("{base_url}/dp/budget_check");
+    let url = format!("{base_url}{BUDGET_CHECK_PATH}");
     let resp = http
         .get(url)
         .query(&[("api_key_id", api_key_id)])
@@ -406,6 +480,71 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The budget gate is handed the dpmgr origin `main` derives from
+    /// `managed.cp_base_url`. A scheme-less value used to make that
+    /// `127.0.0.1:7944/dp/budget_check`, which reqwest rejects at
+    /// request BUILD — and since a build failure is indistinguishable
+    /// from an unreachable CP, `fallback()` with no cache sticky-denies,
+    /// so every proxied request answered `429 budget_exceeded` while
+    /// etcd stayed connected and the console showed the gateway healthy
+    /// (AISIX-Cloud#1643).
+    ///
+    /// A peer that accepts and hangs up separates the two: a builder
+    /// error means no request was formed, any transport error means one
+    /// was and only the exchange failed.
+    #[tokio::test]
+    async fn budget_check_request_is_built_from_a_scheme_less_cp_base_url() {
+        // The listener is HELD for the whole test and answers by
+        // closing the connection immediately. Binding a port and
+        // dropping it would leave a window in which another process on
+        // a busy CI box takes it, and the probe below needs the peer's
+        // behaviour to be deterministic, not merely likely.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+        let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            format!(
+                r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+  cp_base_url: "127.0.0.1:{port}"
+"#
+            ),
+        )
+        .unwrap();
+        let loaded = aisix_core::Config::load_from_path(Some(file.path())).unwrap();
+        // `main` hands BudgetClient the heartbeat URL minus its path,
+        // which for a base carrying no trailing slash is the base itself.
+        let base = loaded.managed.cp_base_url.clone().unwrap();
+        assert_eq!(base, format!("https://127.0.0.1:{port}"));
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let err = fetch_decision(&http, &base, "ak_test")
+            .await
+            .expect_err("the peer hangs up without answering");
+        assert!(
+            !err.is_builder(),
+            "the budget_check request was never built: {err}"
+        );
+    }
 
     #[tokio::test]
     async fn disabled_client_always_allows() {
@@ -553,6 +692,122 @@ mod tests {
         // cp-api now 500s but stale_max default is 600s, so the cached
         // decision is still served.
         assert!(second.allowed);
+    }
+
+    fn decision(allowed: bool) -> Decision {
+        Decision {
+            allowed,
+            fail_mode: FailMode::Sticky,
+            reason: None,
+            budget: None,
+        }
+    }
+
+    /// A deployment with more active api_keys than the cache holds
+    /// inserts on every miss, and every one of those inserts happens on
+    /// a request worker. What must hold is that the work of choosing
+    /// what to drop does not grow with the cache: a full cache costs the
+    /// same per insert as an empty one.
+    #[test]
+    fn evicting_from_a_full_cache_does_not_read_the_cache() {
+        let client = BudgetClient::disabled();
+        for i in 0..CACHE_CAPACITY {
+            client.insert(&format!("key-{i:06}"), decision(true));
+        }
+        assert_eq!(client.cache.len(), CACHE_CAPACITY);
+        let filling = client.inspected.load(Ordering::Relaxed);
+
+        const MISSES: u64 = 2_000;
+        for i in 0..MISSES {
+            client.insert(&format!("fresh-{i:06}"), decision(true));
+        }
+        let evicting = client.inspected.load(Ordering::Relaxed) - filling;
+        assert!(
+            evicting <= MISSES * 2,
+            "choosing what to evict must cost a constant per insert, not the \
+             cache's size: {evicting} entries read over {MISSES} inserts into a \
+             cache of {CACHE_CAPACITY}",
+        );
+        assert_eq!(client.cache.len(), CACHE_CAPACITY, "the cap still holds");
+        assert!(
+            client.cache.get("key-000000").is_none(),
+            "the oldest entry is the one evicted",
+        );
+        assert!(
+            client
+                .cache
+                .get(&format!("key-{:06}", CACHE_CAPACITY - 1))
+                .is_some(),
+            "and the newest survivors are not",
+        );
+
+        // A refresh of a key already cached takes no new room, so it
+        // must not cost an unrelated key its decision.
+        let cached = client.cache.len();
+        client.insert("fresh-000000", decision(false));
+        assert_eq!(client.cache.len(), cached);
+        assert_eq!(
+            client.cache.get("fresh-000001").map(|e| e.decision.allowed),
+            Some(true),
+            "refreshing one key must not evict another",
+        );
+    }
+
+    /// Most deployments never fill the cache, so nothing ever evicts —
+    /// and a key that is cached and never fetched again then sits at the
+    /// front of the expiry order forever. Every refresh of every other
+    /// key leaves a superseded record behind it, so the records have to
+    /// be bounded by something other than eviction.
+    #[test]
+    fn refreshing_keys_below_capacity_does_not_accumulate_records() {
+        let client = BudgetClient::disabled();
+        // One key that is never seen again, pinning the front.
+        client.insert("pinned", decision(true));
+        for round in 0..20_000 {
+            client.insert(&format!("busy-{}", round % 50), decision(true));
+        }
+        assert!(client.cache.len() < CACHE_CAPACITY, "the cache never fills");
+        let records = client.expiry.lock().unwrap().len();
+        assert!(
+            records <= 2 * CACHE_CAPACITY,
+            "expiry records must stay bounded: {records} for {} cached keys",
+            client.cache.len(),
+        );
+        assert!(
+            client.cache.get("pinned").is_some(),
+            "and compaction must not drop a key that is still cached",
+        );
+        assert_eq!(
+            client.cache.get("busy-7").map(|e| e.decision.allowed),
+            Some(true),
+        );
+    }
+
+    /// A key seen again before it expires is the NEWEST entry, not the
+    /// oldest, whatever its first insertion recorded.
+    #[test]
+    fn a_refreshed_key_is_not_evicted_as_the_oldest() {
+        let client = BudgetClient::disabled();
+        for i in 0..CACHE_CAPACITY {
+            client.insert(&format!("key-{i:06}"), decision(true));
+        }
+        // The two oldest keys by first insertion; refresh one of them.
+        client.insert("key-000000", decision(false));
+
+        client.insert("brand-new", decision(true));
+        assert!(
+            client.cache.get("key-000000").is_some(),
+            "a refreshed key must not be dropped on its stale record",
+        );
+        assert!(
+            client.cache.get("key-000001").is_none(),
+            "the genuinely oldest key is the one dropped",
+        );
+        assert_eq!(
+            client.cache.get("key-000000").map(|e| e.decision.allowed),
+            Some(false),
+            "and the refreshed key keeps its refreshed decision",
+        );
     }
 
     #[tokio::test]

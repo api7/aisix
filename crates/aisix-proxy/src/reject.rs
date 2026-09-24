@@ -69,10 +69,13 @@ pub(crate) fn reject_before_dispatch(
         path,
         status,
         latency: elapsed,
+        duration: elapsed,
         // Nothing is resolved this early: no upstream was picked, and the
         // body naming the model is exactly what we refused to read.
         provider: None,
         model: None,
+        upstream_model: None,
+        provider_key_id: None,
         api_key_id,
         prompt_tokens: None,
         completion_tokens: None,
@@ -84,6 +87,8 @@ pub(crate) fn reject_before_dispatch(
         routing_fallback_count: None,
         error_kind: Some(error_kind),
         error: Some(&error),
+        mcp: None,
+        cache: None,
     }
     .emit();
     // `path` must be normalized, not passed through: `AisixPath` below hands
@@ -205,6 +210,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 0,
             tls: None,
+            listeners: Vec::new(),
             real_ip: Default::default(),
             request_id: Default::default(),
             thread_per_core: None,

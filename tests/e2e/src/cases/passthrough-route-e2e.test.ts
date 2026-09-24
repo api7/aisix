@@ -26,7 +26,7 @@ import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 //      including the #164 double-/v1 dedup and Bearer injection.
 //   2. Anthropic inject shape: `x-api-key` + `anthropic-version`, never
 //      a Bearer alongside (#166).
-//   3. The removed implicit tunnel answers 410 with a migration pointer
+//   3. An unclaimed path in the namespace is an ordinary 404 miss
 //      for any unclaimed `/passthrough/*` path.
 //   4. Forward-proxy BYO: a host-matched route with
 //      `credential_mode: forward_client` + `auth_mode: header_key`
@@ -47,7 +47,7 @@ const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
 
-describe("passthrough-route e2e: explicit routes, BYO credentials, 410 tombstone", () => {
+describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed paths", () => {
   let app: SpawnedApp | undefined;
   let seed: SeedClient | undefined;
   let etcdReachable = false;
@@ -206,7 +206,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, 410 tombstone
     expect(hit.headers["authorization"]).toBeUndefined();
   });
 
-  test("unclaimed /passthrough/* answers the 410 migration tombstone", async (ctx) => {
+  test("unclaimed /passthrough/* takes the plain 404 miss path", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;
@@ -217,12 +217,8 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, 410 tombstone
         headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
       },
     );
-    expect(res.status).toBe(410);
-    const body = (await res.json()) as {
-      error?: { code?: unknown; message?: unknown };
-    };
-    expect(body.error?.code).toBe("endpoint_removed");
-    expect(String(body.error?.message)).toContain("passthrough_route");
+    expect(res.status).toBe(404);
+    expect(await res.text()).toBe("");
   });
 
   test("forward-proxy BYO: host match beats typed routes; Authorization forwarded verbatim", async (ctx) => {

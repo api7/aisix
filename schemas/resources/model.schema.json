@@ -103,7 +103,7 @@
     },
     "CooldownConfig": {
       "additionalProperties": false,
-      "description": "Request-path cooldown settings for a direct model after retryable upstream failures.",
+      "description": "Request-path cooldown settings for a direct model after retryable upstream failures. Cooldown is opt-in: it runs only when `enabled` is `true`.",
       "properties": {
         "default_seconds": {
           "description": "Cooldown TTL in seconds when the upstream did not supply a `Retry-After` header or `honor_retry_after` is `false`.",
@@ -112,7 +112,7 @@
           "type": "integer"
         },
         "enabled": {
-          "description": "Whether cooldown is active for this model. Set to `false` to keep the model in rotation regardless of upstream failures.",
+          "description": "Whether cooldown is active for this model. Cooldown is off unless this is set to `true`, so a model that omits it stays in rotation regardless of upstream failures.",
           "type": "boolean"
         },
         "honor_retry_after": {
@@ -294,12 +294,46 @@
     },
     "Judge": {
       "additionalProperties": false,
-      "description": "The judge model that synthesizes the panel responses into one answer. `model` references a direct model alias.",
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model"
+              ]
+            },
+            {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_id"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "The judge model that synthesizes the panel responses into one answer. The judge model is named either by `model` (its display name) or by `model_id` (its resource id); the judge must carry at least one of the two.",
       "properties": {
         "model": {
-          "description": "Model alias for the direct model that synthesizes panel responses.",
+          "description": "Model alias for the direct model that synthesizes panel responses. Read only when `model_id` is absent.",
           "minLength": 1,
           "type": "string"
+        },
+        "model_id": {
+          "description": "Resource id of the direct model that synthesizes panel responses. Present, it is authoritative and `model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps the judge pointing at it with no edit to this document. An id resolving to no model is a judge that does not exist, exactly as a `model` naming no model is.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "synthesis_prompt": {
           "description": "Override for the built-in synthesis prompt template.",
@@ -307,9 +341,6 @@
           "type": "string"
         }
       },
-      "required": [
-        "model"
-      ],
       "type": "object"
     },
     "ModelCost": {
@@ -347,17 +378,48 @@
         },
         {
           "additionalProperties": false,
-          "description": "`{ \"target\": \"<direct alias>\" }` — route to a specific safe model.",
+          "allOf": [
+            {
+              "anyOf": [
+                {
+                  "properties": {
+                    "target": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "target"
+                  ]
+                },
+                {
+                  "properties": {
+                    "target_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "target_id"
+                  ]
+                }
+              ]
+            }
+          ],
+          "description": "`{ \"target\": \"<direct alias>\" }` (or `{ \"target_id\": \"<id>\" }`) — route to a specific safe model.",
           "properties": {
             "target": {
-              "description": "Direct-model alias to route to when embedding fails.",
+              "description": "Direct-model alias to route to when embedding fails. Read only when `target_id` is absent.",
               "minLength": 1,
               "type": "string"
+            },
+            "target_id": {
+              "description": "Resource id of the direct model to route to when embedding fails. Present, it is authoritative and `target` is ignored, so renaming that model keeps this fallback pointing at it with no edit to this document.",
+              "minLength": 1,
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
-          "required": [
-            "target"
-          ],
           "type": "object"
         }
       ],
@@ -365,12 +427,46 @@
     },
     "PanelMember": {
       "additionalProperties": false,
-      "description": "One member of an ensemble panel. `model` references a direct model alias.",
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model"
+              ]
+            },
+            {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_id"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "One member of an ensemble panel. The member model is named either by `model` (its display name) or by `model_id` (its resource id); a member must carry at least one of the two.",
       "properties": {
         "model": {
-          "description": "Model alias for a direct model that receives one panel request.",
+          "description": "Model alias for a direct model that receives one panel request. Read only when `model_id` is absent.",
           "minLength": 1,
           "type": "string"
+        },
+        "model_id": {
+          "description": "Resource id of the direct model that receives one panel request. Present, it is authoritative and `model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this member pointing at it with no edit to this document. An id resolving to no model is a panel member that does not exist, exactly as a `model` naming no model is.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "seed": {
           "description": "Sampling seed for this panel member.",
@@ -391,9 +487,6 @@
           "type": "integer"
         }
       },
-      "required": [
-        "model"
-      ],
       "type": "object"
     },
     "RateLimit": {
@@ -536,7 +629,7 @@
           "type": "string"
         },
         {
-          "description": "Rank targets cheapest-first by the target model's `cost` (combined input+output per-1K price), then fall forward. Targets without a configured `cost` rank last.",
+          "description": "Rank targets cheapest-first by the target model's resolved price (combined input+output per-1K), then fall forward. A target is priced by the `pricing` document its `pricing_key` names, or by its inline `cost` when it names none; a target with no price at all ranks last.",
           "enum": [
             "least_cost"
           ],
@@ -560,12 +653,46 @@
     },
     "RoutingTarget": {
       "additionalProperties": false,
-      "description": "One destination in a routing configuration. `model` references a direct model alias.",
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model"
+              ]
+            },
+            {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_id"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "One destination in a routing configuration. The target model is named either by `model` (its display name) or by `model_id` (its resource id); a target must carry at least one of the two.",
       "properties": {
         "model": {
-          "description": "Model alias for a direct model that can receive routed traffic.",
+          "description": "Model alias for a direct model that can receive routed traffic. Read only when `model_id` is absent.\n\nDefaulted at the type level and required by the schemas instead — as one half of a \"`model` or `model_id`\" alternative, so a target naming its model by id alone validates while one naming it neither way is still rejected.",
           "minLength": 1,
           "type": "string"
+        },
+        "model_id": {
+          "description": "Resource id of the direct model that can receive routed traffic. Present, it is authoritative and `model` is ignored: the id is resolved against the models in the current configuration and the name it resolves to is the target, so renaming that model keeps this target pointing at it with no edit to this document. An id resolving to no model is a target that does not exist, exactly as a `model` naming no model is.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "priority": {
           "description": "Priority tier, default `0`; a higher value is preferred (the APISIX node-priority convention — give backup targets `-1`). The strategy orders targets within each tier; a lower tier is only tried when every higher-tier target failed or is unavailable.",
@@ -587,24 +714,87 @@
           "type": "integer"
         }
       },
-      "required": [
-        "model"
-      ],
       "type": "object"
     },
     "Semantic": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "embedding_model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "embedding_model"
+              ]
+            },
+            {
+              "properties": {
+                "embedding_model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "embedding_model_id"
+              ]
+            }
+          ]
+        },
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "default": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "default"
+              ]
+            },
+            {
+              "properties": {
+                "default_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "default_id"
+              ]
+            }
+          ]
+        }
+      ],
       "description": "Semantic-routing config: pick a target by request meaning.",
       "properties": {
         "default": {
-          "description": "Direct model alias used when no route clears its threshold.",
+          "description": "Direct model alias used when no route clears its threshold. Read only when `default_id` is absent.",
           "minLength": 1,
           "type": "string"
         },
+        "default_id": {
+          "description": "Resource id of the direct model used when no route clears its threshold. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "embedding_model": {
-          "description": "Alias of an `embedding`-modality Model used to embed the request and (at apply time) the route examples.",
+          "description": "Alias of an `embedding`-modality Model used to embed the request and (at apply time) the route examples. Read only when `embedding_model_id` is absent.",
           "minLength": 1,
           "type": "string"
+        },
+        "embedding_model_id": {
+          "description": "Resource id of the `embedding`-modality Model used to embed the request and the route examples. Present, it is authoritative and `embedding_model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this router pointing at it with no edit to this document. An id resolving to no model is an embedding model that does not exist, exactly as an `embedding_model` naming no model is — the router applies `on_embedding_failure`.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "embedding_timeout_ms": {
           "description": "Per-call deadline for the embedding request in milliseconds. `0` or absent disables the embedding-specific deadline.",
@@ -638,8 +828,6 @@
         }
       },
       "required": [
-        "default",
-        "embedding_model",
         "match",
         "routes"
       ],
@@ -682,6 +870,32 @@
     },
     "SemanticRoute": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "target": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target"
+              ]
+            },
+            {
+              "properties": {
+                "target_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target_id"
+              ]
+            }
+          ]
+        }
+      ],
       "description": "One semantic route: a labeled set of example utterances whose embeddings define the route. A request that scores high enough against them dispatches to `target`.",
       "properties": {
         "description": {
@@ -704,9 +918,17 @@
           "type": "string"
         },
         "target": {
-          "description": "Direct model alias that receives traffic matching this route.",
+          "description": "Direct model alias that receives traffic matching this route. Read only when `target_id` is absent.",
           "minLength": 1,
           "type": "string"
+        },
+        "target_id": {
+          "description": "Resource id of the direct model that receives traffic matching this route. Present, it is authoritative and `target` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this route pointing at it with no edit to this document. An id resolving to no model is a route target that does not exist, exactly as a `target` naming no model is.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "threshold": {
           "description": "Per-route similarity threshold. A request matches this route only when its aggregated score is `>=` this value. When omitted, the router-level threshold applies.",
@@ -718,8 +940,7 @@
       },
       "required": [
         "examples",
-        "name",
-        "target"
+        "name"
       ],
       "type": "object"
     },
@@ -801,6 +1022,16 @@
             "required": [
               "cost"
             ]
+          },
+          {
+            "required": [
+              "pricing_key"
+            ]
+          },
+          {
+            "required": [
+              "effort_mapping"
+            ]
           }
         ]
       },
@@ -824,6 +1055,12 @@
           {
             "required": [
               "semantic"
+            ]
+          },
+          {
+            "required": [
+              "embedding",
+              "effort_mapping"
             ]
           }
         ]
@@ -901,6 +1138,16 @@
             "required": [
               "cost"
             ]
+          },
+          {
+            "required": [
+              "pricing_key"
+            ]
+          },
+          {
+            "required": [
+              "effort_mapping"
+            ]
           }
         ]
       },
@@ -960,6 +1207,16 @@
             "required": [
               "cost"
             ]
+          },
+          {
+            "required": [
+              "pricing_key"
+            ]
+          },
+          {
+            "required": [
+              "effort_mapping"
+            ]
           }
         ]
       },
@@ -999,7 +1256,7 @@
           "$ref": "#/definitions/CooldownConfig"
         }
       ],
-      "description": "Direct-model-only request-path cooldown configuration. Omit this field to use the built-in cooldown behavior."
+      "description": "Direct-model-only request-path cooldown configuration. Cooldown is opt-in: omit this field, or leave `enabled` unset, and the model is never taken out of rotation by request-path failures."
     },
     "cost": {
       "allOf": [
@@ -1013,6 +1270,24 @@
       "description": "Operator-facing unique label. Surfaces on `/v1/models`, `req.model` on chat completions, `ApiKey.allowed_models`, and the dashboard model list. `Resource::name()` returns this.",
       "minLength": 1,
       "type": "string"
+    },
+    "effort_mapping": {
+      "additionalProperties": {
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "description": "Direct-model-only mapping from a client-requested reasoning effort to the value sent upstream. After resolving the final target the gateway looks the requested effort up once — the exact entry first, then the `*` entry — and never looks the result up again. A requested value that matches neither is sent unchanged.\n\nThree entries are reserved. The empty-string key matches a request that sets no effort at all, meaning the effort field is absent, `null`, or empty, and its value is added to the outbound request. The `*` key matches any other present value that has no entry of its own, and never matches a request that sets no effort. A `null` value removes the effort field from the outbound request so the provider's own default applies; mapping `*` to `null` therefore strips the effort from every request whose value has no entry of its own. The empty-string key may not be mapped to `null`, because a request that sets no effort has nothing to remove, and no entry may be mapped to an empty value.\n\nOn the Anthropic messages and token-counting endpoints only `output_config.effort` is read and rewritten. A `thinking` block is not an effort setting for this mapping, so a request that carries `thinking` but no `output_config.effort` sets no effort and the empty-string entry applies to it. When such a request is dispatched to a provider that does not accept the Anthropic protocol, the upstream reasoning effort is derived from the mapped `output_config.effort` when one is present and from `thinking` otherwise, except that an entry that removed the effort sends no effort at all. A request that sets `thinking.type: disabled` is never given an effort by this mapping: on the Anthropic protocol no entry writes a tier to it, though an entry that removes the effort still removes it, and on any other protocol it always sends the `none` effort.",
+      "properties": {
+        "": {
+          "description": "The entry for a request that sets no reasoning effort. Its value is sent upstream in place of the missing one, and may not be `null` — a request that sets no effort has no field to remove.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "type": "object"
     },
     "embedding": {
       "allOf": [
@@ -1032,6 +1307,12 @@
     },
     "model_name": {
       "description": "Upstream model identifier sent in provider requests. Routing and ensemble models leave this field unset.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "pricing_key": {
+      "description": "Name of a shared `pricing` document to take the per-token cost from, instead of setting `cost` on this model. The environment's own pricing documents are searched first and the shared catalog second; when the key matches neither, `cost` applies. Editing the pricing document repricies every model naming it, with no change to the models themselves.",
+      "maxLength": 255,
       "minLength": 1,
       "type": "string"
     },

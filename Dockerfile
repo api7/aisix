@@ -77,9 +77,16 @@ COPY schemas ./schemas
 # above.
 COPY bench/pgo-training ./bench/pgo-training
 
-# Profile-guided optimization gate. Default ON: release artifacts are always
-# PGO-built, and a forgotten build-arg ships a PGO'd image — never a silently
-# un-optimized one. CI passes PGO=off only for pull-request smoke builds.
+# Profile-guided optimization gate. The default stays ON so a bare
+# `docker build` — a local release rehearsal, a one-off customer image —
+# produces the same shape as the published artifact rather than a silently
+# un-optimized one; opting out is explicit.
+#
+# CI inverts that default and passes PGO=on only for a STABLE release tag
+# (vX.Y.Z). PR, main/:dev and `-rc.N` builds pass PGO=off: PGO cost ~20 min
+# on every one of the ~40 main pushes per release cycle, and none of those
+# images are the artifact a customer runs. See "Decide PGO build mode" in
+# .github/workflows/docker-image.yml and the PGO section of RELEASING.md.
 ARG PGO=on
 
 # `--locked` forces the build to use the exact versions in Cargo.lock —
@@ -102,17 +109,31 @@ ARG PGO=on
 # retrained profile at a fixed path would silently reuse stale artifacts
 # from the persistent target cache mount.
 #
-# If this ever builds for linux/arm64: jemalloc bakes the build host's
-# page size into the binary, and QEMU reports 4K — set
-# JEMALLOC_SYS_WITH_LG_PAGE=16 here or the image aborts at startup on
-# 64K-page kernels (see crates/aisix-server/src/main.rs). PGO training
-# additionally requires a native arm64 builder: an instrumented binary
-# cannot self-train under QEMU emulation.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    --mount=type=cache,target=/src/target-pgo-gen \
-    --mount=type=cache,target=/src/target-pgo \
+# linux/arm64 (AISIX-Cloud#903) carries two constraints:
+#   - jemalloc bakes the build host's page size into the binary, so a
+#     4K-page build aborts at startup on a 64K-page kernel. Building with
+#     lg-page 16 yields a binary that runs on both (see
+#     crates/aisix-server/src/main.rs). Keyed on TARGETARCH below so a
+#     plain `docker build` on an arm64 host is right too, not only CI.
+#   - PGO training runs the instrumented binary, so it needs a NATIVE
+#     arm64 builder — it cannot self-train under emulation. CI gives each
+#     architecture its own runner for that reason; do not reintroduce QEMU.
+# Supplied by BuildKit; an absent value trips `set -u` below rather than
+# silently producing a 4K-page arm64 binary.
+ARG TARGETARCH
+
+# The cache mounts are keyed per architecture. A cache mount's default id is
+# its target path, so a single builder asked for both platforms at once
+# (`docker build --platform linux/amd64,linux/arm64 .`) would run the two
+# stage variants against one `/src/target` — where they share a cargo lock
+# and both write `release/aisix`, so the copy below can pick up the other
+# architecture's binary.
+RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=target-${TARGETARCH},target=/src/target \
+    --mount=type=cache,id=target-pgo-gen-${TARGETARCH},target=/src/target-pgo-gen \
+    --mount=type=cache,id=target-pgo-${TARGETARCH},target=/src/target-pgo \
     set -eu; \
+    if [ "$TARGETARCH" = "arm64" ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi; \
     mkdir -p /usr/local/share/aisix; \
     if [ "$PGO" = "on" ]; then \
         RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data" CARGO_TARGET_DIR=/src/target-pgo-gen \
@@ -190,7 +211,12 @@ RUN chmod 0755 /usr/local/bin/aisix-entrypoint
 # Proxy + admin + metrics listeners from config.example.yaml.
 EXPOSE 3000 3001 9090
 
-USER aisix
+# Numeric, not `aisix`: kubelet resolves `runAsNonRoot: true` against the
+# image's configured user, and a name it cannot prove is non-root fails
+# the container at admission with CreateContainerConfigError. The uid is
+# the `aisix` passwd entry's, so the default runtime identity — and the
+# ownership of /etc/aisix and /var/lib/aisix — is unchanged.
+USER 10001
 
 # tini forwards signals cleanly to the aisix process; entrypoint script
 # resolves the config path from env, then execs the binary.

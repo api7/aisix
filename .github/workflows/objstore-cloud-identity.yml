@@ -15,8 +15,9 @@
 # build_object_store_ambient(Gcs, …) uses in production); its real-runner
 # round-trip is tracked in #573. objstore_smoke_gcs_cloud_identity self-skips here.
 #
-# Gated: never on a normal push. workflow_dispatch / nightly / same-repo PR
-# labeled `objstore real cloud`. S3 self-skips when its OIDC is unconfigured.
+# Gated: never on a normal push. workflow_dispatch / the schedule below /
+# same-repo PR labeled `objstore real cloud`. S3 self-skips when its OIDC is
+# unconfigured.
 #
 # Required repository secrets (identifiers, not static keys):
 #   AISIX_E2E_OIDC_AWS_ROLE_ARN   IAM role to assume (trusts repo:api7/aisix via GitHub OIDC)
@@ -27,7 +28,9 @@ name: objstore-cloud-identity
 on:
   workflow_dispatch:
   schedule:
-    - cron: "45 0 * * *" # 00:45 UTC (08:45 Asia/Shanghai)
+    # 00:45 UTC (08:45 Asia/Shanghai) on days 3, 6, ..., 30 of each month.
+    # Month boundaries can lengthen the interval to four or five days.
+    - cron: "45 0 3-30/3 * *"
   pull_request:
     types: [labeled, synchronize, reopened]
     branches: [main]

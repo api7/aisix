@@ -105,6 +105,25 @@
         }
       ]
     },
+    "GuardrailInputMessages": {
+      "description": "How much of a request's message history an input guardrail reads.\n\nIDE and agent clients replay the whole conversation on every call, so a rule that matched once keeps matching for the rest of the session even after the offending message is long past. `LatestTurn` narrows every input hook — the block check and the masking pass alike — to the part of the conversation the model has not answered yet.",
+      "oneOf": [
+        {
+          "description": "Read every message in the request, including replayed history and system prompts.",
+          "enum": [
+            "all"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Read only the messages after the last assistant message, excluding system messages: the current user message together with any tool results answering it. Messages the model has already replied to are neither screened nor rewritten.",
+          "enum": [
+            "latest_turn"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "KeywordPattern": {
       "description": "Literal or regular-expression pattern used by a keyword guardrail.",
       "oneOf": [
@@ -277,7 +296,7 @@
         },
         "fail_open": {
           "default": false,
-          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -288,6 +307,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for literal and regular expression matching.",
@@ -349,7 +377,7 @@
         },
         "fail_open": {
           "default": false,
-          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "guardrail_id": {
@@ -372,6 +400,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for Amazon Bedrock Guardrails.",
@@ -450,7 +487,7 @@
         },
         "fail_open": {
           "default": false,
-          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -461,6 +498,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for Azure Prompt Shield.",
@@ -560,7 +606,7 @@
         },
         "fail_open": {
           "default": false,
-          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "halt_on_blocklist_hit": {
@@ -576,6 +622,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for Azure text moderation.",
@@ -725,7 +780,7 @@
         },
         "fail_open": {
           "default": false,
-          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -736,6 +791,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for Aliyun text moderation.",
@@ -864,7 +928,7 @@
         },
         "fail_open": {
           "default": false,
-          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -875,6 +939,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for Aliyun AI Guardrails policy-driven moderation.",
@@ -1003,7 +1076,7 @@
         },
         "fail_open": {
           "default": false,
-          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -1014,6 +1087,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for in-process sensitive-data detection and redaction.",
@@ -1082,7 +1164,7 @@
         },
         "fail_open": {
           "default": false,
-          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -1093,6 +1175,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for Lakera Guard screening.",
@@ -1190,7 +1281,7 @@
         },
         "fail_open": {
           "default": false,
-          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -1201,6 +1292,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for the OpenAI Moderation API.",
@@ -1293,7 +1393,7 @@
         },
         "fail_open": {
           "default": false,
-          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -1304,6 +1404,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for PII detection and anonymization by a customer-run Presidio.",
@@ -1376,6 +1485,66 @@
     },
     {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "deny_examples": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "deny_examples"
+            ]
+          },
+          "then": {
+            "required": [
+              "deny_threshold"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "allow_examples": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "allow_examples"
+            ]
+          },
+          "then": {
+            "required": [
+              "allow_threshold"
+            ]
+          }
+        },
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "embedding_model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "embedding_model"
+              ]
+            },
+            {
+              "properties": {
+                "embedding_model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "embedding_model_id"
+              ]
+            }
+          ]
+        }
+      ],
       "description": "Embedding-similarity screening against operator-supplied example texts. Deny examples block on a close match; an allow-list, when present, blocks everything that matches none of it. Calls an `embedding`-kind Model through the gateway's provider bridges. Detection-only — never rewrites content. Applies on input, output, or both, including buffered streaming output.",
       "properties": {
         "allow_examples": {
@@ -1388,8 +1557,7 @@
           "type": "array"
         },
         "allow_threshold": {
-          "default": 0.75,
-          "description": "Cosine-similarity threshold for `allow_examples`, in `[-1, 1]`. RAISE it to block more — a text must reach it to be admitted.",
+          "description": "Cosine-similarity threshold for `allow_examples`, in `[-1, 1]`. RAISE it to block more — a text must reach it to be admitted. Required whenever `allow_examples` is non-empty, and only then: a row with no allow-list has nothing for this number to decide. See `deny_threshold` for why there is no portable value.",
           "format": "float",
           "maximum": 1.0,
           "minimum": -1.0,
@@ -1410,8 +1578,7 @@
           "type": "array"
         },
         "deny_threshold": {
-          "default": 0.75,
-          "description": "Cosine-similarity threshold for `deny_examples`, in `[-1, 1]`. Lower it to block more.",
+          "description": "Cosine-similarity threshold for `deny_examples`, in `[-1, 1]`. Lower it to block more. Required whenever `deny_examples` is non-empty.\n\nThere is no portable value. Cosine scores are not comparable across embedding models — the same pair of texts can fall on opposite sides of a fixed threshold depending on which model produced the vectors, and a threshold carried over from another model under-screens without any sign that it is doing so. Measure one against the model named in `embedding_model`, on your own traffic: a request that emits a usage event reports what it scored in `guardrail_scores`, including the requests this guardrail allowed. Not every surface can produce that sample. `/a2a`, `rerank`, `/v1/embeddings`, `/v1/images/*`, `/v1/videos`, `/v1/audio/speech` and `/v1/messages/count_tokens` run the INPUT hook only, so an output-hook row scores nothing on them (audio transcription and translation do run both); `/a2a` also resolves no model and no MCP server, so only a row attached at the environment, API-key or team scope reaches it at all.",
           "format": "float",
           "maximum": 1.0,
           "minimum": -1.0,
@@ -1428,6 +1595,14 @@
           "minLength": 1,
           "type": "string"
         },
+        "embedding_model_id": {
+          "description": "Resource id of the `embedding`-kind Model used to embed both the examples and the screened text. Present, it is authoritative and `embedding_model` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this row screening with it and needs no edit here. An id resolving to no model is an embedder that cannot be resolved, exactly as an `embedding_model` naming no model is — the row degrades per `fail_open`, fail-closed by default.\n\nDefaulted at the type level for the same reason `embedding_model` is: the strict write schema requires one of the two, the read path requires neither, and a screening row that fails to load is fail-OPEN.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "enabled": {
           "default": true,
           "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
@@ -1440,7 +1615,7 @@
         },
         "fail_open": {
           "default": false,
-          "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
           "type": "boolean"
         },
         "hook_point": {
@@ -1451,6 +1626,15 @@
           ],
           "default": "both",
           "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
         },
         "kind": {
           "description": "Guardrail provider type for embedding-similarity screening against example texts, using an embedding-kind Model.",
@@ -1511,8 +1695,147 @@
         }
       },
       "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "description": "Screening by an operator-supplied script the gateway runs in a sandboxed engine, for a screening service that speaks its own protocol. The script can allow, block, or rewrite content. Applies on input, output, or both, including streaming output.",
+      "properties": {
+        "created_at": {
+          "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "direction": {
+          "default": "both",
+          "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
+          "type": "boolean"
+        },
+        "enforcement_mode": {
+          "default": "block",
+          "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
+          "type": "string"
+        },
+        "fail_open": {
+          "default": false,
+          "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+          "type": "boolean"
+        },
+        "hook_point": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailHookPoint"
+            }
+          ],
+          "default": "both",
+          "description": "Where in the lifecycle this rule runs."
+        },
+        "input_messages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuardrailInputMessages"
+            }
+          ],
+          "default": "all",
+          "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
+        },
+        "kind": {
+          "description": "Guardrail provider type for screening by an operator-supplied script the gateway runs in a sandboxed engine.",
+          "enum": [
+            "custom"
+          ],
+          "type": "string"
+        },
+        "max_buffer_bytes": {
+          "default": 262144,
+          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "max_memory_bytes": {
+          "default": 16777216,
+          "description": "Memory ceiling for the script engine, in bytes. A script that exceeds it is terminated and the hook's fail-open policy applies.",
+          "format": "uint64",
+          "maximum": 536870912.0,
+          "minimum": 1048576.0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Operator-facing name that surfaces in metric labels and error reasons.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "on_buffer_exceeded": {
+          "default": "fail_closed",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
+          "enum": [
+            "fail_closed",
+            "fail_open"
+          ],
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled (the default), a script failure blocks model output instead of releasing unscanned content. The input hook uses the top-level `fail_open` policy.",
+          "type": "boolean"
+        },
+        "script": {
+          "description": "The script source, as an ES module exporting `checkInput` and/or `checkOutput`. A hook whose function the module does not export is skipped, so a script may cover one direction only.\n\nRequired on both the write schema and the read one, so a row that omits it is refused rather than loaded: unlike the fields that are write-path-only, a `custom` row with no script screens nothing either way, and rejecting it is what puts it in `/status/config`'s `rejected` list where an operator can see it.\n\nA script that is whitespace-only or does not compile passes the schema — `minLength` counts characters, so a whitespace-only value is non-empty — and is refused when the chain is built instead. `aisix validate` reports that and exits non-zero; a serving gateway reports the runtime rejection through config status (api7/aisix#1084).",
+          "minLength": 1,
+          "type": "string"
+        },
+        "secrets": {
+          "additionalProperties": {
+            "description": "Value the script reads as ctx.secrets under this name.",
+            "type": "string"
+          },
+          "description": "Values the script reads as `ctx.secrets.<NAME>`, for credentials the screening service requires. Stored encrypted and decrypted before projection; plaintext is held in memory only and is never logged.",
+          "type": "object"
+        },
+        "stream_processing_mode": {
+          "default": "window",
+          "description": "Streaming output moderation mode: sliding-window incremental release or whole-response hold-back.",
+          "enum": [
+            "window",
+            "buffer_full"
+          ],
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "description": "Wall-clock budget for one hook invocation, in milliseconds, covering the script's own execution and every call it makes. `fail_open` and `output_fail_open` govern the verdict when it elapses. Per-call timeouts within the budget are the script's own to set.",
+          "format": "uint32",
+          "maximum": 300000.0,
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "window_overlap_size": {
+          "default": 256,
+          "description": "Chars carried between windows so a span split across a boundary is still caught.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window_size": {
+          "default": 10000,
+          "description": "Sliding-window size in characters for window mode.",
+          "format": "uint32",
+          "maximum": 10000.0,
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "required": [
         "kind",
-        "embedding_model"
+        "script"
       ],
       "type": "object"
     }
@@ -1540,7 +1863,7 @@
     },
     "fail_open": {
       "default": false,
-      "description": "Behavior when a remote API guardrail cannot complete its check — upstream unreachable, timing out, throttling, or rejecting the call. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`; `false` (the default) blocks with 422. Keyword guardrails do not use this setting.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
+      "description": "Behavior when this guardrail cannot complete its check. Two causes: a remote provider that is unreachable, timing out, throttling, or rejecting the call; and a body the gateway could not give the guardrail at all — one that does not decode as UTF-8 or does not parse, which the proxy would otherwise refuse with `unscannable_body`. `true` allows the request; `false` (the default) blocks with 422.\n\nBoth causes apply to EVERY kind: the second one is the gateway failing to produce scannable text, which happens before any guardrail runs and so reaches all of them. `keyword` and `pii` never call out, so only the second can arise for them; a kind that calls out can meet either.\n\nThe per-hook split follows the same line. A kind that calls out carries its own `output_fail_open` for the output hook, leaving this field to govern the input hook. `keyword` and `pii` have no `output_fail_open`, so this one value governs both of their hooks.\n\nDefaults to fail-closed so an unchecked request is never released on the strength of a guardrail that did not run: an operator who prefers availability over enforcement opts in explicitly. This matches `output_fail_open` and `on_buffer_exceeded`, which have always defaulted closed (AISIX-Cloud#1382).",
       "type": "boolean"
     },
     "hook_point": {
@@ -1551,6 +1874,15 @@
       ],
       "default": "both",
       "description": "Where in the lifecycle this rule runs."
+    },
+    "input_messages": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/GuardrailInputMessages"
+        }
+      ],
+      "default": "all",
+      "description": "How much of the request this rule reads at the input hook.\n\n`all` (the default) scans every message the caller sent, including replayed history and system prompts. `latest_turn` scans only the messages after the last assistant message, with system messages excluded — the current user message plus any tool results answering it. It exists for clients that resend the whole conversation on every call, where a rule that matched one earlier message would otherwise keep refusing the rest of the session.\n\nThe narrowing governs everything the rule does on the request: under `latest_turn` a masking rule rewrites only the current turn, and messages outside it reach the upstream exactly as the caller sent them. A rule whose job is to mask the whole conversation belongs on `all`.\n\nIgnored at the output hook, which always reads the whole response."
     },
     "name": {
       "description": "Operator-facing name that surfaces in metric labels and error reasons.",

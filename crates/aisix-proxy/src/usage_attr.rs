@@ -23,6 +23,7 @@ use aisix_obs::{UsageEvent, UsageEventLabels};
 
 use crate::chat::sanitize_tag;
 use crate::client_ip::ClientContext;
+use crate::operation::Surface;
 use crate::state::ProxyState;
 
 /// The request's ENFORCE-mode guardrail audit handle (AISIX-Cloud#1330),
@@ -52,6 +53,78 @@ pub(crate) type GuardrailAudit = Option<Arc<aisix_guardrails::GuardrailAuditLog>
 /// event happened to go out first holding the only copy.
 pub(crate) fn enforced_hits(audit: &GuardrailAudit) -> Vec<aisix_core::GuardrailEnforcedHit> {
     audit.as_ref().map(|a| a.snapshot()).unwrap_or_default()
+}
+
+/// Snapshot `audit` into a `UsageEvent`'s `guardrail_bypassed_reason`:
+/// the bounded tag of the first guardrail this request failed OPEN on,
+/// empty when none did.
+///
+/// Not terminal-only, unlike [`enforced_hits`]. A bypass says the request
+/// went upstream unscreened, which is true of every attempt the request
+/// made, and `chat.rs` has stamped it on its per-attempt events since the
+/// field existed — a retry that dropped it would read as a screened
+/// attempt.
+///
+/// `chat.rs` keeps threading its own copy instead of calling this: it
+/// hands the value to per-attempt and ensemble sub-call emitters at
+/// points where the value is deliberately the one captured EARLIER in the
+/// request, which a request-scoped snapshot cannot express.
+pub(crate) fn bypass_reason(audit: &GuardrailAudit) -> String {
+    audit
+        .as_ref()
+        .and_then(|a| a.bypass_reason())
+        .unwrap_or_default()
+}
+
+/// Snapshot `audit` into a terminal `UsageEvent`'s `guardrail_scores`
+/// (AISIX-Cloud#1467). Same handle, same terminal-only rule and same
+/// non-destructive read as [`enforced_hits`] — a scoring guardrail runs
+/// once per request, so a per-attempt event would repeat its numbers once
+/// per retry and make a single screening look like several.
+pub(crate) fn guardrail_scores(audit: &GuardrailAudit) -> Vec<aisix_core::GuardrailScore> {
+    audit
+        .as_ref()
+        .map(|a| a.score_snapshot())
+        .unwrap_or_default()
+}
+
+/// Whether a request has a guardrail decision worth preserving even when
+/// the handler has no token usage to report.
+///
+/// Merely having an attached guardrail is not enough: unsupported-provider
+/// and unparseable-usage paths historically suppress zero-value noise rows.
+/// A mask/block, monitor hit, or similarity score is an operator-visible
+/// security fact, so those paths must emit a zero-token event instead.
+///
+/// A BYPASS is one too, and it needs saying separately because it leaves no
+/// enforced hit and no score — a bypass is precisely the outcome where no
+/// policy acted. Without this arm a fail-open request whose upstream
+/// reported no parseable usage has its whole event suppressed, so the
+/// reason is written onto an event nobody ever receives: the same silence
+/// this field exists to break, one layer further out.
+pub(crate) fn has_guardrail_attribution(
+    audit: &GuardrailAudit,
+    monitor_hits: &[aisix_core::GuardrailMonitorHit],
+) -> bool {
+    !monitor_hits.is_empty()
+        || audit.as_ref().is_some_and(|log| {
+            !log.snapshot().is_empty()
+                || !log.score_snapshot().is_empty()
+                || log.bypass_reason().is_some()
+        })
+}
+
+/// [`guardrail_scores`] for the retrying families — see
+/// [`terminal_enforced_hits`].
+pub(crate) fn terminal_guardrail_scores(
+    terminal: bool,
+    audit: &GuardrailAudit,
+) -> Vec<aisix_core::GuardrailScore> {
+    if terminal {
+        guardrail_scores(audit)
+    } else {
+        Vec::new()
+    }
 }
 
 /// [`enforced_hits`] for the retrying families (chat / messages /
@@ -144,6 +217,13 @@ pub(crate) struct ResolvedPk<'a> {
     /// or names a row with a blank display name. Borrowed in the
     /// fallback case so the common pre-dispatch failure allocates nothing.
     name: Cow<'a, str>,
+    /// The upstream wire protocol this key dispatches through
+    /// (AISIX-Cloud#1403) — [`aisix_gateway::upstream_protocol`] of the
+    /// resolved row, [`aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN`] when
+    /// there is no row. Computed HERE rather than at the emit so it
+    /// rides along with the id and name the same row produced, on the
+    /// one snapshot read this type exists to make.
+    protocol: &'static str,
     entry: Option<Arc<ResourceEntry<ProviderKey>>>,
 }
 
@@ -169,7 +249,16 @@ impl<'a> ResolvedPk<'a> {
             }
             None => Cow::Borrowed(UNKNOWN_PK),
         };
-        Self { id, name, entry }
+        let protocol = entry
+            .as_ref()
+            .map(|e| aisix_gateway::upstream_protocol(&e.value))
+            .unwrap_or(aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN);
+        Self {
+            id,
+            name,
+            protocol,
+            entry,
+        }
     }
 
     /// A completion that never reached a ProviderKey — the pre-dispatch
@@ -180,15 +269,17 @@ impl<'a> ResolvedPk<'a> {
         ResolvedPk {
             id: "",
             name: Cow::Borrowed(UNKNOWN_PK),
+            protocol: aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN,
             entry: None,
         }
     }
 
-    /// The id + name pair for the metric label set.
+    /// The ProviderKey dimensions of the metric label set.
     pub(crate) fn labels(&self) -> PkLabels<'_> {
         PkLabels {
             id: self.id,
             name: &self.name,
+            protocol: self.protocol,
         }
     }
 
@@ -204,17 +295,19 @@ impl<'a> ResolvedPk<'a> {
     }
 }
 
-/// The ProviderKey dimensions of a metric label set: the id and the
-/// readable name that is 1:1 with it (so the pair adds no series).
+/// The ProviderKey dimensions of a metric label set: the id, the
+/// readable name, and the upstream wire protocol — all three functions
+/// of one ProviderKey row, so the trio adds no series beyond the id.
 ///
 /// The fields are private on purpose. [`ResolvedPk::labels`] and
-/// [`PkLabels::default`] are the only ways to build one, so a name can
-/// never be paired with an id it was not read off — which is the whole
-/// reason `Upstream` takes this type instead of a bare id.
+/// [`PkLabels::default`] are the only ways to build one, so a name or a
+/// protocol can never be paired with an id it was not read off — which
+/// is the whole reason `Upstream` takes this type instead of a bare id.
 #[derive(Clone, Copy)]
 pub(crate) struct PkLabels<'a> {
     id: &'a str,
     name: &'a str,
+    protocol: &'static str,
 }
 
 impl<'a> PkLabels<'a> {
@@ -225,6 +318,11 @@ impl<'a> PkLabels<'a> {
     pub(crate) fn name(self) -> &'a str {
         self.name
     }
+
+    /// The `upstream_protocol` label (AISIX-Cloud#1403).
+    pub(crate) fn protocol(self) -> &'static str {
+        self.protocol
+    }
 }
 
 impl Default for PkLabels<'_> {
@@ -232,6 +330,7 @@ impl Default for PkLabels<'_> {
         Self {
             id: UNKNOWN_PK,
             name: UNKNOWN_PK,
+            protocol: aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN,
         }
     }
 }
@@ -284,7 +383,7 @@ pub(crate) fn total_tokens_with_cache(
 /// The `model` metric label for a request whose client-supplied `model`
 /// field never resolved to a configured model (e.g. model-not-found). See
 /// [`metric_model_label`].
-pub(crate) const UNRESOLVED_MODEL_LABEL: &str = "unresolved";
+pub const UNRESOLVED_MODEL_LABEL: &str = "unresolved";
 
 /// Bound the `model` metric label to the configured set. A request's `model`
 /// field is arbitrary caller-controlled text until it resolves against the
@@ -366,18 +465,49 @@ pub(crate) fn apply_pk_telemetry(event: &mut UsageEvent, pk: &ResolvedPk<'_>) {
     event.byo_label = sanitize_tag(tags.byo_label.unwrap_or_default());
 }
 
-/// Stamp the JWT identity attribution fields onto an in-progress
-/// UsageEvent (AISIX-Cloud#564). A `None` identity (the API-key path)
-/// leaves the fields empty, which skip-serialize to wire NULL. One
-/// source of truth for the mapping so the handler family can't drift —
+/// Stamp the caller-identity attribution fields onto an in-progress
+/// UsageEvent: the JWT identity (AISIX-Cloud#564) and the org member the
+/// authenticating key belongs to (AISIX-Cloud#1389). A `None` in either
+/// argument leaves its fields empty, which skip-serialize to wire NULL.
+/// One source of truth for the mapping so the handler family can't drift —
 /// same rationale as [`apply_pk_telemetry`]. The values are sanitised
 /// like every other externally-influenced tag: the subject is a claim
 /// from a verified token, but the identity provider is still not a
 /// trusted emitter of control characters or unbounded strings.
-pub(crate) fn apply_jwt_identity(
+///
+/// `user_id` takes both halves of the auth surface: on the API-key path it
+/// is the key's own `user_id`, and on the JWT path it is the `user_id` of
+/// the key the token resolved to — a JWT request runs AS a key, so one
+/// argument covers both and the member filter sees every credential a
+/// member calls through.
+///
+/// `user_name` is that member's display name for the metric label of the
+/// same name (AISIX-Cloud#1455). It is a separate argument rather than a
+/// separate call so the compiler makes every emitting path hand over both
+/// halves of one ApiKey row: a name sourced anywhere but beside its id is
+/// a name that will eventually label the wrong member.
+pub(crate) fn apply_caller_identity(
     event: &mut UsageEvent,
     jwt: Option<&std::sync::Arc<crate::auth::JwtIdentity>>,
+    user_id: Option<&str>,
+    user_name: Option<&str>,
 ) {
+    if let Some(user_id) = user_id {
+        event.user_id = sanitize_tag(user_id.to_string());
+    }
+    if let Some(user_name) = user_name {
+        // NOT `sanitize_tag`, unlike the id above. That call exists to keep
+        // operator-typed text safe on the cp-api wire and in the log line;
+        // `user_name` reaches neither (`#[serde(skip)]`, and
+        // `log_provider_call` does not render it). Its only destination is
+        // the `user_name` metric label, which the four #890 families
+        // already stamp raw off the same ApiKey row — sanitising this one
+        // copy would make a long or odd name read differently on
+        // `aisix_usage_event*` than on `aisix_llm_*`, and break the
+        // cross-family join on the pair for exactly that member. The
+        // prometheus exporter escapes exposition characters itself.
+        event.user_name = user_name.to_string();
+    }
     let Some(jwt) = jwt else {
         return;
     };
@@ -402,17 +532,28 @@ pub(crate) fn apply_jwt_identity(
 /// `"passthrough"` for `/passthrough/...`, `"realtime"` for `/v1/realtime`,
 /// `"openai"` for the OpenAI-shaped handlers) so Logs protocol filtering sees
 /// failures and successes under the same tag.
+///
+/// A guardrail refusal reaches this function like any other failure, so
+/// `guardrail_blocked` is a REQUIRED argument rather than a default: a
+/// handler that forgets it produces a 422 the "Guardrail blocks" view
+/// cannot find, which reads to an operator as "the gateway logged no
+/// guardrail activity at all" (AISIX-Cloud#1428).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_error_usage_event(
     state: &ProxyState,
     snap: &AisixSnapshot,
-    label: &'static str,
+    surface: Surface,
     inbound_protocol: &'static str,
     request_id: &str,
     requested_model: &str,
     api_key_id: &str,
     status_code: u16,
     error_class: &str,
+    // Whether this failure IS a guardrail refusal, from
+    // [`ProxyError::is_guardrail_block`]. Every caller but the realtime
+    // connect failure — which synthesizes its class without a `ProxyError`
+    // — reads it off the error it is reporting.
+    guardrail_blocked: bool,
     client: &ClientContext,
     // The request's enforced guardrail hits. The failure path is where a
     // `blocked` hit lands — a guardrail refusal IS the error — so the
@@ -420,6 +561,17 @@ pub(crate) fn emit_error_usage_event(
     // (`enforced_hits(&audit)`) rather than taken as a handle: the jobs
     // surface accumulates across two separately resolved chains.
     enforced: Vec<aisix_core::GuardrailEnforcedHit>,
+    // The request's similarity scores (AISIX-Cloud#1467), drained the same
+    // way. A refusal by a `kind: semantic` row lands HERE, so an error
+    // event without them would leave the block — the one outcome an
+    // operator is certain to look at — as the only execution with no
+    // number attached.
+    scores: Vec<aisix_core::GuardrailScore>,
+    // The request's fail-open bypass tag, drained the same way. A request
+    // that went upstream unscreened and THEN failed is still a request
+    // that went upstream unscreened, so dropping the tag here would make
+    // the field answerable only for the requests that succeeded.
+    bypass: String,
 ) {
     let event = build_error_usage_event(
         inbound_protocol,
@@ -428,8 +580,11 @@ pub(crate) fn emit_error_usage_event(
         api_key_id,
         status_code,
         error_class,
+        guardrail_blocked,
         client,
         enforced,
+        scores,
+        bypass,
     );
     // The failed request's own attribution, off the same cell
     // `request_metrics::LastTarget` reads — so the usage-event counters and
@@ -441,7 +596,7 @@ pub(crate) fn emit_error_usage_event(
     emit_prepared_usage_event(
         state,
         snap,
-        label,
+        surface,
         event,
         usage_event_labels(&model, &pk),
         client.trace.as_ref(),
@@ -459,8 +614,13 @@ pub(crate) fn build_error_usage_event(
     api_key_id: &str,
     status_code: u16,
     error_class: &str,
+    // See [`emit_error_usage_event`].
+    guardrail_blocked: bool,
     client: &ClientContext,
     enforced: Vec<aisix_core::GuardrailEnforcedHit>,
+    scores: Vec<aisix_core::GuardrailScore>,
+    // See [`emit_error_usage_event`].
+    bypass: String,
 ) -> UsageEvent {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -472,10 +632,18 @@ pub(crate) fn build_error_usage_event(
         error_class: error_class.to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        guardrail_blocked,
         guardrail_enforced_hits: enforced,
+        guardrail_scores: scores,
+        guardrail_bypassed_reason: bypass,
         ..Default::default()
     };
-    apply_jwt_identity(&mut event, client.jwt.as_ref());
+    apply_caller_identity(
+        &mut event,
+        client.jwt.as_ref(),
+        client.caller.user_id.as_deref(),
+        client.caller.user_name.as_deref(),
+    );
     event
 }
 
@@ -500,8 +668,8 @@ pub(crate) fn usage_event_model_label<'a>(
 /// Pair that label with the ProviderKey the event is attributed to.
 ///
 /// Takes the resolved key rather than an id for the same reason
-/// `request_metrics::Upstream` does: the readable name can only come off
-/// the row its id names.
+/// `request_metrics::Upstream` does: the readable name and the upstream
+/// protocol can only come off the row its id names.
 pub(crate) fn usage_event_labels<'a>(
     model: &'a str,
     pk: &'a ResolvedPk<'_>,
@@ -519,13 +687,22 @@ pub(crate) fn usage_event_labels<'a>(
             labels.id()
         },
         provider_key_name: labels.name(),
+        // Both overwritten by `UsageSink::try_emit` from the event's own
+        // member pair (AISIX-Cloud#1389, #1455) — one place, so no handler
+        // in this family can build a label set that disagrees with the row.
+        user_id: "unknown",
+        user_name: "unknown",
+        // Same `PkLabels` the request families read (AISIX-Cloud#1403), so
+        // `aisix_usage_events_emitted_total` joins with them on
+        // `upstream_protocol` instead of dropping out of the aggregation.
+        upstream_protocol: labels.protocol(),
     }
 }
 
 pub(crate) fn emit_prepared_usage_event(
     state: &ProxyState,
     snap: &AisixSnapshot,
-    label: &'static str,
+    surface: Surface,
     event: UsageEvent,
     labels: UsageEventLabels<'_>,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
@@ -534,7 +711,9 @@ pub(crate) fn emit_prepared_usage_event(
     // builder leaves `upstream_latency_ms` at 0, so no upstream span is
     // derivable either way — `dispatched: false` states the common case
     // (most error events never reached a provider).
-    emit_usage(state, snap, label, event, labels, None, trace, true, false);
+    emit_usage(
+        state, snap, surface, event, labels, None, trace, true, false,
+    );
 }
 
 /// THE emission chokepoint (AISIX-Cloud#1279): every usage event leaves
@@ -555,7 +734,7 @@ pub(crate) fn emit_prepared_usage_event(
 pub(crate) fn emit_usage(
     state: &ProxyState,
     snap: &AisixSnapshot,
-    label: &'static str,
+    surface: Surface,
     mut event: UsageEvent,
     labels: UsageEventLabels<'_>,
     content: Option<&aisix_obs::CapturedContent>,
@@ -563,6 +742,40 @@ pub(crate) fn emit_usage(
     terminal: bool,
     dispatched: bool,
 ) {
+    // Stamped here rather than at each construction site: this is the one
+    // point every usage event passes through, so the operation cannot be
+    // present on a family's success path and missing from its error or
+    // streaming one (AISIX-Cloud#1461).
+    event.operation = surface.operation.to_string();
+    // Same reasoning, for the other shape of a caller walking away
+    // (AISIX-Cloud#1571). A stream the consumer abandoned is reported as
+    // 499 by six different families, each through its own emit helper and
+    // none of them naming the outcome; a head-phase cancel names it
+    // explicitly and would otherwise be the only 499 an operator could
+    // filter on. Filling it only when the class is still empty keeps this
+    // from overwriting a more specific one, and leaves the head-phase
+    // event's own message alone.
+    if event.status_code == crate::CLIENT_CLOSED_REQUEST && event.error_class.is_empty() {
+        event.error_class = crate::CLIENT_DISCONNECTED_KIND.to_string();
+        event.error_message = crate::cancel::CANCELLED_MID_STREAM.to_string();
+    }
+    // The request's access-log line, for the families that deferred it to
+    // their stream (AISIX-Cloud#1571). Here, and after the stamping above,
+    // so the line and the event cannot disagree about the outcome: one
+    // status, one error class, one message, whichever of a stream's three
+    // endings this is. A request that wrote its line inline — everything
+    // non-streamed — parked nothing, and this is a no-op for it.
+    if terminal {
+        crate::attribution::emit_deferred_access_log(&event);
+    }
+    // Request-level guardrail blocks are recorded from the terminal event,
+    // not from an individual timed execution. Some fail-closed paths (for
+    // example a streamed-output buffer overflow) reject before a guardrail
+    // member runs, while retries and ensembles can emit several non-terminal
+    // events for one request.
+    if terminal && event.guardrail_blocked {
+        state.metrics.record_guardrail_blocked_request();
+    }
     let emission = trace.map(|bundle| {
         event.trace_id = bundle.trace_id_hex();
         bundle.emission(
@@ -572,7 +785,14 @@ pub(crate) fn emit_usage(
             dispatched,
         )
     });
-    state.usage_sink.try_emit(label, event.clone(), labels);
+    // Tell the request's own cell that an event has gone out, so a cancel
+    // landing in the moments after cannot double it (AISIX-Cloud#1571). A
+    // no-op outside a request scope, which is where the detached stream
+    // emitters and the cancel guard itself both run.
+    crate::attribution::note_usage_emitted(terminal);
+    state
+        .usage_sink
+        .try_emit(surface.handler, event.clone(), labels);
     let exporters = live_exporters(state, snap);
     state.otlp_fan_out.fan_out(
         &event,
@@ -585,6 +805,46 @@ pub(crate) fn emit_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn similarity_score_alone_requires_a_zero_token_event() {
+        let log = Arc::new(aisix_guardrails::GuardrailAuditLog::new());
+        let audit = Some(Arc::clone(&log));
+        assert!(!has_guardrail_attribution(&audit, &[]));
+
+        log.record_score(aisix_core::GuardrailScore {
+            guardrail_name: "semantic-policy".into(),
+            hook: "input".into(),
+            direction: "deny".into(),
+            score: 0.7,
+            threshold: 0.8,
+            matched: false,
+            top_example_index: 0,
+            embedding_model: "embedder".into(),
+        });
+        assert!(has_guardrail_attribution(&audit, &[]));
+    }
+
+    /// A bypass leaves no enforced hit and no score — it is the outcome
+    /// where no policy acted — so it has to be named here explicitly.
+    /// Without it, the unbilled paths that consult this gate
+    /// (`/v1/completions`, `/v1/embeddings`, `/v1/images/*`, `/v1/rerank`)
+    /// suppress the whole event, and the reason lands on a row nobody
+    /// receives.
+    #[test]
+    fn a_bypass_alone_requires_a_zero_token_event() {
+        let log = Arc::new(aisix_guardrails::GuardrailAuditLog::new());
+        let audit = Some(Arc::clone(&log));
+        assert!(!has_guardrail_attribution(&audit, &[]));
+
+        log.record_bypass("lakera_timeout");
+        assert!(
+            log.snapshot().is_empty() && log.score_snapshot().is_empty(),
+            "premise: a bypass is not an enforced hit and not a score, so the \
+             other two arms of this gate cannot be what carries it",
+        );
+        assert!(has_guardrail_attribution(&audit, &[]));
+    }
 
     #[test]
     fn metric_model_label_three_outcomes() {
@@ -706,10 +966,75 @@ mod tests {
             ResolvedPk::resolve(&snap, PK_ID),
         ] {
             assert_eq!(pk.labels().name, "unknown");
+            // AISIX-Cloud#1403: same fallback, same reason — a request
+            // that reached no key reached no protocol either.
+            assert_eq!(pk.labels().protocol, "unknown");
             assert_eq!(pk.telemetry_tags(), aisix_core::TelemetryTags::default());
         }
         assert_eq!(PkLabels::default().id, "unknown");
         assert_eq!(PkLabels::default().name, "unknown");
+        assert_eq!(PkLabels::default().protocol, "unknown");
+    }
+
+    /// AISIX-Cloud#1403: the protocol is read off the SAME row as the id
+    /// and the name, on the one lookup this type exists to make, so the
+    /// three can never describe different keys.
+    #[test]
+    fn resolved_key_carries_its_upstream_protocol() {
+        let snap = snap_with_pk("prod-openai", "");
+        let pk = ResolvedPk::resolve(&snap, PK_ID);
+        assert_eq!(pk.labels().id, PK_ID);
+        assert_eq!(pk.labels().protocol, "openai");
+
+        // A key whose vendor has no specialized bridge takes its
+        // adapter's wire value.
+        let json = r#"{"display_name":"byo-anthropic","secret":"sk","provider":"byo","adapter":"anthropic"}"#;
+        let byo: ProviderKey = serde_json::from_str(json).unwrap();
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, byo, 1));
+        assert_eq!(
+            ResolvedPk::resolve(&snap, PK_ID).labels().protocol,
+            "anthropic",
+            "an open vendor string cannot stand in for the adapter"
+        );
+    }
+
+    /// …and the usage-event counter's label set is built off that same
+    /// resolved key, so `aisix_usage_events_emitted_total` reports the
+    /// protocol of the key its `provider_key_id` names.
+    ///
+    /// It was the one family carrying `inbound_protocol` that had the
+    /// value in hand and did not emit it (found in 0.11.0-rc.2 QA), which
+    /// left it unjoinable with the families that did:
+    /// `sum by (upstream_protocol)` returned an aggregate with this
+    /// counter silently missing from it.
+    #[test]
+    fn usage_event_labels_carry_the_resolved_upstream_protocol() {
+        let snap = snap_with_pk("prod-openai", "");
+        let pk = ResolvedPk::resolve(&snap, PK_ID);
+        let labels = usage_event_labels("gpt-4o", &pk);
+        assert_eq!(labels.provider_key_id, PK_ID);
+        assert_eq!(labels.provider_key_name, "prod-openai");
+        // The UPSTREAM's protocol. An Anthropic-protocol caller served by
+        // this key must still read `openai` here — the inbound protocol
+        // travels on its own label.
+        assert_eq!(labels.upstream_protocol, "openai");
+
+        // Nothing resolved: `unknown`, matching the id/name fallback
+        // beside it and the value the request families use for a
+        // pre-dispatch rejection.
+        let unresolved = ResolvedPk::unresolved();
+        let labels = usage_event_labels("unknown", &unresolved);
+        assert_eq!(labels.provider_key_id, UNKNOWN_PK);
+        assert_eq!(labels.upstream_protocol, "unknown");
+
+        // A deleted id keeps reaching the label verbatim, but there is no
+        // row left to read a protocol off.
+        let empty = AisixSnapshot::new();
+        let gone = ResolvedPk::resolve(&empty, "pk-deleted");
+        let labels = usage_event_labels("gpt-4o", &gone);
+        assert_eq!(labels.provider_key_id, "pk-deleted");
+        assert_eq!(labels.upstream_protocol, "unknown");
     }
 
     /// The id reaches the label verbatim even when it resolves to nothing —
@@ -763,5 +1088,302 @@ mod tests {
 
         let snap = snap_with_pk("\u{1}\u{2}", "");
         assert_eq!(ResolvedPk::resolve(&snap, PK_ID).labels().name, "unknown");
+    }
+
+    /// Every `UsageEvent` this crate builds must set
+    /// `guardrail_bypassed_reason`, and an emitter that genuinely has no
+    /// chain behind it must say so where it is written.
+    ///
+    /// The field defaults to empty, so an emitter that forgets it reports
+    /// "nothing was bypassed" for a request that went upstream unscreened —
+    /// and no behavioural test can see the omission, because an unset field
+    /// and a screened request produce the same row. That is exactly how the
+    /// field spent its whole life written on `/v1/chat/completions` and
+    /// nowhere else.
+    ///
+    /// A parse of the source rather than a list of emitters, for the reason
+    /// `guardrail_coverage` parses the router instead of listing routes: a
+    /// hand-written list nobody updates agrees with itself forever, and the
+    /// emitter family here has sixteen members that keep gaining a
+    /// seventeenth.
+    #[test]
+    fn every_usage_event_this_crate_builds_answers_the_bypass_question() {
+        /// Written inside an emitter that has no guardrail chain behind it
+        /// at all, followed by why.
+        const EXEMPT: &str = "NO-GUARDRAIL-CHAIN:";
+
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut blocks = 0usize;
+        let mut missing = Vec::new();
+
+        // Recursive: `src/` is flat today, and a refactor that moved a
+        // handler into a subdirectory would otherwise take its emitter out
+        // of scope while this still reported green.
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let entries = std::fs::read_dir(dir).expect("the crate's own src/ must be readable");
+            for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        rs_files(&src_dir, &mut files);
+        files.sort();
+
+        for path in files {
+            let src = std::fs::read_to_string(&path).expect("source must read");
+            let name = path
+                .strip_prefix(&src_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            let code = code_mask(&src);
+            for (idx, _) in src.match_indices("UsageEvent {") {
+                // Skip anything that is not Rust code: this file writes the
+                // token it searches for in a string literal and in a
+                // comment, and both would otherwise be counted as emitters
+                // — a check inflating its own coverage.
+                if !code[idx] {
+                    continue;
+                }
+                // `-> UsageEvent {` (optionally path-qualified) is a
+                // return type followed by a function body, not a literal.
+                let before = src[..idx]
+                    .trim_end()
+                    .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
+                    .trim_end();
+                if before.ends_with("->") {
+                    continue;
+                }
+                let open = idx + "UsageEvent ".len();
+                let Some(block) = braced_block(&src, &code, open) else {
+                    panic!("{name}: unbalanced UsageEvent literal at byte {idx}");
+                };
+                blocks += 1;
+                if !sets_bypass_reason(block) && !block.contains(EXEMPT) {
+                    let line = src[..idx].lines().count();
+                    missing.push(format!("{name}:{line}"));
+                }
+            }
+        }
+
+        // The parse must actually find the emitters, not silently yield an
+        // empty set that makes the assertion below vacuous.
+        // The crate's real count. A floor rather than an equality so
+        // adding an emitter does not fail here (the `missing` check
+        // already governs a new one) — but losing four to a parse that
+        // quietly stopped matching is the drift this exists to catch.
+        assert!(
+            blocks >= 18,
+            "the UsageEvent literal scan found only {blocks} — it has stopped tracking the \
+             emitter family",
+        );
+        assert!(
+            missing.is_empty(),
+            "these UsageEvent emitters neither set guardrail_bypassed_reason nor carry a \
+             `{EXEMPT} <why>` comment saying they have no guardrail chain: {missing:?}\n\
+             An unset field reports a screened request, so an emitter that skips it makes the \
+             field unusable as a negative answer.",
+        );
+    }
+
+    /// A byte mask over `src` marking the bytes that are Rust CODE —
+    /// false inside string literals (raw ones included), char literals,
+    /// line comments and nestable block comments.
+    ///
+    /// A real lexer pass rather than a per-line heuristic. The heuristic
+    /// this replaces judged a match by whether its line prefix held a `//`
+    /// or an odd number of quotes, which gets two things wrong that occur
+    /// in ordinary code: a literal after a completed string on the same
+    /// line (`let u = "https://x"; ... UsageEvent {`) reads as commented
+    /// out, and an escaped quote miscounts the parity.
+    fn code_mask(src: &str) -> Vec<bool> {
+        #[derive(Clone, Copy)]
+        enum St {
+            Code,
+            Str,
+            Raw(usize),
+            Char,
+            Line,
+            Block(usize),
+        }
+        let b = src.as_bytes();
+        let mut mask = vec![false; b.len()];
+        let mut st = St::Code;
+        let mut i = 0;
+        while i < b.len() {
+            match st {
+                St::Code => {
+                    mask[i] = true;
+                    match b[i] {
+                        b'/' if b.get(i + 1) == Some(&b'/') => {
+                            st = St::Line;
+                            mask[i] = false;
+                        }
+                        b'/' if b.get(i + 1) == Some(&b'*') => {
+                            st = St::Block(1);
+                            mask[i] = false;
+                            i += 2;
+                            continue;
+                        }
+                        b'"' => st = St::Str,
+                        // A char literal is `'x'` or `'\\n'`; anything
+                        // else starting with a quote is a LIFETIME
+                        // (`&'a str`), and treating one as a literal
+                        // swallows every byte up to the next apostrophe.
+                        b'\'' if b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\'') => {
+                            st = St::Char
+                        }
+                        b'r' => {
+                            // `r"…"` / `r#"…"#`, but not an identifier
+                            // ending in `r`, and not a lifetime.
+                            let prev_ident =
+                                i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+                            let mut j = i + 1;
+                            while b.get(j) == Some(&b'#') {
+                                j += 1;
+                            }
+                            if !prev_ident && b.get(j) == Some(&b'"') {
+                                st = St::Raw(j - i - 1);
+                                i = j + 1;
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                St::Str => {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'"' {
+                        st = St::Code;
+                    }
+                }
+                St::Raw(hashes) => {
+                    if b[i] == b'"' && b[i + 1..].iter().take(hashes).all(|c| *c == b'#') {
+                        st = St::Code;
+                        i += hashes + 1;
+                        continue;
+                    }
+                }
+                St::Char => {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'\'' {
+                        st = St::Code;
+                    }
+                }
+                St::Line => {
+                    if b[i] == b'\n' {
+                        st = St::Code;
+                    }
+                }
+                St::Block(depth) => {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        st = St::Block(depth + 1);
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        st = if depth == 1 {
+                            St::Code
+                        } else {
+                            St::Block(depth - 1)
+                        };
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+        mask
+    }
+
+    /// Whether an emitter block ASSIGNS the field, rather than merely
+    /// mentioning it.
+    ///
+    /// `block.contains("guardrail_bypassed_reason")` would be satisfied by
+    /// a comment, and by `guardrail_bypassed_reason: String::new()` — which
+    /// is exactly the shape of a reverted fix, so the check would have been
+    /// unfalsifiable in the one dimension it is here to guard.
+    fn sets_bypass_reason(block: &str) -> bool {
+        let Some(at) = block.find("guardrail_bypassed_reason") else {
+            return false;
+        };
+        let rest = &block[at + "guardrail_bypassed_reason".len()..];
+        // Field-init shorthand (`guardrail_bypassed_reason,`) takes its
+        // value from a binding, which cannot be an inline empty literal.
+        let Some(rest) = rest.strip_prefix(':') else {
+            return rest.starts_with(',');
+        };
+        // Values run to the end of their line, except the one that wraps
+        // onto continuation lines — whose first line is a receiver, which
+        // is non-empty and passes for the right reason.
+        let value = rest
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(',')
+            .trim();
+        !matches!(
+            value,
+            "" | "\"\"" | "String::new()" | "String::default()" | "Default::default()"
+        )
+    }
+
+    /// The `{ … }` at `open`, skipping braces the mask says are not code.
+    fn braced_block<'a>(src: &'a str, code: &[bool], open: usize) -> Option<&'a str> {
+        let b = src.as_bytes();
+        assert_eq!(b[open], b'{');
+        let mut depth = 0usize;
+        for i in open..b.len() {
+            if !code[i] {
+                continue;
+            }
+            match b[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&src[open..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The mask is load-bearing for the guard above, so it is pinned
+    /// directly: every one of these would be a false positive or a false
+    /// negative under the line-prefix heuristic it replaces.
+    #[test]
+    fn the_code_mask_excludes_strings_comments_and_raw_strings() {
+        let at = |src: &str, needle: &str| {
+            let m = code_mask(src);
+            m[src.find(needle).expect("needle must appear")]
+        };
+        assert!(at("let x = 1; UsageEvent {}", "UsageEvent"));
+        assert!(!at("let s = \"UsageEvent {\";", "UsageEvent"));
+        assert!(!at("// UsageEvent {", "UsageEvent"));
+        assert!(!at("/* a /* b */ UsageEvent */", "UsageEvent"));
+        assert!(!at("let s = r#\"UsageEvent {\"#;", "UsageEvent"));
+        // The two the heuristic got wrong: a completed string earlier on
+        // the line, and an escaped quote inside one.
+        assert!(at("let u = \"https://x\"; UsageEvent {}", "UsageEvent"));
+        assert!(at("let e = \"a\\\"b\"; UsageEvent {}", "UsageEvent"));
+        // A char literal must not open a string, and an identifier ending
+        // in `r` must not open a raw string.
+        assert!(at("let c = '\"'; UsageEvent {}", "UsageEvent"));
+        assert!(at("let var = 1; UsageEvent {}", "UsageEvent"));
     }
 }

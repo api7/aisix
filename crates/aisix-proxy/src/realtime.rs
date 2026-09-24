@@ -4,6 +4,9 @@
 //! Authenticates on connect, resolves the target Model from `?model=`,
 //! opens the provider WebSocket and relays frames bidirectionally.
 //!
+//! The relay is verbatim with one exception, `session.model` — see
+//! [`restamp_session_model_out`] and its mirror.
+//!
 //! ## Protocol scope
 //!
 //! v1 relays the **OpenAI Realtime wire protocol**: adapter `openai`
@@ -14,6 +17,14 @@
 //! cross-protocol translation layer (LiteLLM ships those as dedicated
 //! per-provider `transform_realtime_request/response` modules) — that is
 //! a separate feature, not part of this endpoint.
+//!
+//! OpenAI's Realtime API is GA and its GA endpoint **rejects**
+//! `openai-beta: realtime=v1` (`beta_api_shape_disabled`), so the
+//! gateway does not send it on its own. Beta and GA use different event
+//! vocabularies, so the opt-in belongs to the caller that parses those
+//! events: a client that sends the beta opt-in — as the `openai-beta`
+//! header, or as the `openai-beta.realtime-v1` subprotocol item that the
+//! browser flow uses — has it forwarded upstream, and nothing else does.
 //!
 //! ## Auth
 //!
@@ -29,6 +40,16 @@
 //! Auth/ACL/quota failures reject the HTTP upgrade itself (401/403/429
 //! envelope) rather than accept-then-close-1008: same enforcement point,
 //! observable to every WS client as a failed handshake.
+//!
+//! ## Forwarded client headers
+//!
+//! The ProviderKey's `request.forward_client_headers` applies here as on
+//! every other `/v1/*` face: the named headers ride the upstream
+//! handshake, and a named credential slot displaces the ProviderKey's own
+//! rather than joining it. The handshake slots this surface owns are the
+//! one addition to the shared refusals — see [`REALTIME_HANDSHAKE_SLOTS`].
+//! `request.default_headers` is a separate feature that this face has
+//! never applied.
 //!
 //! ## Usage
 //!
@@ -65,8 +86,82 @@ const AZURE_REALTIME_API_VERSION: &str = "2024-10-01-preview";
 /// Subprotocol item carrying the caller's API key in the browser flow.
 const SUBPROTOCOL_KEY_PREFIX: &str = "openai-insecure-api-key.";
 
+/// Header value by which a client opts into the legacy beta event shape.
+const HEADER_BETA_VALUE: &str = "realtime=v1";
+
+/// Subprotocol item by which a browser client opts into the legacy beta
+/// event shape (a subprotocol token cannot contain `=`, so the header's
+/// `realtime=v1` is spelled `realtime-v1` here).
+const SUBPROTOCOL_BETA_ITEM: &str = "openai-beta.realtime-v1";
+
+/// Handshake slots this surface owns, refused to `forward_client_headers`
+/// on top of the shared lists.
+///
+/// Every other `/v1/*` face rebuilds an HTTP request; this one performs a
+/// second WebSocket handshake, and these headers describe the handshake
+/// the CALLER made rather than the request's content.
+///
+/// `sec-websocket-protocol` is the dangerous one: the documented browser
+/// flow puts the caller's own AISIX key in it
+/// (`openai-insecure-api-key.<key>`), so relaying it would hand the
+/// provider the credential this gateway authenticates with. It also
+/// selects the subprotocol the gateway echoes back to the client, which
+/// is the gateway's answer to make, not the upstream's. Nothing else
+/// declines it — the outbound handshake does not carry one, so a matching
+/// pattern would insert the caller's list verbatim. `-extensions` is the
+/// same shape and enables a compression the gateway's own codec never
+/// negotiated.
+///
+/// `sec-websocket-key` and `-version` are listed for completeness rather
+/// than because they are reachable today: the outbound request already
+/// carries both, and a non-credential name already present is declined on
+/// delivery. Naming them here keeps that from being the only thing
+/// standing between a caller's key and the accept value computed from it.
+const REALTIME_HANDSHAKE_SLOTS: &[&str] = &[
+    "sec-websocket-accept",
+    "sec-websocket-extensions",
+    "sec-websocket-key",
+    "sec-websocket-protocol",
+    "sec-websocket-version",
+];
+
+/// Is `needle` one of the comma-separated items across every value of
+/// `name`? Both headers are list-valued and may repeat, so a first-value
+/// substring test would both miss a repeat and accept `realtime=v10`.
+fn header_list_has(headers: &HeaderMap, name: &str, needle: &str) -> bool {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|item| item.trim().eq_ignore_ascii_case(needle))
+}
+
+/// Did the caller ask for the legacy beta Realtime shape?
+///
+/// OpenAI's beta and GA Realtime APIs use different event vocabularies,
+/// so the opt-in belongs to the client that has to parse those events —
+/// not to us. We forward `openai-beta: realtime=v1` upstream only when
+/// the caller sent the same opt-in, via either channel it has: the
+/// header (server-side clients) or the `sec-websocket-protocol` item
+/// (browser clients, which cannot set headers).
+fn client_requested_beta_realtime(headers: &HeaderMap) -> bool {
+    header_list_has(headers, "openai-beta", HEADER_BETA_VALUE)
+        || header_list_has(headers, "sec-websocket-protocol", SUBPROTOCOL_BETA_ITEM)
+}
+
+type UpstreamDial = Result<
+    (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tokio_tungstenite::tungstenite::Error,
+>;
+
 /// Dial the upstream Realtime endpoint under the deployment's outbound
-/// TLS trust.
+/// TLS trust, on the deployment's connect budget.
 ///
 /// `connect_async` would build its own connector over the compiled-in
 /// root set only, which leaves this the one upstream path that ignores
@@ -75,18 +170,47 @@ const SUBPROTOCOL_KEY_PREFIX: &str = "openai-insecure-api-key.";
 /// provider's `/v1/chat/completions` worked.
 async fn connect_upstream(
     request: tokio_tungstenite::tungstenite::handshake::client::Request,
-) -> Result<
-    (
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        tokio_tungstenite::tungstenite::handshake::client::Response,
-    ),
-    tokio_tungstenite::tungstenite::Error,
-> {
+) -> UpstreamDial {
+    connect_upstream_within(
+        aisix_gateway::upstream_http::config().connect_timeout,
+        request,
+    )
+    .await
+}
+
+/// The dial itself, budget passed in so a test can use one far shorter
+/// than the deployment default.
+///
+/// The budget covers the WHOLE dial — DNS, TCP, TLS *and* the WebSocket
+/// handshake exchange — where the HTTP routes' `connect_timeout` stops
+/// at the end of TLS. tokio-tungstenite exposes no seam between those
+/// phases, and the extra phase is the one that matters most here: an
+/// upstream that completes TLS and then never answers the upgrade is as
+/// stuck as one that never answers the SYN, and nothing downstream
+/// bounds it — the session's idle deadline only starts once the socket
+/// is up. Left unbounded the upgrade hangs until the kernel exhausts its
+/// SYN retries, minutes after every other route would have failed.
+async fn connect_upstream_within(
+    budget: Option<Duration>,
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+) -> UpstreamDial {
     let connector =
         tokio_tungstenite::Connector::Rustls(aisix_gateway::upstream_tls::rustls_client_config());
-    tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector)).await
+    let dial =
+        tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector));
+    let Some(budget) = budget else {
+        return dial.await;
+    };
+    tokio::time::timeout(budget, dial)
+        .await
+        .unwrap_or_else(|_| {
+            Err(tokio_tungstenite::tungstenite::Error::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("upstream connect exceeded upstream.connect_timeout ({budget:?})"),
+                ),
+            ))
+        })
 }
 
 pub(crate) async fn realtime(
@@ -126,7 +250,7 @@ pub(crate) async fn realtime(
                 // auth extractor; do the same here so the session clone
                 // and the error emits below attribute the JWT identity.
                 client.jwt = auth.jwt.clone();
-                prepare(&state, &snapshot, &params, &client, auth.clone())
+                prepare(&state, &snapshot, &params, &headers, &client, auth.clone())
                     .await
                     .map(|prep| (ws, prep))
                     .map_err(|err| (Some(auth), err))
@@ -193,17 +317,21 @@ pub(crate) async fn realtime(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
-                "realtime",
+                crate::operation::REALTIME,
                 "realtime",
                 &request_id,
                 params.get("model").map(String::as_str).unwrap_or(""),
                 api_key_id.unwrap_or(""),
                 status,
                 err.kind(),
+                err.is_guardrail_block(),
                 &client,
                 // Refused before the handshake, so no chain was ever
-                // resolved and no guardrail can have enforced anything.
+                // resolved and no guardrail can have enforced anything —
+                // nor scored anything, nor been bypassed.
                 Vec::new(),
+                Vec::new(),
+                String::new(),
             );
             err.into_response()
         }
@@ -218,6 +346,9 @@ struct Prepared {
     upstream_request: tokio_tungstenite::tungstenite::handshake::client::Request,
     reservation: aisix_ratelimit::MultiReservation,
     requested_model: String,
+    /// Provider-side model id the upstream session was opened with. Only
+    /// [`restamp_session_model_in`] reads it — see there for why.
+    upstream_model: String,
     provider_label: String,
 }
 
@@ -225,9 +356,11 @@ async fn prepare(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     params: &HashMap<String, String>,
+    headers: &HeaderMap,
     client: &ClientContext,
     auth: AuthenticatedKey,
 ) -> Result<Prepared, ProxyError> {
+    let beta_realtime = client_requested_beta_realtime(headers);
     let requested_model = params
         .get("model")
         .map(String::as_str)
@@ -242,7 +375,7 @@ async fn prepare(
 
     let model_entry = crate::model_resolve::resolve_model(snapshot, &requested_model)
         .ok_or_else(|| ProxyError::ModelNotFound(format!("model {requested_model:?} not found")))?;
-    if !auth.key().can_access(&requested_model) {
+    if !auth.key().can_access(snapshot, &requested_model) {
         return Err(ProxyError::ModelForbidden(format!(
             "api key is not authorized for model {requested_model:?}"
         )));
@@ -259,7 +392,31 @@ async fn prepare(
     let secret = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
-    let upstream_request = match pk_entry.value.adapter {
+    // The ProviderKey's `request.forward_client_headers`, resolved against
+    // the caller's own handshake. This face builds its upstream request by
+    // hand instead of through the shared bridge pipeline, which is exactly
+    // where a per-request mechanism goes silently missing — an operator
+    // who declared that this upstream reads the caller's credential got it
+    // on every other `/v1/*` endpoint and not here.
+    let mut forwarded = aisix_gateway::ForwardedClientHeaders::resolve(
+        &aisix_gateway::UpstreamHeaderContext::from_overrides(pk_entry.value.request.as_ref())
+            .with_client_headers(headers)
+            .with_surface_blocked(REALTIME_HANDSHAKE_SLOTS),
+    );
+    // The WebSocket client renders the handshake as text and refuses a
+    // header value it cannot read as a string, failing the whole upstream
+    // connection. Dropping the entry keeps a caller who sent one obs-text
+    // byte from being unable to open a session at all — on every other
+    // face the same header is forwarded byte-for-byte.
+    let dropped = forwarded.drop_non_ascii_values();
+    if dropped > 0 {
+        tracing::debug!(
+            dropped,
+            "forwarded client headers with non-ASCII values are not sent on a realtime handshake"
+        );
+    }
+
+    let mut upstream_request = match pk_entry.value.adapter {
         Some(Adapter::Openai) => {
             let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
             let url = crate::dispatch::build_openai_url(&base, "/realtime");
@@ -277,10 +434,16 @@ async fn prepare(
                     ProxyError::InvalidRequest("provider secret is not header-safe".into())
                 })?,
             );
-            // LiteLLM parity (OpenAIRealtime.async_realtime): the beta
-            // header is sent unconditionally; GA endpoints ignore it.
-            req.headers_mut()
-                .insert("openai-beta", "realtime=v1".parse().unwrap());
+            // Only when the CALLER opted into the legacy beta shape.
+            // OpenAI's GA `/v1/realtime` rejects the header outright
+            // (`beta_api_shape_disabled`) and closes the session, so
+            // sending it unconditionally broke every GA connection.
+            // LiteLLM parity (OpenAIRealtime._get_additional_headers):
+            // forward it iff the client asked for it.
+            if beta_realtime {
+                req.headers_mut()
+                    .insert("openai-beta", "realtime=v1".parse().unwrap());
+            }
             req
         }
         Some(Adapter::AzureOpenai) => {
@@ -323,6 +486,13 @@ async fn prepare(
             )));
         }
     };
+    // AFTER the per-adapter build, which is what lets a credential slot
+    // the operator named displace the ProviderKey's own — the ordering
+    // `apply` documents and every other face follows. It leaves any other
+    // header the arms above set alone: those select how the exchange
+    // works, not who it is from.
+    forwarded.apply(upstream_request.headers_mut());
+
     let reservation = crate::quota::enforce(
         state,
         snapshot,
@@ -343,6 +513,7 @@ async fn prepare(
         upstream_request,
         reservation,
         requested_model,
+        upstream_model,
         provider_label,
     })
 }
@@ -378,8 +549,11 @@ async fn authenticate(
         }
         return crate::auth::authenticate_token(state, token, ctx).await;
     }
-    if let Some(proto) = headers.get("sec-websocket-protocol") {
-        let s = proto.to_str().map_err(|_| ProxyError::MissingAuth)?;
+    // List-valued and splittable across repeated fields, like the beta
+    // opt-in above: reading only the first field 401s a caller whose
+    // credential rides a later one.
+    for proto in headers.get_all("sec-websocket-protocol").iter() {
+        let Ok(s) = proto.to_str() else { continue };
         for item in s.split(',') {
             if let Some(token) = item.trim().strip_prefix(SUBPROTOCOL_KEY_PREFIX) {
                 if !token.is_empty() {
@@ -417,6 +591,85 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Restamp `session.model` on its way DOWN to the client.
+///
+/// `session.created` and `session.updated` are the only Realtime server
+/// events that name a model, and they name the one the provider is running —
+/// so a caller who connected with a gateway alias was told a different name
+/// than the one they addressed. That is the `model_echo` contract, applied on
+/// this surface (#1088).
+///
+/// A frame that names no model, or that the splice scanner refuses, is
+/// returned unchanged.
+fn restamp_session_model_out(text: String, client_facing_model: &str) -> String {
+    splice_or_keep(text, |bytes| {
+        crate::model_echo::restamp_json_bytes(
+            bytes,
+            client_facing_model,
+            crate::model_echo::realtime_session_model,
+        )
+    })
+}
+
+/// Translate `session.model` back on its way UP to the provider.
+///
+/// The mirror of [`restamp_session_model_out`], and it exists because of it.
+/// Realtime clients routinely take the `session` object the gateway just
+/// handed them, change one field and send the whole thing back as
+/// `session.update` — which now carries the gateway's alias where it used to
+/// carry the provider's own id. Only that alias is translated; a client that
+/// names anything else reaches the provider with its own words, and gets the
+/// provider's own answer about it.
+///
+/// Forwarding those other values verbatim is what this relay has always
+/// done, and this function does not change it — but note what it is and is
+/// not. The upstream session's model is fixed by the connect-time query
+/// parameter, and the Realtime protocol documents `model` as one of the two
+/// fields `session.update` cannot change, so a provider that follows the
+/// spec ignores whatever a client puts there. That is the PROVIDER's
+/// guarantee, not one the gateway enforces: against a permissive
+/// OpenAI-compatible server that did honour it, a caller could name a model
+/// the gateway attributed nothing to. Pre-existing either way, and out of
+/// scope here — do not read the passthrough as a check.
+fn restamp_session_model_in(
+    text: String,
+    client_facing_model: &str,
+    upstream_model: &str,
+) -> String {
+    splice_or_keep(text, |bytes| {
+        crate::model_echo::splice_model_value(
+            bytes,
+            crate::model_echo::realtime_session_model,
+            |named| (named == client_facing_model).then(|| upstream_model.to_string()),
+        )
+    })
+}
+
+/// Run a splice over one WebSocket text frame, keeping the original string
+/// whenever there is nothing to rewrite.
+///
+/// The fast path matters: every audio delta is a text frame, and only two
+/// event types in the protocol carry a session at all.
+///
+/// It tests for a backslash as well as for the literal key, and that second
+/// condition is what makes it safe rather than merely quick. JSON lets a key
+/// be spelled with escapes, so `session` can also arrive as
+/// `\u0073ession` — the splice walker decodes keys and would match it, but a
+/// fast path looking only for the literal spelling would have skipped the
+/// frame before the walker ever saw it. An escape needs a backslash, so a
+/// frame carrying neither cannot name `session` at all, and skipping it is
+/// sound. (An audio delta is base64, which has no backslash, so the cheap
+/// case stays cheap.)
+fn splice_or_keep(text: String, splice: impl FnOnce(&[u8]) -> Option<Vec<u8>>) -> String {
+    if !text.contains("\"session\"") && !text.contains('\\') {
+        return text;
+    }
+    match splice(text.as_bytes()).map(String::from_utf8) {
+        Some(Ok(rewritten)) => rewritten,
+        _ => text,
+    }
 }
 
 /// Accumulated session usage harvested from upstream frames.
@@ -479,6 +732,7 @@ async fn run_session(
         upstream_request,
         reservation,
         requested_model,
+        upstream_model,
         provider_label,
     } = prep;
 
@@ -536,18 +790,55 @@ async fn run_session(
                 Some((&provider_label, &requested_model)),
                 Some(&connect_err),
             );
+            // One load shared by the ProviderKey resolution below and the
+            // usage event, like the session's own terminal path (#941) —
+            // and, as there, not by `request_metrics::record`, which takes
+            // its own for the model-label collapse.
+            let snap = state.snapshot.load();
+            // Count the failure like the session that did open, and like
+            // every pre-dispatch rejection above — logs and the
+            // request-rate metrics must not disagree about whether these
+            // requests exist. Attribution is fully resolved here: `prepare`
+            // has already picked the model and the ProviderKey, so this
+            // carries the same labels a successful session would, not the
+            // `unknown` placeholders of a path that never selected a
+            // target.
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &pk_id);
+            crate::request_metrics::record(
+                &state,
+                "/v1/realtime",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &provider_label,
+                    model: &model_entry.value.display_name,
+                    upstream_model: model_entry
+                        .value
+                        .upstream_model()
+                        .unwrap_or(crate::request_metrics::UNKNOWN),
+                    pk: pk.labels(),
+                    ..Default::default()
+                },
+                502,
+                started.elapsed(),
+            );
             crate::usage_attr::emit_error_usage_event(
                 &state,
-                &state.snapshot.load(),
-                "realtime",
+                &snap,
+                crate::operation::REALTIME,
                 "realtime",
                 &request_id,
                 &requested_model,
                 &auth.entry.id,
                 502,
                 "transport",
+                // Failing to open the upstream socket is not a guardrail
+                // decision, whatever the chain went on to allow.
+                /* guardrail_blocked */
+                false,
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
+                crate::usage_attr::guardrail_scores(&audit),
+                crate::usage_attr::bypass_reason(&audit),
             );
             return;
         }
@@ -626,12 +917,14 @@ async fn run_session(
                                 })))
                                 .await;
                             close_status = 400;
-                            session_error = Some(ProxyError::ContentFiltered(
-                                "realtime frame blocked by a guardrail".into(),
-                            ));
+                            session_error = Some(ProxyError::ContentFiltered {
+                                message: "realtime frame blocked by a guardrail".into(),
+                                unavailable: None,
+                            });
                             break;
                         }
                     }
+                    let text = restamp_session_model_in(text, &requested_model, &upstream_model);
                     if up_tx.send(TgMessage::Text(text)).await.is_err() {
                         break;
                     }
@@ -672,12 +965,14 @@ async fn run_session(
                                 })))
                                 .await;
                             close_status = 400;
-                            session_error = Some(ProxyError::ContentFiltered(
-                                "realtime frame blocked by a guardrail".into(),
-                            ));
+                            session_error = Some(ProxyError::ContentFiltered {
+                                message: "realtime frame blocked by a guardrail".into(),
+                                unavailable: None,
+                            });
                             break;
                         }
                     }
+                    let text = restamp_session_model_out(text, &requested_model);
                     if client_tx.send(AxMessage::Text(text)).await.is_err() {
                         break;
                     }
@@ -734,10 +1029,16 @@ async fn run_session(
     );
     // A realtime session can run for minutes, so its terminal emits read a
     // FRESH snapshot rather than the one `prepare` resolved against (#941) —
-    // one load and one ProviderKey lookup shared by the request metric, the
-    // usage event and `record_usage` below, where each used to do its own.
+    // one ProviderKey lookup shared by the request metric, the usage event
+    // and `record_usage` below, where each used to do its own. The load
+    // itself is shared by everything here except `request_metrics::record`,
+    // which takes its own for the model-label collapse.
     let snap = state.snapshot.load();
     let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &pk_id);
+    // Priced off the same fresh snapshot, through the index every other
+    // reader of a model's price uses: `pricing_key` first, inline `cost`
+    // second.
+    let pricing = state.pricing.for_snapshot(&snap);
     crate::request_metrics::record(
         &state,
         "/v1/realtime",
@@ -769,27 +1070,39 @@ async fn run_session(
         // the upstream figure and what the caller waited for coincide.
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
-        cost_usd: model_entry
-            .value
-            .cost
-            .as_ref()
+        cost_usd: pricing
+            .resolve(&model_entry.value)
             .map(|c| c.calculate(usage.input_tokens, usage.output_tokens))
             .unwrap_or(0.0),
         inbound_protocol: "realtime".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        // A frame the chain refused ends the session, so the session's one
+        // terminal event is where the refusal has to be recorded — this is
+        // the only realtime row the "Guardrail blocks" view can ever see
+        // (AISIX-Cloud#1428).
+        guardrail_blocked: session_error
+            .as_ref()
+            .is_some_and(ProxyError::is_guardrail_block),
         guardrail_monitor_hits: monitor_hits,
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(&audit),
+        guardrail_scores: crate::usage_attr::guardrail_scores(&audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(&audit),
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
-    crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
+    crate::usage_attr::apply_caller_identity(
+        &mut event,
+        auth.jwt.as_ref(),
+        auth.key().user_id.as_deref(),
+        auth.key().user_name.as_deref(),
+    );
     let usage_model =
         crate::usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();
     crate::usage_attr::emit_usage(
         &state,
         &snap,
-        "realtime",
+        crate::operation::REALTIME,
         event.clone(),
         crate::usage_attr::usage_event_labels(&usage_model, &pk),
         None,
@@ -819,6 +1132,11 @@ async fn run_session(
             input: usage.input_tokens.min(u32::MAX as u64) as u32,
             output: usage.output_tokens.min(u32::MAX as u64) as u32,
             total: total_tokens.min(u32::MAX as u64) as u32,
+            // The Realtime session reports its cache hits in the
+            // OpenAI shape — inside `input_tokens`, never beside it.
+            cached: usage.cached_tokens.min(u32::MAX as u64) as u32,
+            cache_read: 0,
+            cache_creation: 0,
             spend_usd: event.cost_usd,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
@@ -859,7 +1177,7 @@ async fn guardrail_block_event(
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
-        ..
+        unavailable,
     } = verdict
     {
         let side = if input_side { "input" } else { "output" };
@@ -871,6 +1189,7 @@ async fn guardrail_block_event(
         let msg = crate::error::guardrail_block_message(
             if input_side { "request" } else { "response" },
             guardrail_name.as_deref(),
+            unavailable.as_deref(),
         );
         return Some(
             serde_json::json!({
@@ -899,13 +1218,17 @@ fn emit_access_log(
         }
         None => (None, None),
     };
+    let log_target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method: method.as_str(),
         path: "/v1/realtime",
         status,
         latency: elapsed,
+        duration: elapsed,
         provider: target.map(|(p, _)| p).filter(|p| !p.is_empty()),
         model: target.map(|(_, m)| m),
+        upstream_model: log_target.upstream_model(),
+        provider_key_id: log_target.provider_key_id(),
         api_key_id,
         prompt_tokens: None,
         completion_tokens: None,
@@ -917,12 +1240,64 @@ fn emit_access_log(
         routing_fallback_count: None,
         error_kind,
         error: error.as_deref(),
+        mcp: None,
+        cache: None,
     }
     .emit();
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// JSON lets both a key and a string value be spelled with escapes, and
+    /// the two halves are handled in different places — so they are pinned
+    /// separately.
+    ///
+    /// The KEY half is the one that was broken: the splice walker decodes
+    /// keys and matches `"\u0073ession"` fine, but `splice_or_keep`'s fast
+    /// path tested only for the literal spelling and returned before the
+    /// walker ran, leaking the upstream model id.
+    #[test]
+    fn an_escaped_session_key_is_still_restamped() {
+        let frame = r#"{"type":"session.created","\u0073ession":{"model":"up-1"}}"#;
+        let out = restamp_session_model_out(frame.to_string(), "echo-realtime");
+        assert!(
+            out.contains(r#""model":"echo-realtime""#),
+            "the fast path must not skip an escaped key: {out}"
+        );
+        assert!(!out.contains("up-1"));
+    }
+
+    /// The VALUE half needs no special handling and this proves it rather
+    /// than assuming it: the walker offers the DECODED text to the rewrite
+    /// closure, so an alias spelled with escapes compares equal and is
+    /// translated back to the provider's own id.
+    #[test]
+    fn an_escaped_alias_value_still_translates_back_upstream() {
+        let frame = r#"{"type":"session.update","session":{"model":"echo-\u0072ealtime"}}"#;
+        let out = restamp_session_model_in(frame.to_string(), "echo-realtime", "gpt-realtime");
+        assert!(
+            out.contains(r#""model":"gpt-realtime""#),
+            "an escaped spelling of the alias is still the alias: {out}"
+        );
+    }
+
+    /// The fast path still skips the frames it exists for. An audio delta is
+    /// base64 with no backslash and no session, so it must come back as the
+    /// very same allocation-free string.
+    #[test]
+    fn an_audio_delta_takes_the_fast_path_unchanged() {
+        let frame =
+            r#"{"type":"response.output_audio.delta","delta":"UklGRiQAAABXQVZFZm10IBAAAAA="}"#;
+        assert_eq!(
+            restamp_session_model_out(frame.to_string(), "echo-realtime"),
+            frame
+        );
+        assert_eq!(
+            restamp_session_model_in(frame.to_string(), "echo-realtime", "gpt-realtime"),
+            frame
+        );
+    }
     use super::*;
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
@@ -933,6 +1308,66 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+    /// An upstream that accepts the connection and then never answers
+    /// the upgrade must fail on the configured budget. Without one the
+    /// dial has no deadline at all — the session's idle cap only starts
+    /// once the socket is up — so the upgrade hangs for as long as the
+    /// far end keeps the socket open.
+    #[tokio::test]
+    async fn a_silent_upstream_fails_the_dial_on_its_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept and hold: the sockets stay open and unanswered for as
+        // long as this task lives.
+        let _silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let request = format!("ws://{addr}/v1/realtime")
+            .into_client_request()
+            .unwrap();
+        let budget = Duration::from_millis(300);
+        // The outer bound is the assertion: unbudgeted, the dial simply
+        // never returns, so a plain `.await` here would hang the suite
+        // rather than fail it.
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_upstream_within(Some(budget), request),
+        )
+        .await
+        .expect("the dial must end on its own budget")
+        .expect_err("a silent upstream cannot complete the handshake");
+        assert!(
+            matches!(&err, tokio_tungstenite::tungstenite::Error::Io(e)
+                if e.kind() == std::io::ErrorKind::TimedOut),
+            "the failure must reach `run_session`'s upstream-connect branch \
+             as a transport error, not as something it reports differently: {err}"
+        );
+    }
+
+    /// [`connect_upstream_within`] takes its budget as an argument, so
+    /// only its production caller binds it to the operator's setting. The
+    /// workspace scan in `upstream_http` cannot see that binding — this
+    /// module names the config too — so pin it to the function body.
+    #[test]
+    fn the_production_dial_takes_its_budget_from_the_upstream_config() {
+        let src = include_str!("realtime.rs");
+        let body = src
+            .split_once("async fn connect_upstream(")
+            .expect("connect_upstream is defined in this file")
+            .1
+            .split_once("\n}\n")
+            .expect("its body ends at a top-level brace")
+            .0;
+        assert!(
+            body.contains("upstream_http::config().connect_timeout"),
+            "the Realtime dial must pass `upstream.connect_timeout` as its budget: {body}"
+        );
+    }
+
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
@@ -941,6 +1376,7 @@ mod tests {
             request_id: Default::default(),
             url_rewrites: Vec::new(),
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }
@@ -965,6 +1401,20 @@ mod tests {
         let k_json = format!(r#"{{"key_hash":"{CALLER_HASH}","allowed_models":["*"]}}"#);
         let k: ApiKey = serde_json::from_str(&k_json).unwrap();
         snap.apikeys.insert(ResourceEntry::new("k-1", k, 1));
+        snap
+    }
+
+    /// [`snapshot`] whose ProviderKey opted into forwarding `forward`.
+    fn snapshot_forwarding(api_base: &str, forward: &[&str]) -> AisixSnapshot {
+        let snap = snapshot(api_base, "openai", "openai");
+        let pk_json = format!(
+            r#"{{"display_name":"rt-pk","secret":"sk-up","api_base":"{api_base}",
+                 "provider":"openai","adapter":"openai",
+                 "request":{{"forward_client_headers":{}}}}}"#,
+            serde_json::to_string(forward).unwrap()
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
         snap
     }
 
@@ -994,15 +1444,27 @@ mod tests {
         (addr, state, rx)
     }
 
+    /// One header's value as a string, `""` when absent — the mock
+    /// records the whole map, and every assertion below reads one name.
+    fn header_str(headers: &HeaderMap, name: &str) -> String {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    }
+
     /// Scripted mock upstream: accepts ONE WebSocket, records the request
-    /// path + auth header, waits for one text frame, replies with a
-    /// `response.done` usage frame, then closes.
+    /// path and its FULL header map, waits for one text frame, replies
+    /// with a `response.done` usage frame, then closes.
+    type SeenHandshake = Option<(String, HeaderMap)>;
+
     async fn spawn_upstream() -> (
         std::net::SocketAddr,
-        Arc<Mutex<Option<(String, String)>>>,
+        Arc<Mutex<SeenHandshake>>,
         Arc<Mutex<Vec<String>>>,
     ) {
-        let seen_handshake: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+        let seen_handshake: Arc<Mutex<SeenHandshake>> = Arc::new(Mutex::new(None));
         let seen_frames: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1015,13 +1477,7 @@ mod tests {
                 stream,
                 move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
                       resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                    let auth = req
-                        .headers()
-                        .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
-                    *hs2.lock().unwrap() = Some((req.uri().to_string(), auth));
+                    *hs2.lock().unwrap() = Some((req.uri().to_string(), req.headers().clone()));
                     Ok(resp)
                 },
             )
@@ -1091,16 +1547,23 @@ mod tests {
         // Upstream saw the relayed client frame + the gateway's provider auth.
         assert_eq!(frames.lock().unwrap().len(), 1);
         assert!(frames.lock().unwrap()[0].contains("session.update"));
-        let (uri, auth) = handshake
+        let (uri, seen) = handshake
             .lock()
             .unwrap()
             .clone()
             .expect("handshake recorded");
+        let auth = header_str(&seen, "authorization");
+        let beta = seen.get("openai-beta").map(|_| ());
         assert!(
             uri.contains("/v1/realtime") && uri.contains("model=gpt-realtime"),
             "upstream URI must be the realtime path with the UPSTREAM model id, got {uri}"
         );
         assert_eq!(auth, "Bearer sk-up");
+        assert_eq!(
+            beta, None,
+            "a caller that did not opt in must not have `openai-beta` forwarded upstream: \
+             OpenAI's GA endpoint rejects it with beta_api_shape_disabled"
+        );
 
         // Session-aggregate usage event.
         let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
@@ -1113,6 +1576,200 @@ mod tests {
         assert_eq!(ev.cached_prompt_tokens, 1);
         assert_eq!(ev.requested_model, "rt-model");
         assert_eq!(ev.api_key_id, "k-1");
+    }
+
+    /// `/v1/realtime` builds its upstream handshake by hand rather than
+    /// through the shared bridge pipeline, which is exactly where a
+    /// per-request mechanism goes silently missing: the operator
+    /// configured `forward_client_headers` on this ProviderKey and every
+    /// other `/v1/*` endpoint honoured it.
+    #[tokio::test]
+    async fn a_named_client_header_rides_the_upstream_handshake() {
+        let (up_addr, handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot_forwarding(
+            &format!("http://{up_addr}/v1"),
+            &["x-user-jwt", "sec-websocket-extensions", "x-*"],
+        );
+        let (addr, _state, _rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        req.headers_mut()
+            .insert("x-user-jwt", "eyJraw".parse().unwrap());
+        // A handshake slot the gateway's own client did NOT set, so
+        // nothing would decline it on the way out — only the surface
+        // list stops it.
+        req.headers_mut().insert(
+            "sec-websocket-extensions",
+            "permessage-deflate".parse().unwrap(),
+        );
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("handshake");
+        let (mut tx, mut client_rx) = ws.split();
+        tx.send(TgMessage::Text("{\"type\":\"session.update\"}".into()))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(3), client_rx.next()).await;
+
+        let (_uri, seen) = handshake
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("handshake recorded");
+        assert_eq!(header_str(&seen, "x-user-jwt"), "eyJraw");
+        // The caller did not name `authorization`, so the gateway's own
+        // provider credential still authenticates the session.
+        assert_eq!(header_str(&seen, "authorization"), "Bearer sk-up");
+        // A `"*"`-shaped pattern is not consent to relay the handshake
+        // this surface owns. `permessage-deflate` at the upstream would
+        // enable a compression the gateway's own codec never negotiated,
+        // so the relay would decode garbage.
+        assert_eq!(
+            header_str(&seen, "sec-websocket-extensions"),
+            "",
+            "the caller's own handshake negotiation must not reach the upstream"
+        );
+    }
+
+    /// A header value the WebSocket client cannot render as text fails
+    /// the whole upstream connection, not just that header — so the
+    /// session must still open, minus the one entry. The same value is
+    /// forwarded byte-for-byte on every other face.
+    ///
+    /// Driven over a raw socket rather than through `connect_async`:
+    /// tungstenite renders the handshake as text on the way OUT too, so a
+    /// tungstenite client cannot send this header at all. A browser can,
+    /// and hyper accepts it inbound — which is exactly why the gateway
+    /// has to handle it.
+    #[tokio::test]
+    async fn a_non_ascii_forwarded_value_does_not_sink_the_session() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (up_addr, handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot_forwarding(&format!("http://{up_addr}/v1"), &["x-*"]);
+        let (addr, _state, _rx) = serve(snap).await;
+
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Latin-1 `José` in `x-user-name`: legal in a header value, and
+        // `x-*` admits it alongside the readable `x-user-jwt`.
+        let mut req = Vec::new();
+        req.extend_from_slice(b"GET /v1/realtime?model=rt-model HTTP/1.1\r\n");
+        req.extend_from_slice(format!("Host: {addr}\r\n").as_bytes());
+        req.extend_from_slice(b"Upgrade: websocket\r\nConnection: Upgrade\r\n");
+        req.extend_from_slice(b"Sec-WebSocket-Version: 13\r\n");
+        req.extend_from_slice(b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n");
+        req.extend_from_slice(b"Authorization: Bearer sk-caller\r\n");
+        req.extend_from_slice(b"x-user-jwt: eyJraw\r\n");
+        req.extend_from_slice(b"x-user-name: Jos\xe9\r\n");
+        req.extend_from_slice(b"\r\n");
+        sock.write_all(&req).await.unwrap();
+
+        let mut buf = [0u8; 256];
+        let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+            .await
+            .expect("the gateway must answer the upgrade")
+            .unwrap();
+        let status = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(
+            status.starts_with("HTTP/1.1 101"),
+            "one unreadable header must not fail the session, got: {}",
+            status.lines().next().unwrap_or_default()
+        );
+
+        // The upstream handshake happened, carrying the readable header
+        // and not the other one.
+        let (_uri, seen) = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(h) = handshake.lock().unwrap().clone() {
+                    return h;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("upstream handshake recorded");
+        assert_eq!(header_str(&seen, "x-user-jwt"), "eyJraw");
+        assert!(seen.get("x-user-name").is_none());
+    }
+
+    /// The credential collision, on this face as on every other: the
+    /// operator declared that this upstream reads the caller's own
+    /// credential, so the ProviderKey's stands aside rather than joining
+    /// it on the wire.
+    #[tokio::test]
+    async fn a_named_credential_slot_displaces_the_provider_key_s_own() {
+        let (up_addr, handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot_forwarding(&format!("http://{up_addr}/v1"), &["authorization"]);
+        let (addr, _state, _rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("handshake");
+        let (mut tx, mut client_rx) = ws.split();
+        tx.send(TgMessage::Text("{\"type\":\"session.update\"}".into()))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(3), client_rx.next()).await;
+
+        let (_uri, seen) = handshake
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("handshake recorded");
+        assert_eq!(header_str(&seen, "authorization"), "Bearer sk-caller");
+        // And alone: a second value would let the upstream pick.
+        assert_eq!(seen.get_all("authorization").iter().count(), 1);
+    }
+
+    /// The browser flow puts the caller's own AISIX key in
+    /// `sec-websocket-protocol`. Relaying that list would hand the
+    /// provider the credential this gateway authenticates with, so no
+    /// pattern reaches it — not even one naming it in full.
+    #[tokio::test]
+    async fn the_browser_credential_never_rides_the_upstream_handshake() {
+        let (up_addr, handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot_forwarding(
+            &format!("http://{up_addr}/v1"),
+            &["sec-websocket-protocol", "*"],
+        );
+        let (addr, _state, _rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut().insert(
+            "sec-websocket-protocol",
+            "realtime, openai-insecure-api-key.sk-caller"
+                .parse()
+                .unwrap(),
+        );
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("subprotocol auth must be accepted");
+        let (mut tx, mut client_rx) = ws.split();
+        tx.send(TgMessage::Text("{\"type\":\"session.update\"}".into()))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(3), client_rx.next()).await;
+
+        let (_uri, seen) = handshake
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("handshake recorded");
+        assert!(
+            !header_str(&seen, "sec-websocket-protocol").contains("sk-caller"),
+            "the caller's gateway key must not reach the provider"
+        );
     }
 
     #[tokio::test]
@@ -1142,6 +1799,143 @@ mod tests {
             "the gateway must echo the `realtime` subprotocol"
         );
         drop(ws);
+    }
+
+    /// A browser may split its subprotocol offer across repeated header
+    /// fields; the credential must still be found wherever it lands.
+    #[tokio::test]
+    async fn subprotocol_credential_is_found_in_a_repeated_header_field() {
+        let (up_addr, handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
+        let (addr, _state, _rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        // Two fields: the credential and the beta opt-in ride the second.
+        req.headers_mut()
+            .append("sec-websocket-protocol", "realtime".parse().unwrap());
+        req.headers_mut().append(
+            "sec-websocket-protocol",
+            "openai-insecure-api-key.sk-caller, openai-beta.realtime-v1"
+                .parse()
+                .unwrap(),
+        );
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("a credential in a later subprotocol field must authenticate");
+        let (mut tx, mut client_rx) = ws.split();
+        tx.send(TgMessage::Text(
+            serde_json::json!({"type": "session.update"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(3), client_rx.next()).await;
+
+        // The opt-in rode the same later field, so it reaches upstream.
+        let (_uri, seen) = handshake
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("handshake recorded");
+        assert_eq!(header_str(&seen, "openai-beta"), "realtime=v1");
+    }
+
+    /// The predicate itself: neither channel set => GA (no header).
+    #[test]
+    fn beta_opt_in_is_recognised_on_both_channels() {
+        let hm = |k: &'static str, v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(k, v.parse().unwrap());
+            h
+        };
+        assert!(!client_requested_beta_realtime(&HeaderMap::new()));
+        assert!(client_requested_beta_realtime(&hm(
+            "openai-beta",
+            "realtime=v1"
+        )));
+        assert!(client_requested_beta_realtime(&hm(
+            "openai-beta",
+            "Realtime=v1"
+        )));
+        // Browser flow: the opt-in rides the subprotocol list.
+        assert!(client_requested_beta_realtime(&hm(
+            "sec-websocket-protocol",
+            "realtime, openai-insecure-api-key.sk-x, openai-beta.realtime-v1"
+        )));
+        // A plain browser handshake carrying only the credential is GA.
+        assert!(!client_requested_beta_realtime(&hm(
+            "sec-websocket-protocol",
+            "realtime, openai-insecure-api-key.sk-x"
+        )));
+        // Assistants-style beta values are not the realtime opt-in.
+        assert!(!client_requested_beta_realtime(&hm(
+            "openai-beta",
+            "assistants=v2"
+        )));
+        // A near match must NOT opt in: the value is a list item, not a
+        // substring, so a future `realtime=v10` stays GA.
+        assert!(!client_requested_beta_realtime(&hm(
+            "openai-beta",
+            "realtime=v10"
+        )));
+        // List-valued: the opt-in counts wherever it sits in the list.
+        assert!(client_requested_beta_realtime(&hm(
+            "openai-beta",
+            "assistants=v2, realtime=v1"
+        )));
+        // Repeated headers: `HeaderMap::get` would only see the first.
+        let mut repeated = HeaderMap::new();
+        repeated.append("openai-beta", "assistants=v2".parse().unwrap());
+        repeated.append("openai-beta", "realtime=v1".parse().unwrap());
+        assert!(client_requested_beta_realtime(&repeated));
+        // Same for the subprotocol list, which browsers may also repeat.
+        let mut split_proto = HeaderMap::new();
+        split_proto.append("sec-websocket-protocol", "realtime".parse().unwrap());
+        split_proto.append(
+            "sec-websocket-protocol",
+            "openai-beta.realtime-v1".parse().unwrap(),
+        );
+        assert!(client_requested_beta_realtime(&split_proto));
+    }
+
+    /// A caller that DOES opt in still gets the beta header forwarded,
+    /// so legacy beta clients keep working against upstreams that serve
+    /// the beta shape.
+    #[tokio::test]
+    async fn client_beta_opt_in_is_forwarded_upstream() {
+        let (up_addr, handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
+        let (addr, _state, _rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        req.headers_mut()
+            .insert("openai-beta", "realtime=v1".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("handshake");
+        let (mut tx, mut client_rx) = ws.split();
+        tx.send(TgMessage::Text(
+            serde_json::json!({"type": "session.update"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(3), client_rx.next()).await;
+
+        let (_uri, seen) = handshake
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("handshake recorded");
+        assert_eq!(
+            header_str(&seen, "openai-beta"),
+            "realtime=v1",
+            "an explicit client opt-in must reach the upstream"
+        );
     }
 
     #[tokio::test]
@@ -1390,8 +2184,10 @@ mod tests {
             r#"{"name":"test-block","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
         )
         .unwrap();
-        snap.guardrails
-            .insert(aisix_core::resource::ResourceEntry::new("g-1", g, 1));
+        crate::seed_env_scoped_guardrail(
+            &snap,
+            aisix_core::resource::ResourceEntry::new("g-1", g, 1),
+        );
         let (addr, _state, mut rx) = serve(snap).await;
 
         let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")

@@ -31,8 +31,29 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
 
-    /// Model identifiers this key may use. An empty array denies access to every model.
+    /// Model names this key may use, matched as single-`*` globs. Read only
+    /// when `allowed_model_ids` is absent; ignored entirely when it is
+    /// present. When both are omitted the key may use no model — model
+    /// access is granted explicitly.
+    #[serde(default)]
     pub allowed_models: Vec<String>,
+
+    /// Models this key may use, named by resource id rather than by name, so
+    /// renaming a model does not change what this key may reach. Present —
+    /// including as an empty array — it is authoritative and `allowed_models`
+    /// is ignored; each id is resolved against the current models in the
+    /// snapshot and the resolved name is matched with the same single-`*`
+    /// glob rule. An id naming a wildcard model therefore grants every name
+    /// that model's pattern covers — including a name an exact-match model
+    /// of its own serves, which is how the name form behaves too. An id
+    /// matching no model grants nothing.
+    ///
+    /// Set to `null` it means the same as omitted: the key falls back to
+    /// `allowed_models`. A producer must therefore write `[]`, never
+    /// `null`, for a key that is meant to grant no model — the two are
+    /// opposite grants, and an empty list is the one that is authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_model_ids: Option<Vec<String>>,
 
     /// Request, token, and concurrency limits for this key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,7 +99,8 @@ pub struct ApiKey {
     pub jwt_provider: Option<String>,
 
     /// This key's own layer of the MCP tool ACL, as namespaced
-    /// `<server>__<tool>` glob patterns. It is intersected with the
+    /// `<server>__<tool>` glob patterns, or as `allow_ids` / `deny_ids`
+    /// entries naming the server by resource id. It is intersected with the
     /// environment and team MCP access policies: every present layer must
     /// allow a tool and no layer may deny it. When omitted the key adds no
     /// constraint of its own — but with no layer present anywhere the grant
@@ -93,8 +115,28 @@ pub struct ApiKey {
     /// a burst against one server never consumes another's budget. A server
     /// with no entry here is bounded by `rate_limit` alone. Only tool calls
     /// are metered; the `initialize` / `tools/list` handshake is not.
+    ///
+    /// Read only when `mcp_rate_limits_by_id` is absent; ignored entirely
+    /// when it is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_rate_limits: Option<BTreeMap<String, McpRateLimit>>,
+
+    /// The same per-server limits, keyed by the MCP server's resource id
+    /// (`mcp_servers/<id>`) rather than by its name, so renaming a server
+    /// does not detach the limit that was set for it.
+    ///
+    /// Present — including as an empty object — it is authoritative and
+    /// `mcp_rate_limits` is ignored; an empty object therefore leaves every
+    /// server bounded by `rate_limit` alone. A key naming no registered
+    /// server imposes nothing, and the other entries are unaffected. Set to
+    /// `null` it means the same as omitted: the key falls back to
+    /// `mcp_rate_limits`.
+    ///
+    /// Each key names one server exactly; there is no "every server" key,
+    /// which is the same as today — a server with no entry is bounded by
+    /// `rate_limit` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_rate_limits_by_id: Option<BTreeMap<String, McpRateLimit>>,
 
     /// A2A agents this key may reach, named by their registered names. Entries
     /// are matched as single-`*` globs, mirroring `allowed_models`: `"*"` grants
@@ -151,23 +193,87 @@ impl ApiKey {
         self.expires_at.is_some_and(|deadline| deadline < now)
     }
 
-    /// True if this key is allowed to call the given Model.
+    /// True if this key is allowed to call the model the caller addressed.
     ///
-    /// Entries are matched as single-`*` globs, so `"*"` grants every model and
-    /// `"openai/*"` grants every `openai/*` name (pairing with wildcard Models);
-    /// entries without a `*` match exactly. An empty `allowed_models` list denies
-    /// everything (spec §3 authz rule).
-    pub fn can_access(&self, model_name: &str) -> bool {
-        self.allowed_models
-            .iter()
-            .any(|n| crate::wildcard::wildcard_matches(n, model_name))
+    /// **The single chokepoint for the key→model ACL.** Every request path
+    /// that gates on model access calls this and nothing else, so the two
+    /// grant shapes below can never diverge across the endpoint family. It
+    /// keys on the caller-addressed entry — the name the request names, or
+    /// the stored name of the entry it references — and never on whatever
+    /// target dispatch later picks, for every model kind.
+    ///
+    /// The key grants models one of two ways:
+    ///
+    /// - `allowed_model_ids` present (an empty array included): each id is
+    ///   resolved to the current name of the model carrying it and that name
+    ///   is matched as a single-`*` glob, so an id naming a wildcard model
+    ///   still grants every name its pattern covers. An id resolving to no
+    ///   model grants nothing. `allowed_models` is not read at all.
+    /// - `allowed_model_ids` absent: `allowed_models` names are matched as
+    ///   single-`*` globs — `"*"` grants every model, `"openai/*"` every
+    ///   `openai/*` name, an entry without a `*` matches exactly.
+    ///
+    /// With neither present the key may use no model. Resolution is done per
+    /// request against the live table rather than cached, so a model rename
+    /// takes effect on the next request with no rewrite of any key document.
+    pub fn can_access(&self, snapshot: &super::AisixSnapshot, model_name: &str) -> bool {
+        match &self.allowed_model_ids {
+            Some(ids) => ids.iter().any(|id| {
+                snapshot
+                    .models
+                    .get_by_id(id)
+                    .is_some_and(|m| crate::wildcard::wildcard_matches(m.value.name(), model_name))
+            }),
+            None => self
+                .allowed_models
+                .iter()
+                .any(|n| crate::wildcard::wildcard_matches(n, model_name)),
+        }
     }
 
     /// The limits this key carries for one MCP server, named as it is
     /// registered (the `<server>` namespace of a `<server>__<tool>` call).
     /// `None` when the key sets no limit for that server.
-    pub fn mcp_rate_limit(&self, server: &str) -> Option<&McpRateLimit> {
-        self.mcp_rate_limits.as_ref()?.get(server)
+    ///
+    /// **The single chokepoint for the key→MCP-server limit.** The key
+    /// carries the limits one of two ways and this decides between them, so
+    /// no caller can read one shape and miss the other:
+    ///
+    /// - `mcp_rate_limits_by_id` present (an empty object included): the
+    ///   server's registered name is resolved to the resource id it is
+    ///   stored under and the limit is looked up by that id, so a rename
+    ///   keeps the limit attached. `mcp_rate_limits` is not read at all.
+    /// - `mcp_rate_limits_by_id` absent: `mcp_rate_limits` is looked up by
+    ///   the server's name, as before.
+    ///
+    /// Resolution is done per request against the live table rather than
+    /// cached, so a server rename takes effect on the next request with no
+    /// rewrite of any key document.
+    pub fn mcp_rate_limit<'a>(
+        &'a self,
+        servers: &'a super::McpServerIndex,
+        server: &'a str,
+    ) -> Option<McpServerLimit<'a>> {
+        match &self.mcp_rate_limits_by_id {
+            Some(by_id) => {
+                // Bucketed on the id, not the name: a rename must not hand
+                // the key a fresh window, which is the whole reason the
+                // limit was attached by id.
+                let id = servers.id_of(server)?;
+                Some(McpServerLimit {
+                    bucket: id,
+                    limits: by_id.get(id)?,
+                })
+            }
+            // Bucketed on the name, which is also what selected it: a
+            // rename detaches a name-keyed limit outright, so there is no
+            // window to carry over, and keying these on the id instead
+            // would reset every counter in the fleet at upgrade.
+            None => Some(McpServerLimit {
+                bucket: server,
+                limits: self.mcp_rate_limits.as_ref()?.get(server)?,
+            }),
+        }
     }
 
     /// True if this key may reach the given A2A agent, named by its registered
@@ -204,14 +310,28 @@ impl ApiKey {
 
     /// Iterate over the names of models this key may access, filtering them
     /// against a known universe of model names. Delegates to [`Self::can_access`]
-    /// so glob entries stay consistent with per-request authz: `*` expands to
-    /// the full universe and `openai/*` to every matching name.
+    /// so the listing can never advertise a name the request path would
+    /// reject, whichever grant shape the key carries.
     pub fn accessible_models<'a>(
         &'a self,
+        snapshot: &super::AisixSnapshot,
         all_models: impl Iterator<Item = &'a str> + 'a,
     ) -> Vec<&'a str> {
-        all_models.filter(|name| self.can_access(name)).collect()
+        all_models
+            .filter(|name| self.can_access(snapshot, name))
+            .collect()
     }
+}
+
+/// One key's limits for one MCP server, with the identity its counter is
+/// bucketed on — the server's resource id when the limit was attached by
+/// id, its name when it was attached by name.
+///
+/// The two must not be confused: a counter that changes bucket resets the
+/// window it was in the middle of.
+pub struct McpServerLimit<'a> {
+    pub bucket: &'a str,
+    pub limits: &'a McpRateLimit,
 }
 
 impl Resource for ApiKey {
@@ -243,6 +363,30 @@ mod tests {
     /// SHA-256 hex of `"sk-my-api-key-123"`.
     const SAMPLE_PLAINTEXT: &str = "sk-my-api-key-123";
     const SAMPLE_HASH: &str = "91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c";
+
+    /// A snapshot holding one model per `(id, display_name)` pair, so an
+    /// `allowed_model_ids` entry has something to resolve against.
+    fn snapshot_with_models(models: &[(&str, &str)]) -> super::super::AisixSnapshot {
+        let snap = super::super::AisixSnapshot::default();
+        for (id, display_name) in models {
+            let model: crate::models::Model = serde_json::from_str(&format!(
+                r#"{{
+                  "display_name": "{display_name}",
+                  "provider": "openai",
+                  "model_name": "gpt-4o",
+                  "provider_key_id": "11111111-1111-1111-1111-111111111111"
+                }}"#
+            ))
+            .unwrap();
+            snap.models
+                .insert(crate::resource::ResourceEntry::new(*id, model, 1));
+        }
+        snap
+    }
+
+    fn empty_snapshot() -> super::super::AisixSnapshot {
+        super::super::AisixSnapshot::default()
+    }
 
     fn sample() -> ApiKey {
         serde_json::from_str(&format!(
@@ -280,6 +424,7 @@ mod tests {
             key_hash: "abc".into(),
             display_name: None,
             allowed_models: vec![],
+            allowed_model_ids: None,
             rate_limit: None,
             team_id: None,
             user_id: None,
@@ -289,13 +434,15 @@ mod tests {
             mcp_access: None,
             allowed_routes: None,
             mcp_rate_limits: None,
+            mcp_rate_limits_by_id: None,
             allowed_agents: None,
             expires_at: None,
             disabled: false,
             runtime_id: String::new(),
         };
-        assert!(!k.can_access("my-gpt4"));
-        assert!(!k.can_access("anything"));
+        let snap = empty_snapshot();
+        assert!(!k.can_access(&snap, "my-gpt4"));
+        assert!(!k.can_access(&snap, "anything"));
     }
 
     #[test]
@@ -363,27 +510,30 @@ mod tests {
     #[test]
     fn can_access_checks_whitelist() {
         let k = sample();
-        assert!(k.can_access("my-gpt4"));
-        assert!(k.can_access("my-claude"));
-        assert!(!k.can_access("other"));
+        let snap = empty_snapshot();
+        assert!(k.can_access(&snap, "my-gpt4"));
+        assert!(k.can_access(&snap, "my-claude"));
+        assert!(!k.can_access(&snap, "other"));
     }
 
     #[test]
     fn wildcard_grants_access_to_any_model() {
         let k: ApiKey =
             serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["*"]}"#).unwrap();
-        assert!(k.can_access("my-gpt4"));
-        assert!(k.can_access("literally-anything"));
+        let snap = empty_snapshot();
+        assert!(k.can_access(&snap, "my-gpt4"));
+        assert!(k.can_access(&snap, "literally-anything"));
     }
 
     #[test]
     fn glob_entry_grants_matching_names() {
         let k: ApiKey =
             serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["openai/*"]}"#).unwrap();
-        assert!(k.can_access("openai/gpt-4o"));
-        assert!(k.can_access("openai/gpt-4o-mini"));
-        assert!(!k.can_access("anthropic/claude"));
-        assert!(!k.can_access("openai")); // prefix must be followed by the glob
+        let snap = empty_snapshot();
+        assert!(k.can_access(&snap, "openai/gpt-4o"));
+        assert!(k.can_access(&snap, "openai/gpt-4o-mini"));
+        assert!(!k.can_access(&snap, "anthropic/claude"));
+        assert!(!k.can_access(&snap, "openai")); // prefix must be followed by the glob
     }
 
     #[test]
@@ -391,7 +541,7 @@ mod tests {
         let k: ApiKey =
             serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["openai/*"]}"#).unwrap();
         let universe = ["openai/gpt-4o", "openai/o1", "anthropic/claude"];
-        let mut accessible = k.accessible_models(universe.iter().copied());
+        let mut accessible = k.accessible_models(&empty_snapshot(), universe.iter().copied());
         accessible.sort_unstable();
         assert_eq!(accessible, vec!["openai/gpt-4o", "openai/o1"]);
     }
@@ -401,7 +551,7 @@ mod tests {
         let k: ApiKey =
             serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["*"]}"#).unwrap();
         let universe = ["a", "b", "c"];
-        let accessible = k.accessible_models(universe.iter().copied());
+        let accessible = k.accessible_models(&empty_snapshot(), universe.iter().copied());
         assert_eq!(accessible, vec!["a", "b", "c"]);
     }
 
@@ -409,7 +559,7 @@ mod tests {
     fn accessible_models_filters_explicit_list() {
         let k = sample(); // allowed: ["my-gpt4", "my-claude"]
         let universe = ["my-gpt4", "my-claude", "other"];
-        let mut accessible = k.accessible_models(universe.iter().copied());
+        let mut accessible = k.accessible_models(&empty_snapshot(), universe.iter().copied());
         accessible.sort_unstable();
         assert_eq!(accessible, vec!["my-claude", "my-gpt4"]);
     }
@@ -418,7 +568,9 @@ mod tests {
     fn accessible_models_empty_list_returns_nothing() {
         let k: ApiKey = serde_json::from_str(r#"{"key_hash":"abc","allowed_models":[]}"#).unwrap();
         let universe = ["a", "b"];
-        assert!(k.accessible_models(universe.iter().copied()).is_empty());
+        assert!(k
+            .accessible_models(&empty_snapshot(), universe.iter().copied())
+            .is_empty());
     }
 
     #[test]
@@ -546,5 +698,236 @@ mod tests {
         let v = serde_json::to_value(sample()).unwrap();
         assert!(v.get("disabled").is_none());
         assert!(v.get("expires_at").is_none());
+    }
+
+    #[test]
+    fn allowed_model_ids_grant_by_resource_id() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4"), ("m-2", "my-claude")]);
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-1"]}"#).unwrap();
+        assert!(k.can_access(&snap, "my-gpt4"));
+        assert!(!k.can_access(&snap, "my-claude"));
+    }
+
+    #[test]
+    fn allowed_model_ids_follow_a_rename() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4")]);
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-1"]}"#).unwrap();
+        assert!(k.can_access(&snap, "my-gpt4"));
+
+        // Same id, new name: the key document is untouched.
+        let renamed = snapshot_with_models(&[("m-1", "my-gpt4-v2")]);
+        assert!(renamed.models.get_by_name("my-gpt4").is_none());
+        assert!(k.can_access(&renamed, "my-gpt4-v2"));
+        assert!(!k.can_access(&renamed, "my-gpt4"));
+    }
+
+    #[test]
+    fn allowed_model_ids_naming_a_wildcard_model_keep_its_pattern() {
+        let snap = snapshot_with_models(&[("m-1", "gpt-*")]);
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-1"]}"#).unwrap();
+        assert!(k.can_access(&snap, "gpt-4o"));
+        assert!(!k.can_access(&snap, "claude-sonnet"));
+    }
+
+    #[test]
+    fn allowed_model_ids_win_over_allowed_models() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4"), ("m-2", "my-claude")]);
+        let k: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allowed_models":["my-claude"],"allowed_model_ids":["m-1"]}"#,
+        )
+        .unwrap();
+        assert!(k.can_access(&snap, "my-gpt4"));
+        assert!(!k.can_access(&snap, "my-claude"));
+
+        // Even `allowed_models: ["*"]` is ignored once ids are present.
+        let widened: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allowed_models":["*"],"allowed_model_ids":[]}"#,
+        )
+        .unwrap();
+        assert!(!widened.can_access(&snap, "my-gpt4"));
+    }
+
+    #[test]
+    fn unresolvable_id_grants_nothing_but_leaves_the_rest() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4")]);
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-1","m-gone"]}"#)
+                .unwrap();
+        assert!(k.can_access(&snap, "my-gpt4"));
+        assert!(!k.can_access(&snap, "m-gone"));
+        assert!(!k.can_access(&snap, "anything-else"));
+    }
+
+    #[test]
+    fn neither_grant_field_loads_and_denies_everything() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4")]);
+        let k: ApiKey = serde_json::from_str(r#"{"key_hash":"h"}"#).unwrap();
+        assert!(k.allowed_models.is_empty());
+        assert!(k.allowed_model_ids.is_none());
+        assert!(!k.can_access(&snap, "my-gpt4"));
+        assert!(!k.can_access(&snap, "*"));
+    }
+
+    #[test]
+    fn allowed_model_ids_stays_off_the_wire_when_absent() {
+        let v = serde_json::to_value(sample()).unwrap();
+        assert!(v.get("allowed_model_ids").is_none());
+
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-1"]}"#).unwrap();
+        let v = serde_json::to_value(&k).unwrap();
+        assert_eq!(v["allowed_model_ids"], serde_json::json!(["m-1"]));
+    }
+
+    /// A registered-server index over one `(id, name)` pair per server.
+    fn server_index(servers: &[(&str, &str)]) -> super::super::McpServerIndex {
+        let snap = super::super::AisixSnapshot::default();
+        for (id, name) in servers {
+            let server: crate::models::McpServer = serde_json::from_str(&format!(
+                r#"{{"name":"{name}","url":"https://example.test/mcp"}}"#
+            ))
+            .unwrap();
+            snap.mcp_servers
+                .insert(crate::resource::ResourceEntry::new(*id, server, 1));
+        }
+        super::super::McpServerIndex::build(&snap.mcp_servers)
+    }
+
+    const ONE_RPM: &str = r#"{"rpm":1}"#;
+
+    #[test]
+    fn mcp_rate_limits_are_looked_up_by_server_name_by_default() {
+        let servers = server_index(&[("s-github", "github")]);
+        let k: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h","mcp_rate_limits":{{"github":{ONE_RPM}}}}}"#
+        ))
+        .unwrap();
+        assert!(k.mcp_rate_limit(&servers, "github").is_some());
+        assert!(k.mcp_rate_limit(&servers, "slack").is_none());
+    }
+
+    #[test]
+    fn mcp_rate_limits_by_id_are_looked_up_through_the_server_index() {
+        let servers = server_index(&[("s-github", "github"), ("s-slack", "slack")]);
+        let k: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h","mcp_rate_limits_by_id":{{"s-github":{ONE_RPM}}}}}"#
+        ))
+        .unwrap();
+        assert!(k.mcp_rate_limit(&servers, "github").is_some());
+        assert!(k.mcp_rate_limit(&servers, "slack").is_none());
+    }
+
+    #[test]
+    fn mcp_rate_limits_by_id_follow_a_rename() {
+        let k: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h","mcp_rate_limits_by_id":{{"s-github":{ONE_RPM}}}}}"#
+        ))
+        .unwrap();
+        assert!(k
+            .mcp_rate_limit(&server_index(&[("s-github", "github")]), "github")
+            .is_some());
+
+        // Same id, new name: the key document is untouched.
+        let renamed = server_index(&[("s-github", "github-v2")]);
+        assert!(k.mcp_rate_limit(&renamed, "github-v2").is_some());
+        assert!(k.mcp_rate_limit(&renamed, "github").is_none());
+    }
+
+    #[test]
+    fn mcp_rate_limits_by_id_win_over_the_name_form() {
+        let servers = server_index(&[("s-github", "github"), ("s-slack", "slack")]);
+        let k: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h",
+                 "mcp_rate_limits":{{"slack":{ONE_RPM}}},
+                 "mcp_rate_limits_by_id":{{"s-github":{ONE_RPM}}}}}"#
+        ))
+        .unwrap();
+        assert!(k.mcp_rate_limit(&servers, "github").is_some());
+        assert!(
+            k.mcp_rate_limit(&servers, "slack").is_none(),
+            "the name form is not read at all once the id form is present"
+        );
+
+        // An empty object is authoritative too: every server is bounded by
+        // `rate_limit` alone.
+        let emptied: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h",
+                 "mcp_rate_limits":{{"github":{ONE_RPM}}},
+                 "mcp_rate_limits_by_id":{{}}}}"#
+        ))
+        .unwrap();
+        assert!(emptied.mcp_rate_limit(&servers, "github").is_none());
+    }
+
+    #[test]
+    fn an_unresolvable_server_id_imposes_no_limit_and_spares_its_neighbours() {
+        let servers = server_index(&[("s-slack", "slack")]);
+        let k: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h","mcp_rate_limits_by_id":{{"s-gone":{ONE_RPM},"s-slack":{ONE_RPM}}}}}"#
+        ))
+        .unwrap();
+        assert!(k.mcp_rate_limit(&servers, "slack").is_some());
+        assert!(k.mcp_rate_limit(&servers, "s-gone").is_none());
+    }
+
+    #[test]
+    fn the_counter_bucket_is_whichever_identity_selected_the_limit() {
+        // A rename detaches a name-keyed limit outright, so its counter has
+        // no window to carry over — but an id-keyed limit survives the
+        // rename, and bucketing it on the name would hand the key a fresh
+        // window at the exact moment the feature exists to be transparent.
+        let servers = server_index(&[("s-github", "github")]);
+
+        let by_name: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h","mcp_rate_limits":{{"github":{ONE_RPM}}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            by_name.mcp_rate_limit(&servers, "github").unwrap().bucket,
+            "github"
+        );
+
+        let by_id: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h","mcp_rate_limits_by_id":{{"s-github":{ONE_RPM}}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            by_id.mcp_rate_limit(&servers, "github").unwrap().bucket,
+            "s-github"
+        );
+        // And it stays that bucket across the rename.
+        let renamed = server_index(&[("s-github", "github-v2")]);
+        assert_eq!(
+            by_id.mcp_rate_limit(&renamed, "github-v2").unwrap().bucket,
+            "s-github"
+        );
+    }
+
+    #[test]
+    fn mcp_rate_limits_by_id_stays_off_the_wire_when_absent() {
+        let v = serde_json::to_value(sample()).unwrap();
+        assert!(v.get("mcp_rate_limits_by_id").is_none());
+
+        let k: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"h","mcp_rate_limits_by_id":{{"s-1":{ONE_RPM}}}}}"#
+        ))
+        .unwrap();
+        let v = serde_json::to_value(&k).unwrap();
+        assert!(v["mcp_rate_limits_by_id"]["s-1"].is_object());
+    }
+
+    #[test]
+    fn accessible_models_follows_the_id_grant() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4"), ("m-2", "my-claude")]);
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_model_ids":["m-2"]}"#).unwrap();
+        let names = ["my-gpt4", "my-claude"];
+        assert_eq!(
+            k.accessible_models(&snap, names.iter().copied()),
+            vec!["my-claude"]
+        );
     }
 }

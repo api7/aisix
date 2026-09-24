@@ -88,7 +88,7 @@ pub struct UpstreamErrorView {
 /// and resolved both the target Model AND its referenced ProviderKey
 /// from the [`aisix_core::AisixSnapshot`]. Bridges read from it but
 /// do not mutate it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BridgeContext {
     /// Correlation id propagated into traces and error envelopes.
     pub request_id: String,
@@ -100,7 +100,25 @@ pub struct BridgeContext {
     pub provider_key: std::sync::Arc<ProviderKey>,
     /// Deadline for the entire upstream call. Bridges are expected to
     /// honour this by cancelling any in-flight HTTP request.
+    ///
+    /// On a streaming dispatch this is the **streaming** budget, which
+    /// bounds the connect phase and the gap between chunks rather than
+    /// the whole completion. A bridge that answers a streaming request
+    /// with a non-streaming upstream leg must use
+    /// [`non_streaming_deadline`](Self::non_streaming_deadline) instead.
     pub deadline: Option<Duration>,
+    /// The end-to-end budget for a non-streaming upstream call, carried
+    /// alongside `deadline` on streaming dispatches.
+    ///
+    /// A structured-output request on the synthetic-tool route cannot be
+    /// streamed — the JSON only exists once the tool call is complete —
+    /// so those bridges run the upstream leg non-streaming and render
+    /// the result as chunks. Measured against the streaming budget, a
+    /// completion that takes longer than one chunk gap is supposed to
+    /// would be cut off; this is the budget that call is actually
+    /// entitled to. `None` on a non-streaming dispatch, where `deadline`
+    /// already is it.
+    pub non_streaming_deadline: Option<Duration>,
     /// The authenticated caller, for `${request.api_key.*}` header
     /// templates. Default (all-empty) on calls with no caller behind
     /// them — a background job poll, an internal embedding lookup.
@@ -119,6 +137,36 @@ pub struct BridgeContext {
     pub provider_key_id: String,
 }
 
+/// Print the context without its credentials.
+///
+/// Two of these fields reach live secrets: `provider_key` carries the
+/// gateway's own upstream `api_key`, and `client_headers` the caller's
+/// own. A derived `Debug` would put both in any log line that ever
+/// formats a context, so the type names them instead of quoting them.
+impl std::fmt::Debug for BridgeContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BridgeContext")
+            .field("request_id", &self.request_id)
+            .field("model", &self.model.display_name)
+            .field("provider_key", &self.provider_key.display_name)
+            .field("deadline", &self.deadline)
+            .field("caller", &self.caller)
+            // Names only: the inbound map holds the caller's own
+            // `Authorization`, and nothing marks a header sensitive on
+            // the way in.
+            .field(
+                "client_headers",
+                &self
+                    .client_headers
+                    .as_ref()
+                    .map(|h| h.keys().map(|k| k.as_str()).collect::<Vec<_>>()),
+            )
+            .field("model_id", &self.model_id)
+            .field("provider_key_id", &self.provider_key_id)
+            .finish()
+    }
+}
+
 impl BridgeContext {
     pub fn new(
         request_id: impl Into<String>,
@@ -130,6 +178,7 @@ impl BridgeContext {
             model,
             provider_key,
             deadline: None,
+            non_streaming_deadline: None,
             caller: CallerIdentity::default(),
             client_headers: None,
             model_id: String::new(),
@@ -140,6 +189,25 @@ impl BridgeContext {
     pub fn with_deadline(mut self, deadline: Duration) -> Self {
         self.deadline = Some(deadline);
         self
+    }
+
+    /// Record the end-to-end budget a non-streaming call would have got,
+    /// for the streaming dispatches whose `deadline` is the smaller
+    /// streaming budget. See
+    /// [`non_streaming_deadline`](Self::non_streaming_deadline).
+    pub fn with_non_streaming_deadline(mut self, deadline: Option<Duration>) -> Self {
+        self.non_streaming_deadline = deadline;
+        self
+    }
+
+    /// The deadline an upstream leg that is *not* streaming should run
+    /// under, whichever kind of dispatch this context came from.
+    pub fn non_streaming_ctx(&self) -> Self {
+        let mut ctx = self.clone();
+        if let Some(deadline) = self.non_streaming_deadline {
+            ctx.deadline = Some(deadline);
+        }
+        ctx
     }
 
     /// Attach the caller identity and inbound headers the outbound-header
@@ -185,6 +253,9 @@ impl BridgeContext {
                 provider_key_name: Some(&self.provider_key.display_name),
             },
             client_headers: self.client_headers.as_deref(),
+            // A Bridge speaks HTTP to its upstream and owns no header
+            // name the shared lists do not already cover.
+            surface_blocked: &[],
         }
     }
 }
@@ -196,6 +267,41 @@ fn timeout_cause_suffix(cause: &str) -> String {
         String::new()
     } else {
         format!(": {cause}")
+    }
+}
+
+/// A non-chat operation a Bridge may or may not implement.
+///
+/// The value domain is closed on purpose: it names exactly the three
+/// [`Bridge`] methods that ship a default implementation, and it is what
+/// [`BridgeError::UnsupportedCapability`] carries. Before it existed the
+/// proxy decided the 501 by searching the error's message text for a
+/// phrase, so rewording the sentence below would have silently turned a
+/// 501 into a 500 with nothing to catch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeCapability {
+    /// [`Bridge::embed`] — `/v1/embeddings`.
+    Embeddings,
+    /// [`Bridge::complete`] — `/v1/completions`.
+    TextCompletions,
+    /// [`Bridge::generate_image`] — `/v1/images/generations`.
+    ImageGeneration,
+}
+
+impl BridgeCapability {
+    /// The words the client-facing message names this capability by.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Embeddings => "embeddings",
+            Self::TextCompletions => "text completions",
+            Self::ImageGeneration => "image generation",
+        }
+    }
+}
+
+impl std::fmt::Display for BridgeCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -263,6 +369,21 @@ pub enum BridgeError {
     },
     #[error("bridge is misconfigured: {0}")]
     Config(String),
+    /// The provider's bridge does not implement this operation at all —
+    /// the [`Bridge`] default impl answered, so no request was built and no
+    /// upstream was contacted.
+    ///
+    /// Static per adapter: the same provider will answer the same way for
+    /// every request, which is why it is the one failure that must not
+    /// spend a retry ([`crate::BridgeError`] consumers in the proxy's
+    /// `routing::is_retryable`).
+    ///
+    /// It carries the SAME status, error type and telemetry class as
+    /// [`Config`](Self::Config), which it was spelled as until #1093 — the
+    /// point of the variant is that a status decision no longer reads the
+    /// message text, not that any response changed.
+    #[error("this provider does not support {0}")]
+    UnsupportedCapability(BridgeCapability),
     /// Customer-fixable upstream config — the admin's ProviderKey/Model
     /// is set up wrong (missing api_base, missing model_name) or the
     /// caller's request is malformed (e.g. split_system shape). Maps to
@@ -578,7 +699,14 @@ impl BridgeError {
                 Some(s) if (400..500).contains(s) => *s,
                 _ => 502,
             },
-            BridgeError::Config(_) => 500,
+            // Same 500 as `Config`, which this variant was spelled as
+            // before it was typed. The three routes that turn it into a
+            // 501 build that response inline (they answer it as a dispatch
+            // success, not through `ProxyError`), and the other two callers
+            // of the `embed` default — the semantic router and the guardrail
+            // embedder — surface it through this table. Mapping it to 501
+            // here would change what those two return.
+            BridgeError::Config(_) | BridgeError::UnsupportedCapability(_) => 500,
             BridgeError::InvalidUpstreamConfig(_) => 400,
             BridgeError::InvalidUpstreamCredentials(_) => 401,
             BridgeError::Transport(_) => 502,
@@ -613,6 +741,7 @@ impl BridgeError {
             | BridgeError::Transport(_)
             | BridgeError::StreamAborted => true,
             BridgeError::Config(_)
+            | BridgeError::UnsupportedCapability(_)
             | BridgeError::InvalidUpstreamConfig(_)
             | BridgeError::InvalidUpstreamCredentials(_) => false,
         }
@@ -625,7 +754,7 @@ impl BridgeError {
             BridgeError::UpstreamStatus { .. } => "upstream_error",
             BridgeError::UpstreamDecode(_) => "upstream_decode_error",
             BridgeError::UpstreamInBand { .. } => "upstream_in_band_error",
-            BridgeError::Config(_) => "config_error",
+            BridgeError::Config(_) | BridgeError::UnsupportedCapability(_) => "config_error",
             BridgeError::InvalidUpstreamConfig(_) => "invalid_request_error",
             BridgeError::InvalidUpstreamCredentials(_) => "authentication_error",
             BridgeError::Transport(_) => "transport_error",
@@ -646,6 +775,23 @@ pub trait Bridge: Send + Sync + 'static {
     /// upgrades so dashboards don't break.
     fn name(&self) -> &'static str;
 
+    /// The upstream API protocol this bridge speaks on the wire, as the
+    /// bounded `upstream_protocol` metric label value
+    /// (AISIX-Cloud#1403).
+    ///
+    /// NOT [`Bridge::name`]: a bridge names itself after the vendor
+    /// family it serves, which for Bedrock varies per model family
+    /// (`"anthropic"`, `"meta"`, …) while the wire shape stays
+    /// `"bedrock"` throughout.
+    ///
+    /// The default is [`crate::hub::UPSTREAM_PROTOCOL_UNKNOWN`] so a
+    /// stub bridge in a test does not have to answer. Every bridge
+    /// reachable from `build_hub()` overrides it, which
+    /// `upstream_protocol_label_matches_dispatched_bridge` pins.
+    fn wire_protocol(&self) -> &'static str {
+        crate::hub::UPSTREAM_PROTOCOL_UNKNOWN
+    }
+
     /// Non-streaming call: one request, one response.
     async fn chat(
         &self,
@@ -661,15 +807,16 @@ pub trait Bridge: Send + Sync + 'static {
     ) -> Result<ChatChunkStream, BridgeError>;
 
     /// Embedding call: text(s) → float vectors. Providers that do not
-    /// support embeddings return [`BridgeError::Config`] with a clear
-    /// message so the proxy can surface a 501 rather than a 502.
+    /// support embeddings keep the default, which returns
+    /// [`BridgeError::UnsupportedCapability`] so `/v1/embeddings` can
+    /// surface a 501 rather than a 502.
     async fn embed(
         &self,
         _req: &EmbeddingRequest,
         _ctx: &BridgeContext,
     ) -> Result<EmbeddingResponse, BridgeError> {
-        Err(BridgeError::Config(
-            "this provider does not support embeddings".into(),
+        Err(BridgeError::UnsupportedCapability(
+            BridgeCapability::Embeddings,
         ))
     }
 
@@ -681,14 +828,16 @@ pub trait Bridge: Send + Sync + 'static {
     /// between providers are the caller's responsibility.
     ///
     /// Providers that do not expose a `/completions` endpoint should keep
-    /// the default, which returns a 501-mapped [`BridgeError::Config`].
+    /// the default, which returns
+    /// [`BridgeError::UnsupportedCapability`] — the value `/v1/completions`
+    /// turns into a 501.
     async fn complete(
         &self,
         _body: &serde_json::Value,
         _ctx: &BridgeContext,
     ) -> Result<serde_json::Value, BridgeError> {
-        Err(BridgeError::Config(
-            "this provider does not support text completions".into(),
+        Err(BridgeError::UnsupportedCapability(
+            BridgeCapability::TextCompletions,
         ))
     }
 
@@ -699,14 +848,16 @@ pub trait Bridge: Send + Sync + 'static {
     /// body JSON is returned as-is from the upstream.
     ///
     /// Providers that do not expose an image generation endpoint should keep
-    /// the default, which returns a 501-mapped [`BridgeError::Config`].
+    /// the default, which returns
+    /// [`BridgeError::UnsupportedCapability`] — the value
+    /// `/v1/images/generations` turns into a 501.
     async fn generate_image(
         &self,
         _body: &serde_json::Value,
         _ctx: &BridgeContext,
     ) -> Result<serde_json::Value, BridgeError> {
-        Err(BridgeError::Config(
-            "this provider does not support image generation".into(),
+        Err(BridgeError::UnsupportedCapability(
+            BridgeCapability::ImageGeneration,
         ))
     }
 }
@@ -714,6 +865,107 @@ pub trait Bridge: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::{
+        ChatFormat, ChatMessage, ChatResponse, EmbeddingRequest, FinishReason, UsageStats,
+    };
+
+    /// A Bridge that implements only what the trait requires, so the three
+    /// optional operations fall through to their defaults — the shape every
+    /// provider that does not speak embeddings / text completions / image
+    /// generation actually has.
+    struct ChatOnlyBridge;
+
+    #[async_trait::async_trait]
+    impl Bridge for ChatOnlyBridge {
+        fn name(&self) -> &'static str {
+            "chat-only"
+        }
+        async fn chat(
+            &self,
+            _req: &ChatFormat,
+            _ctx: &BridgeContext,
+        ) -> Result<ChatResponse, BridgeError> {
+            Ok(ChatResponse {
+                id: String::new(),
+                model: String::new(),
+                message: ChatMessage::assistant(String::new()),
+                finish_reason: FinishReason::Stop,
+                usage: UsageStats::default(),
+            })
+        }
+        async fn chat_stream(
+            &self,
+            _req: &ChatFormat,
+            _ctx: &BridgeContext,
+        ) -> Result<ChatChunkStream, BridgeError> {
+            unreachable!("not exercised")
+        }
+    }
+
+    /// The three defaults name their capability in a typed field rather
+    /// than only in prose. Before #1093 the proxy read the sentence to
+    /// decide the status, so rewording it would have moved a 501 to a 500
+    /// with nothing to catch it — and this test would not have existed to
+    /// notice, because the message was the contract.
+    ///
+    /// The `Display` text is asserted too, because the three routes render
+    /// it into the client-facing 501 envelope.
+    #[tokio::test]
+    async fn the_optional_operations_default_to_a_typed_capability_gap() {
+        let b = ChatOnlyBridge;
+        let ctx = BridgeContext::new(
+            "req-1",
+            std::sync::Arc::new(
+                serde_json::from_str::<Model>(
+                    r#"{"display_name":"m","provider":"anthropic","model_name":"claude","provider_key_id":"pk"}"#,
+                )
+                .unwrap(),
+            ),
+            std::sync::Arc::new(
+                serde_json::from_str::<ProviderKey>(r#"{"display_name":"pk","secret":"s"}"#).unwrap(),
+            ),
+        );
+        let embed_req = EmbeddingRequest {
+            model: "m".into(),
+            input: vec!["hello".into()],
+            input_was_single: true,
+            encoding_format: None,
+            dimensions: None,
+        };
+
+        let cases: Vec<(BridgeError, BridgeCapability, &str)> = vec![
+            (
+                b.embed(&embed_req, &ctx).await.unwrap_err(),
+                BridgeCapability::Embeddings,
+                "this provider does not support embeddings",
+            ),
+            (
+                b.complete(&serde_json::json!({}), &ctx).await.unwrap_err(),
+                BridgeCapability::TextCompletions,
+                "this provider does not support text completions",
+            ),
+            (
+                b.generate_image(&serde_json::json!({}), &ctx)
+                    .await
+                    .unwrap_err(),
+                BridgeCapability::ImageGeneration,
+                "this provider does not support image generation",
+            ),
+        ];
+
+        for (err, capability, message) in cases {
+            assert!(
+                matches!(err, BridgeError::UnsupportedCapability(c) if c == capability),
+                "expected {capability:?}, got {err}"
+            );
+            assert_eq!(err.to_string(), message);
+            // The response shape the two non-route callers see is unchanged:
+            // this stays exactly what `Config` reported.
+            assert_eq!(err.http_status(), 500);
+            assert_eq!(err.error_type(), "config_error");
+            assert!(!err.reached_upstream());
+        }
+    }
 
     #[test]
     fn in_band_probe_parses_openai_string_code_envelope() {
@@ -982,6 +1234,50 @@ mod tests {
         let e = BridgeError::InvalidUpstreamCredentials("provider_key.api_key is empty".into());
         assert_eq!(e.http_status(), 401);
         assert_eq!(e.error_type(), "authentication_error");
+    }
+
+    #[test]
+    fn debugging_a_context_names_its_credentials_without_quoting_them() {
+        let pk = sample_provider_key();
+        let api_key = pk.api_key.clone();
+        assert!(!api_key.is_empty(), "the sample must carry a real secret");
+
+        let mut inbound = HeaderMap::new();
+        inbound.insert(
+            http::header::AUTHORIZATION,
+            "Bearer header.payload.signature".parse().expect("header"),
+        );
+
+        let ctx = BridgeContext::new(
+            "req-1",
+            std::sync::Arc::new(sample_model()),
+            std::sync::Arc::new(pk),
+        )
+        .with_client(
+            CallerIdentity::default(),
+            Some(std::sync::Arc::new(inbound)),
+        );
+
+        // The credential is really on the context: without this the
+        // assertions below would pass on an empty one.
+        assert_eq!(
+            ctx.client_headers.as_ref().expect("headers")[http::header::AUTHORIZATION],
+            "Bearer header.payload.signature"
+        );
+
+        let printed = format!("{ctx:?}");
+        assert!(
+            printed.contains("req-1") && printed.contains("authorization"),
+            "the non-secret fields, header names included, still print: {printed}"
+        );
+        assert!(
+            !printed.contains("header.payload.signature"),
+            "the caller's token must not print: {printed}"
+        );
+        assert!(
+            !printed.contains(&api_key),
+            "the provider key's own secret must not print either: {printed}"
+        );
     }
 
     #[test]

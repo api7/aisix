@@ -26,7 +26,9 @@ mod yaml_emit;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aisix_etcd::{build_snapshot, ConfigProvider, ConnectPolicy, EtcdConfigProvider};
+use aisix_etcd::{
+    build_snapshot, ConfigProvider, ConnectPolicy, EtcdConfigProvider, PrefixSet, WatchedPrefix,
+};
 
 use document::build_export_document;
 use yaml_emit::emit_yaml;
@@ -39,8 +41,9 @@ pub struct ExportArgs {
     pub output: Option<PathBuf>,
 }
 
-/// A CLI-appropriate connect policy: fail after a few quick attempts
-/// rather than the gateway's 25s boot budget.
+/// A CLI-appropriate connect policy: fail after a few quick attempts.
+/// The gateway leaves an unreachable etcd to its supervisor instead; a
+/// one-shot command has nothing to wait with.
 const CLI_CONNECT_POLICY: ConnectPolicy = ConnectPolicy {
     interval: Duration::from_secs(1),
     attempts: 3,
@@ -58,6 +61,12 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
         &args.endpoints,
         &args.prefix,
         None,
+        // The export CLI takes endpoints on the command line, not a
+        // config file, so there is no `etcd.request_timeout_ms` or
+        // `etcd.dial_timeout_ms` to honour — and an operator can
+        // interrupt it. Both stay unbounded.
+        None,
+        None,
         CLI_CONNECT_POLICY,
     )
     .await
@@ -70,7 +79,19 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
 
     // Decode through the identical loader path the gateway uses, so the
     // exported set is exactly what the running gateway would serve.
-    let (snapshot, stats) = build_snapshot(&args.prefix, &entries);
+    // The catalog prefix is declared alongside the exported one even
+    // though export never emits a pricing document. When `--prefix` is
+    // the bare base — the pre-`env_id` shape — the range read also
+    // returns `<base>/global/pricing/*`, and resolved against the base
+    // alone those keys parse as kind `global` and are reported as
+    // rejected rows the operator did nothing wrong to produce. Declaring
+    // the prefix resolves them as the prices they are; they simply have
+    // no file form to be emitted into.
+    let prefixes = PrefixSet::new(vec![
+        WatchedPrefix::environment(&args.prefix),
+        WatchedPrefix::global(format!("{}/global/", args.prefix.trim_end_matches('/'))),
+    ]);
+    let (snapshot, stats) = build_snapshot(&prefixes, &entries);
 
     let document = build_export_document(&snapshot, args.reveal_secrets);
     let yaml = emit_yaml(&document).map_err(|e| anyhow::anyhow!(e))?;

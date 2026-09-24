@@ -28,7 +28,7 @@
 //! (aisix-server), not here.
 
 use crate::metrics::UsageEventLabels;
-use aisix_core::{AppliedGuardrail, GuardrailEnforcedHit, GuardrailMonitorHit};
+use aisix_core::{AppliedGuardrail, GuardrailEnforcedHit, GuardrailMonitorHit, GuardrailScore};
 use serde::Serialize;
 
 /// One usage event. Emitted at end-of-request (success / upstream error /
@@ -76,6 +76,31 @@ pub struct UsageEvent {
     #[serde(default)]
     pub api_key_id: String,
 
+    /// UUID of the org member the authenticating ApiKey is owned by
+    /// (`ApiKey.user_id`), snapshotted at request time so the Logs
+    /// member filter keeps naming who actually made the call
+    /// (AISIX-Cloud#1389). Resolving it from `api_key_id` at query time
+    /// instead would re-attribute a key's whole history the moment an
+    /// operator rebinds it, and lose the attribution entirely once the
+    /// key is deleted. Empty when the key is bound to no member, or
+    /// when auth failed before resolution; cp-api stores empty as NULL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub user_id: String,
+
+    /// Display name of the member `user_id` names, for the `user_name`
+    /// metric label the usage-event counters carry beside `user_id`
+    /// (AISIX-Cloud#1455). Read off the same ApiKey row as `user_id` by
+    /// `apply_caller_identity`, which is what keeps the pair from ever
+    /// naming a member and someone else's name.
+    ///
+    /// NOT part of the DP -> cp-api wire contract: cp-api resolves member
+    /// names from its own tables, so shipping a second copy would only
+    /// give that name a way to disagree with itself. It rides the event
+    /// purely so `UsageSink::try_emit` — the one place `user_id` becomes a
+    /// label — can stamp both halves together.
+    #[serde(skip)]
+    pub user_name: String,
+
     /// The model alias exactly as the client sent it in the request
     /// body (`model` field) — a Model-Group name for routed requests,
     /// a direct model's display name otherwise. `model_id` records the
@@ -94,6 +119,9 @@ pub struct UsageEvent {
     /// the absent-or-zero case identically.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cached_prompt_tokens: u32,
+    /// Raw OpenAI cache-write count; it is not additive to prompt tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
 
     /// OpenAI o1/o3 reasoning tokens. Subset of `completion_tokens`.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
@@ -232,6 +260,16 @@ pub struct UsageEvent {
     /// Resolved model the provider actually billed (e.g.
     /// `gpt-4o-2024-08-06` when the request said `gpt-4o`). Differs
     /// from cp-api's `model_id` which points at the dashboard alias.
+    ///
+    /// On a **cache hit** it names the model that PRODUCED the stored
+    /// body, read off the cached response rather than off this request —
+    /// the same value the row for the original call carried. That makes it
+    /// the one field on a hit that names the producer at all: a Model
+    /// Group's hit reports no target, because which of its targets wrote
+    /// the entry is recorded nowhere else (AISIX-Cloud#1571). Empty only
+    /// when the stored response carried no model name. Unlike
+    /// `provider_request_id`, which a hit deliberately leaves empty, this
+    /// is not an identifier anything reconciles against.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider_model_version: String,
 
@@ -247,17 +285,39 @@ pub struct UsageEvent {
     pub cost_usd: f64,
 
     /// True when a guardrail rejected the request (input or output).
+    ///
+    /// cp-api indexes this and the dashboard's Logs "Guardrail blocks"
+    /// view is the exact predicate `guardrail_blocked = true`, so it is
+    /// the ONLY thing that puts a refusal in front of an operator — a
+    /// refused request whose event leaves the field at its `false`
+    /// default is still in the unfiltered feed, which makes the empty
+    /// Blocked view read as "no guardrail activity" rather than as a
+    /// missing row (AISIX-Cloud#1428). Every emitter on a failure path
+    /// must therefore set it from `ProxyError::is_guardrail_block`,
+    /// including a stream refused after its 200 head went out: there the
+    /// status stays 200 and this bool is the whole record of the block.
     pub guardrail_blocked: bool,
 
-    /// Set when at least one remote-API guardrail (today: kind=bedrock)
-    /// failed open: its upstream was unreachable but the operator
-    /// configured `fail_open=true`, so the request went through. The
-    /// reason ("bedrock_5xx" / "bedrock_timeout" / "bedrock_throttled")
-    /// is what gets recorded so a compliance audit can identify
-    /// requests that slipped past the policy. Empty string = no
-    /// bypass (the normal Allow / Block paths). cp-api persists this
-    /// to `dpmgr_usage_events.guardrail_bypassed_reason`; on the
-    /// wire empty maps to NULL via `skip_serializing_if`.
+    /// Set when a guardrail on this request did not evaluate and its
+    /// configured failure policy let the request past it: a remote kind
+    /// whose upstream was unreachable on a `fail_open: true` row, or a
+    /// body the scanner could not read on a chain where nothing that
+    /// reads that side fails closed. The value is the kind's bounded
+    /// failure tag (`bedrock_5xx`, `lakera_timeout`,
+    /// `custom_script_error`, …) or `unscannable_body`, clamped to 64
+    /// bytes; the first bypass of the request wins.
+    ///
+    /// NOT mutually exclusive with `guardrail_blocked`. A chain can fail
+    /// open on one member and be refused by another, and an input hook
+    /// can fail open on a prompt that reached the provider before the
+    /// output hook refused the answer — in both cases something really
+    /// did go unscreened, and suppressing the tag would discard the more
+    /// compliance-relevant half. "Reached a provider unscreened" is the
+    /// two fields read together, not this one alone.
+    ///
+    /// Empty string = nothing was bypassed. cp-api persists this to
+    /// `dpmgr_usage_events.guardrail_bypassed_reason`; on the wire empty
+    /// maps to NULL via `skip_serializing_if`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub guardrail_bypassed_reason: String,
 
@@ -287,13 +347,14 @@ pub struct UsageEvent {
 
     /// What each `enforcement_mode: monitor` guardrail WOULD have done to
     /// this request (AISIX-Cloud#562): one entry per suppressed Block
-    /// (`would_block`, with the operator-facing reason) or suppressed mask
-    /// (`would_mask`, with per-detector counts). Names only — never matched
-    /// content (#153). Lets operators stage a policy and audit its hit rate
-    /// in the dashboard before flipping it to `block`. Empty (no
-    /// monitor-mode guardrail fired) is omitted from the wire; cp-api's
-    /// `/dp/telemetry` binds JSON leniently, so older CP images ignore the
-    /// unknown field.
+    /// (`would_block`, with a code-owned kind/outcome summary) or suppressed
+    /// mask (`would_mask`, with safe per-detector counts; custom scripts use
+    /// the fixed key `custom`). Names only — never matched content (#153).
+    /// Lets operators stage a
+    /// policy and audit its hit rate in the dashboard before flipping it to
+    /// `block`. Empty (no monitor-mode guardrail fired) is omitted from the
+    /// wire; cp-api's `/dp/telemetry` binds JSON leniently, so older CP images
+    /// ignore the unknown field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guardrail_monitor_hits: Vec<GuardrailMonitorHit>,
 
@@ -311,6 +372,26 @@ pub struct UsageEvent {
     /// so older CP images ignore the unknown field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guardrail_enforced_hits: Vec<GuardrailEnforcedHit>,
+
+    /// What a `kind: "semantic"` guardrail actually SCORED on this request
+    /// (AISIX-Cloud#1467) — on requests it passed as well as ones it
+    /// refused, in enforce mode as well as monitor mode.
+    ///
+    /// This is the only field that reports a guardrail execution which
+    /// decided nothing. The three fields above answer "did a policy act";
+    /// a similarity policy also has to answer "how close was it", because
+    /// its threshold is a number an operator has to tune and a
+    /// below-threshold pass is otherwise indistinguishable from a guardrail
+    /// that is not running at all.
+    ///
+    /// One entry per `(guardrail_name, hook, direction)` — a summary of the
+    /// closest call, never one entry per screened text. Indices only, never
+    /// the example text and never the screened text (#153); see
+    /// [`GuardrailScore`]. Empty (no scoring guardrail ran — the dominant
+    /// case) is omitted from the wire; cp-api's `/dp/telemetry` binds JSON
+    /// leniently, so older CP images ignore the unknown field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guardrail_scores: Vec<GuardrailScore>,
 
     /// Cache outcome on this request. One of:
     ///
@@ -377,6 +458,57 @@ pub struct UsageEvent {
     /// the wire = legacy DP image; cp-api stores empty as NULL.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub inbound_protocol: String,
+
+    /// What the caller asked the gateway to DO, from a fixed set:
+    /// `chat`, `messages`, `count_tokens`, `responses`, `completions`,
+    /// `embeddings`, `rerank`, `image_generation`, `image_edit`,
+    /// `transcription`, `translation`, `speech`, `video_generation`,
+    /// `realtime`, `files`, `batches`, `fine_tuning`, `batch_completion`,
+    /// `mcp`, `a2a`, `passthrough`.
+    ///
+    /// That list is the whole of it, and a consumer building a filter or a
+    /// facet should take it verbatim. `aisix_proxy::operation` is where the
+    /// values are defined, and its route census fails the build if a mounted
+    /// route reports one that is not there. Two entries are easy to get wrong
+    /// from the outside: polling or downloading a video job emits NO event at
+    /// all (only `POST /v1/videos` does, as `video_generation`), and
+    /// `batch_completion` is not a caller request — it is the gateway's own
+    /// accounting of a finished batch job, recorded long after the
+    /// `/v1/batches` call that submitted it, and it is the row carrying that
+    /// batch's real tokens and spend.
+    ///
+    /// The dimension nothing else on this event carries. `inbound_protocol`
+    /// collapses every OpenAI-shaped route onto one value, so a text chat, an
+    /// image generation and a video submission are indistinguishable without
+    /// this field — an exporter consumer could only tell them apart by
+    /// regex-ing a captured prompt, which `content_mode = metadata_only`
+    /// never has (AISIX-Cloud#1461).
+    ///
+    /// Bounded and derived from the route the request matched, never from
+    /// caller-supplied text, so it is safe as a metric label or an index key.
+    /// Finer than the `handler` metric label wherever one handler family
+    /// serves several kinds of work: `/v1/images/generations` and
+    /// `/v1/images/edits` share `handler="images"` but not an operation, and
+    /// the three `/v1/videos` routes share `handler="videos"` while only the
+    /// POST generates a video.
+    ///
+    /// Request-scoped: every attempt of one `request_id` — retry, fallback,
+    /// ensemble member, judge — carries the same value, and a request that
+    /// failed or was refused by a guardrail carries it too, because it says
+    /// what was ASKED for rather than what came back.
+    ///
+    /// Empty only on the wire of a gateway older than the field.
+    ///
+    /// Consumed today by the exporter sinks — SLS and object storage keep the
+    /// name verbatim, Datadog maps it to `aisix.operation`, OTLP carries it
+    /// as the `aisix.operation` span attribute beside the semconv
+    /// `gen_ai.operation.name`, whose vocabulary is OpenTelemetry's and
+    /// collapses every OpenAI-shaped route onto `chat`. cp-api binds
+    /// `/dp/telemetry` leniently and currently drops the field; persisting it
+    /// and surfacing it in Logs is the control-plane half of
+    /// AISIX-Cloud#1461.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operation: String,
 
     // ─── Per-attempt telemetry (#655) ───
     //
@@ -665,6 +797,13 @@ fn is_zero_f64(n: &f64) -> bool {
 /// - dropped (reason=sink_full): worker overloaded
 /// - dropped (reason=sink_closed): worker shut down
 /// - dropped (reason=sink_disabled): no sink wired (legacy / dev mode)
+///
+/// The sender worker adds two more reasons to the SAME counter for events
+/// it accepted here and then could not deliver to the control plane —
+/// `send_failed` and `retry_budget_exhausted` (see aisix-server's
+/// `telemetry` module). They carry only the member pair off the event, so
+/// "delivered" reads as "reached the control plane" in aggregate, and the
+/// per-model slice of the invariant covers the queue side only.
 #[derive(Debug, Clone)]
 pub struct UsageSink {
     tx: Option<tokio::sync::mpsc::Sender<UsageEvent>>,
@@ -764,8 +903,35 @@ impl UsageSink {
     /// records did we lose" answerable. The event itself cannot supply
     /// them: its `requested_model` is caller-controlled text (#451) and it
     /// carries no ProviderKey id at all.
+    ///
+    /// The attribution dimensions that DO come off the event are the
+    /// member pair `user_id` / `user_name` (AISIX-Cloud#1389, #1455): both
+    /// are resolved ApiKey fields, not caller text, and taking them here
+    /// rather than from each handler's label builder is what makes the
+    /// counter and the row cp-api persists structurally incapable of
+    /// naming different members. They are stamped together for the same
+    /// reason `PkLabels` keeps a key's id and name together — a name that
+    /// can be sourced separately from its id is a name that will
+    /// eventually be wrong.
     pub fn try_emit(&self, handler: &'static str, event: UsageEvent, labels: UsageEventLabels<'_>) {
         log_provider_call(handler, &event);
+        // Owned because `event` is moved into the channel below while the
+        // drop counter still needs the labels.
+        let user_id = event.user_id.clone();
+        let user_name = event.user_name.clone();
+        let labels = UsageEventLabels {
+            user_id: if user_id.is_empty() {
+                "unknown"
+            } else {
+                user_id.as_str()
+            },
+            user_name: if user_name.is_empty() {
+                "unknown"
+            } else {
+                user_name.as_str()
+            },
+            ..labels
+        };
         // Normalise inbound_protocol to a fixed `&'static str` set at
         // the boundary (audit MEDIUM-3). This both kills the heap
         // alloc per call AND pins prometheus cardinality at the type
@@ -1164,14 +1330,23 @@ mod tests {
         sink.try_emit(
             "chat",
             UsageEvent {
-                status_code: 200,
+                status_code: 429,
                 inbound_protocol: "openai".into(),
+                // Attribution the sink reads off the event itself, not off
+                // the label set the handler built.
+                user_id: "member-1".into(),
+                user_name: "Alice Example".into(),
                 ..Default::default()
             },
             UsageEventLabels {
                 model: "customer-chat",
                 provider_key_id: "pk-1",
                 provider_key_name: "openai-prod",
+                // Both halves of the member pair are the sink's to fill:
+                // whatever a handler puts here has to lose to the event.
+                user_id: "unknown",
+                user_name: "unknown",
+                upstream_protocol: "openai",
             },
         );
 
@@ -1184,6 +1359,12 @@ mod tests {
                 ("model", "customer-chat"),
                 ("provider_key_id", "pk-1"),
                 ("provider_key_name", "openai-prod"),
+                ("user_id", "member-1"),
+                ("user_name", "Alice Example"),
+                // The raw code sits beside the family, so a query can name
+                // one failure mode without giving up the family rollup.
+                ("status_code", "4xx"),
+                ("status", "429"),
             ],
         );
         let dropped = parse_counter_value(
@@ -1194,6 +1375,8 @@ mod tests {
                 ("model", "customer-chat"),
                 ("provider_key_id", "pk-1"),
                 ("provider_key_name", "openai-prod"),
+                ("user_id", "member-1"),
+                ("user_name", "Alice Example"),
             ],
         );
         assert_eq!(
@@ -1419,6 +1602,84 @@ mod tests {
 
         let empty = serde_json::to_string(&UsageEvent::default()).unwrap();
         assert!(!empty.contains("guardrail_enforced_hits"));
+    }
+
+    /// AISIX-Cloud#1467: the similarity summary reaches the wire under the
+    /// key the control plane binds, carries an example INDEX and never the
+    /// texts, and is omitted when nothing scored.
+    #[test]
+    fn guardrail_scores_serialise_when_set_and_are_absent_when_empty() {
+        let ev = UsageEvent {
+            request_id: "req-scored".into(),
+            guardrail_scores: vec![
+                GuardrailScore {
+                    guardrail_name: "topic-guard".into(),
+                    hook: "input".into(),
+                    direction: "deny".into(),
+                    score: 0.812,
+                    threshold: 0.75,
+                    matched: true,
+                    top_example_index: 2,
+                    embedding_model: "text-embedding-3-small".into(),
+                },
+                GuardrailScore {
+                    guardrail_name: "topic-guard".into(),
+                    hook: "input".into(),
+                    direction: "allow".into(),
+                    score: 0.41,
+                    threshold: 0.6,
+                    matched: false,
+                    top_example_index: 0,
+                    embedding_model: "text-embedding-3-small".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""guardrail_scores""#));
+        assert!(json.contains(r#""guardrail_name":"topic-guard""#));
+        assert!(json.contains(r#""direction":"deny""#));
+        assert!(json.contains(r#""direction":"allow""#));
+        assert!(json.contains(r#""embedding_model":"text-embedding-3-small""#));
+        assert!(json.contains(r#""top_example_index":2"#));
+        // The float reaches the wire as the operator would read it, not as
+        // an f64 widening of an f32 ("0.8119999766349792").
+        assert!(json.contains(r#""score":0.812"#), "{json}");
+        assert!(json.contains(r#""threshold":0.75"#), "{json}");
+        // `matched` is `score >= threshold` in BOTH directions — the allow
+        // entry below its threshold is the one that refused, and it reads
+        // `false`.
+        assert!(json.contains(r#""matched":true"#));
+        assert!(json.contains(r#""matched":false"#));
+
+        // A score is emitted on a request nothing acted on, so it must be
+        // structurally impossible for it to carry content (#153).
+        let ev_json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let keys: Vec<&str> = ev_json["guardrail_scores"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            // Alphabetical: the JSON object is read back through a sorted
+            // map, so this pins the field SET, which is the point.
+            vec![
+                "direction",
+                "embedding_model",
+                "guardrail_name",
+                "hook",
+                "matched",
+                "score",
+                "threshold",
+                "top_example_index",
+            ],
+            "the entry has no field that could hold a text",
+        );
+
+        let empty = serde_json::to_string(&UsageEvent::default()).unwrap();
+        assert!(!empty.contains("guardrail_scores"));
     }
 
     #[test]

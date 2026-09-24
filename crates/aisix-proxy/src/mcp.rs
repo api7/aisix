@@ -17,7 +17,8 @@
 
 use std::time::{Duration, Instant};
 
-use aisix_obs::{AccessLog, UsageEvent};
+use aisix_core::models::McpServerAllowlist;
+use aisix_obs::{AccessLog, McpAccessLog, UsageEvent};
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -33,6 +34,47 @@ use crate::state::ProxyState;
 /// model, and the tool name is caller-controlled (unbounded Prometheus
 /// cardinality, same rule as passthrough's #451 sentinel).
 const MCP_MODEL_LABEL: &str = "mcp";
+
+/// What this request turned out to be, filled in by `dispatch` as it learns
+/// it and read by the access log `serve` writes (#1181). Owned rather than
+/// borrowed because the body it is parsed from is consumed on the way to the
+/// gateway.
+#[derive(Default)]
+struct McpRequestLog {
+    /// JSON-RPC `method`, absent when the body is not a single JSON-RPC
+    /// message (a batch, or unparsable) — never invented. Truncated like
+    /// `tool`: an unknown method is caller-controlled text.
+    method: Option<String>,
+    /// `tools/call` only: the tool name as the caller spelled it, which is
+    /// the namespaced `<server>__<tool>` form on `/mcp`, truncated to
+    /// [`MAX_LOGGED_TOOL_BYTES`].
+    tool: Option<String>,
+    /// `tools/list` only: the upstream and post-ACL tool counts.
+    tools: Option<aisix_mcp::ToolsListCounts>,
+}
+
+/// Cap for the caller-controlled strings on the access line — the same bound
+/// the telemetry sinks apply to the tool name, on a UTF-8 boundary.
+const MAX_LOGGED_TOOL_BYTES: usize = 256;
+
+fn truncate_for_log(value: &str) -> String {
+    let mut end = MAX_LOGGED_TOOL_BYTES.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+impl McpRequestLog {
+    fn fields(&self) -> McpAccessLog<'_> {
+        McpAccessLog {
+            method: self.method.as_deref(),
+            tool: self.tool.as_deref(),
+            tools_total: self.tools.map(|c| c.total),
+            tools_returned: self.tools.map(|c| c.returned),
+        }
+    }
+}
 
 /// Just enough of a JSON-RPC request to tell a tool call apart from the MCP
 /// handshake / discovery methods, recover the called tool's name + arguments,
@@ -86,7 +128,7 @@ struct McpCaller {
     /// The anonymous entry's server allowlist, which caps what this
     /// caller may see and call. `None` when the caller authenticated —
     /// an authenticated principal is bounded by its own grant alone.
-    anonymous_servers: Option<Vec<String>>,
+    anonymous_allowlist: Option<McpServerAllowlist>,
 }
 
 /// Authenticate the caller of a `/mcp` entry.
@@ -120,9 +162,12 @@ async fn resolve_caller(
             // the `${request.api_key.*}` header templates — see the
             // caller without re-authenticating.
             parts.extensions.insert(anon.auth.entry.clone());
+            // Including to the attribution cell, which the extractor path
+            // below reaches on its own (AISIX-Cloud#1571).
+            crate::attribution::note_authenticated(&anon.auth);
             return Ok(McpCaller {
                 auth: anon.auth,
-                anonymous_servers: Some(anon.servers),
+                anonymous_allowlist: Some(anon.allowlist),
             });
         }
     }
@@ -133,7 +178,7 @@ async fn resolve_caller(
         .await?;
     Ok(McpCaller {
         auth,
-        anonymous_servers: None,
+        anonymous_allowlist: None,
     })
 }
 
@@ -152,7 +197,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
     };
     let McpCaller {
         auth,
-        anonymous_servers,
+        anonymous_allowlist,
     } = caller;
     let request = Request::from_parts(parts, body);
     // #698: /mcp emits the same access log + request metrics as every other
@@ -176,14 +221,22 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
     // the caller's team / user labels (the handle is an `Arc` clone).
     let caller_auth = auth.clone();
 
+    // The server a scoped entry named in its PATH, before the body is read
+    // — a caller that hangs up mid-upload still files a row naming what it
+    // addressed (AISIX-Cloud#1571). The method and tool follow once the
+    // body has been parsed, inside `dispatch`.
+    crate::attribution::note_mcp_call(scope.as_deref().unwrap_or_default(), "");
+
+    let mut mcp_log = McpRequestLog::default();
     let response = dispatch(
         auth,
-        anonymous_servers.as_deref(),
+        anonymous_allowlist.as_ref(),
         scope.as_deref(),
         &state,
         request,
         &request_id,
         trace.as_ref(),
+        &mut mcp_log,
     )
     .await;
 
@@ -196,13 +249,17 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
     } else {
         "/mcp"
     };
+    let target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method: method.as_str(),
         path: endpoint,
         status,
         latency: elapsed,
+        duration: elapsed,
         provider: Some("mcp"),
         model: None,
+        upstream_model: target.upstream_model(),
+        provider_key_id: target.provider_key_id(),
         api_key_id: Some(&api_key_id),
         prompt_tokens: None,
         completion_tokens: None,
@@ -217,6 +274,11 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
+        // Complete by the time this runs: with `json_response = true` the
+        // transport awaits the handler's terminal message before returning a
+        // fully-buffered body, so `dispatch` has already read the counts.
+        mcp: Some(mcp_log.fields()),
+        cache: None,
     }
     .emit();
     crate::request_metrics::record(
@@ -234,14 +296,16 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
     response
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     auth: AuthenticatedKey,
-    anonymous_servers: Option<&[String]>,
+    anonymous_allowlist: Option<&McpServerAllowlist>,
     scope: Option<&str>,
     state: &ProxyState,
     request: Request,
     request_id: &str,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    log: &mut McpRequestLog,
 ) -> Response {
     // One snapshot for the whole request: the scoped-server resolution below
     // and the gateway construction further down must see the same resource
@@ -291,6 +355,56 @@ async fn dispatch(
 
     let peek = serde_json::from_slice::<JsonRpcPeek>(&bytes).ok();
 
+    let is_tool_call = peek.as_ref().and_then(|p| p.method.as_deref()) == Some("tools/call");
+    // Recorded from the SAME parse the gates below use, and BEFORE the first
+    // of them: one `/mcp` POST carries every operation, so a request the
+    // protocol-version gate rejects needs the method on its line just as much
+    // as one that reaches the gateway (#1181). The tool name is capped the
+    // way the telemetry sinks cap it — it is caller-controlled and bounded
+    // only by the body limit.
+    log.method = peek
+        .as_ref()
+        .and_then(|p| p.method.as_deref())
+        .map(truncate_for_log);
+    log.tool = is_tool_call
+        .then(|| {
+            peek.as_ref()
+                .and_then(|p| p.params.as_ref())
+                .and_then(|p| p.name.as_deref())
+                .map(truncate_for_log)
+        })
+        .flatten();
+    // The same call, to the request's attribution cell, so a caller that
+    // hangs up while the server is still working still files a row naming
+    // what it called (AISIX-Cloud#1571). Split the way the gateway itself
+    // splits it below, so the cancelled row and the completed one carry the
+    // same two values rather than one carrying the namespaced spelling.
+    // The name as PARSED, not `log.tool` — that one has been through
+    // `truncate_for_log`, and the completed row is built from the untruncated
+    // peek. The event's own sinks cap it.
+    let called_tool = is_tool_call
+        .then(|| {
+            peek.as_ref()
+                .and_then(|p| p.params.as_ref())
+                .and_then(|p| p.name.as_deref())
+        })
+        .flatten();
+    let (cancel_server, cancel_tool) = match (scope, called_tool) {
+        // A scoped entry accepts the bare name AND the namespaced one, and
+        // resolves both to the bare tool — so strip the prefix here too, or
+        // a caller that spells it out files a row naming a tool the
+        // completed row would have called something else.
+        (Some(server), Some(tool)) => (
+            server,
+            aisix_mcp::strip_server_prefix(server, tool).unwrap_or(tool),
+        ),
+        (None, Some(tool)) => tool
+            .split_once(aisix_mcp::TOOL_NAMESPACE_SEPARATOR)
+            .unwrap_or(("", "")),
+        (server, None) => (server.unwrap_or_default(), ""),
+    };
+    crate::attribution::note_mcp_call(cancel_server, cancel_tool);
+
     // Converge the accepted `MCP-Protocol-Version` set before any quota,
     // guardrail, or upstream work (AISIX-Cloud#1148). rmcp's own transport
     // check admits its whole hardcoded KNOWN_VERSIONS list — including
@@ -305,7 +419,6 @@ async fn dispatch(
         return response;
     }
 
-    let is_tool_call = peek.as_ref().and_then(|p| p.method.as_deref()) == Some("tools/call");
     // Resolve the called (server, tool) up front, owned, so it survives the
     // body being consumed when the request is rebuilt. Aggregated: split the
     // namespaced name. Scoped: the server comes from the path and the name is
@@ -408,17 +521,18 @@ async fn dispatch(
             .unwrap_or_default();
         let chat =
             aisix_gateway::ChatFormat::new("", vec![aisix_gateway::ChatMessage::user(args_text)]);
-        // Segment-moderating members (semantic, Bedrock ANONYMIZE) are
-        // consulted through the segment pass below instead — the same
-        // check/moderate split every LLM family uses, so a member is
-        // never consulted (or billed) twice per hook.
+        // Segment-moderating members (custom scripts, Bedrock ANONYMIZE,
+        // Presidio, Lakera, Aliyun AI) are consulted through the segment
+        // pass below instead — the same check/moderate split every LLM
+        // family uses, so a member is never consulted (or billed) twice
+        // per hook.
         let (verdict, hits) =
             aisix_guardrails::Guardrail::check_input_non_segment_observed(chain, &chat).await;
         monitor_hits.extend(hits);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             tracing::warn!(
@@ -444,7 +558,12 @@ async fn dispatch(
                 trace,
                 /* dispatched */ false,
             );
-            return jsonrpc_guardrail_block(rpc_id, "tool call", guardrail_name.as_deref());
+            return jsonrpc_guardrail_block(
+                rpc_id,
+                "tool call",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            );
         }
     }
 
@@ -510,15 +629,20 @@ async fn dispatch(
                         trace,
                         /* dispatched */ false,
                     );
-                    return jsonrpc_guardrail_block(rpc_id, "tool call", None);
+                    return jsonrpc_guardrail_block(
+                        rpc_id,
+                        "tool call",
+                        None,
+                        Some(crate::error::TAG_MASK_WRITEBACK_FAILED),
+                    );
                 }
             }
         }
         _ => bytes,
     };
     // Async segment-moderation pass over the same `params.arguments`
-    // string leaves the sync write-back covers (#1363): semantic rows —
-    // and any other segment-moderating member — mask through here. The
+    // string leaves the sync write-back covers (#1363): every
+    // segment-moderating member decides — and masks — through here. The
     // pass reuses the byte-splice walker, so the scan slots and the
     // write-back slots are the same set by construction (no fourth text
     // shape; the aisix#1027 scan/rewrite divergence is not widened).
@@ -535,7 +659,10 @@ async fn dispatch(
                     );
                     axum::body::Bytes::from(rewritten)
                 }
-                SegmentPassOutcome::Block(guardrail_name) => {
+                SegmentPassOutcome::Block {
+                    guardrail_name,
+                    unavailable,
+                } => {
                     emit_tool_call_usage(
                         state,
                         &snapshot,
@@ -553,7 +680,12 @@ async fn dispatch(
                         trace,
                         /* dispatched */ false,
                     );
-                    return jsonrpc_guardrail_block(rpc_id, "tool call", guardrail_name.as_deref());
+                    return jsonrpc_guardrail_block(
+                        rpc_id,
+                        "tool call",
+                        guardrail_name.as_deref(),
+                        unavailable.as_deref(),
+                    );
                 }
             }
         }
@@ -568,21 +700,37 @@ async fn dispatch(
     // from the key together with the environment/team MCP access policies —
     // so MCP tool access is governed by the same key object as LLM access.
     let acl = {
-        let resolved = aisix_mcp::ToolAcl::resolve(&snapshot, auth.key());
+        let resolved = aisix_mcp::ToolAcl::resolve(&snapshot, &state.mcp_servers, auth.key());
         // The anonymous allowlist is a CEILING on the bound principal,
         // not just the entry gate. Applied here — one layer on the ACL
         // both endpoints share — it constrains `tools/list` and
         // `tools/call` alike, so an anonymous caller cannot reach an
         // unlisted server by naming `<server>__<tool>` on the
         // aggregated endpoint while its scoped entry stays closed.
-        match anonymous_servers {
-            Some(servers) => resolved.narrowed_to_servers(servers),
+        match anonymous_allowlist {
+            Some(allowlist) => resolved.narrowed_to_allowlist(allowlist),
             None => resolved,
         }
     };
+    // Read before the ACL moves into the gateway: which of the two reasons an
+    // empty `tools/list` has is the one thing the counts alone cannot say.
+    let acl_has_grant = acl.has_grant();
+    // The agent's own inbound headers, forwarded to every registered
+    // server whose `forward_client_headers` admits them — an internal
+    // server that authorizes on the end user's own credential rather than
+    // on the gateway's. Every server forwards nothing by default.
+    //
+    // Read off `parts` rather than the request that is about to be rebuilt
+    // below: only `content-length` was ever rewritten, and that header is
+    // never forwarded.
+    let client_headers = parts.headers.clone();
     let gateway = match scope {
         // Same snapshot as the resolution above, so the entry is still there.
-        Some(server) => match aisix_mcp::McpGateway::from_snapshot_scoped(&snapshot, server) {
+        Some(server) => match aisix_mcp::McpGateway::from_snapshot_scoped_for_request(
+            &snapshot,
+            server,
+            Some(&client_headers),
+        ) {
             Some(gateway) => gateway,
             None => {
                 return (
@@ -592,9 +740,13 @@ async fn dispatch(
                     .into_response()
             }
         },
-        None => aisix_mcp::McpGateway::from_snapshot(&snapshot),
+        None => aisix_mcp::McpGateway::from_snapshot_for_request(&snapshot, Some(&client_headers)),
     }
     .with_tool_acl(acl);
+    // Cloned out before the gateway is handed to the transport, which clones
+    // it per session; the slot itself is shared, so this handle sees what the
+    // handler writes.
+    let tools_list_counts = gateway.tools_list_counts();
     // The deployment's body cap replaces rmcp's own 4 MiB default inside
     // the service; the proxy-level read above already enforced the same
     // limit, so the two layers can never disagree.
@@ -608,6 +760,29 @@ async fn dispatch(
         Err(infallible) => match infallible {},
     };
     let latency = started.elapsed();
+
+    // `tools/list` only — nothing else writes the slot. An empty list where
+    // the upstreams did return tools is an ACL misconfiguration the operator
+    // has to be able to see without turning on debug logging; an upstream
+    // that returned nothing is not (and already warns when it failed).
+    if let Some(counts) = tools_list_counts.get().copied() {
+        log.tools = Some(counts);
+        if counts.returned == 0 && counts.total > 0 {
+            if acl_has_grant {
+                tracing::warn!(
+                    api_key_id = auth.entry.id.as_str(),
+                    upstream_tools = counts.total,
+                    "mcp tools/list returned no tools: the caller's effective MCP access rules (allow, deny and anonymous allowlist) exclude every upstream tool"
+                );
+            } else {
+                tracing::warn!(
+                    api_key_id = auth.entry.id.as_str(),
+                    upstream_tools = counts.total,
+                    "mcp tools/list returned no tools: no MCP access policy or key-level grant applies to this caller"
+                );
+            }
+        }
+    }
 
     // Output guardrails + mask write-back: scan the tool result before
     // returning it, rewriting masked spans in place. The response body is
@@ -629,7 +804,10 @@ async fn dispatch(
         };
         if let Some(chain) = &guardrail_chain {
             match apply_output_guardrails(chain, &resp_bytes, &mcp_tool, &mut monitor_hits).await {
-                ToolResultOutcome::Block(guardrail_name) => {
+                ToolResultOutcome::Block {
+                    guardrail_name,
+                    unavailable,
+                } => {
                     emit_tool_call_usage(
                         state,
                         &snapshot,
@@ -651,6 +829,7 @@ async fn dispatch(
                         rpc_id,
                         "tool result",
                         guardrail_name.as_deref(),
+                        unavailable.as_deref(),
                     );
                 }
                 ToolResultOutcome::Allow(Some((rewritten, counts))) => {
@@ -750,9 +929,15 @@ enum SegmentPassOutcome {
     Keep,
     /// Masked replacements were spliced in.
     Rewritten(Vec<u8>),
-    /// A segment-moderating member blocked; the value is the firing
-    /// guardrail's name (`None` for a fail-closed walk failure).
-    Block(Option<String>),
+    /// A segment-moderating member blocked. Carries the firing
+    /// guardrail's name and, when the refusal was an availability failure
+    /// rather than a content decision, its bounded failure tag — the same
+    /// two the `Block` verdict carries, so the `/mcp` tool result says
+    /// which of the two happened just like every other family does.
+    Block {
+        guardrail_name: Option<String>,
+        unavailable: Option<String>,
+    },
 }
 
 /// Segment pass over the request's `params.arguments` string leaves.
@@ -773,7 +958,7 @@ async fn moderate_tool_arguments(
     .await
 }
 
-/// Run the chain's segment-moderating members (semantic rows, Bedrock
+/// Run the chain's segment-moderating members (custom scripts, Bedrock
 /// ANONYMIZE) over the string leaves `pred` selects (#1363): collect
 /// the decoded slots with the same byte-splice walker the write-back
 /// uses, moderate them in ONE chain pass, and splice the positionally
@@ -796,11 +981,15 @@ async fn moderate_selected_segments(
         // Structurally impossible (every caller's body already parsed as
         // JSON) — fail closed rather than let content bypass the pass.
         tracing::warn!(error = %err, "mcp segment collect walk failed; blocking");
-        return SegmentPassOutcome::Block(None);
+        return SegmentPassOutcome::Block {
+            guardrail_name: None,
+            unavailable: Some(crate::error::TAG_UNSCANNABLE_BODY.to_owned()),
+        };
     }
-    if texts.is_empty() {
-        return SegmentPassOutcome::Keep;
-    }
+    // No early return on an empty collect walk — see `redact::moderate_body`.
+    // A `tools/call` with `"arguments": {}` has no string leaves, and
+    // returning `Keep` here meant a guardrail scoped to the MCP server was
+    // never consulted: the tool executed under an unconditional block rule.
     let mut outcome = if input {
         aisix_guardrails::Guardrail::moderate_input_segments(chain, &texts).await
     } else {
@@ -810,7 +999,7 @@ async fn moderate_selected_segments(
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
-        ..
+        unavailable,
     } = outcome.verdict
     {
         tracing::warn!(
@@ -818,7 +1007,10 @@ async fn moderate_selected_segments(
             reason = %reason,
             "guardrail blocked MCP content in the segment pass"
         );
-        return SegmentPassOutcome::Block(guardrail_name);
+        return SegmentPassOutcome::Block {
+            guardrail_name,
+            unavailable,
+        };
     }
     let Some(masked) = outcome.masked else {
         return SegmentPassOutcome::Keep;
@@ -833,7 +1025,10 @@ async fn moderate_selected_segments(
             masked = masked.len(),
             "mcp segment mask drifted from the collect walk; blocking"
         );
-        return SegmentPassOutcome::Block(None);
+        return SegmentPassOutcome::Block {
+            guardrail_name: None,
+            unavailable: Some(crate::error::TAG_MASK_WRITEBACK_FAILED.to_owned()),
+        };
     }
     let mut cursor = 0usize;
     match crate::json_splice::rewrite_string_values(body, pred, |t| {
@@ -851,7 +1046,10 @@ async fn moderate_selected_segments(
         }
         Err(err) => {
             tracing::warn!(error = %err, "mcp segment mask splice failed; blocking");
-            SegmentPassOutcome::Block(None)
+            SegmentPassOutcome::Block {
+                guardrail_name: None,
+                unavailable: Some(crate::error::TAG_MASK_WRITEBACK_FAILED.to_owned()),
+            }
         }
     }
 }
@@ -881,10 +1079,14 @@ fn tool_call_capture(
 
 /// Outcome of the output-hook guardrail pass over an MCP tool result.
 enum ToolResultOutcome {
-    /// Reject the tool result. The inner value is the firing guardrail's
-    /// name, or `None` for a fail-closed block (unparseable body / splice
-    /// failure).
-    Block(Option<String>),
+    /// Reject the tool result. Carries the firing guardrail's name (or
+    /// `None` for a fail-closed block on an unparseable body / splice
+    /// failure) and, when the refusal was an availability failure rather
+    /// than a content decision, its bounded failure tag.
+    Block {
+        guardrail_name: Option<String>,
+        unavailable: Option<String>,
+    },
     /// Release the tool result; `Some` carries the mask-rewritten body
     /// bytes and the per-detector counts.
     Allow(Option<(Vec<u8>, crate::redact::RedactionCounts)>),
@@ -908,9 +1110,28 @@ async fn apply_output_guardrails(
     // `application/json` object; a body that does not parse (e.g. if that ever
     // regressed to SSE framing) must not slip an unscanned tool result past the
     // guardrail — block rather than allow.
+    //
+    // Only when a guardrail would have READ the result and refuses when it
+    // cannot evaluate, though. The chain is resolved once for both
+    // directions, so it is non-empty for a tool call screened on the request
+    // side alone; refusing the RESULT on the strength of an input-hook
+    // attachment would refuse a body that attachment was never going to
+    // inspect. `output_fail_open: true` opts out on the same grounds the
+    // input side honours `fail_open`.
     let value: serde_json::Value = match serde_json::from_slice(response_bytes) {
         Ok(value) => value,
-        Err(_) => return ToolResultOutcome::Block(None),
+        Err(_) if !aisix_guardrails::Guardrail::refuses_unevaluable_output(chain) => {
+            // Released unscanned — a bypass, under the tag the fail-closed
+            // arm below refuses with. See the same pair in `messages.rs`.
+            chain.record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+            return ToolResultOutcome::Allow(None);
+        }
+        Err(_) => {
+            return ToolResultOutcome::Block {
+                guardrail_name: None,
+                unavailable: Some(crate::error::TAG_UNSCANNABLE_BODY.to_owned()),
+            }
+        }
     };
     // A protocol-level error envelope (no `result`) has no tool output to scan.
     let Some(result) = value.get("result") else {
@@ -984,7 +1205,7 @@ async fn apply_output_guardrails(
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
-        ..
+        unavailable,
     } = verdict
     {
         tracing::warn!(
@@ -993,13 +1214,16 @@ async fn apply_output_guardrails(
             reason = %reason,
             "guardrail blocked MCP tool result"
         );
-        return ToolResultOutcome::Block(guardrail_name);
+        return ToolResultOutcome::Block {
+            guardrail_name,
+            unavailable,
+        };
     }
     // Mask write-back over the same surface the scan covers
     // (`tool_result_path`; `name`/`uri` stay untouched — they address a
     // resource; see the scan-loop comment). Two write-back channels
     // compose: the sync per-field redactors (kind=pii mask rules), then
-    // the async segment pass (semantic rows, Bedrock ANONYMIZE) over
+    // the async segment pass (custom scripts, Bedrock ANONYMIZE) over
     // whatever the sync pass produced.
     let mut counts = crate::redact::RedactionCounts::new();
     let mut current: Option<Vec<u8>> = None;
@@ -1023,7 +1247,10 @@ async fn apply_output_guardrails(
                     error = %err,
                     "mcp output mask splice failed; blocking tool result",
                 );
-                return ToolResultOutcome::Block(None);
+                return ToolResultOutcome::Block {
+                    guardrail_name: None,
+                    unavailable: Some(crate::error::TAG_MASK_WRITEBACK_FAILED.to_owned()),
+                };
             }
         }
     }
@@ -1041,8 +1268,14 @@ async fn apply_output_guardrails(
         {
             SegmentPassOutcome::Keep => {}
             SegmentPassOutcome::Rewritten(bytes) => current = Some(bytes),
-            SegmentPassOutcome::Block(guardrail_name) => {
-                return ToolResultOutcome::Block(guardrail_name)
+            SegmentPassOutcome::Block {
+                guardrail_name,
+                unavailable,
+            } => {
+                return ToolResultOutcome::Block {
+                    guardrail_name,
+                    unavailable,
+                }
             }
         }
     }
@@ -1123,9 +1356,18 @@ fn emit_tool_call_usage(
         guardrail_enforced_hits: guardrail_chain
             .map(|c| c.enforced_hits())
             .unwrap_or_default(),
+        guardrail_scores: guardrail_chain.map(|c| c.scores()).unwrap_or_default(),
+        guardrail_bypassed_reason: guardrail_chain
+            .and_then(|c| c.bypass_reason())
+            .unwrap_or_default(),
         ..Default::default()
     };
-    crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
+    crate::usage_attr::apply_caller_identity(
+        &mut event,
+        auth.jwt.as_ref(),
+        auth.key().user_id.as_deref(),
+        auth.key().user_name.as_deref(),
+    );
     crate::usage_attr::apply_auth_type(&mut event, auth);
     // A tool call resolves neither a model nor a ProviderKey, so the
     // attribution labels are the placeholder — present so this family has
@@ -1137,7 +1379,7 @@ fn emit_tool_call_usage(
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "mcp",
+        crate::operation::MCP,
         event,
         aisix_obs::UsageEventLabels::default(),
         content,
@@ -1218,8 +1460,9 @@ fn jsonrpc_guardrail_block(
     id: Option<serde_json::Value>,
     side: &str,
     guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
 ) -> Response {
-    let message = crate::error::guardrail_block_message(side, guardrail_name);
+    let message = crate::error::guardrail_block_message(side, guardrail_name, unavailable);
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id.unwrap_or(serde_json::Value::Null),
@@ -1253,6 +1496,7 @@ mod tests {
             request_id: Default::default(),
             url_rewrites: Vec::new(),
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }
@@ -1849,6 +2093,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_anonymous_entry_gate_reads_the_id_form_when_it_is_present() {
+        // `servers` names `kb`, `server_ids` names `docs`'s id. The id
+        // side decides both ways: `docs` opens and `kb` stays closed.
+        let router = router_with(snapshot_with_anonymous(serde_json::json!({
+            "servers": ["kb"],
+            "server_ids": ["mcp-docs"],
+        })));
+        for (server, expected) in [("docs", StatusCode::OK), ("kb", StatusCode::UNAUTHORIZED)] {
+            let response = router
+                .clone()
+                .oneshot(from_ip(
+                    scoped_request(server, None, "initialize", serde_json::json!({})),
+                    "10.1.2.3",
+                ))
+                .await
+                .expect("router responds");
+            assert_eq!(response.status(), expected, "/mcp/{server}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_id_spelled_anonymous_entry_gate_follows_a_rename() {
+        // Same id, new name, settings document untouched: anonymous
+        // access moves to the server's new namespace.
+        let snapshot = snapshot_with_anonymous(serde_json::json!({
+            "servers": ["docs"],
+            "server_ids": ["mcp-docs"],
+        }));
+        insert_mcp_server(&snapshot, "mcp-docs", "docs-v2", true);
+        let router = router_with(snapshot);
+        for (server, expected) in [
+            ("docs-v2", StatusCode::OK),
+            ("docs", StatusCode::UNAUTHORIZED),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(from_ip(
+                    scoped_request(server, None, "initialize", serde_json::json!({})),
+                    "10.1.2.3",
+                ))
+                .await
+                .expect("router responds");
+            assert_eq!(response.status(), expected, "/mcp/{server}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_unresolvable_id_list_closes_every_scoped_anonymous_entry() {
+        // An empty array is the authoritative "no server", even beside a
+        // name list that still names one — and an id matching no
+        // registered server offers nothing rather than everything.
+        for ids in [serde_json::json!([]), serde_json::json!(["mcp-gone"])] {
+            let router = router_with(snapshot_with_anonymous(serde_json::json!({
+                "servers": ["docs", "kb"],
+                "server_ids": ids,
+                "aggregate_entry": true,
+            })));
+            for server in ["docs", "kb"] {
+                let response = router
+                    .clone()
+                    .oneshot(from_ip(
+                        scoped_request(server, None, "initialize", serde_json::json!({})),
+                        "10.1.2.3",
+                    ))
+                    .await
+                    .expect("router responds");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{ids}: /mcp/{server} must stay closed"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_allowlist_that_names_nothing_closes_the_aggregated_entry_too() {
+        // `aggregate_entry` cannot stand in for the allowlist: an open
+        // door onto an empty room reads as enabled, serves no tool, and
+        // suppresses the `WWW-Authenticate` hint a standard MCP client
+        // follows to sign in. `servers` is required non-empty on both
+        // schemas for that reason, so only `server_ids: []` can reach the
+        // state — and it closes with it.
+        let router = router_with(snapshot_with_anonymous(serde_json::json!({
+            "servers": ["docs", "kb"],
+            "server_ids": [],
+            "aggregate_entry": true,
+        })));
+        let response = router
+            .oneshot(from_ip(initialize_request(None), "10.1.2.3"))
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // An allowlist that names a server the gateway cannot resolve is
+        // NOT the same state: it is a transient the operator did not ask
+        // for, and the aggregated entry keeps its pre-existing behavior
+        // there (open, under a ceiling that admits nothing) for the name
+        // spelling as much as the id one.
+        let router = router_with(snapshot_with_anonymous(serde_json::json!({
+            "servers": ["docs"],
+            "server_ids": ["mcp-gone"],
+            "aggregate_entry": true,
+        })));
+        let response = router
+            .oneshot(from_ip(initialize_request(None), "10.1.2.3"))
+            .await
+            .expect("router responds");
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn anonymous_aggregated_entry_is_opt_in() {
         // Listing a server opens `/mcp/docs`, never the aggregated
         // endpoint: that one is the OAuth-discovery entry and carries
@@ -2078,6 +2434,155 @@ mod tests {
         );
     }
 
+    /// A caller that hangs up while the call is still being processed.
+    ///
+    /// `/mcp` names no model, so before AISIX-Cloud#1571 the cancel guard
+    /// skipped it entirely and the call left a `499` access-log line with no
+    /// usage row at all — on a surface where the row is the only record that
+    /// the caller's key spent an upstream's time. The row it files now
+    /// carries what this family is attributed by: the server and the tool,
+    /// split from the same peek the completed row is built from.
+    ///
+    /// The request is parked in the input-guardrail scan, which runs after
+    /// that peek and before any upstream contact.
+    #[tokio::test]
+    async fn a_cancelled_tool_call_files_a_row_naming_the_tool() {
+        use aisix_obs::{UsageEvent, UsageSink};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let scanner = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&scanner)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let handle = SnapshotHandle::new(snapshot_with_key());
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle.clone(), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let router = build_router(state);
+        seed_mcp_server(&handle, "mcp-ghost", "ghost");
+        seed_guardrail_with_attachment(
+            &handle,
+            &format!(
+                r#"{{"name":"slow-input","kind":"azure_content_safety_text_moderation","hook_point":"input","endpoint":"{}","api_key":"k"}}"#,
+                scanner.uri()
+            ),
+            r#"{"guardrail_id":"g1","scope_type":"mcp_server","scope_id":"mcp-ghost","priority":50}"#,
+        );
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            router.oneshot(tools_call_request()),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the call answered on its own — this is not modelling a cancel",
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a cancelled /mcp call emitted no usage event")
+            .expect("sender dropped without sending");
+        assert_eq!(event.status_code, crate::CLIENT_CLOSED_REQUEST, "{event:?}");
+        assert_eq!(event.error_class, "client_disconnected", "{event:?}");
+        assert_eq!(event.operation, "mcp");
+        assert_eq!(event.inbound_protocol, "mcp");
+        assert_eq!(event.api_key_id, "ak-1");
+        // Split the way the completed row splits it, so the two are
+        // comparable rather than one carrying the namespaced spelling.
+        assert_eq!(event.mcp_server_name, "ghost");
+        assert_eq!(event.mcp_tool_name, "tool");
+        assert_eq!(event.requested_model, "", "this surface names no model");
+        assert_eq!(event.model_id, "");
+        assert_eq!(event.prompt_tokens, 0);
+        assert!(rx.try_recv().is_err(), "one call, one row");
+    }
+
+    /// The same cancel on the SCOPED entry, where the caller may spell the
+    /// tool either way.
+    ///
+    /// `/mcp/ghost` accepts `tool` and `ghost__tool` alike and resolves both
+    /// to the bare name, so a cancelled row has to resolve it the same way —
+    /// otherwise one request's two records name two different tools, and a
+    /// per-tool count splits by how each caller happened to spell it.
+    #[tokio::test]
+    async fn a_cancelled_scoped_call_files_the_tool_under_its_bare_name() {
+        use aisix_obs::{UsageEvent, UsageSink};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let scanner = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&scanner)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let handle = SnapshotHandle::new(snapshot_with_key());
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle.clone(), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let router = build_router(state);
+        seed_mcp_server(&handle, "mcp-ghost", "ghost");
+        seed_guardrail_with_attachment(
+            &handle,
+            &format!(
+                r#"{{"name":"slow-input","kind":"azure_content_safety_text_moderation","hook_point":"input","endpoint":"{}","api_key":"k"}}"#,
+                scanner.uri()
+            ),
+            r#"{"guardrail_id":"g1","scope_type":"mcp_server","scope_id":"mcp-ghost","priority":50}"#,
+        );
+
+        // The namespaced spelling, on the scoped entry that also accepts the
+        // bare one.
+        let req = HttpRequest::post("/mcp/ghost")
+            .header("host", "mcp.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": { "name": "ghost__tool", "arguments": {} }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(500), router.oneshot(req)).await;
+        assert!(
+            outcome.is_err(),
+            "the call answered on its own — this is not modelling a cancel",
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a cancelled scoped /mcp call emitted no usage event")
+            .expect("sender dropped without sending");
+        assert_eq!(event.status_code, crate::CLIENT_CLOSED_REQUEST, "{event:?}");
+        assert_eq!(event.mcp_server_name, "ghost");
+        assert_eq!(
+            event.mcp_tool_name, "tool",
+            "the namespaced spelling must resolve to the same tool the completed row names",
+        );
+    }
+
     #[tokio::test]
     async fn anonymous_tool_call_is_marked_on_the_usage_event() {
         use aisix_obs::{UsageEvent, UsageSink};
@@ -2217,7 +2722,7 @@ mod tests {
         monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
     ) -> Option<Option<String>> {
         match apply_output_guardrails(chain, response_bytes, tool, monitor_hits).await {
-            ToolResultOutcome::Block(name) => Some(name),
+            ToolResultOutcome::Block { guardrail_name, .. } => Some(guardrail_name),
             ToolResultOutcome::Allow(_) => None,
         }
     }
@@ -2266,7 +2771,7 @@ mod tests {
             other => panic!(
                 "expected a rewritten Allow, got {}",
                 match other {
-                    ToolResultOutcome::Block(_) => "Block",
+                    ToolResultOutcome::Block { .. } => "Block",
                     ToolResultOutcome::Allow(None) => "Allow(None)",
                     ToolResultOutcome::Allow(_) => unreachable!(),
                 }
@@ -2384,7 +2889,10 @@ mod tests {
         let body = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"forbidden-token"}]}}"#;
         assert!(matches!(
             apply_output_guardrails(&chain, body, "report", &mut Vec::new()).await,
-            ToolResultOutcome::Block(Some(_)),
+            ToolResultOutcome::Block {
+                guardrail_name: Some(_),
+                ..
+            },
         ));
 
         let hits = chain.enforced_hits();
@@ -2634,6 +3142,91 @@ mod tests {
         );
     }
 
+    /// The mirror of the `/v1/messages` gate on the response side: `/mcp`
+    /// resolves ONE chain for both directions, so a tool call screened on
+    /// the request side alone still arrives here with a non-empty chain.
+    /// An unparseable tool result must not be refused on the strength of a
+    /// row that only ever reads the arguments. Fails on `a456ab71` — the
+    /// parse arm blocked unconditionally there.
+    #[tokio::test]
+    async fn unparseable_tool_result_with_an_input_only_chain_is_allowed() {
+        let sse_body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"result\":{}}\n\n";
+
+        // Explicitly input-only: `INPUT_GUARD` omits `hook_point`, whose
+        // default is `both`, so it would read the result too.
+        const INPUT_ONLY_GUARD: &str = r#"{"name":"mcp-input-only","kind":"keyword","hook_point":"input","patterns":[{"kind":"literal","value":"forbidden-token"}]}"#;
+        let input_only = env_chain_with(INPUT_ONLY_GUARD);
+        assert!(!input_only.is_empty(), "the chain must be non-empty");
+        assert!(
+            output_guardrail_block(&input_only, sse_body, "echo", &mut Vec::new())
+                .await
+                .is_none(),
+            "an input-hook row never reads the tool result, so it cannot refuse it"
+        );
+
+        // An output row that asked to fail open is likewise not a reason to
+        // refuse. `kind: keyword` has no `output_fail_open` of its own, so
+        // the row-level `fail_open` governs both of its hooks.
+        const OUTPUT_OPEN_GUARD: &str = r#"{"name":"mcp-output-open","kind":"keyword","hook_point":"output","fail_open":true,"patterns":[{"kind":"literal","value":"forbidden-token"}]}"#;
+        let output_open = env_chain_with(OUTPUT_OPEN_GUARD);
+        assert!(!output_open.is_empty(), "the chain must be non-empty");
+        assert!(
+            output_guardrail_block(&output_open, sse_body, "echo", &mut Vec::new())
+                .await
+                .is_none(),
+            "a row that asked to fail open must not refuse an unparseable result"
+        );
+
+        // The output-hook row still fails closed on the same bytes.
+        let output = env_chain_with(OUTPUT_GUARD);
+        assert!(
+            output_guardrail_block(&output, sse_body, "echo", &mut Vec::new())
+                .await
+                .is_some(),
+            "an output-hook row must still fail closed"
+        );
+    }
+
+    /// Releasing an unparseable tool result under a fail-open OUTPUT row is
+    /// a bypass — the client got tool output nothing screened — and it is
+    /// recorded under the same tag the fail-closed direction refuses with.
+    ///
+    /// The input-only chain is the control: nothing in it was ever going to
+    /// read the result, so releasing it bypassed nothing and the field must
+    /// stay empty. Tagging that case would make the field fire on results
+    /// that were never going to be screened.
+    #[tokio::test]
+    async fn releasing_an_unparseable_tool_result_records_a_bypass_only_when_a_row_read_it() {
+        let sse_body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"result\":{}}\n\n";
+
+        const OUTPUT_OPEN_GUARD: &str = r#"{"name":"mcp-output-open","kind":"keyword","hook_point":"output","fail_open":true,"patterns":[{"kind":"literal","value":"forbidden-token"}]}"#;
+        let output_open = env_chain_with(OUTPUT_OPEN_GUARD);
+        assert!(
+            output_guardrail_block(&output_open, sse_body, "echo", &mut Vec::new())
+                .await
+                .is_none(),
+            "premise: a fail-open output row must release the result"
+        );
+        assert_eq!(
+            output_open.bypass_reason().as_deref(),
+            Some(crate::error::TAG_UNSCANNABLE_BODY),
+        );
+
+        const INPUT_ONLY_GUARD: &str = r#"{"name":"mcp-input-only","kind":"keyword","hook_point":"input","patterns":[{"kind":"literal","value":"forbidden-token"}]}"#;
+        let input_only = env_chain_with(INPUT_ONLY_GUARD);
+        assert!(
+            output_guardrail_block(&input_only, sse_body, "echo", &mut Vec::new())
+                .await
+                .is_none(),
+            "premise: an input-only row must release the result"
+        );
+        assert_eq!(
+            input_only.bypass_reason(),
+            None,
+            "nothing in this chain reads the result, so nothing was bypassed",
+        );
+    }
+
     #[tokio::test]
     async fn output_guardrail_scans_decoded_text_not_envelope() {
         use aisix_guardrails::{LiveGuardrailIndex, RequestContext};
@@ -2681,6 +3274,7 @@ mod tests {
             Some(serde_json::json!(42)),
             "tool result",
             Some("mcp-output-guard"),
+            None,
         );
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(

@@ -186,10 +186,6 @@ describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () =
     seed = new SeedClient(etcd, app.etcdPrefix);
     upstream = await startJobsUpstream();
 
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: ["*"],
-    });
     const pk = await seed.createProviderKey({
       display_name: "jobs-e2e-pk",
       secret: "sk-upstream-jobs",
@@ -220,6 +216,10 @@ describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () =
       provider: "openai",
       model_name: "gpt-4o",
       provider_key_id: hdrPk.id,
+    });
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
     });
 
     // Gate on the DP snapshot, not the store: /v1/models only lists the

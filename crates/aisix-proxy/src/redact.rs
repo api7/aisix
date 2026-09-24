@@ -19,8 +19,9 @@
 //! .redacted_entity_counts`.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
-use aisix_gateway::{ChatChunk, ChatFormat, ChatResponse};
+use aisix_gateway::{ChatChunk, ChatFormat, ChatResponse, Role};
 use aisix_guardrails::Guardrail;
 use serde_json::Value;
 
@@ -35,13 +36,45 @@ pub fn merge_counts(into: &mut RedactionCounts, from: RedactionCounts) {
     }
 }
 
-/// Which side's redactor to run. The two sides can be configured
-/// independently (`hook_point`), so every JSON-walking helper takes the
-/// direction rather than hardcoding one.
+/// Which side's redactor to run, and — on the request side — which part of
+/// the conversation the text belongs to. The two sides can be configured
+/// independently (`hook_point`), so every JSON-walking helper takes this
+/// rather than hardcoding one.
+///
+/// The request side splits because a guardrail row may carry
+/// `input_messages: latest_turn`, which narrows it to the part of the
+/// conversation the model has not answered yet. Carrying the split in this
+/// type rather than in a parallel argument is what makes it total: every
+/// slot a walker offers has to name which half it is in, and the compiler
+/// asks the question at each new one.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
+    /// Request text inside the latest-turn window: this turn's user
+    /// message and the tool results answering it. Every input guardrail
+    /// reads it. Also the direction a caller names for a whole-request
+    /// pass, and the only one the single-input surfaces ever use.
     Input,
+    /// Request text the model has already replied to, plus every system
+    /// message. Only rows left on `input_messages: all` read it.
+    InputHistory,
     Output,
+}
+
+impl Direction {
+    /// Request side, either window.
+    pub fn is_input(self) -> bool {
+        matches!(self, Direction::Input | Direction::InputHistory)
+    }
+
+    /// The request-side direction for a slot, given whether it sits inside
+    /// the latest-turn window.
+    fn input_window(in_latest_turn: bool) -> Self {
+        if in_latest_turn {
+            Direction::Input
+        } else {
+            Direction::InputHistory
+        }
+    }
 }
 
 fn redact_str(
@@ -50,7 +83,8 @@ fn redact_str(
     text: &str,
 ) -> Option<aisix_guardrails::Redaction> {
     match dir {
-        Direction::Input => chain.redact_input_text(text),
+        Direction::Input => chain.redact_input_text_in_turn(text, true),
+        Direction::InputHistory => chain.redact_input_text_in_turn(text, false),
         Direction::Output => chain.redact_output_text(text),
     }
 }
@@ -85,23 +119,26 @@ fn redact_str(
 /// counts and reports the provider's entity counts instead.
 const SEGMENT_APPLY_MARKER: &str = "__segment_apply__";
 
-/// Pass-1 probe: records every text slot the walker offers. Never
-/// rewrites, so the body is bit-identical after the collect walk.
+/// Pass-1 probe: records every text slot the walker offers, with the
+/// latest-turn window each one belongs to. Never rewrites, so the body is
+/// bit-identical after the collect walk.
 #[derive(Default)]
 struct SegmentCollector {
-    texts: std::sync::Mutex<Vec<String>>,
+    texts: std::sync::Mutex<Vec<(String, bool)>>,
 }
 
 impl SegmentCollector {
-    fn take(&self) -> Vec<String> {
-        std::mem::take(&mut self.texts.lock().expect("collector poisoned"))
+    /// The collected slots and their window flags, positionally aligned.
+    fn take(&self) -> (Vec<String>, Vec<bool>) {
+        let mut slots = self.texts.lock().expect("collector poisoned");
+        std::mem::take(&mut *slots).into_iter().unzip()
     }
 
-    fn record(&self, text: &str) -> Option<aisix_guardrails::Redaction> {
+    fn record(&self, text: &str, in_latest_turn: bool) -> Option<aisix_guardrails::Redaction> {
         self.texts
             .lock()
             .expect("collector poisoned")
-            .push(text.to_owned());
+            .push((text.to_owned(), in_latest_turn));
         None
     }
 }
@@ -117,10 +154,20 @@ impl Guardrail for SegmentCollector {
         true
     }
     fn redact_input_text(&self, text: &str) -> Option<aisix_guardrails::Redaction> {
-        self.record(text)
+        self.record(text, true)
+    }
+    // The window arrives here and nowhere else: `redact_str` routes every
+    // request-side slot through this method, so overriding the plain one
+    // alone would collect the text and lose which half it came from.
+    fn redact_input_text_in_turn(
+        &self,
+        text: &str,
+        in_latest_turn: bool,
+    ) -> Option<aisix_guardrails::Redaction> {
+        self.record(text, in_latest_turn)
     }
     fn redact_output_text(&self, text: &str) -> Option<aisix_guardrails::Redaction> {
-        self.record(text)
+        self.record(text, true)
     }
 }
 
@@ -204,6 +251,43 @@ pub async fn moderate_body(
     non_segment_verdict: aisix_guardrails::GuardrailVerdict,
     counts_out: &mut RedactionCounts,
     monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+    walk: impl FnMut(&dyn Guardrail) -> RedactionCounts,
+) -> aisix_guardrails::GuardrailVerdict {
+    moderate_body_scanning(
+        chain,
+        dir,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        Vec::new(),
+        walk,
+    )
+    .await
+}
+
+/// [`moderate_body`] plus text that must be SCANNED but must never be
+/// written back.
+///
+/// The walker is both the collect pass and the apply pass, so a slot it
+/// offers is a slot the provider may rewrite. That makes it the wrong place
+/// for a signed Anthropic `thinking` block: the block has to reach the
+/// screening call (an operator's block rule must still fire on it) and must
+/// come back byte-identical (#1104). `scan_only` is appended after the
+/// collected slots and truncated off the masked reply before the apply
+/// walk, so those texts are judged and never rewritten.
+///
+/// Without it the segment kinds — `bedrock`, `presidio`, `lakera`,
+/// `aliyun_ai_guardrail`, `custom` — never saw thinking content at all on
+/// `/v1/messages`: they answer `Allow` from `check_input_non_segment` by
+/// design and take their real verdict from this pass, so a block policy on
+/// any of them was bypassable by moving the text into a thinking block.
+pub async fn moderate_body_scanning(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+    scan_only: Vec<String>,
     mut walk: impl FnMut(&dyn Guardrail) -> RedactionCounts,
 ) -> aisix_guardrails::GuardrailVerdict {
     if non_segment_verdict.is_block() || !chain.moderates_segments() {
@@ -211,17 +295,41 @@ pub async fn moderate_body(
     }
     let collector = SegmentCollector::default();
     walk(&collector);
-    let texts = collector.take();
-    if texts.is_empty() {
-        return non_segment_verdict;
-    }
+    let (mut texts, mut in_latest_turn) = collector.take();
+    // Everything past here is judged but unwritable; the apply walk only
+    // ever offers the first `writable` slots back.
+    let writable = texts.len();
+    texts.extend(scan_only);
+    // The scan-only tail is Anthropic signed reasoning — assistant content,
+    // and so outside every latest-turn window by construction.
+    in_latest_turn.resize(texts.len(), false);
+    // The pass runs even with zero collected slots. "Nothing to scan" is
+    // not "nothing to decide": a segment-moderating member may hold a
+    // verdict that does not depend on the text (a `kind: custom` policy
+    // script), and skipping the pass turned an operator's block rule into
+    // a silent allow on any request whose scannable slots were all empty.
+    // Every member that needs a remote call short-circuits empty input
+    // itself (bedrock/lakera/presidio/aliyun all refuse empty content), so
+    // consulting the chain here costs no provider round-trip.
     let mut outcome = match dir {
-        Direction::Input => chain.moderate_input_segments(&texts).await,
+        Direction::Input | Direction::InputHistory => {
+            chain
+                .moderate_input_segments_in_turn(&texts, &in_latest_turn)
+                .await
+        }
         Direction::Output => chain.moderate_output_segments(&texts).await,
     };
     monitor_hits_out.append(&mut outcome.monitor_hits);
     if !outcome.verdict.is_block() {
-        if let Some(masked) = outcome.masked {
+        if let Some(mut masked) = outcome.masked {
+            // Drop the scan-only tail. The applier is positional and the
+            // walk offers only the first `writable` slots, so slots 0..n
+            // land correctly either way — this is not what keeps the signed
+            // block unwritten (the walk never offering it is). What it
+            // buys: without it `warn_if_misaligned` fires on every request
+            // that carries a thinking block, reporting a drift that did not
+            // happen and training operators to ignore a real one.
+            masked.truncate(writable);
             let applier = SegmentApplier::new(masked);
             // Marker counts are plumbing (see SEGMENT_APPLY_MARKER) —
             // discard them; the provider counts below are the real ones.
@@ -342,22 +450,29 @@ pub fn redact_json_encoded(
 /// Mask the request messages of a normalised [`ChatFormat`] in place:
 /// the flat `content` string and the `text` field of typed content
 /// blocks — the same surface `check_input` scans (`message_scan_text`).
-/// Tool-call arguments replayed in history are covered too (they reach
-/// the upstream verbatim). Returns the merged counts (empty = untouched).
+/// Tool-call arguments and replayed `reasoning_content` are covered too
+/// (both reach the upstream verbatim through `extra`). Returns the merged
+/// counts (empty = untouched).
+///
+/// This list and `message_scan_text`'s must stay equal: a slot the scan
+/// reads but this does not is a Mask rule that reports a hit and then
+/// dispatches the match unmasked.
 pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> RedactionCounts {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_input() {
         return counts;
     }
-    for msg in &mut req.messages {
+    let window_from = chat_latest_turn_start(&req.messages);
+    for (i, msg) in req.messages.iter_mut().enumerate() {
+        let dir = Direction::input_window(i >= window_from && msg.role != Role::System);
         if let Some(content) = msg.content.as_mut() {
-            apply_to_string(chain, Direction::Input, content, &mut counts);
+            apply_to_string(chain, dir, content, &mut counts);
         }
         if let Some(blocks) = msg.content_blocks.as_mut() {
             for block in blocks {
                 if block.get("type").and_then(Value::as_str) == Some("text") {
                     if let Some(text) = block.get_mut("text") {
-                        apply_to_value_string(chain, Direction::Input, text, &mut counts);
+                        apply_to_value_string(chain, dir, text, &mut counts);
                     }
                 }
             }
@@ -365,10 +480,36 @@ pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> Redact
         // History-replay tool calls: arguments travel to the upstream
         // verbatim through `extra`, so mask them like fresh content.
         if let Some(tool_calls) = msg.extra.get_mut("tool_calls") {
-            redact_tool_call_arguments(chain, Direction::Input, tool_calls, &mut counts);
+            redact_tool_call_arguments(chain, dir, tool_calls, &mut counts);
+        }
+        // Same reason for replayed reasoning: `reasoning_content` is the
+        // canonical slot the provider overrides normalise every vendor
+        // spelling onto, and it rides `extra` to the upstream untouched.
+        // Nothing signs it on this wire, so masking it is safe.
+        if let Some(reasoning @ Value::String(_)) = msg.extra.get_mut("reasoning_content") {
+            apply_to_value_string(chain, dir, reasoning, &mut counts);
         }
     }
     counts
+}
+
+/// Index of the first message inside the latest-turn window: one past the
+/// last assistant message, or 0 when the request carries none.
+///
+/// The wire-level half of `aisix_guardrails::latest_turn_view`, which
+/// answers the same question for the CHECK pass over the parsed
+/// `ChatFormat`. Both are pinned per protocol by the e2e cases — this one
+/// has to exist separately because the mask walkers rewrite raw slots and
+/// have no parsed view to index against.
+fn chat_latest_turn_start(messages: &[aisix_gateway::ChatMessage]) -> usize {
+    let answered = messages
+        .iter()
+        .rposition(|m| m.role != Role::System)
+        .unwrap_or(0);
+    messages[..answered]
+        .iter()
+        .rposition(|m| m.role == Role::Assistant)
+        .map_or(0, |i| i + 1)
 }
 
 /// Mask `function.arguments` (JSON-encoded string) on each element of an
@@ -402,22 +543,67 @@ pub fn redact_anthropic_request(chain: &dyn Guardrail, body: &mut Value) -> Reda
     if !chain.redacts_input() {
         return counts;
     }
+    // The top-level `system` prompt is never in the window.
     if let Some(system) = body.get_mut("system") {
-        redact_anthropic_content(chain, Direction::Input, system, &mut counts);
+        redact_anthropic_content(chain, Direction::InputHistory, system, &mut counts);
     }
     if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
-        for msg in messages {
+        let window_from = anthropic_latest_turn_start(messages);
+        for (i, msg) in messages.iter_mut().enumerate() {
+            // A `role: "system"` entry is not in the Anthropic spec but
+            // Claude Code sends it (#597); it is a system message wherever
+            // it sits, so it stays out of the window like the field above.
+            let is_system = msg.get("role").and_then(Value::as_str) == Some("system");
+            let dir = Direction::input_window(i >= window_from && !is_system);
             if let Some(content) = msg.get_mut("content") {
-                redact_anthropic_content(chain, Direction::Input, content, &mut counts);
+                redact_anthropic_content(chain, dir, content, &mut counts);
             }
         }
     }
     counts
 }
 
+/// Index of the first `messages[]` entry inside the latest-turn window on
+/// the Anthropic wire: one past the last `role: "assistant"` entry.
+///
+/// A tool-loop turn is an assistant message carrying `tool_use` blocks,
+/// so the boundary lands where the parsed view puts it — the `tool_result`
+/// blocks answering it ride the FINAL user message, which is in the window
+/// whole. A TRAILING assistant message is a prefill and never closes the
+/// window; see `aisix_guardrails::latest_turn_view`.
+fn anthropic_latest_turn_start(messages: &[Value]) -> usize {
+    let answered = messages
+        .iter()
+        .rposition(|m| m.get("role").and_then(Value::as_str) != Some("system"))
+        .unwrap_or(0);
+    messages[..answered]
+        .iter()
+        .rposition(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        .map_or(0, |i| i + 1)
+}
+
 /// Anthropic `content` is either a bare string or an array of typed
 /// blocks. Rewrites `text` blocks, `tool_result` nested content, and
 /// `tool_use` input objects; leaves image/document blocks alone.
+///
+/// **Deliberate exception to "no write-back channel means block".** A
+/// `thinking` / `redacted_thinking` block is signed by the provider, so it
+/// can be neither rewritten (the signature would no longer verify and the
+/// upstream rejects the replayed turn) nor, per the ruling on #1104,
+/// blocked. A mask-action hit inside one is FORWARDED UNCHANGED, for every
+/// guardrail kind — including the kinds that otherwise turn an unmaskable
+/// result into a blocking verdict.
+///
+/// Why refusing it buys nothing: the same bytes already left the gateway.
+/// Generated reasoning is out of the OUTPUT scope by design, so this block
+/// is one the gateway itself handed to the client, unmasked, on the
+/// previous turn. Blocking the replay protects nothing that was not already
+/// disclosed, and it denies service permanently, because a client following
+/// Anthropic's extended-thinking protocol re-sends the block every turn.
+///
+/// BLOCK-action rules are unaffected and still fire on thinking content —
+/// the scan reads it (`parse_inbound_request_for_scan`); only the mask has
+/// nowhere to write.
 fn redact_anthropic_content(
     chain: &dyn Guardrail,
     dir: Direction,
@@ -452,6 +638,35 @@ fn redact_anthropic_content(
     }
 }
 
+/// The plaintext of every signed reasoning block in an Anthropic request,
+/// for SCAN-ONLY submission to the segment pass
+/// ([`moderate_body_scanning`]).
+///
+/// Deliberately not part of `redact_anthropic_content`'s walk: that walk is
+/// also the write-back path, and a signed `thinking` block must be
+/// forwarded byte-identical (#1104). Collecting it here is what lets a
+/// segment-moderating kind — `bedrock`, `presidio`, `lakera`,
+/// `aliyun_ai_guardrail`, `custom` — judge the text without being handed a
+/// slot it could rewrite.
+///
+/// `redacted_thinking` carries only provider ciphertext under `data`, so
+/// there is no plaintext in it to screen.
+pub fn anthropic_signed_reasoning_texts(body: &Value) -> Vec<String> {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .map(|msgs| {
+            msgs.iter()
+                .filter_map(|m| m.get("content").and_then(Value::as_array))
+                .flatten()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("thinking"))
+                .filter_map(|b| b.get("thinking").and_then(Value::as_str))
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Mask an Anthropic-native `/v1/messages` RESPONSE body in place (the
 /// non-streaming passthrough JSON): top-level `content` blocks (`text` +
 /// `tool_use` input).
@@ -475,21 +690,67 @@ pub fn redact_responses_request(chain: &dyn Guardrail, body: &mut Value) -> Reda
     if !chain.redacts_input() {
         return counts;
     }
+    // `instructions` is this API's system prompt — never in the window.
     if let Some(instructions) = body.get_mut("instructions") {
-        apply_to_value_string(chain, Direction::Input, instructions, &mut counts);
+        apply_to_value_string(chain, Direction::InputHistory, instructions, &mut counts);
     }
     match body.get_mut("input") {
+        // A bare-string `input` is the whole current turn.
         Some(v @ Value::String(_)) => {
             apply_to_value_string(chain, Direction::Input, v, &mut counts)
         }
         Some(Value::Array(items)) => {
-            for item in items {
-                redact_responses_item(chain, Direction::Input, item, &mut counts);
+            let window_from = responses_latest_turn_start(items);
+            for (i, item) in items.iter_mut().enumerate() {
+                let dir =
+                    Direction::input_window(i >= window_from && !responses_item_is_system(item));
+                redact_responses_item(chain, dir, item, &mut counts);
             }
         }
         _ => {}
     }
     counts
+}
+
+/// Index of the first `input[]` item inside the latest-turn window on the
+/// Responses wire: one past the last assistant-side item.
+///
+/// Assistant-side is broader than `role: "assistant"` here, because this
+/// API spells a model turn as a typed item with no role at all — see
+/// [`responses_item_is_assistant`].
+fn responses_latest_turn_start(items: &[Value]) -> usize {
+    let answered = items
+        .iter()
+        .rposition(|i| !responses_item_is_system(i))
+        .unwrap_or(0);
+    items[..answered]
+        .iter()
+        .rposition(responses_item_is_assistant)
+        .map_or(0, |i| i + 1)
+}
+
+/// Whether one `input[]` item is something the MODEL produced, and so a
+/// boundary for the latest-turn window.
+///
+/// This API does not spell a model turn as a role: a tool call the model
+/// asked for is a bare `function_call` item, and so is a `reasoning`
+/// item. A tool RESULT is the caller answering that call and is not a
+/// boundary.
+///
+/// Asks `responses::responses_item_role` rather than re-deriving the
+/// answer, so this protocol has ONE role mapping and not two. Two of them
+/// disagreed on `{"role": "user", "type": "reasoning"}` — nothing sends
+/// that, but the whole point of the design is that the check pass and
+/// these walkers cannot drift, and a second copy is where drift comes
+/// from.
+fn responses_item_is_assistant(item: &Value) -> bool {
+    crate::responses::responses_item_role(item) == Role::Assistant
+}
+
+/// Whether one `input[]` item is a system-side message. `developer` is
+/// this API's spelling of the same thing.
+fn responses_item_is_system(item: &Value) -> bool {
+    crate::responses::responses_item_role(item) == Role::System
 }
 
 /// One `/v1/responses` input/output item. `message` items carry
@@ -527,9 +788,52 @@ fn redact_responses_item(
                 *args = owned;
             }
         }
-        Some("function_call_output") => {
+        // The custom-tool spelling of the same pair. Its argument slot is
+        // `input` and it is free-form text rather than JSON-encoded, so it
+        // is rewritten directly. Both are read by the scan
+        // (`responses::responses_item_text`), and a slot the scan reads
+        // and this walk does not is a Mask rule that reports a hit and
+        // then forwards the match unmasked.
+        Some("custom_tool_call") => {
+            if let Some(input) = item.get_mut("input") {
+                apply_to_value_string(chain, dir, input, counts);
+            }
+        }
+        Some("function_call_output" | "custom_tool_call_output") => {
             if let Some(output) = item.get_mut("output") {
                 apply_to_value_string(chain, dir, output, counts);
+            }
+        }
+        // A `reasoning` item replayed on the REQUEST. Its `content[].text`
+        // and `summary[].text` are both read by the scan
+        // (`responses::responses_item_text`), so a Mask rule matching there
+        // reported a hit, returned Allow, and dispatched the body with the
+        // match still in it — the mask has to reach the same slots the scan
+        // does. Neither slot carries a provider signature, so rewriting one
+        // is not replay-breaking; the Anthropic `thinking` block is the
+        // signed case and is forwarded unchanged instead (see
+        // `redact_anthropic_content`).
+        //
+        // NOT closed here: a reasoning item's `encrypted_content` is
+        // forwarded verbatim and is neither scanned nor rewritten, so on a
+        // request that replays one the masked `text` is a readable copy
+        // while the provider still receives the original. Masking it is not
+        // possible (it is provider ciphertext) and refusing on it is the
+        // open question this arm's Anthropic sibling raises — do not read
+        // this arm as closing the `/v1/responses` side.
+        //
+        // Input only. Reasoning the model GENERATES is out of
+        // output-guardrail scope, so this arm must not fire on
+        // `redact_responses_response`.
+        Some("reasoning") if dir.is_input() => {
+            for key in ["content", "summary"] {
+                if let Some(Value::Array(parts)) = item.get_mut(key) {
+                    for part in parts {
+                        if let Some(text) = part.get_mut("text") {
+                            apply_to_value_string(chain, dir, text, counts);
+                        }
+                    }
+                }
             }
         }
         _ => {}
@@ -813,13 +1117,18 @@ struct SseFrame {
     raw: Vec<u8>,
     /// Parsed `data:` payload, when the frame carries one.
     data: Option<Value>,
+    /// The blank line that ended this frame, re-emitted as the upstream
+    /// wrote it — a masked CRLF document must not come back LF-framed.
+    term: &'static [u8],
     dirty: bool,
 }
 
 impl SseFrame {
-    /// Re-render the frame: the first `data:` line is replaced with the
-    /// re-serialised payload (subsequent `data:` lines dropped); every
-    /// other line passes through untouched.
+    /// Re-render the frame: the first `data:` line carries the whole
+    /// re-serialised payload and the frame's other `data:` lines go with
+    /// it; every other line passes through untouched. Collapsing them is
+    /// not a loss — the payload is the lines joined with `\n`, and a
+    /// compact JSON document holds none, so one line says the same thing.
     fn render(&self) -> Vec<u8> {
         if !self.dirty {
             return self.raw.clone();
@@ -835,6 +1144,12 @@ impl SseFrame {
                 if !data_written {
                     out.push_str("data: ");
                     out.push_str(&serde_json::to_string(data).unwrap_or_default());
+                    // Keep the line's own ending: the rest of the frame
+                    // passes through verbatim, so dropping the `\r` here
+                    // alone would leave one LF line in a CRLF frame.
+                    if line.ends_with('\r') {
+                        out.push('\r');
+                    }
                     out.push('\n');
                     data_written = true;
                 }
@@ -848,36 +1163,349 @@ impl SseFrame {
         if out.ends_with('\n') {
             out.pop();
         }
+        // ...and, on a CRLF frame whose LAST line was a dropped `data:`
+        // line, the CR that line ending left behind. The frame's own
+        // terminator CR was split off with the frame, so anything trailing
+        // here belongs to a line that is no longer followed by one — it
+        // would reach the client as a lone CR before the separator.
+        if out.ends_with('\r') {
+            out.pop();
+        }
         out.into_bytes()
     }
 }
 
+/// Offset and length of the first frame terminator (a blank line) in `raw`.
+///
+/// The ONE place this crate decides where an SSE frame ends. Everything
+/// below derives from it, so the frame-based redaction pass and the
+/// line-based scan passes cannot end up with two notions of framing —
+/// which is exactly how an unterminated final frame slipped past one pass
+/// while the other read it (#1091).
+///
+/// It is the relay's own `messages::find_frame_end`, deliberately called
+/// rather than reimplemented: two functions that agree today are how the
+/// disagreement this fixes got in. That one is CRLF-aware, and it has to
+/// be — the scan passes read lines and trim, so a CRLF-framed upstream is
+/// ordinary text to them, while a splitter that knew only `\n\n` would hand
+/// the whole body back as one unframed blob and the redactor would render
+/// it down to its first `data:` line. Same disagreement, second costume.
+fn frame_terminator(raw: &[u8]) -> Option<(usize, usize)> {
+    let end = crate::messages::find_frame_end(raw)?;
+    let term: &'static [u8] = if raw[..end].ends_with(b"\r\n\r\n") {
+        b"\r\n\r\n"
+    } else {
+        b"\n\n"
+    };
+    Some((end - term.len(), term.len()))
+}
+
+/// Byte offset just past the LAST complete frame terminator in `raw`
+/// (`0` when there is none, `raw.len()` when the body ends on one).
+/// `raw[end..]` is therefore the unterminated trailing fragment.
+fn last_frame_end(raw: &[u8]) -> usize {
+    let mut end = 0usize;
+    let mut rest = raw;
+    while let Some((pos, len)) = frame_terminator(rest) {
+        end += pos + len;
+        rest = &rest[pos + len..];
+    }
+    end
+}
+
+/// A frame's `data:` payload, un-parsed (`None` = the frame carries no
+/// `data:` line at all — a comment or keepalive).
+///
+/// A frame may carry SEVERAL `data:` lines, and the payload is all of them
+/// joined with `\n`; one leading space after the colon belongs to the
+/// framing, not the payload
+/// (<https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation>).
+/// Reading only the first line truncates the payload silently, which is
+/// how such a frame used to be invisible to the scan and rendered down to
+/// its first line by the redactor (#1100).
+pub(crate) fn frame_payload(frame_raw: &[u8]) -> Option<String> {
+    let ranges = data_line_ranges(frame_raw);
+    let (first, rest) = ranges.split_first()?;
+    let mut payload = String::from_utf8_lossy(&frame_raw[first.clone()]).into_owned();
+    for r in rest {
+        payload.push('\n');
+        payload.push_str(&String::from_utf8_lossy(&frame_raw[r.clone()]));
+    }
+    Some(payload)
+}
+
+/// Each `data:` line's payload, as a byte range into `frame_raw`, in order.
+///
+/// The same scan [`frame_payload`] joins, kept as offsets for the one
+/// consumer that must write BACK into the frame rather than only read it:
+/// `model_echo::restamp_sse_frame` splices the caller's alias in place and
+/// needs to know which bytes to replace. Two readers of the same framing
+/// would be free to disagree about where a payload starts, which is how
+/// the restamp came to see only the first line of a multi-line frame
+/// (#1105) while every other consumer saw all of it (#1100).
+pub(crate) fn data_line_ranges(frame_raw: &[u8]) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for line in frame_raw.split(|&b| b == b'\n') {
+        let start = offset;
+        offset += line.len() + 1; // the split consumed one `\n`
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(after_colon) = line.strip_prefix(b"data:") else {
+            continue;
+        };
+        let mut from = start + b"data:".len();
+        if after_colon.first() == Some(&b' ') {
+            from += 1;
+        }
+        out.push(from..start + line.len());
+    }
+    out
+}
+
+/// The `data:` payload of every frame in a buffered SSE body, in order,
+/// plus a trailing unterminated fragment's if there is one. Frames with no
+/// `data:` line are skipped.
+///
+/// The line-based block scans read this rather than raw lines, so the
+/// payload they scan is the payload the redaction pass rewrites — the two
+/// cannot disagree about what a frame carries (#1100).
+pub(crate) fn sse_frame_payloads(raw: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = raw;
+    while let Some((pos, len)) = frame_terminator(rest) {
+        if let Some(p) = frame_payload(&rest[..pos]) {
+            out.push(p);
+        }
+        rest = &rest[pos + len..];
+    }
+    if let Some(p) = frame_payload(rest) {
+        out.push(p);
+    }
+    out
+}
+
+/// Whether a payload is one the passes can read: one JSON document, or
+/// nothing to read at all (empty, or the `[DONE]` sentinel — both are
+/// skipped by every scan).
+fn payload_scannable(payload: &str) -> bool {
+    let t = payload.trim();
+    t.is_empty() || t == "[DONE]" || serde_json::from_str::<Value>(t).is_ok()
+}
+
 /// Split a buffered SSE byte stream into frames on the blank-line
 /// separator. Returns `(frames, trailing)` where `trailing` is a
-/// partial frame with no terminator yet (forwarded verbatim).
+/// partial frame with no terminator yet (forwarded verbatim). Call
+/// [`seal_buffered_sse`] first on anything a guardrail will scan, and
+/// `trailing` is empty by construction.
 fn split_sse_frames(raw: &[u8]) -> (Vec<SseFrame>, &[u8]) {
+    let (complete, trailing) = raw.split_at(last_frame_end(raw));
     let mut frames = Vec::new();
-    let mut start = 0usize;
-    let mut i = 0usize;
-    while i + 1 < raw.len() {
-        if raw[i] == b'\n' && raw[i + 1] == b'\n' {
-            let frame_raw = &raw[start..i];
-            let data = String::from_utf8_lossy(frame_raw)
-                .split('\n')
-                .find(|l| l.starts_with("data:"))
-                .and_then(|l| serde_json::from_str::<Value>(l["data:".len()..].trim()).ok());
-            frames.push(SseFrame {
-                raw: frame_raw.to_vec(),
-                data,
-                dirty: false,
-            });
-            start = i + 2;
-            i += 2;
-        } else {
-            i += 1;
-        }
+    let mut rest = complete;
+    while let Some((pos, len)) = frame_terminator(rest) {
+        let frame_raw = &rest[..pos];
+        frames.push(SseFrame {
+            raw: frame_raw.to_vec(),
+            data: frame_payload(frame_raw)
+                .and_then(|l| serde_json::from_str::<Value>(l.trim()).ok()),
+            term: if len == 4 { b"\r\n\r\n" } else { b"\n\n" },
+            dirty: false,
+        });
+        rest = &rest[pos + len..];
     }
-    (frames, &raw[start..])
+    (frames, trailing)
+}
+
+/// What [`seal_buffered_sse`] did with a buffered body's trailing bytes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SseTailSeal {
+    /// The body already ended on a frame terminator; nothing to do.
+    Terminated,
+    /// A final frame the upstream never terminated, but which parses:
+    /// the missing terminator bytes were appended.
+    Completed { padded: usize },
+    /// A final frame that cannot be parsed, and so cannot be scanned:
+    /// it was cut from the buffer.
+    Dropped { dropped: usize },
+}
+
+/// What [`seal_buffered_sse`] did to a buffered body.
+#[derive(Debug)]
+pub struct BufferedSseSeal {
+    /// The trailing, unterminated fragment's disposition (#1091).
+    pub tail: SseTailSeal,
+    /// The payloads of terminated frames excised because they are not one
+    /// JSON document (#1100) — plain text, or several `data:` lines that
+    /// do not join into one.
+    ///
+    /// They are gone from the buffer, and the caller MUST fold them into
+    /// the text it hands the block scan: nothing can mask such a payload,
+    /// but a forbidden literal in one still has to block the response.
+    pub excised: Vec<String>,
+    /// How many bytes that excision removed (log detail).
+    pub excised_bytes: usize,
+}
+
+impl BufferedSseSeal {
+    /// Whether anything was removed from the buffer. A buffer left empty
+    /// by a cut has nothing scanned in it and must be refused; one that
+    /// was empty to begin with is just an empty upstream response.
+    pub fn cut_anything(&self) -> bool {
+        matches!(self.tail, SseTailSeal::Dropped { .. }) || !self.excised.is_empty()
+    }
+}
+
+/// Seal a fully-buffered SSE body so a guardrail scan and the redaction
+/// pass read the SAME frames, and so no frame reaches the client whose
+/// payload neither of them could parse (#1091, #1100).
+///
+/// Two passes run over such a buffer and they used to disagree about what
+/// it contains: the line-based block scan reads whatever `data:` lines it
+/// finds and parses each one, while the frame-based redactor walks
+/// terminator-delimited frames. Wherever they disagreed, something
+/// unscanned reached the client. Both shapes of disagreement are resolved
+/// here, BEFORE either pass runs:
+///
+/// - **The trailing fragment** (#1091) — a non-conformant upstream can end
+///   mid-frame. If it parses, or carries nothing a scan could read (no
+///   `data:` line at all, an empty payload, or the `[DONE]` sentinel), the
+///   terminator it left off is completed and it becomes an ordinary frame
+///   to both passes. If it does not, it is cut.
+/// - **A terminated frame whose payload is not one JSON document** (#1100)
+///   — plain text, or `data:` lines that do not join into one document.
+///   Neither pass could read it: the scan `continue`s past a line it
+///   cannot parse, and the redactor skips a frame with no parsed payload,
+///   so it was released byte-for-byte having been seen by nothing. Nothing
+///   can mask such a payload structurally, so it is excised and returned
+///   in [`BufferedSseSeal::excised`] for the caller's block scan to read.
+///
+/// A caller whose buffer is left empty by either cut has nothing scanned
+/// at all and must refuse (`unscannable_body`) rather than answer with an
+/// empty 200.
+///
+/// What this does NOT establish, and must not be read as establishing:
+/// that everything released was *understood*. The test here is whether a
+/// payload PARSES, because that is the most this layer can decide without
+/// knowing the route's event vocabulary. A frame carrying valid JSON of a
+/// `type` no pass models still travels through unread; that predates #1100
+/// and closing it would cut responses that reach clients today, so it is
+/// deliberately left (see #1100 for the reasoning). Do not build on a
+/// stronger invariant than the one stated above.
+///
+/// A 200 body that is not SSE at all — what an upstream ignoring
+/// `stream: true` returns — used to reach here too, and was released with
+/// a `\n\n` appended to it. It no longer does: `/v1/responses` and
+/// `/v1/messages` choose their relay branch from the upstream's own
+/// content type (`dispatch::upstream_body_is_sse`), so such a body takes
+/// the non-streaming buffered scan+mask path instead of this one.
+///
+/// Note what is NOT cut: a frame carrying several `data:` lines that join
+/// into one JSON document is a well-formed frame, and is scanned and
+/// masked like any other. The payload is the lines joined with `\n` —
+/// reading only the first is the truncation #1100 is about, not a reason
+/// to drop the frame.
+pub fn seal_buffered_sse(buf: &mut Vec<u8>) -> BufferedSseSeal {
+    let tail = seal_sse_tail(buf);
+    let (excised, excised_bytes) = excise_unscannable_frames(buf);
+    BufferedSseSeal {
+        tail,
+        excised,
+        excised_bytes,
+    }
+}
+
+/// Resolve the unterminated trailing fragment (#1091). See
+/// [`seal_buffered_sse`].
+///
+/// Pads by what is MISSING, not a fixed `\n\n`: a fragment that already
+/// ends in half its terminator needs only the other half, and a full pad
+/// would leave a stray blank line in the released bytes. The upstream's own
+/// line ending is matched, so a CRLF stream stays a CRLF stream.
+fn seal_sse_tail(buf: &mut Vec<u8>) -> SseTailSeal {
+    let end = last_frame_end(buf);
+    if end == buf.len() {
+        return SseTailSeal::Terminated;
+    }
+    // An empty payload and the `[DONE]` sentinel carry no text (the scan
+    // passes skip both), so cutting one protects nothing and takes the
+    // terminal event the client is waiting for with it.
+    let scannable = frame_payload(&buf[end..]).is_none_or(|p| payload_scannable(&p));
+    if !scannable {
+        let dropped = buf.len() - end;
+        buf.truncate(end);
+        return SseTailSeal::Dropped { dropped };
+    }
+    // How much of its terminator the FRAGMENT wrote — read `buf` here and a
+    // one-byte fragment borrows the previous frame's terminator to match a
+    // longer pattern, so the pad comes up short and the seal leaves a tail
+    // behind. A fragment that stopped part-way through its terminator says
+    // which style it was writing; one that stopped right after its payload
+    // says nothing, so the frames before it are the only evidence.
+    let frag = &buf[end..];
+    let crlf_stream = buf[..end].ends_with(b"\r\n\r\n");
+    let pad: &[u8] = if frag.ends_with(b"\r\n\r") {
+        b"\n"
+    } else if frag.ends_with(b"\r\n") {
+        b"\r\n"
+    } else if frag.ends_with(b"\r") && crlf_stream {
+        b"\n\r\n"
+    } else if frag.ends_with(b"\n") {
+        b"\n"
+    } else if crlf_stream {
+        b"\r\n\r\n"
+    } else {
+        b"\n\n"
+    };
+    buf.extend_from_slice(pad);
+    SseTailSeal::Completed { padded: pad.len() }
+}
+
+/// Cut every terminated frame whose payload is not one JSON document
+/// (#1100), returning those payloads and the bytes removed. See
+/// [`seal_buffered_sse`].
+///
+/// Runs AFTER the tail seal, so a fragment that was padded into a frame is
+/// judged by the same rule as the frames before it.
+fn excise_unscannable_frames(buf: &mut Vec<u8>) -> (Vec<String>, usize) {
+    // A frame with no `data:` line at all is a comment or a keepalive:
+    // there is nothing in it for a scan to read and nothing for a mask to
+    // rewrite, so it is not a bypass.
+    let unscannable =
+        |frame: &[u8]| matches!(frame_payload(frame), Some(p) if !payload_scannable(&p));
+    // Look before copying. Every buffered response reaches this, and almost
+    // none of them has a frame to cut, so the common path must not rebuild
+    // the buffer to discover that.
+    let mut rest: &[u8] = buf;
+    let mut any = false;
+    while let Some((pos, len)) = frame_terminator(rest) {
+        if unscannable(&rest[..pos]) {
+            any = true;
+            break;
+        }
+        rest = &rest[pos + len..];
+    }
+    if !any {
+        return (Vec::new(), 0);
+    }
+
+    let mut excised: Vec<String> = Vec::new();
+    let mut excised_bytes = 0usize;
+    let mut kept: Vec<u8> = Vec::with_capacity(buf.len());
+    let mut rest: &[u8] = buf;
+    while let Some((pos, len)) = frame_terminator(rest) {
+        match frame_payload(&rest[..pos]) {
+            Some(p) if !payload_scannable(&p) => {
+                excised.push(p);
+                excised_bytes += pos + len;
+            }
+            _ => kept.extend_from_slice(&rest[..pos + len]),
+        }
+        rest = &rest[pos + len..];
+    }
+    // Empty after the tail seal, but appending it keeps this function
+    // correct on its own terms rather than on its caller's.
+    kept.extend_from_slice(rest);
+    *buf = kept;
+    (excised, excised_bytes)
 }
 
 /// Mask a fully-buffered Anthropic-native SSE response (the `/v1/messages`
@@ -1035,7 +1663,7 @@ pub fn redact_anthropic_sse(
     let mut out = Vec::with_capacity(raw.len());
     for frame in &frames {
         out.extend_from_slice(&frame.render());
-        out.extend_from_slice(b"\n\n");
+        out.extend_from_slice(frame.term);
     }
     out.extend_from_slice(trailing);
     Some((out, counts))
@@ -1185,6 +1813,22 @@ pub fn redact_responses_sse(
                     args_channels.entry(channel_key(data)).or_default().push(fi);
                 }
             }
+            // A custom tool's input is free-form text, not a JSON-encoded
+            // argument object, so it masks through the plain text channel
+            // rather than the args one. It needs a channel at all because
+            // `redact_responses_item` masks the same string on the
+            // terminal item: without this the caller is handed the masked
+            // text on `output_item.done` and the unmasked text on the
+            // delta it assembled the input from.
+            Some("response.custom_tool_call_input.delta") => {
+                if data
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| !t.is_empty())
+                {
+                    text_channels.entry(channel_key(data)).or_default().push(fi);
+                }
+            }
             _ => {}
         }
     }
@@ -1276,6 +1920,11 @@ pub fn redact_responses_sse(
                     *args = owned;
                 }
             }
+            "response.custom_tool_call_input.done" => {
+                if let Some(input) = data.get_mut("input") {
+                    apply_to_value_string(chain, Direction::Output, input, &mut local);
+                }
+            }
             "response.output_item.done" => {
                 if let Some(item) = data.get_mut("item") {
                     redact_responses_item(chain, Direction::Output, item, &mut local);
@@ -1307,7 +1956,7 @@ pub fn redact_responses_sse(
     let mut out = Vec::with_capacity(raw.len());
     for frame in &frames {
         out.extend_from_slice(&frame.render());
-        out.extend_from_slice(b"\n\n");
+        out.extend_from_slice(frame.term);
     }
     out.extend_from_slice(trailing);
     Some((out, counts))
@@ -1336,6 +1985,510 @@ mod tests {
 
     fn both() -> Arc<dyn Guardrail> {
         mask_chain(aisix_core::models::GuardrailHookPoint::Both)
+    }
+
+    // ── latest-turn window, wire level (AISIX-Cloud#1558) ────────────────
+    //
+    // The mask walkers rewrite raw slots and have no parsed `ChatFormat` to
+    // index against, so each wire shape answers the boundary question for
+    // itself. These pin the three answers against the one
+    // `aisix_guardrails::latest_turn_view` gives the check pass.
+
+    #[test]
+    fn chat_window_starts_after_the_last_assistant_message() {
+        let req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "fresh"},
+                {"role": "tool", "content": "result", "tool_call_id": "c1"},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(chat_latest_turn_start(&req.messages), 3);
+    }
+
+    /// The wire-level twin of
+    /// `chain::tests::a_trailing_assistant_prefill_does_not_close_the_window`.
+    #[test]
+    fn a_trailing_assistant_message_does_not_close_the_window_on_any_wire() {
+        let chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "answered"},
+                {"role": "user", "content": "fresh"},
+                {"role": "assistant", "content": "Sure, here is"},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(chat_latest_turn_start(&chat.messages), 2);
+
+        let anthropic = json!([
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "answered"},
+            {"role": "user", "content": "fresh"},
+            {"role": "assistant", "content": "Sure, here is"},
+        ]);
+        assert_eq!(
+            anthropic_latest_turn_start(anthropic.as_array().unwrap()),
+            2,
+        );
+
+        let responses = json!([
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "type": "message",
+             "content": [{"type": "output_text", "text": "answered"}]},
+            {"role": "user", "content": "fresh"},
+            {"type": "reasoning", "encrypted_content": "opaque"},
+        ]);
+        assert_eq!(
+            responses_latest_turn_start(responses.as_array().unwrap()),
+            2,
+        );
+    }
+
+    /// The wire-level twin of
+    /// `chain::tests::a_system_message_after_a_prefill_does_not_reopen_the_bypass`:
+    /// a system message trailing the prefill must not make the prefill
+    /// look answered on any of the three shapes.
+    #[test]
+    fn a_system_message_after_a_prefill_does_not_close_the_window() {
+        let chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "secret"},
+                {"role": "assistant", "content": "Sure, here is"},
+                {"role": "system", "content": "trailing policy"},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(chat_latest_turn_start(&chat.messages), 0);
+
+        // The non-spec `role: "system"` entry Claude Code sends (#597).
+        let anthropic = json!([
+            {"role": "user", "content": "secret"},
+            {"role": "assistant", "content": "Sure, here is"},
+            {"role": "system", "content": "trailing policy"},
+        ]);
+        assert_eq!(
+            anthropic_latest_turn_start(anthropic.as_array().unwrap()),
+            0,
+        );
+
+        let responses = json!([
+            {"role": "user", "content": "secret"},
+            {"role": "assistant", "type": "message",
+             "content": [{"type": "output_text", "text": "Sure, here is"}]},
+            {"role": "developer", "content": "trailing policy"},
+        ]);
+        assert_eq!(
+            responses_latest_turn_start(responses.as_array().unwrap()),
+            0,
+        );
+    }
+
+    /// A request that is nothing but one assistant prefill still has a
+    /// window — the whole request.
+    #[test]
+    fn a_request_of_one_assistant_message_is_entirely_in_the_window() {
+        let chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": "Sure, here is"}],
+        }))
+        .unwrap();
+        assert_eq!(chat_latest_turn_start(&chat.messages), 0);
+    }
+
+    #[test]
+    fn chat_window_with_no_assistant_message_is_the_whole_request() {
+        let req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "only"},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(chat_latest_turn_start(&req.messages), 0);
+    }
+
+    /// An Anthropic tool loop: the assistant turn carrying `tool_use` is
+    /// the boundary, and the `tool_result` answering it rides the final
+    /// user message, which is inside the window whole.
+    #[test]
+    fn anthropic_window_starts_after_the_tool_use_turn() {
+        let messages = json!([
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": [{"type": "text", "text": "reply"}]},
+            {"role": "user", "content": "call it"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "result"}
+            ]},
+        ]);
+        assert_eq!(anthropic_latest_turn_start(messages.as_array().unwrap()), 4,);
+    }
+
+    /// The Responses API spells a model turn as a typed item with no role
+    /// at all, so `role: "assistant"` alone would put a whole agent tool
+    /// loop inside the window.
+    #[test]
+    fn responses_window_treats_typed_model_items_as_the_boundary() {
+        let items = json!([
+            {"role": "user", "content": "old"},
+            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "result"},
+        ]);
+        // The tool RESULT is the caller answering, not a boundary — the
+        // window opens right after the call.
+        assert_eq!(responses_latest_turn_start(items.as_array().unwrap()), 2);
+    }
+
+    #[test]
+    fn responses_window_opens_after_a_replayed_assistant_message() {
+        let items = json!([
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "type": "message",
+             "content": [{"type": "output_text", "text": "reply"}]},
+            {"role": "user", "content": "fresh"},
+        ]);
+        assert_eq!(responses_latest_turn_start(items.as_array().unwrap()), 2);
+    }
+
+    /// The window is what a `latest_turn` row reads; a row left on `all`
+    /// must keep rewriting the history, so the walkers cannot simply skip
+    /// out-of-window slots.
+    #[test]
+    fn an_all_row_still_masks_history_after_the_window_split() {
+        let chain = both();
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "old alice@example.com"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "fresh bob@example.com"},
+            ],
+        }))
+        .unwrap();
+        let counts = redact_chat_format(chain.as_ref(), &mut req);
+        assert_eq!(counts.get("email"), Some(&2), "{counts:?}");
+        assert!(!req.messages[0].content_str().contains("alice@example.com"));
+    }
+
+    /// `message_scan_text` reads `extra["reasoning_content"]`, so this
+    /// must rewrite it or a Mask rule reports a hit on reasoning it then
+    /// forwards to the upstream verbatim. Nothing on the OpenAI wire signs
+    /// this slot, so rewriting it is safe — unlike the Anthropic `thinking`
+    /// block below.
+    #[test]
+    fn chat_format_masks_replayed_reasoning_content() {
+        let chain = both();
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "who?"},
+                {
+                    "role": "assistant",
+                    "content": "checking",
+                    "reasoning_content": "the user meant a@x.com I think"
+                }
+            ]
+        }))
+        .unwrap();
+        let counts = redact_chat_format(chain.as_ref(), &mut req);
+        assert_eq!(
+            req.messages[1]
+                .extra
+                .get("reasoning_content")
+                .and_then(Value::as_str),
+            Some("the user meant [EMAIL_REDACTED] I think"),
+        );
+        assert!(!counts.is_empty());
+    }
+
+    /// C1: the `/v1/responses` scan reads a `reasoning` item's
+    /// `content[].text` AND `summary[].text`, so the request mask has to
+    /// reach both — otherwise a Mask rule matching there reported a hit,
+    /// returned Allow, and dispatched the body with the match intact.
+    #[test]
+    fn responses_request_masks_reasoning_content_and_summary() {
+        let chain = both();
+        let mut body = json!({
+            "model": "m",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "ask a@x.com"}],
+                    "content": [{"type": "reasoning_text", "text": "or call 13800138000"}]
+                }
+            ]
+        });
+        let counts = redact_responses_request(chain.as_ref(), &mut body);
+        let item = &body["input"][1];
+        assert_eq!(
+            item["summary"][0]["text"].as_str(),
+            Some("ask [EMAIL_REDACTED]")
+        );
+        assert_eq!(
+            item["content"][0]["text"].as_str(),
+            Some("or call [CHINA_MOBILE_REDACTED]")
+        );
+        assert!(!counts.is_empty());
+    }
+
+    /// The mirror of the test above, and the reason the arm is gated on
+    /// `Direction::Input`: reasoning the model GENERATED is out of the
+    /// output-guardrail scope, so the response mask must leave a
+    /// `reasoning` item in `output[]` byte-identical.
+    #[test]
+    fn responses_response_leaves_generated_reasoning_alone() {
+        let chain = both();
+        let mut body = json!({
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "ask a@x.com"}],
+                    "content": [{"type": "reasoning_text", "text": "or call 13800138000"}]
+                },
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "reply to b@y.org"}]
+                }
+            ]
+        });
+        let before = body["output"][0].clone();
+        redact_responses_response(chain.as_ref(), &mut body);
+        assert_eq!(
+            body["output"][0], before,
+            "generated reasoning is untouched"
+        );
+        assert_eq!(
+            body["output"][1]["content"][0]["text"].as_str(),
+            Some("reply to [EMAIL_REDACTED]"),
+            "the message item is still masked",
+        );
+    }
+
+    /// A mask-action hit inside a signed `thinking` / `redacted_thinking`
+    /// block is FORWARDED UNCHANGED — the deliberate exception to "no
+    /// write-back channel means block" (#1104). The block is byte-identical
+    /// afterwards, and the ordinary block beside it still masks, so this
+    /// pins an exception for the signed block rather than an exemption for
+    /// the whole message.
+    #[test]
+    fn signed_reasoning_is_forwarded_unchanged_while_its_neighbours_mask() {
+        let chain = both();
+        let mut body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "mail a@x.com", "signature": "sig-abc"},
+                    {"type": "redacted_thinking", "data": "opaque a@x.com blob"},
+                    {"type": "text", "text": "also mail a@x.com"}
+                ]}
+            ]
+        });
+        let before = body["messages"][1]["content"].clone();
+        redact_anthropic_request(chain.as_ref(), &mut body);
+
+        assert_eq!(
+            body["messages"][1]["content"][0], before[0],
+            "the signed thinking block is byte-identical",
+        );
+        assert_eq!(
+            body["messages"][1]["content"][1], before[1],
+            "so is the redacted_thinking block",
+        );
+        assert_eq!(
+            body["messages"][1]["content"][2]["text"].as_str(),
+            Some("also mail [EMAIL_REDACTED]"),
+            "the mask is demonstrably running on this very request",
+        );
+    }
+
+    /// The exception is for the MASK only. A block-action rule still fires
+    /// on thinking content, because the scan reads it — otherwise the
+    /// exception would have turned a signed block into a channel any
+    /// forbidden text could travel through.
+    #[test]
+    fn a_block_rule_still_fires_on_thinking_content() {
+        use aisix_guardrails::{KeywordBlocklist, KeywordRule};
+
+        let chain: Arc<dyn Guardrail> = Arc::new(GuardrailChain::new(vec![Arc::new(
+            KeywordBlocklist::input_only(vec![KeywordRule::literal("FORBIDDENTHOUGHT")]),
+        )]));
+
+        let body = json!({
+            "model": "claude",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "I will FORBIDDENTHOUGHT now", "signature": "s"}
+            ]}]
+        });
+        let chat = aisix_provider_anthropic::parse_inbound_request_for_scan(&body).unwrap();
+        let verdict = futures::executor::block_on(aisix_guardrails::Guardrail::check_input(
+            chain.as_ref(),
+            &chat,
+        ));
+        assert!(
+            matches!(verdict, aisix_guardrails::GuardrailVerdict::Block { .. }),
+            "a block rule must still reach thinking text, got {verdict:?}",
+        );
+    }
+
+    /// The FIVE segment-moderating kinds — `bedrock`, `presidio`, `lakera`,
+    /// `aliyun_ai_guardrail`, `custom` — answer `Allow` from
+    /// `check_input_non_segment` by design and take their real verdict from
+    /// the segment pass. That pass walks the redactor, which never offers a
+    /// signed `thinking` block, so before the scan-only channel existed a
+    /// block policy on any of those kinds was bypassable by moving the text
+    /// into a thinking block. The keyword test above cannot see this: keyword
+    /// is not a segment moderator.
+    #[tokio::test]
+    async fn a_segment_kind_sees_thinking_text_and_can_block_on_it() {
+        use aisix_guardrails::{GuardrailVerdict, SegmentsOutcome};
+        use std::sync::Mutex;
+
+        /// Records what the segment pass was offered, and blocks on a
+        /// literal — the shape a Presidio/Bedrock/custom block policy has.
+        struct RecordingSegmenter {
+            seen: Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl Guardrail for RecordingSegmenter {
+            fn name(&self) -> &'static str {
+                "recording-segmenter"
+            }
+            fn moderates_segments(&self) -> bool {
+                true
+            }
+            async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+                *self.seen.lock().unwrap() = texts.to_vec();
+                let hit = texts.iter().any(|t| t.contains("FORBIDDENTHOUGHT"));
+                SegmentsOutcome {
+                    verdict: if hit {
+                        GuardrailVerdict::block("segment block".to_string())
+                    } else {
+                        GuardrailVerdict::Allow
+                    },
+                    masked: None,
+                    counts: Default::default(),
+                    monitor_hits: Vec::new(),
+                }
+            }
+        }
+
+        let seg = Arc::new(RecordingSegmenter {
+            seen: Mutex::new(Vec::new()),
+        });
+        let chain: Arc<dyn Guardrail> = Arc::new(GuardrailChain::new(vec![seg.clone()]));
+
+        let mut body = json!({
+            "model": "claude",
+            "messages": [
+                {"role": "user", "content": "benign question"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "I will FORBIDDENTHOUGHT now", "signature": "s"}
+                ]}
+            ]
+        });
+        let before = body.clone();
+
+        let mut counts = RedactionCounts::new();
+        let mut hits = Vec::new();
+        let verdict = moderate_body_scanning(
+            chain.as_ref(),
+            Direction::Input,
+            GuardrailVerdict::Allow,
+            &mut counts,
+            &mut hits,
+            anthropic_signed_reasoning_texts(&body),
+            |g| redact_anthropic_request(g, &mut body),
+        )
+        .await;
+
+        let seen = seg.seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|t| t.contains("FORBIDDENTHOUGHT")),
+            "the segment pass must be offered the thinking text, got {seen:?}",
+        );
+        assert!(
+            matches!(verdict, GuardrailVerdict::Block { .. }),
+            "a segment kind's block rule must fire on thinking content, got {verdict:?}",
+        );
+        assert_eq!(body, before, "and the body is never rewritten");
+    }
+
+    /// The scan-only text is judged but never written back: a segment kind
+    /// that masks every slot it was offered must not have that mask land on
+    /// the signed block, and must still land on the ordinary ones. (What
+    /// enforces that is the walk not offering the block — see the note on
+    /// `masked.truncate`, which is about log truthfulness, not this.)
+    #[tokio::test]
+    async fn a_segment_masks_ordinary_slots_but_never_the_signed_block() {
+        use aisix_guardrails::{GuardrailVerdict, SegmentsOutcome};
+
+        struct MaskEverything;
+        #[async_trait::async_trait]
+        impl Guardrail for MaskEverything {
+            fn name(&self) -> &'static str {
+                "mask-everything"
+            }
+            fn moderates_segments(&self) -> bool {
+                true
+            }
+            async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+                SegmentsOutcome {
+                    verdict: GuardrailVerdict::Allow,
+                    masked: Some(texts.iter().map(|_| "MASKED".to_owned()).collect()),
+                    counts: std::collections::BTreeMap::from([("X".to_owned(), 1)]),
+                    monitor_hits: Vec::new(),
+                }
+            }
+        }
+
+        let chain: Arc<dyn Guardrail> =
+            Arc::new(GuardrailChain::new(vec![Arc::new(MaskEverything)]));
+        let mut body = json!({
+            "model": "claude",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "secret chain", "signature": "s"},
+                {"type": "text", "text": "ordinary text"}
+            ]}]
+        });
+
+        let mut counts = RedactionCounts::new();
+        let mut hits = Vec::new();
+        moderate_body_scanning(
+            chain.as_ref(),
+            Direction::Input,
+            GuardrailVerdict::Allow,
+            &mut counts,
+            &mut hits,
+            anthropic_signed_reasoning_texts(&body),
+            |g| redact_anthropic_request(g, &mut body),
+        )
+        .await;
+
+        let blocks = &body["messages"][0]["content"];
+        assert_eq!(
+            blocks[0]["thinking"].as_str(),
+            Some("secret chain"),
+            "the signed block is byte-identical even under a mask-everything segmenter",
+        );
+        assert_eq!(
+            blocks[1]["text"].as_str(),
+            Some("MASKED"),
+            "…while the ordinary slot beside it is rewritten",
+        );
     }
 
     #[test]
@@ -1664,6 +2817,38 @@ mod tests {
         assert_eq!(counts.get("email"), Some(&1));
     }
 
+    /// The bridged encoder now emits reasoning-summary frames alongside the
+    /// message frames it always did. Generated reasoning is out of
+    /// output-guardrail scope, so an output mask that rewrites the held
+    /// stream has to leave those frames byte-identical while still masking
+    /// the message beside them — the mirror of
+    /// `responses_response_leaves_generated_reasoning_alone` at the wire
+    /// level, which is the layer the hold-back release actually goes through.
+    #[test]
+    fn responses_sse_leaves_reasoning_summary_frames_alone() {
+        let chain = both();
+        let reasoning = concat!(
+            "event: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"ask a@x.com\"}\n\n",
+            "event: response.reasoning_summary_text.done\ndata: {\"type\":\"response.reasoning_summary_text.done\",\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"text\":\"ask a@x.com\"}\n\n",
+            "event: response.reasoning_summary_part.done\ndata: {\"type\":\"response.reasoning_summary_part.done\",\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"ask a@x.com\"}}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"status\":\"completed\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"ask a@x.com\"}]}}\n\n",
+        );
+        let raw = format!(
+            "{reasoning}{}",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":1,\"content_index\":0,\"delta\":\"reply to b@y.org\"}\n\n",
+        );
+        let (out, _) = redact_responses_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.starts_with(reasoning),
+            "every reasoning frame must survive byte-identical: {out}"
+        );
+        assert!(
+            out.contains("\"delta\":\"reply to [EMAIL_REDACTED]\""),
+            "…and the message beside them is still masked: {out}"
+        );
+    }
+
     #[test]
     fn responses_sse_masks_function_call_args_channel() {
         let chain = both();
@@ -1677,6 +2862,551 @@ mod tests {
         assert!(!out.contains("a@"), "original fragments gone: {out}");
         assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
         assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    /// A custom tool's input streams on its own event pair, and the same
+    /// string is masked on the terminal item by `redact_responses_item`.
+    /// Leave the pair out of this walk and the caller reads the masked
+    /// text on `output_item.done` and the raw match on the delta it
+    /// assembled the input from — one stream carrying both.
+    #[test]
+    fn responses_sse_masks_the_custom_tool_input_channel() {
+        let chain = both();
+        let raw = concat!(
+            "event: response.custom_tool_call_input.delta\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"ctc_1\",\"output_index\":0,\"delta\":\"mail a@x.com now\"}\n\n",
+            "event: response.custom_tool_call_input.done\ndata: {\"type\":\"response.custom_tool_call_input.done\",\"item_id\":\"ctc_1\",\"output_index\":0,\"input\":\"mail a@x.com now\"}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_1\",\"call_id\":\"c1\",\"name\":\"apply_patch\",\"input\":\"mail a@x.com now\",\"status\":\"completed\"}}\n\n",
+        );
+        let (out, counts) = redact_responses_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            !out.contains("a@x.com"),
+            "the custom tool input reached the client unmasked: {out}"
+        );
+        assert_eq!(out.matches("[EMAIL_REDACTED]").count(), 3, "out: {out}");
+        assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    // #1091: an upstream that ends mid-frame used to leave the two passes
+    // reading different bytes — the line-based block scan saw the fragment,
+    // the frame-based redactor appended it verbatim without masking it. The
+    // seal is what makes both read the same frames, so these assert the
+    // masking THROUGH it: drop the `seal_buffered_sse` call and the PII
+    // literal comes back.
+    #[test]
+    fn responses_sse_masks_a_final_frame_the_upstream_never_terminated() {
+        let chain = both();
+        let mut raw = concat!(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"hello \"}\n\n",
+            // Complete JSON, only the terminating blank line missing.
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"mail a@x.com\"}",
+        )
+        .as_bytes()
+        .to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut raw).tail,
+            SseTailSeal::Completed { padded: 2 }
+        );
+        let (out, counts) = redact_responses_sse(chain.as_ref(), &raw)
+            .expect("the sealed tail must reach the redactor");
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "tail left unmasked: {out}");
+        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
+        assert_eq!(counts.get("email"), Some(&1));
+        // And the client gets a frame it can actually parse.
+        assert!(out.ends_with("\n\n"), "out: {out}");
+    }
+
+    #[test]
+    fn anthropic_sse_masks_a_final_frame_the_upstream_never_terminated() {
+        let chain = both();
+        let mut raw = concat!(
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello \"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"mail a@x.com\"}}",
+        )
+        .as_bytes()
+        .to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut raw).tail,
+            SseTailSeal::Completed { padded: 2 }
+        );
+        let (out, counts) = redact_anthropic_sse(chain.as_ref(), &raw)
+            .expect("the sealed tail must reach the redactor");
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "tail left unmasked: {out}");
+        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
+        assert_eq!(counts.get("email"), Some(&1));
+        assert!(out.ends_with("\n\n"), "out: {out}");
+    }
+
+    #[test]
+    fn seal_leaves_a_terminated_body_byte_identical() {
+        let raw = b"event: x\ndata: {\"a\":1}\n\n".to_vec();
+        let mut sealed = raw.clone();
+        assert_eq!(seal_buffered_sse(&mut sealed).tail, SseTailSeal::Terminated);
+        assert_eq!(sealed, raw);
+    }
+
+    #[test]
+    fn seal_pads_by_what_the_upstream_left_off() {
+        // Nothing of the terminator written.
+        let mut none = b"data: {\"a\":1}".to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut none).tail,
+            SseTailSeal::Completed { padded: 2 }
+        );
+        assert_eq!(none, b"data: {\"a\":1}\n\n");
+        // Half of it written: one newline is what is missing, and padding a
+        // fixed `\n\n` here would leave a stray blank line in the frames.
+        let mut half = b"data: {\"a\":1}\n".to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut half).tail,
+            SseTailSeal::Completed { padded: 1 }
+        );
+        assert_eq!(half, b"data: {\"a\":1}\n\n");
+        // A comment / keepalive carries nothing to scan, so it is kept.
+        let mut comment = b"data: {\"a\":1}\n\n: ping".to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut comment).tail,
+            SseTailSeal::Completed { padded: 2 }
+        );
+    }
+
+    #[test]
+    fn crlf_framed_bodies_are_framed_and_masked_like_any_other() {
+        let chain = both();
+        // A CRLF-framed stream is ordinary text to the line-based scan, so
+        // the redactor has to read the same frames out of it. Reading none
+        // would leave it unmasked; reading ONE would drop every `data:` line
+        // after the first when that frame is rewritten.
+        let raw = concat!(
+            "event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"mail a@\"}\r\n\r\n",
+            "event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"x.com ok\"}\r\n\r\n",
+            "event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{}}\r\n\r\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let mut sealed = raw.clone();
+        assert_eq!(seal_buffered_sse(&mut sealed).tail, SseTailSeal::Terminated);
+        assert_eq!(sealed, raw, "a terminated CRLF body must not be repadded");
+        let (out, counts) = redact_responses_sse(chain.as_ref(), &sealed).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "out: {out}");
+        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
+        assert_eq!(counts.get("email"), Some(&1));
+        // Every frame survives the rewrite.
+        assert_eq!(out.matches("data:").count(), 3, "out: {out}");
+        assert!(out.contains("response.completed"), "out: {out}");
+    }
+
+    #[test]
+    fn seal_matches_the_upstreams_own_line_ending() {
+        let mut crlf = b"data: {\"a\":1}\r\n".to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut crlf).tail,
+            SseTailSeal::Completed { padded: 2 }
+        );
+        assert_eq!(crlf, b"data: {\"a\":1}\r\n\r\n");
+        // Three quarters of a CRLF terminator written.
+        let mut partial = b"data: {\"a\":1}\r\n\r".to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut partial).tail,
+            SseTailSeal::Completed { padded: 1 }
+        );
+        assert_eq!(partial, b"data: {\"a\":1}\r\n\r\n");
+    }
+
+    #[test]
+    fn seal_keeps_a_crlf_stream_crlf_when_the_tail_has_no_terminator_bytes() {
+        // The fragment itself carries no clue — it stops right after its
+        // payload — so the completed frames before it settle the style.
+        let mut raw = concat!(
+            "event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"hello \"}\r\n\r\n",
+            "event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"mail a@x.com\"}",
+        )
+        .as_bytes()
+        .to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut raw).tail,
+            SseTailSeal::Completed { padded: 4 }
+        );
+        assert!(raw.ends_with(b"\r\n\r\n"));
+        // And the sealed frame is a frame to the redactor, like the first.
+        let (out, _) = redact_responses_sse(both().as_ref(), &raw).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "out: {out}");
+        assert_eq!(out.matches("data:").count(), 2, "out: {out}");
+        // Half a payload line written: the CR is there, its LF is not.
+        let mut half_line = b"data: {\"a\":1}\r\n\r\ndata: {\"b\":2}\r".to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut half_line).tail,
+            SseTailSeal::Completed { padded: 3 }
+        );
+        assert!(half_line.ends_with(b"data: {\"b\":2}\r\n\r\n"));
+    }
+
+    #[test]
+    fn seal_cuts_a_fragment_that_is_several_frames_run_together() {
+        // An upstream that never wrote its blank lines. Padding this into
+        // ONE frame would be worse than leaving it: the redactor writes only
+        // the first `data:` line of a frame it rewrites, so a mask would
+        // delete `KEEPME` and the terminal event with it.
+        let mut raw = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"mail a@x.com\"}\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\" and KEEPME\"}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}",
+        )
+        .as_bytes()
+        .to_vec();
+        assert!(matches!(
+            seal_buffered_sse(&mut raw).tail,
+            SseTailSeal::Dropped { .. }
+        ));
+        // Nothing was scanned, so nothing is released — the caller refuses.
+        assert!(raw.is_empty());
+    }
+
+    #[test]
+    fn a_masked_crlf_document_stays_crlf_framed() {
+        let chain = both();
+        let raw = concat!(
+            "event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"mail a@x.com\"}\r\n\r\n",
+            "event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{}}\r\n\r\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let (out, _) = redact_responses_sse(chain.as_ref(), &raw).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
+        // The mask must not re-frame the document it passed through: every
+        // terminator, and the rewritten line's own ending, stay CRLF.
+        assert!(!out.contains("\n\n"), "LF-framed after masking: {out:?}");
+        assert_eq!(out.matches("\r\n\r\n").count(), 2, "out: {out:?}");
+        // `split`, not `lines`: the latter strips the very `\r` under test.
+        let masked = out
+            .split('\n')
+            .find(|l| l.contains("[EMAIL_REDACTED]"))
+            .expect("the masked line");
+        assert!(
+            masked.ends_with('\r'),
+            "rewritten line lost its CR: {masked:?}"
+        );
+    }
+
+    #[test]
+    fn seal_always_leaves_the_buffer_ending_on_a_terminator() {
+        // The invariant the whole fix rests on, and the one `split_sse_frames`
+        // documents: after a seal there is no trailing fragment left for the
+        // two passes to read differently. Exhaustive over the bytes that can
+        // form a terminator plus one payload byte, so the boundary cases
+        // (a fragment that is a lone `\r` after a CRLF frame, a `\n\n\n`
+        // run, an empty buffer) are covered by construction rather than by
+        // imagination.
+        let alphabet = [b'a', b'\n', b'\r'];
+        let mut words: Vec<Vec<u8>> = vec![Vec::new()];
+        for _ in 0..7 {
+            let mut next = Vec::new();
+            for w in &words {
+                for b in alphabet {
+                    let mut w = w.clone();
+                    w.push(b);
+                    next.push(w);
+                }
+            }
+            for w in &words {
+                let mut buf = w.clone();
+                let before = buf.clone();
+                seal_buffered_sse(&mut buf);
+                assert_eq!(
+                    last_frame_end(&buf),
+                    buf.len(),
+                    "sealed {before:?} into {buf:?}, which still has a tail",
+                );
+                // And sealing is settled: a second pass changes nothing.
+                let once = buf.clone();
+                assert_eq!(seal_buffered_sse(&mut buf).tail, SseTailSeal::Terminated);
+                assert_eq!(buf, once, "seal is not idempotent on {before:?}");
+            }
+            words = next;
+        }
+    }
+
+    #[test]
+    fn seal_keeps_a_final_frame_with_nothing_to_scan() {
+        // Neither payload is JSON, and neither carries text any pass reads —
+        // cutting them would only cost the client its terminal event.
+        for tail in ["data: [DONE]", "data:"] {
+            let mut raw = format!("data: {{\"a\":1}}\n\n{tail}").into_bytes();
+            assert!(
+                matches!(
+                    seal_buffered_sse(&mut raw).tail,
+                    SseTailSeal::Completed { .. }
+                ),
+                "cut {tail}",
+            );
+            assert!(String::from_utf8(raw)
+                .unwrap()
+                .ends_with(&format!("{tail}\n\n")));
+        }
+    }
+
+    #[test]
+    fn seal_cuts_a_final_frame_that_cannot_be_parsed() {
+        // Truncated mid-JSON: nothing can extract its text, so nothing can
+        // scan it, so it must not be released.
+        let mut raw = b"data: {\"a\":1}\n\ndata: {\"text\":\"SECRET".to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut raw).tail,
+            SseTailSeal::Dropped { dropped: 21 },
+        );
+        assert_eq!(raw, b"data: {\"a\":1}\n\n");
+        // When it is the WHOLE body the buffer is left empty — the caller
+        // refuses rather than answering with an empty 200.
+        let mut only = b"data: {\"text\":\"SECRET".to_vec();
+        assert!(matches!(
+            seal_buffered_sse(&mut only).tail,
+            SseTailSeal::Dropped { .. }
+        ));
+        assert!(only.is_empty());
+    }
+
+    // #1100: the sibling of the fragment above, in the frames BEFORE it. A
+    // terminated frame whose payload is not one JSON document was read by
+    // neither pass — the scan `continue`d past a line it could not parse and
+    // the redactor skipped a frame with no parsed payload — so it went out
+    // byte-for-byte, seen by nothing. And a frame whose payload legitimately
+    // spans several `data:` lines lost every line after the first when the
+    // redactor rewrote it.
+
+    #[test]
+    fn a_frames_payload_is_all_of_its_data_lines_joined() {
+        // Split mid-document, which is exactly what the spec's `\n` join is
+        // for. Reading only the first line leaves neither half parseable.
+        let frame = b"event: x\ndata: {\"type\":\"content_block_delta\",\ndata: \"index\":0}";
+        assert_eq!(
+            frame_payload(frame).as_deref(),
+            Some("{\"type\":\"content_block_delta\",\n\"index\":0}"),
+        );
+        // One leading space belongs to the framing, the rest to the payload.
+        assert_eq!(frame_payload(b"data:  x").as_deref(), Some(" x"));
+        // So does the CR of a CRLF line ending — the payload is the text
+        // between them. Only a continued payload can carry one: a frame's
+        // last line hands its CR to the terminator.
+        assert_eq!(
+            frame_payload(b"data: one\r\ndata: two").as_deref(),
+            Some("one\ntwo"),
+        );
+        // No `data:` line at all: a comment or keepalive, nothing to read.
+        assert_eq!(frame_payload(b": ping"), None);
+    }
+
+    /// `data_line_ranges` is what the model restamp splices into, so an
+    /// off-by-one in its arithmetic would rewrite the wrong bytes. The
+    /// ranges are checked against the payload lines they must select on
+    /// every framing variant a provider is allowed to emit.
+    #[test]
+    fn data_line_ranges_select_exactly_the_payload_lines() {
+        for (frame, want) in [
+            // Canonical: labelled event, LF terminators, one space after the colon.
+            (
+                &b"event: message_start\ndata: {\"a\":1}\n\n"[..],
+                vec![&b"{\"a\":1}"[..]],
+            ),
+            // CRLF: the `\r` belongs to the framing, not the payload.
+            (
+                &b"event: x\r\ndata: {\"a\":1}\r\n\r\n"[..],
+                vec![&b"{\"a\":1}"[..]],
+            ),
+            // No space after the colon — the spec makes it optional.
+            (&b"data:{\"a\":1}\n\n"[..], vec![&b"{\"a\":1}"[..]]),
+            // A comment/keepalive line ahead of the data line.
+            (&b": ping\ndata: {\"a\":1}\n\n"[..], vec![&b"{\"a\":1}"[..]]),
+            // Terminal sentinel.
+            (&b"data: [DONE]\n\n"[..], vec![&b"[DONE]"[..]]),
+            // Empty payload: a zero-width range, not a panic and not the tail.
+            (&b"data:\n\n"[..], vec![&b""[..]]),
+            // No data line at all.
+            (&b"event: ping\n\n"[..], vec![]),
+            // A value containing the delimiter bytes must not confuse the scan.
+            (
+                &b"event: e\ndata: {\"t\":\"a: b\"}\n\n"[..],
+                vec![&b"{\"t\":\"a: b\"}"[..]],
+            ),
+            // One document over several lines: every line is selected, and a
+            // non-data line between two of them is not (#1105).
+            (
+                &b"event: e\ndata: {\"a\":1,\nid: 7\ndata: \"b\":2}\n\n"[..],
+                vec![&b"{\"a\":1,"[..], &b"\"b\":2}"[..]],
+            ),
+        ] {
+            let ranges = data_line_ranges(frame);
+            let got: Vec<&[u8]> = ranges.iter().map(|r| &frame[r.clone()]).collect();
+            assert_eq!(
+                got,
+                want,
+                "ranges select the payload lines for {:?}",
+                String::from_utf8_lossy(frame),
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_sse_masks_a_frame_whose_payload_spans_several_data_lines() {
+        let chain = both();
+        let mut raw = concat!(
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello \"}}\n\n",
+            // One frame, one JSON document, written over two `data:` lines.
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\n",
+            "data: \"delta\":{\"type\":\"text_delta\",\"text\":\"mail a@x.com\"}}\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        // Nothing to seal — every frame here is terminated — and nothing to
+        // excise either: the joined payload IS one JSON document.
+        let seal = seal_buffered_sse(&mut raw);
+        assert_eq!(seal.tail, SseTailSeal::Terminated);
+        assert!(seal.excised.is_empty(), "excised: {:?}", seal.excised);
+        let (out, counts) = redact_anthropic_sse(chain.as_ref(), &raw)
+            .expect("the whole payload must reach the redactor");
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "left unmasked: {out}");
+        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
+        assert_eq!(counts.get("email"), Some(&1));
+        // The rewritten frame carries the whole document, re-serialised onto
+        // one `data:` line — the payload is preserved, not truncated to its
+        // first line.
+        assert!(out.contains("\"index\":0"), "second line dropped: {out}");
+        assert!(out.contains("\"text_delta\""), "second line dropped: {out}");
+    }
+
+    #[test]
+    fn responses_sse_masks_a_frame_whose_payload_spans_several_data_lines() {
+        let chain = both();
+        let mut raw = concat!(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"hello \"}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\n",
+            "data: \"item_id\":\"m\",\"delta\":\"mail a@x.com\"}\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let seal = seal_buffered_sse(&mut raw);
+        assert!(seal.excised.is_empty(), "excised: {:?}", seal.excised);
+        let (out, counts) = redact_responses_sse(chain.as_ref(), &raw)
+            .expect("the whole payload must reach the redactor");
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "left unmasked: {out}");
+        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
+        assert_eq!(counts.get("email"), Some(&1));
+        assert!(
+            out.contains("\"item_id\":\"m\""),
+            "second line dropped: {out}"
+        );
+    }
+
+    #[test]
+    fn seal_excises_a_terminated_frame_whose_payload_is_not_json() {
+        // Plain text in the middle of an otherwise well-formed stream. No
+        // pass could read it, so it used to be released having been scanned
+        // by nothing.
+        let mut raw = b"data: {\"a\":1}\n\ndata: my mail is a@x.com\n\ndata: [DONE]\n\n".to_vec();
+        let seal = seal_buffered_sse(&mut raw);
+        assert_eq!(seal.tail, SseTailSeal::Terminated);
+        // Handed back for the caller's block scan: nothing can mask it, but
+        // a forbidden literal in it still has to block the response.
+        assert_eq!(seal.excised, vec!["my mail is a@x.com".to_string()]);
+        assert_eq!(seal.excised_bytes, "data: my mail is a@x.com\n\n".len());
+        assert!(seal.cut_anything());
+        // ...and it is gone from what will be released, while its neighbours
+        // — including the frames with nothing to scan — are untouched.
+        assert_eq!(raw, b"data: {\"a\":1}\n\ndata: [DONE]\n\n");
+    }
+
+    #[test]
+    fn seal_excises_a_terminated_frame_whose_data_lines_do_not_join_into_one_document() {
+        // Two complete events run together with no blank line between them:
+        // not one frame, and the join is not one document either. Same rule
+        // as the tail shape, now applied wherever it appears.
+        let mut raw =
+            b"data: {\"a\":1}\n\ndata: {\"b\":2}\ndata: {\"c\":3}\n\ndata: [DONE]\n\n".to_vec();
+        let seal = seal_buffered_sse(&mut raw);
+        assert_eq!(
+            seal.excised,
+            vec!["{\"b\":2}\n{\"c\":3}".to_string()],
+            "raw: {}",
+            String::from_utf8_lossy(&raw),
+        );
+        assert_eq!(raw, b"data: {\"a\":1}\n\ndata: [DONE]\n\n");
+    }
+
+    #[test]
+    fn seal_can_excise_the_whole_buffer() {
+        // The caller refuses with `unscannable_body` rather than answering
+        // with an empty 200 — `cut_anything` is what tells it apart from an
+        // upstream that simply sent nothing.
+        let mut raw = b"data: not json at all\n\n".to_vec();
+        let seal = seal_buffered_sse(&mut raw);
+        assert!(raw.is_empty());
+        assert!(seal.cut_anything());
+
+        let mut empty = Vec::new();
+        let seal = seal_buffered_sse(&mut empty);
+        assert!(!seal.cut_anything(), "an empty body is not a cut");
+    }
+
+    #[test]
+    fn seal_keeps_frames_with_nothing_to_scan_and_crlf_frames() {
+        // A comment, a keepalive and an empty payload carry no text any pass
+        // reads, so excising them would cost the client its events and
+        // protect nothing. Framed CRLF, since that is the form the splitter
+        // used to miss entirely.
+        let raw = b": ping\r\n\r\ndata:\r\n\r\ndata: [DONE]\r\n\r\n".to_vec();
+        let mut sealed = raw.clone();
+        let seal = seal_buffered_sse(&mut sealed);
+        assert!(seal.excised.is_empty(), "excised: {:?}", seal.excised);
+        assert_eq!(sealed, raw);
+        // `sealed == raw` alone would hold even if the splitter saw one
+        // unframed blob, since an empty excision returns the buffer
+        // untouched. Assert the framing itself: three CRLF frames, and the
+        // `\r` stripped from each payload rather than left in it.
+        assert_eq!(
+            sse_frame_payloads(&raw),
+            vec![String::new(), "[DONE]".to_string()],
+        );
+    }
+
+    #[test]
+    fn seal_excises_a_crlf_frame_and_leaves_its_neighbours_crlf() {
+        let mut crlf =
+            b"data: {\"a\":1}\r\n\r\ndata: not json\r\n\r\ndata: [DONE]\r\n\r\n".to_vec();
+        let seal = seal_buffered_sse(&mut crlf);
+        assert_eq!(seal.excised, vec!["not json".to_string()]);
+        assert_eq!(crlf, b"data: {\"a\":1}\r\n\r\ndata: [DONE]\r\n\r\n");
+    }
+
+    #[test]
+    fn anthropic_sse_masks_a_crlf_frame_whose_payload_spans_several_data_lines() {
+        // The CRLF half of the LF case above. The dropped `data:` line takes
+        // its line ending with it, so without care the CR of the line BEFORE
+        // the separator is left stranded and the client reads `...}\r` as
+        // the payload.
+        let chain = both();
+        let mut raw = concat!(
+            "event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\r\n",
+            "data: \"delta\":{\"type\":\"text_delta\",\"text\":\"mail a@x.com\"}}\r\n\r\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let seal = seal_buffered_sse(&mut raw);
+        assert!(seal.excised.is_empty(), "excised: {:?}", seal.excised);
+        let (out, _) = redact_anthropic_sse(chain.as_ref(), &raw)
+            .expect("the whole payload must reach the redactor");
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "left unmasked: {out}");
+        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
+        // A masked CRLF frame stays a well-formed CRLF frame: the payload
+        // ends at `}`, not at a stray CR.
+        assert!(out.ends_with("}\r\n\r\n"), "stray CR: {out:?}");
+        assert!(!out.contains("\r\r"), "stray CR: {out:?}");
     }
 
     #[test]

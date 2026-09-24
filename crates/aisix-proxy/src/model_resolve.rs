@@ -32,10 +32,14 @@ pub(crate) fn resolve_model(
     // the request's attribution cell (see `attribution`).
     if let Some(exact) = snapshot.models.get_by_name(requested) {
         crate::attribution::note_requested_model(requested);
+        note_dispatchable_entry(&exact);
         return Some(exact);
     }
     let (entry, upstream) = best_wildcard_row(snapshot, requested)?;
     crate::attribution::note_requested_model(requested);
+    // A wildcard row is a direct model, and attribution stays on the ROW
+    // (see the module docs), so the synthetic clone below inherits its id.
+    note_dispatchable_entry(&entry);
     let mut model = entry.value.clone();
     model.model_name = Some(upstream);
     Some(Arc::new(ResourceEntry::new(
@@ -43,6 +47,20 @@ pub(crate) fn resolve_model(
         model,
         entry.revision,
     )))
+}
+
+/// Record the resolved entry's uuid for the terminal emitters that run
+/// after the handler is gone (AISIX-Cloud#1571) — but only when the entry
+/// dispatches to an upstream itself. A routing group, an ensemble and a
+/// semantic router are addressed by the caller and served by something
+/// else; their uuid prices nothing, so the cancel path leaves `model_id`
+/// empty for them and takes the target's id from the attempt instead.
+fn note_dispatchable_entry(entry: &ResourceEntry<Model>) {
+    let model = &entry.value;
+    if model.is_routing() || model.is_ensemble() || model.is_semantic() {
+        return;
+    }
+    crate::attribution::note_resolved_entry(&entry.id);
 }
 
 /// Wildcard fallback: the most specific direct Model whose `*`-glob
@@ -74,6 +92,30 @@ fn best_wildcard_row(
         }
     }
     best.map(|(_, entry, upstream)| (entry, upstream))
+}
+
+/// Whether `model` is a row that would actually serve the caller-facing
+/// name `requested` — an exact `display_name`, or a wildcard glob covering
+/// it. Used where a name arrives from somewhere other than a live request
+/// body (a client-supplied video id) and must not be echoed back as though
+/// the gateway had attested it.
+pub(crate) fn row_serves_name(model: &Model, requested: &str) -> bool {
+    // The same kind gate `best_wildcard_row` applies: only a direct row can
+    // serve a caller-minted alias. Unreachable today on the one surface that
+    // calls this — `dispatch::require_provider` rejects those kinds first —
+    // but this sits beside the function it mirrors, and it judges an entry
+    // the CLIENT named, so the two answer alike rather than by coincidence.
+    if model.is_routing() || model.is_ensemble() || model.is_semantic() {
+        return false;
+    }
+    // Exact equality FIRST, and for wildcard rows too. `resolve_model` starts
+    // with `get_by_name(requested)`, so a caller can address `wan/*`
+    // literally and be served by that row — which makes the pattern a name
+    // the row serves, however odd it looks. Narrowing this to the glob would
+    // make the two functions disagree about the same request.
+    model.display_name == requested
+        || (model.display_name.contains('*')
+            && wildcard_capture(&model.display_name, requested).is_some())
 }
 
 /// The `display_name` of the wildcard row that would serve `requested`,
@@ -130,6 +172,34 @@ mod tests {
             "provider_key_id": "pk-1",
         }))
         .unwrap()
+    }
+
+    /// `row_serves_name` gates a name that did NOT arrive on a live request
+    /// body — it decides whether the gateway will echo a caller-supplied
+    /// string back as its own `model`. A row must accept every name it
+    /// really serves and refuse everything else.
+    #[test]
+    fn row_serves_name_accepts_only_names_the_row_would_serve() {
+        let exact = direct_model("wan-turbo", Some("wan-upstream"));
+        assert!(row_serves_name(&exact, "wan-turbo"));
+        assert!(!row_serves_name(&exact, "wan-turbo-forged"));
+        assert!(!row_serves_name(&exact, "anything-at-all"));
+
+        let wildcard = direct_model("wan/*", Some("wan-*"));
+        // Every name the glob covers — the whole reason the poll echoes the
+        // caller's string rather than the row's own.
+        assert!(row_serves_name(&wildcard, "wan/turbo"));
+        assert!(row_serves_name(&wildcard, "wan/plus"));
+        // The pattern itself IS accepted, and deliberately so: `resolve_model`
+        // resolves `wan/*` by exact name lookup before it ever tries globbing,
+        // so that string is a name this row really serves. Narrowing it here
+        // would make the echo refuse a name the dispatcher accepts.
+        assert!(row_serves_name(&wildcard, "wan/*"));
+        // A bare prefix is not covered by the glob.
+        assert!(!row_serves_name(&wildcard, "wan"));
+        // Outside the glob: a forged id must not get its string echoed.
+        assert!(!row_serves_name(&wildcard, "other/turbo"));
+        assert!(!row_serves_name(&wildcard, "anything-at-all"));
     }
 
     fn snapshot_with(models: Vec<(&str, Model)>) -> AisixSnapshot {

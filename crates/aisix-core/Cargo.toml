@@ -24,19 +24,29 @@ schemars = { workspace = true, features = ["chrono"] }
 chrono.workspace = true
 chrono-tz.workspace = true
 once_cell.workspace = true
+rustix.workspace = true
 # ApiKey::hash_bearer (prd-09a §9A.7B.4) is the canonical SHA-256 the
 # proxy uses to compare an incoming Authorization: Bearer <plaintext>
 # against the snapshot's `key_hash` column.
 sha2.workspace = true
+ring.workspace = true
 hex.workspace = true
 # Trusted-proxy CIDR parsing/validation for proxy.real_ip (#492)
 ipnet.workspace = true
+# `managed.cp_base_url` is validated as an http(s) URL at load so the
+# heartbeat / telemetry / budget call sites cannot be handed a value
+# reqwest fails to parse (AISIX-Cloud#1643).
+url.workspace = true
 # Header-name parsing/validation for proxy.request_id.accept_headers
 # (AISIX-Cloud#1288) — same role ipnet plays for real_ip.
 http.workspace = true
 # filesource: resources.yaml parsing + deterministic UUIDv5 resource ids
 yaml-rust2.workspace = true
 uuid.workspace = true
+# `tokio::sync::watch` backs ConfigStatus::wait_until_applied — the
+# awaitable first-apply signal the boot path gates the proxy listener on.
+# Runtime-agnostic: no reactor or driver is pulled into this crate.
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

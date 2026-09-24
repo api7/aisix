@@ -31,7 +31,8 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-use aisix_etcd::loader::{PartialCompatEntry, RejectedEntry};
+use aisix_core::ConfigRejectionSnapshot;
+use aisix_etcd::loader::PartialCompatEntry;
 use aisix_obs::SinkStatsSnapshot;
 use anyhow::{anyhow, Context};
 use serde::Serialize;
@@ -65,7 +66,7 @@ fn format_build_version(pkg_version: &str, build_sha: Option<&str>) -> String {
 /// Pre-fix the loader logged a warning and silently moved on. Customers
 /// who saved an invalid resource in the dashboard saw "Saved" but the
 /// DP dropped the row — no signal back. See issue #115.
-pub type RejectionFetcher = Arc<dyn Fn() -> Vec<RejectedEntry> + Send + Sync>;
+pub type RejectionFetcher = Arc<dyn Fn() -> Vec<ConfigRejectionSnapshot> + Send + Sync>;
 
 /// Per-tick source of the highest etcd/kine revision the watch
 /// supervisor has applied to its snapshot (`WatchStatus.revision`).
@@ -120,6 +121,21 @@ pub struct MtlsBundle {
     pub client_cert_path: PathBuf,
     pub client_key_path: PathBuf,
     pub extra_ca_pem: Option<Vec<u8>>,
+}
+
+/// Path the DP POSTs a heartbeat to, under `managed.cp_base_url`. The
+/// budget gate derives its own origin by stripping this suffix back
+/// off, and the telemetry worker by swapping it for `/dp/telemetry`.
+pub const HEARTBEAT_PATH: &str = "/dp/heartbeat";
+
+/// Build the heartbeat URL from `managed.cp_base_url`.
+///
+/// Both managed boot paths (fresh provision, persisted bundle) derive
+/// it here so they cannot drift, and so a test can exercise the same
+/// derivation the binary uses. The base already carries a scheme —
+/// `aisix_core::Config` normalises it at load.
+pub fn heartbeat_url(cp_base: &str) -> String {
+    format!("{}{HEARTBEAT_PATH}", cp_base.trim_end_matches('/'))
 }
 
 /// Configuration captured at register time. `url`, `dp_id`, `interval`
@@ -403,15 +419,15 @@ impl ExporterHealthWire {
 }
 
 /// On-the-wire shape for one rejection. Kept as a separate type from
-/// `aisix_etcd::loader::RejectedEntry` so the loader's internal
-/// representation can evolve without forcing a wire bump. The two
-/// converge today; `kind` is serialised as a string ("bad_key",
+/// [`ConfigRejectionSnapshot`] so the status subsystem's internal
+/// representation can evolve without forcing a wire bump. `kind` is
+/// serialised as a string ("bad_key",
 /// "non_json", "schema_failed", "parse_failed", "unknown_kind") so
 /// cp-api can match without depending on Rust enum repr.
 #[derive(Debug, Serialize)]
 struct RejectedResourceWire {
     key: String,
-    kind: &'static str,
+    kind: String,
     error: String,
     timestamp_unix_secs: u64,
     /// Unix seconds since when this key has been serving its last known
@@ -424,11 +440,11 @@ struct RejectedResourceWire {
     stale_serving_since_unix_secs: Option<u64>,
 }
 
-impl From<&RejectedEntry> for RejectedResourceWire {
-    fn from(r: &RejectedEntry) -> Self {
+impl From<&ConfigRejectionSnapshot> for RejectedResourceWire {
+    fn from(r: &ConfigRejectionSnapshot) -> Self {
         Self {
             key: r.key.clone(),
-            kind: r.kind.as_str(),
+            kind: r.kind.clone(),
             error: r.error.clone(),
             timestamp_unix_secs: r.timestamp_unix_secs,
             stale_serving_since_unix_secs: r.stale_serving_since_unix_secs,
@@ -470,13 +486,25 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
         .as_ref()
         .map(|fetcher| fetcher())
         .unwrap_or(0);
-    let config_hash = cfg
-        .config_hash_fetcher
-        .as_ref()
-        .and_then(|fetcher| fetcher())
-        // Defensive clamp — the hash is 64 hex chars, but the CP column
-        // caps at 128 so never send more.
-        .map(|h| h.chars().take(CONFIG_HASH_MAX_CHARS).collect::<String>());
+    // Off the runtime's own threads: the configuration status computes
+    // this digest when something reports it rather than on every apply,
+    // so the first heartbeat after an apply walks the whole
+    // configuration on a background-priority thread.
+    let config_hash = match cfg.config_hash_fetcher.clone() {
+        Some(fetcher) => match tokio::task::spawn_blocking(move || fetcher()).await {
+            Ok(hash) => hash,
+            Err(error) => {
+                // Silently omitting it would repeat every cycle with
+                // nothing to read.
+                tracing::error!(%error, "reading the applied config hash failed");
+                None
+            }
+        },
+        None => None,
+    }
+    // Defensive clamp — the hash is 64 hex chars, but the CP column
+    // caps at 128 so never send more.
+    .map(|h| h.chars().take(CONFIG_HASH_MAX_CHARS).collect::<String>());
     let mut exporter_health: Vec<ExporterHealthWire> = cfg
         .exporter_health_fetcher
         .as_ref()
@@ -668,6 +696,68 @@ mod tests {
         )
     }
 
+    /// A scheme-less `managed.cp_base_url` used to produce
+    /// `127.0.0.1:7944/dp/heartbeat`, which reqwest rejects when the
+    /// request is BUILT — so the beat never left the process and the
+    /// only symptom was one WARN per interval, while etcd (which
+    /// attaches its own scheme) stayed connected and the console showed
+    /// the gateway healthy (AISIX-Cloud#1643).
+    ///
+    /// The probe is the error kind: a builder error means no request was
+    /// ever formed, while any transport error means one was and only the
+    /// exchange failed. A peer that accepts and hangs up is what makes
+    /// the two distinguishable without standing up a control plane.
+    #[tokio::test]
+    async fn heartbeat_request_is_built_from_a_scheme_less_cp_base_url() {
+        // The listener is HELD for the whole test and answers by
+        // closing the connection immediately. Binding a port and
+        // dropping it would leave a window in which another process on
+        // a busy CI box takes it, and the probe below needs the peer's
+        // behaviour to be deterministic, not merely likely.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+        let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            format!(
+                r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+  cp_base_url: "127.0.0.1:{port}"
+"#
+            ),
+        )
+        .unwrap();
+        let loaded = aisix_core::Config::load_from_path(Some(file.path())).unwrap();
+        let url = heartbeat_url(loaded.managed.cp_base_url.as_deref().unwrap());
+        assert_eq!(url, format!("https://127.0.0.1:{port}/dp/heartbeat"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_bundle(url, write_test_bundle(dir.path()));
+        let err = send(&plain_client(), &cfg, 0).await.unwrap_err();
+        let source = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<reqwest::Error>())
+            .unwrap_or_else(|| panic!("expected a reqwest failure, got: {err:#}"));
+        assert!(
+            !source.is_builder(),
+            "the heartbeat request was never built: {source}"
+        );
+    }
+
     fn plain_client() -> reqwest::Client {
         // Plain HTTP client used by the wiremock-based send tests.
         // We don't want to drag the wiremock test through TLS termination
@@ -757,22 +847,14 @@ mod tests {
         let received = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
 
-        // B.6 — exact compiled-in kinds under default features.
+        // B.6 — the compiled-in kinds reach the wire verbatim, in order.
+        // Compared against the crate that owns the list rather than a copy
+        // of it: a second hand-written list here would only freeze whatever
+        // the first one says. What the list must CONTAIN is pinned against
+        // the schema vocabulary in `aisix_guardrails`.
         assert_eq!(
             body["supported_guardrail_kinds"],
-            serde_json::json!([
-                "keyword",
-                "pii",
-                "azure_content_safety",
-                "azure_content_safety_text_moderation",
-                "aliyun_text_moderation",
-                "aliyun_ai_guardrail",
-                "bedrock",
-                "lakera",
-                "openai_moderation",
-                "presidio",
-                "semantic",
-            ]),
+            serde_json::json!(aisix_guardrails::supported_kinds()),
         );
 
         // B.3 — the fetched applied revision.
@@ -823,16 +905,16 @@ mod tests {
         let cfg = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls)
             .with_rejection_fetcher(Arc::new(|| {
                 vec![
-                    RejectedEntry {
+                    ConfigRejectionSnapshot {
                         key: "/aisix/models/stale-served".into(),
-                        kind: aisix_etcd::loader::RejectionKind::SchemaFailed,
+                        kind: "schema_failed".into(),
                         error: "schema validation failed".into(),
                         timestamp_unix_secs: 1_770_000_100,
                         stale_serving_since_unix_secs: Some(1_770_000_000),
                     },
-                    RejectedEntry {
+                    ConfigRejectionSnapshot {
                         key: "/aisix/models/never-loaded".into(),
-                        kind: aisix_etcd::loader::RejectionKind::SchemaFailed,
+                        kind: "schema_failed".into(),
                         error: "schema validation failed".into(),
                         timestamp_unix_secs: 1_770_000_100,
                         stale_serving_since_unix_secs: None,

@@ -15,7 +15,8 @@ use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 
 use aisix_core::models::{
-    GuardrailEnforcedHit, GuardrailExecution, GuardrailMetricsSink, GuardrailMonitorHit,
+    GuardrailEnforcedHit, GuardrailExecution, GuardrailInputMessages, GuardrailMetricsSink,
+    GuardrailMonitorHit,
 };
 
 use crate::audit::GuardrailAuditLog;
@@ -31,6 +32,10 @@ struct ChainMember {
     name: String,
     kind: String,
     guardrail: Arc<dyn Guardrail>,
+    /// The row's `input_messages`. Lives on the member rather than the
+    /// guardrail because it is common to all twelve kinds and none of them
+    /// needs to know its own window — the chain narrows what it hands over.
+    input_messages: GuardrailInputMessages,
 }
 
 #[derive(Clone)]
@@ -57,6 +62,31 @@ pub struct GuardrailChain {
     audit: Option<Arc<GuardrailAuditLog>>,
 }
 
+/// The message window each member reads, resolved once per fold.
+///
+/// `None` when no member narrows — the common case, and the one that must
+/// stay allocation-free: `latest_turn_view` clones the request's messages.
+fn latest_turn_view_if_needed(members: &[ChainMember], req: &ChatFormat) -> Option<ChatFormat> {
+    members
+        .iter()
+        .any(|m| m.input_messages == GuardrailInputMessages::LatestTurn)
+        .then(|| crate::latest_turn_view(req))
+}
+
+/// What `m` is allowed to read of `req`.
+fn member_input<'a>(
+    m: &ChainMember,
+    req: &'a ChatFormat,
+    narrowed: &'a Option<ChatFormat>,
+) -> &'a ChatFormat {
+    match m.input_messages {
+        GuardrailInputMessages::All => req,
+        // `narrowed` is `Some` whenever any member asks for it, so the
+        // fallback is unreachable rather than a silent widening.
+        GuardrailInputMessages::LatestTurn => narrowed.as_ref().unwrap_or(req),
+    }
+}
+
 impl std::fmt::Debug for GuardrailChain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GuardrailChain")
@@ -74,6 +104,7 @@ impl GuardrailChain {
                     name: g.name().to_owned(),
                     kind: g.name().to_owned(),
                     guardrail: g,
+                    input_messages: GuardrailInputMessages::All,
                 })
                 .collect(),
             applied: Vec::new(),
@@ -90,26 +121,44 @@ impl GuardrailChain {
     /// chain's runtime behaviour does not depend on that — `applied` is
     /// telemetry-only.
     pub fn new_with_applied(
-        members: Vec<(String, Arc<dyn Guardrail>)>,
+        members: Vec<(String, Arc<dyn Guardrail>, GuardrailInputMessages)>,
         applied: Vec<AppliedGuardrail>,
     ) -> Self {
         Self {
             members: members
                 .into_iter()
                 .enumerate()
-                .map(|(i, (name, guardrail))| ChainMember {
+                .map(|(i, (name, guardrail, input_messages))| ChainMember {
                     kind: applied
                         .get(i)
                         .map(|a| a.kind.clone())
                         .unwrap_or_else(|| guardrail.name().to_owned()),
                     name,
                     guardrail,
+                    input_messages,
                 })
                 .collect(),
             applied,
             sink: None,
             audit: None,
         }
+    }
+
+    /// Test shorthand for a chain whose every member is left on
+    /// `input_messages: all` — the default, and what the folds behave like
+    /// when nothing narrows.
+    #[cfg(test)]
+    pub fn new_with_applied_all(
+        members: Vec<(String, Arc<dyn Guardrail>)>,
+        applied: Vec<AppliedGuardrail>,
+    ) -> Self {
+        Self::new_with_applied(
+            members
+                .into_iter()
+                .map(|(name, g)| (name, g, GuardrailInputMessages::All))
+                .collect(),
+            applied,
+        )
     }
 
     /// Attach a per-execution telemetry sink (AISIX-Cloud#1076). Called by
@@ -120,12 +169,37 @@ impl GuardrailChain {
         self
     }
 
-    /// Attach the request's enforced-hit log (AISIX-Cloud#1330). Called by
-    /// `LiveGuardrailIndex::resolve` with a freshly minted log; `None`
-    /// (the default for test-built chains) records nothing.
+    /// Attach the request's enforced-hit and score log
+    /// (AISIX-Cloud#1330, #1467). Called by `LiveGuardrailIndex::resolve`
+    /// with a freshly minted log; `None` (the default for test-built
+    /// chains) records nothing.
+    ///
+    /// Members that report similarity scores are rebound to the log here.
+    /// This is the only point that has both — the index's members are
+    /// shared by every request and the log is minted per request — so a
+    /// chain that skips it scores nothing, which is why the two are one
+    /// call rather than two.
     pub fn with_audit_log(mut self, audit: Option<Arc<GuardrailAuditLog>>) -> Self {
+        if let Some(log) = audit.as_ref() {
+            for m in &mut self.members {
+                if let Some(bound) = m.guardrail.bind_score_log(log) {
+                    m.guardrail = bound;
+                }
+            }
+        }
         self.audit = audit;
         self
+    }
+
+    /// The similarity scores recorded on this request so far
+    /// (AISIX-Cloud#1467). Empty when no scoring guardrail ran or when the
+    /// chain carries no log. Non-destructive — see
+    /// [`GuardrailAuditLog::score_snapshot`].
+    pub fn scores(&self) -> Vec<aisix_core::GuardrailScore> {
+        self.audit
+            .as_ref()
+            .map(|a| a.score_snapshot())
+            .unwrap_or_default()
     }
 
     /// The ENFORCE-mode hits recorded on this request so far: which
@@ -139,6 +213,91 @@ impl GuardrailChain {
             .as_ref()
             .map(|a| a.snapshot())
             .unwrap_or_default()
+    }
+
+    /// The request's fail-open bypass tag, or `None` when nothing was
+    /// bypassed (the dominant case) or the chain carries no audit log.
+    /// Non-destructive — see [`GuardrailAuditLog::bypass_reason`].
+    pub fn bypass_reason(&self) -> Option<String> {
+        self.audit.as_ref().and_then(|a| a.bypass_reason())
+    }
+
+    /// Record a bypass the PROXY performed on the chain's behalf, rather
+    /// than one a member returned.
+    ///
+    /// One caller shape: a body the scanner cannot read, which the
+    /// handler passes through when nothing attached both reads that side
+    /// and refuses when it cannot evaluate (#1115). No member ran, so no
+    /// member can report it, yet the request was screened by nothing —
+    /// exactly what the field is read to rule out.
+    ///
+    /// Reported to BOTH receivers, and they answer different questions.
+    /// The audit log keeps the first tag only — it feeds a single
+    /// per-request field. The metrics sink counts every call, matching
+    /// `aisix_guardrail_bypasses_total`'s per-event meaning on the
+    /// execution-driven path, where a chain with three bypassed members
+    /// already increments three times.
+    ///
+    /// No event is counted twice: a bypass recorded here had no execution
+    /// to report, and `record_execution` reaches the counter through the
+    /// sink's execution method instead. One REQUEST can still produce
+    /// both, and legitimately — `audio.rs` records an undecodable
+    /// transcript tail here and then scans the decodable remainder, whose
+    /// members may themselves fail open. Those are two things that went
+    /// unscreened, not one counted twice.
+    ///
+    /// Counting here rather than only auditing is what keeps
+    /// `aisix_guardrail_bypasses_total` symmetric with
+    /// `aisix_guardrail_blocks_total`, which already counts the
+    /// pre-execution refusals. Without it the SAME unscannable body was
+    /// counted when the chain refused and counted nowhere when it let the
+    /// request through — the direction an operator is reading the counter
+    /// to find.
+    ///
+    /// The tag is clamped once here so both receivers carry the identical
+    /// value; [`GuardrailAuditLog::record_bypass`] clamps too, and the
+    /// clamp is idempotent.
+    ///
+    /// A no-op for whichever receiver the chain does not carry.
+    pub fn record_bypass(&self, reason: &str) {
+        if self.audit.is_none() && self.sink.is_none() {
+            return;
+        }
+        let tag = crate::bounded_failure_tag(reason);
+        if let Some(audit) = self.audit.as_ref() {
+            audit.record_bypass(&tag);
+        }
+        if let Some(sink) = self.sink.as_ref() {
+            sink.record_guardrail_bypass(&tag);
+        }
+    }
+
+    /// Record the proxy's pass-through of a REQUEST body it could not scan
+    /// — but only when that pass-through is a bypass.
+    ///
+    /// The pass-through has two causes and only one of them is one. A chain
+    /// where every member that reads the request is fail-open let an
+    /// unscreened request through: that is a bypass. A chain where NO member
+    /// reads the request never offered to screen it, so nothing was
+    /// bypassed and the request left exactly as it would with no guardrail
+    /// configured — tagging it would make the field fire on requests that
+    /// were never going to be screened, which is the way to make a
+    /// negative answer untrustworthy in the other direction.
+    ///
+    /// Both halves are read off the same member set the refusal gate uses
+    /// (#1115), so the two cannot disagree about which chain refuses.
+    pub fn record_unevaluable_input_bypass(&self, reason: &str) {
+        if Guardrail::runs_on_input(self) && !Guardrail::refuses_unevaluable_input(self) {
+            self.record_bypass(reason);
+        }
+    }
+
+    /// Response-side counterpart of
+    /// [`Self::record_unevaluable_input_bypass`].
+    pub fn record_unevaluable_output_bypass(&self, reason: &str) {
+        if Guardrail::runs_on_output(self) && !Guardrail::refuses_unevaluable_output(self) {
+            self.record_bypass(reason);
+        }
     }
 
     /// The request's audit log handle, for a caller that outlives the
@@ -211,7 +370,7 @@ impl GuardrailChain {
 fn classify_execution<'v>(
     verdict: &'v GuardrailVerdict,
     masked: bool,
-    hits: &[GuardrailMonitorHit],
+    hits: &'v [GuardrailMonitorHit],
 ) -> (&'static str, Option<&'v str>) {
     match verdict {
         GuardrailVerdict::Block { unavailable, .. } => ("blocked", unavailable.as_deref()),
@@ -220,7 +379,11 @@ fn classify_execution<'v>(
             if masked {
                 ("masked", None)
             } else if hits.iter().any(|h| h.action == "would_block") {
-                ("would_block", None)
+                let error_type = hits
+                    .iter()
+                    .find(|h| h.action == "would_block" && !h.error_type.is_empty())
+                    .map(|h| h.error_type.as_str());
+                ("would_block", error_type)
             } else if hits.iter().any(|h| h.action == "would_mask") {
                 ("would_mask", None)
             } else {
@@ -246,11 +409,16 @@ struct Recorders<'a> {
 /// per-entity mask counts, and only the segment pass has any — the check
 /// folds pass `None`.
 ///
-/// The audit log takes only the two ENFORCED outcomes it exists to
-/// record: `masked` and `blocked`. `allowed` is not an event, `bypassed`
-/// is already carried by `guardrail_bypassed_reason`, and the two
-/// `would_*` results belong to `guardrail_monitor_hits` — routing them
-/// here would make an enforcing hit indistinguishable from a staged one.
+/// [`GuardrailAuditLog::record`] takes only the two ENFORCED outcomes the
+/// hit array exists to record: `masked` and `blocked`. `allowed` is not an
+/// event, and the two `would_*` results belong to
+/// `guardrail_monitor_hits` — routing them here would make an enforcing
+/// hit indistinguishable from a staged one.
+///
+/// `bypassed` is recorded too, but onto the log's separate `bypass` slot
+/// rather than as a hit: it is what `guardrail_bypassed_reason` is built
+/// from, and a bypass enforced nothing, so folding it into an array whose
+/// whole meaning is "a policy acted here" would widen that field silently.
 ///
 /// The two are told apart on the audit event (AISIX-Cloud#1365): a member
 /// with `fail_open: false` whose upstream is
@@ -288,6 +456,14 @@ fn record_execution(
             error_type,
             elapsed,
         });
+    }
+    // A fail-open bypass is not an enforced hit — nothing was masked or
+    // refused — but it IS the fact `guardrail_bypassed_reason` exists to
+    // report, and every handler already threads this log to its usage
+    // event. Recording it here is what makes the field reach the non-chat
+    // routes: they read the log, not a hand-threaded out-param.
+    if let (Some(audit), Some(tag)) = (to.audit, verdict.bypass_reason()) {
+        audit.record_bypass(tag);
     }
     if let (Some(audit), "blocked" | "masked") = (to.audit, result) {
         // A `blocked` member reports no counts: the block short-circuits
@@ -373,11 +549,68 @@ impl Guardrail for GuardrailChain {
         self.members.iter().any(|m| m.guardrail.runs_on_output())
     }
 
+    /// `true` when at least one member inspects the request. An empty
+    /// chain — and a chain whose every member is attached on the output
+    /// hook alone — reports `false`, so a caller can tell "guardrails are
+    /// attached" apart from "a guardrail will read this request".
+    fn runs_on_input(&self) -> bool {
+        self.members.iter().any(|m| m.guardrail.runs_on_input())
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        self.members
+            .iter()
+            .any(|m| m.guardrail.fails_closed_on_input())
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        self.members
+            .iter()
+            .any(|m| m.guardrail.fails_closed_on_output())
+    }
+
+    /// The strictest member decides — but both halves must hold on the
+    /// SAME member. A chain of [output-only fail-closed, input-only
+    /// fail-open] reads the request and contains a fail-closed row, yet
+    /// no single member both reads the request AND refuses when it
+    /// cannot, so nothing there justifies refusing one. Folding the two
+    /// predicates separately would get that case wrong.
+    fn refuses_unevaluable_input(&self) -> bool {
+        self.members
+            .iter()
+            .any(|m| m.guardrail.refuses_unevaluable_input())
+    }
+
+    fn refuses_unevaluable_output(&self) -> bool {
+        self.members
+            .iter()
+            .any(|m| m.guardrail.refuses_unevaluable_output())
+    }
+
+    /// A nested chain binds its own members and answers `Some` only when
+    /// one of them took the bind — so an outer chain replaces this member
+    /// exactly when doing so changes anything.
+    fn bind_score_log(&self, log: &Arc<GuardrailAuditLog>) -> Option<Arc<dyn Guardrail>> {
+        let mut bound = self.clone();
+        let mut any = false;
+        for m in &mut bound.members {
+            if let Some(g) = m.guardrail.bind_score_log(log) {
+                m.guardrail = g;
+                any = true;
+            }
+        }
+        any.then(|| Arc::new(bound) as Arc<dyn Guardrail>)
+    }
+
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
         let mut bypass: Option<String> = None;
+        let narrowed = latest_turn_view_if_needed(&self.members, req);
         for m in &self.members {
             let started = Instant::now();
-            let verdict = m.guardrail.check_input(req).await;
+            let verdict = m
+                .guardrail
+                .check_input(member_input(m, req, &narrowed))
+                .await;
             record_execution(
                 self.recorders(),
                 m,
@@ -455,9 +688,13 @@ impl Guardrail for GuardrailChain {
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
         let mut bypass: Option<String> = None;
         let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
+        let narrowed = latest_turn_view_if_needed(&self.members, req);
         for m in &self.members {
             let started = Instant::now();
-            let (verdict, member_hits) = m.guardrail.check_input_observed(req).await;
+            let (verdict, member_hits) = m
+                .guardrail
+                .check_input_observed(member_input(m, req, &narrowed))
+                .await;
             record_execution(
                 self.recorders(),
                 m,
@@ -547,9 +784,13 @@ impl Guardrail for GuardrailChain {
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
         let mut bypass: Option<String> = None;
         let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
+        let narrowed = latest_turn_view_if_needed(&self.members, req);
         for m in &self.members {
             let started = Instant::now();
-            let (verdict, member_hits) = m.guardrail.check_input_non_segment_observed(req).await;
+            let (verdict, member_hits) = m
+                .guardrail
+                .check_input_non_segment_observed(member_input(m, req, &narrowed))
+                .await;
             // A segment-moderating member answers via the segment pass —
             // this call is an instant Allow, not an execution; recording
             // it would pollute the member's series with zero-length
@@ -652,11 +893,26 @@ impl Guardrail for GuardrailChain {
     /// member moderates the previous member's masked output, mirroring
     /// `fold_redactions`; the first Bypass reason sticks. Counts merge.
     async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
-        fold_segments(&self.members, self.recorders(), texts, true).await
+        fold_segments(&self.members, self.recorders(), texts, true, None).await
+    }
+
+    async fn moderate_input_segments_in_turn(
+        &self,
+        texts: &[String],
+        in_latest_turn: &[bool],
+    ) -> SegmentsOutcome {
+        fold_segments(
+            &self.members,
+            self.recorders(),
+            texts,
+            true,
+            Some(in_latest_turn),
+        )
+        .await
     }
 
     async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
-        fold_segments(&self.members, self.recorders(), texts, false).await
+        fold_segments(&self.members, self.recorders(), texts, false, None).await
     }
 
     /// The check fold minus segment-moderating members — the pass those
@@ -666,9 +922,13 @@ impl Guardrail for GuardrailChain {
     /// rather than being skipped wholesale.
     async fn check_input_non_segment(&self, req: &ChatFormat) -> GuardrailVerdict {
         let mut bypass: Option<String> = None;
+        let narrowed = latest_turn_view_if_needed(&self.members, req);
         for m in &self.members {
             let started = Instant::now();
-            let verdict = m.guardrail.check_input_non_segment(req).await;
+            let verdict = m
+                .guardrail
+                .check_input_non_segment(member_input(m, req, &narrowed))
+                .await;
             if !m.guardrail.moderates_segments() {
                 record_execution(
                     self.recorders(),
@@ -750,9 +1010,16 @@ impl Guardrail for GuardrailChain {
     /// output, so stacked redacting guardrails compose. Counts merge across
     /// members.
     fn redact_input_text(&self, text: &str) -> Option<Redaction> {
+        self.redact_input_text_in_turn(text, true)
+    }
+
+    fn redact_input_text_in_turn(&self, text: &str, in_latest_turn: bool) -> Option<Redaction> {
         fold_redactions(
             text,
-            self.members.iter().filter(|m| m.guardrail.redacts_input()),
+            self.members.iter().filter(|m| {
+                m.guardrail.redacts_input()
+                    && (in_latest_turn || m.input_messages == GuardrailInputMessages::All)
+            }),
             true,
             self.audit.as_deref(),
         )
@@ -772,11 +1039,19 @@ impl Guardrail for GuardrailChain {
 /// check folds (first Block short-circuits with attribution, first Bypass
 /// reason sticks) plus mask composition: each member moderates the
 /// previous member's masked output. Counts merge across members.
+///
+/// `in_latest_turn` (input side only) flags which of `texts` sit inside the
+/// latest-turn window; a member configured `input_messages: latest_turn` is
+/// offered only those slots and its masked reply is spliced back onto the
+/// positions it was given, so the slots it never saw keep the caller's text
+/// verbatim. `None` — the output side, and any input chain with no such
+/// member — offers every slot to everyone, allocation-free.
 async fn fold_segments(
     members: &[ChainMember],
     to: Recorders<'_>,
     texts: &[String],
     input: bool,
+    in_latest_turn: Option<&[bool]>,
 ) -> SegmentsOutcome {
     let phase = if input { "input" } else { "output" };
     let mut masked: Option<Vec<String>> = None;
@@ -787,7 +1062,25 @@ async fn fold_segments(
         if !m.guardrail.moderates_segments() {
             continue;
         }
-        let src: &[String] = masked.as_deref().unwrap_or(texts);
+        let full: &[String] = masked.as_deref().unwrap_or(texts);
+        // Slots this member may read, as indices into `full`. `None` = all
+        // of them. A flag missing for a slot counts as in-window: the
+        // walker and the collector enumerate the same body, so a short
+        // flag vector is a bug, and erring toward scanning MORE keeps a
+        // block rule firing rather than silently going quiet.
+        let window: Option<Vec<usize>> = match (m.input_messages, in_latest_turn) {
+            (GuardrailInputMessages::LatestTurn, Some(flags)) => {
+                let idx: Vec<usize> = (0..full.len())
+                    .filter(|i| flags.get(*i).copied().unwrap_or(true))
+                    .collect();
+                (idx.len() != full.len()).then_some(idx)
+            }
+            _ => None,
+        };
+        let narrowed: Option<Vec<String>> = window
+            .as_ref()
+            .map(|idx| idx.iter().map(|&i| full[i].clone()).collect());
+        let src: &[String] = narrowed.as_deref().unwrap_or(full);
         let started = Instant::now();
         let mut outcome = if input {
             m.guardrail.moderate_input_segments(src).await
@@ -840,7 +1133,19 @@ async fn fold_segments(
             // APPLIED anonymization (`redacted_entity_counts`), so a
             // refused mask must not inflate them.
             if new_masked.len() == src.len() {
-                masked = Some(new_masked);
+                masked = Some(match window {
+                    // Splice the member's window back into the full slot
+                    // list; everything outside it keeps the text the
+                    // previous member left.
+                    Some(idx) => {
+                        let mut spliced = full.to_vec();
+                        for (k, &i) in idx.iter().enumerate() {
+                            spliced[i] = new_masked[k].clone();
+                        }
+                        spliced
+                    }
+                    None => new_masked,
+                });
                 Redaction::merge_counts(&mut counts, &outcome.counts);
             } else {
                 tracing::warn!(
@@ -915,7 +1220,7 @@ fn fold_redactions<'a>(
 mod tests {
     use super::*;
     use crate::{KeywordBlocklist, KeywordRule};
-    use aisix_gateway::{ChatMessage, FinishReason, UsageStats};
+    use aisix_gateway::{ChatMessage, FinishReason, Role, UsageStats};
 
     /// AISIX-Cloud#1330: the audit log and the metrics sink are gated
     /// independently. `record_execution` used to bail the moment the sink
@@ -925,7 +1230,7 @@ mod tests {
     #[tokio::test]
     async fn a_block_is_audited_even_with_no_metrics_sink_attached() {
         let audit = Arc::new(GuardrailAuditLog::new());
-        let chain = GuardrailChain::new_with_applied(
+        let chain = GuardrailChain::new_with_applied_all(
             vec![(
                 "deny-secrets".to_owned(),
                 Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("nope")]))
@@ -949,6 +1254,167 @@ mod tests {
         assert_eq!(hits[0].guardrail_name, "deny-secrets");
         assert_eq!(hits[0].hook, "input");
         assert_eq!(hits[0].action, "blocked");
+    }
+
+    /// A fail-OPEN bypass is the outcome nobody sees: no refusal reaches
+    /// the caller, and the request's usage row is otherwise identical to a
+    /// screened one. It rides the same per-request log the enforced hits do
+    /// so every handler that already threads that handle reports it — the
+    /// alternative was one hand-threaded out-param per handler, which is
+    /// how `guardrail_bypassed_reason` came to exist on chat and nowhere
+    /// else.
+    #[tokio::test]
+    async fn a_fold_records_the_first_bypass_on_the_audit_log() {
+        struct FailsOpen(&'static str);
+        #[async_trait]
+        impl Guardrail for FailsOpen {
+            fn name(&self) -> &'static str {
+                "fails-open"
+            }
+            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+                GuardrailVerdict::Bypass {
+                    reason: self.0.to_owned(),
+                }
+            }
+        }
+
+        let audit = Arc::new(GuardrailAuditLog::new());
+        let chain = GuardrailChain::new(vec![
+            Arc::new(FailsOpen("lakera_timeout")) as Arc<dyn Guardrail>,
+            Arc::new(FailsOpen("bedrock_5xx")) as Arc<dyn Guardrail>,
+        ])
+        .with_audit_log(Some(Arc::clone(&audit)));
+
+        assert!(chain.check_input(&req("anything")).await.is_bypass());
+        assert_eq!(
+            chain.bypass_reason().as_deref(),
+            Some("lakera_timeout"),
+            "the policy that failed FIRST is the one that explains the request",
+        );
+        assert!(
+            chain.enforced_hits().is_empty(),
+            "a bypass enforced nothing, so it must not appear as an enforced hit",
+        );
+    }
+
+    /// A refusal by one member does not erase another member's bypass.
+    ///
+    /// The fold does not short-circuit on `Bypass`, so a chain of
+    /// [fail-open remote row, blocking row] refuses the request while the
+    /// first row screened nothing. Both facts ride the event: this is the
+    /// same pair `chat.rs` has always emitted on a billed-then-blocked
+    /// response, where an input hook failed open on a prompt the provider
+    /// had already answered. Suppressing the tag whenever
+    /// `guardrail_blocked` is set would discard exactly that case, which is
+    /// the more compliance-relevant of the two.
+    #[tokio::test]
+    async fn a_block_by_one_member_does_not_erase_another_member_bypass() {
+        struct FailsOpen;
+        #[async_trait]
+        impl Guardrail for FailsOpen {
+            fn name(&self) -> &'static str {
+                "fails-open"
+            }
+            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+                GuardrailVerdict::Bypass {
+                    reason: "lakera_timeout".to_owned(),
+                }
+            }
+        }
+
+        let audit = Arc::new(GuardrailAuditLog::new());
+        let chain = GuardrailChain::new_with_applied_all(
+            vec![
+                (
+                    "open-row".to_owned(),
+                    Arc::new(FailsOpen) as Arc<dyn Guardrail>,
+                ),
+                (
+                    "deny-secrets".to_owned(),
+                    Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("nope")]))
+                        as Arc<dyn Guardrail>,
+                ),
+            ],
+            vec![
+                AppliedGuardrail {
+                    kind: "lakera".to_owned(),
+                    hook: "input".to_owned(),
+                },
+                AppliedGuardrail {
+                    kind: "keyword".to_owned(),
+                    hook: "input".to_owned(),
+                },
+            ],
+        )
+        .with_audit_log(Some(Arc::clone(&audit)));
+
+        // The refusal still happens — recording must not weaken it.
+        assert!(chain.check_input(&req("nope")).await.is_block());
+        assert_eq!(
+            chain.bypass_reason().as_deref(),
+            Some("lakera_timeout"),
+            "the first row screened nothing; the second one refusing does not change that",
+        );
+    }
+
+    /// The pass-through the proxy performs on a body it could not scan is a
+    /// bypass only when something would have read that side. An output-only
+    /// chain never offered to screen the request, so tagging it would fire
+    /// the field on requests that were never going to be screened.
+    ///
+    /// Both sinks are asserted from the one member-set decision:
+    /// `guardrail_bypassed_reason` on the usage event and the
+    /// `aisix_guardrail_bypasses_total` increment must agree about which
+    /// pass-through was a bypass, which is only true while they read the
+    /// same predicate rather than each deriving its own.
+    #[test]
+    fn an_unevaluable_pass_is_a_bypass_only_when_a_member_reads_that_side() {
+        let rule = || vec![KeywordRule::literal("x")];
+        let log = || Some(Arc::new(GuardrailAuditLog::new()));
+        let sinked = |g: Arc<dyn Guardrail>| {
+            let sink = Arc::new(RecordingSink::default());
+            let chain = GuardrailChain::new(vec![g])
+                .with_audit_log(log())
+                .with_metrics_sink(Some(Arc::clone(&sink) as Arc<dyn GuardrailMetricsSink>));
+            (chain, sink)
+        };
+
+        let (open_in, open_in_sink) = sinked(Arc::new(
+            KeywordBlocklist::input_only(rule()).with_fail_open(true),
+        ));
+        open_in.record_unevaluable_input_bypass("unscannable_body");
+        assert_eq!(
+            open_in.bypass_reason().as_deref(),
+            Some("unscannable_body"),
+            "a fail-open row that reads the request WAS bypassed",
+        );
+        assert_eq!(
+            open_in_sink.bypasses(),
+            ["unscannable_body"],
+            "the same bypass has to reach the counter: no member executed, \
+             so nothing else will count it",
+        );
+
+        let (output_only, output_only_sink) =
+            sinked(Arc::new(KeywordBlocklist::output_only(rule())));
+        output_only.record_unevaluable_input_bypass("unscannable_body");
+        assert_eq!(
+            output_only.bypass_reason(),
+            None,
+            "nothing here reads the request, so nothing was bypassed",
+        );
+        assert!(
+            output_only_sink.bypasses().is_empty(),
+            "counting this would make the counter fire on requests that were \
+             never going to be screened",
+        );
+
+        // The fail-closed direction never reaches the call at all, but the
+        // predicate must agree with the refusal gate if it ever does.
+        let (closed_in, closed_in_sink) = sinked(Arc::new(KeywordBlocklist::input_only(rule())));
+        closed_in.record_unevaluable_input_bypass("unscannable_body");
+        assert_eq!(closed_in.bypass_reason(), None);
+        assert!(closed_in_sink.bypasses().is_empty());
     }
 
     /// AISIX-Cloud#1365: a fail-CLOSED refusal is an outage, not a policy
@@ -976,7 +1442,7 @@ mod tests {
         }
 
         let audit = Arc::new(GuardrailAuditLog::new());
-        let chain = GuardrailChain::new_with_applied(
+        let chain = GuardrailChain::new_with_applied_all(
             vec![(
                 "lakera-prod".to_owned(),
                 Arc::new(Unavailable) as Arc<dyn Guardrail>,
@@ -1029,6 +1495,7 @@ mod tests {
                     exec.error_type.unwrap_or("none").to_owned(),
                 ));
             }
+            fn record_guardrail_bypass(&self, _reason: &str) {}
         }
         struct Unavailable;
         #[async_trait]
@@ -1129,7 +1596,7 @@ mod tests {
     /// reason.
     #[tokio::test]
     async fn block_is_attributed_to_the_firing_member_by_name() {
-        let chain = GuardrailChain::new_with_applied(
+        let chain = GuardrailChain::new_with_applied_all(
             vec![
                 (
                     "pass-through".to_owned(),
@@ -1173,7 +1640,7 @@ mod tests {
     /// pass it through (innermost name wins, no double prefix).
     #[tokio::test]
     async fn nested_chain_block_keeps_innermost_attribution() {
-        let inner = GuardrailChain::new_with_applied(
+        let inner = GuardrailChain::new_with_applied_all(
             vec![(
                 "inner-rule".to_owned(),
                 Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")]))
@@ -1181,7 +1648,7 @@ mod tests {
             )],
             Vec::new(),
         );
-        let outer = GuardrailChain::new_with_applied(
+        let outer = GuardrailChain::new_with_applied_all(
             vec![(
                 "outer-chain".to_owned(),
                 Arc::new(inner) as Arc<dyn Guardrail>,
@@ -1322,6 +1789,99 @@ mod tests {
         assert!(!empty.stream_output_policy().holds_back());
     }
 
+    /// `runs_on_input` is the mirror of `runs_on_output`, and callers that
+    /// refuse a request the scanner cannot read key on it: "a guardrail is
+    /// attached" is not the same question as "a guardrail will read this
+    /// request" (#1113 / #1114 follow-up).
+    #[test]
+    fn runs_on_input_reports_only_input_side_members() {
+        let output_only = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::output_only(vec![
+            KeywordRule::literal("x"),
+        ]))]);
+        assert!(
+            !output_only.runs_on_input(),
+            "an output-only chain never reads the request"
+        );
+        assert!(output_only.runs_on_output());
+        // The distinction the gate needs: non-empty, yet nothing reads input.
+        assert!(!output_only.is_empty());
+
+        let input_only = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::input_only(vec![
+            KeywordRule::literal("x"),
+        ]))]);
+        assert!(input_only.runs_on_input());
+
+        let both = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::new(vec![
+            KeywordRule::literal("x"),
+        ]))]);
+        assert!(both.runs_on_input());
+        assert!(both.runs_on_output());
+
+        let mixed = GuardrailChain::new(vec![
+            Arc::new(KeywordBlocklist::output_only(vec![KeywordRule::literal(
+                "x",
+            )])),
+            Arc::new(KeywordBlocklist::input_only(vec![KeywordRule::literal(
+                "y",
+            )])),
+        ]);
+        assert!(mixed.runs_on_input(), "one input-side member is enough");
+
+        assert!(!GuardrailChain::new(vec![]).runs_on_input());
+    }
+
+    /// The gate on the proxy-raised `unscannable_body` refusals: a member
+    /// must BOTH read that side and fail closed. The cross case in the
+    /// middle is the one that separates this from folding the two halves
+    /// independently — that chain reads the request and contains a
+    /// fail-closed row, but not in the same member.
+    #[test]
+    fn refuses_unevaluable_needs_both_halves_on_one_member() {
+        let rule = || vec![KeywordRule::literal("x")];
+
+        let closed_in = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::input_only(rule()))]);
+        assert!(closed_in.refuses_unevaluable_input());
+        assert!(!closed_in.refuses_unevaluable_output());
+
+        // `fail_open: true` opts the row out of the refusal entirely.
+        let open_in = GuardrailChain::new(vec![Arc::new(
+            KeywordBlocklist::input_only(rule()).with_fail_open(true),
+        )]);
+        assert!(open_in.runs_on_input(), "it still SCANS");
+        assert!(
+            !open_in.refuses_unevaluable_input(),
+            "but it must not refuse a body it could not be given"
+        );
+
+        // The cross case: reads the request (member 2), has a fail-closed
+        // row (member 1), yet neither member is both.
+        let cross = GuardrailChain::new(vec![
+            Arc::new(KeywordBlocklist::output_only(rule())),
+            Arc::new(KeywordBlocklist::input_only(rule()).with_fail_open(true)),
+        ]);
+        assert!(cross.runs_on_input());
+        assert!(cross.fails_closed_on_input());
+        assert!(
+            !cross.refuses_unevaluable_input(),
+            "folding the two predicates separately would refuse here"
+        );
+        assert!(
+            cross.refuses_unevaluable_output(),
+            "the output-only row left fail_open at its default"
+        );
+
+        // Strictest wins among members that DO read the request.
+        let mixed = GuardrailChain::new(vec![
+            Arc::new(KeywordBlocklist::input_only(rule()).with_fail_open(true)),
+            Arc::new(KeywordBlocklist::input_only(rule())),
+        ]);
+        assert!(mixed.refuses_unevaluable_input());
+
+        let empty = GuardrailChain::new(vec![]);
+        assert!(!empty.refuses_unevaluable_input());
+        assert!(!empty.refuses_unevaluable_output());
+    }
+
     // --- segment moderation folds (#932 bedrock follow-up) ---------------
 
     /// A stub segment moderator: uppercases every slot and reports a
@@ -1353,6 +1913,353 @@ mod tests {
                 monitor_hits: Vec::new(),
             }
         }
+    }
+
+    // ── input_messages: latest_turn (AISIX-Cloud#1558) ───────────────────
+
+    fn conversation() -> ChatFormat {
+        ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::system("system AKIA"),
+                ChatMessage::user("old AKIA"),
+                ChatMessage::assistant("sure"),
+                ChatMessage::user("fresh"),
+                ChatMessage::tool("tool result"),
+            ],
+        )
+    }
+
+    fn member(
+        name: &str,
+        g: Arc<dyn Guardrail>,
+        scope: GuardrailInputMessages,
+    ) -> (String, Arc<dyn Guardrail>, GuardrailInputMessages) {
+        (name.to_owned(), g, scope)
+    }
+
+    fn applied(n: usize) -> Vec<AppliedGuardrail> {
+        (0..n)
+            .map(|_| AppliedGuardrail {
+                kind: "keyword".to_owned(),
+                hook: "both".to_owned(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn latest_turn_view_starts_after_the_last_assistant_and_drops_system() {
+        let view = crate::latest_turn_view(&conversation());
+        let seen: Vec<_> = view
+            .messages
+            .iter()
+            .map(|m| (m.role, m.content_str().to_owned()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (Role::User, "fresh".to_owned()),
+                (Role::Tool, "tool result".to_owned()),
+            ],
+        );
+    }
+
+    /// A trailing assistant message is a prefill, not an answered turn.
+    /// If it closed the window the window would be EMPTY, and appending
+    /// one would be a one-line bypass of every `latest_turn` rule.
+    #[test]
+    fn a_trailing_assistant_prefill_does_not_close_the_window() {
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::system("sys"),
+                ChatMessage::user("old AKIA"),
+                ChatMessage::assistant("answered"),
+                ChatMessage::user("fresh"),
+                ChatMessage::assistant("Sure, here is"),
+            ],
+        );
+        let seen: Vec<_> = crate::latest_turn_view(&req)
+            .messages
+            .iter()
+            .map(|m| (m.role, m.content_str().to_owned()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (Role::User, "fresh".to_owned()),
+                (Role::Assistant, "Sure, here is".to_owned()),
+            ],
+        );
+    }
+
+    /// The prefill rule is measured against the last NON-SYSTEM message.
+    /// Otherwise appending a system message after the prefill makes the
+    /// prefill look answered, and the window is left holding system
+    /// messages alone — which, since system messages are excluded, is an
+    /// empty window and the same bypass one step further out.
+    #[tokio::test]
+    async fn a_system_message_after_a_prefill_does_not_reopen_the_bypass() {
+        let chain = GuardrailChain::new_with_applied(
+            vec![member(
+                "narrow",
+                Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")]))
+                    as Arc<dyn Guardrail>,
+                GuardrailInputMessages::LatestTurn,
+            )],
+            applied(1),
+        );
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::user("please handle AKIA"),
+                ChatMessage::assistant("Sure, here is"),
+                ChatMessage::system("trailing policy"),
+            ],
+        );
+        assert!(
+            chain.check_input(&req).await.is_block(),
+            "the window must still hold the user message",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trailing_assistant_message_cannot_silence_a_narrowed_row() {
+        let chain = GuardrailChain::new_with_applied(
+            vec![member(
+                "narrow",
+                Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")]))
+                    as Arc<dyn Guardrail>,
+                GuardrailInputMessages::LatestTurn,
+            )],
+            applied(1),
+        );
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::user("please handle AKIA"),
+                ChatMessage::assistant("Sure, here is"),
+            ],
+        );
+        assert!(
+            chain.check_input(&req).await.is_block(),
+            "appending an assistant message must not empty the window",
+        );
+    }
+
+    #[test]
+    fn latest_turn_view_with_no_assistant_keeps_every_non_system_message() {
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::system("sys"),
+                ChatMessage::user("a"),
+                ChatMessage::tool("b"),
+            ],
+        );
+        let roles: Vec<_> = crate::latest_turn_view(&req)
+            .messages
+            .iter()
+            .map(|m| m.role)
+            .collect();
+        assert_eq!(roles, vec![Role::User, Role::Tool]);
+    }
+
+    /// The customer report: the pattern sits in replayed history and the
+    /// new prompt is clean. A `latest_turn` row must let it through while
+    /// an `all` row on the same wording still refuses it.
+    #[tokio::test]
+    async fn latest_turn_member_does_not_see_history_but_an_all_member_does() {
+        let kw = || {
+            Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")]))
+                as Arc<dyn Guardrail>
+        };
+        let narrowed = GuardrailChain::new_with_applied(
+            vec![member("narrow", kw(), GuardrailInputMessages::LatestTurn)],
+            applied(1),
+        );
+        assert_eq!(
+            narrowed.check_input(&conversation()).await,
+            GuardrailVerdict::Allow,
+        );
+
+        let whole = GuardrailChain::new_with_applied(
+            vec![member("whole", kw(), GuardrailInputMessages::All)],
+            applied(1),
+        );
+        assert!(
+            whole.check_input(&conversation()).await.is_block(),
+            "an `all` row still reads the replayed history",
+        );
+    }
+
+    /// The window is per member, so one narrowed row must not narrow its
+    /// peers — the same fold hands each member a different view.
+    #[tokio::test]
+    async fn a_narrowed_member_does_not_narrow_its_peers() {
+        let chain = GuardrailChain::new_with_applied(
+            vec![
+                // Matches history only. It is FIRST in the chain, so if
+                // the fold handed it the whole request it would block and
+                // take the attribution below.
+                member(
+                    "narrow",
+                    Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")]))
+                        as Arc<dyn Guardrail>,
+                    GuardrailInputMessages::LatestTurn,
+                ),
+                // Matches the current turn.
+                member(
+                    "whole",
+                    Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("fresh")]))
+                        as Arc<dyn Guardrail>,
+                    GuardrailInputMessages::All,
+                ),
+            ],
+            applied(2),
+        );
+        let verdict = chain.check_input(&conversation()).await;
+        match verdict {
+            GuardrailVerdict::Block { guardrail_name, .. } => {
+                assert_eq!(guardrail_name.as_deref(), Some("whole"));
+            }
+            other => panic!("expected the `all` member to block, got {other:?}"),
+        }
+    }
+
+    /// A masking row on `latest_turn` rewrites only the slots inside the
+    /// window; the history keeps the caller's bytes.
+    #[tokio::test]
+    async fn a_narrowed_segment_member_masks_only_in_window_slots() {
+        let chain = GuardrailChain::new_with_applied(
+            vec![member(
+                "seg",
+                Arc::new(StubSegments {
+                    verdict: GuardrailVerdict::Allow,
+                    mask: true,
+                }) as Arc<dyn Guardrail>,
+                GuardrailInputMessages::LatestTurn,
+            )],
+            applied(1),
+        );
+        let texts = vec!["history".to_owned(), "current".to_owned()];
+        let out = chain
+            .moderate_input_segments_in_turn(&texts, &[false, true])
+            .await;
+        assert_eq!(
+            out.masked.expect("mask applied"),
+            vec!["history".to_owned(), "CURRENT".to_owned()],
+        );
+    }
+
+    /// Two members with DIFFERENT windows compose on one slot list: the
+    /// `all` member rewrites everything, then the `latest_turn` member
+    /// rewrites its window ON TOP of that. A history slot must carry the
+    /// first member's mark and only that; a window slot must carry both.
+    /// Nothing else covers this — the check fold has
+    /// `a_narrowed_member_does_not_narrow_its_peers`, the segment fold had
+    /// no equivalent, and each e2e lane carries a single row.
+    #[tokio::test]
+    async fn members_with_different_windows_compose_on_the_same_slots() {
+        struct Suffix(&'static str);
+        #[async_trait]
+        impl Guardrail for Suffix {
+            fn name(&self) -> &'static str {
+                "suffix"
+            }
+            fn moderates_segments(&self) -> bool {
+                true
+            }
+            async fn moderate_input_segments(&self, texts: &[String]) -> crate::SegmentsOutcome {
+                crate::SegmentsOutcome {
+                    verdict: GuardrailVerdict::Allow,
+                    masked: Some(texts.iter().map(|t| format!("{t}{}", self.0)).collect()),
+                    counts: std::collections::BTreeMap::new(),
+                    monitor_hits: Vec::new(),
+                }
+            }
+        }
+
+        let chain = GuardrailChain::new_with_applied(
+            vec![
+                member(
+                    "whole",
+                    Arc::new(Suffix("+A")) as Arc<dyn Guardrail>,
+                    GuardrailInputMessages::All,
+                ),
+                member(
+                    "narrow",
+                    Arc::new(Suffix("+L")) as Arc<dyn Guardrail>,
+                    GuardrailInputMessages::LatestTurn,
+                ),
+            ],
+            applied(2),
+        );
+        let texts = vec!["history".to_owned(), "current".to_owned()];
+        let out = chain
+            .moderate_input_segments_in_turn(&texts, &[false, true])
+            .await;
+        assert_eq!(
+            out.masked.expect("mask applied"),
+            vec!["history+A".to_owned(), "current+A+L".to_owned()],
+        );
+    }
+
+    /// The same member on `all` still rewrites everything — the assertion
+    /// above must be pinning the window, not the stub.
+    #[tokio::test]
+    async fn an_unnarrowed_segment_member_masks_every_slot() {
+        let chain = GuardrailChain::new_with_applied(
+            vec![member(
+                "seg",
+                Arc::new(StubSegments {
+                    verdict: GuardrailVerdict::Allow,
+                    mask: true,
+                }) as Arc<dyn Guardrail>,
+                GuardrailInputMessages::All,
+            )],
+            applied(1),
+        );
+        let texts = vec!["history".to_owned(), "current".to_owned()];
+        let out = chain
+            .moderate_input_segments_in_turn(&texts, &[false, true])
+            .await;
+        assert_eq!(
+            out.masked.expect("mask applied"),
+            vec!["HISTORY".to_owned(), "CURRENT".to_owned()],
+        );
+    }
+
+    /// The sync mask channel (`pii`) takes the window through the same
+    /// per-member filter.
+    #[test]
+    fn the_sync_mask_channel_skips_a_narrowed_member_outside_the_window() {
+        let chain = GuardrailChain::new_with_applied(
+            vec![member(
+                "pii",
+                Arc::new(crate::PiiGuardrail::new(
+                    vec![crate::builtin_rule("email", crate::PiiAction::Mask)
+                        .expect("builtin email rule")],
+                    aisix_core::models::GuardrailHookPoint::Both,
+                    0,
+                    false,
+                )) as Arc<dyn Guardrail>,
+                GuardrailInputMessages::LatestTurn,
+            )],
+            applied(1),
+        );
+        assert!(
+            chain
+                .redact_input_text_in_turn("mail alice@example.com", false)
+                .is_none(),
+            "history is forwarded byte-identical",
+        );
+        assert!(
+            chain
+                .redact_input_text_in_turn("mail alice@example.com", true)
+                .is_some(),
+            "the current turn is still masked",
+        );
     }
 
     /// The non-segment check fold skips segment members (they're consulted
@@ -1391,7 +2298,7 @@ mod tests {
     async fn segment_fold_composes_masks_and_attributes_blocks() {
         // Two maskers: uppercase then uppercase again (idempotent — the
         // composition is observable via counts merging to 2 members).
-        let chain = GuardrailChain::new_with_applied(
+        let chain = GuardrailChain::new_with_applied_all(
             vec![
                 (
                     "mask-a".to_owned(),
@@ -1420,7 +2327,7 @@ mod tests {
         assert_eq!(out.counts.get("STUB"), Some(&4), "2 members × 2 slots");
 
         // Block short-circuits and is attributed to the firing member.
-        let blocking = GuardrailChain::new_with_applied(
+        let blocking = GuardrailChain::new_with_applied_all(
             vec![(
                 "seg-blocker".to_owned(),
                 Arc::new(StubSegments {
@@ -1490,7 +2397,7 @@ mod tests {
                 hook: "both".to_owned(),
             },
         ];
-        let chain = GuardrailChain::new_with_applied(vec![], applied.clone());
+        let chain = GuardrailChain::new_with_applied_all(vec![], applied.clone());
         assert_eq!(chain.applied(), applied.as_slice());
     }
 
@@ -1507,11 +2414,16 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingSink(std::sync::Mutex<Vec<Recorded>>);
+    struct RecordingSink {
+        execs: std::sync::Mutex<Vec<Recorded>>,
+        /// Pre-execution bypasses, the `aisix_guardrail_bypasses_total`
+        /// increments that carry no execution record.
+        bypasses: std::sync::Mutex<Vec<String>>,
+    }
 
     impl GuardrailMetricsSink for RecordingSink {
         fn record_guardrail_execution(&self, exec: &GuardrailExecution<'_>) {
-            self.0.lock().unwrap().push(Recorded {
+            self.execs.lock().unwrap().push(Recorded {
                 guardrail: exec.guardrail_name.to_owned(),
                 kind: exec.kind.to_owned(),
                 phase: exec.phase,
@@ -1519,11 +2431,18 @@ mod tests {
                 error_type: exec.error_type.map(str::to_owned),
             });
         }
+        fn record_guardrail_bypass(&self, reason: &str) {
+            self.bypasses.lock().unwrap().push(reason.to_owned());
+        }
     }
 
     impl RecordingSink {
         fn take(&self) -> Vec<Recorded> {
-            std::mem::take(&mut self.0.lock().unwrap())
+            std::mem::take(&mut self.execs.lock().unwrap())
+        }
+
+        fn bypasses(&self) -> Vec<String> {
+            self.bypasses.lock().unwrap().clone()
         }
     }
 
@@ -1532,7 +2451,7 @@ mod tests {
         applied: Vec<AppliedGuardrail>,
     ) -> (GuardrailChain, Arc<RecordingSink>) {
         let sink = Arc::new(RecordingSink::default());
-        let chain = GuardrailChain::new_with_applied(members, applied)
+        let chain = GuardrailChain::new_with_applied_all(members, applied)
             .with_metrics_sink(Some(sink.clone()));
         (chain, sink)
     }
@@ -1542,6 +2461,33 @@ mod tests {
             kind: "keyword".to_owned(),
             hook: "both".to_owned(),
         }
+    }
+
+    #[test]
+    fn monitor_metric_keeps_a_later_failure_tag() {
+        let hits = vec![
+            GuardrailMonitorHit {
+                guardrail_name: "policy".to_owned(),
+                hook: "input".to_owned(),
+                action: "would_block".to_owned(),
+                reason: "keyword_would_block".to_owned(),
+                error_type: String::new(),
+                counts: Default::default(),
+            },
+            GuardrailMonitorHit {
+                guardrail_name: "runtime".to_owned(),
+                hook: "input".to_owned(),
+                action: "would_block".to_owned(),
+                reason: "custom_would_block:custom_timeout".to_owned(),
+                error_type: "custom_timeout".to_owned(),
+                counts: Default::default(),
+            },
+        ];
+
+        assert_eq!(
+            classify_execution(&GuardrailVerdict::Allow, false, &hits),
+            ("would_block", Some("custom_timeout")),
+        );
     }
 
     /// Every member consulted by a fold is recorded with its row name, the

@@ -21,6 +21,23 @@
           "scope_ref"
         ]
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "deny_ids": {
+            "type": "array"
+          }
+        },
+        "required": [
+          "deny_ids"
+        ]
+      },
+      "then": {
+        "required": [
+          "deny"
+        ]
+      }
     }
   ],
   "definitions": {
@@ -42,23 +59,64 @@
           "type": "string"
         }
       ]
+    },
+    "McpToolRef": {
+      "additionalProperties": false,
+      "description": "One tool on one MCP server, the server named by its resource id and the tool by name.\n\nThe tool half is matched with the same single-`*` glob rule the name form uses, so `tool: \"*\"` is the id spelling of `<server>__*`. The server half is an exact id: it is compared against the id of the server the addressed tool actually belongs to, never glob-matched, so a server whose *name* happens to contain a `*` cannot widen a grant.\n\nBoth halves are required on the WRITE path and defaulted by the runtime loader — the strict schemas add them to this definition's `required`, the types do not. An entry these were required of at the type level would fail to deserialize, and the loader skips a row it cannot deserialize whole: one malformed entry in one `allow_ids` array would stop the entire `api_key` from authenticating any traffic at all, not merely lose it MCP access. Defaulted, the malformed entry matches nothing instead — an empty `server_id` names no registered server, and an empty `tool` glob covers no tool name the gateway exposes.",
+      "properties": {
+        "server_id": {
+          "description": "Resource id of the registered MCP server (`mcp_servers/<id>`) this entry refers to. An id matching no registered server refers to nothing: the entry never matches, and the other entries are unaffected.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "tool": {
+          "description": "Tool on that server, matched as a single-`*` glob against the bare tool name — the part after the `<server>__` namespace prefix. `\"*\"` covers every tool the server exposes.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "server_id",
+        "tool"
+      ],
+      "type": "object"
     }
   },
   "properties": {
     "allow": {
       "default": [],
-      "description": "Namespaced `<server>__<tool>` patterns this layer allows. Entries are matched as single-`*` globs: `\"*\"` allows every tool, `\"<server>__*\"` every tool on one server, and an entry without a `*` matches one tool exactly. An empty list allows nothing, which is how a policy blocks all MCP access; a policy that only means to subtract tools writes `[\"*\"]` here and lists them under `deny`.\n\nThe write path requires the field (the strict schema adds it to `required`), so a layer never allows something by omission. The runtime loader defaults it to empty instead of rejecting the row: a document written before the layered shape would otherwise fail to deserialize, and a skipped `api_key` row stops authenticating altogether rather than merely losing MCP access.",
+      "description": "Namespaced `<server>__<tool>` patterns this layer allows. Entries are matched as single-`*` globs: `\"*\"` allows every tool, `\"<server>__*\"` every tool on one server, and an entry without a `*` matches one tool exactly. An empty list allows nothing, which is how a policy blocks all MCP access; a policy that only means to subtract tools writes `[\"*\"]` here and lists them under `deny`.\n\nThe write path requires the field (the strict schema adds it to `required`), so a layer never allows something by omission. The runtime loader defaults it to empty instead of rejecting the row: a document written before the layered shape would otherwise fail to deserialize, and a skipped `api_key` row stops authenticating altogether rather than merely losing MCP access.\n\nRead only when `allow_ids` is absent; ignored entirely when it is present.",
       "items": {
         "type": "string"
       },
       "type": "array"
     },
+    "allow_ids": {
+      "description": "This layer's allow side written by MCP server resource id instead of by server name, so renaming a server does not change what the layer allows. Each entry names one MCP server by the id it is registered under and one tool by name, the tool matched as a single-`*` glob against the bare tool name.\n\nPresent — including as an empty array — it is authoritative and `allow` is ignored; an empty array therefore allows nothing. Set to `null` it means the same as omitted: the layer falls back to `allow`.\n\nIt cannot express \"every server\": each entry names one server exactly and `server_id` is never a glob, so an enumeration of the servers registered today silently fails to cover one registered tomorrow. To allow (or deny) every server, present and future, leave this absent and use the name form's `\"*\"`.",
+      "items": {
+        "$ref": "#/definitions/McpToolRef"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
     "deny": {
-      "description": "Namespaced `<server>__<tool>` patterns subtracted from the effective grant of every key the policy applies to, using the same single-`*` glob matching as `allow`. Deny always wins: a tool matched here stays unavailable however the other layers allow it.",
+      "description": "Namespaced `<server>__<tool>` patterns subtracted from the effective grant of every key the policy applies to, using the same single-`*` glob matching as `allow`. Deny always wins: a tool matched here stays unavailable however the other layers allow it.\n\nRead only when `deny_ids` is absent; ignored entirely when it is present.",
       "items": {
         "type": "string"
       },
       "type": "array"
+    },
+    "deny_ids": {
+      "description": "This layer's deny side written by MCP server resource id instead of by server name. Present — including as an empty array — it is authoritative and `deny` is ignored; an empty array subtracts nothing. Absent or `null`, the layer falls back to `deny`.\n\nIt cannot express \"every server\": each entry names one server exactly and `server_id` is never a glob, so an enumeration of the servers registered today silently fails to cover one registered tomorrow. To allow (or deny) every server, present and future, leave this absent and use the name form's `\"*\"`.",
+      "items": {
+        "$ref": "#/definitions/McpToolRef"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
     },
     "enabled": {
       "default": true,

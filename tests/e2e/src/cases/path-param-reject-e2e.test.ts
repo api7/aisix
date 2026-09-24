@@ -58,8 +58,8 @@ describe("path-param rejection e2e: :param routes answer the envelope", () => {
       ["GET", "/v1/batches/%ff"],
       ["GET", "/v1/fine_tuning/jobs/%ff"],
       ["GET", "/v1/videos/%ff"],
-      // `/passthrough/*` left the :param family with the implicit tunnel's
-      // removal — unclaimed paths there answer the 410 tombstone instead.
+      // `/passthrough/*` is not in the :param family: it is a path-prefix
+      // namespace, so an unclaimed path is an ordinary 404 miss, not a 400.
     ] as const) {
       const res = await fetch(`${app.proxyUrl}${path}`, {
         method,

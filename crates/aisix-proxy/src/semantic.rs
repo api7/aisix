@@ -12,11 +12,12 @@
 //! ([`SemanticVectorCache`]) are pure and unit-tested in isolation; the
 //! async embedding call lives in [`resolve`].
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 
-use aisix_core::models::{EmbeddingFailureMode, OnEmbeddingFailure, Semantic};
+use aisix_core::models::{resolve_model_ref, EmbeddingFailureMode, OnEmbeddingFailure, Semantic};
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, Model};
 use aisix_gateway::{EmbeddingRequest, EmbeddingVector};
@@ -75,11 +76,23 @@ pub(crate) fn decide(
 /// Direct-model alias to dispatch to when the embedding call fails, per
 /// `on_embedding_failure`. `None` means the policy is `fail` — the caller
 /// returns `503`.
-pub(crate) fn embedding_failure_target(semantic: &Semantic) -> Option<&str> {
+///
+/// Each of the two aliases it can return is a model reference in its own
+/// right, so both are resolved against the snapshot: an id spelling follows
+/// a rename, and an id that resolves to nothing comes back as itself and
+/// dispatches nowhere, exactly as a dangling alias does.
+pub(crate) fn embedding_failure_target<'a>(
+    snapshot: &AisixSnapshot,
+    semantic: &'a Semantic,
+) -> Option<Cow<'a, str>> {
     match &semantic.on_embedding_failure {
-        OnEmbeddingFailure::Mode(EmbeddingFailureMode::Default) => Some(&semantic.default),
+        OnEmbeddingFailure::Mode(EmbeddingFailureMode::Default) => {
+            Some(semantic.default_ref(snapshot))
+        }
         OnEmbeddingFailure::Mode(EmbeddingFailureMode::Fail) => None,
-        OnEmbeddingFailure::Target { target } => Some(target),
+        OnEmbeddingFailure::Target { target, target_id } => {
+            Some(resolve_model_ref(snapshot, target, target_id.as_deref()))
+        }
     }
 }
 
@@ -139,24 +152,31 @@ pub(crate) async fn resolve(
         .expect("resolve called on a non-semantic model");
     let router = &router_entry.value;
 
+    // Every alias this function dispatches to is read through the model
+    // reference helpers: a router that names its targets by id keeps
+    // working across a rename of any of them, and an id that resolves to
+    // nothing behaves as the dangling alias it stands in for.
+    let default_target = semantic.default_ref(snapshot);
+
     // No user text to classify (e.g. a system-only or tool-only request):
     // route to `default` without an embedding call rather than embedding an
     // empty string, which could spuriously match a route.
     if prompt.trim().is_empty() {
         let (attempt, _) =
-            select_eligible(state, snapshot, router, source_ip, &semantic.default, None)?;
+            select_eligible(state, snapshot, router, source_ip, &default_target, None)?;
         return Ok((vec![attempt], None));
     }
 
     // Resolve the embedding model + its modality metadata. A dangling or
     // wrong-kind reference is a config error; degrade via the failure
     // policy rather than 500.
-    let embed_entry = match snapshot.models.get_by_name(&semantic.embedding_model) {
+    let embedding_model = semantic.embedding_model_ref(snapshot);
+    let embed_entry = match snapshot.models.get_by_name(&embedding_model) {
         Some(e) if e.value.is_embedding() => e,
         other => {
             tracing::warn!(
                 router = %router_entry.value.display_name,
-                embedding_model = %semantic.embedding_model,
+                embedding_model = %embedding_model,
                 found = other.is_some(),
                 "semantic router references a missing or non-embedding embedding_model; \
                  applying on_embedding_failure",
@@ -250,8 +270,8 @@ pub(crate) async fn resolve(
                 snapshot,
                 router,
                 source_ip,
-                semantic.routes[i].target.as_str(),
-                Some(semantic.default.as_str()),
+                &semantic.routes[i].target_ref(snapshot),
+                Some(&default_target),
             )?;
             // `x-aisix-route` reports the route that actually served the
             // request: a winner displaced by its target's gates is a
@@ -260,14 +280,8 @@ pub(crate) async fn resolve(
             (attempt, name)
         }
         None => {
-            let (attempt, _) = select_eligible(
-                state,
-                snapshot,
-                router,
-                source_ip,
-                semantic.default.as_str(),
-                None,
-            )?;
+            let (attempt, _) =
+                select_eligible(state, snapshot, router, source_ip, &default_target, None)?;
             (attempt, None)
         }
     };
@@ -289,9 +303,9 @@ fn fallback(
     source_ip: &str,
     semantic: &Semantic,
 ) -> Result<(Vec<AttemptModel>, Option<String>), ProxyError> {
-    match embedding_failure_target(semantic) {
+    match embedding_failure_target(snapshot, semantic) {
         Some(alias) => {
-            let (attempt, _) = select_eligible(state, snapshot, router, source_ip, alias, None)?;
+            let (attempt, _) = select_eligible(state, snapshot, router, source_ip, &alias, None)?;
             Ok((vec![attempt], None))
         }
         None => Err(ProxyError::ProviderUnavailable),
@@ -406,6 +420,32 @@ pub(crate) async fn embed_texts(
     request_id: &str,
     texts: &[String],
 ) -> Result<Vec<Vec<f32>>, ProxyError> {
+    // Detached: this is a dispatch the GATEWAY decided to make — for a
+    // semantic guardrail, a semantic route, or the semantic cache — not one
+    // the caller addressed. Two of its three callers run after the winning
+    // attempt has already settled, so letting it commit the embedding model
+    // to the request's attribution cell would put that model on the
+    // request's own access-log line and usage event
+    // (see `attribution::detached`).
+    crate::attribution::detached(embed_texts_inner(
+        hub,
+        snapshot,
+        embed_entry,
+        timeout,
+        request_id,
+        texts,
+    ))
+    .await
+}
+
+async fn embed_texts_inner(
+    hub: &aisix_gateway::Hub,
+    snapshot: &AisixSnapshot,
+    embed_entry: &ResourceEntry<Model>,
+    timeout: Option<std::time::Duration>,
+    request_id: &str,
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>, ProxyError> {
     let model = &embed_entry.value;
     crate::dispatch::require_provider(model)?;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -479,6 +519,7 @@ pub(crate) async fn embed_texts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aisix_core::resource::ResourceEntry;
 
     fn semantic(json: &str) -> Semantic {
         serde_json::from_str(json).unwrap()
@@ -500,6 +541,84 @@ mod tests {
                 "match": {"threshold": 0.5}
             }"#,
         )
+    }
+
+    /// Embedding is a dispatch the GATEWAY decides to make, and two of its
+    /// three callers — a semantic guardrail's OUTPUT hook, and the semantic
+    /// cache's write — run after the winning attempt has already settled.
+    ///
+    /// The request's attribution cell records the last target
+    /// `resolve_provider_key` committed to, and the access-log line and the
+    /// cancelled-request usage event both read it. So without a cell of its
+    /// own, an ordinary request that happens to run a semantic guardrail
+    /// would report the EMBEDDING model as the upstream it dispatched to —
+    /// on the very line an operator reads to find out which member of a
+    /// routing group served them (AISIX-Cloud#1571). Wrong, not merely
+    /// absent, which is the worse of the two.
+    #[tokio::test]
+    async fn embedding_does_not_overwrite_the_caller_s_target() {
+        use aisix_core::snapshot::ResourceTable;
+
+        let embed_model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "bge-m3",
+            "provider": "openai",
+            "model_name": "text-embedding-3-small",
+            "provider_key_id": "pk-embed",
+        }))
+        .unwrap();
+        let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+            "display_name": "embed-key",
+            "secret": "sk-embed",
+            "api_base": "http://127.0.0.1:1",
+            "provider": "openai",
+            "adapter": "openai",
+        }))
+        .unwrap();
+        let provider_keys = ResourceTable::default();
+        provider_keys.insert(ResourceEntry::new("pk-embed", pk, 1));
+        let snapshot = AisixSnapshot {
+            provider_keys,
+            ..Default::default()
+        };
+        let embed_entry = ResourceEntry::new("m-embed", embed_model, 1);
+
+        let cell = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(cell.clone(), async {
+            // What the CALLER addressed and the gateway dispatched to.
+            let served: Model = serde_json::from_value(serde_json::json!({
+                "display_name": "served-by",
+                "provider": "anthropic",
+                "model_name": "claude-sonnet-4",
+                "provider_key_id": "pk-chat",
+            }))
+            .unwrap();
+            crate::attribution::note_target(&served, "pk-chat");
+
+            // An empty `Hub` means no bridge, so this fails — but only
+            // AFTER `resolve_provider_key` has committed the embedding
+            // target, which is the write under test.
+            let err = embed_texts(
+                &aisix_gateway::Hub::new(),
+                &snapshot,
+                &embed_entry,
+                None,
+                "req-embed",
+                &["scan me".to_string()],
+            )
+            .await
+            .expect_err("premise: no bridge is registered, so this must fail");
+            assert!(
+                matches!(err, ProxyError::ProviderUnavailable),
+                "premise: it must fail at bridge resolution, i.e. after the \
+                 provider key was resolved — got {err}",
+            );
+
+            let resolved = crate::attribution::current().expect("in scope");
+            assert_eq!(resolved.upstream_model, "claude-sonnet-4");
+            assert_eq!(resolved.provider, "anthropic");
+            assert_eq!(resolved.provider_key_id, "pk-chat");
+        })
+        .await;
     }
 
     #[test]
@@ -559,20 +678,73 @@ mod tests {
 
     #[test]
     fn embedding_failure_target_maps_each_policy() {
+        let snap = AisixSnapshot::default();
         let default_policy = router();
-        assert_eq!(embedding_failure_target(&default_policy), Some("gpt-4o"));
+        assert_eq!(
+            embedding_failure_target(&snap, &default_policy).as_deref(),
+            Some("gpt-4o")
+        );
 
         let fail = semantic(
             r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
                 "default":"d","match":{"threshold":0.5},"on_embedding_failure":"fail"}"#,
         );
-        assert_eq!(embedding_failure_target(&fail), None);
+        assert!(embedding_failure_target(&snap, &fail).is_none());
 
         let target = semantic(
             r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
                 "default":"d","match":{"threshold":0.5},"on_embedding_failure":{"target":"safe"}}"#,
         );
-        assert_eq!(embedding_failure_target(&target), Some("safe"));
+        assert_eq!(
+            embedding_failure_target(&snap, &target).as_deref(),
+            Some("safe")
+        );
+    }
+
+    /// The id spelling decides at both `on_embedding_failure` shapes, and
+    /// resolves against the live table — so a rename of the fallback model
+    /// needs no edit to the router.
+    #[test]
+    fn embedding_failure_target_follows_the_id_spelling() {
+        let snap = AisixSnapshot::default();
+        snap.models.insert(ResourceEntry::new(
+            "m-safe",
+            serde_json::from_str::<Model>(
+                r#"{"display_name":"safe-v2","provider":"openai","model_name":"gpt-4o",
+                    "provider_key_id":"11111111-1111-1111-1111-111111111111"}"#,
+            )
+            .unwrap(),
+            1,
+        ));
+
+        let explicit = semantic(
+            r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
+                "default":"d","match":{"threshold":0.5},
+                "on_embedding_failure":{"target":"stale","target_id":"m-safe"}}"#,
+        );
+        assert_eq!(
+            embedding_failure_target(&snap, &explicit).as_deref(),
+            Some("safe-v2")
+        );
+
+        let by_default = semantic(
+            r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
+                "default":"stale","default_id":"m-safe","match":{"threshold":0.5}}"#,
+        );
+        assert_eq!(
+            embedding_failure_target(&snap, &by_default).as_deref(),
+            Some("safe-v2")
+        );
+
+        // An id that resolves to nothing stands in as its own name, which
+        // dispatches nowhere — what a dangling alias already does.
+        let dangling = semantic(
+            r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
+                "default":"d","default_id":"m-gone","match":{"threshold":0.5}}"#,
+        );
+        let resolved = embedding_failure_target(&snap, &dangling).unwrap();
+        assert_eq!(resolved, "m-gone");
+        assert!(snap.models.get_by_name(&resolved).is_none());
     }
 
     #[test]

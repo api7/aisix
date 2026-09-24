@@ -245,8 +245,9 @@ pub fn metrics_router(
 }
 
 /// Prometheus scrape handler. Reflects the live config load-observability
-/// state into the recorder (so the `aisix_config_*` series are current) then
-/// renders. Unauthenticated by design — restrict access at the network layer.
+/// state and the log writer's drop total into the recorder (so the
+/// `aisix_config_*` series and `aisix_log_lines_dropped_total` are current)
+/// then renders. Unauthenticated by design — restrict access at the network layer.
 /// Emits `text/plain; version=0.0.4`.
 async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<MetricsState>,
@@ -254,15 +255,49 @@ async fn metrics_handler(
     use axum::http::header::CONTENT_TYPE;
     use axum::response::IntoResponse;
 
-    state
-        .metrics
-        .sync_config_status(&state.config_status.metrics());
+    let Some(config) = off_runtime(state.config_status.clone(), |status| status.metrics()).await
+    else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "metrics scrape failed").into_response();
+    };
+    state.metrics.sync_config_status(&config);
+    state.metrics.sync_log_status();
+    let body = axum::body::Body::from_stream(receiver_stream(state.metrics.render_stream()));
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
-        state.metrics.render(),
+        body,
     )
         .into_response()
+}
+
+/// Read a configuration digest off the runtime's own threads.
+///
+/// `ConfigStatus` computes `source_hash` / `config_hash` when something
+/// reports them rather than on every apply, so the first read after an
+/// apply walks the whole configuration — on a background-priority thread
+/// that a saturated core may keep waiting. Neither listener may block a
+/// worker on that.
+async fn off_runtime<T: Send + 'static>(
+    status: aisix_core::ConfigStatus,
+    read: fn(&aisix_core::ConfigStatus) -> T,
+) -> Option<T> {
+    match tokio::task::spawn_blocking(move || read(&status)).await {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::error!(%error, "reading the configuration status failed");
+            None
+        }
+    }
+}
+
+/// Adapt the renderer's piece channel to the `Stream` a response body is
+/// built from.
+fn receiver_stream(
+    receiver: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
+    futures::stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|piece| (piece, receiver))
+    })
 }
 
 /// `GET /status/config` — the load-observability contract. Answers "did my
@@ -272,7 +307,14 @@ async fn status_config_handler(
     axum::extract::State(state): axum::extract::State<MetricsState>,
 ) -> Response {
     use axum::response::IntoResponse;
-    (StatusCode::OK, axum::Json(state.config_status.view())).into_response()
+    let Some(view) = off_runtime(state.config_status.clone(), |status| status.view()).await else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reading the configuration status failed",
+        )
+            .into_response();
+    };
+    (StatusCode::OK, axum::Json(view)).into_response()
 }
 
 /// `GET /status/ready` — 503 with "no configuration available" until the
@@ -380,11 +422,12 @@ fn normalized_prometheus_path(path: &str) -> String {
     }
 }
 
+/// Takes no [`AdminState`], for the same reason the proxy listener's
+/// does not: see [`aisix_proxy::health::livez_response`].
 async fn livez(
-    axum::extract::State(state): axum::extract::State<AdminState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    aisix_proxy::health::livez_response(&state.livez_state, params.contains_key("verbose"))
+    aisix_proxy::health::livez_response(params.contains_key("verbose"))
 }
 
 async fn readyz(
@@ -591,6 +634,68 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The scrape body is produced in pieces as the exposition is
+    /// rendered, so at real cardinality it reaches the client as many
+    /// chunks rather than one. A registry small enough to fit in one
+    /// piece never exercises that, and every other case here is: this
+    /// one drives enough series that the handover happens repeatedly,
+    /// through the real router and response body, and requires what
+    /// arrives to be the exposition and nothing less.
+    #[tokio::test]
+    async fn a_large_registry_survives_the_trip_through_the_response() {
+        use aisix_obs::{Metrics, RequestOutcome};
+        use std::time::Duration;
+
+        let metrics = Arc::new(Metrics::new(false));
+        for i in 0..20_000 {
+            metrics.record_request(
+                "openai",
+                &format!("model-{i:05}"),
+                200,
+                RequestOutcome::Success,
+                Duration::from_millis(10),
+            );
+        }
+        let app = metrics_router(
+            Arc::clone(&metrics),
+            aisix_core::ConfigStatus::new(aisix_core::SourceKind::Etcd),
+            &PrometheusConfig {
+                enabled: true,
+                path: "/metrics".into(),
+                addr: "0.0.0.0:9090".into(),
+            },
+            empty_models_status(),
+        );
+
+        let resp = run(
+            app,
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 512 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.len() > 1024 * 1024,
+            "the fixture must be larger than one piece to test the handover \
+             ({} bytes)",
+            body.len(),
+        );
+        // Nothing lost at a boundary: the first series, the last one, and
+        // the count of them.
+        assert!(body.contains("model=\"model-00000\""));
+        assert!(body.contains("model=\"model-19999\""));
+        assert_eq!(
+            body.matches("aisix_requests_total{").count(),
+            20_000,
+            "every series must arrive",
+        );
+        assert!(body.ends_with('\n'));
     }
 
     #[tokio::test]
@@ -1087,7 +1192,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn livez_returns_503_when_shutting_down() {
+    async fn livez_stays_200_when_shutting_down() {
         let state = build_state();
         state.livez_state.mark_shutting_down();
         let app = build_router(state);
@@ -1096,10 +1201,12 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-        let text = std::str::from_utf8(&bytes).unwrap();
-        assert!(text.contains("livez check failed"));
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the admin listener answers the same liveness question as the \
+             proxy one, and a draining process is not one to restart",
+        );
     }
 
     #[tokio::test]

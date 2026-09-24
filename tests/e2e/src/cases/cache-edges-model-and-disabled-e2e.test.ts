@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -90,14 +91,6 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: [
-        "cache-edges-A",
-        "cache-edges-B",
-        "cache-edges-disabled",
-      ],
-    });
     // Two enabled policies scoped narrowly to A and B respectively
     // so test (1) has caching ON for those Models, plus one
     // disabled policy scoped to the third Model. Crucially the
@@ -119,6 +112,17 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
       enabled: false,
       applies_to: "model:cache-edges-disabled",
     });
+    // The final caller key gates all three policies, not just model A's.
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: [
+        "cache-edges-A",
+        "cache-edges-B",
+        "cache-edges-disabled",
+      ],
+    });
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
   });
 
   afterAll(async () => {

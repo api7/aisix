@@ -25,12 +25,15 @@ pub mod ensemble;
 pub mod guardrail;
 pub mod mcp_auth_settings;
 pub mod mcp_policy;
+pub mod mcp_ref;
 pub mod mcp_server;
 pub mod model;
+pub mod model_ref;
 pub mod observability_exporter;
 pub mod oidc_provider;
 pub mod passthrough_route;
 pub mod policy_conditions;
+pub mod pricing;
 pub mod provider_key;
 pub mod rate_limit;
 pub mod rate_limit_policy;
@@ -40,7 +43,7 @@ pub mod semantic;
 pub mod snapshot;
 
 pub use a2a_agent::{A2aAgent, A2aAuthType, A2aProtocolVersion};
-pub use apikey::ApiKey;
+pub use apikey::{ApiKey, McpServerLimit};
 pub use cache_policy::{AppliesTo, CacheBackend, CachePolicy, CacheScope, SemanticCacheConfig};
 pub use claim_mapping::{ClaimMapping, ClaimMatch, ClaimMatchOp, ClaimResolve};
 pub use embedding::EmbeddingConfig;
@@ -48,32 +51,36 @@ pub use ensemble::{EnsembleConfig, Judge, PanelMember};
 pub use guardrail::{
     AliyunAiGuardrailConfig, AliyunTextModerationConfig, AppliedGuardrail,
     AzureContentSafetyConfig, AzureContentSafetyTextModerationConfig, BedrockAWSCredentials,
-    BedrockConfig, BedrockLatencyMode, Guardrail, GuardrailAttachment, GuardrailEnforcedHit,
-    GuardrailExecution, GuardrailHookPoint, GuardrailKind, GuardrailMetricsSink,
-    GuardrailMonitorHit, GuardrailScopeType, KeywordConfig, KeywordPattern, LakeraConfig,
-    OpenaiModerationConfig, PiiConfig, PiiCustomPattern, PiiDetectorConfig, PresidioConfig,
-    PresidioEntityConfig, SemanticConfig,
+    BedrockConfig, BedrockLatencyMode, CustomConfig, Guardrail, GuardrailAttachment,
+    GuardrailEnforcedHit, GuardrailExecution, GuardrailHookPoint, GuardrailInputMessages,
+    GuardrailKind, GuardrailMetricsSink, GuardrailMonitorHit, GuardrailScopeType, GuardrailScore,
+    KeywordConfig, KeywordPattern, LakeraConfig, OpenaiModerationConfig, PiiConfig,
+    PiiCustomPattern, PiiDetectorConfig, PresidioConfig, PresidioEntityConfig, SemanticConfig,
 };
-pub use mcp_auth_settings::McpAuthSettings;
+pub use mcp_auth_settings::{McpAnonymousAccess, McpAuthSettings, McpServerAllowlist};
 pub use mcp_policy::{McpAccess, McpPolicy, McpPolicyScope};
+pub use mcp_ref::{LiveMcpServerIndex, McpServerIndex, McpToolRef};
 pub use mcp_server::{McpAuthType, McpProtocolVersion, McpServer, McpServerType, McpTransport};
 pub use model::{
-    Adapter, BackgroundModelCheck, CooldownConfig, Model, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+    Adapter, BackgroundModelCheck, CooldownConfig, EffortAction, MappedEffort, Model,
+    DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
+pub use model_ref::resolve_model_ref;
 pub use observability_exporter::{
     AliyunSlsConfig, DatadogConfig, ExporterKind, ObjectStoreCompression, ObjectStoreConfig,
     ObjectStoreProvider, ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
 };
-pub use oidc_provider::{BoundClaimExpect, OidcProvider};
+pub use oidc_provider::{BoundClaimExpect, HmacSecret, OidcProvider, HMAC_SECRET_MIN_BYTES};
 pub use passthrough_route::{PassthroughAuthMode, PassthroughCredentialMode, PassthroughRoute};
 pub use policy_conditions::{
     eval_condition_nodes, validate_condition_nodes, ConditionGroup, ConditionInput, ConditionLogic,
     ConditionNode, ConditionOperator, ConditionValue, GroupByDimension, PolicyAction,
     PolicyCondition, PolicyDimension,
 };
+pub use pricing::{LivePricingIndex, Pricing, PricingIndex};
 pub use provider_key::{
-    ParamConstraints, ProviderKey, RequestOverrides, ResponseOverrides, StreamDoneMarker,
-    TelemetryKind, TelemetryTags,
+    ApiEndpoint, ApiSurface, ParamConstraints, ProviderApis, ProviderKey, RequestOverrides,
+    ResponseOverrides, StreamDoneMarker, TelemetryKind, TelemetryTags,
 };
 pub use rate_limit::{McpRateLimit, RateLimit};
 pub use rate_limit_policy::{PolicyScope, PolicyWindow, RateLimitPolicy};
@@ -91,8 +98,9 @@ pub use schema::{
     validate_mcp_server_lenient, validate_model, validate_model_lenient,
     validate_observability_exporter, validate_observability_exporter_lenient,
     validate_oidc_provider, validate_oidc_provider_lenient, validate_passthrough_route,
-    validate_passthrough_route_lenient, validate_provider_key, validate_provider_key_lenient,
-    validate_rate_limit_policy, validate_rate_limit_policy_lenient, SchemaError,
+    validate_passthrough_route_lenient, validate_pricing, validate_pricing_lenient,
+    validate_provider_key, validate_provider_key_lenient, validate_rate_limit_policy,
+    validate_rate_limit_policy_lenient, SchemaError,
 };
 pub use semantic::{
     Aggregation, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticMatch,

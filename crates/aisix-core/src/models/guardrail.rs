@@ -43,6 +43,9 @@
 //!     detection-only block.
 //!   * `presidio` — self-hosted Presidio analyze→anonymize; per-entity
 //!     `mask`/`block` + selectable anonymize operator.
+//!   * `custom` — operator-supplied script run in a sandboxed engine in the
+//!     DP process; reaches a screening service that speaks its own protocol
+//!     without a separate adapter deployment. Detection-only.
 //!
 //! See `aisix-guardrails/src/keyword.rs` for the runtime semantics
 //! the snapshot is parsed into.
@@ -64,6 +67,29 @@ pub enum GuardrailHookPoint {
     /// Run on both input and output.
     #[default]
     Both,
+}
+
+/// How much of a request's message history an input guardrail reads.
+///
+/// IDE and agent clients replay the whole conversation on every call, so a
+/// rule that matched once keeps matching for the rest of the session even
+/// after the offending message is long past. `LatestTurn` narrows every
+/// input hook — the block check and the masking pass alike — to the part
+/// of the conversation the model has not answered yet.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardrailInputMessages {
+    /// Read every message in the request, including replayed history and
+    /// system prompts.
+    #[default]
+    All,
+    /// Read only the messages after the last assistant message, excluding
+    /// system messages: the current user message together with any tool
+    /// results answering it. Messages the model has already replied to are
+    /// neither screened nor rewritten.
+    LatestTurn,
 }
 
 /// Literal or regular-expression pattern used by a keyword guardrail.
@@ -755,6 +781,22 @@ pub struct SemanticConfig {
     #[serde(default)]
     #[schemars(length(min = 1))]
     pub embedding_model: String,
+    /// Resource id of the `embedding`-kind Model used to embed both the
+    /// examples and the screened text. Present, it is authoritative and
+    /// `embedding_model` is ignored: the id is resolved against the models
+    /// in the current configuration, so renaming that model keeps this row
+    /// screening with it and needs no edit here. An id resolving to no
+    /// model is an embedder that cannot be resolved, exactly as an
+    /// `embedding_model` naming no model is — the row degrades per
+    /// `fail_open`, fail-closed by default.
+    ///
+    /// Defaulted at the type level for the same reason `embedding_model`
+    /// is: the strict write schema requires one of the two, the read path
+    /// requires neither, and a screening row that fails to load is
+    /// fail-OPEN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub embedding_model_id: Option<String>,
     /// Example texts whose meaning must be REFUSED. A screened text
     /// scoring at or above `deny_threshold` against any of them blocks.
     #[serde(default)]
@@ -768,12 +810,41 @@ pub struct SemanticConfig {
     #[schemars(length(max = 100))]
     pub allow_examples: Vec<String>,
     /// Cosine-similarity threshold for `deny_examples`, in `[-1, 1]`.
-    /// Lower it to block more.
+    /// Lower it to block more. Required whenever `deny_examples` is
+    /// non-empty.
+    ///
+    /// There is no portable value. Cosine scores are not comparable
+    /// across embedding models — the same pair of texts can fall on
+    /// opposite sides of a fixed threshold depending on which model
+    /// produced the vectors, and a threshold carried over from another
+    /// model under-screens without any sign that it is doing so. Measure
+    /// one against the model named in `embedding_model`, on your own
+    /// traffic: a request that emits a usage event reports what it scored
+    /// in `guardrail_scores`, including the requests this guardrail
+    /// allowed. Not every surface can produce that sample. `/a2a`,
+    /// `rerank`, `/v1/embeddings`, `/v1/images/*`, `/v1/videos`,
+    /// `/v1/audio/speech` and `/v1/messages/count_tokens` run the INPUT
+    /// hook only, so an output-hook row scores nothing on them (audio
+    /// transcription and translation do run both); `/a2a` also resolves no
+    /// model and no MCP server, so only a row attached at the
+    /// environment, API-key or team scope reaches it at all.
+    // Defaulted at the TYPE level and required by the strict write schema
+    // instead, for the reason `embedding_model` gives: rows written before
+    // the field was required carry no key at all, and a row the loader
+    // cannot deserialize is skipped whole — a screening row that vanishes
+    // is a guardrail that stopped screening, which is fail-OPEN on a
+    // security control. The default keeps the historical value rather than
+    // a lowered one, because those rows enforce it today and changing what
+    // they enforce without the operator asking would be a worse surprise;
+    // see `default_semantic_threshold`.
     #[serde(default = "default_semantic_threshold")]
     #[schemars(range(min = -1.0, max = 1.0))]
     pub deny_threshold: f32,
     /// Cosine-similarity threshold for `allow_examples`, in `[-1, 1]`.
     /// RAISE it to block more — a text must reach it to be admitted.
+    /// Required whenever `allow_examples` is non-empty, and only then: a
+    /// row with no allow-list has nothing for this number to decide. See
+    /// `deny_threshold` for why there is no portable value.
     #[serde(default = "default_semantic_threshold")]
     #[schemars(range(min = -1.0, max = 1.0))]
     pub allow_threshold: f32,
@@ -812,6 +883,11 @@ pub struct SemanticConfig {
     pub output_fail_open: bool,
 }
 
+/// Read-path only. The strict write schema requires each threshold
+/// alongside its example list, so nothing an operator saves today lands
+/// here — this exists for rows written before that requirement, which
+/// enforce 0.75 and must go on enforcing it until the control plane's
+/// backfill rewrites them. Retire it once no unmigrated row remains.
 fn default_semantic_threshold() -> f32 {
     0.75
 }
@@ -826,6 +902,110 @@ fn default_semantic_max_screened_texts() -> u32 {
 
 fn default_semantic_text_source() -> String {
     "user_messages".to_owned()
+}
+
+/// Config block for `kind: "custom"`. Runs an operator-supplied script in a
+/// sandboxed engine inside the gateway, so a screening service that speaks
+/// its own protocol can be reached without deploying a separate adapter.
+///
+/// The script is an ES module exporting `checkInput` and/or `checkOutput`.
+/// Each receives a context object and returns a verdict:
+///
+/// ```js
+/// export async function checkInput(ctx) {
+///   const resp = await fetch("https://screening.internal/scan", {
+///     method: "POST",
+///     headers: { "content-type": "application/json" },
+///     body: JSON.stringify({ text: ctx.text }),
+///   });
+///   const result = await resp.json();
+///   return result.verdict === "deny"
+///     ? { action: "block", reason_code: "policy" }
+///     : { action: "none" };
+/// }
+/// ```
+///
+/// A script can allow, block, or rewrite content. Rewriting returns a
+/// replacement for each slot in `ctx.segments`; where the call site cannot
+/// substitute text back, a rewrite request blocks instead of releasing the
+/// original. Scripts also get signing primitives (`crypto`) and access to
+/// the environment's embedding model (`aisix.embed`), so a script can
+/// express what the built-in kinds express. Applies on input, output, or
+/// both, including streamed output.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
+pub struct CustomConfig {
+    /// The script source, as an ES module exporting `checkInput` and/or
+    /// `checkOutput`. A hook whose function the module does not export is
+    /// skipped, so a script may cover one direction only.
+    ///
+    /// Required on both the write schema and the read one, so a row that
+    /// omits it is refused rather than loaded: unlike the fields that are
+    /// write-path-only, a `custom` row with no script screens nothing
+    /// either way, and rejecting it is what puts it in `/status/config`'s
+    /// `rejected` list where an operator can see it.
+    ///
+    /// A script that is whitespace-only or does not compile passes the
+    /// schema — `minLength` counts characters, so a whitespace-only value is
+    /// non-empty — and is refused when the chain is built instead. `aisix
+    /// validate` reports that and exits non-zero; a serving gateway reports
+    /// the runtime rejection through config status (api7/aisix#1084).
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    pub script: String,
+    /// Values the script reads as `ctx.secrets.<NAME>`, for credentials the
+    /// screening service requires. Stored encrypted and decrypted before
+    /// projection; plaintext is held in memory only and is never logged.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub secrets: std::collections::BTreeMap<String, String>,
+    /// Wall-clock budget for one hook invocation, in milliseconds, covering
+    /// the script's own execution and every call it makes. `fail_open` and
+    /// `output_fail_open` govern the verdict when it elapses. Per-call
+    /// timeouts within the budget are the script's own to set.
+    #[serde(default = "default_custom_timeout_ms")]
+    #[schemars(range(min = 1, max = 300_000))]
+    pub timeout_ms: u32,
+    /// Memory ceiling for the script engine, in bytes. A script that exceeds
+    /// it is terminated and the hook's fail-open policy applies.
+    #[serde(default = "default_custom_max_memory_bytes")]
+    #[schemars(range(min = 1_048_576, max = 536_870_912u64))]
+    pub max_memory_bytes: u64,
+
+    // --- streaming-output controls (consumed by aisix-proxy build_sse_stream) ---
+    /// Streaming output moderation mode: sliding-window incremental release
+    /// or whole-response hold-back.
+    #[serde(default = "default_custom_stream_processing_mode")]
+    pub stream_processing_mode: String,
+    /// Sliding-window size in characters for window mode.
+    #[serde(default = "default_acs_window_size")]
+    #[schemars(range(min = 1, max = 10_000))]
+    pub window_size: u32,
+    /// Chars carried between windows so a span split across a boundary is still caught.
+    #[serde(default = "default_acs_window_overlap_size")]
+    pub window_overlap_size: u32,
+    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
+    #[serde(default = "default_acs_max_buffer_bytes")]
+    #[schemars(range(min = 1))]
+    pub max_buffer_bytes: u64,
+    /// Buffer-overflow policy for streamed output when the buffer cap is hit.
+    #[serde(default = "default_acs_on_buffer_exceeded")]
+    pub on_buffer_exceeded: String,
+    /// Fail-open policy for the output hook. When disabled (the default), a
+    /// script failure blocks model output instead of releasing unscanned
+    /// content. The input hook uses the top-level `fail_open` policy.
+    #[serde(default)]
+    pub output_fail_open: bool,
+}
+
+fn default_custom_timeout_ms() -> u32 {
+    5_000
+}
+
+fn default_custom_max_memory_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn default_custom_stream_processing_mode() -> String {
+    "window".to_owned()
 }
 
 /// Provider discriminator. The kind drives which `*_config` block is
@@ -891,6 +1071,11 @@ pub enum GuardrailKind {
     /// Detection-only — never rewrites content. Applies on input,
     /// output, or both, including buffered streaming output.
     Semantic(SemanticConfig),
+    /// Screening by an operator-supplied script the gateway runs in a
+    /// sandboxed engine, for a screening service that speaks its own
+    /// protocol. The script can allow, block, or rewrite content. Applies
+    /// on input, output, or both, including streaming output.
+    Custom(CustomConfig),
 }
 
 impl GuardrailKind {
@@ -911,6 +1096,7 @@ impl GuardrailKind {
             GuardrailKind::OpenaiModeration(_) => "openai_moderation",
             GuardrailKind::Presidio(_) => "presidio",
             GuardrailKind::Semantic(_) => "semantic",
+            GuardrailKind::Custom(_) => "custom",
         }
     }
 }
@@ -943,8 +1129,11 @@ pub struct AppliedGuardrail {
 /// stage a policy, watch its hit rate in the dashboard, and only then flip
 /// it to `block`.
 ///
-/// `reason` and `counts` carry detector/entity/category NAMES only — never
-/// matched content (#153 no-leak criterion).
+/// `reason` is a code-owned kind/outcome summary, never the inner guardrail's
+/// dynamic reason. An availability failure may append its bounded, code-owned
+/// failure tag. Built-in mask `counts` carry detector/entity/category names;
+/// custom masks use the fixed key `custom` and count rewritten segments. No
+/// matched content enters this structure (#153 no-leak criterion).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuardrailMonitorHit {
     /// The configured (row) name of the monitor-mode guardrail that fired.
@@ -954,10 +1143,16 @@ pub struct GuardrailMonitorHit {
     /// `would_block` (a Block verdict was downgraded) or `would_mask`
     /// (maskable spans were observed but not rewritten).
     pub action: String,
-    /// The suppressed Block's operator-facing reason (`would_block` only;
-    /// empty for `would_mask`).
+    /// Code-owned summary of the suppressed Block's kind and outcome
+    /// (`would_block` only; empty for `would_mask`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reason: String,
+    /// Bounded failure tag retained only until the execution metrics sink has
+    /// recorded this monitor hit. The public usage-event summary carries the
+    /// same tag in `reason`, so this internal copy must not change its shape.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub error_type: String,
     /// detector/entity name → span count the guardrail would have masked
     /// (`would_mask` only; empty for `would_block`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -1024,6 +1219,82 @@ fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
+/// One similarity-screening summary from a `kind: "semantic"` guardrail
+/// execution (AISIX-Cloud#1467): what the embedding comparison actually
+/// scored, on a request it PASSED as well as on one it refused.
+///
+/// It exists because a similarity policy is untunable without its numbers.
+/// The verdict fields answer "did it fire"; nothing answered "how close was
+/// it", so an operator whose threshold was slightly too high saw a guardrail
+/// that simply never fired and had to bisect the threshold blindly. Monitor
+/// mode did not help: [`GuardrailMonitorHit`] records only a SUPPRESSED
+/// BLOCK, so a below-threshold pass produced no record at all.
+///
+/// One entry per `(guardrail_name, hook, direction)` — a SUMMARY, not one
+/// entry per screened text. A request screens up to `max_screened_texts`
+/// messages, and reporting each would make the array grow with conversation
+/// length while burying the only number that matters: the closest call.
+/// So `deny` carries the HIGHEST similarity seen across the screened texts
+/// and `allow` the LOWEST best-allow similarity, each being the text that
+/// came nearest to changing the verdict.
+///
+/// `embedding_model` is not decoration: cosine scores are not comparable
+/// across embedding models, so a score without the model that produced it
+/// cannot be read against a threshold, against another deployment, or
+/// against a value recorded before the model was switched.
+///
+/// **Indices only, never text.** `top_example_index` names the example the
+/// candidate scored highest against; neither the example text nor the
+/// screened text is ever captured here (#153 no-leak criterion). That is
+/// deliberate and not an oversight to be corrected later: this event is
+/// durable and widely readable, so an echoed example would let anyone with
+/// log access enumerate the operator's deny list, and an echoed candidate
+/// would make the telemetry a copy of user prompts. An interactive
+/// operator-facing dry-run answers with the example text; this does not.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GuardrailScore {
+    /// The configured (row) name of the guardrail that scored.
+    pub guardrail_name: String,
+    /// Which side ran: `input` or `output`. Never `both` — that is a
+    /// configuration value, not an execution.
+    pub hook: String,
+    /// Which example list was scored against:
+    ///
+    /// - `deny` — similarity to the closest `deny_examples` entry. The
+    ///   guardrail refuses at or above `threshold`.
+    /// - `allow` — similarity to the closest `allow_examples` entry,
+    ///   reported only when that list is non-empty. The guardrail refuses
+    ///   BELOW `threshold`.
+    pub direction: String,
+    /// Cosine similarity, in `[-1, 1]`. For `deny` the highest seen across
+    /// the screened texts; for `allow` the lowest best-allow value.
+    pub score: f32,
+    /// The configured threshold this direction compares against
+    /// (`deny_threshold` / `allow_threshold`), recorded alongside the score
+    /// so a stored event stays readable after the row is retuned.
+    pub threshold: f32,
+    /// `score >= threshold`, in BOTH directions — a statement about
+    /// similarity only, never about the verdict. Whether crossing the
+    /// threshold is good or bad is the direction's business: `deny` refuses
+    /// when it is `true`, `allow` refuses when it is `false`. Defining it as
+    /// "this caused the block" would invert its meaning between the two.
+    ///
+    /// Other gateways spell the equivalent flag as "passed", which reads
+    /// more naturally but only works where crossing a threshold always
+    /// means the same thing. It cannot describe an allow-list gate, whose
+    /// whole shape is that falling SHORT is the refusal. The difference is
+    /// deliberate.
+    pub matched: bool,
+    /// Zero-based index, into this direction's example list, of the
+    /// HIGHEST-SCORING example — whether or not it crossed the threshold.
+    /// On `matched: false` this is the number an operator needs: it names
+    /// which example came closest.
+    pub top_example_index: u32,
+    /// The `embedding_model` the row screened with. See the type doc: a
+    /// score is not interpretable without it.
+    pub embedding_model: String,
+}
+
 /// One guardrail member execution as observed by the chain fold
 /// (AISIX-Cloud#1076): identity, phase, enforced outcome, and wall-clock
 /// duration. All fields are bounded values safe for metric labels — never
@@ -1063,6 +1334,20 @@ pub struct GuardrailExecution<'a> {
 /// build time, so aisix-guardrails stays free of a metrics dependency.
 pub trait GuardrailMetricsSink: Send + Sync + 'static {
     fn record_guardrail_execution(&self, exec: &GuardrailExecution<'_>);
+
+    /// Count one bypass the PROXY performed on the chain's behalf, with
+    /// no member execution to carry it: a body the gateway could not give
+    /// the guardrails at all, which a fail-open chain lets through (#1115).
+    ///
+    /// The execution-driven bypasses reach the same counter through
+    /// [`Self::record_guardrail_execution`], which is why this is a second
+    /// method rather than a synthetic execution — there is no member, no
+    /// kind and no duration to report, and inventing them would put a
+    /// phantom row in the per-execution latency histogram.
+    ///
+    /// Required rather than defaulted: a sink that silently dropped these
+    /// would under-report exactly the traffic the counter is read to find.
+    fn record_guardrail_bypass(&self, reason: &str);
 }
 
 /// Content policy evaluated before or after upstream calls.
@@ -1081,11 +1366,44 @@ pub struct Guardrail {
     #[serde(default)]
     pub hook_point: GuardrailHookPoint,
 
-    /// Behavior when a remote API guardrail cannot complete its check —
-    /// upstream unreachable, timing out, throttling, or rejecting the
-    /// call. `true` allows the request and records the bypass reason in
-    /// `usage_events.guardrail_bypassed_reason`; `false` (the default)
-    /// blocks with 422. Keyword guardrails do not use this setting.
+    /// How much of the request this rule reads at the input hook.
+    ///
+    /// `all` (the default) scans every message the caller sent, including
+    /// replayed history and system prompts. `latest_turn` scans only the
+    /// messages after the last assistant message, with system messages
+    /// excluded — the current user message plus any tool results answering
+    /// it. It exists for clients that resend the whole conversation on
+    /// every call, where a rule that matched one earlier message would
+    /// otherwise keep refusing the rest of the session.
+    ///
+    /// The narrowing governs everything the rule does on the request:
+    /// under `latest_turn` a masking rule rewrites only the current turn,
+    /// and messages outside it reach the upstream exactly as the caller
+    /// sent them. A rule whose job is to mask the whole conversation
+    /// belongs on `all`.
+    ///
+    /// Ignored at the output hook, which always reads the whole response.
+    #[serde(default)]
+    pub input_messages: GuardrailInputMessages,
+
+    /// Behavior when this guardrail cannot complete its check. Two
+    /// causes: a remote provider that is unreachable, timing out,
+    /// throttling, or rejecting the call; and a body the gateway could
+    /// not give the guardrail at all — one that does not decode as UTF-8
+    /// or does not parse, which the proxy would otherwise refuse with
+    /// `unscannable_body`. `true` allows the request; `false` (the
+    /// default) blocks with 422.
+    ///
+    /// Both causes apply to EVERY kind: the second one is the gateway
+    /// failing to produce scannable text, which happens before any
+    /// guardrail runs and so reaches all of them. `keyword` and `pii`
+    /// never call out, so only the second can arise for them; a kind
+    /// that calls out can meet either.
+    ///
+    /// The per-hook split follows the same line. A kind that calls out
+    /// carries its own `output_fail_open` for the output hook, leaving
+    /// this field to govern the input hook. `keyword` and `pii` have no
+    /// `output_fail_open`, so this one value governs both of their hooks.
     ///
     /// Defaults to fail-closed so an unchecked request is never released
     /// on the strength of a guardrail that did not run: an operator who
@@ -1166,6 +1484,11 @@ impl Resource for Guardrail {
 /// A `Model`-scoped guardrail therefore never inspects MCP or passthrough
 /// traffic, an `McpServer`-scoped one never inspects model traffic, and a
 /// `PassthroughRoute`-scoped one inspects only the traffic of that route.
+///
+/// Scope follows the entry the caller addresses: a guardrail attached to a
+/// model runs only for requests addressed to that model. When the model is
+/// reached as a member of a routing, semantic, or ensemble group, its
+/// guardrails do not run — attach the guardrail to the group instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailScopeType {

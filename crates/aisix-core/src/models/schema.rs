@@ -71,6 +71,7 @@ pub struct Schemas {
     pub claim_mapping: Validator,
     pub passthrough_route: Validator,
     pub mcp_auth_settings: Validator,
+    pub pricing: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile(true)));
@@ -84,7 +85,7 @@ pub static LENIENT_SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::
 /// [`resource_root_schema`] takes. The published schema files and the
 /// validator sets are built from this list, so a new resource cannot reach
 /// one without reaching the other.
-pub const RESOURCES: [&str; 15] = [
+pub const RESOURCES: [&str; 16] = [
     "model",
     "api_key",
     "provider_key",
@@ -100,6 +101,7 @@ pub const RESOURCES: [&str; 15] = [
     "claim_mapping",
     "passthrough_route",
     "mcp_auth_settings",
+    "pricing",
 ];
 
 /// Whether a resource's write contract closes unknown top-level fields.
@@ -125,18 +127,19 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "model" => model_root_schema(strict),
         "api_key" => apikey_root_schema(strict),
         "provider_key" => provider_key_root_schema(),
-        "guardrail" => guardrail_root_schema(),
+        "guardrail" => guardrail_root_schema(strict),
         "guardrail_attachment" => guardrail_attachment_root_schema(),
         "cache_policy" => cache_policy_root_schema(),
         "observability_exporter" => observability_exporter_root_schema(),
         "rate_limit_policy" => rate_limit_policy_root_schema(),
-        "mcp_server" => mcp_server_root_schema(),
+        "mcp_server" => mcp_server_root_schema(strict),
         "mcp_policy" => mcp_policy_root_schema(strict),
         "a2a_agent" => a2a_agent_root_schema(),
         "oidc_provider" => oidc_provider_root_schema(),
         "claim_mapping" => claim_mapping_root_schema(),
         "passthrough_route" => passthrough_route_root_schema(),
         "mcp_auth_settings" => mcp_auth_settings_root_schema(),
+        "pricing" => pricing_root_schema(),
         other => panic!("unknown resource {other:?}"),
     };
     if strict {
@@ -172,6 +175,7 @@ impl Schemas {
             claim_mapping: build("claim_mapping"),
             passthrough_route: build("passthrough_route"),
             mcp_auth_settings: build("mcp_auth_settings"),
+            pricing: build("pricing"),
         }
     }
 }
@@ -266,10 +270,9 @@ pub fn open_unknown_fields(schema: &mut Value) {
 /// would be silent.
 ///
 /// A resource listed here must not carry a schema-hidden but
-/// serde-consumed field — a `#[schemars(skip)]` tombstone like
-/// `McpAccess::legacy_mode`. This walk reads known field names off the
-/// schema, so a field the schema does not mention would be reported as
-/// unknown on every row that carries it.
+/// serde-consumed field — a `#[schemars(skip)]` tombstone. This walk reads
+/// known field names off the schema, so a field the schema does not mention
+/// would be reported as unknown on every row that carries it.
 static REPORT_SCHEMAS: Lazy<Vec<(&'static str, Value)>> = Lazy::new(|| {
     [
         "guardrail",
@@ -296,8 +299,10 @@ static REPORT_SCHEMAS: Lazy<Vec<(&'static str, Value)>> = Lazy::new(|| {
 /// `datadog` exporter carrying an `otlp_http` field) does not show up here —
 /// that is a malformed document, not a field from a newer build, and the
 /// write path rejects it. Map-valued fields (`headers`,
-/// `severity_threshold_by_category`) declare a value schema rather than
-/// properties, so their keys are never unknown.
+/// `severity_threshold_by_category`, `effort_mapping`) declare a value
+/// schema every key falls back to, so their keys are never unknown —
+/// including the one key `effort_mapping` additionally declares as a
+/// property.
 pub fn unknown_field_paths(resource: &str, value: &Value) -> Vec<String> {
     let Some((_, schema)) = REPORT_SCHEMAS.iter().find(|(name, _)| *name == resource) else {
         return Vec::new();
@@ -491,11 +496,13 @@ pub fn validate_model(value: &Value) -> Result<(), SchemaError> {
     if validate(&SCHEMAS.model, &probe).is_err() {
         return Err(err);
     }
-    // strip_kind_inapplicable only reports on these three kinds.
+    // strip_kind_inapplicable reports only on these non-direct shapes.
     let kind = if model.is_routing() {
         "model group"
     } else if model.is_ensemble() {
         "ensemble"
+    } else if model.is_embedding() {
+        "embedding model"
     } else {
         "semantic router"
     };
@@ -526,13 +533,84 @@ pub fn validate_guardrail(value: &Value) -> Result<(), SchemaError> {
             "guardrail",
             &SCHEMAS.guardrail,
             value,
-            err,
+            name_missing_semantic_threshold(value, err),
         )),
+    }
+}
+
+/// Name the similarity threshold a `kind: semantic` row left out.
+///
+/// A guardrail document is a `oneOf`, so the conditional requirement in the
+/// semantic branch collapses to the same root-level "not valid under any of
+/// the schemas" every branch failure does — true, and useless to the
+/// operator who simply has not chosen a number yet. This is the most
+/// ordinary write-path error for this kind, because there is no default to
+/// fall back on.
+///
+/// Same discipline as [`name_unknown_fields`]: the message is replaced only
+/// when the missing threshold is the WHOLE story. The document is
+/// re-validated with the absent keys filled in, and one that also violates
+/// something else keeps the original error, which points at the other
+/// problem.
+///
+/// It deliberately does not suggest a value. Cosine scales differ enough
+/// between embedding models that any number printed here would be wrong for
+/// most rows, and a suggested number is one an operator will take.
+fn name_missing_semantic_threshold(value: &Value, err: SchemaError) -> SchemaError {
+    let Some(fields) = value.as_object() else {
+        return err;
+    };
+    if fields.get("kind").and_then(Value::as_str) != Some("semantic") {
+        return err;
+    }
+    let listed = |examples: &str| {
+        fields
+            .get(examples)
+            .and_then(Value::as_array)
+            .is_some_and(|list| !list.is_empty())
+    };
+    let missing: Vec<&str> = [
+        ("deny_examples", "deny_threshold"),
+        ("allow_examples", "allow_threshold"),
+    ]
+    .into_iter()
+    .filter(|(examples, threshold)| listed(examples) && !fields.contains_key(*threshold))
+    .map(|(_, threshold)| threshold)
+    .collect();
+    if missing.is_empty() {
+        return err;
+    }
+    let mut probe = value.clone();
+    if let Some(fields) = probe.as_object_mut() {
+        for threshold in &missing {
+            fields.insert((*threshold).to_string(), json!(0.5));
+        }
+    }
+    if validate(&SCHEMAS.guardrail, &probe).is_err() {
+        return err;
+    }
+    SchemaError {
+        path: err.path,
+        message: format!(
+            "{} required: a similarity threshold has no portable default, \
+             because cosine scores are not comparable across embedding \
+             models. Measure one against `embedding_model` on your own \
+             traffic and set it explicitly.",
+            missing
+                .iter()
+                .map(|threshold| format!("`{threshold}`"))
+                .collect::<Vec<_>>()
+                .join(" and "),
+        ),
     }
 }
 
 pub fn validate_cache_policy(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.cache_policy, value)
+}
+
+pub fn validate_pricing(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.pricing, value)
 }
 
 pub fn validate_observability_exporter(value: &Value) -> Result<(), SchemaError> {
@@ -675,6 +753,10 @@ pub fn validate_cache_policy_lenient(value: &Value) -> Result<(), SchemaError> {
     validate(&LENIENT_SCHEMAS.cache_policy, value)
 }
 
+pub fn validate_pricing_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.pricing, value)
+}
+
 pub fn validate_observability_exporter_lenient(value: &Value) -> Result<(), SchemaError> {
     validate(&LENIENT_SCHEMAS.observability_exporter, value)
 }
@@ -780,11 +862,168 @@ pub fn model_root_schema(strict: bool) -> Value {
             if branch.get("type").and_then(Value::as_str) == Some("object") {
                 if let Some(obj) = branch.as_object_mut() {
                     obj.insert("additionalProperties".to_string(), json!(false));
+                    require_name_or_id(obj, "target", "target_id");
                 }
             }
         }
     }
+    // Every place a model document points at ANOTHER model accepts the
+    // reference as a name or as a resource id. Applied to both contracts:
+    // these fields were required on the read path too, so relaxing only the
+    // write path would leave a stored id-only reference dropping its row.
+    apply_model_ref_alternatives(&mut schema);
+    apply_effort_mapping_tokens(&mut schema, strict);
     schema
+}
+
+/// State `effort_mapping`'s reserved forms on both contracts: a `null` value
+/// ("send this request with no effort field at all") and the empty-string
+/// key that stands for a request setting no effort in the first place.
+///
+/// `schemars` renders a map from its value type alone, so it cannot say
+/// that those two may not be combined — and `"": null` asks to remove a
+/// field the request never set, a rule that can never do anything. Pinning
+/// that one key to a string rejects the pair outright instead of storing a
+/// rule nothing reads.
+fn apply_effort_mapping_tokens(schema: &mut Value, strict: bool) {
+    let node = schema
+        .pointer_mut("/properties/effort_mapping")
+        .and_then(Value::as_object_mut)
+        .expect("model schema declares effort_mapping");
+    // An empty target value is refused on the write path only. It asks to
+    // send an effort the gateway itself reads back as "no effort set", so
+    // it is another rule that can never mean what it says — but `minLength`
+    // on the read schema would delete a stored row that carries one, and a
+    // row is worth more than the knob. `minLength` ignores a `null`, so the
+    // removal form is unaffected.
+    let value_schema = if strict {
+        json!({"type": ["string", "null"], "minLength": 1})
+    } else {
+        json!({"type": ["string", "null"]})
+    };
+    node.insert("additionalProperties".to_string(), value_schema);
+    let mut not_set_key = json!({
+        "description": "The entry for a request that sets no reasoning effort. Its value is sent upstream in place of the missing one, and may not be `null` — a request that sets no effort has no field to remove.",
+        "type": "string"
+    });
+    if strict {
+        not_set_key["minLength"] = json!(1);
+    }
+    node.insert("properties".to_string(), json!({"": not_set_key}));
+}
+
+/// Every `(type, name field, id field)` a model reference is written as.
+///
+/// One table, applied by [`apply_model_ref_alternatives`] to whatever
+/// schema carries the type — the resource root schemas here, and the
+/// standalone nested-type files `dump-schema` publishes beside them.
+/// Without it those files would say a routing target requires no fields
+/// at all, which is not the contract the enforced copy states.
+///
+/// The `kind: semantic` guardrail's embedder is not here: it lives in a
+/// `oneOf` branch rather than a named type, and it is required on the
+/// write path only (see [`guardrail_root_schema`]).
+pub const MODEL_REF_TYPES: &[(&str, &str, &str)] = &[
+    ("RoutingTarget", "model", "model_id"),
+    ("PanelMember", "model", "model_id"),
+    ("Judge", "model", "model_id"),
+    ("SemanticRoute", "target", "target_id"),
+    ("Semantic", "embedding_model", "embedding_model_id"),
+    ("Semantic", "default", "default_id"),
+    (
+        "SemanticCacheConfig",
+        "embedding_model",
+        "embedding_model_id",
+    ),
+];
+
+/// Every id-form model-reference FIELD, wherever it appears.
+///
+/// Distinct from [`MODEL_REF_TYPES`], which is keyed by the type carrying
+/// the pair: two of these sit somewhere no named type covers — a cache
+/// policy's `applies_to_model_id` on the resource root, and the
+/// `kind: semantic` guardrail's `embedding_model_id` inside a `oneOf`
+/// branch.
+const MODEL_REF_ID_FIELDS: &[&str] = &[
+    "model_id",
+    "target_id",
+    "embedding_model_id",
+    "default_id",
+    "applies_to_model_id",
+];
+
+/// Let every [`MODEL_REF_ID_FIELDS`] property accept an explicit `null`,
+/// at any depth.
+///
+/// A producer that spells "no id here" as `null` rather than by omitting
+/// the key must mean the same thing — the reference falls back to its
+/// name — and it does at the type level, where serde reads `null` into
+/// `None`. The schema is what decides whether serde ever sees the
+/// document: these resources render `Option` WITHOUT the null type
+/// (`struct_root_schema(false)`), so an explicit `null` would fail
+/// validation and the loader would skip the whole row. `api_key`, which
+/// renders with it, already accepts `null` on `allowed_model_ids` — this
+/// keeps the id form answering to `null` the same way on every resource
+/// rather than only on the one that happens to render nullably.
+fn allow_null_on_model_ref_ids(schema: &mut Value) {
+    match schema {
+        Value::Object(map) => {
+            if let Some(Value::Object(properties)) = map.get_mut("properties") {
+                for field in MODEL_REF_ID_FIELDS {
+                    let Some(Value::Object(property)) = properties.get_mut(*field) else {
+                        continue;
+                    };
+                    // A property whose whole schema is a `type` is not a
+                    // DECLARATION, it is the pin inside a requiredness
+                    // clause ([`require_name_or_id`]), which exists to
+                    // reject exactly the `null` this would let through.
+                    // A real declaration always carries its description
+                    // and length bound beside the type.
+                    if property.len() == 1 {
+                        continue;
+                    }
+                    if property.get("type") == Some(&json!("string")) {
+                        property.insert("type".to_string(), json!(["string", "null"]));
+                    }
+                }
+            }
+            for child in map.values_mut() {
+                allow_null_on_model_ref_ids(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                allow_null_on_model_ref_ids(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Turn every [`MODEL_REF_TYPES`] entry `schema` carries into a "name or
+/// id" alternative — whether the type is the schema's ROOT (a standalone
+/// nested-type file) or one of its `definitions`. Types the schema does
+/// not carry are skipped. Also widens every id field to accept `null`
+/// (see [`allow_null_on_model_ref_ids`]).
+pub fn apply_model_ref_alternatives(schema: &mut Value) {
+    allow_null_on_model_ref_ids(schema);
+    let root_title = schema
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    for (type_name, name, id) in MODEL_REF_TYPES {
+        if root_title.as_deref() == Some(*type_name) {
+            if let Some(root) = schema.as_object_mut() {
+                require_name_or_id(root, name, id);
+            }
+        }
+        if let Some(node) = schema
+            .pointer_mut(&format!("/definitions/{type_name}"))
+            .and_then(Value::as_object_mut)
+        {
+            require_name_or_id(node, name, id);
+        }
+    }
 }
 
 /// Canonical JSON Schema for the `api_key` resource, derived from the
@@ -795,14 +1034,91 @@ pub fn model_root_schema(strict: bool) -> Value {
 pub fn apikey_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::ApiKey>(true);
     if strict {
-        require_property(
-            schema
-                .pointer_mut("/definitions/McpAccess")
-                .expect("api_key schema defines McpAccess"),
-            "allow",
+        require_mcp_tool_ref(&mut schema);
+        let access = schema
+            .pointer_mut("/definitions/McpAccess")
+            .expect("api_key schema defines McpAccess");
+        require_property(access, "allow");
+        insert_all_of(access, vec![require_name_form_beside_ids("deny", "array")]);
+        insert_all_of(
+            &mut schema,
+            vec![require_name_form_beside_ids("mcp_rate_limits", "object")],
         );
     }
     schema
+}
+
+/// The write-path shape of one [`McpToolRef`](crate::models::McpToolRef)
+/// entry: both halves present and non-empty.
+///
+/// It lives here rather than on the type because the runtime loader must
+/// keep DESERIALIZING a malformed entry — a row it cannot deserialize is
+/// skipped whole, and for an `api_key` that means the key stops
+/// authenticating every kind of traffic rather than merely losing MCP
+/// access. The write path still refuses to guess.
+fn require_mcp_tool_ref(schema: &mut Value) {
+    let Some(def) = schema.pointer_mut("/definitions/McpToolRef") else {
+        return;
+    };
+    for field in ["server_id", "tool"] {
+        require_property(def, field);
+        if let Some(property) = def.pointer_mut(&format!("/properties/{field}")) {
+            let property = property
+                .as_object_mut()
+                .expect("McpToolRef property is a JSON object");
+            property.insert("minLength".to_string(), json!(1));
+            // The `#[serde(default)]` the loader needs renders as
+            // `default: ""`, which beside `minLength: 1` is a value this
+            // very schema refuses — a form generator that honours defaults
+            // would pre-fill a field and then fail to save it. The lenient
+            // set keeps the annotation, where it is the truth about what
+            // the loader does with an omitted half.
+            property.remove("default");
+        }
+    }
+}
+
+/// A subschema requiring `<name_field>` whenever the id spelling that
+/// shadows it, `<name_field>_ids` (or `<name_field>_by_id` for a map), is
+/// written as a real value.
+///
+/// The id spelling is invisible to a gateway one release behind the
+/// control plane, and the name spelling is the only thing such a gateway
+/// can read. Left optional, a control plane could write a deny — or a
+/// per-server limit — that simply does not exist on that gateway for the
+/// length of the upgrade window: a restriction failing OPEN, silently.
+/// Requiring the pair keeps the older reading conservative and unchanged,
+/// the same reason `allow` is required outright.
+///
+/// The `type` guard matters: `required` alone would also fire on an
+/// explicit `null`, which means the same as omitting the field.
+fn require_name_form_beside_ids(name_field: &str, id_type: &str) -> Value {
+    let id_field = match id_type {
+        "object" => format!("{name_field}_by_id"),
+        _ => format!("{name_field}_ids"),
+    };
+    json!({
+        "if": {
+            "required": [id_field],
+            "properties": { id_field: { "type": id_type } }
+        },
+        "then": { "required": [name_field] }
+    })
+}
+
+/// Append `subschemas` to a schema node's `allOf`, creating it when absent.
+/// Never overwrites: a producer may inject more than one overlay, and
+/// `close_unknown_fields` deliberately does not descend into them.
+fn insert_all_of(schema: &mut Value, subschemas: Vec<Value>) {
+    let obj = schema
+        .as_object_mut()
+        .expect("schema fragment is a JSON object");
+    match obj.get_mut("allOf").and_then(Value::as_array_mut) {
+        Some(list) => list.extend(subschemas),
+        None => {
+            obj.insert("allOf".to_string(), Value::Array(subschemas));
+        }
+    }
 }
 
 /// Add `name` to a schema object's `required` list, creating the list
@@ -825,6 +1141,61 @@ fn require_property(schema: &mut Value, name: &str) {
     }
 }
 
+/// [`require_property`] for a `oneOf` branch already borrowed as its object
+/// map.
+fn require_branch_property(branch: &mut serde_json::Map<String, Value>, name: &str) {
+    match branch.get_mut("required").and_then(Value::as_array_mut) {
+        Some(list) => {
+            if !list.iter().any(|v| v.as_str() == Some(name)) {
+                list.push(json!(name));
+            }
+        }
+        None => {
+            branch.insert("required".to_string(), json!([name]));
+        }
+    }
+}
+
+/// Turn a required model-reference field into a "name **or** id" pair.
+///
+/// Every document that points at a Model may name it by display name or by
+/// resource id ([`crate::models::resolve_model_ref`]). Requiredness moves
+/// off the name alone and onto the alternative: `name` is dropped from
+/// `required` and an `allOf` member `{"anyOf": [{"required": [name]},
+/// {"required": [id]}]}` is added, so a document naming the model either
+/// way validates while one naming it NEITHER way is rejected exactly as a
+/// missing name was.
+///
+/// Appends to `allOf` rather than replacing it — the `semantic` guardrail
+/// branch already carries threshold rules there, and one object can need
+/// two alternatives (a semantic router names both an embedding model and a
+/// default).
+fn require_name_or_id(node: &mut serde_json::Map<String, Value>, name: &str, id: &str) {
+    if let Some(list) = node.get_mut("required").and_then(Value::as_array_mut) {
+        list.retain(|v| v.as_str() != Some(name));
+        if list.is_empty() {
+            node.remove("required");
+        }
+    }
+    // Each branch pins its field to a STRING, not merely to being
+    // present: `required` in JSON Schema is satisfied by a key whose
+    // value is `null`, and the id fields accept `null` (see
+    // `allow_null_on_model_ref_ids`). Without the type, `{"model_id":
+    // null}` — which names no model at all — would validate.
+    let clause = json!({
+        "anyOf": [
+            {"required": [name], "properties": {name: {"type": "string"}}},
+            {"required": [id], "properties": {id: {"type": "string"}}},
+        ]
+    });
+    match node.get_mut("allOf").and_then(Value::as_array_mut) {
+        Some(list) => list.push(clause),
+        None => {
+            node.insert("allOf".to_string(), json!([clause]));
+        }
+    }
+}
+
 /// Canonical JSON Schema for the `provider_key` resource, derived from the
 /// [`ProviderKey`](crate::models::ProviderKey) struct. Uses the nullable
 /// `Option` representation (`true`): `TelemetryTags` carries fields cp-api
@@ -841,6 +1212,35 @@ pub fn provider_key_root_schema() -> Value {
         "Accepted as an alternative spelling of `api_key`. \
          Provide the credential under exactly one of the two names.",
     );
+    // `schemars` annotates `IpAddr` with `format: "ip"`, which nothing
+    // validates: `format` is an annotation in draft-07 and the compiled
+    // validators do not opt into checking it. Without a constraint the
+    // gate passes a hostname through and the row then dies at
+    // deserialization — where the whole Provider Key is skipped, taking
+    // every Model that references it with it. This charset is a superset
+    // of every address `IpAddr` parses, so it rejects nothing valid; what
+    // it catches is the mistake operators actually make, a hostname or a
+    // URL written where the address goes. The exact grammar (octet
+    // ranges, group counts) stays with the decoder.
+    //
+    // `minItems` because an empty list is a written override that
+    // overrides nothing — the field is omitted to mean "resolve normally".
+    // Duplicates are deliberately allowed: a repeated address costs one
+    // wasted connect attempt and nothing else, and leaving it out is one
+    // fewer rule for the control plane to mirror exactly.
+    let resolve_addresses = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("provider_key schema has properties")
+        .get_mut("resolve_addresses")
+        .and_then(Value::as_object_mut)
+        .expect("provider_key schema declares resolve_addresses");
+    resolve_addresses.insert("minItems".to_string(), json!(1));
+    resolve_addresses
+        .get_mut("items")
+        .and_then(Value::as_object_mut)
+        .expect("resolve_addresses declares its item schema")
+        .insert("pattern".to_string(), json!("^[0-9A-Fa-f:.]+$"));
     schema
 }
 
@@ -913,7 +1313,18 @@ fn accept_renamed_field(schema: &mut Value, canonical: &str, former: &str, note:
 /// path enforces them. The label
 /// is accepted under both its canonical name `name` and its former name
 /// `display_name` (see [`accept_renamed_field`]).
-pub fn mcp_server_root_schema() -> Value {
+///
+/// `strict` additionally forbids a `*` in the label
+/// ([`NAME_PATTERN_STRICT`](super::mcp_server::NAME_PATTERN_STRICT), whose
+/// doc has the mechanism): the name is pasted into the
+/// `<server>__<tool>` glob patterns every name-form MCP grant, deny and
+/// anonymous ceiling is written as, and a `*` in it makes them either
+/// wider than written (`gh*__read` also covers `ghost__read`) or empty
+/// (`gh*__*` carries two `*`, which matches nothing). The read schema is
+/// deliberately left alone: a stored row that already carries a `*` must
+/// keep loading on every gateway, since a read-path tightening drops the
+/// row instead of the character.
+pub fn mcp_server_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::McpServer>(true);
     schema
         .as_object_mut()
@@ -922,6 +1333,19 @@ pub fn mcp_server_root_schema() -> Value {
             "allOf".to_string(),
             super::mcp_server::mcp_server_credential_coupling(),
         );
+    if strict {
+        // Applied BEFORE the rename acceptance below, which copies this
+        // property to `display_name` — the two spellings of one label
+        // cannot enforce different patterns.
+        let name = schema
+            .pointer_mut("/properties/name")
+            .and_then(Value::as_object_mut)
+            .expect("mcp server schema declares `name`");
+        name.insert(
+            "pattern".to_string(),
+            json!(super::mcp_server::NAME_PATTERN_STRICT),
+        );
+    }
     accept_renamed_field(
         &mut schema,
         "name",
@@ -1030,6 +1454,17 @@ fn title_single_value_enum_variants(
 /// plain-but-absent `Option` representation (`false`): the control plane
 /// omits unset fields (`jwks_uri`, `bound_claims`) rather than sending an
 /// explicit `null`.
+///
+/// Only `name` is required here. Which of `issuer` / `audiences` /
+/// `jwks_uri` a provider must or must not carry depends on its
+/// verification mode — which the presence of `hmac_secret` derives — and
+/// the secret's floor is a count of UTF-8 bytes rather than of the
+/// characters `minLength` measures. Both live in
+/// [`OidcProvider::validate_semantics`], applied by the loader and the
+/// file source after parse, exactly as the rate-limit policy's tree caps
+/// are.
+///
+/// [`OidcProvider::validate_semantics`]: crate::models::OidcProvider::validate_semantics
 pub fn oidc_provider_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::OidcProvider>(false);
     // schemars does not propagate the `#[schemars(length(min = 1))]` on
@@ -1132,8 +1567,31 @@ pub fn passthrough_route_root_schema() -> Value {
 /// (cp-api keys the row by the environment id; the resources file
 /// rejects duplicates at load) and, at read time, by the resolvers
 /// failing closed — not by the document schema.
+///
+/// The resource renders its `Option` fields non-nullable, but
+/// `anonymous.server_ids` accepts an explicit `null` on BOTH paths: the
+/// control plane clears the id spelling by writing one, and the read
+/// schema refusing it would drop the whole row — taking the OAuth
+/// discovery surface down along with anonymous access.
+///
+/// `servers` stays required beside it on both paths, which is stricter
+/// than the "write the name form beside the id form" guard the other MCP
+/// id spellings carry: a gateway one release behind the control plane
+/// reads the name form only, and an anonymous ceiling it cannot read at
+/// all is one it does not apply.
 pub fn mcp_auth_settings_root_schema() -> Value {
-    struct_root_schema::<crate::models::McpAuthSettings>(false)
+    let mut schema = struct_root_schema::<crate::models::McpAuthSettings>(false);
+    // `expect`, not a silent `if let`: a pointer that quietly stops
+    // matching would drop `null` out of the READ schema, and the loader
+    // skips a row it cannot validate — taking the OAuth discovery
+    // surface down with anonymous access, which is the outcome this
+    // patch exists to prevent.
+    schema
+        .pointer_mut("/definitions/McpAnonymousAccess/properties/server_ids")
+        .and_then(Value::as_object_mut)
+        .expect("mcp_auth_settings schema declares `anonymous.server_ids`")
+        .insert("type".to_string(), json!(["array", "null"]));
+    schema
 }
 
 /// Canonical JSON Schema for the `mcp_policy` resource, derived from the
@@ -1146,24 +1604,21 @@ pub fn mcp_auth_settings_root_schema() -> Value {
 /// environment layer).
 pub fn mcp_policy_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::McpPolicy>(true);
+    let mut overlays = vec![json!({
+        "if": {
+            "properties": { "scope": { "const": "team" } }
+        },
+        "then": {
+            "required": ["scope_ref"],
+            "properties": { "scope_ref": { "type": "string", "minLength": 1 } }
+        }
+    })];
     if strict {
         require_property(&mut schema, "allow");
+        require_mcp_tool_ref(&mut schema);
+        overlays.push(require_name_form_beside_ids("deny", "array"));
     }
-    schema
-        .as_object_mut()
-        .expect("mcp_policy root schema is a JSON object")
-        .insert(
-            "allOf".to_string(),
-            json!([{
-                "if": {
-                    "properties": { "scope": { "const": "team" } }
-                },
-                "then": {
-                    "required": ["scope_ref"],
-                    "properties": { "scope_ref": { "type": "string", "minLength": 1 } }
-                }
-            }]),
-        );
+    insert_all_of(&mut schema, overlays);
     schema
 }
 
@@ -1196,7 +1651,7 @@ pub fn mcp_policy_root_schema(strict: bool) -> Value {
 /// 4. `schemars` leaves discriminator tag fields and collection item schemas
 ///    without descriptions, so the public schema fills those gaps.
 /// 5. `created_at` republishes its `date-time` format (annotation-only).
-pub fn guardrail_root_schema() -> Value {
+pub fn guardrail_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::Guardrail>(false);
     let obj = schema
         .as_object_mut()
@@ -1373,20 +1828,105 @@ pub fn guardrail_root_schema() -> Value {
                 "semantic" => {
                     set_property_enum(b, "text_source", json!(["user_messages", "all_messages"]));
                     set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
-                    // Required on the write path, defaulted in the type:
-                    // see the field's doc comment. A row saved without it
-                    // would screen every request against a model that
-                    // resolves to nothing.
-                    match b.get_mut("required").and_then(Value::as_array_mut) {
-                        Some(list) => {
-                            if !list.iter().any(|v| v.as_str() == Some("embedding_model")) {
-                                list.push(json!("embedding_model"));
+                    // WRITE PATH ONLY, all of it. Each of these fields is
+                    // defaulted at the type level so that a STORED row
+                    // lacking it still deserializes: the loader's failure
+                    // unit is the row, and a screening guardrail that
+                    // vanishes is fail-OPEN — strictly worse than the
+                    // field defaulting. What an operator may save is the
+                    // stricter question, and it is asked here.
+                    if strict {
+                        // …and the type-level default goes with them. It
+                        // exists so a STORED row without the key still
+                        // loads; advertised on the write contract it reads
+                        // as a suggested value, which is the one thing this
+                        // change is trying to stop — a schema-driven form
+                        // or generator would pre-fill 0.75 and put the
+                        // operator back where they started.
+                        for threshold in ["deny_threshold", "allow_threshold"] {
+                            if let Some(Value::Object(properties)) = b.get_mut("properties") {
+                                if let Some(Value::Object(field)) = properties.get_mut(threshold) {
+                                    field.remove("default");
+                                }
                             }
                         }
-                        None => {
-                            b.insert("required".to_string(), json!(["embedding_model"]));
+                        // Each threshold is required alongside ITS OWN
+                        // example list and only then — demanding an allow
+                        // threshold on a deny-only row would be asking for
+                        // a number that decides nothing. There is no value
+                        // that is right for every embedding model, so
+                        // there is nothing to default to; see the fields'
+                        // doc comments.
+                        b.insert(
+                            "allOf".to_string(),
+                            json!([
+                                {
+                                    "if": {
+                                        "required": ["deny_examples"],
+                                        "properties": { "deny_examples": { "minItems": 1 } }
+                                    },
+                                    "then": { "required": ["deny_threshold"] }
+                                },
+                                {
+                                    "if": {
+                                        "required": ["allow_examples"],
+                                        "properties": { "allow_examples": { "minItems": 1 } }
+                                    },
+                                    "then": { "required": ["allow_threshold"] }
+                                }
+                            ]),
+                        );
+                        // A row saved without an embedding model would
+                        // screen every request against a model that
+                        // resolves to nothing. Either spelling satisfies
+                        // it — the id form survives a rename of the model.
+                        // AFTER the `allOf` above, which is written rather
+                        // than appended to.
+                        require_name_or_id(b, "embedding_model", "embedding_model_id");
+                    }
+                }
+                "custom" => {
+                    // Required on BOTH schemas, unlike the semantic fields
+                    // above, and the asymmetry is the point rather than an
+                    // oversight. Those two relax on the read path because a
+                    // row that loads behaves BETTER than one that vanishes:
+                    // an absent threshold keeps screening at its stored
+                    // default, and an empty `embedding_model` REFUSES every
+                    // request in scope rather than admitting it, since
+                    // `fail_open` defaults to false — fail-closed beats the
+                    // row vanishing and letting the traffic through
+                    // unscreened. It costs the `rejected[]` signal, which
+                    // api7/aisix#1084 tracks. A scriptless `custom` row screens nothing
+                    // either way, so relaxing it changes no enforcement and
+                    // rejects it into `/status/config`'s `rejected[]` at load
+                    // time. Only a MISSING key is caught here; a
+                    // whitespace-only or uncompilable script clears
+                    // `minLength: 1` and is reported as a runtime build
+                    // rejection instead.
+                    require_branch_property(b, "script");
+                    if strict {
+                        // The published contract must not advertise a value
+                        // it rejects: `script` carried `default: ""` beside
+                        // `minLength: 1`, so a generator honouring it
+                        // pre-filled something the same schema refuses. Same
+                        // reasoning as the thresholds above.
+                        if let Some(Value::Object(properties)) = b.get_mut("properties") {
+                            if let Some(Value::Object(field)) = properties.get_mut("script") {
+                                field.remove("default");
+                            }
                         }
                     }
+                    set_property_enum(
+                        b,
+                        "stream_processing_mode",
+                        json!(["window", "buffer_full"]),
+                    );
+                    set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
+                    set_property_additional_properties_description(
+                        b,
+                        "secrets",
+                        "Value the script reads as ctx.secrets under this name.",
+                    );
                 }
                 _ => {}
             }
@@ -1427,6 +1967,10 @@ pub fn guardrail_root_schema() -> Value {
         }
     }
     close_definitions(&mut schema);
+    // On BOTH contracts, unlike the requirement injected above: an
+    // explicit `null` must mean the same as omitting the key on the read
+    // path too, or a row that spells it that way is skipped whole.
+    allow_null_on_model_ref_ids(&mut schema);
     schema
 }
 
@@ -1496,6 +2040,10 @@ fn guardrail_kind_description(kind: &str) -> Option<&'static str> {
         "semantic" => Some(
             "Guardrail provider type for embedding-similarity screening against \
              example texts, using an embedding-kind Model.",
+        ),
+        "custom" => Some(
+            "Guardrail provider type for screening by an operator-supplied \
+             script the gateway runs in a sandboxed engine.",
         ),
         _ => None,
     }
@@ -1577,7 +2125,20 @@ fn set_property_additional_properties_description(
 /// has no `deny_unknown_fields`, so the schema omits `additionalProperties`
 /// (i.e. `true`) — forward-compat fields from a newer cp-api are tolerated.
 pub fn cache_policy_root_schema() -> Value {
-    struct_root_schema::<crate::models::CachePolicy>(false)
+    let mut schema = struct_root_schema::<crate::models::CachePolicy>(false);
+    // The similarity layer's embedding model is named either way, like
+    // every other model reference. `applies_to` needs no alternative: it
+    // has a default, and `applies_to_model_id` simply overrides it.
+    apply_model_ref_alternatives(&mut schema);
+    schema
+}
+
+/// Canonical JSON Schema for the `pricing` resource, derived from the
+/// [`Pricing`](crate::models::Pricing) struct. All three fields are the
+/// document — a row missing one prices nothing — so they are required on
+/// both the write and the read path.
+pub fn pricing_root_schema() -> Value {
+    struct_root_schema::<crate::models::Pricing>(false)
 }
 
 /// Canonical JSON Schema for the `observability_exporter` resource, derived
@@ -1870,6 +2431,281 @@ mod tests {
             }
         });
         assert!(validate_model(&v).is_err());
+    }
+
+    // ---- model references by resource id (`<field>_id`) ----
+
+    /// Every place a model document points at another model takes the id
+    /// spelling on BOTH contracts. The lenient half is the one that
+    /// matters most: a stored document the read schema rejects is a row
+    /// the loader skips whole.
+    #[test]
+    fn model_references_accept_the_id_spelling() {
+        let cases = [
+            json!({"display_name": "g", "routing": {"targets": [{"model_id": "m-1"}]}}),
+            json!({"display_name": "g", "routing": {
+                "targets": [{"model": "a", "model_id": "m-1"}, {"model": "b"}]}}),
+            json!({"display_name": "e", "ensemble": {
+                "panel": [{"model_id": "m-1"}], "judge": {"model_id": "m-2"}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model_id": "m-e",
+                "routes": [{"name": "r", "target_id": "m-1", "examples": ["x"]}],
+                "default_id": "m-2",
+                "match": {"threshold": 0.5}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 0.5},
+                "on_embedding_failure": {"target_id": "m-9"}}}),
+        ];
+        for case in cases {
+            validate_model(&case).unwrap_or_else(|e| panic!("strict rejected {case}: {e}"));
+            validate_model_lenient(&case)
+                .unwrap_or_else(|e| panic!("lenient rejected {case}: {e}"));
+        }
+    }
+
+    /// A field the strict schema does not declare is reported as unknown
+    /// on every row that carries it, and `model` takes its partial-compat
+    /// report from the schema rather than from `serde_ignored` (untagged
+    /// and flattened content is invisible to that). So the id spellings
+    /// have to be visible to the walk, not merely accepted by the
+    /// validator.
+    #[test]
+    fn model_reference_ids_are_not_reported_as_unknown_fields() {
+        let v = json!({
+            "display_name": "everything",
+            "semantic": {
+                "embedding_model_id": "m-e",
+                "routes": [{"name": "r", "target_id": "m-1", "examples": ["x"]}],
+                "default_id": "m-2",
+                "match": {"threshold": 0.5},
+                "on_embedding_failure": {"target_id": "m-3"}
+            }
+        });
+        assert!(unknown_field_paths("model", &v).is_empty());
+
+        let group = json!({
+            "display_name": "g",
+            "routing": {"targets": [{"model_id": "m-1", "weight": 2}]}
+        });
+        assert!(unknown_field_paths("model", &group).is_empty());
+
+        let panel = json!({
+            "display_name": "e",
+            "ensemble": {"panel": [{"model_id": "m-1"}], "judge": {"model_id": "m-2"}}
+        });
+        assert!(unknown_field_paths("model", &panel).is_empty());
+
+        // The walk still works: a genuinely unknown sibling is reported.
+        let bogus = json!({
+            "display_name": "g",
+            "routing": {"targets": [{"model_id": "m-1", "bogus_id": "x"}]}
+        });
+        assert_eq!(
+            unknown_field_paths("model", &bogus),
+            vec!["routing.targets.0.bogus_id"]
+        );
+    }
+
+    /// An explicit `null` id means the same as omitting the key — the
+    /// reference falls back to its name — on BOTH contracts, and at every
+    /// site.
+    ///
+    /// The write path is the smaller half. On the read path a `null` the
+    /// schema rejects does not "ignore the field", it skips the whole
+    /// stored row: the model disappears, or the guardrail stops screening.
+    /// `api_key.allowed_model_ids` has accepted `null` since #1148 because
+    /// that resource happens to render `Option` nullably; a producer that
+    /// spells "unset" as `null` there and copies the idiom here must not
+    /// fall off a cliff.
+    #[test]
+    fn a_null_model_reference_id_means_the_same_as_an_absent_one() {
+        let model = json!({
+            "display_name": "g",
+            "routing": {"targets": [{"model": "a", "model_id": null}]},
+        });
+        validate_model(&model).unwrap();
+        validate_model_lenient(&model).unwrap();
+        assert_eq!(
+            serde_json::from_value::<crate::models::Model>(model.clone())
+                .unwrap()
+                .routing
+                .unwrap()
+                .targets[0]
+                .model_id,
+            None,
+            "serde reads a null id as absent; the schema must let it through to serde"
+        );
+
+        let semantic = json!({
+            "display_name": "s",
+            "semantic": {
+                "embedding_model": "e", "embedding_model_id": null,
+                "routes": [{"name": "r", "target": "t", "target_id": null, "examples": ["x"]}],
+                "default": "d", "default_id": null,
+                "match": {"threshold": 0.5},
+                "on_embedding_failure": {"target": "safe", "target_id": null}
+            }
+        });
+        validate_model(&semantic).unwrap();
+        validate_model_lenient(&semantic).unwrap();
+
+        let policy = json!({
+            "name": "p",
+            "applies_to": "all",
+            "applies_to_model_id": null,
+            "semantic": {"embedding_model": "e", "embedding_model_id": null, "threshold": 0.9}
+        });
+        validate_cache_policy(&policy).unwrap();
+        validate_cache_policy_lenient(&policy).unwrap();
+
+        let guardrail = json!({
+            "name": "g", "kind": "semantic",
+            "embedding_model": "e", "embedding_model_id": null,
+            "deny_examples": ["x"], "deny_threshold": 0.8
+        });
+        validate_guardrail(&guardrail).unwrap();
+        validate_guardrail_lenient(&guardrail).unwrap();
+
+        // A null id is not a way to name the model, though: it satisfies
+        // neither half of the alternative. Asserted at every site,
+        // because the requiredness clause and the nullability widening
+        // are two passes over the same schema and one can undo the other.
+        let rejected = [
+            json!({"display_name": "g", "routing": {"targets": [{"model_id": null}]}}),
+            json!({"display_name": "e", "ensemble": {
+                "panel": [{"model_id": null}], "judge": {"model": "j"}}}),
+            json!({"display_name": "e", "ensemble": {
+                "panel": [{"model": "a"}], "judge": {"model_id": null}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model_id": null,
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "default": "d", "match": {"threshold": 0.5}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "default_id": null, "match": {"threshold": 0.5}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "r", "target_id": null, "examples": ["x"]}],
+                "default": "d", "match": {"threshold": 0.5}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "default": "d", "match": {"threshold": 0.5},
+                "on_embedding_failure": {"target_id": null}}}),
+        ];
+        for case in rejected {
+            assert!(
+                validate_model(&case).is_err(),
+                "strict accepted a null id as naming a model: {case}"
+            );
+            assert!(
+                validate_model_lenient(&case).is_err(),
+                "lenient accepted a null id as naming a model: {case}"
+            );
+        }
+        assert!(validate_cache_policy(&json!({
+            "name": "p", "semantic": {"embedding_model_id": null, "threshold": 0.9}
+        }))
+        .is_err());
+        assert!(validate_guardrail(&json!({
+            "name": "g", "kind": "semantic", "embedding_model_id": null,
+            "deny_examples": ["x"], "deny_threshold": 0.8
+        }))
+        .is_err());
+    }
+
+    /// Relaxing the name field must not make "names the model no way at
+    /// all" valid — that is the same missing reference it always was, and
+    /// it stays rejected on both contracts.
+    #[test]
+    fn model_reference_naming_neither_field_is_still_rejected() {
+        let cases = [
+            json!({"display_name": "g", "routing": {"targets": [{"weight": 2}]}}),
+            json!({"display_name": "e", "ensemble": {
+                "panel": [{"temperature": 0.5}], "judge": {"model": "j"}}}),
+            json!({"display_name": "e", "ensemble": {
+                "panel": [{"model": "a"}], "judge": {"synthesis_prompt": "x"}}}),
+            json!({"display_name": "s", "semantic": {
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "default": "d", "match": {"threshold": 0.5}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "match": {"threshold": 0.5}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "r", "examples": ["x"]}],
+                "default": "d", "match": {"threshold": 0.5}}}),
+            json!({"display_name": "s", "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "default": "d", "match": {"threshold": 0.5},
+                "on_embedding_failure": {"synthesis_prompt": "not a target"}}}),
+        ];
+        for case in cases {
+            assert!(
+                validate_model(&case).is_err(),
+                "strict accepted a reference naming no model: {case}"
+            );
+            assert!(
+                validate_model_lenient(&case).is_err(),
+                "lenient accepted a reference naming no model: {case}"
+            );
+        }
+    }
+
+    /// A cache policy's model scope and its similarity embedder both take
+    /// the id spelling; the embedder's requirement moves onto the pair.
+    #[test]
+    fn cache_policy_model_references_accept_the_id_spelling() {
+        let scoped = json!({"name": "p", "applies_to_model_id": "m-1"});
+        validate_cache_policy(&scoped).unwrap();
+        validate_cache_policy_lenient(&scoped).unwrap();
+
+        let embedder = json!({
+            "name": "p",
+            "semantic": {"embedding_model_id": "m-e", "threshold": 0.9}
+        });
+        validate_cache_policy(&embedder).unwrap();
+        validate_cache_policy_lenient(&embedder).unwrap();
+
+        let neither = json!({"name": "p", "semantic": {"threshold": 0.9}});
+        assert!(validate_cache_policy(&neither).is_err());
+        assert!(validate_cache_policy_lenient(&neither).is_err());
+    }
+
+    /// The guardrail embedder keeps its strict/lenient split: the write
+    /// path demands one of the two spellings, the read path neither — a
+    /// screening row that fails to load is fail-OPEN.
+    #[test]
+    fn guardrail_semantic_embedder_accepts_the_id_spelling() {
+        let by_id = json!({
+            "name": "g", "kind": "semantic",
+            "embedding_model_id": "m-e",
+            "deny_examples": ["x"], "deny_threshold": 0.8
+        });
+        validate_guardrail(&by_id).unwrap();
+        validate_guardrail_lenient(&by_id).unwrap();
+
+        // Neither spelling: refused on write, still loaded on read.
+        let neither = json!({
+            "name": "g", "kind": "semantic",
+            "deny_examples": ["x"], "deny_threshold": 0.8
+        });
+        assert!(validate_guardrail(&neither).is_err());
+        validate_guardrail_lenient(&neither).unwrap();
+
+        // The threshold coupling still fires alongside the new
+        // alternative — both live in the same `allOf`.
+        let unthresholded = json!({
+            "name": "g", "kind": "semantic",
+            "embedding_model_id": "m-e", "deny_examples": ["x"]
+        });
+        assert!(validate_guardrail(&unthresholded).is_err());
     }
 
     // ---- semantic-routing + embedding-modality schema tests (#641) ----
@@ -2275,11 +3111,29 @@ mod tests {
     }
 
     #[test]
-    fn apikey_missing_allowed_models_fails() {
+    fn apikey_grant_fields_are_both_optional() {
+        // A key may grant models by name, by id, or (having neither)
+        // not at all — so neither field is required on either path.
         let v =
             json!({"key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20"});
-        let err = validate_apikey(&v).unwrap_err();
-        assert!(err.message.to_lowercase().contains("allowed_models"));
+        validate_apikey(&v).unwrap();
+        validate_apikey_lenient(&v).unwrap();
+    }
+
+    #[test]
+    fn apikey_allowed_model_ids_is_accepted() {
+        let hash = "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20";
+        for ids in [json!(["m-1", "m-2"]), json!([]), json!(null)] {
+            let v = json!({"key_hash": hash, "allowed_model_ids": ids});
+            validate_apikey(&v).unwrap();
+            validate_apikey_lenient(&v).unwrap();
+        }
+        // Both grant shapes may be written together; the runtime lets the
+        // ids decide.
+        let v = json!({"key_hash": hash, "allowed_models": ["a"], "allowed_model_ids": ["m-1"]});
+        validate_apikey(&v).unwrap();
+        // Ids are resource ids, not numbers or objects.
+        assert!(validate_apikey(&json!({"key_hash": hash, "allowed_model_ids": [1]})).is_err());
     }
 
     #[test]
@@ -2354,10 +3208,11 @@ mod tests {
 
     #[test]
     fn apikey_mcp_access_rejects_the_removed_mode_field() {
-        // Write path: `mode` is gone from the authored shape. Read path:
-        // the CP projects `"mode": "deny"` as a tombstone so 0.9.x DPs
-        // load the row fail-closed, and this generation's loader must
-        // keep accepting the hybrid document.
+        // Write path: `mode` is gone from the authored shape and stays
+        // rejected. Read path: a document a pre-0.10.0 control plane wrote
+        // still carries the retired selector, and the lenient validator
+        // must keep accepting it — the api_key row authenticates every
+        // kind of traffic, so it must never be skipped over a dead key.
         let v = json!({
             "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
             "allowed_models":[],
@@ -2432,6 +3287,143 @@ mod tests {
         let policy = json!({"scope": "env", "mode": "all"});
         validate_mcp_policy_lenient(&policy).unwrap();
         assert!(validate_mcp_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn mcp_id_form_sides_are_accepted_on_both_paths() {
+        let hash = "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20";
+        let entry = json!({"server_id": "s-1", "tool": "create_issue"});
+
+        for ids in [json!([entry.clone()]), json!([]), json!(null)] {
+            let policy = json!({
+                "scope": "env", "allow": ["*"], "deny": [],
+                "allow_ids": ids, "deny_ids": ids,
+            });
+            validate_mcp_policy(&policy).unwrap();
+            validate_mcp_policy_lenient(&policy).unwrap();
+
+            let key = json!({
+                "key_hash": hash,
+                "mcp_access": {"allow": ["*"], "deny": [], "allow_ids": ids, "deny_ids": ids},
+                "mcp_rate_limits": {},
+                "mcp_rate_limits_by_id": {"s-1": {"rpm": 1}},
+            });
+            validate_apikey(&key).unwrap();
+            validate_apikey_lenient(&key).unwrap();
+        }
+
+        // Both spellings may be written together; the runtime lets the ids
+        // decide.
+        validate_mcp_policy(&json!({
+            "scope": "env",
+            "allow": ["github__create_issue"],
+            "allow_ids": [entry],
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn mcp_id_form_entries_must_name_a_server_and_a_tool_on_the_write_path() {
+        let bad = [
+            json!({"tool": "create_issue"}),
+            json!({"server_id": "s-1"}),
+            json!({"server_id": "", "tool": "create_issue"}),
+            json!({"server_id": "s-1", "tool": ""}),
+            json!({"server_id": "s-1", "tool": "x", "rogue": 1}),
+            json!("s-1__create_issue"),
+        ];
+        for entry in bad {
+            assert!(
+                validate_mcp_policy(&json!({
+                    "scope": "env", "allow": ["*"], "allow_ids": [entry.clone()]
+                }))
+                .is_err(),
+                "allow_ids entry {entry} must be rejected on the write path"
+            );
+        }
+    }
+
+    #[test]
+    fn a_half_written_mcp_tool_ref_still_loads_leniently() {
+        // Pins the split, and requiredness is exactly what has to be
+        // pinned on BOTH sets: the loader deserializes what it validates,
+        // and a row it cannot deserialize is skipped whole — for an
+        // `api_key` that means the key stops authenticating every kind of
+        // traffic, not just losing MCP access. So one malformed entry in
+        // one `allow_ids` array must degrade to an entry matching nothing,
+        // never to a dead key.
+        let hash = "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20";
+        for entry in [
+            json!({"tool": "create_issue"}),
+            json!({"server_id": "s-1"}),
+            json!({"server_id": "", "tool": ""}),
+        ] {
+            let key = json!({
+                "key_hash": hash,
+                "mcp_access": {"allow": [], "allow_ids": [entry.clone()]},
+            });
+            validate_apikey_lenient(&key).unwrap();
+            assert!(validate_apikey(&key).is_err());
+            // And it really deserializes — validating leniently is only
+            // half of what the loader does with the row.
+            let parsed: crate::models::ApiKey = serde_json::from_value(key).unwrap();
+            let refs = parsed.mcp_access.unwrap().allow_ids.unwrap();
+            assert_eq!(refs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn the_write_path_requires_the_name_form_beside_every_id_form() {
+        // The id spelling is invisible to a gateway one release behind the
+        // control plane, and the name spelling is the only thing such a
+        // gateway can read. Writing a deny — or a per-server limit — in
+        // the id spelling ALONE would leave that restriction simply absent
+        // there for the length of the upgrade window: a restriction
+        // failing open, silently. `allow` is required outright for the
+        // same reason.
+        let hash = "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20";
+        let entry = json!({"server_id": "s-1", "tool": "delete_repo"});
+
+        // allow: required outright, so the id spelling alone is refused.
+        assert!(validate_mcp_policy(&json!({
+            "scope": "env", "allow_ids": [entry],
+        }))
+        .is_err());
+
+        // deny, on a policy and on a key's own layer.
+        let policy = json!({"scope": "env", "allow": ["*"], "deny_ids": [entry]});
+        assert!(validate_mcp_policy(&policy).is_err());
+        validate_mcp_policy(&json!({
+            "scope": "env", "allow": ["*"], "deny": ["github__delete_repo"],
+            "deny_ids": [entry],
+        }))
+        .unwrap();
+
+        let key_only_ids =
+            json!({"key_hash": hash, "mcp_access": {"allow": ["*"], "deny_ids": [entry]}});
+        assert!(validate_apikey(&key_only_ids).is_err());
+
+        // Per-server limits.
+        let limits_only_ids =
+            json!({"key_hash": hash, "mcp_rate_limits_by_id": {"s-1": {"rpm": 1}}});
+        assert!(validate_apikey(&limits_only_ids).is_err());
+        validate_apikey(&json!({
+            "key_hash": hash,
+            "mcp_rate_limits": {"github": {"rpm": 1}},
+            "mcp_rate_limits_by_id": {"s-1": {"rpm": 1}},
+        }))
+        .unwrap();
+
+        // An explicit `null` means the same as omitted, so it demands
+        // nothing — only a real value does.
+        validate_mcp_policy(&json!({"scope": "env", "allow": ["*"], "deny_ids": null})).unwrap();
+        validate_apikey(&json!({"key_hash": hash, "mcp_rate_limits_by_id": null})).unwrap();
+
+        // The loader takes every one of these rows regardless: the guard
+        // is a write contract, never a reason to drop a stored row.
+        validate_mcp_policy_lenient(&policy).unwrap();
+        validate_apikey_lenient(&key_only_ids).unwrap();
+        validate_apikey_lenient(&limits_only_ids).unwrap();
     }
 
     #[test]
@@ -2554,6 +3546,88 @@ mod tests {
             "cooldown": { "default_seconds": 30 }
         });
         assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn effort_mapping_is_direct_only_on_strict_writes() {
+        let direct = json!({
+            "display_name": "glm",
+            "provider": "openai",
+            "model_name": "glm-5.3",
+            "provider_key_id": "pk-1",
+            "effort_mapping": {"medium": "high"}
+        });
+        validate_model(&direct).unwrap();
+
+        for virtual_model in [
+            json!({
+                "display_name": "group",
+                "routing": {"targets": [{"model": "glm"}]},
+                "effort_mapping": {"medium": "high"}
+            }),
+            json!({
+                "display_name": "ensemble",
+                "ensemble": {"panel": [{"model": "glm"}], "judge": {"model": "glm"}},
+                "effort_mapping": {"medium": "high"}
+            }),
+            json!({
+                "display_name": "semantic",
+                "semantic": {
+                    "embedding_model": "embed",
+                    "routes": [{"name": "default", "target": "glm", "examples": ["hello"]}],
+                    "default": "glm",
+                    "match": {"threshold": 0.5}
+                },
+                "effort_mapping": {"medium": "high"}
+            }),
+            json!({
+                "display_name": "embed",
+                "provider": "openai",
+                "model_name": "text-embedding-3-small",
+                "provider_key_id": "pk-1",
+                "embedding": {"dimensions": 1536},
+                "effort_mapping": {"medium": "high"}
+            }),
+        ] {
+            assert!(validate_model(&virtual_model).is_err());
+            validate_model_lenient(&virtual_model).unwrap();
+        }
+    }
+
+    /// The reserved forms of `effort_mapping`, and the one pair that is
+    /// refused on BOTH contracts: `""` means "the request set no effort"
+    /// and `null` means "send no effort field", so the two together are a
+    /// rule that can never do anything. Read-path rejection is deliberate —
+    /// nothing writes that pair, so a stored row carrying it is not a row
+    /// an older control plane left behind.
+    #[test]
+    fn effort_mapping_reserved_forms_are_accepted_except_the_empty_null_pair() {
+        let with = |mapping: Value| {
+            json!({
+                "display_name": "glm",
+                "provider": "openai",
+                "model_name": "glm-5.3",
+                "provider_key_id": "pk-1",
+                "effort_mapping": mapping
+            })
+        };
+
+        let ok = with(json!({"": "high", "*": "low", "medium": null}));
+        validate_model(&ok).unwrap();
+        validate_model_lenient(&ok).unwrap();
+
+        let bad = with(json!({"": null}));
+        assert!(validate_model(&bad).is_err());
+        assert!(validate_model_lenient(&bad).is_err());
+
+        // An empty target value is a write-path refusal only: it asks to
+        // send an effort the gateway reads back as "no effort set", but a
+        // stored row carrying one must still load rather than vanish.
+        for empty in [json!({"medium": ""}), json!({"": ""})] {
+            let doc = with(empty);
+            assert!(validate_model(&doc).is_err(), "{doc}");
+            validate_model_lenient(&doc).unwrap();
+        }
     }
 
     #[test]
@@ -2874,6 +3948,144 @@ mod tests {
             "risk_level_threshold": "none"
         });
         assert!(validate_guardrail(&v).is_err());
+    }
+
+    // ---- kind=semantic: a threshold has no portable default -------------
+
+    fn semantic_row(extra: Value) -> Value {
+        let mut v = json!({
+            "name": "g",
+            "kind": "semantic",
+            "embedding_model": "embed-1"
+        });
+        let fields = v.as_object_mut().unwrap();
+        for (k, val) in extra.as_object().unwrap() {
+            fields.insert(k.clone(), val.clone());
+        }
+        v
+    }
+
+    #[test]
+    fn guardrail_semantic_deny_list_without_its_threshold_is_rejected() {
+        // The write path refuses to guess. Cosine scales differ between
+        // embedding models, so a defaulted threshold is not a convenience
+        // — it is a number that silently under-protects on whichever
+        // model it was not measured against.
+        let v = semantic_row(json!({ "deny_examples": ["forbidden"] }));
+        let err = validate_guardrail(&v).expect_err("a deny list needs its threshold");
+        assert!(err.message.contains("`deny_threshold`"), "{}", err.message);
+        // The message must not hand the operator a number to adopt.
+        assert!(!err.message.contains("0.75"), "{}", err.message);
+    }
+
+    #[test]
+    fn guardrail_semantic_allow_list_without_its_threshold_is_rejected() {
+        let v = semantic_row(json!({ "allow_examples": ["permitted"] }));
+        let err = validate_guardrail(&v).expect_err("an allow list needs its threshold");
+        assert!(err.message.contains("`allow_threshold`"), "{}", err.message);
+    }
+
+    #[test]
+    fn guardrail_semantic_needs_only_the_threshold_its_list_uses() {
+        // Each threshold is required alongside ITS OWN list. Demanding an
+        // allow threshold on a deny-only row would be asking for a number
+        // that decides nothing.
+        let deny_only = semantic_row(json!({
+            "deny_examples": ["forbidden"],
+            "deny_threshold": 0.5
+        }));
+        validate_guardrail(&deny_only).unwrap();
+
+        let allow_only = semantic_row(json!({
+            "allow_examples": ["permitted"],
+            "allow_threshold": 0.5
+        }));
+        validate_guardrail(&allow_only).unwrap();
+
+        let both_missing_one = semantic_row(json!({
+            "deny_examples": ["forbidden"],
+            "allow_examples": ["permitted"],
+            "deny_threshold": 0.5
+        }));
+        let err = validate_guardrail(&both_missing_one).expect_err("allow list unthresholded");
+        assert!(err.message.contains("`allow_threshold`"), "{}", err.message);
+        assert!(!err.message.contains("`deny_threshold`"), "{}", err.message);
+    }
+
+    #[test]
+    fn guardrail_semantic_with_no_examples_needs_no_threshold() {
+        // A row with neither list screens nothing and is skipped at chain
+        // build; requiring a number from it would reject a shape the
+        // gateway already treats as inert.
+        validate_guardrail(&semantic_row(json!({}))).unwrap();
+    }
+
+    #[test]
+    fn guardrail_semantic_missing_threshold_does_not_mask_a_second_error() {
+        // Same discipline as the unknown-field explainer: the message is
+        // replaced only when the missing threshold is the whole story.
+        let v = semantic_row(json!({
+            "deny_examples": ["forbidden"],
+            "text_source": "not_a_mode"
+        }));
+        let err = validate_guardrail(&v).expect_err("the enum is still wrong");
+        assert!(!err.message.contains("`deny_threshold`"), "{}", err.message);
+    }
+
+    #[test]
+    fn the_semantic_write_requirements_never_reach_the_read_path() {
+        // The loader's failure unit is the ROW, so a requirement that
+        // leaks into the lenient schema does not make a stored guardrail
+        // stricter — it deletes it. A screening row that vanishes stops
+        // screening entirely, which is fail-OPEN on a security control and
+        // strictly worse than the field defaulting.
+        //
+        // Both fields below are the shape a control plane wrote before the
+        // write path demanded them, so both must still load.
+        let unthresholded = json!({
+            "name": "g",
+            "kind": "semantic",
+            "embedding_model": "embed-1",
+            "deny_examples": ["forbidden"]
+        });
+        validate_guardrail_lenient(&unthresholded)
+            .expect("a stored row written before the threshold was required keeps screening");
+        assert!(
+            validate_guardrail(&unthresholded).is_err(),
+            "but it cannot be SAVED"
+        );
+
+        let modelless = json!({
+            "name": "g",
+            "kind": "semantic",
+            "deny_examples": ["forbidden"],
+            "deny_threshold": 0.5
+        });
+        validate_guardrail_lenient(&modelless)
+            .expect("an unresolvable embedding model refuses per fail_open, it does not vanish");
+        assert!(
+            validate_guardrail(&modelless).is_err(),
+            "but it cannot be SAVED"
+        );
+    }
+
+    #[test]
+    fn guardrail_semantic_row_without_a_threshold_still_loads() {
+        // The READ path keeps the default, and that asymmetry is the
+        // point: rows written before the requirement carry no key, and a
+        // row the loader cannot deserialize is skipped whole — a
+        // screening guardrail that disappears is fail-OPEN. They go on
+        // enforcing the 0.75 they enforce today until the control plane
+        // backfills them.
+        let row: crate::models::Guardrail = serde_json::from_value(semantic_row(json!({
+            "deny_examples": ["forbidden"]
+        })))
+        .expect("an unmigrated row must still deserialize");
+        let crate::models::GuardrailKind::Semantic(cfg) = &row.config else {
+            panic!("not a semantic row");
+        };
+        assert_eq!(cfg.deny_threshold, 0.75);
+        assert_eq!(cfg.allow_threshold, 0.75);
     }
 
     #[test]
@@ -3650,6 +4862,63 @@ mod tests {
         validate_provider_key(&v).unwrap();
     }
 
+    /// AISIX-Cloud#1388 / the two-protocol upstream: one credential, an
+    /// OpenAI-compatible path and an Anthropic-compatible one on the same
+    /// host. Both entry shapes have to validate — with a `base` override
+    /// and without one (the bare declaration that a surface exists).
+    #[test]
+    fn provider_key_with_apis_entries_passes() {
+        let v = json!({
+            "display_name": "deepseek-prod",
+            "secret": "sk-x",
+            "api_base": "https://api.deepseek.com/v1",
+            "provider": "deepseek",
+            "adapter": "openai",
+            "apis": {
+                "responses": {},
+                "messages": {"base": "https://api.deepseek.com/anthropic"}
+            }
+        });
+        validate_provider_key(&v).unwrap();
+
+        // An empty map is meaningful on its own: it says the key serves
+        // nothing beyond what its adapter implies.
+        let v = json!({
+            "display_name": "vllm",
+            "secret": "sk-x",
+            "api_base": "https://vllm.internal/v1",
+            "provider": "openai",
+            "apis": {}
+        });
+        validate_provider_key(&v).unwrap();
+    }
+
+    /// The surface key set is closed on the write path, so a typo (or a
+    /// surface this release does not serve) fails loudly rather than
+    /// sitting in the document doing nothing.
+    #[test]
+    fn provider_key_rejects_an_unknown_api_surface() {
+        let v = json!({
+            "display_name": "x",
+            "secret": "sk-x",
+            "apis": {"embeddings": {"base": "https://up/v1"}}
+        });
+        validate_provider_key(&v).unwrap_err();
+    }
+
+    /// …but the read path tolerates one, so a surface added by a newer
+    /// control plane is ignored instead of taking the whole Provider Key
+    /// row — and with it every model that references the key — offline.
+    #[test]
+    fn lenient_provider_key_tolerates_an_unknown_api_surface() {
+        let v = json!({
+            "display_name": "x",
+            "secret": "sk-x",
+            "apis": {"embeddings": {"base": "https://up/v1"}}
+        });
+        validate_provider_key_lenient(&v).unwrap();
+    }
+
     #[test]
     fn provider_key_with_byo_telemetry_shape_passes() {
         let v = json!({
@@ -3840,6 +5109,54 @@ mod tests {
         validate_mcp_server(&json!({"name": "github", "url": "https://x/mcp"})).unwrap();
         validate_mcp_server(&json!({"display_name": "github", "url": "https://x/mcp"})).unwrap();
         assert!(validate_mcp_server(&json!({"url": "https://x/mcp"})).is_err());
+    }
+
+    #[test]
+    fn an_mcp_server_name_may_not_carry_a_star_on_the_write_path() {
+        // A name is pasted into the `<server>__*` glob patterns every
+        // name-form MCP grant, deny and anonymous ceiling is written as,
+        // so `gh*` would reach `ghost`'s tools as well as its own.
+        for label in ["name", "display_name"] {
+            for bad in ["gh*", "*", "a*b", "*gh"] {
+                assert!(
+                    validate_mcp_server(&json!({label: bad, "url": "https://x/mcp"})).is_err(),
+                    "{label}: {bad} must be refused on the write path"
+                );
+            }
+            // The shapes the pattern already refused, and one it never
+            // did — the tightening must not have moved either.
+            for bad in ["gh__ub", "gh_"] {
+                assert!(
+                    validate_mcp_server(&json!({label: bad, "url": "https://x/mcp"})).is_err(),
+                    "{label}: {bad} must stay refused"
+                );
+            }
+            validate_mcp_server(&json!({label: "gh_ub", "url": "https://x/mcp"})).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_stored_mcp_server_name_with_a_star_still_loads() {
+        // Pins the split, and the split is the whole point: the loader
+        // SKIPS a row it cannot validate, so closing the read pattern
+        // would delete an already-registered server rather than fix its
+        // name — and with it every grant, limit and anonymous entry that
+        // names it. Rejected by the write path, accepted by the loader,
+        // and it really deserializes.
+        let doc = json!({"name": "gh*", "url": "https://x/mcp"});
+        assert!(validate_mcp_server(&doc).is_err());
+        validate_mcp_server_lenient(&doc).unwrap();
+        let parsed: crate::models::McpServer = serde_json::from_value(doc).unwrap();
+        assert_eq!(parsed.name, "gh*");
+
+        // The `__` and trailing-`_` shapes are refused on BOTH paths, as
+        // before: those names cannot be split back into server + tool at
+        // all, so serving the row is worse than skipping it.
+        for bad in ["gh__ub", "gh_"] {
+            let doc = json!({"name": bad, "url": "https://x/mcp"});
+            assert!(validate_mcp_server(&doc).is_err(), "{bad}");
+            assert!(validate_mcp_server_lenient(&doc).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -4526,6 +5843,19 @@ mod tests {
         let msg = validate_model(&semantic).unwrap_err().message;
         assert!(msg.contains("`auto_prompt_caching`"), "{msg}");
         assert!(msg.contains("semantic router"), "{msg}");
+
+        let embedding = json!({
+            "display_name": "embed",
+            "provider": "openai",
+            "model_name": "text-embedding-3-small",
+            "provider_key_id": "pk",
+            "embedding": {"dimensions": 1536},
+            "effort_mapping": {"medium": "high"}
+        });
+        let msg = validate_model(&embedding).unwrap_err().message;
+        assert!(msg.contains("`effort_mapping`"), "{msg}");
+        assert!(msg.contains("embedding model"), "{msg}");
+        assert!(!msg.contains("semantic router"), "{msg}");
     }
 
     #[test]
@@ -4604,6 +5934,109 @@ mod tests {
         assert!(err.message.contains("`retries`"), "{err:?}");
     }
 
+    #[test]
+    fn the_custom_branch_requires_a_script_on_both_schemas() {
+        // Deliberately NOT split, unlike the semantic fields. The rule the
+        // split serves is "a row that loads behaves better than one that
+        // vanishes", and it does not hold here: a scriptless `custom` row
+        // screens nothing whether the loader skips it or the chain builder
+        // refuses it. Relaxing the read path would therefore change no
+        // enforcement. The loader rejects it into `/status/config`'s
+        // `rejected[]`; whitespace-only or uncompilable scripts are reported
+        // there as runtime build rejections instead.
+        //
+        // Asserted against BOTH sets, because reading one says a field is
+        // required somewhere and can never say where it is NOT.
+        //
+        // This covers a MISSING key only. A whitespace-only or uncompilable
+        // script passes both schemas — `minLength: 1` admits a single space,
+        // while the builder refuses on `trim().is_empty()` — and is refused
+        // when the chain is built, which `aisix validate` and a serving
+        // gateway report.
+        let scriptless = json!({"name": "g", "kind": "custom"});
+        assert!(
+            validate_guardrail(&scriptless).is_err(),
+            "a scriptless row must not be savable"
+        );
+        assert!(
+            validate_guardrail_lenient(&scriptless).is_err(),
+            "and a stored one is rejected into the config status, not loaded",
+        );
+
+        let schema = guardrail_root_schema(true);
+        let branch = schema["oneOf"]
+            .as_array()
+            .expect("the guardrail schema is a `oneOf` over the kinds")
+            .iter()
+            .find(|b| b["properties"]["kind"]["enum"][0] == "custom")
+            .expect("the custom branch exists");
+        let required: Vec<&str> = branch["required"]
+            .as_array()
+            .map(|l| l.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        assert!(required.contains(&"script"), "required = {required:?}");
+        // …and the published contract must not advertise a value it
+        // rejects. Without this the strip is guarded only by the schema
+        // drift job, which pins code against artefact and would go green on
+        // a regenerated artefact carrying the default back.
+        // Pin a property that must be PRESENT first. `Value::Index` yields
+        // `Null` for a missing key and `Null.get("default")` is `None`, so
+        // the absence assertion below passes vacuously if the whole
+        // `script` property is dropped — which would also silently ship a
+        // strict branch with no `minLength`, making `""` savable.
+        assert_eq!(branch["properties"]["script"]["minLength"], json!(1));
+
+        // …and pin the BEHAVIOUR that keyword produces, not just its
+        // presence. The builder's `trim().is_empty()` guard is reachable
+        // only because a whitespace-only script clears `minLength: 1` while
+        // an empty one does not — neither half was asserted anywhere.
+        let blank = json!({"name": "g", "kind": "custom", "script": ""});
+        assert!(
+            validate_guardrail(&blank).is_err(),
+            "an empty script is not savable"
+        );
+        assert!(
+            validate_guardrail_lenient(&blank).is_err(),
+            "nor loadable — so it never reaches the builder",
+        );
+        let whitespace = json!({"name": "g", "kind": "custom", "script": " "});
+        validate_guardrail(&whitespace).expect("a whitespace-only script clears minLength");
+        validate_guardrail_lenient(&whitespace)
+            .expect("on both sets — which is what makes the builder's trim() guard reachable");
+        assert!(
+            branch["properties"]["script"].get("default").is_none(),
+            "script still advertises a default: {}",
+            branch["properties"]["script"]
+        );
+    }
+
+    #[test]
+    fn the_write_contract_advertises_no_threshold_default() {
+        // The type-level default exists for the read path. Published on
+        // the write contract it reads as a recommendation, and a
+        // schema-driven form or code generator would pre-fill it —
+        // handing the operator back the number this change exists to stop
+        // them inheriting.
+        let schema = guardrail_root_schema(true);
+        let branch = schema["oneOf"]
+            .as_array()
+            .expect("the guardrail schema is a `oneOf` over the kinds")
+            .iter()
+            .find(|b| b["properties"]["kind"]["enum"][0] == "semantic")
+            .expect("the semantic branch exists")
+            .clone();
+        for threshold in ["deny_threshold", "allow_threshold"] {
+            assert!(
+                branch["properties"][threshold].get("default").is_none(),
+                "{threshold} still advertises a default: {}",
+                branch["properties"][threshold]
+            );
+            // The bounds stay: a threshold outside [-1, 1] is still refused.
+            assert_eq!(branch["properties"][threshold]["minimum"], -1.0);
+            assert_eq!(branch["properties"][threshold]["maximum"], 1.0);
+        }
+    }
+
     /// Every guardrail kind describes itself, from one source, and no two
     /// kinds share a sentence.
     ///
@@ -4624,6 +6057,7 @@ mod tests {
             "azure_content_safety",
             "azure_content_safety_text_moderation",
             "bedrock",
+            "custom",
             "keyword",
             "lakera",
             "openai_moderation",
@@ -4632,7 +6066,7 @@ mod tests {
             "semantic",
         ];
 
-        let schema = guardrail_root_schema();
+        let schema = guardrail_root_schema(true);
         let branches = schema["oneOf"]
             .as_array()
             .expect("the guardrail schema is a `oneOf` over the kinds");

@@ -25,3 +25,48 @@ Two things the gate must not be:
   invalid-response failure must surface as itself rather than as a timeout.
   Prefer a gate that cannot throw (`ProxyClient.listModels`) over a `try/catch`
   around an SDK call.
+
+## A log line is never readable when the request that produced it returns
+
+The gateway hands every event to a bounded queue drained by a dedicated
+writer thread, so the request path never blocks on the log descriptor
+(`crates/aisix-obs/src/log_writer.rs`); the harness then drains the child's
+pipe from its own event loop. Neither hop is ordered against the HTTP
+response, so `app.output()` read straight after a request routinely does
+not contain that request's access-log line — the read passes only when the
+machine happens to be idle.
+
+Wait for it: `waitForLogLine(app, pred, what)`, or `waitForLogLines` for a
+lower bound on how many. Reading `output()` once is correct for a line the
+gateway wrote before `spawnApp` resolved (a boot warning, a configuration
+rejected at startup), and for one that the queue and its writer — both
+FIFO — must have delivered before a line the spec has already waited for.
+
+**`waitForLogLines(…, n, …)` returns the moment the *n*th line is visible,
+so it bounds a count from below and never from above.** A spec asserting
+"exactly *n*" — one line per request, one warning per outage — needs a
+barrier that provably follows the last line it is counting, not a wait for
+the first. The barrier is a later request's own access-log line: whatever
+that request's predecessors wrote is ahead of it in the queue.
+
+## etcd is per-fork, and on CI it must be there
+
+CI runs one etcd cluster per vitest fork and hands each fork its own
+(`AISIX_E2E_ETCD_ENDPOINTS`, mapped by `VITEST_POOL_ID`). Two
+consequences a spec author cannot see from the 200-odd call sites they
+would otherwise copy:
+
+- **`etcdEndpoint()` is the only permitted way to name an etcd.** Reading
+  `AISIX_E2E_ETCD` / `AISIX_E2E_ETCD_ENDPOINTS`, or writing a
+  `127.0.0.1:2379` literal, pins ONE fork's cluster while the gateway
+  the spec just spawned talks to its own — surfacing as a
+  `waitConfigPropagation` timeout that reads like a product bug.
+  `harness/etcd-endpoint.test.ts` fails the build on it.
+
+- **`ping()` throws on CI**, so the familiar
+  `if (!(await etcd.ping())) ctx.skip()` prologue is a local-only escape
+  hatch there; do not add a second `if (process.env.CI) throw` beside
+  it. The skip exists for a developer with no etcd running. On CI a
+  skipped file contributes no assertions while the leg still reports
+  green, and with a cluster per fork one dead endpoint would take out
+  only the quarter of the suite bound to it — quietly.

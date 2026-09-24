@@ -21,6 +21,22 @@ thiserror.workspace = true
 tracing.workspace = true
 base64.workspace = true
 chrono.workspace = true
+ring.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# A real HTTP/2 server that completes the handshake, accepts the request
+# and then never answers it — the shape of an etcd that is reachable but
+# never confirms a call. See the `etcd_provider` tests.
+h2.workspace = true
+# Builds the responses that h2 server sends back — a trailers-only gRPC
+# error is how a test stands in for an etcd that answered and refused.
+http.workspace = true
+# `test-util` drives the shutdown-drain bound on a paused clock, so the
+# test asserts the bound without spending it.
+tokio = { workspace = true, features = ["test-util"] }
+# Captures the log lines a test asserts on — the periodic "still
+# connecting" line is the whole of what a hanging boot dial produces, so
+# it is asserted on directly rather than through its effects.
+tracing-subscriber.workspace = true

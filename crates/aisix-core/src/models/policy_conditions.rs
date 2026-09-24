@@ -279,10 +279,10 @@ pub struct ConditionGroup {
 
 /// A slot in a condition list: leaf or nested group. Untagged — the
 /// shapes are disjoint (a leaf requires `dimension`/`operator`/`value`,
-/// a group `logic`/`children`), and the schema closes both variants
-/// against unknown fields in **both** validator sets because serde
-/// silently swallows unknown fields inside untagged content (same
-/// reasoning as `OnEmbeddingFailure` in the model schema).
+/// a group `logic`/`children`), and the write contract rejects unknown
+/// fields inside either variant, because an unknown field placed there
+/// is otherwise ignored without being reported (same reasoning as
+/// `OnEmbeddingFailure` in the model schema).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum ConditionNode {

@@ -70,6 +70,11 @@ fn shared_http_client() -> rmcp_reqwest::Client {
         .get_or_init(|| {
             let cfg = aisix_gateway::upstream_http::config();
             let mut b = rmcp_reqwest::Client::builder()
+                // rmcp pins its own reqwest major, so this client cannot
+                // be built from `client_builder()` — but it resolves
+                // through the same process-wide cache, via that crate
+                // version's own resolver trait.
+                .dns_resolver(std::sync::Arc::new(CachedResolver))
                 .pool_idle_timeout(cfg.pool_idle_timeout)
                 .tcp_keepalive(cfg.tcp_keepalive);
             if let Some(d) = cfg.connect_timeout {
@@ -118,16 +123,40 @@ fn shared_http_client() -> rmcp_reqwest::Client {
         .clone()
 }
 
+/// The workspace DNS cache, behind rmcp's reqwest major's resolver trait.
+struct CachedResolver;
+
+impl rmcp_reqwest::dns::Resolve for CachedResolver {
+    fn resolve(&self, name: rmcp_reqwest::dns::Name) -> rmcp_reqwest::dns::Resolving {
+        let cache = aisix_gateway::dns_cache::shared();
+        Box::pin(async move {
+            let addrs = cache.lookup(name.as_str()).await?;
+            Ok(
+                Box::new(addrs.iter().copied().collect::<Vec<_>>().into_iter())
+                    as rmcp_reqwest::dns::Addrs,
+            )
+        })
+    }
+}
+
 /// Header carrying the gateway-held key for `api_key` upstream auth.
 const API_KEY_HEADER: &str = "x-api-key";
 
-/// How the gateway authenticates to an upstream MCP server. The credential is
-/// held here on the gateway side and is never exposed to the calling agent —
-/// the agent presents only its AISIX key. The MCP authorization spec
-/// (2025-11-25) also requires that a downstream client token is never passed
-/// through to the upstream; every credential set here — a Bearer, an API key,
-/// or an OAuth token the gateway mints itself — is a distinct, gateway-held
-/// credential.
+/// How the gateway authenticates to an upstream MCP server. Every variant is
+/// a distinct, gateway-held credential — a Bearer, an API key, or an OAuth
+/// token the gateway mints itself — and none of them is ever exposed to the
+/// calling agent, which presents only its AISIX key.
+///
+/// Relaying the CALLER's own credentials is a separate, opt-in mechanism
+/// ([`McpUpstream::forwarded_client_headers`], from the server's
+/// `forward_client_headers`), never a property of this enum. The normative
+/// rule it has to respect is the audience one — a server "MUST only accept
+/// tokens specifically intended for themselves" (MCP authorization,
+/// 2025-06-18 and later) — so relaying is for an internal server that reads
+/// the claims of a token its own identity provider issued, not for one that
+/// validates `aud` against itself. There is no normative prohibition on the
+/// relay itself; the "token passthrough is forbidden" wording lives in a
+/// non-normative security best-practices guide.
 #[derive(Clone)]
 pub enum McpAuth {
     /// No upstream auth — the server is reachable as-is.
@@ -220,6 +249,15 @@ pub struct McpUpstream {
     /// Protocol revision the session is opened with. Defaults to the
     /// legacy `initialize` handshake.
     pub protocol: McpProtocol,
+    /// Inbound client headers this server's `forward_client_headers`
+    /// admits, resolved per request against the calling agent's own
+    /// request. Empty when the server configures none, or when nothing the
+    /// agent sent matched.
+    ///
+    /// Independent of `auth`, which stays the gateway's own credential —
+    /// except when both name the same header, where the forwarded value
+    /// wins and the gateway's is not sent at all.
+    pub forwarded_client_headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 // Manual so a `Bearer` token cannot leak through `McpUpstream`'s `Debug`
@@ -231,6 +269,16 @@ impl std::fmt::Debug for McpUpstream {
             .field("auth", &self.auth)
             .field("timeout", &self.timeout)
             .field("protocol", &self.protocol)
+            .field(
+                // Names only: a forwarded header may be the caller's own
+                // credential.
+                "forwarded_client_headers",
+                &self
+                    .forwarded_client_headers
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -243,7 +291,18 @@ impl McpUpstream {
             auth: McpAuth::None,
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
             protocol: McpProtocol::default(),
+            forwarded_client_headers: Vec::new(),
         }
+    }
+
+    /// Deliver the client headers this server forwards, as already
+    /// resolved against the inbound request.
+    pub fn with_forwarded_client_headers(
+        mut self,
+        forwarded: Vec<(HeaderName, HeaderValue)>,
+    ) -> Self {
+        self.forwarded_client_headers = forwarded;
+        self
     }
 
     /// Select the protocol revision the session is opened with.
@@ -369,40 +428,64 @@ impl RmcpBridge {
             // connection settings — `from_uri`/`from_config` would build
             // rmcp's own default client with none of them — and through
             // `transport_config` for the pinned transport defaults.
-            let transport = match &upstream.auth {
-                McpAuth::None => StreamableHttpClientTransport::with_client(
-                    shared_http_client(),
-                    transport_config(&upstream.url),
-                ),
-                McpAuth::Bearer(token) => StreamableHttpClientTransport::with_client(
-                    shared_http_client(),
-                    transport_config(&upstream.url).auth_header(token.clone()),
-                ),
+            // Gateway credential and forwarded client headers are
+            // resolved into one header set rather than one arm each,
+            // because they can name the same slot: an operator who lists
+            // `authorization` in `forward_client_headers` is choosing the
+            // caller's own credential over the gateway's, and the upstream
+            // must receive exactly one of them.
+            //
+            // The claimed set is read before anything fills a slot, so
+            // suppressing the gateway credential and delivering the
+            // forwarded value cannot disagree.
+            let forwarded = &upstream.forwarded_client_headers;
+            let claims = |name: &str| forwarded.iter().any(|(n, _)| n.as_str() == name);
+            let mut custom: HashMap<HeaderName, HeaderValue> = HashMap::new();
+            let mut auth_header: Option<String> = None;
+            match &upstream.auth {
+                McpAuth::None => {}
+                McpAuth::Bearer(token) => {
+                    if !claims("authorization") {
+                        auth_header = Some(token.clone());
+                    }
+                }
                 McpAuth::ApiKey(key) => {
-                    // A key with non-header-safe bytes is a clean config error,
-                    // not a panic — and the key itself never enters the message.
-                    let mut value = HeaderValue::from_str(key).map_err(|_| {
-                        McpError::Connect(
-                            "upstream API key is not a valid HTTP header value".to_string(),
-                        )
-                    })?;
-                    // Marks the value opaque to `Debug` formatting of the
-                    // header map, mirroring this module's redaction posture.
-                    value.set_sensitive(true);
-                    let headers = HashMap::from([(HeaderName::from_static(API_KEY_HEADER), value)]);
-                    StreamableHttpClientTransport::with_client(
-                        shared_http_client(),
-                        transport_config(&upstream.url).custom_headers(headers),
-                    )
+                    if !claims(API_KEY_HEADER) {
+                        // A key with non-header-safe bytes is a clean config error,
+                        // not a panic — and the key itself never enters the message.
+                        let mut value = HeaderValue::from_str(key).map_err(|_| {
+                            McpError::Connect(
+                                "upstream API key is not a valid HTTP header value".to_string(),
+                            )
+                        })?;
+                        // Marks the value opaque to `Debug` formatting of the
+                        // header map, mirroring this module's redaction posture.
+                        value.set_sensitive(true);
+                        custom.insert(HeaderName::from_static(API_KEY_HEADER), value);
+                    }
                 }
                 McpAuth::OAuth2(cfg) => {
-                    let token = crate::oauth::get_or_fetch(cfg).await?;
-                    StreamableHttpClientTransport::with_client(
-                        shared_http_client(),
-                        transport_config(&upstream.url).auth_header(token),
-                    )
+                    // Minted only when it will actually be sent: a token a
+                    // forwarded header is about to displace is a round trip
+                    // to the identity provider whose only possible effect is
+                    // failing a request that did not need it.
+                    if !claims("authorization") {
+                        auth_header = Some(crate::oauth::get_or_fetch(cfg).await?);
+                    }
                 }
-            };
+            }
+            for (name, value) in forwarded {
+                custom.insert(name.clone(), value.clone());
+            }
+            let mut config = transport_config(&upstream.url);
+            if let Some(token) = auth_header {
+                config = config.auth_header(token);
+            }
+            if !custom.is_empty() {
+                config = config.custom_headers(custom);
+            }
+            let transport =
+                StreamableHttpClientTransport::with_client(shared_http_client(), config);
             // Lifecycle follows the configured protocol revision. The
             // handler is `ClientInfo::default()` on BOTH paths — identical
             // handshake bytes to the previous unit handler (whose default
@@ -668,6 +751,37 @@ pub(crate) fn warn_cleartext_credential(server: &McpServer) {
     }
 }
 
+/// Header slots the MCP transport itself owns on this hop.
+///
+/// `mcp-session-id`, `mcp-protocol-version` and `last-event-id` name the
+/// session the CALLER holds with this gateway, not the one the gateway
+/// opens upstream, so a relayed copy identifies a session the upstream
+/// never issued. rmcp refuses a custom `mcp-session-id` / `last-event-id`
+/// outright — the connection then fails rather than degrades — and while
+/// it does let `mcp-protocol-version` through, that one selects the
+/// revision the session is opened at, which is the transport's decision
+/// and not the caller's.
+pub const MCP_PROTOCOL_HEADERS: &[&str] =
+    &["last-event-id", "mcp-protocol-version", "mcp-session-id"];
+
+/// The inbound client headers `server` forwards out of `client_headers`.
+///
+/// `None` — a gateway built from the snapshot alone, with no request
+/// behind it — forwards nothing.
+pub fn forwarded_client_headers(
+    server: &McpServer,
+    client_headers: Option<&http::HeaderMap>,
+) -> Vec<(HeaderName, HeaderValue)> {
+    let Some(client) = client_headers else {
+        return Vec::new();
+    };
+    aisix_core::resolve_forwarded_client_headers(
+        &server.forward_client_headers,
+        client,
+        MCP_PROTOCOL_HEADERS,
+    )
+}
+
 pub fn upstream_from_mcp_server(server: &McpServer) -> McpUpstream {
     let auth = match server.auth_type {
         McpAuthType::None => McpAuth::None,
@@ -696,6 +810,10 @@ pub fn upstream_from_mcp_server(server: &McpServer) -> McpUpstream {
         auth,
         timeout,
         protocol,
+        // Per-request, so it is attached by the gateway that holds the
+        // inbound headers (`McpGateway::from_snapshot_for_request`), not
+        // derived from the stored server row here.
+        forwarded_client_headers: Vec::new(),
     }
 }
 

@@ -31,6 +31,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: check guardrails without provider features
+        run: cargo check --locked -p aisix-guardrails --no-default-features
 
   schema-drift:
     name: schema drift (resources)
@@ -41,11 +43,23 @@ jobs:
       - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
       - name: regenerate schemas
-        run: cargo run -p aisix-core --bin dump-schema
+        run: |
+          # The dump only ever writes, so a file it STOPPED emitting (a
+          # resource dropped from RESOURCES) would sit in the tree forever and
+          # keep being vendored. Clear both sets first so a vanished file shows
+          # up in `git diff` as a deletion.
+          rm -f schemas/resources/*.schema.json schemas/resources-lenient/*.schema.json
+          cargo run -p aisix-core --bin dump-schema
       - name: assert no drift
         run: |
+          # --intent-to-add so a file the dump newly creates (a new resource,
+          # or a whole set) shows up in `git diff` instead of passing as
+          # untracked. Both published sets are checked: `schemas/resources/`
+          # (strict write contract) and `schemas/resources-lenient/` (the
+          # etcd loader's read contract).
+          git add --intent-to-add schemas/
           if ! git diff --exit-code schemas/; then
-            echo "::error::Resource JSON Schemas in 'schemas/resources/' drift from the Rust types in 'crates/aisix-core/src/models/'."
+            echo "::error::Resource JSON Schemas in 'schemas/resources/' or 'schemas/resources-lenient/' drift from the Rust types in 'crates/aisix-core/src/models/'."
             echo "::error::Fix: run 'cargo run -p aisix-core --bin dump-schema' locally and commit the diff."
             exit 1
           fi
@@ -107,11 +121,10 @@ jobs:
       # The tests no-op when this is unset (local dev), so absence is safe.
       #
       # MUST NOT start with the `AISIX_` prefix — Config::load_from_path
-      # merges every AISIX_* env var into the root Config (via
-      # config-rs Environment::with_prefix("AISIX")), and Config has
-      # `#[serde(deny_unknown_fields)]`. An AISIX_REDIS_URL leaks into
-      # every Config::load_from_path test as `redis_url` and breaks
-      # the entire `aisix-core::config::tests` module.
+      # owns that namespace (config-rs Environment::with_prefix("AISIX")).
+      # An AISIX_CACHE_* name reaches `Config` as an override of the cache
+      # section and breaks every Config::load_from_path test; any other
+      # AISIX_ name is dropped with a warning on every boot.
       CACHE_TEST_REDIS_URL: redis://127.0.0.1:6379
       # Picked up by crates/aisix-cache/tests/semantic_redis_integration.rs
       # — needs the vector-capable redis:8 service above. The PLAIN url
@@ -134,6 +147,21 @@ jobs:
       CACHE_TEST_REDIS_CLUSTER_NODES: redis://127.0.0.1:7000,redis://127.0.0.1:7001,redis://127.0.0.1:7002
       CACHE_TEST_REDIS_SENTINELS: redis://127.0.0.1:26379
       CACHE_TEST_REDIS_MASTER: mymaster
+      # Picked up by crates/aisix-redis/tests/auth_connect.rs. A
+      # password-protected Redis of its own (6390), started by the step
+      # below: `requirepass` is server-wide, so putting it on the shared
+      # service would lock every other Redis test out of it. The URL
+      # carries NO credential — the tests supply it, in each of the ways
+      # an operator can. Same skip-if-unset / no-AISIX_-prefix rules.
+      REDIS_AUTH_TEST_URL: redis://127.0.0.1:6390
+      REDIS_AUTH_TEST_PASSWORD: aisix-ci-redis
+      # The cluster and sentinel halves of the same file, pointed at the
+      # topologies below. They need NO password, which is what makes them
+      # usable here: a credential they refuse proves the field reached
+      # the handshake, without a second authenticated topology.
+      REDIS_AUTH_TEST_CLUSTER_NODES: redis://127.0.0.1:7000,redis://127.0.0.1:7001,redis://127.0.0.1:7002
+      REDIS_AUTH_TEST_SENTINELS: redis://127.0.0.1:26379
+      REDIS_AUTH_TEST_MASTER: mymaster
       # Picked up by crates/aisix-redis/tests/sentinel_failover.rs — the
       # master+replica+sentinel(26380) topology the setup step brings up,
       # so the failover/reconnect test forces a real promotion in CI.
@@ -144,14 +172,33 @@ jobs:
       ADMIN_TEST_ETCD_URL: http://127.0.0.1:2379
       # Picked up by crates/aisix-etcd/tests/watch_integration.rs.
       ETCD_TEST_URL: http://127.0.0.1:2379
+      # Picked up by crates/aisix-etcd/tests/auth_connect_integration.rs.
+      # A SECOND cluster, started with authentication ON by the step
+      # below: enabling auth is cluster-wide, so doing it on the service
+      # above would lock every other etcd test out of it. Same
+      # skip-if-unset / no-AISIX_-prefix rules.
+      ETCD_AUTH_TEST_URL: http://127.0.0.1:2479
+      ETCD_AUTH_TEST_USER: root
+      ETCD_AUTH_TEST_PASSWORD: aisix-ci-etcd
+      # Picked up by crates/aisix-etcd/tests/auth_token_recovery.rs and
+      # crates/aisix-admin/tests/etcd_integration.rs. A THIRD cluster,
+      # authenticated like the one above but differing in two ways that
+      # the token-recovery tests need and that no other test should have
+      # to live with: its tokens expire in seconds instead of the
+      # five-minute default, so a test can sit out a real expiry; and it
+      # runs `--auth-token jwt` instead of the default `simple`, which is
+      # the only mode in which an auth-store revision change refuses a
+      # token that was already issued. Tests here also change that auth
+      # store, which stales every token the cluster has handed out. The
+      # container and this short-lifetime approach come from community PR
+      # api7/aisix#763 (okaybase). `ETCD_AUTH_TTL_TEST_SECS` must match
+      # the `ttl=` below — the tests sleep past it.
+      ETCD_AUTH_TTL_TEST_URL: http://127.0.0.1:2579
+      ETCD_AUTH_TTL_TEST_USER: root
+      ETCD_AUTH_TTL_TEST_PASSWORD: aisix-ci-etcd
+      ETCD_AUTH_TTL_TEST_SECS: 5
     steps:
       - uses: actions/checkout@v6
-        with:
-          # crates/aisix-core/tests/compat_debt.rs resolves "has a release
-          # shipped since this compat marker's anchor?" from `git tag`. The
-          # default shallow checkout carries no tags, and that gate FAILS
-          # rather than skips when it finds none — do not drop this.
-          fetch-tags: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -159,6 +206,57 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Start the authenticated etcds
+        # Not service containers: a user has to be created and
+        # `auth enable` called after the server is up, which service
+        # containers cannot do.
+        #
+        # Two of them, on 2479 and 2579. The second issues JWT tokens
+        # with a lifetime short enough for a test to sit out a real
+        # expiry. It is a cluster of its own so that neither that
+        # lifetime, nor the auth-store changes those tests make, can
+        # reach the first.
+        run: |
+          # Signing key for the JWT cluster below. Generated per run and
+          # thrown away with the runner: it authenticates nothing outside
+          # this job.
+          mkdir -p /tmp/etcd-jwt
+          openssl genpkey -algorithm RSA -out /tmp/etcd-jwt/jwt.key -pkeyopt rsa_keygen_bits:2048
+          openssl rsa -in /tmp/etcd-jwt/jwt.key -pubout -out /tmp/etcd-jwt/jwt.pub
+          start_auth_etcd() {
+            name=$1
+            client=$2
+            peer=$3
+            shift 3
+            docker run -d --name "$name" -p "$client:$client" -v /tmp/etcd-jwt:/keys \
+              quay.io/coreos/etcd:v3.5.18 \
+              /usr/local/bin/etcd --name "$name" "$@" \
+              --listen-client-urls "http://0.0.0.0:$client" \
+              --advertise-client-urls "http://127.0.0.1:$client" \
+              --listen-peer-urls "http://0.0.0.0:$peer" \
+              --initial-advertise-peer-urls "http://127.0.0.1:$peer" \
+              --initial-cluster "$name=http://127.0.0.1:$peer"
+            etcdctl() {
+              docker exec -e ETCDCTL_API=3 -e ETCDCTL_ENDPOINTS="http://127.0.0.1:$client" \
+                "$name" etcdctl "$@"
+            }
+            for _ in $(seq 30); do
+              etcdctl endpoint health && break
+              sleep 1
+            done
+            # Fail here rather than let the three `etcdctl` calls below
+            # fail one at a time with a connection error that says
+            # nothing about which cluster never came up.
+            etcdctl endpoint health \
+              || { echo "::error::$name never became ready on $client"; exit 1; }
+            etcdctl user add root:aisix-ci-etcd
+            etcdctl user grant-role root root
+            etcdctl auth enable
+          }
+          start_auth_etcd etcd-auth 2479 2480
+          # Keep `ttl=` in step with ETCD_AUTH_TTL_TEST_SECS above.
+          start_auth_etcd etcd-auth-ttl 2579 2580 \
+            --auth-token 'jwt,pub-key=/keys/jwt.pub,priv-key=/keys/jwt.key,sign-method=RS256,ttl=5s'
       - name: Start Redis Cluster + Sentinel
         # The `redis` service above covers single-node. Here we bring up a
         # 3-node cluster (7000-7002) and a sentinel (26379) monitoring the
@@ -207,6 +305,16 @@ jobs:
           sleep 2
           docker exec redis-fo-sentinel redis-cli -p 26380 sentinel get-master-addr-by-name myfo | tr -d '\r' | tr '\n' ' ' | grep -qE '127\.0\.0\.1 +6381' \
             || { echo "::error::Failover sentinel 26380 did not resolve myfo to the master"; exit 1; }
+          # A password-protected Redis for the credential-refusal tests.
+          # Its own server because `requirepass` is server-wide.
+          docker run -d --name redis-auth --network host redis:7-alpine \
+            redis-server --port 6390 --requirepass aisix-ci-redis
+          for _ in $(seq 30); do
+            docker exec redis-auth redis-cli -p 6390 -a aisix-ci-redis ping 2>/dev/null | grep -q PONG && break
+            sleep 1
+          done
+          docker exec redis-auth redis-cli -p 6390 -a aisix-ci-redis ping | grep -q PONG \
+            || { echo "::error::Authenticated Redis 6390 did not come up"; exit 1; }
       - name: unit tests with coverage
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov-unit.info
       - uses: actions/upload-artifact@v7
@@ -214,6 +322,11 @@ jobs:
           name: coverage-unit
           path: lcov-unit.info
           retention-days: 7
+      - name: exporter User-Agent uses the release version
+        env:
+          # Differ from Cargo's version so the old source cannot pass.
+          AISIX_BUILD_VERSION: 0.0.0-ci
+        run: cargo test -p aisix-obs --lib otlp_http_sink::tests::otlp_sink_posts_one_request_with_all_spans -- --exact
 
   build-bin:
     name: build aisix (instrumented)
@@ -221,6 +334,7 @@ jobs:
     env:
       RUSTFLAGS: "-C instrument-coverage"
       LLVM_PROFILE_FILE: "coverage/aisix-%p-%m.profraw"
+      AISIX_BUILD_VERSION: 0.0.0-ci
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -242,6 +356,11 @@ jobs:
     name: e2e (vitest, ${{ matrix.serving }}) + coverage
     needs: [build-bin]
     runs-on: ubuntu-latest
+    # Explicit, so the job's token stays read-only regardless of the
+    # repository-level default (currently `read`, but that is a setting).
+    # Mirrors the mcp-conformance job below.
+    permissions:
+      contents: read
     strategy:
       # The two serving modes are separate products of the same binary:
       # thread-per-core answers a request on the thread that accepted it
@@ -259,12 +378,40 @@ jobs:
           - serving: work-stealing
             thread_per_core: "false"
     services:
+      # One etcd per vitest fork. The suite ran at maxForks=2 because
+      # 20+ files' gateways watching a SINGLE cluster pushed watch
+      # dispatch past `waitConfigPropagation` (#157); the fork count is
+      # derived from AISIX_E2E_ETCD_ENDPOINTS below, so removing a
+      # cluster here lowers it rather than doubling forks onto a shared
+      # one. It does NOT work in the other direction: forkBudget is also
+      # capped by the core count, and ubuntu-latest has exactly four — a
+      # fifth service would add no forks and only a fifth thing that has
+      # to be up. Raising concurrency means a bigger runner AND another
+      # cluster, in that order.
       etcd:
         image: quay.io/coreos/etcd:v3.5.15
         env:
           ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
           ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
         ports: ["2379:2379"]
+      etcd2:
+        image: quay.io/coreos/etcd:v3.5.15
+        env:
+          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+          ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
+        ports: ["2380:2379"]
+      etcd3:
+        image: quay.io/coreos/etcd:v3.5.15
+        env:
+          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+          ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
+        ports: ["2381:2379"]
+      etcd4:
+        image: quay.io/coreos/etcd:v3.5.15
+        env:
+          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+          ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
+        ports: ["2382:2379"]
       redis:
         # redis:8 = vector-capable, so the semantic-cache redis e2e
         # exercises the real path against AISIX_E2E_REDIS.
@@ -324,6 +471,10 @@ jobs:
           # Vector-less redis for the semantic-cache degradation suite;
           # the main 6379 service is redis:8 (vector-capable).
           AISIX_E2E_REDIS_PLAIN: redis://127.0.0.1:6377
+          # One entry per etcd service above. vitest derives maxForks
+          # from this list (see tests/e2e/vitest.config.ts), and
+          # harness/etcd.ts hands each fork its own entry.
+          AISIX_E2E_ETCD_ENDPOINTS: http://127.0.0.1:2379,http://127.0.0.1:2380,http://127.0.0.1:2381,http://127.0.0.1:2382
         run: pnpm test
       - name: tag coverage by leg
         # The gate downloads every leg with `merge-multiple: true`, which

@@ -124,6 +124,51 @@ pub struct PassthroughRoute {
     #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
     pub identity_header: Option<String>,
 
+    /// Inbound client headers forwarded to the upstream even when this
+    /// route would otherwise strip them, as single-`*` glob patterns
+    /// matched case-insensitively against the header name
+    /// (`"authorization"`, `"x-trace-*"`). Empty — the default — overrides
+    /// no stripping.
+    ///
+    /// A header the caller sends more than once is forwarded with every
+    /// value preserved.
+    ///
+    /// A route forwards the caller's headers by default, so this field
+    /// only matters for the ones it removes: the ProviderKey's
+    /// `strip_headers` under `credential_mode: inject`, and the slot the
+    /// gateway consumed to authenticate the caller. Naming `authorization`
+    /// under `auth_mode: gateway_key` therefore puts the caller's own
+    /// credential back on the upstream request in place of the one this
+    /// route would inject, never both — which is what lets an internal
+    /// service that already authorizes on the end user's `Authorization`
+    /// keep doing so unchanged.
+    ///
+    /// A credential slot — `authorization`, `proxy-authorization`,
+    /// `x-api-key`, `api-key`, `x-goog-api-key`, `cookie`, and the AWS
+    /// SigV4 trio `x-amz-security-token` / `x-amz-date` /
+    /// `x-amz-content-sha256` — and
+    /// `traceparent` / `tracestate` are forwarded only when a pattern
+    /// names them exactly. A glob such as `"*"` or `"x-*"` is a statement
+    /// about the operator's own headers, not consent to hand a third party
+    /// the caller's credential or to graft the caller's trace onto that
+    /// party's telemetry, so a broad pattern overrides the rest of the
+    /// strip set and leaves those alone.
+    ///
+    /// This route's own `auth_header_name` and `identity_header` are read
+    /// the same way. Both are slots this route chose rather than ones the
+    /// gateway owns — under `auth_mode: header_key` the first carries the
+    /// gateway credential the caller authenticated with, and the second
+    /// carries an end-user identity this route records and strips — so a
+    /// glob does not sweep either, and a pattern that names one in full
+    /// forwards it.
+    ///
+    /// Headers whose forwarding would break the exchange rather than
+    /// change who it comes from are stripped whatever the patterns say:
+    /// `host`, `content-length`, the hop-by-hop headers that describe the
+    /// caller's own connection, and the gateway's `x-aisix-*` namespace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forward_client_headers: Vec<String>,
+
     /// Maximum time, in milliseconds, for the upstream exchange. Bounds
     /// the response-header phase and any non-SSE body read, but never a
     /// healthy SSE relay (which ends with the upstream stream or the
@@ -203,22 +248,7 @@ impl PassthroughRoute {
         let Some(hosts) = &self.hosts else {
             return false;
         };
-        hosts.iter().any(|pattern| {
-            let p = pattern.to_ascii_lowercase();
-            if let Some(suffix) = p.strip_prefix("*.") {
-                match host.strip_suffix(suffix) {
-                    // `label.` + suffix, with exactly one label consumed.
-                    Some(head) => {
-                        head.ends_with('.')
-                            && !head[..head.len() - 1].is_empty()
-                            && !head[..head.len() - 1].contains('.')
-                    }
-                    None => false,
-                }
-            } else {
-                p == host
-            }
-        })
+        crate::host::matches(hosts, host)
     }
 }
 
@@ -268,7 +298,7 @@ pub fn passthrough_route_coupling() -> Value {
                 "type": "array", "minItems": 1,
                 "items": {
                     "type": "string", "minLength": 1,
-                    "pattern": "^(\\*\\.)?([A-Za-z0-9-]+\\.)+[A-Za-z0-9-]+$|^[A-Za-z0-9-]+$"
+                    "pattern": crate::host::HOST_PATTERN
                 }
             } } }
         },
@@ -347,8 +377,14 @@ pub fn passthrough_route_coupling() -> Value {
         },
         {
             "if": { "required": ["identity_header"] },
+            // Presence, not value, for the same reason as the caller-JWT
+            // slot below: the property declares itself nullable and no
+            // mode requires it, so an explicit null means "not
+            // configured" rather than a document worth dropping the
+            // route over. The coupled fields above are the opposite
+            // case and keep their type pin.
             "then": { "properties": { "identity_header": {
-                "type": "string", "not": { "enum": FORBIDDEN_HEADER_SLOTS }
+                "not": { "enum": FORBIDDEN_HEADER_SLOTS }
             } } }
         },
         // auth_mode couplings. The mode-required companions are pinned to
@@ -433,6 +469,34 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn the_client_header_forward_is_a_free_list_of_patterns() {
+        use crate::models::schema::{
+            validate_passthrough_route, validate_passthrough_route_lenient,
+        };
+
+        let with = |patterns: serde_json::Value| {
+            let mut v = json!({
+                "name": "system-server",
+                "path_prefix": "/passthrough/system",
+                "target_url": "https://erp.internal",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
+            });
+            v["forward_client_headers"] = patterns;
+            v
+        };
+
+        // Naming the credential slot the gateway consumed is the point of
+        // the field, not an oversight, so the schema does not second-guess
+        // it — the runtime decides what is deliverable.
+        validate_passthrough_route(&with(json!(["authorization", "x-trace-*", "*"])))
+            .expect("credential slots and globs are both accepted");
+        validate_passthrough_route(&with(json!([])))
+            .expect("an empty list is the default, spelled out");
+        validate_passthrough_route_lenient(&with(json!(["authorization"])))
+            .expect("the read path must not cost the route over a pattern");
     }
 
     #[test]
@@ -530,6 +594,30 @@ mod coupling_tests {
             "source_cidrs": ["10.0.0.0/8"]
         });
         assert!(validate_passthrough_route(&doc).is_err());
+    }
+
+    #[test]
+    fn explicit_null_on_an_optional_header_slot_clears_it() {
+        // The opposite of the coupled fields above: no mode requires
+        // these, they declare themselves nullable, and `null` is how a
+        // resources.yaml author writes "not set" — a bare key parses to
+        // it. Rejecting that costs the whole route on the lenient read
+        // path, over a value the author meant to leave empty.
+        let field = "identity_header";
+        let mut doc = base();
+        doc[field] = json!(null);
+        validate_passthrough_route(&doc)
+            .unwrap_or_else(|e| panic!("strict must accept null {field}: {e}"));
+        validate_passthrough_route_lenient(&doc)
+            .unwrap_or_else(|e| panic!("lenient must accept null {field}: {e}"));
+
+        // Relaxing the type did not relax the rule the branch exists for.
+        let mut doc = base();
+        doc[field] = json!("authorization");
+        assert!(
+            validate_passthrough_route(&doc).is_err(),
+            "a credential slot is still refused as an identity header"
+        );
     }
 
     #[test]

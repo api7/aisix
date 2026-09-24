@@ -197,6 +197,7 @@ impl ObservabilitySink for AliyunSlsSink {
             });
         }
 
+        let retry_after = super::retry_after_of(status, resp.headers());
         let body = resp.text().await.unwrap_or_default();
         let (error_code, detail) = parse_sls_error(status, &body);
         // 5xx / 408 / 429 are always worth retrying; SLS also signals back-
@@ -207,7 +208,13 @@ impl ObservabilitySink for AliyunSlsSink {
             || status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || is_transient_error_code(&error_code)
         {
-            Err(SinkError::Transient(detail))
+            Err(match retry_after {
+                Some(retry_after) => SinkError::Throttled {
+                    retry_after,
+                    detail,
+                },
+                None => SinkError::Transient(detail),
+            })
         } else {
             Err(SinkError::Permanent(detail))
         }
@@ -351,8 +358,8 @@ fn base_url_for(endpoint: &str, project: &str) -> String {
 /// reference is upper-cased with non-alphanumerics folded to `_`, then read
 /// from `SLS_CRED_<REF>_AK_ID` / `SLS_CRED_<REF>_AK_SECRET`. The prefix is
 /// deliberately NOT `AISIX_`: that namespace is owned by the config loader
-/// (`Environment::with_prefix("AISIX")`), so an `AISIX_`-named secret would be
-/// reinterpreted as a config override. Returns `None` when either half is
+/// (`Environment::with_prefix("AISIX")`), which reads such a name as a
+/// configuration override or warns about it on every boot. Returns `None` when either half is
 /// unset or blank — the caller then lets the misconfiguration surface as a
 /// delivery-health auth error rather than signing with an empty key. BYOK
 /// variants (customer KMS / uploaded key) plug in here as alternative
@@ -490,6 +497,7 @@ mod tests {
             prompt_tokens: 5,
             completion_tokens: 7,
             upstream_latency_ms: 123,
+            operation: "image_generation".into(),
             ..UsageEvent::default()
         };
         let ack = sink
@@ -572,6 +580,15 @@ mod tests {
         assert!(!contents.contains_key("finish_reason"));
         // Metadata-only path never carries a prompt.
         assert!(!contents.contains_key("prompt"));
+        // …which is precisely why the request classification has to ride the
+        // metadata (AISIX-Cloud#1461): with no prompt to inspect, `operation`
+        // is the only thing on this record that says what kind of call it
+        // was, and it must arrive as its own indexable column rather than
+        // buried in some composite value.
+        assert_eq!(
+            contents.get("operation").map(String::as_str),
+            Some("image_generation")
+        );
     }
 
     #[tokio::test]

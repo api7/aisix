@@ -3,6 +3,7 @@ import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -58,10 +59,6 @@ describe("cache policy e2e: identical request hits cache", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: ["cache-e2e"],
-    });
     // A policy requires `name`, `enabled`, and `applies_to` to take
     // effect.
     await seed.createCachePolicy({
@@ -69,6 +66,12 @@ describe("cache policy e2e: identical request hits cache", () => {
       enabled: true,
       applies_to: "all",
     });
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["cache-e2e"],
+    });
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
   });
 
   afterAll(async () => {
@@ -87,22 +90,6 @@ describe("cache policy e2e: identical request hits cache", () => {
       baseURL: `${app.proxyUrl}/v1`,
     });
 
-    // Wait for the snapshot to carry the Model + ProviderKey + ApiKey
-    // + CachePolicy. The probe uses a distinct message so it doesn't
-    // pollute the cache fingerprint we're about to test against.
-    await waitConfigPropagation(async () => {
-      try {
-        await client.chat.completions.create({
-          model: "cache-e2e",
-          messages: [{ role: "user", content: "ready-probe" }],
-        });
-        return true;
-      } catch {
-        return false;
-      }
-    });
-
-    // Baseline includes the probe (and any retries during propagation).
     const baseline = upstream.receivedRequests.length;
 
     // First call with a fresh fingerprint — cache miss, upstream hit.

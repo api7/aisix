@@ -34,6 +34,17 @@ pub(crate) const MINUTE_SECS: u64 = 60;
 pub(crate) const HOUR_SECS: u64 = 60 * 60;
 pub(crate) const DAY_SECS: u64 = 24 * 60 * 60;
 
+/// Dimension names. Both stores name the same window identically —
+/// they are the Redis key segment AND the `x-ratelimit-scope` value a
+/// 429 reports, so a client cannot be told `rpm` by one backend and
+/// `RPM` by the other.
+pub(crate) const DIM_RPS: &str = "rps";
+pub(crate) const DIM_RPM: &str = "rpm";
+pub(crate) const DIM_RPH: &str = "rph";
+pub(crate) const DIM_RPD: &str = "rpd";
+pub(crate) const DIM_TPM: &str = "tpm";
+pub(crate) const DIM_TPD: &str = "tpd";
+
 /// A windowed request/token dimension active on a [`RateLimit`]:
 /// `(name, window_secs, limit)`. Shared by both stores so the Redis key
 /// layout and the local counter set never drift.
@@ -46,10 +57,10 @@ pub(crate) struct Dim {
 /// Request-count dimensions (rps/rpm/rph/rpd) that carry a limit.
 pub(crate) fn request_dims(limits: &RateLimit) -> Vec<Dim> {
     [
-        ("rps", SECOND_SECS, limits.rps),
-        ("rpm", MINUTE_SECS, limits.rpm),
-        ("rph", HOUR_SECS, limits.rph),
-        ("rpd", DAY_SECS, limits.rpd),
+        (DIM_RPS, SECOND_SECS, limits.rps),
+        (DIM_RPM, MINUTE_SECS, limits.rpm),
+        (DIM_RPH, HOUR_SECS, limits.rph),
+        (DIM_RPD, DAY_SECS, limits.rpd),
     ]
     .into_iter()
     .filter_map(|(name, window_secs, limit)| {
@@ -65,8 +76,8 @@ pub(crate) fn request_dims(limits: &RateLimit) -> Vec<Dim> {
 /// Token-count dimensions (tpm/tpd) that carry a limit.
 pub(crate) fn token_dims(limits: &RateLimit) -> Vec<Dim> {
     [
-        ("tpm", MINUTE_SECS, limits.tpm),
-        ("tpd", DAY_SECS, limits.tpd),
+        (DIM_TPM, MINUTE_SECS, limits.tpm),
+        (DIM_TPD, DAY_SECS, limits.tpd),
     ]
     .into_iter()
     .filter_map(|(name, window_secs, limit)| {

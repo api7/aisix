@@ -33,6 +33,7 @@ use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AdminConfig, AisixSnapshot};
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use etcd_client::{DeleteOptions, Txn, TxnOp};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -55,14 +56,23 @@ fn unique_prefix() -> String {
     .replace(['(', ')', ' '], "")
 }
 
+fn lazy_client_for(url: &str) -> Arc<aisix_etcd::LazyEtcdClient> {
+    Arc::new(aisix_etcd::LazyEtcdClient::new(
+        vec![url.to_string()],
+        None,
+        None,
+    ))
+}
+
 async fn etcd_client_for(url: &str) -> etcd_client::Client {
     etcd_client::Client::connect([url], None)
         .await
         .expect("etcd connect")
 }
 
-async fn build_state(client: etcd_client::Client, prefix: &str) -> AdminState {
-    let store: Arc<dyn ConfigStore> = Arc::new(EtcdConfigStore::new(client, prefix));
+async fn build_state(url: &str, prefix: &str) -> AdminState {
+    let store: Arc<dyn ConfigStore> =
+        Arc::new(EtcdConfigStore::new(lazy_client_for(url), prefix, None));
     let handle = SnapshotHandle::new(AisixSnapshot::new());
     let cfg = AdminConfig {
         enabled: true,
@@ -124,7 +134,7 @@ async fn direct_write_read_round_trip(
 ) {
     let prefix = unique_prefix();
     let mut client = etcd_client_for(url).await;
-    let state = build_state(client.clone(), &prefix).await;
+    let state = build_state(url, &prefix).await;
 
     seed(&mut client, &prefix, kind, id, &payload).await;
 
@@ -176,6 +186,75 @@ async fn models_round_trip_through_real_etcd() {
         }),
     )
     .await;
+}
+
+/// The admin read surface ranges a whole kind subtree in one gRPC
+/// message, so it meets the transport's default 4 MiB decode ceiling the
+/// same way the gateway's bootstrap range does — by resource count, not by
+/// any one document being large. A store that read through that default
+/// would fail this list with `OutOfRange`.
+#[tokio::test]
+async fn model_list_reads_a_range_larger_than_the_default_decode_limit() {
+    let Some(url) = etcd_url() else {
+        eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
+        return;
+    };
+
+    let prefix = unique_prefix();
+    let mut client = etcd_client_for(&url).await;
+    let store = EtcdConfigStore::new(lazy_client_for(&url), &prefix, None);
+
+    // etcd caps a transaction at 128 operations, so the fixture is written
+    // in batches of that rather than one round trip per key.
+    const COUNT: usize = 26_000;
+    const BATCH: usize = 128;
+    let mut seeded_bytes = 0usize;
+    let mut ops: Vec<TxnOp> = Vec::with_capacity(BATCH);
+    for i in 0..COUNT {
+        let key = format!("{prefix}/models/m-large-{i:05}");
+        let value = serde_json::to_vec(&json!({
+            "display_name": format!("large-{i:05}"),
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111"
+        }))
+        .expect("serialize");
+        seeded_bytes += key.len() + value.len();
+        ops.push(TxnOp::put(key.into_bytes(), value, None));
+        if ops.len() == BATCH {
+            client
+                .txn(Txn::new().and_then(std::mem::take(&mut ops)))
+                .await
+                .expect("seed batch");
+        }
+    }
+    if !ops.is_empty() {
+        client
+            .txn(Txn::new().and_then(ops))
+            .await
+            .expect("seed batch");
+    }
+
+    // Key and value bytes only: protobuf framing adds to this, so it is a
+    // lower bound on the response the store has to decode. Guards the
+    // fixture — a shrunken one would pass against the very ceiling this
+    // test exists to cross.
+    assert!(
+        seeded_bytes > 4 * 1024 * 1024,
+        "fixture must exceed the default decode limit, got {seeded_bytes} bytes",
+    );
+
+    // Clean up before asserting: a store that decodes at the default limit
+    // fails this list, and panicking first would leave the whole fixture
+    // behind in an etcd other tests share.
+    let listed = store.list_models().await;
+    client
+        .delete(prefix, Some(DeleteOptions::new().with_prefix()))
+        .await
+        .expect("cleanup");
+
+    let models = listed.expect("list models");
+    assert_eq!(models.len(), COUNT);
 }
 
 #[tokio::test]
@@ -331,7 +410,7 @@ async fn admin_writes_are_refused_against_real_etcd() {
     };
     let prefix = unique_prefix();
     let mut client = etcd_client_for(&url).await;
-    let state = build_state(client.clone(), &prefix).await;
+    let state = build_state(&url, &prefix).await;
 
     let payload = json!({
         "display_name": "sneaky",
@@ -498,7 +577,8 @@ async fn loader_picks_up_every_direct_write() {
         })
         .collect();
 
-    let (snap, stats) = aisix_etcd::build_snapshot(&prefix, &raw_entries);
+    let (snap, stats) =
+        aisix_etcd::build_snapshot(&aisix_etcd::PrefixSet::single(&prefix), &raw_entries);
     assert_eq!(
         stats.schema_rejected, 0,
         "loader rejected a canonical document: {stats:?}"
@@ -524,4 +604,98 @@ async fn loader_picks_up_every_direct_write() {
     assert_eq!(snap.observability_exporters.len(), 1);
     assert_eq!(snap.mcp_servers.len(), 1);
     assert_eq!(snap.a2a_agents.len(), 1);
+}
+
+/// The admin read path against an etcd whose auth token stops working
+/// under it.
+///
+/// `etcd-client` authenticates once, inside `Client::connect`, and never
+/// again, so the token a store dialled with is the only one it will ever
+/// have. An admin listener is idle for long stretches by nature — nobody
+/// is calling `GET /apisix/admin/models` every second — which is exactly
+/// the state in which etcd's `--auth-token-ttl` elapses. Every later
+/// admin read was then refused until the gateway was restarted.
+///
+/// Bracketed by `ETCD_AUTH_TTL_TEST_URL`, the short-TTL authenticated
+/// cluster `.github/workflows/ci.yml` starts (the container and the
+/// short-TTL approach come from community PR api7/aisix#763, `okaybase`);
+/// no-ops when it is unset, like every other integration test here.
+#[tokio::test]
+async fn admin_reads_survive_a_token_the_server_forgets() {
+    let (Ok(url), Ok(user), Ok(password), Ok(ttl)) = (
+        std::env::var("ETCD_AUTH_TTL_TEST_URL"),
+        std::env::var("ETCD_AUTH_TTL_TEST_USER"),
+        std::env::var("ETCD_AUTH_TTL_TEST_PASSWORD"),
+        std::env::var("ETCD_AUTH_TTL_TEST_SECS"),
+    ) else {
+        eprintln!("skipping: ETCD_AUTH_TTL_TEST_URL not set");
+        return;
+    };
+    let ttl: u64 = ttl.parse().expect("ETCD_AUTH_TTL_TEST_SECS is a number");
+    let credentials =
+        || Some(etcd_client::ConnectOptions::new().with_user(user.clone(), password.clone()));
+
+    let prefix = unique_prefix();
+    let mut writer = etcd_client::Client::connect([url.clone()], credentials())
+        .await
+        .expect("seed client");
+    seed(
+        &mut writer,
+        &prefix,
+        "models",
+        "m-token",
+        &json!({
+            "display_name": "token-it",
+            "provider": "openai",
+            "model_name": "gpt-4o-mini",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111"
+        }),
+    )
+    .await;
+
+    let store = EtcdConfigStore::new(
+        Arc::new(aisix_etcd::LazyEtcdClient::new(
+            vec![url.clone()],
+            credentials(),
+            Some(std::time::Duration::from_secs(10)),
+        )),
+        &prefix,
+        Some(std::time::Duration::from_secs(10)),
+    );
+    assert_eq!(
+        store
+            .list_models()
+            .await
+            .expect("the first read works")
+            .len(),
+        1,
+    );
+
+    // etcd's token TTL is refreshed by use, so it is only ever an idle
+    // admin listener that reaches it — which is the failure as reported.
+    tokio::time::sleep(std::time::Duration::from_secs(ttl + 4)).await;
+
+    let models = store
+        .list_models()
+        .await
+        .expect("an expired token must be replaced, not fail the admin read");
+    assert_eq!(
+        models.len(),
+        1,
+        "the read after re-authenticating must return the same configuration",
+    );
+    assert_eq!(models[0].id, "m-token");
+
+    // A writer of its own: this one's token expired during the sleep too,
+    // and nothing re-authenticates a bare `etcd_client::Client`.
+    let mut writer = etcd_client::Client::connect([url], credentials())
+        .await
+        .expect("cleanup client");
+    writer
+        .delete(
+            format!("{prefix}/models/m-token"),
+            Some(DeleteOptions::new().with_prefix()),
+        )
+        .await
+        .expect("cleanup");
 }

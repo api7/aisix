@@ -23,7 +23,7 @@
 use std::sync::{Arc, OnceLock};
 
 use aisix_core::config::OutboundTlsConfig;
-use aisix_core::models::provider_key::ProviderKeyTls;
+use aisix_core::models::provider_key::UpstreamConnection;
 
 /// PEM material and verification policy shared by every outbound client.
 ///
@@ -194,30 +194,24 @@ pub fn reqwest_material() -> &'static ReqwestTlsMaterial {
 
 // ─── per-ProviderKey overrides ───────────────────────────────────────
 
-/// Clients built for a `ProviderKey.tls` override, keyed by the override
-/// itself so every key with the same settings shares one connection
-/// pool.
+/// Clients built for a Provider Key's connection overrides, keyed by the
+/// overrides themselves so every key configured the same way shares one
+/// connection pool.
 ///
-/// A client is the unit reqwest attaches trust to, so an override cannot
-/// be applied per request — it needs its own client, and therefore its
-/// own pool. Building one per dispatch would pay a TLS handshake on
-/// every call, which is precisely what the shared pool exists to avoid;
-/// the cache keeps it to one per distinct override.
+/// A client is the unit reqwest attaches trust and name resolution to, so
+/// an override cannot be applied per request — it needs its own client,
+/// and therefore its own pool. Building one per dispatch would pay a TLS
+/// handshake on every call, which is precisely what the shared pool
+/// exists to avoid; the cache keeps it to one per distinct override.
 ///
-/// Unbounded on purpose. The key space is the set of distinct TLS
-/// settings across the Provider Keys an operator has configured — a
+/// Unbounded on purpose. The key space is the set of distinct override
+/// combinations across the Provider Keys an operator has configured — a
 /// handful in the deployments this exists for, and each entry is one
 /// idle connection pool.
-static PK_CLIENTS: OnceLock<dashmap::DashMap<ProviderKeyTls, reqwest::Client>> = OnceLock::new();
+static PK_CLIENTS: OnceLock<dashmap::DashMap<UpstreamConnection, reqwest::Client>> =
+    OnceLock::new();
 
 // ─── per-worker pools ────────────────────────────────────────────────
-
-/// The user agent every dispatch-path client is built with.
-///
-/// A worker's pool stands in for those clients, so it has to present the
-/// same identity upstream. `every_dispatch_client_presents_the_same_user_agent`
-/// holds them in step.
-pub(crate) const DISPATCH_USER_AGENT: &str = "aisix/0.1";
 
 thread_local! {
     /// Whether this thread serves proxy traffic on its own runtime.
@@ -256,20 +250,15 @@ fn worker_client() -> Option<reqwest::Client> {
         return None;
     }
     WORKER_CLIENT.with(|cell| {
-        cell.get_or_init(|| {
-            match crate::upstream_http::client_builder()
-                .user_agent(DISPATCH_USER_AGENT)
-                .build()
-            {
-                Ok(client) => Some(client),
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "per-worker upstream pool could not be built; this worker \
-                         dispatches on the shared pool"
-                    );
-                    None
-                }
+        cell.get_or_init(|| match crate::upstream_http::client_builder().build() {
+            Ok(client) => Some(client),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "per-worker upstream pool could not be built; this worker \
+                     dispatches on the shared pool"
+                );
+                None
             }
         })
         .clone()
@@ -282,16 +271,17 @@ fn worker_client() -> Option<reqwest::Client> {
 /// is the overwhelmingly common case and the one that must keep sharing
 /// the bridge's pool.
 ///
-/// A malformed `ca_cert` falls back to `shared` with a logged error
-/// rather than to a client that trusts less than the operator asked
-/// for — the request then fails against the private endpoint, which is
-/// the same visible outcome as not having configured anything, and is
-/// preferable to quietly proceeding.
+/// A malformed `ca_cert` falls back with a logged error rather than to a
+/// client that trusts less than the operator asked for — the request then
+/// fails against the private endpoint, which is the same visible outcome
+/// as not having configured anything, and is preferable to quietly
+/// proceeding. What it falls back TO depends on whether the key also
+/// names addresses: see the error arms below.
 pub fn client_for_provider_key(
     shared: &reqwest::Client,
-    tls: Option<&ProviderKeyTls>,
+    conn: Option<&UpstreamConnection>,
 ) -> reqwest::Client {
-    let Some(tls) = tls.filter(|t| !t.is_noop()) else {
+    let Some(conn) = conn.filter(|c| !c.is_noop()) else {
         // On a thread-per-core worker, dispatch on that worker's own
         // pool: the upstream connection is then read by the same runtime
         // that is waiting for the response, instead of waking a thread
@@ -300,12 +290,12 @@ pub fn client_for_provider_key(
         return worker_client().unwrap_or_else(|| shared.clone());
     };
     let cache = PK_CLIENTS.get_or_init(dashmap::DashMap::new);
-    if let Some(existing) = cache.get(tls) {
+    if let Some(existing) = cache.get(conn) {
         return existing.clone();
     }
-    match build_provider_key_client(tls) {
-        Ok(client) => cache.entry(tls.clone()).or_insert(client).clone(),
-        Err(e) => {
+    match build_provider_key_client(conn) {
+        Ok(client) => cache.entry(conn.clone()).or_insert(client).clone(),
+        Err(e) if conn.resolve.is_empty() => {
             tracing::error!(
                 error = %e,
                 "provider_key.tls could not be applied; falling back to the \
@@ -313,34 +303,77 @@ pub fn client_for_provider_key(
             );
             shared.clone()
         }
+        Err(e) => {
+            // With an address override configured, the shared client is
+            // NOT a safe fallback: it resolves the hostname through DNS,
+            // so a key whose trust material failed to load would carry
+            // its credential to whatever public DNS answers instead of to
+            // the private endpoint the operator named — reaching a
+            // different server, and succeeding while doing it.
+            //
+            // Keep the resolution and drop only the part that failed. The
+            // request then reaches the configured address and fails its
+            // certificate check there, which is the same visible outcome
+            // as not having configured any trust material.
+            tracing::error!(
+                error = %e,
+                "provider_key.tls could not be applied; dispatching to \
+                 resolve_addresses on the deployment's trust settings, \
+                 where this endpoint is expected to fail verification"
+            );
+            let resolution_only = UpstreamConnection {
+                tls: None,
+                resolve: conn.resolve.clone(),
+            };
+            // `resolve_to_addrs` cannot fail, so the only way this second
+            // build fails is a TLS backend that would not initialise —
+            // which `shared` could not have been built over either.
+            build_provider_key_client(&resolution_only)
+                .map(|client| cache.entry(resolution_only).or_insert(client).clone())
+                .unwrap_or_else(|_| shared.clone())
+        }
     }
 }
 
-fn build_provider_key_client(tls: &ProviderKeyTls) -> Result<reqwest::Client, String> {
+fn build_provider_key_client(conn: &UpstreamConnection) -> Result<reqwest::Client, String> {
     // Layer the key's override ON TOP of the deployment settings rather
     // than replacing them: a deployment CA and a per-key CA are both
     // trust roots, and a client presenting the deployment's mTLS
     // identity must keep presenting it.
-    let mut builder = crate::upstream_http::client_builder().user_agent(PROVIDER_KEY_USER_AGENT);
-    if let Some(pem) = tls.ca_cert.as_ref().filter(|p| !p.trim().is_empty()) {
-        let roots = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
-            .map_err(|e| format!("provider_key.tls.ca_cert: {e}"))?;
-        if roots.is_empty() {
-            return Err("provider_key.tls.ca_cert contains no certificate".into());
+    let mut builder = crate::upstream_http::client_builder();
+    if let Some(tls) = conn.tls.as_ref() {
+        if let Some(pem) = tls.ca_cert.as_ref().filter(|p| !p.trim().is_empty()) {
+            let roots = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
+                .map_err(|e| format!("provider_key.tls.ca_cert: {e}"))?;
+            if roots.is_empty() {
+                return Err("provider_key.tls.ca_cert contains no certificate".into());
+            }
+            for root in roots {
+                builder = builder.add_root_certificate(root);
+            }
         }
-        for root in roots {
-            builder = builder.add_root_certificate(root);
+        if !tls.verify {
+            builder = builder.danger_accept_invalid_certs(true);
         }
     }
-    if !tls.verify {
-        builder = builder.danger_accept_invalid_certs(true);
+    for (host, addrs) in &conn.resolve {
+        // Port 0: reqwest keeps the port from the request URL and takes
+        // only the address from here. The hostname stays the one the URL
+        // names, so `Host`, `:authority`, the TLS server name and the
+        // certificate check are all unaffected — this replaces name
+        // resolution and nothing else.
+        //
+        // The whole list goes in at once, in the operator's order, so the
+        // connector walks it the way it walks a resolver's answer and
+        // moves to the next address when one will not connect.
+        let socket_addrs: Vec<std::net::SocketAddr> = addrs
+            .iter()
+            .map(|addr| std::net::SocketAddr::new(*addr, 0))
+            .collect();
+        builder = builder.resolve_to_addrs(host, &socket_addrs);
     }
     builder.build().map_err(|e| e.to_string())
 }
-
-/// Matches the agent every bridge sets on its shared client, so a
-/// per-key client is indistinguishable upstream from the shared one.
-const PROVIDER_KEY_USER_AGENT: &str = "aisix/0.1";
 
 // ─── raw rustls (Realtime WebSocket) ─────────────────────────────────
 
@@ -421,8 +454,29 @@ fn root_store(tls: &TlsSettings) -> rustls::RootCertStore {
 
 // ─── AWS SDK (Bedrock) ───────────────────────────────────────────────
 
+/// The smithy builder [`aws_http_client`] starts from, carrying
+/// `upstream.pool_idle_timeout`.
+///
+/// Split out because `build_https` returns an opaque `SharedHttpClient`:
+/// this builder is the last point at which a test can observe the value.
+/// Without the setting the SDK keeps hyper's own 90s idle lifetime —
+/// longer than a typical hop's idle timeout, which is exactly the stale
+/// pooled connection `upstream.pool_idle_timeout` exists to prevent.
+///
+/// It is the only one of the `upstream` connection knobs this stack can
+/// take. `pool_max_idle_per_host` and the three `tcp_keepalive_*`
+/// settings have no entry point on the smithy builder or its connector
+/// builder, so they still stop at the reqwest clients — the same shape
+/// as the two `upstream.tls` knobs [`warn_unsupported_for_aws`] calls
+/// out, and worth knowing before assuming the whole block reaches here.
+#[cfg(feature = "aws")]
+fn aws_pooled_builder() -> aws_smithy_http_client::Builder {
+    aws_smithy_http_client::Builder::new()
+        .pool_idle_timeout(crate::upstream_http::config().pool_idle_timeout)
+}
+
 /// The HTTP client every Bedrock SDK client is built on, carrying the
-/// deployment's extra trust roots.
+/// deployment's extra trust roots and `upstream.pool_idle_timeout`.
 ///
 /// Built once and shared: the AWS SDK otherwise constructs a connector
 /// per client, and each construction re-reads the platform trust store.
@@ -437,31 +491,44 @@ fn root_store(tls: &TlsSettings) -> rustls::RootCertStore {
 /// — is fully served by `ca_file`.
 #[cfg(feature = "aws")]
 pub fn aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
-    use aws_smithy_http_client::tls;
     static CLIENT: OnceLock<aws_smithy_runtime_api::client::http::SharedHttpClient> =
         OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            let tls_cfg = &crate::upstream_http::config().tls;
-            warn_unsupported_for_aws(tls_cfg);
+    CLIENT.get_or_init(build_aws_http_client).clone()
+}
 
-            let mut trust_store = tls::TrustStore::default();
-            if let Some(pem) = &tls_cfg.extra_ca_pem {
-                trust_store = trust_store.with_pem_certificate(pem.as_slice());
-            }
-            let context = tls::TlsContext::builder()
-                .with_trust_store(trust_store)
-                .build()
-                .expect("TLS context from a bundle validated at boot");
+/// The same client, built fresh and therefore carrying its own
+/// connection pool. Test harnesses only — a production call site wants
+/// [`aws_http_client`], and the outbound-TLS scan in `upstream_http`
+/// fails any file that builds an SDK client without naming it.
+///
+/// Sharing one pool is right for the gateway, which runs a single
+/// tokio runtime for the life of the process. It is wrong for a test
+/// binary, where every `#[tokio::test]` builds and drops a runtime of
+/// its own: a connection pooled under one test's runtime outlives that
+/// runtime, and reaching it again once the OS has recycled the mock
+/// server's ephemeral port fails the request with hyper's
+/// "runtime dropped the dispatch task" instead of reaching the server.
+#[cfg(feature = "aws")]
+pub fn build_aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    use aws_smithy_http_client::tls;
+    let tls_cfg = &crate::upstream_http::config().tls;
+    warn_unsupported_for_aws(tls_cfg);
 
-            aws_smithy_http_client::Builder::new()
-                .tls_provider(tls::Provider::rustls(
-                    tls::rustls_provider::CryptoMode::AwsLc,
-                ))
-                .tls_context(context)
-                .build_https()
-        })
-        .clone()
+    let mut trust_store = tls::TrustStore::default();
+    if let Some(pem) = &tls_cfg.extra_ca_pem {
+        trust_store = trust_store.with_pem_certificate(pem.as_slice());
+    }
+    let context = tls::TlsContext::builder()
+        .with_trust_store(trust_store)
+        .build()
+        .expect("TLS context from a bundle validated at boot");
+
+    aws_pooled_builder()
+        .tls_provider(tls::Provider::rustls(
+            tls::rustls_provider::CryptoMode::AwsLc,
+        ))
+        .tls_context(context)
+        .build_https()
 }
 
 /// Say out loud which `upstream.tls` knobs the AWS SDK stack cannot
@@ -554,6 +621,7 @@ mod danger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aisix_core::models::provider_key::ProviderKeyTls;
 
     fn ca_pem() -> Vec<u8> {
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -562,13 +630,40 @@ mod tests {
         params.self_signed(&kp).unwrap().pem().into_bytes()
     }
 
-    /// The literal scan in `upstream_http` cannot see named constants, so
-    /// the per-key client's agent is pinned to the dispatch agent here —
-    /// a per-key client must stay indistinguishable upstream from the
-    /// shared (or per-worker) one.
+    /// The AWS SDK stack does not go through
+    /// `upstream_http::client_builder`, so nothing else makes it honour
+    /// `upstream.pool_idle_timeout`. Left unset it keeps hyper's 90s idle
+    /// lifetime — the value `upstream_http`'s own default guard rejects,
+    /// because it outlives a typical hop's idle timeout and the pool then
+    /// hands out connections the far end has already closed.
+    #[cfg(feature = "aws")]
     #[test]
-    fn provider_key_clients_present_the_dispatch_user_agent() {
-        assert_eq!(PROVIDER_KEY_USER_AGENT, DISPATCH_USER_AGENT);
+    fn the_aws_builder_carries_the_configured_pool_idle_timeout() {
+        let configured = crate::upstream_http::config().pool_idle_timeout;
+        assert!(configured.is_some(), "the default must set a timeout");
+        // `Builder`'s fields are private; its derived `Debug` is the only
+        // way to read back what was applied. `None` there means the
+        // setting never reached the builder.
+        let applied = format!("{:?}", aws_pooled_builder());
+        assert!(
+            applied.contains(&format!("pool_idle_timeout: Some({:?})", configured)),
+            "the configured pool idle timeout did not reach the AWS builder: {applied}"
+        );
+        // …and the shared client must be built from that builder, not
+        // from a bare `Builder::new()` alongside it. Scoped to the
+        // function body: this test's own text mentions the helper too.
+        let src = include_str!("upstream_tls.rs");
+        let body = src
+            .split_once("pub fn build_aws_http_client()")
+            .expect("build_aws_http_client is defined in this file")
+            .1
+            .split_once("\n}\n")
+            .expect("its body ends at a top-level brace")
+            .0;
+        assert!(
+            body.contains("aws_pooled_builder()"),
+            "build_aws_http_client must build on `aws_pooled_builder()`: {body}"
+        );
     }
 
     #[test]
@@ -698,10 +793,29 @@ mod tests {
     /// client (and therefore its own connection pool)?" is asserted
     /// through the cache: an entry exists exactly when a dedicated client
     /// was built.
-    fn cached(tls: &ProviderKeyTls) -> bool {
+    fn cached(conn: &UpstreamConnection) -> bool {
         PK_CLIENTS
             .get()
-            .is_some_and(|cache| cache.contains_key(tls))
+            .is_some_and(|cache| cache.contains_key(conn))
+    }
+
+    /// A key carrying only `tls`, in the shape the dispatch sites derive.
+    fn tls_conn(tls: ProviderKeyTls) -> UpstreamConnection {
+        UpstreamConnection {
+            tls: Some(tls),
+            resolve: Vec::new(),
+        }
+    }
+
+    /// A key carrying only `resolve_addresses`, for one hostname.
+    fn resolve_conn(host: &str, addrs: &[&str]) -> UpstreamConnection {
+        UpstreamConnection {
+            tls: None,
+            resolve: vec![(
+                host.to_string(),
+                addrs.iter().map(|a| a.parse().unwrap()).collect(),
+            )],
+        }
     }
 
     /// `tls: {}` — every field left at its default — is not an override,
@@ -726,10 +840,63 @@ mod tests {
     /// dispatching on the bridge's own client, so nothing is cached.
     #[test]
     fn a_key_without_an_override_builds_no_dedicated_client() {
-        let noop = ProviderKeyTls::default();
+        let noop = tls_conn(ProviderKeyTls::default());
         let _ = client_for_provider_key(&shared_client(), None);
+        // Passed a profile that configures nothing — the shape a caller
+        // assembling `UpstreamConnection` by hand can produce — this must
+        // still land on the shared pool rather than build a client and
+        // split it.
         let _ = client_for_provider_key(&shared_client(), Some(&noop));
         assert!(!cached(&noop));
+    }
+
+    /// `resolve_addresses` is an override in its own right: a key that
+    /// sets it while leaving TLS at the deployment defaults still needs
+    /// its own client, because reqwest attaches name resolution to the
+    /// client and not to the request.
+    #[test]
+    fn resolve_addresses_alone_build_a_dedicated_client() {
+        let key: aisix_core::models::ProviderKey = serde_json::from_value(serde_json::json!({
+            "display_name": "pk-alone",
+            "api_key": "sk-x",
+            "api_base": "https://vendor-alone.invalid/v1",
+            "resolve_addresses": ["192.0.2.10", "192.0.2.11"],
+        }))
+        .unwrap();
+        let conn = key.upstream_connection().expect("an override is set");
+        assert_eq!(conn.tls, None);
+        assert_eq!(
+            conn.resolve,
+            resolve_conn("vendor-alone.invalid", &["192.0.2.10", "192.0.2.11"]).resolve
+        );
+        let _ = client_for_provider_key(&shared_client(), Some(&conn));
+        assert!(cached(&conn));
+    }
+
+    /// Two keys pointing the same hostname at different addresses must not
+    /// share a client: the resolution lives on the client, so one pool
+    /// could only ever dial one of the two.
+    #[test]
+    fn different_addresses_for_one_hostname_get_different_clients() {
+        let first = resolve_conn("vendor-split.invalid", &["192.0.2.21"]);
+        let second = resolve_conn("vendor-split.invalid", &["192.0.2.22"]);
+        assert_ne!(first, second);
+        let _ = client_for_provider_key(&shared_client(), Some(&first));
+        let _ = client_for_provider_key(&shared_client(), Some(&second));
+        assert!(cached(&first));
+        assert!(cached(&second));
+        let for_this_host = PK_CLIENTS
+            .get()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.key()
+                    .resolve
+                    .iter()
+                    .any(|(h, _)| h == "vendor-split.invalid")
+            })
+            .count();
+        assert_eq!(for_this_host, 2);
     }
 
     /// Two keys configured identically land on one client, so a
@@ -741,9 +908,9 @@ mod tests {
             ca_cert: Some(String::from_utf8(ca_pem()).unwrap()),
             verify: true,
         };
-        assert!(!cached(&tls));
-        let _ = client_for_provider_key(&shared_client(), Some(&tls));
-        let _ = client_for_provider_key(&shared_client(), Some(&tls.clone()));
+        assert!(!cached(&tls_conn(tls.clone())));
+        let _ = client_for_provider_key(&shared_client(), Some(&tls_conn(tls.clone())));
+        let _ = client_for_provider_key(&shared_client(), Some(&tls_conn(tls.clone())));
 
         // Counted per-CA rather than over the whole map: the tests in
         // this module share the static and run concurrently, so a total
@@ -753,7 +920,7 @@ mod tests {
             .get()
             .unwrap()
             .iter()
-            .filter(|e| e.key().ca_cert == tls.ca_cert)
+            .filter(|e| e.key().tls.as_ref().map(|t| &t.ca_cert) == Some(&tls.ca_cert))
             .count();
         assert_eq!(
             for_this_ca, 1,
@@ -771,8 +938,33 @@ mod tests {
             ca_cert: Some("-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n".into()),
             verify: true,
         };
-        let _ = client_for_provider_key(&shared_client(), Some(&tls));
-        assert!(!cached(&tls));
+        let _ = client_for_provider_key(&shared_client(), Some(&tls_conn(tls.clone())));
+        assert!(!cached(&tls_conn(tls)));
+    }
+
+    /// The same failure, on a key that also names addresses, must NOT
+    /// land on the shared client: that one resolves the hostname through
+    /// DNS, so the key's credential would go to whatever public DNS
+    /// answers rather than to the private endpoint — and would very
+    /// likely get there. The resolution survives; only the trust material
+    /// that failed to load is dropped.
+    #[test]
+    fn a_malformed_ca_cert_beside_an_address_override_keeps_the_addresses() {
+        let tls = ProviderKeyTls {
+            ca_cert: Some("-----BEGIN CERTIFICATE-----\nbad\n-----END CERTIFICATE-----\n".into()),
+            verify: true,
+        };
+        let addresses = resolve_conn("vendor-failclosed.invalid", &["192.0.2.31"]);
+        let conn = UpstreamConnection {
+            tls: Some(tls),
+            resolve: addresses.resolve.clone(),
+        };
+        let _ = client_for_provider_key(&shared_client(), Some(&conn));
+        assert!(!cached(&conn), "the unbuildable profile must not be cached");
+        assert!(
+            cached(&addresses),
+            "the request must still be dispatched to the configured addresses"
+        );
     }
 
     /// `verify: false` alone is a real override — no CA, but a different
@@ -783,7 +975,7 @@ mod tests {
             ca_cert: None,
             verify: false,
         };
-        let _ = client_for_provider_key(&shared_client(), Some(&tls));
-        assert!(cached(&tls));
+        let _ = client_for_provider_key(&shared_client(), Some(&tls_conn(tls.clone())));
+        assert!(cached(&tls_conn(tls)));
     }
 }

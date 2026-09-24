@@ -14,6 +14,7 @@ import {
   type CapturedSpan,
   type MockOtlp,
 } from "../harness/otlp-mock.js";
+import { metricDelta, scrapeMetrics } from "../harness/metrics.js";
 
 // E2E (AISIX-Cloud#1279): the OTLP export is a real trace, not a bag of
 // disconnected spans. One request — including a failover with a failed
@@ -818,6 +819,110 @@ describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
     expect(spans).toHaveLength(1);
     expect(spans[0].kind).toBe(KIND_SERVER);
     expect(spans[0].parentSpanId).toBe("");
+  });
+
+  test("an exporter that never recovers counts every failed attempt and the records it lost", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    // #1060: the fan-out already accounted these in `SinkStats`, which is
+    // the heartbeat's view and resets whenever an exporter is
+    // reconfigured. Nothing reached `GET /metrics`, so an operator
+    // querying either family saw an empty result whether telemetry was
+    // flowing or being discarded.
+    //
+    // A refusal the sink treats as PERMANENT (400), so the batch is
+    // dropped on its first attempt. A transient refusal is now retried on
+    // a budget of minutes — the retry half is asserted separately below,
+    // by the attempt counter rather than by waiting the budget out.
+    const otlp = await startMockOtlp({ failFirst: 50, failStatus: 400 });
+    receivers.push(otlp);
+    const exporterName = "trace-fanout-drop-otlp";
+    await seed.createObservabilityExporter({
+      name: exporterName,
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlp.url,
+    });
+    const upstream = await startOpenAiUpstream({
+      nonStreamBody: okUpstreamBody("cmpl-fanout-drop"),
+    });
+    upstreams.push(upstream);
+    await createOpenAiModel("trace-fanout-drop-direct", upstream);
+    await propagate();
+
+    const before = await scrapeMetrics(app.metricsUrl);
+    await driveChat("trace-fanout-drop-direct");
+
+    const deadline = Date.now() + 30_000;
+    let drops = 0;
+    let failures = 0;
+    while (Date.now() < deadline) {
+      const after = await scrapeMetrics(app.metricsUrl);
+      drops = metricDelta(before, after, "aisix_otlp_fanout_drops_total", {
+        exporter: exporterName,
+        reason: "permanent_error",
+      });
+      failures = metricDelta(before, after, "aisix_otlp_fanout_failures_total", {
+        exporter: exporterName,
+      });
+      if (drops > 0) break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    expect(drops).toBeGreaterThan(0);
+    // One count per failed ATTEMPT — the distinction between the two
+    // families is exactly this.
+    expect(failures).toBeGreaterThan(0);
+    // The receiver really did refuse it.
+    expect(otlp.posts).toBeGreaterThan(0);
+  });
+
+  test("a receiver that keeps failing transiently is still being retried minutes later", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    // The defect: the batch was given up on 3.0s after its first attempt
+    // (four retries of a ladder that doubled 200ms to a 5s cap), so a
+    // receiver outage longer than that lost every batch that started
+    // inside it. The budget is minutes now, so what this asserts is that
+    // the batch is STILL being retried well past the old give-up point —
+    // not the give-up itself, which no e2e should sit out.
+    const otlp = await startMockOtlp({ failFirst: 10_000 });
+    receivers.push(otlp);
+    const exporterName = "trace-fanout-retry-otlp";
+    await seed.createObservabilityExporter({
+      name: exporterName,
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlp.url,
+    });
+    const upstream = await startOpenAiUpstream({
+      nonStreamBody: okUpstreamBody("cmpl-fanout-retry"),
+    });
+    upstreams.push(upstream);
+    await createOpenAiModel("trace-fanout-retry-direct", upstream);
+    await propagate();
+
+    const before = await scrapeMetrics(app.metricsUrl);
+    await driveChat("trace-fanout-retry-direct");
+
+    // Past the old 3.0s ceiling: by here the batch used to be gone.
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && otlp.posts < 6) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    const after = await scrapeMetrics(app.metricsUrl);
+
+    expect(otlp.posts).toBeGreaterThanOrEqual(6);
+    expect(
+      metricDelta(before, after, "aisix_otlp_fanout_drops_total", {
+        exporter: exporterName,
+        reason: "retries_exhausted",
+      }),
+    ).toBe(0);
   });
 
   test("a transient receiver failure re-delivers byte-identical span ids", async (ctx) => {

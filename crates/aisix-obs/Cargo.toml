@@ -18,6 +18,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+metrics-util.workspace = true
+crossbeam-queue.workspace = true
+quanta.workspace = true
+bytes.workspace = true
 regex.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
@@ -44,3 +48,7 @@ lz4_flex.workspace = true
 [dev-dependencies]
 wiremock.workspace = true
 futures.workspace = true
+# `test-util` plays the delivery retry ladder out on a paused clock: the
+# budget is minutes of wall time and the cases assert where each attempt
+# lands in it.
+tokio = { workspace = true, features = ["test-util"] }

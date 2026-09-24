@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, RoutingStrategy};
@@ -143,46 +143,40 @@ pub fn config_readiness_block(last_apply_age: Option<Duration>) -> Option<&'stat
     }
 }
 
-pub fn livez_response(livez: &LivezState, verbose: bool) -> Response {
-    let mut body = String::new();
-    let mut failed = false;
-
-    body.push_str("[+]ping ok\n");
-    match livez.shutdown_check() {
-        Ok(()) => body.push_str("[+]shutdown ok\n"),
-        Err(_) => {
-            failed = true;
-            body.push_str("[-]shutdown failed: reason withheld\n");
-        }
-    }
-
+/// `GET /livez` — process liveness: should this instance be RESTARTED?
+///
+/// Answering at all is the check. The listener is bound and the runtime
+/// is servicing requests, which is the whole of what a liveness probe
+/// decides, so this never fails.
+///
+/// A draining instance answers `200` like any other. Draining is
+/// deliberate work, not a fault: an instance that has been told to shut
+/// down is finishing the requests it already accepted, and restarting it
+/// kills exactly those. That is what a failing liveness probe asks a
+/// platform to do, which is why "stop sending traffic here" belongs on
+/// [`readyz_response`] instead — the two questions are what separates
+/// the endpoints, and answering both with the drain state collapses them
+/// into one.
+///
+/// The platform is not the only caller that matters: the gateway also
+/// runs as a single container under docker or systemd, where a
+/// supervisor watching this endpoint would restart a healthy draining
+/// process mid-flight.
+///
+/// [`LivezState`] is deliberately not a parameter. The drain state is the
+/// one thing this answer must not depend on, and not taking it is a
+/// stronger guarantee than a comment saying so.
+pub fn livez_response(verbose: bool) -> Response {
     let headers = [
         (CONTENT_TYPE, TEXT_PLAIN_UTF8.clone()),
         (X_CONTENT_TYPE_OPTIONS.clone(), NOSNIFF.clone()),
     ];
 
-    if failed {
-        // Graceful shutdown is an expected drain, not an internal error —
-        // 503 so Kubernetes stops routing without treating it as a crash
-        // loop (#591).
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            headers,
-            format!("{body}livez check failed"),
-        )
-            .into_response();
-    }
-
     if !verbose {
         return (StatusCode::OK, headers, "ok").into_response();
     }
 
-    (
-        StatusCode::OK,
-        headers,
-        format!("{body}livez check passed\n"),
-    )
-        .into_response()
+    (StatusCode::OK, headers, "[+]ping ok\nlivez check passed\n").into_response()
 }
 
 /// `GET /readyz` — readiness (traffic eligibility), distinct from `/livez`
@@ -439,16 +433,29 @@ impl Entry {
 /// byte-identical behavior. Only when none holds do the trackers take the
 /// cheap read-first paths — writes whose consumers provably don't exist.
 ///
-/// The predicate set is recomputed at most once per snapshot version
-/// (packed with the version into one atomic so the pair can never be
-/// observed torn). A racing store between the version read and the table
-/// walk can cache bits against a stale version; the next call detects the
-/// mismatch and recomputes, so the value converges immediately.
+/// Two tiers, both packed with their key into one atomic so a pair can
+/// never be observed torn. The hot tier is keyed on the snapshot version:
+/// one relaxed load answers "nothing has changed at all". When that
+/// misses, the `models` table generation answers "nothing THIS reads has
+/// changed" — a write to any other resource kind then costs one snapshot
+/// load and restamps the hot tier rather than rescanning every model.
+/// Before AISIX-Cloud#1542 the version was the only key, so every API-key
+/// edit rescanned the whole model table on the next request.
+///
+/// A racing store between a key read and the table walk can cache bits
+/// against a stale key; the next call detects the mismatch and
+/// recomputes, so the value converges immediately.
 #[derive(Debug)]
 pub struct BookkeepingFlags {
     snapshot: SnapshotHandle<AisixSnapshot>,
     /// `(snapshot version << 3) | predicate bits`, or [`UNCOMPUTED`].
     packed: AtomicU64,
+    /// `(models table generation << 3) | predicate bits`, or
+    /// [`UNCOMPUTED`].
+    packed_by_generation: AtomicU64,
+    /// Walks of the model table. The observable behind "an unrelated
+    /// configuration write does not rescan every model".
+    scans: AtomicU64,
 }
 
 const FLAG_LEAST_BUSY: u64 = 1;
@@ -462,6 +469,8 @@ impl BookkeepingFlags {
         Arc::new(Self {
             snapshot,
             packed: AtomicU64::new(UNCOMPUTED),
+            packed_by_generation: AtomicU64::new(UNCOMPUTED),
+            scans: AtomicU64::new(0),
         })
     }
 
@@ -471,6 +480,12 @@ impl BookkeepingFlags {
         self.bits() != 0
     }
 
+    /// Model-table walks run so far.
+    #[cfg(test)]
+    fn scans(&self) -> u64 {
+        self.scans.load(Ordering::Relaxed)
+    }
+
     fn bits(&self) -> u64 {
         let ver = self.snapshot.version();
         let packed = self.packed.load(Ordering::Relaxed);
@@ -478,6 +493,17 @@ impl BookkeepingFlags {
             return packed & FLAG_BITS;
         }
         let snap = self.snapshot.load();
+        let generation = snap.models.generation();
+        let by_generation = self.packed_by_generation.load(Ordering::Relaxed);
+        if by_generation != UNCOMPUTED && by_generation >> 3 == generation {
+            // Some other table moved. The predicates read `models` only,
+            // so the answer stands — restamp it under the new version so
+            // the next call takes the one-load path again.
+            let bits = by_generation & FLAG_BITS;
+            self.packed.store((ver << 3) | bits, Ordering::Relaxed);
+            return bits;
+        }
+        self.scans.fetch_add(1, Ordering::Relaxed);
         let mut bits = 0;
         for entry in snap.models.entries() {
             let m = &entry.value;
@@ -492,6 +518,8 @@ impl BookkeepingFlags {
                 bits |= FLAG_HEALTH_CHECKS;
             }
         }
+        self.packed_by_generation
+            .store((generation << 3) | bits, Ordering::Relaxed);
         self.packed.store((ver << 3) | bits, Ordering::Relaxed);
         bits
     }
@@ -513,6 +541,14 @@ pub struct HealthTracker {
 /// jitter, roughly matching LiteLLM's last-10-samples moving average.
 const LATENCY_EWMA_ALPHA: f64 = 0.3;
 
+/// Minimum gap between two `routing candidate excluded` lines for the same
+/// (target, reason). The exclusion happens on the per-request routing path,
+/// so an unthrottled line would be one log per request for as long as a
+/// target stays out of rotation — on a busy gateway that is a flood, and a
+/// flood is what gets a diagnostic turned off before the incident that
+/// needs it.
+const EXCLUSION_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Default, Debug)]
 pub struct ModelRuntimeStatusTracker {
     entries: DashMap<String, RuntimeEntry>,
@@ -533,6 +569,15 @@ pub struct ModelRuntimeStatusTracker {
     /// every method runs its historical write path. See
     /// [`BookkeepingFlags`].
     flags: Option<Arc<BookkeepingFlags>>,
+    /// When the last `routing candidate excluded` line was written, per
+    /// (routing group, target, reason). See
+    /// [`ModelRuntimeStatusTracker::should_log_exclusion`] for why the
+    /// group is part of the key and not just the target.
+    ///
+    /// Bounded by the configured groups times their members times the two
+    /// reasons; entries for a group or target the operator has since
+    /// deleted are never revisited and cost one key each.
+    exclusion_log: DashMap<(String, String, &'static str), Instant>,
 }
 
 /// RAII guard that decrements a target's in-flight counter when dropped.
@@ -645,11 +690,54 @@ impl ModelRuntimeStatusTracker {
             metrics: Some(metrics),
             snapshot: Some(snapshot),
             flags: Some(flags),
+            exclusion_log: DashMap::new(),
         }
     }
 
     fn bookkeeping_active(&self) -> bool {
         self.flags.as_ref().is_none_or(|f| f.any_active())
+    }
+
+    /// Rate gate for the `routing candidate excluded` line: true at most
+    /// once per [`EXCLUSION_LOG_INTERVAL`] for a given (routing group,
+    /// target, reason).
+    ///
+    /// The **group** is in the key because the line names one, and the
+    /// operator reads it per group. One direct model is routinely a
+    /// target of several groups; keyed on the target alone, a busy group
+    /// would win the window almost every time it opened and a quiet group
+    /// sharing that target would print nothing at all — leaving exactly
+    /// the "one attempt, no explanation" trace this line exists to
+    /// remove. It also decides `candidates`, which differs per group.
+    ///
+    /// A change of reason logs immediately rather than waiting out the
+    /// previous window, so a target that goes from cooling to
+    /// background-unhealthy is not hidden behind the cooling line. Only
+    /// excluded candidates reach here, so the steady state of a healthy
+    /// group takes no write lock at all.
+    pub(crate) fn should_log_exclusion(
+        &self,
+        virtual_name: &str,
+        model_id: &str,
+        reason: &'static str,
+    ) -> bool {
+        let key = (virtual_name.to_string(), model_id.to_string(), reason);
+        // Decide and update under one guard. A get() guard held by a match
+        // scrutinee would survive into insert() and deadlock on expiration.
+        match self.exclusion_log.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let now = Instant::now();
+                if now.duration_since(*entry.get()) < EXCLUSION_LOG_INTERVAL {
+                    return false;
+                }
+                entry.insert(now);
+                true
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(Instant::now());
+                true
+            }
+        }
     }
 
     pub fn mark_cooldown(&self, model_id: &str, ttl: Duration, reason: impl Into<String>) {
@@ -966,6 +1054,42 @@ mod tests {
     use axum::body::to_bytes;
     use std::thread;
 
+    fn an_api_key() -> aisix_core::ApiKey {
+        serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["vg"]}"#).expect("test key")
+    }
+
+    #[test]
+    fn a_write_to_an_unrelated_table_does_not_rescan_the_models() {
+        // The predicates read `models` and nothing else, but they used to
+        // be keyed on the snapshot version, which moves on every
+        // published write of any kind — so a bulk API-key edit rescanned
+        // the whole model table on the next request (AISIX-Cloud#1542).
+        let handle =
+            SnapshotHandle::new(snapshot_with(Some(model_json(Some("least_busy"), false))));
+        let flags = BookkeepingFlags::new(handle.clone());
+        assert!(flags.any_active());
+        assert_eq!(flags.scans(), 1);
+
+        for i in 0..5 {
+            let next = handle.load().as_ref().clone();
+            next.apikeys.insert(aisix_core::ResourceEntry::new(
+                format!("k-{i}"),
+                an_api_key(),
+                1,
+            ));
+            handle.store(next);
+            assert!(flags.any_active(), "the answer must not change");
+        }
+        assert_eq!(flags.scans(), 1, "the model table was walked again");
+
+        // A write that DOES touch models rescans.
+        let next = handle.load().as_ref().clone();
+        next.models.remove("m-1");
+        handle.store(next);
+        assert!(!flags.any_active());
+        assert_eq!(flags.scans(), 2);
+    }
+
     #[test]
     fn new_model_is_healthy() {
         let t = HealthTracker::new();
@@ -1059,6 +1183,7 @@ mod tests {
             metrics: None,
             snapshot: None,
             flags: Some(flags),
+            ..Default::default()
         };
         (handle, t)
     }
@@ -1188,8 +1313,7 @@ mod tests {
 
     #[tokio::test]
     async fn livez_default_success_is_plain_ok() {
-        let state = LivezState::new();
-        let resp = livez_response(&state, false);
+        let resp = livez_response(false);
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
@@ -1198,28 +1322,34 @@ mod tests {
 
     #[tokio::test]
     async fn livez_verbose_success_lists_checks() {
-        let state = LivezState::new();
-        let resp = livez_response(&state, true);
+        let resp = livez_response(true);
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("[+]ping ok"));
-        assert!(text.contains("[+]shutdown ok"));
         assert!(text.contains("livez check passed"));
     }
 
+    /// A draining instance is healthy and must not be restarted:
+    /// restarting it kills the in-flight requests the drain exists to
+    /// finish. Liveness therefore stays `200` throughout, and it is
+    /// `/readyz` that withdraws the instance from traffic — the test
+    /// below pins the other half.
     #[tokio::test]
-    async fn livez_failure_returns_503_with_reason_withheld() {
+    async fn livez_stays_ok_while_draining() {
         let state = LivezState::new();
         state.mark_shutting_down();
-        let resp = livez_response(&state, false);
 
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
-        let text = std::str::from_utf8(&body).unwrap();
-        assert!(text.contains("[-]shutdown failed: reason withheld"));
-        assert!(text.contains("livez check failed"));
+        let resp = livez_response(false);
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let readyz = readyz_response(&state, None, false);
+        assert_eq!(
+            readyz.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the drain has to be visible somewhere, and readiness is where",
+        );
     }
 
     /// The count has to survive an unpaired decrement: it is reported on
@@ -1491,6 +1621,102 @@ mod tests {
         assert_eq!(s.status, RuntimeStatus::Healthy);
         assert_eq!(s.last_check_status, Some(429));
         assert_eq!(s.status_reason.as_deref(), Some("ignored_transient_error"));
+    }
+
+    #[test]
+    fn exclusion_log_gate_throttles_a_repeat_and_lets_a_new_reason_through() {
+        // The gate is what keeps the `routing candidate excluded` WARN
+        // off the per-request hot path. Its two obligations: never write
+        // the same (target, reason) twice inside the window, and never
+        // let the window hide a target whose reason has changed.
+        let t = ModelRuntimeStatusTracker::new();
+        assert!(t.should_log_exclusion("g-1", "m-1", "cooling"));
+        assert!(!t.should_log_exclusion("g-1", "m-1", "cooling"));
+        assert!(t.should_log_exclusion("g-1", "m-1", "unhealthy"));
+        assert!(!t.should_log_exclusion("g-1", "m-1", "unhealthy"));
+        // Throttling is per target, not global.
+        assert!(t.should_log_exclusion("g-1", "m-2", "cooling"));
+        // …and per routing group: a second group that shares `m-1` still
+        // gets its own line, because it has its own `candidates` count and
+        // its own operator reading it.
+        assert!(t.should_log_exclusion("g-2", "m-1", "cooling"));
+        assert!(!t.should_log_exclusion("g-2", "m-1", "cooling"));
+    }
+
+    #[test]
+    fn exclusion_log_gate_does_not_extend_the_window_when_suppressed() {
+        let t = ModelRuntimeStatusTracker::new();
+        let key = ("g-1".to_string(), "m-1".to_string(), "cooling");
+        let logged_at = Instant::now() - EXCLUSION_LOG_INTERVAL / 2;
+        t.exclusion_log.insert(key.clone(), logged_at);
+
+        for _ in 0..8 {
+            assert!(!t.should_log_exclusion("g-1", "m-1", "cooling"));
+            // Busy traffic must not postpone the next log indefinitely.
+            assert_eq!(*t.exclusion_log.get(&key).unwrap(), logged_at);
+        }
+    }
+
+    #[test]
+    fn exclusion_log_gate_reopens_after_the_interval_without_blocking() {
+        let t = Arc::new(ModelRuntimeStatusTracker::new());
+        t.exclusion_log.insert(
+            ("g-1".to_string(), "m-1".to_string(), "cooling"),
+            Instant::now() - EXCLUSION_LOG_INTERVAL,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let reopened = t.should_log_exclusion("g-1", "m-1", "cooling");
+            let repeated = t.should_log_exclusion("g-1", "m-1", "cooling");
+            tx.send((reopened, repeated)).unwrap();
+        });
+        // A synchronous lock deadlock cannot be bounded by a Tokio timeout
+        // on the same worker. Keep the watchdog on the test thread.
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("exclusion logging blocked after its throttle expired"),
+            (true, false),
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn exclusion_log_gate_allows_one_concurrent_writer_per_window() {
+        for expired in [false, true] {
+            let t = Arc::new(ModelRuntimeStatusTracker::new());
+            if expired {
+                t.exclusion_log.insert(
+                    ("g-1".to_string(), "m-1".to_string(), "cooling"),
+                    Instant::now() - EXCLUSION_LOG_INTERVAL,
+                );
+            }
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let t = t.clone();
+                    let barrier = barrier.clone();
+                    let tx = tx.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        tx.send(t.should_log_exclusion("g-1", "m-1", "cooling"))
+                            .unwrap();
+                    })
+                })
+                .collect();
+            let allowed = (0..8)
+                .map(|_| {
+                    usize::from(
+                        rx.recv_timeout(Duration::from_secs(2))
+                            .expect("concurrent exclusion logging blocked"),
+                    )
+                })
+                .sum::<usize>();
+            assert_eq!(allowed, 1, "expired={expired}");
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        }
     }
 
     #[test]

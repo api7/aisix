@@ -11,7 +11,8 @@
 //!   That is the full request for a non-streamed response and only time to
 //!   response START for a streamed one; `aisix_request_e2e_latency_seconds`
 //!   is the series that is end-to-end on both. See `request_metrics`.
-//! - `aisix_ratelimit_rejections_total{scope}` — counter for 429 flows.
+//! - `aisix_ratelimit_rejections_total{scope,layer,policy_id}` — counter for
+//!   429 flows.
 //! - `aisix_tokens_consumed_total{provider,model}` — counter of
 //!   `usage.total_tokens` summed across completed calls. Streamed calls are
 //!   included: they contribute from the end-of-stream emit, not at response
@@ -27,9 +28,10 @@
 //! `metrics-exporter-prometheus`'s text renderer; no global recorder is
 //! installed, so tests can spin up isolated instances per case.
 
-use metrics_exporter_prometheus::{
-    Matcher, PrometheusBuilder, PrometheusHandle, PrometheusRecorder,
-};
+use crate::metric_labels::{LabelRecorder, LabelSelection};
+use crate::prometheus::Recorder as PrometheusRecorder;
+use crate::scrape::Scrape;
+use metrics_exporter_prometheus::{DistributionBuilder, Matcher};
 use std::collections::HashMap;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -47,9 +49,46 @@ pub const M_LLM_SPEND_MICRO_USD_TOTAL: &str = "aisix_llm_spend_micro_usd_total";
 pub const M_LLM_INPUT_TOKENS_TOTAL: &str = "aisix_llm_input_tokens_total";
 pub const M_LLM_OUTPUT_TOKENS_TOTAL: &str = "aisix_llm_output_tokens_total";
 pub const M_LLM_TOTAL_TOKENS_TOTAL: &str = "aisix_llm_total_tokens_total";
+// ── Upstream prompt-cache token detail (AISIX-Cloud#1404) ───────────────
+//
+// The upstream provider's OWN prompt cache, not the gateway's response /
+// semantic cache — that one is `aisix_cache_requests_total{outcome}`, and
+// mixing the two is the whole reason these carry `input` in the name.
+//
+// Three counters rather than two because the providers report cache reads
+// under two INCOMPATIBLE accounting rules, and folding them together makes
+// every cross-protocol ratio wrong:
+//
+// - OpenAI-shape (`prompt_tokens_details.cached_tokens`, DeepSeek's
+//   `prompt_cache_hit_tokens`, Gemini's `cachedContentTokenCount`) is a
+//   SUBSET of the reported prompt tokens — already inside
+//   `aisix_llm_input_tokens_total`.
+// - Anthropic-shape (`cache_read_input_tokens` / `cache_creation_input_tokens`,
+//   Bedrock's `cacheReadInputTokens` / `cacheWriteInputTokens`) is reported
+//   ALONGSIDE `input_tokens` — outside `aisix_llm_input_tokens_total`, and
+//   folded into `aisix_llm_total_tokens_total` by `total_tokens_with_cache`.
+//
+// So the cache-inclusive input a request really consumed is
+// `input + cache_read + cache_creation`, and the part of it served from
+// cache is `cached_input + cache_read`. Both expressions hold for either
+// provider shape precisely because the two reads stay separate here.
+//
+// All three are sparse: a series appears only once its value is non-zero,
+// so providers that report no cache detail mint nothing.
+/// Prompt-cache hits the upstream reported as part of its prompt token
+/// count — already included in [`M_LLM_INPUT_TOKENS_TOTAL`].
+pub const M_LLM_CACHED_INPUT_TOKENS_TOTAL: &str = "aisix_llm_cached_input_tokens_total";
+/// Prompt-cache hits the upstream reported as a counter separate from its
+/// input tokens — NOT included in [`M_LLM_INPUT_TOKENS_TOTAL`], and
+/// included in [`M_LLM_TOTAL_TOKENS_TOTAL`].
+pub const M_LLM_CACHE_READ_INPUT_TOKENS_TOTAL: &str = "aisix_llm_cache_read_input_tokens_total";
+/// Input tokens written INTO the upstream's prompt cache. Reported as a
+/// counter separate from input tokens, and billed at a premium by every
+/// provider that reports it.
+pub const M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL: &str =
+    "aisix_llm_cache_creation_input_tokens_total";
 pub const M_LLM_REQUESTS_TOTAL: &str = "aisix_llm_requests_total";
 pub const M_LLM_REQUEST_DURATION: &str = "aisix_llm_request_duration_seconds";
-pub const M_LLM_API_LATENCY: &str = "aisix_llm_api_latency_seconds";
 pub const M_LLM_TTFT: &str = "aisix_llm_time_to_first_token_seconds";
 /// Issue #890 req-4: token volume sliced by inbound client type — a
 /// DEDICATED low-cardinality series so the client dimension never multiplies
@@ -62,6 +101,21 @@ pub const M_LLM_TTFT: &str = "aisix_llm_time_to_first_token_seconds";
 /// client_type × model × token_type — per-key/team/user dimensions belong to
 /// the `aisix_llm_*_tokens_total` families (or UsageEvent/logs), never here.
 pub const M_LLM_TOKENS_BY_CLIENT_TOTAL: &str = "aisix_llm_tokens_by_client_total";
+/// Requests currently inside a handler, by `endpoint` and
+/// `inbound_protocol`.
+///
+/// Deliberately carries NO `upstream_protocol` (AISIX-Cloud#1403). This
+/// gauge is a matched pair of edges — `InFlightGuard::new` increments on
+/// the way in, its `Drop` decrements on the way out — and the increment
+/// runs in the proxy middleware, BEFORE routing has selected a target, so
+/// at that moment the label has no value but `unknown`. Resolving it only
+/// on the decrement would be worse than useless: the two edges would
+/// address different series, leaving the `unknown` one pinned at a
+/// non-zero count forever on an endpoint that has long gone idle.
+///
+/// Callers wanting concurrency by upstream protocol take it from the
+/// request families, which label the completed request with the target it
+/// actually reached.
 pub const M_PROXY_IN_FLIGHT: &str = "aisix_proxy_in_flight_requests";
 pub const M_PROXY_REQUESTS_TOTAL: &str = "aisix_proxy_requests_total";
 pub const M_PROXY_FAILED_REQUESTS_TOTAL: &str = "aisix_proxy_failed_requests_total";
@@ -96,6 +150,11 @@ pub const M_PROXY_CLIENT_CANCELLED_TOTAL: &str = "aisix_proxy_client_cancelled_r
 /// suppress the log's rate-limited warnings, never this counter. Both
 /// label sets are bounded by construction — `endpoint` is a route
 /// template (#451) and `outcome` a fixed vocabulary.
+///
+/// Deliberately carries NO `upstream_protocol` (AISIX-Cloud#1403): the
+/// cap rejects the request while draining its body, before any handler
+/// runs and therefore before a target is selected, so the label would be
+/// the constant `unknown` on every sample this family can ever produce.
 pub const M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL: &str =
     "aisix_proxy_request_body_limit_rejections_total";
 /// Per-DEPLOYMENT (one concrete Model row = one upstream target) call
@@ -148,14 +207,37 @@ pub const M_BUDGET_DETAILS_PRESENT: &str = "aisix_budget_details_present";
 pub const M_REDIS_FAILURES_TOTAL: &str = "aisix_redis_failures_total";
 pub const M_USAGE_EVENT_DROPS_TOTAL: &str = "aisix_usage_event_drops_total";
 /// Guardrail outcomes (#379 observability). `aisix_guardrail_blocks_total`
-/// counts requests a guardrail rejected (input or output hook; policy or
-/// fail-closed combined). `aisix_guardrail_bypasses_total` counts fail-open
-/// events — a remote-API guardrail's upstream was unreachable but `fail_open`
-/// let the request through — sliced by the bounded DP-internal `reason`
-/// (e.g. `bedrock_5xx` / `bedrock_timeout` / `bedrock_throttled`).
+/// counts REQUESTS rejected by guardrail enforcement, including fail-closed
+/// paths such as a streaming buffer overflow that happen before a guardrail
+/// member executes.
 ///
-/// Scope: recorded for `/v1/chat/completions` only until #519 brings the
-/// `/v1/messages` path in — read these as chat-path, not gateway-wide.
+/// `aisix_guardrail_bypasses_total` counts fail-OPEN EVENTS, sliced by the
+/// bounded DP-internal `reason` (e.g. `bedrock_5xx` / `bedrock_timeout` /
+/// `bedrock_throttled` / `unscannable_body`). Two producers reach it: a
+/// member that executed and was bypassed — a remote-API guardrail's
+/// upstream was unreachable but `fail_open` let the request through — and
+/// a bypass the proxy records with no member execution behind it, an
+/// unscannable body a fail-open chain let through (#1115). The second
+/// producer reaches THIS counter only: with no execution there is no
+/// `aisix_guardrail_latency_seconds` row, so that family's
+/// `result="bypassed"` slice stays execution-only and the two no longer
+/// agree on a total.
+///
+/// The two are NOT the same unit and must not be compared or summed.
+/// `blocks_total` fires once per request, off the terminal usage event;
+/// `bypasses_total` fires once per bypass event, so one outage on a chain
+/// with two fail-open members attached to both hooks adds 4 for a single
+/// request. Read it as "how many screenings were skipped", never as a
+/// count of requests that went unscreened.
+///
+/// The pre-execution case is deliberately symmetric across the two: the
+/// same unscannable body is a block when the chain fails closed and a
+/// bypass when it fails open. It is not the whole of "the gateway could
+/// not scan this", though — the sites that scan a lossy copy
+/// unconditionally, with no failure policy involved
+/// (`jobs::scan_output_blob`, `passthrough_route`), record nothing by
+/// design, so a zero here is not proof that nothing went unread. The set
+/// and its rationale live in `crates/aisix-proxy/AGENTS.md`.
 pub const M_GUARDRAIL_BLOCKS_TOTAL: &str = "aisix_guardrail_blocks_total";
 pub const M_GUARDRAIL_BYPASSES_TOTAL: &str = "aisix_guardrail_bypasses_total";
 
@@ -183,24 +265,46 @@ pub const M_AUTH_DECISIONS_TOTAL: &str = "aisix_auth_decisions_total";
 /// - `phase`: `input` / `output`.
 /// - `result`: `allowed` / `blocked` / `masked` / `bypassed` (remote
 ///   failure + fail-open) / `would_block` / `would_mask` (monitor mode).
-/// - `error_type`: bounded failure tag (e.g. `lakera_timeout`) when
-///   `result="bypassed"`, else `none`. Fail-closed failures surface as
-///   `blocked` (the timeout budget shows up in the latency distribution).
+/// - `error_type`: bounded failure tag (e.g. `lakera_timeout`,
+///   `custom_unknown_action`) whenever the guardrail could not EVALUATE
+///   the content, else `none`. It is populated on `result="bypassed"`
+///   (fail-open) and equally on the `result="blocked"` a fail-CLOSED row
+///   produces for the same cause (AISIX-Cloud#1365) — `result` stays
+///   `blocked` there so a shipped alert on it keeps counting, and
+///   `error_type != "none"` is what separates "this content violated a
+///   policy" from "this guardrail is broken or its provider is down".
 ///
 /// The `_count` series doubles as a per-guardrail execution counter, so
 /// there is no separate `aisix_guardrail_requests_total` (LiteLLM's
 /// `litellm_guardrail_requests_total` equivalent = `sum by (...)` of it).
 pub const M_GUARDRAIL_LATENCY_SECONDS: &str = "aisix_guardrail_latency_seconds";
-/// Issue #408: counter for UsageEvents successfully enqueued onto the
-/// `UsageSink` (i.e. handed off to the telemetry worker for delivery
-/// to cp-api + per-env OTLP exporters). Operators slice this by:
-/// - `handler`: which OpenAI-shape handler emitted (chat /
-///   embeddings / responses / completions / rerank / audio /
-///   images / messages). Fixed enumeration, low cardinality.
-/// - `status_code`: bucketed as `2xx` / `4xx` / `5xx` (avoid the
-///   1000-value cardinality blowup of raw u16 codes).
-/// - `inbound_protocol`: `openai` / `anthropic`. Matches the
-///   wire-level field on UsageEvent.
+/// Issue #408: counter for UsageEvent emission attempts, incremented before
+/// the `UsageSink` accepts or rejects the event. Operators slice this by:
+/// - `handler`: the bounded handler family that emitted the event (for
+///   example `chat`, `messages`, `count_tokens`, `responses`, `mcp`, or
+///   `passthrough_route`). Fixed enumeration, low cardinality.
+/// - `status_code`: bucketed as `2xx` / `4xx` / `5xx`.
+/// - `status`: the raw code (`429`, `502`, ...), so a query can name one
+///   failure mode instead of a whole family (AISIX-Cloud#1389). Named to
+///   match `aisix_proxy_requests_total`'s own raw-code label, so one
+///   spelling works across both families — and deliberately NOT
+///   `http_status_code`, which contains `status_code` as a substring and
+///   would make every `status_code="…"` matcher ambiguous. It adds no
+///   series over `status_code` alone (the raw code determines the family),
+///   and `status_code` is kept so dashboards and alerts written against
+///   `status_code="4xx"` keep working unchanged.
+/// - `user_id` / `user_name`: the org member behind the request and
+///   their display name, from [`UsageEventLabels`]. Both come off one
+///   ApiKey row, so the name is determined by the id and the pair is one
+///   series, not one per name.
+/// - `inbound_protocol`: `openai` / `anthropic` / `mcp` / `other`, with
+///   non-HTTP and tunnel protocols folded into the bounded `other` bucket.
+/// - `upstream_protocol`: the wire protocol of the ProviderKey the event
+///   was attributed to, so this family joins with the request and usage
+///   families on that dimension (AISIX-Cloud#1403). Read off the SAME
+///   resolved row as `provider_key_id` / `provider_key_name`, and
+///   `unknown` for an event that never selected an upstream (a
+///   pre-dispatch rejection, or a non-inference tunnel like `/mcp`).
 ///
 /// Paired with `aisix_usage_event_drops_total{reason}` for the
 /// `try_send` failure paths (sink full / closed).
@@ -312,10 +416,21 @@ pub const M_CONFIG_LAST_RELOAD_SUCCESS_TIMESTAMP: &str =
 pub const M_CONFIG_RELOADS_TOTAL: &str = "aisix_config_reloads_total";
 pub const M_CONFIG_RELOAD_FAILURES_TOTAL: &str = "aisix_config_reload_failures_total";
 pub const M_CONFIG_REJECTED_RESOURCES: &str = "aisix_config_rejected_resources";
+/// Rows per kind whose `kind` segment this gateway version does not know —
+/// forward compatibility, not a load failure, so they are counted here
+/// instead of in [`M_CONFIG_REJECTED_RESOURCES`] and leave
+/// [`M_CONFIG_LAST_RELOAD_SUCCESSFUL`] at `1` (issue #1207). Non-zero means
+/// the control plane writing to this data plane projects a resource kind
+/// this build was released before; serving and later configuration updates
+/// are unaffected, and upgrading the gateway clears it. Disjoint from
+/// [`M_CONFIG_REJECTED_RESOURCES`]: a row is counted by exactly one.
+pub const M_CONFIG_UNKNOWN_KIND_RESOURCES: &str = "aisix_config_unknown_kind_resources";
 /// Served resources per kind carrying fields this gateway version does not
 /// know (loaded with those fields ignored — partially compatible, #871).
-/// Non-zero typically means a newer control plane is writing ahead of this
-/// data plane's rollout.
+/// Non-zero means this data plane and the control plane writing to it are
+/// not the same generation; which one is ahead is not knowable from here
+/// (AISIX-Cloud#1435), since a field this build retired is as unknown to
+/// it as one it has never seen.
 pub const M_CONFIG_PARTIALLY_COMPATIBLE_RESOURCES: &str =
     "aisix_config_partially_compatible_resources";
 /// Served resources per kind whose latest source bytes are rejected and
@@ -328,6 +443,26 @@ pub const M_CONFIG_OBSERVED_REVISION: &str = "aisix_config_observed_revision";
 pub const M_CONFIG_APPLIED_REVISION: &str = "aisix_config_applied_revision";
 pub const M_CONFIG_HASH_INFO: &str = "aisix_config_hash_info";
 pub const M_CONFIG_SOURCE_CONNECTED: &str = "aisix_config_source_connected";
+/// Wall time of one configuration apply — parse, snapshot clone, hash,
+/// cache flush, publish. Pushed by the supervisor through
+/// [`Metrics::record_config_apply`] rather than reflected from a view:
+/// only the apply knows what one cost, and a gauge read at scrape time
+/// would miss every apply between two scrapes.
+///
+/// Renders as a Prometheus SUMMARY, not a histogram — no buckets are
+/// configured for it, same as every other distribution here bar the
+/// three SLO series. So it carries per-instance quantiles over a rolling
+/// window and no `_bucket` series: `histogram_quantile()` against it
+/// returns nothing, and quantiles do not aggregate across gateways.
+pub const M_CONFIG_APPLY_DURATION_SECONDS: &str = "aisix_config_apply_duration_seconds";
+/// How much change that apply carried: watch events for
+/// `trigger="watch"`, rows in the snapshot for `trigger="full"`. Paired
+/// with the duration, this is what separates "the control plane wrote a
+/// lot" from "one small write costs this much".
+pub const M_CONFIG_APPLY_BATCH_EVENTS: &str = "aisix_config_apply_batch_events";
+/// Log events discarded because the log sink was not draining fast
+/// enough. Above zero means the log is incomplete for that window.
+pub const M_LOG_LINES_DROPPED_TOTAL: &str = "aisix_log_lines_dropped_total";
 
 /// Default bucket edges for [`M_REQUEST_E2E_LATENCY_SECONDS`], spanning the
 /// full client-perceived range: a millisecond-scale rejection or cache hit
@@ -472,8 +607,9 @@ pub struct Metrics {
 }
 
 struct MetricsInner {
-    recorder: PrometheusRecorder,
-    handle: PrometheusHandle,
+    recorder: LabelRecorder,
+    handle: Arc<PrometheusRecorder>,
+    scrape: Scrape,
     /// Per-(endpoint, protocol) in-flight counts. A linear scan over a
     /// bounded slot list (route templates × protocols): the steady-state
     /// hit is two pointer-length string compares with no allocation and
@@ -496,12 +632,99 @@ struct MetricsInner {
     /// applied hash changed, or a kind's rejections cleared) instead of
     /// leaving a second, contradictory sample in the exposition.
     config_labels: Mutex<ConfigLabelState>,
+    /// Every label set seen on a gauge family whose identity includes a
+    /// resource that can be deleted, rebound or renamed, so
+    /// [`Metrics::retire_stale_gauges`] can retire the ones that stopped
+    /// describing anything.
+    ///
+    /// These families are written ONLY from the request path, and the
+    /// recorder registers no idle timeout, so a series whose key is gone
+    /// is never touched again and keeps asserting its last value as
+    /// though it were current — `aisix_budget_details_present` stays at
+    /// `1` for a deleted key, latching the documented "over 90%" alert
+    /// with no way to clear short of restarting the process.
+    ///
+    /// Populated on the registration path only (a worker-cache miss), so
+    /// the steady-state emit never touches this lock.
+    retirable: Mutex<HashMap<Box<str>, RetirableSeries>>,
+}
+
+/// A gauge family whose label set can outlive what it describes.
+///
+/// Counters and histograms are deliberately absent: a counter that stops
+/// being written reads as a flat rate and its total stays historically
+/// correct, so nothing has to be retired. Only a gauge asserts a CURRENT
+/// value, which is what goes wrong once the thing it names is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GaugeFamily {
+    /// `aisix_budget_*` — keyed by an api key plus the team / member it
+    /// was bound to at the time.
+    Budget,
+    /// `aisix_ratelimit_remaining_{requests,tokens}` — keyed by an api
+    /// key and a model.
+    RatelimitRemaining,
+}
+
+// `aisix_deployment_state` is NOT here, though its label set can strand
+// the same way. It is edge-triggered: `health.rs`'s `sync_deployment_state`
+// returns early unless the state CHANGED, so a live model is written only
+// when its health flips. Retiring it on a label change — repointing a
+// model at another provider key, or renaming the model — would blank the
+// series with nothing to rewrite it until the next health transition, and
+// "is this deployment up?" going dark is worse than the stale label it
+// would replace. Making it sweepable means having the health tracker
+// re-publish on a snapshot change, which is a different change.
+
+fn family_key(family: GaugeFamily) -> &'static str {
+    match family {
+        GaugeFamily::Budget => "budget",
+        GaugeFamily::RatelimitRemaining => "ratelimit_remaining",
+    }
+}
+
+struct RetirableSeries {
+    family: GaugeFamily,
+    /// Label VALUES in the family's fixed order — the same order
+    /// [`LiveGaugeSeries`] destructures them in.
+    labels: Vec<Box<str>>,
+    /// The metrics actually registered under this label set, and the only
+    /// ones retirement writes.
+    ///
+    /// A family's members are not all present for every label set: a key
+    /// with no budget reaches `clear_budget_gauges`, which writes the
+    /// presence flag alone. Retiring the family's full list would then
+    /// CREATE the four amount series — `metrics::gauge!` registers on
+    /// first use — minting exactly the per-key cardinality that
+    /// `clear_budget_gauges` is careful not to.
+    metrics: Vec<&'static str>,
+}
+
+/// One live label set, handed to the liveness predicate of
+/// [`Metrics::retire_stale_gauges`]. Variants carry named fields rather
+/// than a slice so a caller cannot silently compare the wrong label
+/// against the wrong resource.
+#[derive(Debug, Clone, Copy)]
+pub enum LiveGaugeSeries<'a> {
+    Budget {
+        api_key_id: &'a str,
+        team_id: &'a str,
+        user_id: &'a str,
+        user_name: &'a str,
+    },
+    RatelimitRemaining {
+        api_key_id: &'a str,
+        /// Reported for context only. It is the model string the CALLER
+        /// sent, not a resolved name, so a liveness check must not try to
+        /// look it up — see the emit site's note.
+        model: &'a str,
+    },
 }
 
 #[derive(Default)]
 struct ConfigLabelState {
     last_hash: Option<String>,
     last_rejected_kinds: std::collections::HashSet<String>,
+    last_unknown_kinds: std::collections::HashSet<String>,
     last_partial_kinds: std::collections::HashSet<String>,
     last_stale_kinds: std::collections::HashSet<String>,
 }
@@ -511,6 +734,19 @@ struct ConfigLabelState {
 /// production never approaches this; it is a safety valve against an
 /// unforeseen unbounded dimension pinning memory in every worker.
 const WORKER_CACHE_CAPACITY: usize = 1024;
+
+/// Cap on the retirable-series registry — the process-wide count of
+/// distinct label sets across the gauge families that can outlive what
+/// they name.
+///
+/// The bound that makes one number safe for all of them is that every
+/// dimension is CONFIGURED: api keys, and models collapsed to the
+/// configured set by `usage_attr::metric_model_label`. A caller-shaped
+/// dimension would break it — the registry is shared, so one family able
+/// to mint entries per request would fill the cap and silently stop every
+/// other family from being tracked, which is exactly the failure this
+/// whole mechanism exists to prevent.
+const RETIRABLE_CAPACITY: usize = 16_384;
 
 /// Separator joining label values into a worker-cache key — a control
 /// byte that no bounded label vocabulary contains. A value that DOES
@@ -538,6 +774,9 @@ struct UsageSeriesHandles {
     input_tokens: OnceLock<metrics::Counter>,
     output_tokens: OnceLock<metrics::Counter>,
     total_tokens: OnceLock<metrics::Counter>,
+    cached_input_tokens: OnceLock<metrics::Counter>,
+    cache_read_input_tokens: OnceLock<metrics::Counter>,
+    cache_creation_input_tokens: OnceLock<metrics::Counter>,
     spend_micro_usd: OnceLock<metrics::Counter>,
 }
 
@@ -724,38 +963,53 @@ impl Metrics {
     /// Like [`Metrics::new_with_env_id`], with operator-supplied histogram
     /// bucket edges (`observability.metrics.buckets`, AISIX-Cloud#1226).
     pub fn new_with_buckets(env_id: &str, buckets: &HistogramBuckets) -> Self {
+        Self::new_with_labels(env_id, buckets, &Default::default())
+            .expect("default metric labels are valid")
+    }
+
+    pub fn new_with_labels(
+        env_id: &str,
+        buckets: &HistogramBuckets,
+        labels: &std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Result<Self, String> {
+        let selection = LabelSelection::compile(labels)?;
         // Buckets ONLY for the SLO histograms and the guardrail latency
         // histogram: with `metrics-exporter-prometheus`, a distribution
         // without configured buckets renders as a summary — which is what
         // every legacy `histogram!` series here intentionally stays as.
-        let recorder = PrometheusBuilder::new()
-            .set_buckets_for_metric(
-                Matcher::Full(M_REQUEST_E2E_LATENCY_SECONDS.to_string()),
-                &buckets.request_e2e_latency,
-            )
-            .expect("bucket lists are validated non-empty")
-            .set_buckets_for_metric(
-                Matcher::Full(M_REQUEST_TTFT_SECONDS.to_string()),
-                &buckets.request_ttft,
-            )
-            .expect("bucket lists are validated non-empty")
-            .set_buckets_for_metric(
-                Matcher::Full(M_GUARDRAIL_LATENCY_SECONDS.to_string()),
-                &buckets.guardrail_latency,
-            )
-            .expect("bucket lists are validated non-empty")
-            .set_buckets_for_metric(
-                Matcher::Full(M_A2A_TTFB_SECONDS.to_string()),
-                &buckets.a2a_ttfb,
-            )
-            .expect("bucket lists are validated non-empty")
-            .build_recorder();
-        let handle = recorder.handle();
+        let distributions = DistributionBuilder::new(
+            metrics_util::parse_quantiles(&[0.0, 0.5, 0.9, 0.95, 0.99, 0.999, 1.0]),
+            None,
+            None,
+            None,
+            Some(HashMap::from([
+                (
+                    Matcher::Full(M_REQUEST_E2E_LATENCY_SECONDS.to_string()),
+                    buckets.request_e2e_latency.clone(),
+                ),
+                (
+                    Matcher::Full(M_REQUEST_TTFT_SECONDS.to_string()),
+                    buckets.request_ttft.clone(),
+                ),
+                (
+                    Matcher::Full(M_GUARDRAIL_LATENCY_SECONDS.to_string()),
+                    buckets.guardrail_latency.clone(),
+                ),
+                (
+                    Matcher::Full(M_A2A_TTFB_SECONDS.to_string()),
+                    buckets.a2a_ttfb.clone(),
+                ),
+            ])),
+        );
+        let recorder = Arc::new(PrometheusRecorder::new(distributions));
+        let handle = recorder.clone();
+        let recorder = LabelRecorder::new(recorder, selection, env_id);
         static NEXT_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        Self {
+        Ok(Self {
             inner: Arc::new(MetricsInner {
                 recorder,
                 handle,
+                scrape: Scrape::default(),
                 proxy_in_flight: Mutex::new(Vec::new()),
                 worker_key_prefix: format!(
                     "{:x}",
@@ -767,8 +1021,206 @@ impl Metrics {
                     env_id.to_string()
                 },
                 config_labels: Mutex::new(ConfigLabelState::default()),
+                retirable: Mutex::new(HashMap::new()),
             }),
+        })
+    }
+
+    /// Record what one configuration apply cost.
+    ///
+    /// `trigger` is `watch` for a coalesced watch batch and `full` for a
+    /// (re)load of every prefix; `events` counts watch events for the
+    /// first and snapshot rows for the second.
+    pub fn record_config_apply(&self, trigger: &'static str, events: usize, elapsed: Duration) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::histogram!(M_CONFIG_APPLY_DURATION_SECONDS, "trigger" => trigger)
+                .record(elapsed.as_secs_f64());
+            metrics::histogram!(M_CONFIG_APPLY_BATCH_EVENTS, "trigger" => trigger)
+                .record(events as f64);
+        });
+    }
+
+    /// Reflect the log writer's drop total into the recorder.
+    ///
+    /// Pulled at scrape time, like [`Self::sync_config_status`]: the
+    /// writer thread predates this struct and has no recorder of its own.
+    /// Always emitted, so the series reads `0` on a healthy gateway
+    /// rather than being absent.
+    pub fn sync_log_status(&self) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::counter!(M_LOG_LINES_DROPPED_TOTAL)
+                .absolute(crate::log_writer::dropped_total());
+        });
+    }
+
+    /// Remember one label set of a retirable gauge family.
+    ///
+    /// Called from the REGISTRATION path only — a worker-cache miss — so
+    /// the steady-state emit never takes this lock. Re-registration (a
+    /// second worker, or a cache eviction) is an idempotent no-op.
+    fn track_retirable(&self, family: GaugeFamily, metric: &'static str, labels: &[&str]) {
+        let mut key = String::with_capacity(64);
+        key.push_str(family_key(family));
+        for value in labels {
+            key.push(WORKER_KEY_SEP);
+            key.push_str(value);
         }
+        let mut map = self.inner.retirable.lock().expect("retirable registry");
+        if let Some(entry) = map.get_mut(key.as_str()) {
+            // A label set is registered once per metric per worker, and the
+            // members appear at different times — a key gets its presence
+            // flag on the request that finds no budget and its amounts only
+            // once one exists. So an existing entry still has to learn about
+            // a metric it has not seen.
+            if !entry.metrics.contains(&metric) {
+                entry.metrics.push(metric);
+            }
+            return;
+        }
+        // Safety valve, same reasoning as `WORKER_CACHE_CAPACITY`: these
+        // label sets are bounded by the configured resources, but an
+        // unforeseen unbounded dimension must not pin memory here. Losing
+        // a registration only means that series is not retirable — never
+        // a wrong value.
+        if map.len() >= RETIRABLE_CAPACITY {
+            return;
+        }
+        map.insert(
+            Box::from(key.as_str()),
+            RetirableSeries {
+                family,
+                labels: labels.iter().map(|v| Box::from(*v)).collect(),
+                metrics: vec![metric],
+            },
+        );
+    }
+
+    /// Retire the gauge series whose label set no longer describes
+    /// anything, returning how many were retired this pass.
+    ///
+    /// `is_live` answers, for one label set, "does the configuration
+    /// still contain this exact thing?" — the caller holds the snapshot,
+    /// so this crate needs to know nothing about resource lifecycles.
+    ///
+    /// Retirement writes a value, because the exporter has no API to drop
+    /// a series. The value is deliberately NOT zero for anything that
+    /// carries a quantity: `aisix_ratelimit_remaining_requests 0` reads as
+    /// "quota exhausted" and `aisix_budget_remaining_usd 0` as "spent it
+    /// all", so zeroing would replace a stale claim with a false one.
+    /// `NaN` is the honest marker — it renders in the text format and
+    /// every comparison against it is false, so an alert on a retired
+    /// series stops firing instead of inverting. It does mean an
+    /// aggregation over a family with a retired member reads `NaN`; the
+    /// metric reference says so.
+    /// `aisix_budget_details_present` is the exception: it is a boolean
+    /// presence flag whose documented cleared value is `0`, and that is
+    /// what the guard `details_present == 1` is written against.
+    ///
+    /// A retired label set is DROPPED from the registry, so it is marked
+    /// exactly once rather than re-marked every pass. It is not re-tracked
+    /// by a later write either — `with_worker_handle` returns straight out
+    /// of the thread-local cache on a hit and never reaches the
+    /// registration path. That costs nothing in practice: these ids are
+    /// uuids, so an identical label set coming back would need a deleted id
+    /// to be reissued, and the shapes that DO recur (a rebind, a rename)
+    /// produce a different label set, which registers on its own.
+    pub fn retire_stale_gauges(&self, is_live: impl Fn(LiveGaugeSeries<'_>) -> bool) -> usize {
+        // Take the entries out under the lock and release it before doing
+        // any work: `is_live` reads the caller's snapshot and the retire
+        // path registers handles on the recorder, and holding this mutex
+        // across either puts the sweeper in the request path's way — the
+        // registration side takes the same lock on a worker-cache miss.
+        let taken: Vec<RetirableSeries> = {
+            let mut map = self.inner.retirable.lock().expect("retirable registry");
+            map.drain().map(|(_, v)| v).collect()
+        };
+        let mut retired = 0usize;
+        let mut keep: Vec<RetirableSeries> = Vec::with_capacity(taken.len());
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            for series in taken {
+                let l: Vec<&str> = series.labels.iter().map(|v| &**v).collect();
+                let view = match (series.family, l.as_slice()) {
+                    (GaugeFamily::Budget, [api_key_id, team_id, user_id, user_name]) => {
+                        LiveGaugeSeries::Budget {
+                            api_key_id,
+                            team_id,
+                            user_id,
+                            user_name,
+                        }
+                    }
+                    (GaugeFamily::RatelimitRemaining, [api_key_id, model]) => {
+                        LiveGaugeSeries::RatelimitRemaining { api_key_id, model }
+                    }
+                    // Arity is fixed per family at the registration sites;
+                    // a mismatch means a family gained a label without its
+                    // view. Keep rather than retire on a guess.
+                    _ => {
+                        keep.push(series);
+                        continue;
+                    }
+                };
+                if is_live(view) {
+                    keep.push(series);
+                    continue;
+                }
+                retired += 1;
+                // Only what this label set actually registered. Writing a
+                // family's full list would CREATE the members it never had:
+                // `metrics::gauge!` registers on first use, so retiring a
+                // budgetless key would mint the four amount series that
+                // `clear_budget_gauges` deliberately does not.
+                for metric in &series.metrics {
+                    // The presence flag is boolean and its documented
+                    // cleared value is 0; everything else carries a
+                    // quantity and retires to NaN.
+                    let value = if *metric == M_BUDGET_DETAILS_PRESENT {
+                        0.0
+                    } else {
+                        f64::NAN
+                    };
+                    match view {
+                        LiveGaugeSeries::Budget {
+                            api_key_id,
+                            team_id,
+                            user_id,
+                            user_name,
+                        } => metrics::gauge!(
+                            *metric,
+                            "api_key_id" => api_key_id.to_string(),
+                            "team_id" => team_id.to_string(),
+                            "user_id" => user_id.to_string(),
+                            "user_name" => user_name.to_string(),
+                        )
+                        .set(value),
+                        LiveGaugeSeries::RatelimitRemaining { api_key_id, model } => {
+                            metrics::gauge!(
+                                *metric,
+                                "api_key_id" => api_key_id.to_string(),
+                                "model" => model.to_string(),
+                            )
+                            .set(value)
+                        }
+                    }
+                }
+            }
+        });
+        // A retired label set is dropped: nothing writes it any more, so
+        // re-marking it every tick is pure waste, and keeping it would let
+        // dead entries fill `RETIRABLE_CAPACITY` and silently stop NEW
+        // series from ever being tracked — which is the bug this exists to
+        // fix. See `retire_stale_gauges` for why not re-tracking a revived
+        // label set costs nothing.
+        let mut map = self.inner.retirable.lock().expect("retirable registry");
+        for series in keep {
+            let mut key = String::with_capacity(64);
+            key.push_str(family_key(series.family));
+            for value in &series.labels {
+                key.push(WORKER_KEY_SEP);
+                key.push_str(value);
+            }
+            map.entry(Box::from(key.as_str())).or_insert(series);
+        }
+        retired
     }
 
     /// Render the current metric values in Prometheus text exposition format.
@@ -776,11 +1228,22 @@ impl Metrics {
         self.inner.handle.render()
     }
 
+    /// Render outside the async runtime, into the response as it is
+    /// produced. The receiver yields the body in bounded pieces and ends
+    /// when the exposition does.
+    pub fn render_stream(
+        &self,
+    ) -> tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>> {
+        let metrics = self.clone();
+        self.inner
+            .scrape
+            .stream(move |emit| metrics.inner.handle.render_chunks(emit))
+    }
+
     /// Drain pending histogram samples into their distributions.
     ///
-    /// `PrometheusBuilder::build_recorder` does not start the exporter's
-    /// background upkeep task, so the server must call this periodically
-    /// even when no Prometheus server is scraping the metrics endpoint.
+    /// The server calls this periodically even without scrapes so pending
+    /// raw samples cannot accumulate indefinitely.
     pub fn run_upkeep(&self) {
         self.inner.handle.run_upkeep();
     }
@@ -792,8 +1255,9 @@ impl Metrics {
     ///
     /// Etcd-only series (`observed_revision`, `applied_revision`,
     /// `source_connected`) are emitted only in etcd mode. Label churn on the
-    /// info/rejected gauges (`hash_info`, `rejected_resources`) zeroes the
-    /// prior label set so the exposition never carries two live samples.
+    /// info/rejected gauges (`hash_info`, `rejected_resources`,
+    /// `unknown_kind_resources`) zeroes the prior label set so the exposition
+    /// never carries two live samples.
     ///
     /// Deliberately NOT routed through the per-worker handle cache: this
     /// runs once per scrape (not per request), and the zeroing discipline
@@ -865,6 +1329,24 @@ impl Metrics {
                     .set(*count as f64);
             }
             labels.last_rejected_kinds = view.rejected_by_kind.keys().cloned().collect();
+
+            // Unknown-kind gauge per kind, same zeroing discipline. Zero and
+            // not NaN: unlike the retirable request-path gauges, this one
+            // counts rows currently in a state, so "no rows of this kind are
+            // unknown to me" is the true reading of 0 — and it keeps a
+            // `sum()` over the family, which is what an operator alerts on,
+            // from going NaN.
+            for kind in &labels.last_unknown_kinds {
+                if !view.unknown_kind_by_kind.contains_key(kind) {
+                    metrics::gauge!(M_CONFIG_UNKNOWN_KIND_RESOURCES, "kind" => kind.clone())
+                        .set(0.0);
+                }
+            }
+            for (kind, count) in &view.unknown_kind_by_kind {
+                metrics::gauge!(M_CONFIG_UNKNOWN_KIND_RESOURCES, "kind" => kind.clone())
+                    .set(*count as f64);
+            }
+            labels.last_unknown_kinds = view.unknown_kind_by_kind.keys().cloned().collect();
 
             // Partially-compatible gauge per kind, same zeroing discipline.
             // Per-field detail deliberately stays off the labels (field paths
@@ -969,32 +1451,35 @@ impl Metrics {
         );
     }
 
-    /// Record one request's guardrail outcome. Called once per request from
-    /// the centralised telemetry emit, using the same data as the UsageEvent's
-    /// `guardrail_blocked` / `guardrail_bypassed_reason` fields. An empty
-    /// `bypass_reason` means no bypass occurred.
-    pub fn record_guardrail_outcome(&self, blocked: bool, bypass_reason: &str) {
-        if blocked {
-            self.cached_counter(
-                M_GUARDRAIL_BLOCKS_TOTAL,
-                1,
-                |_| {},
-                || metrics::counter!(M_GUARDRAIL_BLOCKS_TOTAL),
-            );
-        }
-        if !bypass_reason.is_empty() {
-            self.cached_counter(
-                M_GUARDRAIL_BYPASSES_TOTAL,
-                1,
-                |k| k.label(bypass_reason),
-                || {
-                    metrics::counter!(
-                        M_GUARDRAIL_BYPASSES_TOTAL,
-                        "reason" => bypass_reason.to_string(),
-                    )
-                },
-            );
-        }
+    /// Count one request rejected by guardrail enforcement. The terminal
+    /// UsageEvent path calls this exactly once, including refusals that happen
+    /// before a guardrail member executes (for example a streamed-output
+    /// buffer overflow).
+    pub fn record_guardrail_blocked_request(&self) {
+        self.cached_counter(
+            M_GUARDRAIL_BLOCKS_TOTAL,
+            1,
+            |_| {},
+            || metrics::counter!(M_GUARDRAIL_BLOCKS_TOTAL),
+        );
+    }
+
+    /// Bump `aisix_guardrail_bypasses_total` for one bypass under
+    /// `reason`. Reached from both producers: a bypassed member execution
+    /// (below) and the proxy's pre-execution bypass (the
+    /// `GuardrailMetricsSink` impl).
+    fn count_guardrail_bypass(&self, reason: &str) {
+        self.cached_counter(
+            M_GUARDRAIL_BYPASSES_TOTAL,
+            1,
+            |k| k.label(reason),
+            || {
+                metrics::counter!(
+                    M_GUARDRAIL_BYPASSES_TOTAL,
+                    "reason" => reason.to_string(),
+                )
+            },
+        );
     }
 
     /// Record one guardrail member execution on
@@ -1026,6 +1511,9 @@ impl Metrics {
                 )
             },
         );
+        if let ("bypassed", Some(reason)) = (exec.result, exec.error_type) {
+            self.count_guardrail_bypass(reason);
+        }
     }
 
     /// Count one rate-limit rejection. `scope` is the exceeded
@@ -1427,6 +1915,7 @@ impl Metrics {
             |k| {
                 k.label(labels.endpoint);
                 k.label(labels.inbound_protocol);
+                k.label(labels.upstream_protocol);
                 k.label(labels.provider);
                 k.label(labels.model);
                 k.label(labels.upstream_model);
@@ -1452,6 +1941,7 @@ impl Metrics {
             |k| {
                 k.label(labels.endpoint);
                 k.label(labels.inbound_protocol);
+                k.label(labels.upstream_protocol);
                 k.label(labels.provider);
                 k.label(labels.model);
                 k.label(labels.upstream_model);
@@ -1587,11 +2077,22 @@ impl Metrics {
         });
     }
 
+    /// The terminal token + spend emit for one request.
+    ///
+    /// The three prompt-cache counters (AISIX-Cloud#1404) are recorded
+    /// ALONGSIDE `input_tokens` / `total_tokens`, never folded into
+    /// them: this function must not change what the existing three
+    /// counters report, or every cost figure built on them shifts. The
+    /// caller supplies each field exactly as the upstream reported it —
+    /// see [`LlmUsage`] for which accounting shape each one carries.
     pub fn record_llm_usage(&self, labels: UsageLabels<'_>, usage: LlmUsage) {
         let spend_micro_usd = usage.spend_micro_usd();
         if usage.input_tokens == 0
             && usage.output_tokens == 0
             && usage.total_tokens == 0
+            && usage.cached_input_tokens == 0
+            && usage.cache_read_input_tokens == 0
+            && usage.cache_creation_input_tokens == 0
             && spend_micro_usd.is_none()
         {
             return;
@@ -1615,6 +2116,24 @@ impl Metrics {
                 })
                 .increment(u64::from(usage.total_tokens));
             }
+            if usage.cached_input_tokens > 0 {
+                self.init_handle(&handles.cached_input_tokens, || {
+                    labels.counter(M_LLM_CACHED_INPUT_TOKENS_TOTAL)
+                })
+                .increment(u64::from(usage.cached_input_tokens));
+            }
+            if usage.cache_read_input_tokens > 0 {
+                self.init_handle(&handles.cache_read_input_tokens, || {
+                    labels.counter(M_LLM_CACHE_READ_INPUT_TOKENS_TOTAL)
+                })
+                .increment(u64::from(usage.cache_read_input_tokens));
+            }
+            if usage.cache_creation_input_tokens > 0 {
+                self.init_handle(&handles.cache_creation_input_tokens, || {
+                    labels.counter(M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL)
+                })
+                .increment(u64::from(usage.cache_creation_input_tokens));
+            }
             if let Some(value) = spend_micro_usd {
                 self.init_handle(&handles.spend_micro_usd, || {
                     labels.counter(M_LLM_SPEND_MICRO_USD_TOTAL)
@@ -1634,6 +2153,7 @@ impl Metrics {
             |k| {
                 k.label(labels.endpoint);
                 k.label(labels.inbound_protocol);
+                k.label(labels.upstream_protocol);
                 k.label(labels.provider);
                 k.label(labels.model);
                 k.label(labels.upstream_model);
@@ -1649,6 +2169,7 @@ impl Metrics {
                     M_LLM_TTFT,
                     "endpoint" => labels.endpoint.to_string(),
                     "inbound_protocol" => labels.inbound_protocol.to_string(),
+                    "upstream_protocol" => labels.upstream_protocol.to_string(),
                     "provider" => labels.provider.to_string(),
                     "model" => labels.model.to_string(),
                     "upstream_model" => labels.upstream_model.to_string(),
@@ -1821,6 +2342,11 @@ impl Metrics {
                     k.label(model);
                 },
                 || {
+                    self.track_retirable(
+                        GaugeFamily::RatelimitRemaining,
+                        M_RATELIMIT_REMAINING_REQUESTS,
+                        &[api_key_id, model],
+                    );
                     metrics::gauge!(
                         M_RATELIMIT_REMAINING_REQUESTS,
                         "api_key_id" => api_key_id.to_string(),
@@ -1838,6 +2364,11 @@ impl Metrics {
                     k.label(model);
                 },
                 || {
+                    self.track_retirable(
+                        GaugeFamily::RatelimitRemaining,
+                        M_RATELIMIT_REMAINING_TOKENS,
+                        &[api_key_id, model],
+                    );
                     metrics::gauge!(
                         M_RATELIMIT_REMAINING_TOKENS,
                         "api_key_id" => api_key_id.to_string(),
@@ -1857,13 +2388,25 @@ impl Metrics {
                 k.label(labels.api_key_id);
                 k.label(labels.team_id);
                 k.label(labels.user_id);
+                k.label(labels.user_name);
             },
             || {
+                self.track_retirable(
+                    GaugeFamily::Budget,
+                    metric,
+                    &[
+                        labels.api_key_id,
+                        labels.team_id,
+                        labels.user_id,
+                        labels.user_name,
+                    ],
+                );
                 metrics::gauge!(
                     metric,
                     "api_key_id" => labels.api_key_id.to_string(),
                     "team_id" => labels.team_id.to_string(),
                     "user_id" => labels.user_id.to_string(),
+                    "user_name" => labels.user_name.to_string(),
                 )
             },
         );
@@ -1885,10 +2428,34 @@ impl Metrics {
         }
     }
 
+    /// The key carries no budget: clear the presence flag and nothing
+    /// else.
+    ///
+    /// Deliberately does NOT retract the four amounts, even though a key
+    /// whose budget was removed leaves them frozen at their last budgeted
+    /// values. This runs on EVERY request whose decision carries no
+    /// budget, which includes every request on a deployment with budgets
+    /// switched off (`budget::Mode::Disabled` answers `allow_all()`, and
+    /// that is the default) — writing the amounts here would mint four
+    /// `NaN` series per api key for a feature nobody enabled, five-ing
+    /// the cardinality of this family to fix a case that only arises
+    /// after a budget is deleted. The documented guard
+    /// `aisix_budget_details_present == 1` is what covers that case, and
+    /// [`Metrics::retire_stale_gauges`] covers the key going away.
     pub fn clear_budget_gauges(&self, labels: BudgetLabels<'_>) {
         self.cached_budget_gauge(M_BUDGET_DETAILS_PRESENT, labels, 0.0);
     }
 
+    /// Count one failed operation against a Redis-backed store, by
+    /// `operation`. The label names the subsystem as well as the call
+    /// (`ratelimit_acquire`, `cache_get`, …) because a deployment points
+    /// several stores at the same Redis and an operator's first question
+    /// is which of them is degraded.
+    ///
+    /// Every one of these failures degrades silently by design — the
+    /// shared rate limiter falls back to per-replica counting, a cache
+    /// read becomes a miss — so this counter is the only place the
+    /// degradation is visible.
     pub fn record_redis_failure(&self, operation: &str) {
         self.cached_counter(
             M_REDIS_FAILURES_TOTAL,
@@ -1898,10 +2465,25 @@ impl Metrics {
         );
     }
 
-    /// Count a usage event that never made it into the queue. Carries the
+    /// Count a usage event that never made it into the queue, or that the
+    /// sender worker could not deliver to the control plane. Carries the
     /// same attribution as the emit counter (AISIX-Cloud#1317): a dropped
     /// event is a hole in the usage record, and the operator's question is
-    /// whose data is missing, which `reason` alone cannot answer.
+    /// whose data is missing, which `reason` alone cannot answer. (The
+    /// sender-side reasons can only supply the member pair — see
+    /// [`crate::UsageSink`].)
+    ///
+    /// "The same attribution" means every dimension [`UsageEventLabels`]
+    /// supplies, `upstream_protocol` included (AISIX-Cloud#1403) — the
+    /// pair is read as `emitted == delivered + dropped`, and a slice of
+    /// that invariant exists only on dimensions BOTH sides carry. The
+    /// protocol is a function of the ProviderKey row `provider_key_id`
+    /// already names, so like `provider_key_name` it adds no series here.
+    /// (`handler` / `status_code` / `status` / `inbound_protocol`
+    /// are the emit counter's own arguments, not attribution, and stay
+    /// one-sided — `emitted == delivered + dropped` is an invariant over
+    /// the attribution dimensions, which is why the member pair `user_id`
+    /// / `user_name` DOES appear on both.)
     pub fn record_usage_event_drop(&self, reason: &str, labels: UsageEventLabels<'_>) {
         self.cached_counter(
             M_USAGE_EVENT_DROPS_TOTAL,
@@ -1911,6 +2493,9 @@ impl Metrics {
                 k.label(labels.model);
                 k.label(labels.provider_key_id);
                 k.label(labels.provider_key_name);
+                k.label(labels.user_id);
+                k.label(labels.user_name);
+                k.label(labels.upstream_protocol);
             },
             || {
                 metrics::counter!(
@@ -1919,6 +2504,9 @@ impl Metrics {
                     "model" => labels.model.to_string(),
                     "provider_key_id" => labels.provider_key_id.to_string(),
                     "provider_key_name" => labels.provider_key_name.to_string(),
+                    "user_id" => labels.user_id.to_string(),
+                    "user_name" => labels.user_name.to_string(),
+                    "upstream_protocol" => labels.upstream_protocol.to_string(),
                 )
             },
         );
@@ -1930,20 +2518,21 @@ impl Metrics {
     ///
     /// The surface labels are `&'static str` so prometheus cardinality is
     /// type-system-bounded:
-    /// - `handler`: OpenAI-shape endpoint name (`chat`, `embeddings`,
-    ///   `messages`, etc.)
+    /// - `handler`: bounded handler family (`chat`, `embeddings`,
+    ///   `messages`, `mcp`, etc.)
     /// - `status_code`: bucketed by `status_bucket()` (one of `2xx` /
     ///   `3xx` / `4xx` / `5xx` / `other`) — never a raw u16
     /// - `inbound_protocol`: normalised by the caller to one of
-    ///   `"openai"` / `"anthropic"` / `"other"` (audit MEDIUM-3 —
+    ///   `"openai"` / `"anthropic"` / `"mcp"` / `"other"` (audit MEDIUM-3 —
     ///   `&'static str` here prevents user-controlled cardinality)
     ///
-    /// [`UsageEventLabels`] adds the model and ProviderKey the event was
-    /// attributed to (AISIX-Cloud#1317). Those cannot be `&'static str`,
-    /// so they are bounded at the proxy's emit chokepoint instead — see
-    /// that type. The dimensions they add are ones
-    /// `aisix_llm_requests_total` already carries, so this counter stays
-    /// well inside the request families' series count.
+    /// [`UsageEventLabels`] adds the model, the ProviderKey the event was
+    /// attributed to (AISIX-Cloud#1317), that key's `upstream_protocol`
+    /// (AISIX-Cloud#1403) and the member pair `user_id` / `user_name`. Those cannot be `&'static str`, so they are
+    /// bounded at the proxy's emit chokepoint instead — see that type. The
+    /// dimensions they add are ones `aisix_llm_requests_total` already
+    /// carries, so this counter stays well inside the request families'
+    /// series count.
     pub fn record_usage_event_emit(
         &self,
         handler: &'static str,
@@ -1958,29 +2547,44 @@ impl Metrics {
             |k| {
                 k.label(handler);
                 k.label(status_class);
+                k.label_u16(status_code);
                 k.label(inbound_protocol);
                 k.label(labels.model);
                 k.label(labels.provider_key_id);
                 k.label(labels.provider_key_name);
+                k.label(labels.user_id);
+                k.label(labels.user_name);
+                k.label(labels.upstream_protocol);
             },
             || {
                 metrics::counter!(
                     M_USAGE_EVENT_EMITS_TOTAL,
                     "handler" => handler,
                     "status_code" => status_class,
+                    "status" => status_code.to_string(),
                     "inbound_protocol" => inbound_protocol,
+                    "upstream_protocol" => labels.upstream_protocol.to_string(),
                     "model" => labels.model.to_string(),
                     "provider_key_id" => labels.provider_key_id.to_string(),
                     "provider_key_name" => labels.provider_key_name.to_string(),
+                    "user_id" => labels.user_id.to_string(),
+                    "user_name" => labels.user_name.to_string(),
                 )
             },
         );
     }
 
-    pub fn record_otlp_fanout_drop(&self, exporter: &str, reason: &str) {
+    /// Count `records` telemetry records the fan-out lost, by exporter
+    /// and by `reason` (`queue_full` / `worker_stopped` /
+    /// `retries_exhausted` / `permanent_error`).
+    ///
+    /// A record count rather than a batch count, so it is comparable with
+    /// what the exporter did deliver: one failed batch loses as many
+    /// records as it carried.
+    pub fn record_otlp_fanout_drop(&self, exporter: &str, reason: &str, records: u64) {
         self.cached_counter(
             M_OTLP_FANOUT_DROPS_TOTAL,
-            1,
+            records,
             |k| {
                 k.label(exporter);
                 k.label(reason);
@@ -1995,6 +2599,10 @@ impl Metrics {
         );
     }
 
+    /// Count one failed export ATTEMPT against `exporter`. Every retry
+    /// that failed counts, so a sink that only ever succeeds on its third
+    /// try is visible here even though it never drops a record — which is
+    /// the distinction from [`Metrics::record_otlp_fanout_drop`].
     pub fn record_otlp_fanout_failure(&self, exporter: &str) {
         self.cached_counter(
             M_OTLP_FANOUT_FAILURES_TOTAL,
@@ -2040,11 +2648,27 @@ impl Metrics {
             metric,
             elapsed.as_secs_f64(),
             |k| {
-                k.label(labels.endpoint);
-                k.label(model);
-                k.label(provider);
-                k.label(status_bucket(labels.status));
-                k.label_bool(labels.streaming);
+                for name in self.inner.recorder.selected_labels(metric) {
+                    let value = match name.as_str() {
+                        "env_id" => continue,
+                        "endpoint" => labels.endpoint,
+                        "model" => model,
+                        "provider" => provider,
+                        "status_class" => status_bucket(labels.status),
+                        "streaming" => bool_str(labels.streaming),
+                        "inbound_protocol" => labels.details.inbound_protocol,
+                        "upstream_protocol" => labels.details.upstream_protocol,
+                        "upstream_model" => labels.details.upstream_model,
+                        "provider_key_id" => labels.details.provider_key_id,
+                        "provider_key_name" => labels.details.provider_key_name,
+                        "api_key_id" => labels.details.api_key_id,
+                        "team_id" => labels.details.team_id,
+                        "user_id" => labels.details.user_id,
+                        "user_name" => labels.details.user_name,
+                        _ => "unknown",
+                    };
+                    k.label(value);
+                }
             },
             || {
                 metrics::histogram!(
@@ -2055,6 +2679,15 @@ impl Metrics {
                     "provider" => provider.to_string(),
                     "status_class" => status_bucket(labels.status),
                     "streaming" => bool_str(labels.streaming),
+                    "inbound_protocol" => labels.details.inbound_protocol.to_string(),
+                    "upstream_protocol" => labels.details.upstream_protocol.to_string(),
+                    "upstream_model" => labels.details.upstream_model.to_string(),
+                    "provider_key_id" => labels.details.provider_key_id.to_string(),
+                    "provider_key_name" => labels.details.provider_key_name.to_string(),
+                    "api_key_id" => labels.details.api_key_id.to_string(),
+                    "team_id" => labels.details.team_id.to_string(),
+                    "user_id" => labels.details.user_id.to_string(),
+                    "user_name" => labels.details.user_name.to_string(),
                 )
             },
         );
@@ -2077,6 +2710,10 @@ impl Metrics {
 impl aisix_core::GuardrailMetricsSink for Metrics {
     fn record_guardrail_execution(&self, exec: &aisix_core::GuardrailExecution<'_>) {
         Metrics::record_guardrail_execution(self, exec);
+    }
+
+    fn record_guardrail_bypass(&self, reason: &str) {
+        self.count_guardrail_bypass(reason);
     }
 }
 
@@ -2109,7 +2746,7 @@ pub struct A2aCallOutcome {
     pub task_state: &'static str,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct LatencyLabels<'a> {
     /// Route template, e.g. `/v1/chat/completions`. Bounded set.
     pub endpoint: &'a str,
@@ -2120,6 +2757,9 @@ pub struct LatencyLabels<'a> {
     /// Raw HTTP status; bucketed to `2xx`/`4xx`/… at record time.
     pub status: u16,
     pub streaming: bool,
+    /// Attribution available for optional labels; the default histogram
+    /// selection retains only its historical dimensions.
+    pub details: UsageLabels<'a>,
 }
 
 /// Missing dimensions default to `"unknown"`, never an empty label value.
@@ -2333,6 +2973,22 @@ fn valid_client_label(label: &str) -> bool {
 pub struct RequestLabels<'a> {
     pub endpoint: &'a str,
     pub inbound_protocol: &'a str,
+    /// The upstream API protocol the selected target actually speaks —
+    /// the ProviderKey adapter's wire value, as resolved by the SAME
+    /// two-tier rule dispatch uses (AISIX-Cloud#1403).
+    ///
+    /// A bounded set: `openai` / `anthropic` / `bedrock` / `vertex` /
+    /// `azure-openai`, plus `unknown` for a request that never selected
+    /// an upstream (a pre-dispatch rejection, or a non-inference route
+    /// like `/mcp`). Distinct from `inbound_protocol`, which is the
+    /// protocol the CALLER spoke: a request arriving on `/v1/messages`
+    /// and served by an OpenAI-shape upstream carries
+    /// `inbound_protocol="anthropic", upstream_protocol="openai"`.
+    ///
+    /// `provider` cannot stand in for it: vendor identity is an open
+    /// string, and the same vendor can be reached through different
+    /// adapters (a `byo` key with `adapter: anthropic`, say).
+    pub upstream_protocol: &'a str,
     pub provider: &'a str,
     pub model: &'a str,
     pub upstream_model: &'a str,
@@ -2366,6 +3022,7 @@ impl Default for RequestLabels<'_> {
         Self {
             endpoint: "unknown",
             inbound_protocol: "openai",
+            upstream_protocol: "unknown",
             provider: "unknown",
             model: "unknown",
             upstream_model: "unknown",
@@ -2389,6 +3046,7 @@ impl RequestLabels<'_> {
             metric,
             "endpoint" => self.endpoint.to_string(),
             "inbound_protocol" => self.inbound_protocol.to_string(),
+            "upstream_protocol" => self.upstream_protocol.to_string(),
             "provider" => self.provider.to_string(),
             "model" => self.model.to_string(),
             "upstream_model" => self.upstream_model.to_string(),
@@ -2410,6 +3068,7 @@ impl RequestLabels<'_> {
             metric,
             "endpoint" => self.endpoint.to_string(),
             "inbound_protocol" => self.inbound_protocol.to_string(),
+            "upstream_protocol" => self.upstream_protocol.to_string(),
             "provider" => self.provider.to_string(),
             "model" => self.model.to_string(),
             "upstream_model" => self.upstream_model.to_string(),
@@ -2420,6 +3079,7 @@ impl RequestLabels<'_> {
             "user_id" => self.user_id.to_string(),
             "user_name" => self.user_name.to_string(),
             "stream" => bool_str(self.stream),
+            "is_fallback" => bool_str(self.is_fallback),
             "status" => self.status.to_string(),
             "outcome" => self.outcome.as_str().to_string(),
         )
@@ -2430,6 +3090,22 @@ impl RequestLabels<'_> {
 pub struct UsageLabels<'a> {
     pub endpoint: &'a str,
     pub inbound_protocol: &'a str,
+    /// The upstream API protocol the selected target actually speaks —
+    /// the ProviderKey adapter's wire value, as resolved by the SAME
+    /// two-tier rule dispatch uses (AISIX-Cloud#1403).
+    ///
+    /// A bounded set: `openai` / `anthropic` / `bedrock` / `vertex` /
+    /// `azure-openai`, plus `unknown` for a request that never selected
+    /// an upstream (a pre-dispatch rejection, or a non-inference route
+    /// like `/mcp`). Distinct from `inbound_protocol`, which is the
+    /// protocol the CALLER spoke: a request arriving on `/v1/messages`
+    /// and served by an OpenAI-shape upstream carries
+    /// `inbound_protocol="anthropic", upstream_protocol="openai"`.
+    ///
+    /// `provider` cannot stand in for it: vendor identity is an open
+    /// string, and the same vendor can be reached through different
+    /// adapters (a `byo` key with `adapter: anthropic`, say).
+    pub upstream_protocol: &'a str,
     pub provider: &'a str,
     pub model: &'a str,
     pub upstream_model: &'a str,
@@ -2448,6 +3124,7 @@ impl Default for UsageLabels<'_> {
         Self {
             endpoint: "unknown",
             inbound_protocol: "openai",
+            upstream_protocol: "unknown",
             provider: "unknown",
             model: "unknown",
             upstream_model: "unknown",
@@ -2467,6 +3144,7 @@ impl UsageLabels<'_> {
             metric,
             "endpoint" => self.endpoint.to_string(),
             "inbound_protocol" => self.inbound_protocol.to_string(),
+            "upstream_protocol" => self.upstream_protocol.to_string(),
             "provider" => self.provider.to_string(),
             "model" => self.model.to_string(),
             "upstream_model" => self.upstream_model.to_string(),
@@ -2485,6 +3163,17 @@ pub struct LlmUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub total_tokens: u32,
+    /// Upstream prompt-cache hits already counted inside `input_tokens`
+    /// — the OpenAI accounting shape (AISIX-Cloud#1404). See
+    /// [`M_LLM_CACHED_INPUT_TOKENS_TOTAL`].
+    pub cached_input_tokens: u32,
+    /// Upstream prompt-cache hits reported ALONGSIDE `input_tokens` —
+    /// the Anthropic accounting shape. See
+    /// [`M_LLM_CACHE_READ_INPUT_TOKENS_TOTAL`].
+    pub cache_read_input_tokens: u32,
+    /// Input tokens written into the upstream's prompt cache. See
+    /// [`M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL`].
+    pub cache_creation_input_tokens: u32,
     pub spend_usd: f64,
 }
 
@@ -2517,6 +3206,44 @@ pub struct UsageEventLabels<'a> {
     pub model: &'a str,
     pub provider_key_id: &'a str,
     pub provider_key_name: &'a str,
+    /// Org member the authenticating key belongs to (AISIX-Cloud#1389) —
+    /// the same `user_id` `aisix_proxy_requests_total` carries, so a
+    /// member's request rate and their usage-event rate slice alike.
+    /// `unknown` when the key is bound to no member, or when auth never
+    /// resolved a key.
+    ///
+    /// This is attribution, so it sits on BOTH counters: "which member's
+    /// usage records were lost" is exactly the question the shared label
+    /// set exists to keep answerable. `UsageSink::try_emit` fills it from
+    /// the event's own `user_id`, so the counter and the row cp-api
+    /// persists can never name different people.
+    pub user_id: &'a str,
+    /// Readable display name of the member `user_id` names
+    /// (AISIX-Cloud#1455). One series per (id, name) pair rather than per
+    /// name: the two are read off one ApiKey row, so at any instant the
+    /// name is determined by the id and the label costs nothing. The name
+    /// is a SNAPSHOT of the row, not a live read: cp-api stamps it when it
+    /// projects the ApiKey, and nothing reprojects a key just because its
+    /// member was renamed — so a rename shows up here only once that key is
+    /// next written for some other reason, and splits the counter into a
+    /// before and an after series when it does.
+    ///
+    /// Filled from the event beside `user_id` in `UsageSink::try_emit`
+    /// rather than by each handler's label builder, so the two cannot
+    /// name different people. `unknown` whenever `user_id` is.
+    pub user_name: &'a str,
+    /// The upstream wire protocol of the key named by `provider_key_id`
+    /// (AISIX-Cloud#1403) — the same value, resolved the same way, that
+    /// the request and usage families carry, so an operator can align
+    /// this counter with them under `sum by (upstream_protocol)`.
+    ///
+    /// Must be read off the SAME ProviderKey row as the id and name
+    /// beside it (`usage_attr::ResolvedPk`), never looked up separately:
+    /// three dimensions describing three different keys is exactly the
+    /// drift `PkLabels` exists to prevent. `unknown` when nothing was
+    /// resolved — the pre-dispatch failures, and the tunnels that have
+    /// no LLM upstream at all (`/mcp`, `/a2a`).
+    pub upstream_protocol: &'a str,
 }
 
 impl Default for UsageEventLabels<'_> {
@@ -2525,6 +3252,9 @@ impl Default for UsageEventLabels<'_> {
             model: "unknown",
             provider_key_id: "unknown",
             provider_key_name: "unknown",
+            user_id: "unknown",
+            user_name: "unknown",
+            upstream_protocol: "unknown",
         }
     }
 }
@@ -2585,6 +3315,22 @@ pub struct BudgetLabels<'a> {
     pub api_key_id: &'a str,
     pub team_id: &'a str,
     pub user_id: &'a str,
+    /// Readable display name of the member `user_id` names
+    /// (AISIX-Cloud#1455), read off the same ApiKey row so the name is
+    /// determined by the id and the pair costs no series over `user_id`
+    /// alone. `unknown` whenever `user_id` is.
+    ///
+    /// These are GAUGES, and this recorder registers no idle timeout, so
+    /// a label set that stops being written stays at its last value: if a
+    /// rename ever does reach the ApiKey row (see [`UsageEventLabels`] —
+    /// it takes a later write of that key), the pre-rename sample stays
+    /// behind, and a `sum` that does not group by the member counts both.
+    /// That is true of every label on this family that can change under a
+    /// fixed `api_key_id`: rebinding a key's team or owner strands its
+    /// samples the same way. `clear_budget_gauges` does not help — it
+    /// zeroes `details_present` for the label set it is handed, which is
+    /// the new one.
+    pub user_name: &'a str,
 }
 
 impl Default for BudgetLabels<'_> {
@@ -2593,6 +3339,7 @@ impl Default for BudgetLabels<'_> {
             api_key_id: "unknown",
             team_id: "unknown",
             user_id: "unknown",
+            user_name: "unknown",
         }
     }
 }
@@ -2638,6 +3385,316 @@ impl RequestOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// This file's own source with the test module cut off. Every guard
+    /// below reads the production half only — a mention from inside the
+    /// tests is not a use.
+    fn production_source() -> &'static str {
+        include_str!("metrics.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production half")
+    }
+
+    /// Every metric-name constant this module declares: `M_FOO` ->
+    /// "aisix_foo", so failures name the metric an operator would grep for
+    /// rather than a Rust identifier. Whitespace-tolerant: the longer
+    /// constants wrap their value onto the next line.
+    ///
+    /// Read out of the source so the set is never a list someone has to
+    /// remember to extend.
+    fn declared_metric_names() -> BTreeMap<&'static str, &'static str> {
+        let production = production_source();
+        let names: BTreeMap<&str, &str> = production
+            .match_indices("pub const M_")
+            .filter_map(|(at, marker)| {
+                let decl = &production[at + marker.len()..];
+                let (tail, rest) = decl.split_once(": &str =")?;
+                let value = rest.trim_start().strip_prefix('"')?;
+                let start = at + marker.len() - "M_".len();
+                let ident = &production[start..start + "M_".len() + tail.len()];
+                Some((ident, value.split('"').next()?))
+            })
+            .collect();
+        assert!(
+            names.len() > 40,
+            "the constant scan found only {} metric names — the `pub const` \
+             spelling it keys off has changed and the guards built on it are \
+             no longer looking at anything",
+            names.len()
+        );
+        names
+    }
+
+    /// One `metrics::{counter,histogram,gauge}!` invocation in this file's
+    /// production half: the family it emits (resolved to the metric NAME
+    /// where the first argument is one of this module's `M_*` constants,
+    /// otherwise the argument text itself) and the label keys it writes.
+    ///
+    /// Read out of the source deliberately. Only `aisix-obs` depends on
+    /// the `metrics` crate and every invocation lives in this file, so
+    /// the scan sees the WHOLE emit surface — including families no test
+    /// exercises, which is precisely where the omission this guards
+    /// against hides.
+    fn emit_sites() -> Vec<(String, BTreeSet<String>)> {
+        let production = production_source();
+        let names = declared_metric_names();
+
+        let mut sites = Vec::new();
+        for macro_name in ["counter", "histogram", "gauge"] {
+            let opener = format!("metrics::{macro_name}!(");
+            let mut cursor = 0usize;
+            while let Some(offset) = production[cursor..].find(&opener) {
+                let open = cursor + offset + opener.len() - 1;
+                let mut depth = 0usize;
+                let mut end = open;
+                for (i, c) in production[open..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = open + i;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(end > open, "unbalanced `{opener}` at byte {open}");
+                let body = &production[open + 1..end];
+                let line = production[..open].lines().count();
+                let family = body
+                    .split(',')
+                    .next()
+                    .expect("a family argument")
+                    .trim()
+                    .to_string();
+                let display = names
+                    .get(family.as_str())
+                    .map(|name| (*name).to_string())
+                    // A shared helper takes the family as a parameter, so
+                    // the site has no name of its own — identify it by the
+                    // helper it lives in, which is what a reader has to go
+                    // edit.
+                    .unwrap_or_else(|| {
+                        let enclosing = production[..open]
+                            .rsplit_once("    fn ")
+                            .and_then(|(_, tail)| tail.split('(').next())
+                            .unwrap_or(family.as_str());
+                        format!("{enclosing}() (metrics.rs:{line})")
+                    });
+                let labels = body
+                    .split('"')
+                    .skip(1)
+                    .step_by(2)
+                    .zip(body.split('"').skip(2).step_by(2))
+                    .filter(|(_, after)| after.trim_start().starts_with("=>"))
+                    .map(|(key, _)| key.to_string())
+                    .collect();
+                sites.push((display, labels));
+                cursor = end;
+            }
+        }
+        assert!(
+            sites.len() > 20,
+            "the emit-site scan found only {} sites — the macro spelling it \
+             keys off has changed and this guard is no longer looking at \
+             anything",
+            sites.len()
+        );
+        sites
+    }
+
+    /// Every `M_*` constant this module declares must be referred to by
+    /// the production code below it — a name nothing else mentions cannot
+    /// reach an emit site, whatever the plumbing in between.
+    ///
+    /// `aisix_llm_api_latency_seconds` sat here declared and emitted by
+    /// nothing at all, found by accident rather than by a check. Both
+    /// sides of this assertion are read out of the source, so a constant
+    /// added tomorrow is covered without anyone remembering to extend a
+    /// list — a list-shaped test would have been typed from the families
+    /// that DO emit and would have passed.
+    ///
+    /// Deliberately checks the mention and not the emit itself. A family
+    /// argument reaches `metrics::{counter,histogram,gauge}!` through
+    /// five different helper shapes and, in `record_routing_fallback`,
+    /// through a local binding chosen by an `if` — resolving that
+    /// statically needs a dataflow model of the module, which would be
+    /// far more likely to break on an innocent refactor than to catch a
+    /// second dead constant. The weaker signal is the one that is both
+    /// robust and sufficient for the defect it guards.
+    #[test]
+    fn every_metric_name_constant_is_used_by_production_code() {
+        // Doc comments cross-reference constants by the dozen, and a
+        // rustdoc link is not a use.
+        let code: String = production_source()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let is_ident_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let mentions = |ident: &str| -> usize {
+            let mut count = 0usize;
+            let mut cursor = 0usize;
+            while let Some(offset) = code[cursor..].find(ident) {
+                let at = cursor + offset;
+                let end = at + ident.len();
+                let bounded = !code[..at].chars().next_back().is_some_and(&is_ident_char)
+                    && !code[end..].chars().next().is_some_and(&is_ident_char);
+                if bounded {
+                    count += 1;
+                }
+                cursor = end;
+            }
+            count
+        };
+
+        // The declaration itself is one mention; anything reachable has a
+        // second one somewhere.
+        let unused: Vec<&str> = declared_metric_names()
+            .into_iter()
+            .filter(|(ident, _)| mentions(ident) < 2)
+            .map(|(_, name)| name)
+            .collect();
+        assert!(
+            unused.is_empty(),
+            "declared but never used by any production code — nothing can \
+             emit these, so the series do not exist to scrape: {unused:?}"
+        );
+    }
+
+    /// The families that carry `inbound_protocol` and deliberately do NOT
+    /// carry `upstream_protocol`. Both are counted at a point where no
+    /// upstream has been selected — the reason is spelled out at each
+    /// metric's own definition, which is what a reader hits first.
+    ///
+    /// Membership here is a decision, not a backlog: adding a family is
+    /// how you state "this one is excluded on purpose", and the assertions
+    /// below reject an entry that is stale (the family gained the label
+    /// anyway) or dangling (the family no longer carries
+    /// `inbound_protocol`).
+    fn upstream_protocol_exempt_families() -> BTreeSet<&'static str> {
+        BTreeSet::from([
+            // Incremented in the proxy middleware, before routing picks a
+            // target; the matching decrement must address the same series.
+            M_PROXY_IN_FLIGHT,
+            // The body cap rejects before any handler runs.
+            M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL,
+        ])
+    }
+
+    /// Every rendered sample that carries `inbound_protocol` must carry
+    /// `upstream_protocol` too, unless its family is a stated exclusion.
+    ///
+    /// The exposition half of
+    /// `upstream_protocol_covers_every_inbound_protocol_family`: that one
+    /// reads the emit sites and cannot see whether the label survives to
+    /// the wire; this one reads what a Prometheus scrape would actually
+    /// get. Both derive the family set instead of listing it — the caller
+    /// hands over a rendering, not a set of names to check.
+    fn assert_upstream_protocol_rides_along(rendered: &str) {
+        let exempt = upstream_protocol_exempt_families();
+        let mut checked = 0usize;
+        for line in rendered.lines() {
+            if line.starts_with('#') || !line.contains("inbound_protocol=") {
+                continue;
+            }
+            let family = line.split('{').next().expect("a sample name");
+            // Histogram suffixes are the same family.
+            let base = family
+                .strip_suffix("_bucket")
+                .or_else(|| family.strip_suffix("_sum"))
+                .or_else(|| family.strip_suffix("_count"))
+                .unwrap_or(family);
+            if exempt.contains(base) {
+                continue;
+            }
+            // Every sample of a family must carry the label, or
+            // `sum by (upstream_protocol)` silently drops the ones that
+            // do not — an operator's dashboard then joins across a
+            // subset and reads as merely incomplete data.
+            assert!(
+                line.contains("upstream_protocol="),
+                "{base} sample carries inbound_protocol without \
+                 upstream_protocol: {line}"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "no sample carrying inbound_protocol was rendered — this \
+             assertion checked nothing"
+        );
+    }
+
+    /// AISIX-Cloud#1403: `upstream_protocol` must sit on every family that
+    /// carries `inbound_protocol`, minus the ones deliberately excluded.
+    ///
+    /// Derived from the emit sites rather than restated as a list of
+    /// family names. A hand-written list only ever freezes the set that
+    /// existed when someone typed it: the label originally reached
+    /// exactly the families that share a label STRUCT — `RequestLabels`,
+    /// `UsageLabels` — and the three that build their label list inline
+    /// here were never considered. Two of those are the deliberate
+    /// exclusions below; the third,
+    /// `aisix_usage_events_emitted_total`, had the value in hand beside
+    /// `provider_key_id` and simply did not emit it, so
+    /// `sum by (upstream_protocol)` dropped it out of every join with the
+    /// rest. A list-shaped test would have been written to match the
+    /// families that did get it, and passed.
+    #[test]
+    fn upstream_protocol_covers_every_inbound_protocol_family() {
+        let sites = emit_sites();
+        let with = |label: &str| -> BTreeSet<String> {
+            sites
+                .iter()
+                .filter(|(_, labels)| labels.contains(label))
+                .map(|(family, _)| family.clone())
+                .collect()
+        };
+        let inbound = with("inbound_protocol");
+        let upstream = with("upstream_protocol");
+        let exempt: BTreeSet<String> = upstream_protocol_exempt_families()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        let missing: Vec<&String> = inbound
+            .iter()
+            .filter(|f| !upstream.contains(*f) && !exempt.contains(*f))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these families carry `inbound_protocol` without \
+             `upstream_protocol`: {missing:?}. Either resolve the value off \
+             the request's `usage_attr::ResolvedPk` the way the request \
+             families do — never a second ProviderKey lookup — or add the \
+             family to `upstream_protocol_exempt_families` and say at its \
+             definition why the value cannot exist at emit time.",
+        );
+
+        let stale: Vec<&String> = exempt.iter().filter(|f| upstream.contains(*f)).collect();
+        assert!(
+            stale.is_empty(),
+            "these families are listed as deliberately without \
+             `upstream_protocol` but now emit it: {stale:?}. Drop them from \
+             `upstream_protocol_exempt_families` and from the exclusion note \
+             at their definition.",
+        );
+
+        let dangling: Vec<&String> = exempt.iter().filter(|f| !inbound.contains(*f)).collect();
+        assert!(
+            dangling.is_empty(),
+            "these families are listed as deliberately without \
+             `upstream_protocol` but no longer carry `inbound_protocol` \
+             either: {dangling:?}. The exemption is about a comparison that \
+             no longer exists — remove it.",
+        );
+    }
 
     #[test]
     fn outcome_from_status_maps_correctly() {
@@ -2654,6 +3711,49 @@ mod tests {
         assert_eq!(
             RequestOutcome::from_status(502),
             RequestOutcome::UpstreamError
+        );
+    }
+
+    /// Both halves of the apply pair have to reach the registry — a
+    /// `metrics::histogram!` called anywhere outside `with_local_recorder`
+    /// records into nothing, which is the failure this pins.
+    #[test]
+    fn a_recorded_config_apply_renders_both_series_with_its_trigger() {
+        let m = Metrics::new(false);
+        m.record_config_apply("watch", 7, Duration::from_millis(12));
+        let rendered = m.render();
+        for name in [M_CONFIG_APPLY_DURATION_SECONDS, M_CONFIG_APPLY_BATCH_EVENTS] {
+            assert!(
+                rendered.contains(&format!("{name}_count{{trigger=\"watch\"}} 1")),
+                "{name} must render one observation labelled by trigger, got: {rendered}",
+            );
+        }
+        assert!(
+            rendered.contains(&format!(
+                "{M_CONFIG_APPLY_BATCH_EVENTS}_sum{{trigger=\"watch\"}} 7"
+            )),
+            "the batch size is the event count, got: {rendered}",
+        );
+    }
+
+    /// The series has to be published on every scrape, or "no drops" is
+    /// indistinguishable from "the gateway is too old to report drops".
+    ///
+    /// Asserted against the live total rather than a literal `0`: the
+    /// writer's own tests share this process and drop events into the
+    /// same counter, and what this pins is that the series exists.
+    #[test]
+    fn the_dropped_log_line_total_is_published_on_every_scrape() {
+        let m = Metrics::new(false);
+        m.sync_log_status();
+        let expected = format!(
+            "{M_LOG_LINES_DROPPED_TOTAL} {}",
+            crate::log_writer::dropped_total()
+        );
+        assert!(
+            m.render().contains(&expected),
+            "a scrape must publish {expected:?}, got: {}",
+            m.render(),
         );
     }
 
@@ -2794,11 +3894,26 @@ mod tests {
     #[test]
     fn guardrail_outcome_counters_increment() {
         let m = Metrics::new(false);
-        m.record_guardrail_outcome(true, ""); // blocked, no bypass
-        m.record_guardrail_outcome(false, "bedrock_5xx"); // fail-open bypass
-        m.record_guardrail_outcome(false, ""); // clean request → records nothing
+        // Request-level block accounting is separate from timed executions:
+        // this also represents fail-closed paths that never call a member.
+        m.record_guardrail_blocked_request();
+        for (result, error_type) in [
+            ("blocked", None),
+            ("bypassed", Some("bedrock_5xx")),
+            ("allowed", None),
+        ] {
+            m.record_guardrail_execution(&aisix_core::GuardrailExecution {
+                guardrail_name: "policy",
+                kind: "bedrock",
+                phase: "input",
+                result,
+                error_type,
+                elapsed: Duration::from_millis(1),
+            });
+        }
         let rendered = m.render();
-        // Exactly one block (the clean call must not increment it).
+        // Exactly one request block: the timed blocked execution must not
+        // double-count it.
         assert!(
             rendered.contains(&format!("{M_GUARDRAIL_BLOCKS_TOTAL} 1")),
             "want one block, got:\n{rendered}"
@@ -2842,6 +3957,7 @@ mod tests {
         let labels = RequestLabels {
             endpoint: "/v1/chat/completions",
             inbound_protocol: "openai",
+            upstream_protocol: "anthropic",
             provider: "openai",
             model: "gpt",
             upstream_model: "gpt-4o",
@@ -2859,6 +3975,7 @@ mod tests {
         let usage_labels = UsageLabels {
             endpoint: "/v1/chat/completions",
             inbound_protocol: "openai",
+            upstream_protocol: "anthropic",
             provider: "openai",
             model: "gpt",
             upstream_model: "gpt-4o",
@@ -2883,6 +4000,9 @@ mod tests {
                 input_tokens: 5,
                 output_tokens: 7,
                 total_tokens: 12,
+                cached_input_tokens: 3,
+                cache_read_input_tokens: 800,
+                cache_creation_input_tokens: 200,
                 spend_usd: 0.001,
             },
         );
@@ -2925,6 +4045,114 @@ mod tests {
                     "is_fallback must stay off the duration histogram: {line}"
                 );
             }
+        }
+        // AISIX-Cloud#1403: the cross-protocol pair. The labels above spell
+        // an OpenAI caller served by an Anthropic upstream, and both halves
+        // have to survive onto the same sample or the conversion is
+        // invisible.
+        assert!(rendered.contains("inbound_protocol=\"openai\""));
+        assert!(rendered.contains("upstream_protocol=\"anthropic\""));
+        assert_upstream_protocol_rides_along(&rendered);
+        // AISIX-Cloud#1404: each cache counter carries its own value and
+        // none of them was folded into input or total.
+        assert!(rendered.contains(M_LLM_CACHED_INPUT_TOKENS_TOTAL));
+        assert!(rendered.contains(M_LLM_CACHE_READ_INPUT_TOKENS_TOTAL));
+        assert!(rendered.contains(M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL));
+        let value_of = |family: &str| -> f64 {
+            rendered
+                .lines()
+                .find(|line| line.starts_with(family) && line.contains('{'))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("{family} rendered no sample"))
+        };
+        assert_eq!(value_of(M_LLM_CACHED_INPUT_TOKENS_TOTAL), 3.0);
+        assert_eq!(value_of(M_LLM_CACHE_READ_INPUT_TOKENS_TOTAL), 800.0);
+        assert_eq!(value_of(M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL), 200.0);
+        assert_eq!(value_of(M_LLM_INPUT_TOKENS_TOTAL), 5.0);
+        assert_eq!(value_of(M_LLM_TOTAL_TOKENS_TOTAL), 12.0);
+    }
+
+    /// A request that reported only cache tokens still records them. The
+    /// all-zero short-circuit in `record_llm_usage` guards series
+    /// sparsity, and before #1404 it only knew about input / output /
+    /// total / spend — so a usage report whose only non-zero field is a
+    /// cache counter must not be swallowed by it.
+    #[test]
+    fn cache_only_usage_is_not_swallowed_by_the_zero_short_circuit() {
+        let m = Metrics::new(false);
+        m.record_llm_usage(
+            UsageLabels::default(),
+            LlmUsage {
+                cache_read_input_tokens: 64,
+                ..Default::default()
+            },
+        );
+        let rendered = m.render();
+        assert!(rendered.contains(M_LLM_CACHE_READ_INPUT_TOKENS_TOTAL));
+        // …and the counters that reported nothing stay absent, so the
+        // scrape does not gain a zero-valued series per request.
+        assert!(!rendered.contains(M_LLM_CACHED_INPUT_TOKENS_TOTAL));
+        assert!(!rendered.contains(M_LLM_INPUT_TOKENS_TOTAL));
+    }
+
+    #[test]
+    fn latency_cache_uses_only_selected_labels() {
+        let before = WORKER_CACHE.with(|cell| cell.borrow().histograms.len());
+        let defaults = Metrics::new(false);
+        for index in 0..100 {
+            let caller = format!("caller-{index}");
+            let labels = LatencyLabels {
+                details: UsageLabels {
+                    user_name: &caller,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            defaults.record_request_e2e_latency(labels, Duration::from_millis(1));
+            defaults.record_request_ttft(labels, Duration::from_millis(1));
+        }
+        assert_eq!(
+            WORKER_CACHE.with(|cell| cell.borrow().histograms.len()),
+            before + 2
+        );
+
+        let selected = Metrics::new_with_labels(
+            "test",
+            &HistogramBuckets::default(),
+            &[(
+                M_REQUEST_TTFT_SECONDS.to_string(),
+                vec!["user_name".to_string()],
+            )]
+            .into(),
+        )
+        .unwrap();
+        for user_name in ["alice", "bob"] {
+            for model in ["one", "two"] {
+                selected.record_request_ttft(
+                    LatencyLabels {
+                        model,
+                        details: UsageLabels {
+                            user_name,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    Duration::from_millis(1),
+                );
+            }
+        }
+        assert_eq!(
+            WORKER_CACHE.with(|cell| cell.borrow().histograms.len()),
+            before + 4
+        );
+        let rendered = selected.render();
+        for user_name in ["alice", "bob"] {
+            assert!(rendered
+                .lines()
+                .any(|line| line.starts_with("aisix_request_ttft_seconds_count{")
+                    && line.contains(&format!("user_name=\"{user_name}\""))
+                    && line.ends_with(" 2")));
         }
     }
 
@@ -3151,11 +4379,13 @@ mod tests {
             api_key_id: "ak-a",
             team_id: "team-a",
             user_id: "user-a",
+            user_name: "alice",
         };
         let key_b = BudgetLabels {
             api_key_id: "ak-b",
             team_id: "team-b",
             user_id: "user-b",
+            user_name: "bob",
         };
         metrics.set_budget_gauges(
             key_a,
@@ -3191,7 +4421,15 @@ mod tests {
             let line = series(metric, "team-a")
                 .unwrap_or_else(|| panic!("{metric} missing for team-a:\n{rendered}"));
             assert!(line.ends_with(&format!(" {value}")), "got: {line}");
-            assert!(line.contains("api_key_id=\"ak-a\"") && line.contains("user_id=\"user-a\""));
+            assert!(
+                line.contains("api_key_id=\"ak-a\"")
+                    && line.contains("user_id=\"user-a\"")
+                    // AISIX-Cloud#1455: the member's readable name rides
+                    // beside their id here for the same reason it does on
+                    // the request families — a budget alert that can only
+                    // name a UUID is one an operator has to go look up.
+                    && line.contains("user_name=\"alice\"")
+            );
         }
         // Key B must have its OWN spent series, not overwrite A's.
         assert!(series(M_BUDGET_SPENT_USD, "team-b").is_some_and(|l| l.ends_with(" 7")));
@@ -3497,6 +4735,350 @@ mod tests {
         );
     }
 
+    /// `clear_budget_gauges` runs on EVERY request whose decision carries
+    /// no budget — which is every request on a deployment with budgets
+    /// switched off, the default. Retracting the amounts here would mint
+    /// four series per api key for a feature nobody enabled, so it must
+    /// touch the presence flag and nothing else.
+    #[test]
+    fn a_budgetless_key_mints_only_the_presence_flag() {
+        let m = Metrics::new(false);
+        m.clear_budget_gauges(BudgetLabels {
+            api_key_id: "ak-1",
+            team_id: "t",
+            user_id: "u",
+            user_name: "alice",
+        });
+        let rendered = m.render();
+        assert_eq!(
+            series_lines(&rendered, M_BUDGET_DETAILS_PRESENT).len(),
+            1,
+            "{rendered}"
+        );
+        for metric in [
+            M_BUDGET_LIMIT_USD,
+            M_BUDGET_SPENT_USD,
+            M_BUDGET_REMAINING_USD,
+            M_BUDGET_RESET_SECONDS,
+        ] {
+            assert!(
+                series_lines(&rendered, metric).is_empty(),
+                "{metric} must not exist for a key that never had a budget:\n{rendered}"
+            );
+        }
+    }
+
+    /// Retiring a budgetless key must not mint the amounts it never had.
+    ///
+    /// `metrics::gauge!` REGISTERS on first use, so retiring a family's
+    /// full list creates the members that label set never carried. Budgets
+    /// are off by default, which puts every api key on the
+    /// `clear_budget_gauges` path — so retiring blind would mint four
+    /// series per deleted key for a feature nobody enabled, the exact
+    /// cardinality `clear_budget_gauges` avoids on the write side.
+    #[test]
+    fn retiring_a_budgetless_key_mints_no_amount_series() {
+        let m = Metrics::new(false);
+        let labels = BudgetLabels {
+            api_key_id: "ak-1",
+            team_id: "t",
+            user_id: "u",
+            user_name: "alice",
+        };
+        // The shape of a deployment with budgets switched off: the flag
+        // and nothing else, on every request.
+        m.clear_budget_gauges(labels);
+        assert_eq!(m.retire_stale_gauges(|_| false), 1);
+
+        let rendered = m.render();
+        assert!(
+            series_lines(&rendered, M_BUDGET_DETAILS_PRESENT)
+                .pop()
+                .expect("the flag was registered, so it retires")
+                .ends_with(" 0"),
+            "{rendered}"
+        );
+        for metric in [
+            M_BUDGET_LIMIT_USD,
+            M_BUDGET_SPENT_USD,
+            M_BUDGET_REMAINING_USD,
+            M_BUDGET_RESET_SECONDS,
+        ] {
+            assert!(
+                series_lines(&rendered, metric).is_empty(),
+                "retirement created {metric}, which this key never had:\n{rendered}"
+            );
+        }
+    }
+
+    /// The amounts appear later than the flag — a key gets its presence
+    /// flag on the request that finds no budget, and its amounts only once
+    /// one exists — so an already-tracked label set has to learn about a
+    /// metric it has not seen, or retirement would leave the amounts frozen.
+    #[test]
+    fn an_amount_registered_after_the_flag_still_retires() {
+        let m = Metrics::new(false);
+        let labels = BudgetLabels {
+            api_key_id: "ak-1",
+            team_id: "t",
+            user_id: "u",
+            user_name: "alice",
+        };
+        m.clear_budget_gauges(labels);
+        m.set_budget_gauges(
+            labels,
+            BudgetGauges {
+                spent_usd: Some(40.0),
+                ..BudgetGauges::default()
+            },
+        );
+        assert_eq!(m.retire_stale_gauges(|_| false), 1);
+
+        let rendered = m.render();
+        assert!(
+            series_lines(&rendered, M_BUDGET_SPENT_USD)
+                .pop()
+                .expect("renders")
+                .ends_with(" NaN"),
+            "{rendered}"
+        );
+        // Still nothing for the amounts that were never written.
+        assert!(
+            series_lines(&rendered, M_BUDGET_LIMIT_USD).is_empty(),
+            "{rendered}"
+        );
+    }
+
+    /// A gauge whose key is gone must stop claiming to describe the
+    /// present. Before retirement the recorder has no idle timeout, so the
+    /// deleted key's sample stayed frozen with `details_present=1` —
+    /// enough to latch the documented "over 90%" alert forever.
+    #[test]
+    fn a_deleted_key_retires_its_budget_series() {
+        let m = Metrics::new(false);
+        let labels = BudgetLabels {
+            api_key_id: "ak-gone",
+            team_id: "t",
+            user_id: "u",
+            user_name: "alice",
+        };
+        m.set_budget_gauges(
+            labels,
+            BudgetGauges {
+                limit_usd: Some(100.0),
+                spent_usd: Some(95.0),
+                remaining_usd: Some(5.0),
+                reset_seconds: Some(60),
+            },
+        );
+        assert!(m.render().contains("aisix_budget_details_present"));
+
+        // Nothing is live: the key was deleted.
+        assert_eq!(m.retire_stale_gauges(|_| false), 1);
+
+        let rendered = m.render();
+        let value = |metric: &str| -> String {
+            series_lines(&rendered, metric)
+                .pop()
+                .unwrap_or_else(|| panic!("{metric} must still render\n{rendered}"))
+                .rsplit(' ')
+                .next()
+                .expect("a value")
+                .to_string()
+        };
+        // The presence flag is the one the documented guard reads, and its
+        // cleared value is 0 — that is what makes the alert stop matching.
+        assert_eq!(value(M_BUDGET_DETAILS_PRESENT), "0");
+        // The quantities go to NaN, NOT 0: `spent 0 / limit 0` is a claim
+        // about a budget, and a `remaining_usd 0` would read as "exhausted".
+        for metric in [
+            M_BUDGET_LIMIT_USD,
+            M_BUDGET_SPENT_USD,
+            M_BUDGET_REMAINING_USD,
+            M_BUDGET_RESET_SECONDS,
+        ] {
+            assert_eq!(value(metric), "NaN", "{metric} must retire to NaN");
+        }
+    }
+
+    /// `aisix_ratelimit_remaining_requests 0` means "quota exhausted".
+    /// Retiring to zero would replace a stale claim with a false one, so
+    /// this pins the marker rather than trusting the constant.
+    #[test]
+    fn retirement_never_asserts_a_meaningful_zero() {
+        let m = Metrics::new(false);
+        m.set_rate_limit_remaining("ak-gone", "gpt-4o", Some(7), Some(900));
+        assert_eq!(m.retire_stale_gauges(|_| false), 1);
+
+        let rendered = m.render();
+        for metric in [M_RATELIMIT_REMAINING_REQUESTS, M_RATELIMIT_REMAINING_TOKENS] {
+            let line = series_lines(&rendered, metric)
+                .pop()
+                .unwrap_or_else(|| panic!("{metric} must render\n{rendered}"));
+            assert!(
+                line.ends_with(" NaN"),
+                "{metric} must retire to NaN, never to a value that means \
+                 something: {line}"
+            );
+        }
+    }
+
+    /// `aisix_deployment_state` is deliberately NOT swept: it is written
+    /// only on a health TRANSITION, so retiring it would blank a live
+    /// model's state with nothing to rewrite it until the next flip.
+    #[test]
+    fn deployment_state_is_not_retirable() {
+        let m = Metrics::new(false);
+        m.set_deployment_state(
+            DeploymentLabels {
+                provider: "openai",
+                model: "gpt-4o",
+                upstream_model: "gpt-4o",
+                provider_key_id: "pk-gone",
+            },
+            DeploymentState::Down,
+        );
+        // Nothing is live, and it still must not be touched.
+        assert_eq!(m.retire_stale_gauges(|_| false), 0);
+        assert!(
+            series_lines(&m.render(), M_DEPLOYMENT_STATE)
+                .pop()
+                .expect("renders")
+                .ends_with(" 2"),
+            "a health-transition gauge must keep its last reported state"
+        );
+    }
+
+    /// Retirement is per label SET, not per key: rebinding a key to another
+    /// team strands the old series under the same `api_key_id`, and only
+    /// that one may be retired.
+    #[test]
+    fn rebinding_retires_the_old_label_set_and_leaves_the_new_one() {
+        let m = Metrics::new(false);
+        let spend = |v| BudgetGauges {
+            spent_usd: Some(v),
+            ..BudgetGauges::default()
+        };
+        let before = BudgetLabels {
+            api_key_id: "ak-1",
+            team_id: "team-old",
+            user_id: "u",
+            user_name: "alice",
+        };
+        let after = BudgetLabels {
+            team_id: "team-new",
+            ..before
+        };
+        m.set_budget_gauges(before, spend(40.0));
+        m.set_budget_gauges(after, spend(45.0));
+
+        // Only the post-rebind label set is current.
+        let retired = m.retire_stale_gauges(|series| match series {
+            LiveGaugeSeries::Budget { team_id, .. } => team_id == "team-new",
+            _ => true,
+        });
+        assert_eq!(retired, 1);
+
+        let rendered = m.render();
+        let line = |team: &str| -> String {
+            series_lines(&rendered, M_BUDGET_SPENT_USD)
+                .into_iter()
+                .find(|l| l.contains(&format!("team_id=\"{team}\"")))
+                .unwrap_or_else(|| panic!("team {team} must render\n{rendered}"))
+                .to_string()
+        };
+        assert!(line("team-old").ends_with(" NaN"), "{}", line("team-old"));
+        assert!(line("team-new").ends_with(" 45"), "{}", line("team-new"));
+    }
+
+    /// The sweep must not touch a series whose key is still configured —
+    /// a wrongly retired gauge hides live state, which is worse than the
+    /// stale sample it was meant to clean up.
+    #[test]
+    fn a_live_key_is_never_retired() {
+        let m = Metrics::new(false);
+        m.set_budget_gauges(
+            BudgetLabels {
+                api_key_id: "ak-live",
+                team_id: "t",
+                user_id: "u",
+                user_name: "alice",
+            },
+            BudgetGauges {
+                spent_usd: Some(12.0),
+                ..BudgetGauges::default()
+            },
+        );
+        assert_eq!(m.retire_stale_gauges(|_| true), 0);
+        let rendered = m.render();
+        assert!(
+            series_lines(&rendered, M_BUDGET_SPENT_USD)
+                .pop()
+                .expect("renders")
+                .ends_with(" 12"),
+            "{rendered}"
+        );
+    }
+
+    /// A retired label set is DROPPED from the registry, not kept and
+    /// re-marked forever. Keeping it would let dead entries fill
+    /// `RETIRABLE_CAPACITY` over a long-running process and silently stop
+    /// new series from being tracked at all — the very bug this exists to
+    /// fix — and would re-emit the same NaN on every tick.
+    #[test]
+    fn a_retired_series_is_dropped_from_the_registry() {
+        let m = Metrics::new(false);
+        let labels = BudgetLabels {
+            api_key_id: "ak-1",
+            team_id: "t",
+            user_id: "u",
+            user_name: "alice",
+        };
+        m.set_budget_gauges(
+            labels,
+            BudgetGauges {
+                spent_usd: Some(40.0),
+                ..BudgetGauges::default()
+            },
+        );
+        assert_eq!(m.retire_stale_gauges(|_| false), 1);
+        // Nothing left to retire: the entry is gone, so the sweep does no
+        // work on it again.
+        assert_eq!(m.retire_stale_gauges(|_| false), 0);
+    }
+
+    /// Rebinding produces a NEW label set, which registers and is
+    /// retirable in its own right — so dropping the old entry does not
+    /// leave the key untracked. (An identical label set coming back would
+    /// need a deleted id to be reissued, which uuids do not do.)
+    #[test]
+    fn the_label_set_a_rebind_creates_is_tracked_too() {
+        let m = Metrics::new(false);
+        let spend = |v| BudgetGauges {
+            spent_usd: Some(v),
+            ..BudgetGauges::default()
+        };
+        let before = BudgetLabels {
+            api_key_id: "ak-1",
+            team_id: "team-old",
+            user_id: "u",
+            user_name: "alice",
+        };
+        m.set_budget_gauges(before, spend(40.0));
+        assert_eq!(m.retire_stale_gauges(|_| false), 1);
+
+        let after = BudgetLabels {
+            team_id: "team-new",
+            ..before
+        };
+        m.set_budget_gauges(after, spend(45.0));
+        assert_eq!(
+            m.retire_stale_gauges(|_| false),
+            1,
+            "the post-rebind label set must be tracked on its own registration"
+        );
+    }
+
     #[test]
     fn budget_gauge_key_covers_every_label() {
         let m = Metrics::new(false);
@@ -3504,6 +5086,7 @@ mod tests {
             api_key_id: "ak",
             team_id: "t",
             user_id: "u",
+            user_name: "n",
         };
         let variants = [
             BudgetLabels {
@@ -3516,6 +5099,13 @@ mod tests {
             },
             BudgetLabels {
                 user_id: "u2",
+                ..base
+            },
+            // A rename keeps the id and changes only the name. Off the
+            // worker key, the gauge would keep reporting this member
+            // under their old name for as long as the worker lives.
+            BudgetLabels {
+                user_name: "n2",
                 ..base
             },
         ];
@@ -3610,6 +5200,7 @@ mod tests {
             provider: "p",
             status: 200,
             streaming: false,
+            details: Default::default(),
         };
         let variants = [
             LatencyLabels {
@@ -3739,6 +5330,9 @@ mod tests {
         model: "gpt-4o",
         provider_key_id: "pk-1",
         provider_key_name: "openai-prod",
+        user_id: "member-1",
+        user_name: "alice",
+        upstream_protocol: "openai",
     };
 
     #[test]
@@ -3771,7 +5365,67 @@ mod tests {
                 ..PK_A
             },
         );
-        assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_EMITS_TOTAL, 6);
+        // AISIX-Cloud#1403: and so does the upstream protocol. A key
+        // repointed at an Anthropic-shape upstream keeps its id, so
+        // leaving this out of the cache key would report the new traffic
+        // under the old protocol for as long as the worker lives.
+        m.record_usage_event_emit(
+            "chat",
+            200,
+            "openai",
+            UsageEventLabels {
+                upstream_protocol: "anthropic",
+                ..PK_A
+            },
+        );
+        // AISIX-Cloud#1455: a renamed member keeps their id, so the name
+        // has to be part of the key or this counter reports them under
+        // the old name for the worker's lifetime.
+        m.record_usage_event_emit(
+            "chat",
+            200,
+            "openai",
+            UsageEventLabels {
+                user_name: "alice-renamed",
+                ..PK_A
+            },
+        );
+        assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_EMITS_TOTAL, 8);
+    }
+
+    /// AISIX-Cloud#1403: the label survives onto the exposition, with the
+    /// UPSTREAM's protocol rather than the caller's, and `unknown` where
+    /// no upstream was selected.
+    ///
+    /// The family this test exists for is the one 0.11.0-rc.2 shipped
+    /// without the label: it had the resolved ProviderKey right beside
+    /// `provider_key_id` and emitted everything but its protocol.
+    #[test]
+    fn usage_event_emit_reports_the_upstream_protocol_not_the_callers() {
+        let m = Metrics::new(false);
+        // An Anthropic-protocol caller served by an OpenAI-shape upstream.
+        m.record_usage_event_emit("messages", 200, "anthropic", PK_A);
+        // A request that never reached a key — a pre-dispatch rejection,
+        // or a tunnel with no LLM upstream at all.
+        m.record_usage_event_emit("chat", 401, "openai", UsageEventLabels::default());
+        let rendered = m.render();
+
+        assert!(
+            rendered.contains(
+                "handler=\"messages\",status_code=\"2xx\",status=\"200\",\
+                 inbound_protocol=\"anthropic\",upstream_protocol=\"openai\""
+            ),
+            "cross-protocol sample must report the upstream's protocol:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "handler=\"chat\",status_code=\"4xx\",status=\"401\",\
+                 inbound_protocol=\"openai\",upstream_protocol=\"unknown\""
+            ),
+            "an unresolved upstream must read `unknown`, never borrow the \
+             inbound protocol:\n{rendered}"
+        );
+        assert_upstream_protocol_rides_along(&rendered);
     }
 
     #[test]
@@ -3787,31 +5441,73 @@ mod tests {
                 ..PK_A
             },
         );
-        assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_DROPS_TOTAL, 3);
+        m.record_usage_event_drop(
+            "sink_full",
+            UsageEventLabels {
+                user_name: "alice-renamed",
+                ..PK_A
+            },
+        );
+        assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_DROPS_TOTAL, 4);
     }
 
     /// AISIX-Cloud#1317: the two counters are read as one pair —
     /// `emitted == delivered + dropped`. A per-model or per-key slice of
     /// that invariant only exists if BOTH sides carry the same attribution,
     /// which is why `try_emit` hands one label set to both.
+    ///
+    /// Derived, not a list of label names: the drop sample must carry
+    /// everything the emit sample does EXCEPT the three dimensions
+    /// `record_usage_event_emit` takes as its own arguments. So a field
+    /// added to [`UsageEventLabels`] and wired into the emit counter fails
+    /// this test until it reaches the drop counter too — which is how
+    /// `upstream_protocol` reached only one side in the first place
+    /// (AISIX-Cloud#1403).
     #[test]
     fn emits_and_drops_carry_the_same_attribution_labels() {
         let m = Metrics::new(false);
         m.record_usage_event_emit("chat", 200, "openai", PK_A);
         m.record_usage_event_drop("sink_full", PK_A);
         let rendered = m.render();
-        for metric in [M_USAGE_EVENT_EMITS_TOTAL, M_USAGE_EVENT_DROPS_TOTAL] {
+
+        let labels_of = |metric: &str| -> BTreeSet<String> {
             let line = series_lines(&rendered, metric)
                 .pop()
                 .unwrap_or_else(|| panic!("{metric} must render\n{rendered}"));
-            for want in [
-                r#"model="gpt-4o""#,
-                r#"provider_key_id="pk-1""#,
-                r#"provider_key_name="openai-prod""#,
-            ] {
-                assert!(line.contains(want), "{metric} is missing {want}: {line}");
-            }
-        }
+            line.split_once('{')
+                .and_then(|(_, rest)| rest.rsplit_once('}'))
+                .expect("a labelled sample")
+                .0
+                .split(',')
+                .filter_map(|pair| pair.split_once('=').map(|(k, _)| k.to_string()))
+                .collect()
+        };
+        // The emit counter's own arguments — a surface of the emitting
+        // handler, not of the event's attribution.
+        let emit_only: BTreeSet<String> = ["handler", "status_code", "status", "inbound_protocol"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let attribution: BTreeSet<String> = labels_of(M_USAGE_EVENT_EMITS_TOTAL)
+            .difference(&emit_only)
+            .cloned()
+            .collect();
+        assert!(
+            attribution.contains("model")
+                && attribution.contains("provider_key_id")
+                && attribution.contains("user_id"),
+            "the attribution set looks wrong: {attribution:?}"
+        );
+
+        let dropped = labels_of(M_USAGE_EVENT_DROPS_TOTAL);
+        let missing: Vec<&String> = attribution.difference(&dropped).collect();
+        assert!(
+            missing.is_empty(),
+            "the drop counter is missing attribution the emit counter \
+             carries: {missing:?}. Both sides take one `UsageEventLabels`, \
+             so a dimension on only one of them makes that slice of \
+             `emitted == delivered + dropped` unanswerable.",
+        );
     }
 
     #[test]
@@ -4015,6 +5711,7 @@ mod tests {
                             output_tokens: 2,
                             total_tokens: 3,
                             spend_usd: 0.000001,
+                            ..Default::default()
                         },
                     );
                 })
@@ -4386,6 +6083,7 @@ mod tests {
             provider: "openai",
             status: 200,
             streaming: false,
+            details: Default::default(),
         };
         m.record_request_e2e_latency(labels, Duration::from_millis(1500));
         m.record_request_ttft(
@@ -4413,7 +6111,17 @@ mod tests {
         assert!(out.contains("status_class=\"2xx\""));
         assert!(out.contains("streaming=\"false\""));
         assert!(out.contains("streaming=\"true\""));
-        for high_card in ["api_key_id", "user_id", "team_id", "provider_key_id"] {
+        // Substring matches, so each NAME label has to be listed beside its
+        // id: `contains("user_id")` does not see `user_name`, and these
+        // histograms are the one family the id/name pair must NOT reach.
+        for high_card in [
+            "api_key_id",
+            "user_id",
+            "user_name",
+            "team_id",
+            "provider_key_id",
+            "provider_key_name",
+        ] {
             for line in out.lines().filter(|l| l.contains("aisix_request_")) {
                 assert!(
                     !line.contains(high_card),
@@ -4436,6 +6144,7 @@ mod tests {
                 provider: "anthropic",
                 status: 502,
                 streaming: false,
+                details: Default::default(),
             },
             Duration::from_millis(1500),
         );
@@ -4469,6 +6178,7 @@ mod tests {
             provider: "openai",
             status: 200,
             streaming: true,
+            details: Default::default(),
         };
         m.record_request_ttft(labels, Duration::ZERO);
         assert!(
@@ -4515,6 +6225,7 @@ mod tests {
             provider: "openai",
             status: 200,
             streaming: true,
+            details: Default::default(),
         };
         m.record_request_e2e_latency(labels, Duration::from_millis(1500));
         m.record_request_ttft(labels, Duration::from_millis(1500));
@@ -4548,6 +6259,7 @@ mod tests {
                 provider: "anthropic",
                 status: 200,
                 streaming: true,
+                details: Default::default(),
             },
             Duration::from_millis(1500),
         );
@@ -4584,6 +6296,7 @@ mod tests {
             provider: "openai",
             status: 200,
             streaming: true,
+            details: Default::default(),
         };
         m.record_request_e2e_latency(labels, Duration::from_millis(1500));
         m.record_request_ttft(labels, Duration::from_millis(1500));
@@ -4672,6 +6385,7 @@ mod tests {
             reloads_total: 3,
             reload_failures: std::collections::BTreeMap::new(),
             rejected_by_kind: std::collections::BTreeMap::new(),
+            unknown_kind_by_kind: std::collections::BTreeMap::new(),
             partially_compatible_by_kind: std::collections::BTreeMap::new(),
             stale_served_by_kind: std::collections::BTreeMap::new(),
             observed_revision: Some(42),
@@ -4691,6 +6405,7 @@ mod tests {
         view.partially_compatible_by_kind
             .insert("api_keys".to_string(), 3);
         view.stale_served_by_kind.insert("models".to_string(), 1);
+        view.unknown_kind_by_kind.insert("pricing".to_string(), 2);
         m.sync_config_status(&view);
         let out = m.render();
 
@@ -4708,6 +6423,9 @@ mod tests {
         )));
         assert!(out.contains(&format!(
             "{M_CONFIG_STALE_SERVED_RESOURCES}{{kind=\"models\"}} 1"
+        )));
+        assert!(out.contains(&format!(
+            "{M_CONFIG_UNKNOWN_KIND_RESOURCES}{{kind=\"pricing\"}} 2"
         )));
         assert!(out.contains(&format!("{M_CONFIG_OBSERVED_REVISION} 42")));
         assert!(out.contains(&format!("{M_CONFIG_APPLIED_REVISION} 42")));
@@ -4740,6 +6458,7 @@ mod tests {
             .partially_compatible_by_kind
             .insert("api_keys".to_string(), 1);
         first.stale_served_by_kind.insert("models".to_string(), 1);
+        first.unknown_kind_by_kind.insert("pricing".to_string(), 1);
         m.sync_config_status(&first);
 
         // The applied config changes and the models rejection clears.
@@ -4763,6 +6482,11 @@ mod tests {
         // And for the stale-served gauge (#871).
         assert!(out.contains(&format!(
             "{M_CONFIG_STALE_SERVED_RESOURCES}{{kind=\"models\"}} 0"
+        )));
+        // And for the unknown-kind gauge (#1207) — zero, not NaN: it counts
+        // rows in a state, so 0 is the true reading once they are gone.
+        assert!(out.contains(&format!(
+            "{M_CONFIG_UNKNOWN_KIND_RESOURCES}{{kind=\"pricing\"}} 0"
         )));
     }
 

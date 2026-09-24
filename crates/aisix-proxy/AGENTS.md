@@ -43,7 +43,7 @@ the four errors when missed:
   budget (`routing::effective_timeouts`).
 - **The rate-limit reservation has to become a `into_stream_hold()`.** Dropping it
   at handler return releases the concurrency slot while the stream is still
-  running, which is how a key capped at N serves more than N at once (#450). The
+  running, which is how a key capped at N serves more than N at once. The
   terminal token cost then rides `Limiter::add_tokens_post_stream` instead of
   `commit_tokens`.
 - **The UsageEvent moves into the stream's Drop guard.** Counts that arrive on a
@@ -56,7 +56,7 @@ the four errors when missed:
   request is a way around the check the same request gets without it. That is
   `runs_on_output(chain) && chain.stream_output_policy().holds_back()`. A
   monitor-only chain resolves to `EndOfStreamCheck` and must NOT hold the stream
-  back (AISIX-Cloud#1010) — it takes the live path and scans once at
+  back — it takes the live path and scans once at
   end-of-stream via `guardrail_stream::EosOutputScan`.
 
 Retry semantics change too, and that is intended: the retryable unit ends at the
@@ -69,6 +69,126 @@ mock upstream that trickles its response over ~1s, and a client read loop that
 counts chunks and measures first-byte against last-byte
 (`audio-stream-relay-e2e.test.ts`).
 
+## A guardrail-raised refusal is gated on the direction, not on `is_empty()`
+
+`GuardrailIndex::resolve` matches on SCOPE only — env / model / mcp_server /
+api_key / team. It does not filter by `hook_point`, so a chain resolved for a
+request is non-empty whenever any attachment is in scope, including one attached
+on the output hook alone. Each guardrail then no-ops on the hook it is not
+configured for, which makes `!chain.is_empty()` a safe gate for *running* the
+checks and a wrong gate for *refusing*: a refusal the proxy raises itself —
+`unscannable_body`, and anything else the code decides rather than a verdict —
+is only justified when something would have read that side of the exchange.
+
+Gate the refusal on `Guardrail::refuses_unevaluable_input(&chain)` for a
+request-side one and `refuses_unevaluable_output(&chain)` for a response-side
+one. Those fold TWO conditions per member — the member reads that side, and its
+failure policy is fail-closed — and a chain is `any` over its members. Both
+halves must hold on the SAME member, which is why there is a combined predicate
+rather than two you could `&&` together: a chain of [output-only fail-closed,
+input-only fail-open] reads the request and contains a fail-closed row, yet
+nothing in it justifies refusing a request.
+
+The failure policy is per hook: the row's `fail_open` governs the input hook,
+and each remote kind's own `<Kind>Config::output_fail_open` governs the output
+hook. `keyword` and `pii` have no `output_fail_open` — they never call out — so
+their row-level `fail_open` governs both of their hooks.
+
+`/mcp` is the sharp case for the direction half: it resolves ONE chain and uses
+it in both directions, so an input-only row reaches the output arm and vice
+versa. Note also that `hook_point` defaults to `both` and `fail_open` to
+`false`, so this only bites a deployment that set one of them explicitly.
+
+Not gated, deliberately: the refusals that need a HELD-BACK stream
+(`output_buffer_exceeded`, `mask_writeback_failed`, and `unscannable_body` on a
+buffered SSE body). Honouring `fail_open` there does not mean skipping a
+refusal, it means releasing already-buffered bytes that were never scanned —
+a different decision, and one nobody has taken.
+
+## The bypass reason rides the audit log, and every emitter must set it
+
+`usage_events.guardrail_bypassed_reason` is the record that a guardrail on
+this request did not evaluate and its failure policy let the request past
+it. Its failure mode is silent in both directions: the caller gets a normal
+200, and an emitter that leaves the field at its `String::default()`
+reports "nothing was bypassed" for a request that was — indistinguishable
+from a screened one.
+
+**It is not mutually exclusive with `guardrail_blocked`, and must not be
+suppressed when that is set.** A chain can fail open on one member and be
+refused by another, and an input hook can fail open on a prompt the
+provider already answered before the output hook refused it. Both are
+requests where something really did go unscreened, and the second is the
+more compliance-relevant of the two — `chat.rs` has always carried the
+input bypass onto the billed-then-blocked event through `UpstreamCharge`.
+"Reached a provider unscreened" is the two fields read together, never this
+one alone.
+
+So it is not threaded per handler. The chain folds record the first `Bypass`
+they see onto the request's `GuardrailAuditLog`, which every handler already
+clones for `guardrail_enforced_hits`, and every emitter reads it back with
+`usage_attr::bypass_reason(audit)`. Not terminal-only, unlike the enforced
+hits: every attempt of a request that failed open went upstream unscreened.
+`chat.rs` still threads its own copy because its per-attempt and ensemble
+sub-call emitters are handed the value captured earlier in the request,
+which a request-scoped snapshot cannot express; the two agree by
+construction.
+
+Two rules follow, and both are enforced mechanically rather than by review:
+
+- A new `UsageEvent` literal in this crate sets the field, or carries a
+  `NO-GUARDRAIL-CHAIN: <why>` comment saying no chain was ever resolved
+  (`usage_attr`'s `every_usage_event_this_crate_builds_answers_the_bypass_question`
+  parses the crate's own source for both).
+- A pass-through the PROXY performs on a body it could not scan is recorded
+  with `GuardrailChain::record_unevaluable_{input,output}_bypass`, never
+  `record_bypass` directly. That pass has two causes and only one is a
+  bypass: a chain whose readers of that side are all fail-open let an
+  unscreened request through, while a chain where NOTHING reads that side
+  never offered to screen it. Tagging the second would fire the field on
+  requests that were never going to be screened, which breaks the negative
+  answer just as thoroughly as dropping the first.
+
+Deliberately NOT recorded, so the next person does not read the gated
+unscannable sites as the full set: the places that scan a mangled copy
+unconditionally, with no failure policy involved. `jobs::scan_output_blob`
+scans `String::from_utf8_lossy` of a batch or fine-tuning response and, where
+the verdict lets it through, relays the original bytes whatever the row's
+failure policy says; `passthrough_route` scans the lossy body. Neither
+consults `refuses_unevaluable_*`, so a fail-CLOSED row does not refuse there
+either — not something telemetry can paper over, and making them refuse is a
+behaviour change rather than an observability one. Tagging them instead
+would fire the field on every job response and every passthrough body, which
+destroys the negative answer just as thoroughly.
+Note that `record_unevaluable_*` is the wrong helper at such a site: its
+predicate assumes the fail-closed case was already refused, so at a site that
+never refuses it would silently drop exactly the case worth reporting.
+
+The multipart `prompt` on `audio.rs` and `images_edits.rs` is not in that set:
+both call `dispatch::require_utf8_prompt_fields` after model resolution and
+before the chain runs, so an undecodable `prompt` part is answered 400 and the
+`filter_map` in their scan builders cannot be reached by one. Audio's
+transcript OUTPUT scan is a separate site and is gated rather than dropped:
+`transcription_output_text` reports whether the plain-text fallback (`text` /
+`srt` / `vtt`) had to decode lossily, and its caller runs the same gate as
+`/mcp`'s tool-result arm — refuse under `refuses_unevaluable_output`, record
+the bypass otherwise. Those two are the crate's only `refuses_unevaluable_output`
+call sites: `/v1/messages` and `/v1/messages/count_tokens` gate the INPUT side
+with the mirror predicate, and their response-side `unscannable_body` arms are
+the held-back-stream ones listed above as deliberately ungated. Audio differs
+from `/mcp` in still scanning the lossy text when it does not refuse, because a
+transcript is prose the caller reads: only the bytes `from_utf8_lossy` replaced
+go unread. The flag it gates on reports a failed DECODE, not scan coverage — a
+JSON body with no transcript field scans nothing and reports no bypass, the same
+as the empty transcript a silent recording returns.
+
+Values come from the guardrail kind's own `bypass_tag()` — the same bounded
+vocabulary `GuardrailVerdict::block_unavailable` carries, so one outage reads
+the same whichever way the row is configured — plus `unscannable_body` for
+the proxy-raised pass. The audit log clamps whatever it is given through
+`bounded_failure_tag`, because the value lands on an unsanitized metric
+label and on a wire field the control plane stores as `varchar(64)`.
+
 ## Every terminal path emits the access log — including the ones that give up early
 
 The access log and `request_metrics::record` are emitted **by the handler**, at
@@ -77,6 +197,20 @@ and token counts. A path that returns before reaching that tail therefore logs
 nothing, and nothing errors: the caller gets a correct status while the gateway
 keeps no record of the request, which is indistinguishable from the request never
 arriving.
+
+One exception, and it is the whole of it: **a STREAMED response's line is not
+the handler's to write.** Its tail runs when the head goes out, which is not
+when the request ends — so it parks the line on the attribution cell
+(`attribution::PendingAccessLog`) and the line goes out from
+`usage_attr::emit_usage` with the request's TERMINAL usage event, whichever of
+the stream's endings produced it. That is what makes the line and the row agree
+on `status`, `error_class` and `error_message` by construction; writing the line
+at the tail instead would report every abandoned stream as a `200` beside its
+own `499` row. Two consequences for a new streaming family: park
+the line whenever the response IS a stream (a "telemetry already emitted" flag
+is NOT the same predicate — chat's buffered ensemble sets one), and make sure
+the stream really does emit a terminal usage event, because that emit is now
+the only thing that writes the line.
 
 Two shapes give up early, and both must answer through
 `reject::reject_before_dispatch` (it renders the envelope *and* emits the
@@ -97,7 +231,32 @@ Emit the request metrics through `request_metrics::record` and nothing else. It
 writes the legacy `aisix_requests_total` **and** the detailed `aisix_proxy_*` /
 `aisix_llm_*` families from one call, so calling `Metrics::record_request`
 directly silently produces a request that exists in one family and not the
-others — the bug AISIX-Cloud#1234 fixed across ten endpoints.
+others.
+
+There is a third shape, and it reaches no tail at all: a caller that hangs up
+before the response head is written. axum **drops** the handler future, so the
+access log, the metrics and the usage events are all continuation code that
+never runs — and nothing errors, exactly as above. `ClientCancelGuard` writes
+the line, the cancel counter and the usage events from `Drop` instead
+(`cancel.rs`). What that costs everyone else is a
+standing rule: **anything a cancelled request must report has to be published to
+the request's attribution cell (`attribution.rs`) at a chokepoint the handlers
+already pass through — never held only in a handler local.** A value kept in a
+local is correct on every path except the one nobody tests, and the symptom is a
+missing row rather than an error.
+
+That guard's lifetime does **not** end when the handler returns: it rides the
+response body (`TelemetryBody`), because a streaming family's own terminal
+emitter is built INSIDE its `async_stream!` generator and so does not exist
+until the body's first poll — a body dropped before that emits nothing
+anywhere. Two rules follow for anything that touches the middleware's response
+handling. Keep the body's first poll observable: wrapping it in a combinator
+that hides `poll_frame` (`map_frame` sees only delivered frames, not the poll
+that returned `Pending`) hands every delivered stream a second, contradicting
+`499` row. And keep the body's **drop** inside the request's attribution scope
+(`attribution::sync_scope`): two families build their emitter outside the
+generator, so it fires on an unpolled drop, and that scope is the only reason
+the guard can see that it already spoke.
 
 ## A passthrough route that detects an envelope must observe what the typed endpoint does
 
@@ -108,8 +267,7 @@ a typed endpoint has a second home: a new `UsageEvent` token dimension needs
 reading in `usage_of`, a new guardrail scan input needs adding to
 `message_scan_text` / `request_guardrail_text`, a new attribution field needs
 setting on `RouteTelemetry`. Miss it and the route keeps answering 200 while
-metering and enforcement silently weaken — the shape of #988, where the cache
-and reasoning counters existed everywhere except here.
+metering and enforcement silently weaken.
 
 Two rules bound the extraction:
 
@@ -128,8 +286,7 @@ Adding a `.route(…)` in `build_router` is not enough, and nothing fails loudly
 if you stop there:
 
 1. `normalize_endpoint_label` — an unlisted path collapses to `"other"`, so the
-   route is invisible per-endpoint in every request series (how `/v1/videos`
-   shipped).
+   route is invisible per-endpoint in every request series.
 2. `request_metrics::LLM_ENDPOINTS` — decides whether the route counts as model
    inference. Unlisted means proxy-only, which is the safe default but a silent
    one.
@@ -150,24 +307,24 @@ is a statement about that model, and reaching it through a group must not strip 
 The only deliberately entry-scoped gate is the group's own copy of any of the
 above. Anything else that only checks `model_entry` / `virtual_entry` is a bug.
 
-Guardrail attachment is the **known open exception, not a settled design**: the
-chain resolves from `RequestContext.model_id` before dispatch, so a guardrail
-scoped to a member never runs for group traffic (measured: direct 422, via group
-200). It is unfixed because the semantics are undecided, not because entry scope
-is correct — input guardrails run before a target is picked, and under failover
-there is no single "winning member" to resolve against. Tracked in
-AISIX-Cloud#1090; do not cite it as precedent for scoping a new gate to the entry.
-The 2026-08 model-kind audit re-confirmed the same gap for **ensemble panel/judge
-sub-calls and semantic-router targets**, and the ruling (project decision) is that
-all three kinds stay under #1090's one unified design pass: the operator can
-attach the guardrail to the parent entry, so member scope is a mitigable gap, not
-an unavoidable bypass. Do not piecemeal-fix one kind ahead of that decision, and
-do not re-audit it as a new finding. The same project ruling holds for the OTHER
-member gates on **ensemble** sub-calls (member `allowed_cidrs`, cooldown/health
-consumption, Prometheus usage, caching): ensemble is an experimental surface and
-its parity gaps are deliberate TODOs, not fresh findings — semantic-router
-targets got these gates first because they share the single-winner dispatch
-shape; graduate ensemble deliberately, in one pass.
+**Guardrail attachment is the one deliberate exception, and it is settled
+design.** Its scope follows the entry the caller addresses: a guardrail attached
+to a model runs only for requests addressed to that model. When the model is
+reached as a member of a routing, semantic, or ensemble group, its guardrails do
+not run — the operator attaches the guardrail to the group instead. The chain is
+resolved once from the addressed entry before a target is picked, which is what
+makes an input guardrail's verdict independent of which member a failover lands
+on. Do not "fix" a member-scoped guardrail into running for group traffic, do not
+re-audit it as a finding, and do not cite it as precedent for scoping any OTHER
+per-model gate to the entry — it is the exception because the decision is
+about which entry the caller addressed, not about a member's own configuration.
+
+The OTHER member gates on **ensemble** sub-calls (member `allowed_cidrs`,
+cooldown/health consumption, Prometheus usage, caching) are a separate matter:
+ensemble is an experimental surface and its parity gaps are deliberate TODOs,
+not fresh findings — semantic-router targets got these gates first because they
+share the single-winner dispatch shape; graduate ensemble deliberately, in one
+pass.
 
 Two shapes, both already implemented — copy the nearest one:
 
@@ -193,8 +350,8 @@ never becomes a probe for which members exist.
 
 ## `request_id` is caller-controlled input, not a gateway-minted UUID
 
-Since AISIX-Cloud#1288 a caller can supply the request id via a configured inbound
-header and `request_id::ensure_request_id` adopts it verbatim, so every
+A caller can supply the request id via a configured inbound header, and
+`request_id::ensure_request_id` adopts it verbatim, so every
 `ClientContext.request_id` / `RequestId` value downstream may be a string the
 caller chose. It is only guaranteed to be 1..=256 bytes of visible ASCII
 (`request_id::is_acceptable`) — **not** a UUID, and not unique: nothing stops two

@@ -15,7 +15,7 @@ import {
 // blocked response is signalled with a terminal `error` event (mirroring
 // /v1/chat/completions and the common streaming-guardrail pattern). We stream
 // Anthropic SSE whose text_delta carries a forbidden token and require
-// the response to end with a content_filter error event.
+// the response to end with an Anthropic-shape `error` event.
 
 const CALLER = "sk-msgstream-gr-caller";
 const HASH = createHash("sha256").update(CALLER).digest("hex");
@@ -83,7 +83,7 @@ describe("streaming /v1/messages output guardrail (#448)", () => {
       }),
     });
 
-  test("a forbidden streamed response ends with a content_filter error event", async (ctx) => {
+  test("a forbidden streamed response ends with an anthropic-shape error event", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {
       ctx.skip();
       return;
@@ -91,7 +91,7 @@ describe("streaming /v1/messages output guardrail (#448)", () => {
     await waitConfigPropagation(async () => {
       const r = await stream();
       const b = await r.text();
-      return b.includes("content_filter");
+      return b.includes("event: error");
     });
 
     const res = await stream();
@@ -102,6 +102,18 @@ describe("streaming /v1/messages output guardrail (#448)", () => {
     // response until it scans clean — the matched content must NOT reach
     // the wire (pre-fix it was forwarded verbatim before the error frame).
     expect(body, "hold-back keeps the matched content off the wire").not.toContain(FORBIDDEN);
-    expect(body, "stream must end with a content_filter error event").toContain("content_filter");
+    // The terminal frame carries `error.type = "invalid_request_error"` —
+    // the same value the HTTP 422 half of this endpoint renders. Anthropic's
+    // `error.type` is a closed enum with no `content_filter` member, so the
+    // two halves had been disagreeing and the SDK's typed parse rejected the
+    // streaming one.
+    expect(body, "stream must end with an SSE error event").toContain("event: error");
+    const frame = body.slice(body.lastIndexOf("event: error"));
+    const payload = JSON.parse(
+      frame.slice(frame.indexOf("data: ") + "data: ".length, frame.indexOf("\n\n")),
+    ) as { type: string; error: { type: string; message: string } };
+    expect(payload.type).toBe("error");
+    expect(payload.error.type).toBe("invalid_request_error");
+    expect(payload.error).not.toHaveProperty("code");
   });
 });

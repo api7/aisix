@@ -158,6 +158,7 @@ pub async fn image_edits(
                 &snapshot,
                 &pk,
                 ENDPOINT,
+                crate::operation::IMAGE_EDIT,
                 &request_id,
                 &success.model_id,
                 &success.model_name,
@@ -174,6 +175,7 @@ pub async fn image_edits(
                 success.monitor_hits.clone(),
                 success.captured_content.as_ref(),
                 &audit,
+                true,
             );
             success.response
         }
@@ -216,15 +218,18 @@ pub async fn image_edits(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
-                "images",
+                crate::operation::IMAGE_EDIT,
                 "openai",
                 &request_id,
                 &attributed.requested_model,
                 &api_key_id,
                 status,
                 err.kind(),
+                err.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
+                crate::usage_attr::guardrail_scores(&audit),
+                crate::usage_attr::bypass_reason(&audit),
             );
             err.into_response()
         }
@@ -281,7 +286,7 @@ async fn dispatch(
     let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
-    if !auth.key().can_access(&model_name) {
+    if !auth.key().can_access(snapshot, &model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()));
     }
 
@@ -334,7 +339,14 @@ async fn dispatch(
             .filter(|s| !s.is_empty())
             .map(|s| ChatMessage::user(s.to_string()))
             .collect();
-        if !prompt_messages.is_empty() {
+        // The chain runs whether or not a `prompt` part was supplied.
+        // Gating on "we found text" made the check a text matcher's
+        // privilege: a guardrail that decides about the CALL — a policy
+        // script, an unconditional block scoped to this model — never
+        // fired on the ordinary shape of this endpoint (an edit with no `prompt` part),
+        // so an operator's rule silently allowed exactly the requests
+        // that carry nothing to match.
+        {
             let chat = aisix_gateway::ChatFormat::new(&model_name, prompt_messages);
             let (verdict, hits) =
                 aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
@@ -342,7 +354,7 @@ async fn dispatch(
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
-                ..
+                unavailable,
             } = verdict
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
@@ -352,8 +364,10 @@ async fn dispatch(
                     reason = %reason,
                     "guardrail blocked /v1/images/edits request (prompt field)",
                 );
-                return Err(ProxyError::ContentFiltered(
-                    crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+                return Err(crate::error::guardrail_block_error(
+                    "request",
+                    guardrail_name.as_deref(),
+                    unavailable.as_deref(),
                 ));
             }
         }
@@ -530,7 +544,7 @@ async fn dispatch(
         ),
     );
 
-    let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
+    let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
     let tracker = &state.runtime_status;
     let model_id: &str = &model_entry.id;
     let cooldown_cfg = model.cooldown.as_ref();
@@ -661,6 +675,7 @@ mod tests {
             request_id: Default::default(),
             url_rewrites: Vec::new(),
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }
@@ -937,7 +952,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("img-edit-prod"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let app = build_app(snap);
         let resp = tower::ServiceExt::oneshot(app, make_req("img-edit-prod", "please BLOCKME now"))
@@ -972,7 +987,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("img-edit-prod"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let mut body: Vec<u8> = Vec::new();
         body.extend_from_slice(
@@ -1196,7 +1211,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("my-image"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let app = build_app_with_sink(snap, tx);
@@ -1249,7 +1264,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("my-image"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(masking_input_guardrail());
+        crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let app = build_app_with_sink(snap, tx);

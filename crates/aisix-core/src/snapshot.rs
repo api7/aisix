@@ -15,11 +15,23 @@
 //! business types in `models::AisixSnapshot`. This crate provides the
 //! primitive only.
 
+mod reclaim;
+
 use crate::resource::{Resource, ResourceEntry};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// Process-wide source of [`ResourceTable::generation`] stamps.
+///
+/// One counter for every table of every snapshot, so a stamp is unique
+/// across kinds and across rebuilds. That is what lets a derived cache
+/// compare two generations for equality and conclude "same rows": a
+/// table rebuilt from scratch (resync, cache restore) takes fresh stamps
+/// rather than replaying the previous snapshot's, so it can never
+/// coincide with the value a cache is holding.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Per-kind table with primary id-index and secondary name-index.
 ///
@@ -27,19 +39,26 @@ use std::sync::Arc;
 /// duplicate storage — the name map just holds ids.
 #[derive(Debug)]
 pub struct ResourceTable<T: Resource> {
-    by_id: DashMap<String, Arc<ResourceEntry<T>>>,
-    by_name: DashMap<String, String>,
+    // Index strings are immutable and shared across copy-on-write snapshots.
+    by_id: DashMap<Arc<str>, Arc<ResourceEntry<T>>>,
+    by_name: DashMap<Arc<str>, Arc<str>>,
     /// Cached entry count, maintained by [`ResourceTable::insert`] /
     /// [`ResourceTable::remove`]. DashMap's own `len()` / `is_empty()`
     /// visit every shard (a CAS pair per shard), so per-request
     /// emptiness checks on the hot path go through this counter
     /// instead — one relaxed load, O(1) regardless of shard count.
     count: AtomicUsize,
+    /// Stamp bumped on every mutation of THIS table and carried across
+    /// [`Clone`]. See [`ResourceTable::generation`].
+    generation: AtomicU64,
 }
 
-/// Manual impl: `AtomicUsize` is not `Clone`. The count is re-seeded
+/// Manual impl: the atomics are not `Clone`. The count is re-seeded
 /// from the cloned map's length, which the etcd watch supervisor's
-/// clone-then-mutate update cycle relies on being exact.
+/// clone-then-mutate update cycle relies on being exact. The generation
+/// is COPIED, not re-stamped: a clone holds the same rows, so a cache
+/// keyed on it must not be invalidated by the copy-on-write cycle that
+/// publishes an unrelated table's change.
 impl<T: Resource> Clone for ResourceTable<T> {
     fn clone(&self) -> Self {
         let by_id = self.by_id.clone();
@@ -48,6 +67,7 @@ impl<T: Resource> Clone for ResourceTable<T> {
             by_id,
             by_name: self.by_name.clone(),
             count,
+            generation: AtomicU64::new(self.generation.load(Ordering::Acquire)),
         }
     }
 }
@@ -58,6 +78,10 @@ impl<T: Resource> Default for ResourceTable<T> {
             by_id: DashMap::new(),
             by_name: DashMap::new(),
             count: AtomicUsize::new(0),
+            // Empty and never mutated: an unconfigured kind keeps
+            // generation 0 forever, so two empty tables compare equal
+            // and no consumer rebuilds anything for them.
+            generation: AtomicU64::new(0),
         }
     }
 }
@@ -75,19 +99,54 @@ impl<T: Resource> ResourceTable<T> {
         self.len() == 0
     }
 
+    /// Invalidation key for anything DERIVED from this table's rows.
+    ///
+    /// Monotonic and unique process-wide: it changes whenever this table
+    /// is mutated and is carried unchanged across [`Clone`], so a cache
+    /// that keys on it rebuilds when — and only when — the rows it reads
+    /// actually changed.
+    ///
+    /// **Key derived caches on this, never on
+    /// [`SnapshotHandle::version`].** The snapshot version moves on every
+    /// published write of any kind, so keying on it makes an API-key edit
+    /// invalidate (say) the guardrail index, which is rebuilt
+    /// synchronously on the next request that resolves one. That is the
+    /// shape of AISIX-Cloud#1542. The snapshot version remains the right
+    /// tool for "has ANY configuration changed", such as an install guard
+    /// that must not publish an older build over a newer one.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Stamped AFTER the mutation lands, and released, so a reader that
+    /// observes a new generation also observes the rows behind it.
+    fn bump_generation(&self) {
+        self.generation.store(
+            NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            Ordering::Release,
+        );
+    }
+
     /// Insert or replace an entry, updating both indices.
     ///
     /// If an entry with the same id already exists, the old name index entry
     /// is removed first (handles rename on update).
     pub fn insert(&self, entry: ResourceEntry<T>) {
-        let id = entry.id.clone();
-        let name = entry.value.name().to_string();
+        self.insert_arc(Arc::new(entry));
+    }
 
-        if let Some(old) = self.by_id.get(&id) {
-            let old_name = old.value.name().to_string();
-            if old_name != name {
+    /// [`ResourceTable::insert`] for an entry already behind an `Arc` —
+    /// the copy-on-write path, where the new table shares the previous
+    /// snapshot's rows instead of deep-copying every payload.
+    pub fn insert_arc(&self, entry: Arc<ResourceEntry<T>>) {
+        let id: Arc<str> = Arc::from(entry.id.as_str());
+        let name: Arc<str> = Arc::from(entry.value.name());
+
+        if let Some(old) = self.by_id.get(id.as_ref()) {
+            let old_name = old.value.name();
+            if old_name != name.as_ref() {
                 // Only clear the old mapping if it still points at us.
-                self.by_name.remove_if(&old_name, |_, v| v == &id);
+                self.by_name.remove_if(old_name, |_, v| v == &id);
             }
         }
 
@@ -98,17 +157,19 @@ impl<T: Resource> ResourceTable<T> {
         // one redundant full scan, but can never skip an entry that is
         // already visible in the map.
         self.count.fetch_add(1, Ordering::Relaxed);
-        if self.by_id.insert(id, Arc::new(entry)).is_some() {
+        if self.by_id.insert(id, entry).is_some() {
             self.count.fetch_sub(1, Ordering::Relaxed);
         }
+        self.bump_generation();
     }
 
     /// Remove by id; also removes the matching name index entry.
     pub fn remove(&self, id: &str) -> Option<Arc<ResourceEntry<T>>> {
         let (_, entry) = self.by_id.remove(id)?;
         self.count.fetch_sub(1, Ordering::Relaxed);
-        let name = entry.value.name().to_string();
-        self.by_name.remove_if(&name, |_, v| v == id);
+        let name = entry.value.name();
+        self.by_name.remove_if(name, |_, v| v.as_ref() == id);
+        self.bump_generation();
         Some(entry)
     }
 
@@ -117,6 +178,8 @@ impl<T: Resource> ResourceTable<T> {
     }
 
     pub fn get_by_name(&self, name: &str) -> Option<Arc<ResourceEntry<T>>> {
+        // Release the name shard before taking the id shard, since updates
+        // acquire them in the opposite order.
         let id = self.by_name.get(name)?.clone();
         self.get_by_id(&id)
     }
@@ -127,7 +190,7 @@ impl<T: Resource> ResourceTable<T> {
     pub fn name_conflicts(&self, name: &str, self_id: Option<&str>) -> bool {
         match self.by_name.get(name) {
             Some(existing_id) => match self_id {
-                Some(me) => existing_id.as_str() != me,
+                Some(me) => existing_id.as_ref() != me,
                 None => true,
             },
             None => false,
@@ -143,6 +206,22 @@ impl<T: Resource> ResourceTable<T> {
             return Vec::new();
         }
         self.by_id.iter().map(|kv| kv.value().clone()).collect()
+    }
+
+    /// Collect only matching rows without cloning handles for the rest of the
+    /// table. The predicate runs under a shard guard and must not reenter it.
+    pub fn matching_entries(
+        &self,
+        pred: impl Fn(&ResourceEntry<T>) -> bool,
+    ) -> Vec<Arc<ResourceEntry<T>>> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        self.by_id
+            .iter()
+            .filter(|kv| pred(kv.value()))
+            .map(|kv| kv.value().clone())
+            .collect()
     }
 
     /// True when any entry satisfies `pred`, without materialising the
@@ -186,6 +265,9 @@ impl<T: Resource> ResourceTable<T> {
 /// `SnapshotHandle<S>` is the type actually stored in axum state — consumers
 /// call [`SnapshotHandle::load`] on every request to get the current `Arc<S>`
 /// without any locking.
+/// Replaced snapshots are retained until their readers finish, then destroyed
+/// on a shared reclamation thread. The bounded retirement queue can apply
+/// backpressure to writers; readers never use that queue.
 ///
 /// The manual `Clone` impl deliberately does *not* require `S: Clone` — the
 /// handle only clones its inner `Arc`, the `S` is never duplicated.
@@ -204,7 +286,7 @@ impl<S> Clone for SnapshotHandle<S> {
     }
 }
 
-impl<S> SnapshotHandle<S> {
+impl<S: Send + Sync + 'static> SnapshotHandle<S> {
     pub fn new(initial: S) -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(initial)),
@@ -221,6 +303,13 @@ impl<S> SnapshotHandle<S> {
     /// Consumers can compare this to detect snapshot changes without
     /// relying on `Arc` pointer identity (which suffers from the ABA
     /// problem when the allocator reuses addresses).
+    ///
+    /// This answers "has ANY configuration changed", which is almost
+    /// never the question a cache of something DERIVED from the snapshot
+    /// is asking. Key those on [`ResourceTable::generation`] of the
+    /// tables they read instead: one API-key edit moves this counter, and
+    /// a cache keyed on it is then rebuilt on the request path of every
+    /// worker thread for a write it does not read (AISIX-Cloud#1542).
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::Acquire)
     }
@@ -228,8 +317,9 @@ impl<S> SnapshotHandle<S> {
     /// Atomic store. Called by the etcd watch supervisor after building a
     /// fresh snapshot.
     pub fn store(&self, new: S) {
-        self.inner.store(Arc::new(new));
+        let previous = self.inner.swap(Arc::new(new));
         self.version.fetch_add(1, Ordering::Release);
+        reclaim::retire(previous);
     }
 
     /// Read-copy-update. Runs `f(current)` to produce a new snapshot,
@@ -248,8 +338,9 @@ impl<S> SnapshotHandle<S> {
     where
         F: FnMut(&S) -> S,
     {
-        self.inner.rcu(|current| f(current.as_ref()));
+        let previous = self.inner.rcu(|current| f(current.as_ref()));
         self.version.fetch_add(1, Ordering::Release);
+        reclaim::retire(previous);
     }
 }
 

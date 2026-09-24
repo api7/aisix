@@ -29,12 +29,19 @@ const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("he
 
 const E2E_SERIES = "aisix_request_e2e_latency_seconds";
 const TTFT_SERIES = "aisix_request_ttft_seconds";
+const DETAILED_TTFT_SERIES = "aisix_llm_time_to_first_token_seconds";
+
+const RESPONSES_NATIVE_MODEL = "histo-responses-native";
+const RESPONSES_BRIDGE_MODEL = "histo-responses-bridge";
 
 describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;
+  let responsesNativeUpstream: OpenAiUpstream | undefined;
+  let responsesBridgeUpstream: OpenAiUpstream | undefined;
   let failUpstream: OpenAiUpstream | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -69,13 +76,58 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
       ],
       eventDelayMs: 20,
     });
+    responsesNativeUpstream = await startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({
+          type: "response.created",
+          response: { id: "resp-histo-native", model: "gpt-4o-mini" },
+        }),
+        JSON.stringify({ type: "response.output_text.delta", delta: "native reply" }),
+        JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp-histo-native",
+            status: "completed",
+            model: "gpt-4o-mini",
+            usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+          },
+        }),
+        "[DONE]",
+      ],
+      firstEventDelayMs: 25,
+    });
+    responsesBridgeUpstream = await startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({
+          id: "chatcmpl-histo-bridge",
+          object: "chat.completion.chunk",
+          model: "deepseek-chat",
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        }),
+        JSON.stringify({
+          id: "chatcmpl-histo-bridge",
+          object: "chat.completion.chunk",
+          model: "deepseek-chat",
+          choices: [{ index: 0, delta: { content: "bridged reply" }, finish_reason: null }],
+        }),
+        JSON.stringify({
+          id: "chatcmpl-histo-bridge",
+          object: "chat.completion.chunk",
+          model: "deepseek-chat",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage: { prompt_tokens: 11, completion_tokens: 5, total_tokens: 16 },
+        }),
+        "[DONE]",
+      ],
+      firstEventDelayMs: 25,
+    });
     failUpstream = await startOpenAiUpstream({
       status: 500,
       errorBody: { error: { message: "mock outage", type: "server_error" } },
     });
 
     app = await spawnApp();
-    const seed = new SeedClient(etcd, app.etcdPrefix);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = await seed.createProviderKey({
       display_name: "histo-pk",
@@ -99,6 +151,30 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: streamPk.id,
     });
+    const responsesNativePk = await seed.createProviderKey({
+      display_name: "histo-responses-native-pk",
+      secret: "sk-mock",
+      api_base: `${responsesNativeUpstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: RESPONSES_NATIVE_MODEL,
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: responsesNativePk.id,
+    });
+    const responsesBridgePk = await seed.createProviderKey({
+      display_name: "histo-responses-bridge-pk",
+      provider: "deepseek",
+      adapter: "openai",
+      secret: "sk-mock",
+      api_base: `${responsesBridgeUpstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: RESPONSES_BRIDGE_MODEL,
+      provider: "deepseek",
+      model_name: "deepseek-chat",
+      provider_key_id: responsesBridgePk.id,
+    });
     const failPk = await seed.createProviderKey({
       display_name: "histo-fail-pk",
       secret: "sk-mock",
@@ -112,7 +188,13 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
     });
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: ["histo-model", "histo-stream-model", "histo-fail-model"],
+      allowed_models: [
+        "histo-model",
+        "histo-stream-model",
+        "histo-fail-model",
+        RESPONSES_NATIVE_MODEL,
+        RESPONSES_BRIDGE_MODEL,
+      ],
     });
 
     await waitConfigPropagation(async () => {
@@ -125,6 +207,8 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
     await app?.exit();
     await upstream?.close();
     await streamUpstream?.close();
+    await responsesNativeUpstream?.close();
+    await responsesBridgeUpstream?.close();
     await failUpstream?.close();
   });
 
@@ -151,6 +235,35 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
     return res.text();
   }
 
+  async function appliedConfig(): Promise<
+    | { applySeq: number; resourceCounts: Record<string, number> }
+    | undefined
+  > {
+    const res = await fetch(`${app!.metricsUrl}/status/config`);
+    if (!res.ok) return undefined;
+    const body = (await res.json()) as {
+      applied?: { apply_seq?: number; resource_counts?: Record<string, number> };
+    };
+    if (typeof body.applied?.apply_seq !== "number") return undefined;
+    return {
+      applySeq: body.applied.apply_seq,
+      resourceCounts: body.applied.resource_counts ?? {},
+    };
+  }
+
+  async function responses(model: string): Promise<Response> {
+    const res = await fetch(`${app!.proxyUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model, input: "hello", stream: true }),
+    });
+    await res.text();
+    return res;
+  }
+
   /** Lines of `series` matching every given label pair. */
   function bucketLines(body: string, series: string, labels: Record<string, string>): string[] {
     return body.split("\n").filter(
@@ -170,6 +283,20 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
           Object.entries(labels).every(([k, v]) => l.includes(`${k}="${v}"`)),
       )
       .map((l) => parseInt(l.split("}").at(-1)!.trim(), 10))
+      .reduce((a, b) => a + b, 0);
+  }
+
+  /** Sum of `series`_sum across label combinations matching `labels`. */
+  function sumOf(body: string, series: string, labels: Record<string, string>): number {
+    return body
+      .split("\n")
+      .filter(
+        (l) =>
+          l.startsWith(`${series}_sum{`) &&
+          Object.entries(labels).every(([k, v]) => l.includes(`${k}="${v}"`)),
+      )
+      .map((l) => Number(l.split("}").at(-1)!.trim()))
+      .filter((v) => !Number.isNaN(v))
       .reduce((a, b) => a + b, 0);
   }
 
@@ -284,5 +411,147 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
     expect(body).not.toContain("aisix_llm_request_duration_seconds_bucket");
     expect(body).not.toContain("aisix_proxy_request_duration_seconds_bucket");
     expect(body).toContain("aisix_llm_request_duration_seconds");
+  });
+
+  test("native and bridged Responses streams record both TTFT families exactly once", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const before = await scrape();
+    expect((await responses(RESPONSES_NATIVE_MODEL)).status).toBe(200);
+    expect((await responses(RESPONSES_BRIDGE_MODEL)).status).toBe(200);
+
+    let body = "";
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      body = await scrape();
+      const complete = [RESPONSES_NATIVE_MODEL, RESPONSES_BRIDGE_MODEL].every(
+        (model) =>
+          countOf(body, TTFT_SERIES, {
+            endpoint: "/v1/responses",
+            model,
+          }) === 1 &&
+          countOf(body, DETAILED_TTFT_SERIES, {
+            endpoint: "/v1/responses",
+            model,
+          }) === 1,
+      );
+      if (complete || Date.now() > deadline) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    for (const [model, provider] of [
+      [RESPONSES_NATIVE_MODEL, "openai"],
+      [RESPONSES_BRIDGE_MODEL, "deepseek"],
+    ] as const) {
+      const lowCardLabels = {
+        endpoint: "/v1/responses",
+        model,
+        provider,
+        streaming: "true",
+        status_class: "2xx",
+      };
+      expect(
+        bucketLines(body, TTFT_SERIES, lowCardLabels).length,
+        `${model} low-cardinality TTFT buckets`,
+      ).toBeGreaterThan(0);
+      expect(countOf(body, TTFT_SERIES, lowCardLabels)).toBe(1);
+      expect(
+        sumOf(body, TTFT_SERIES, lowCardLabels) -
+          sumOf(before, TTFT_SERIES, lowCardLabels),
+      ).toBeGreaterThan(0);
+
+      const detailedLabels = {
+        endpoint: "/v1/responses",
+        model,
+        provider,
+        inbound_protocol: "openai",
+        upstream_protocol: "openai",
+      };
+      expect(countOf(body, DETAILED_TTFT_SERIES, detailedLabels)).toBe(1);
+      expect(
+        sumOf(body, DETAILED_TTFT_SERIES, detailedLabels) -
+          sumOf(before, DETAILED_TTFT_SERIES, detailedLabels),
+      ).toBeGreaterThan(0);
+    }
+  });
+
+  test("buffered Responses output-guardrail paths retain TTFT on allow and block", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    const guardrailBody = (pattern: string) => ({
+      name: "histo-responses-output",
+      enabled: true,
+      hook_point: "output",
+      kind: "keyword",
+      patterns: [{ kind: "literal", value: pattern }],
+    });
+    const beforeCreate = await appliedConfig();
+    expect(beforeCreate).toBeDefined();
+    const guardrail = await seed.createGuardrail(guardrailBody("native reply"));
+
+    await waitConfigPropagation(async () => {
+      const applied = await appliedConfig();
+      return (
+        applied !== undefined &&
+        applied.applySeq > beforeCreate!.applySeq &&
+        applied.resourceCounts.guardrails === 1 &&
+        applied.resourceCounts.guardrail_attachments === 1
+      );
+    });
+
+    const assertDelta = async (status: number, statusClass: "2xx" | "4xx") => {
+      const before = await scrape();
+      expect((await responses(RESPONSES_NATIVE_MODEL)).status).toBe(status);
+      const after = await scrape();
+      const lowCardLabels = {
+        endpoint: "/v1/responses",
+        model: RESPONSES_NATIVE_MODEL,
+        provider: "openai",
+        streaming: "true",
+        status_class: statusClass,
+      };
+      const detailedLabels = {
+        endpoint: "/v1/responses",
+        model: RESPONSES_NATIVE_MODEL,
+        provider: "openai",
+        inbound_protocol: "openai",
+        upstream_protocol: "openai",
+      };
+      expect(
+        countOf(after, TTFT_SERIES, lowCardLabels) -
+          countOf(before, TTFT_SERIES, lowCardLabels),
+      ).toBe(1);
+      expect(
+        sumOf(after, TTFT_SERIES, lowCardLabels) -
+          sumOf(before, TTFT_SERIES, lowCardLabels),
+      ).toBeGreaterThan(0);
+      expect(
+        countOf(after, DETAILED_TTFT_SERIES, detailedLabels) -
+          countOf(before, DETAILED_TTFT_SERIES, detailedLabels),
+      ).toBe(1);
+      expect(
+        sumOf(after, DETAILED_TTFT_SERIES, detailedLabels) -
+          sumOf(before, DETAILED_TTFT_SERIES, detailedLabels),
+      ).toBeGreaterThan(0);
+    };
+
+    await assertDelta(422, "4xx");
+
+    const beforeUpdate = await appliedConfig();
+    expect(beforeUpdate).toBeDefined();
+    await seed.update(
+      "guardrails",
+      guardrail.id as string,
+      guardrailBody("never-matches-native-response"),
+    );
+    await waitConfigPropagation(async () => {
+      const applied = await appliedConfig();
+      return applied !== undefined && applied.applySeq > beforeUpdate!.applySeq;
+    });
+    await assertDelta(200, "2xx");
   });
 });

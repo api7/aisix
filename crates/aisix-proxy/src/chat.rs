@@ -17,6 +17,7 @@
 //!    status, error type, and (for rate-limits) Retry-After.
 
 use aisix_cache::{semantic_prompt_text, Cache, CacheKey, SemanticCacheStore};
+use aisix_core::models::CacheBackend;
 use aisix_core::models::{CacheScope, SemanticCacheConfig};
 use aisix_core::{AisixSnapshot, AppliedGuardrail};
 use aisix_gateway::{BridgeError, ChatFormat, ChatResponse};
@@ -181,26 +182,50 @@ pub async fn chat_completions(
                 &success,
                 elapsed,
             );
-            emit_access_log(
-                method,
-                path,
-                status,
-                elapsed,
-                Some(success.provider.as_str()),
-                Some(&model_name),
-                Some(&api_key_id),
-                success.prompt_tokens,
-                success.completion_tokens,
-                success.total_tokens,
-                &request_id,
-                // Empty on the streaming path — the id rides the first
-                // upstream frame, which has not arrived yet. That case is
-                // covered by the per-attempt `provider call completed` line
-                // the usage sink emits (AISIX-Cloud#1289).
-                Some(success.provider_request_id.as_str()),
-                &success.routing,
-                None,
-            );
+            // `telemetry_handled_by_stream` alone is NOT "the response is a
+            // stream": the BUFFERED ensemble path sets it too, to mean "the
+            // sub-call emits already covered this request". That one has no
+            // later emitter to write a parked line, so the conjunction is
+            // what keeps its line from disappearing.
+            if req.is_streaming() && success.telemetry_handled_by_stream {
+                // A streamed response has no outcome yet: the head exists, nothing
+                // has been delivered, and whether the caller reads it to the end
+                // or walks away is minutes from being known. Park the line and
+                // let whichever terminal emitter ends the request write it, with
+                // that emitter's status, tokens and message (AISIX-Cloud#1571).
+                crate::attribution::defer_access_log(
+                    crate::attribution::PendingAccessLog::new(
+                        method,
+                        path,
+                        &request_id,
+                        &api_key_id,
+                        started,
+                    )
+                    .with_model(&success.provider, &model_name)
+                    .with_routing(&success.routing),
+                );
+            } else {
+                emit_access_log(
+                    method,
+                    path,
+                    status,
+                    elapsed,
+                    Some(success.provider.as_str()),
+                    Some(&model_name),
+                    Some(&api_key_id),
+                    success.prompt_tokens,
+                    success.completion_tokens,
+                    success.total_tokens,
+                    &request_id,
+                    Some(success.provider_request_id.as_str()),
+                    &success.routing,
+                    None,
+                    Some(aisix_obs::CacheAccessLog {
+                        status: success.cache_status.as_str(),
+                        hit_layer: success.cache_hit_layer.map(|l| l.as_str()),
+                    }),
+                );
+            }
             // Per #655: emit a zero-token event for each failed attempt
             // that preceded the winner (non-streaming fallover). No-op for
             // direct-model success, cache hits, and the single-attempt
@@ -258,6 +283,7 @@ pub async fn chat_completions(
                     success.completion_tokens.unwrap_or(0) as u32,
                     UsageExtras {
                         cached_prompt_tokens: success.cached_prompt_tokens,
+                        cache_write_tokens: success.cache_write_tokens,
                         reasoning_tokens: success.reasoning_tokens,
                         cache_creation_tokens: success.cache_creation_tokens,
                         cache_read_tokens: success.cache_read_tokens,
@@ -306,9 +332,17 @@ pub async fn chat_completions(
             let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
             if let Some(rl_status) = state.limiter.peek(&api_key_id, &rl_limits).await {
                 crate::render::inject_ratelimit_headers(&mut success.response, &rl_status);
+                // `model_name` is the caller's raw string; it must be
+                // collapsed to the configured set before it becomes a
+                // Prometheus label, exactly as the failure path below
+                // does (#451, and the `Upstream::model` contract in
+                // `request_metrics`). This family was the one that got
+                // it wrong: a wildcard alias serves unboundedly many
+                // concrete names off one row, so the raw value let a
+                // caller mint a series per request.
                 state.metrics.set_rate_limit_remaining(
                     &api_key_id,
-                    &model_name,
+                    &crate::usage_attr::metric_model_label(&snapshot, &model_name),
                     rl_status.rpm_remaining(),
                     rl_status.tpm_remaining(),
                 );
@@ -429,14 +463,16 @@ pub async fn chat_completions(
                 status,
                 elapsed,
             );
-            state.metrics.record_request_e2e_latency(
-                LatencyLabels {
-                    endpoint: "/v1/chat/completions",
-                    model: metric_model.as_ref(),
-                    provider: last_target.provider(),
-                    status,
-                    streaming: req.is_streaming(),
-                },
+            crate::request_metrics::record_e2e_latency(
+                &state,
+                "/v1/chat/completions",
+                crate::request_metrics::Caller::new(&auth),
+                last_target.upstream(
+                    metric_model.as_ref(),
+                    req.is_streaming(),
+                    routing.fallback_count() > 0,
+                ),
+                status,
                 elapsed,
             );
             emit_access_log(
@@ -454,13 +490,22 @@ pub async fn chat_completions(
                 None,
                 &routing,
                 Some(&err),
+                // This branch holds a `ProxyError` and never sees the cache
+                // gate, so it has no verdict of its own — `emit_access_log`
+                // falls back to the request's attribution cell, which is
+                // how a stored body the output guardrail refused still says
+                // the cache is what answered it.
+                None,
             );
             // `resolved_model_id` is populated by `dispatch` once
             // `req.model` resolves against the snapshot, so a guardrail /
             // budget / rate-limit / bridge error after that point still
             // records which model the request targeted. ContentFiltered
-            // (guardrail) sets `guardrail_blocked` for the Blocked tab.
-            let guardrail_blocked = matches!(err, ProxyError::ContentFiltered(_));
+            // (guardrail) sets `guardrail_blocked` for the Blocked tab —
+            // through the shared predicate every handler now reads, so the
+            // family cannot answer this question two different ways
+            // (AISIX-Cloud#1428).
+            let guardrail_blocked = err.is_guardrail_block();
             let model_id_str = resolved_model_id.as_deref().unwrap_or("");
             // AISIX-Cloud#1013: failed requests carry the (post-mask)
             // request body so a 4xx/5xx can be triaged from the log alone.
@@ -553,6 +598,7 @@ pub async fn chat_completions(
                         c.completion_tokens,
                         UsageExtras {
                             cached_prompt_tokens: c.cached_prompt_tokens,
+                            cache_write_tokens: c.cache_write_tokens,
                             reasoning_tokens: c.reasoning_tokens,
                             cache_creation_tokens: c.cache_creation_tokens,
                             cache_read_tokens: c.cache_read_tokens,
@@ -621,6 +667,12 @@ pub async fn chat_completions(
                             // Input masking may have fired before the failure.
                             redacted_entity_counts: redaction_counts.clone(),
                             guardrail_monitor_hits: monitor_hits.clone(),
+                            // Read off the audit handle rather than
+                            // `dispatch`'s local: a failure unwinds through
+                            // `DispatchFailure`, which never carried the
+                            // bypass, so a request that failed open and then
+                            // errored used to report an empty reason.
+                            bypass_reason: crate::usage_attr::bypass_reason(&audit),
                             ..UsageExtras::default()
                         },
                         /* cost_usd */ 0.0,
@@ -667,6 +719,7 @@ struct Success {
     /// for providers that don't expose them; cp-api falls back to the
     /// standard prompt / completion rate when these are 0.
     cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
@@ -674,7 +727,9 @@ struct Success {
     /// message id) — empty when the cached path served the request
     /// (re-using a stored response's id would mislead reconciliation).
     provider_request_id: String,
-    /// Resolved model the provider actually billed.
+    /// Resolved model the provider actually billed. On a cache HIT it is
+    /// the model the ORIGINAL upstream reported for the stored body — the
+    /// producer — not anything about this request.
     provider_model_version: String,
     provider_key_id: String,
     upstream_model: String,
@@ -688,7 +743,18 @@ struct Success {
     /// guardrail upstream unreachable + `fail_open=true`). The first
     /// bypass reason wins. Goes onto `usage_events.guardrail_bypassed_reason`
     /// so a compliance audit can see what slipped past during a Bedrock
-    /// outage. None for the normal Allow / Block paths.
+    /// outage. `None` when nothing was bypassed.
+    ///
+    /// A Block does not clear it: an input hook that failed open on a
+    /// prompt the provider then answered is still a bypass, whatever the
+    /// output hook went on to decide — which is why the billed-then-blocked
+    /// event carries this through `UpstreamCharge`.
+    ///
+    /// Threaded here rather than read back off the audit handle — which is
+    /// where every other handler gets it — because the per-attempt and
+    /// ensemble sub-call emitters are handed the value captured EARLIER in
+    /// the request, which a request-scoped snapshot cannot express. The two
+    /// agree by construction: both are the first `Bypass` the chain folded.
     bypass_reason: Option<String>,
     /// Cache outcome for this request. `disabled` when no enabled
     /// cache_policy is in snapshot for the env; `miss` when the cache
@@ -908,6 +974,46 @@ async fn cache_semantic_embed(
     }
 }
 
+/// Which half of the cache subsystem a degradation belongs to. They fail
+/// and recover independently, and only the semantic half costs an
+/// embedding call, so they are reported separately.
+#[derive(Clone, Copy)]
+enum CacheHalf {
+    Exact,
+    Semantic,
+}
+
+/// True when this failure is the FIRST of an outage, so the caller logs
+/// it at WARN and the rest of the outage at debug. How hard and how long
+/// the backend is failing is `aisix_redis_failures_total{operation}`; the
+/// log line only has to say that it started.
+///
+/// `backend` is the matched policy's, and only `redis` participates. A
+/// memory-backed policy shares neither the connection nor the failure
+/// mode, and it essentially cannot fail — so counting its successes
+/// would re-arm the latch on every such request and bring the per-request
+/// flood straight back in a deployment that runs both kinds of policy.
+fn note_cache_failed(state: &ProxyState, backend: Option<CacheBackend>, half: CacheHalf) -> bool {
+    let (Some(CacheBackend::Redis), Some(backends)) = (backend, state.cache.as_ref()) else {
+        return true;
+    };
+    match half {
+        CacheHalf::Exact => backends.note_exact_failure(),
+        CacheHalf::Semantic => backends.note_semantic_failure(),
+    }
+}
+
+/// Re-arm [`note_cache_failed`], so a LATER outage is reported again.
+fn note_cache_ok(state: &ProxyState, backend: Option<CacheBackend>, half: CacheHalf) {
+    let (Some(CacheBackend::Redis), Some(backends)) = (backend, state.cache.as_ref()) else {
+        return;
+    };
+    match half {
+        CacheHalf::Exact => backends.note_exact_success(),
+        CacheHalf::Semantic => backends.note_semantic_success(),
+    }
+}
+
 /// Read path of the cache gate: exact (L1) lookup first, then — on an
 /// exact miss, when the policy configures it — the semantic (L2)
 /// similarity lookup. A semantic hit backfills the exact layer so the
@@ -926,12 +1032,22 @@ async fn resolve_cache_hit(
     semantic_gate: Option<&SemanticGateCtx>,
     request_id: &str,
     semantic_embedding: &mut Option<Vec<f32>>,
+    policy_backend: Option<CacheBackend>,
 ) -> Option<(ChatResponse, CacheHitLayer, Option<f32>)> {
     match cache.get(key).await {
-        Ok(Some(cached)) => return Some((cached, CacheHitLayer::Exact, None)),
-        Ok(None) => {}
-        Err(err) => {
+        Ok(Some(cached)) => {
+            note_cache_ok(state, policy_backend, CacheHalf::Exact);
+            return Some((cached, CacheHitLayer::Exact, None));
+        }
+        Ok(None) => note_cache_ok(state, policy_backend, CacheHalf::Exact),
+        // Once per outage, not once per request: the count lives on
+        // `aisix_redis_failures_total`, and a cache Redis can now stay
+        // unreachable from boot onwards.
+        Err(err) if note_cache_failed(state, policy_backend, CacheHalf::Exact) => {
             tracing::warn!(error = %err, key = %key, "cache lookup failed");
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, key = %key, "cache lookup failed");
         }
     }
     let sem = semantic_gate?;
@@ -948,6 +1064,11 @@ async fn resolve_cache_hit(
         .await
     {
         Ok(Some(hit)) => {
+            // A hit is a success too: without this a semantic cache that
+            // recovered and went straight to serving hits would leave the
+            // latch set, and the NEXT outage's first failure would report
+            // at debug.
+            note_cache_ok(state, policy_backend, CacheHalf::Semantic);
             // Backfill TTL is capped at the matched entry's own
             // remaining lifetime: a paraphrase near expiry must not
             // grant the stored response a fresh full TTL, or repeated
@@ -957,11 +1078,19 @@ async fn resolve_cache_hit(
                 .saturating_duration_since(std::time::Instant::now());
             let backfill_ttl = ttl.map(|t| t.min(remaining)).unwrap_or(remaining);
             if !backfill_ttl.is_zero() {
-                if let Err(err) = cache
+                // The backfill is an exact-half write, so it reports
+                // under the exact latch like the other two.
+                match cache
                     .put_with_ttl(key, hit.response.clone(), backfill_ttl)
                     .await
                 {
-                    tracing::warn!(error = %err, key = %key, "cache backfill write failed");
+                    Ok(()) => note_cache_ok(state, policy_backend, CacheHalf::Exact),
+                    Err(err) if note_cache_failed(state, policy_backend, CacheHalf::Exact) => {
+                        tracing::warn!(error = %err, key = %key, "cache backfill write failed");
+                    }
+                    Err(err) => {
+                        tracing::debug!(error = %err, key = %key, "cache backfill write failed");
+                    }
                 }
             }
             // 4-dp similarity everywhere it surfaces (header, usage
@@ -970,16 +1099,26 @@ async fn resolve_cache_hit(
             Some((hit.response, CacheHitLayer::Semantic, Some(similarity)))
         }
         Ok(None) => {
+            note_cache_ok(state, policy_backend, CacheHalf::Semantic);
             *semantic_embedding = Some(vector);
             None
         }
         Err(err) => {
-            tracing::warn!(
-                target: "aisix::cache",
-                policy_name = %sem.policy_name,
-                error = %err,
-                "semantic cache lookup failed",
-            );
+            if note_cache_failed(state, policy_backend, CacheHalf::Semantic) {
+                tracing::warn!(
+                    target: "aisix::cache",
+                    policy_name = %sem.policy_name,
+                    error = %err,
+                    "semantic cache lookup failed",
+                );
+            } else {
+                tracing::debug!(
+                    target: "aisix::cache",
+                    policy_name = %sem.policy_name,
+                    error = %err,
+                    "semantic cache lookup failed",
+                );
+            }
             state
                 .metrics
                 .record_cache_semantic_store_failure(&sem.policy_name, "lookup");
@@ -1029,6 +1168,69 @@ pub(crate) fn estimation_output_text(resp: &aisix_gateway::ChatResponse) -> Stri
     out
 }
 
+/// Token-estimation fallback for a non-streaming `/v1/chat/completions`
+/// response (AISIX-Cloud#1074): the token counters the upstream never
+/// reported, counted locally. Per counter, so a number it did report
+/// always stands. Returns `(prompt, completion, estimated)`.
+fn estimate_missing_chat_usage(
+    resp: &aisix_gateway::ChatResponse,
+    upstream_model: &str,
+    req: &ChatFormat,
+) -> (u32, u32, bool) {
+    let (p, c) = (resp.usage.prompt_tokens, resp.usage.completion_tokens);
+    if p != 0 && c != 0 {
+        return (p, c, false);
+    }
+    let est = crate::token_estimate::Estimator::new(
+        upstream_model,
+        crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
+    );
+    let filled =
+        crate::token_estimate::fill_missing(&est, p, c, Some(&estimation_output_text(resp)));
+    (
+        filled.prompt_tokens,
+        filled.completion_tokens,
+        filled.estimated,
+    )
+}
+
+/// Carry the locally-estimated counters onto the response body the client
+/// receives, so the client-visible `usage` and the usage record are one
+/// number: a caller told `completion_tokens: 0` for a reply it can read
+/// has no way to reconcile that with what the dashboard bills. The
+/// estimate is reported in the ordinary usage shape — there is no
+/// client-facing marker saying it was estimated, and `usage_estimated` on
+/// the usage record stays the way to tell.
+///
+/// Applied at the client exit, and that placement carries two guarantees
+/// the call site cannot state for itself. It runs AFTER the cache write,
+/// so a cache entry stores what the UPSTREAM reported and a hit re-derives
+/// the estimate from its own request instead of replaying these numbers as
+/// the provider's — losing `usage_estimated` on every hit row. And it runs
+/// AFTER the quota total, which keeps reading the upstream's own
+/// `total_tokens` through `cache_inclusive_total`, so nothing about what
+/// is billed changes: a provider counting overhead we cannot see is still
+/// not corrected downward.
+///
+/// The bridged `/v1/messages` and `/v1/responses` exits fill the same way,
+/// for the same reason. Their NATIVE passthrough paths deliberately do
+/// not — the dividing line is whether the gateway serialises the body
+/// itself or relays the provider's bytes verbatim.
+fn apply_estimated_usage(
+    usage: &mut aisix_gateway::chat::UsageStats,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+) {
+    usage.prompt_tokens = prompt_tokens;
+    usage.completion_tokens = completion_tokens;
+    // A total reported beside a counter that was zero describes numbers
+    // the client is no longer being told, so it no longer adds up. Zeroing
+    // it makes the projection derive prompt + completion — the arithmetic
+    // it uses when no total was reported at all, and the rule the bridged
+    // `/v1/responses` exit already applies.
+    usage.total_tokens = 0;
+}
+
 /// #1074 ensemble sub-call token fallback. A sub-call backend (a panel
 /// member, or the judge) that reports no usage would otherwise record
 /// silent zeros; estimate the prompt from that sub-call's own request
@@ -1065,6 +1267,56 @@ fn estimate_subcall_tokens(
         filled.completion_tokens,
         filled.estimated,
     )
+}
+
+/// Preserve any provider-reported overhead while ensuring Anthropic-shaped
+/// cache counters, which sit beside input tokens, are included in the
+/// canonical total used for quotas and Prometheus.
+fn cache_inclusive_total(
+    reported_total: u64,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cache_creation_tokens: u32,
+    cache_read_tokens: u32,
+) -> u64 {
+    reported_total.max(crate::usage_attr::total_tokens_with_cache(
+        prompt_tokens,
+        completion_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    ))
+}
+
+#[derive(Clone)]
+pub(crate) struct EffectiveSubcallUsage {
+    pub(crate) usage: aisix_gateway::chat::UsageStats,
+    pub(crate) estimated: bool,
+}
+
+/// Resolve one ensemble sub-call's final accounting once, then share it
+/// between its UsageEvent, request-level Prometheus aggregate, and quota
+/// commit. The client-facing response still carries only upstream-reported
+/// usage; local estimates remain telemetry-only.
+pub(crate) fn effective_subcall_usage(
+    req: &ChatFormat,
+    model: &str,
+    reported: &aisix_gateway::chat::UsageStats,
+    output_text: &str,
+) -> EffectiveSubcallUsage {
+    let (prompt_tokens, completion_tokens, estimated) =
+        estimate_subcall_tokens(req, model, reported, output_text);
+    let mut usage = reported.clone();
+    usage.prompt_tokens = prompt_tokens;
+    usage.completion_tokens = completion_tokens;
+    usage.total_tokens = cache_inclusive_total(
+        u64::from(reported.total_tokens),
+        prompt_tokens,
+        completion_tokens,
+        usage.cache_creation_tokens,
+        usage.cache_read_tokens,
+    )
+    .min(u64::from(u32::MAX)) as u32;
+    EffectiveSubcallUsage { usage, estimated }
 }
 
 fn last_user_message_text(req: &ChatFormat) -> Option<String> {
@@ -1169,6 +1421,7 @@ struct UpstreamCharge {
     /// carried no usage block.
     usage_estimated: bool,
     cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
@@ -1257,7 +1510,7 @@ async fn dispatch(
     // (manually, not via this helper).
     let with_model = |e: ProxyError| DispatchFailure::new(Some(model_id.clone()), None, e);
 
-    if !auth.key().can_access(&req.model) {
+    if !auth.key().can_access(snapshot, &req.model) {
         return Err(with_model(ProxyError::ModelForbidden(req.model.clone())));
     }
 
@@ -1319,7 +1572,7 @@ async fn dispatch(
         GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } => {
             // The verdict's `reason` carries matched-pattern detail
             // (e.g. `"input blocked by literal \"forbidden-token\""`).
@@ -1345,8 +1598,10 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked request"
             );
-            return Err(with_model(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+            return Err(with_model(crate::error::guardrail_block_error(
+                "request",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
             )));
         }
         GuardrailVerdict::Bypass { reason } => {
@@ -1406,6 +1661,7 @@ async fn dispatch(
             let attempts = resolve_attempt_models(
                 &state.routing,
                 &state.runtime_status,
+                &state.pricing,
                 snapshot,
                 &req.model,
                 &virtual_entry.id,
@@ -1546,6 +1802,7 @@ async fn dispatch(
 
         'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
             let model = &attempt.model;
+            let upstream_req = crate::effort_mapping::chat_request(req, model);
             let Ok(provider) = crate::dispatch::require_provider(model) else {
                 last_reserve_reject = None;
                 last_err = Some(BridgeError::Config("model has no provider".into()));
@@ -1591,6 +1848,11 @@ async fn dispatch(
             if let Some(d) = stream_budget {
                 ctx = ctx.with_deadline(d);
             }
+            // A bridge that has to answer this streaming request with a
+            // non-streaming upstream leg (the structured-output tool
+            // route) measures that leg against the end-to-end budget,
+            // not against the per-chunk one set above.
+            ctx = ctx.with_non_streaming_deadline(timeouts.request);
 
             // How many times to re-hit the SAME target (with backoff) on a
             // retryable failure before failing over to the next one.
@@ -1608,12 +1870,16 @@ async fn dispatch(
             );
 
             for attempt_idx in 0..=budget.attempts {
-                let (idx, kind) = stream_routing.begin_attempt(&model.display_name);
                 let target_model = if is_routing_request {
                     model.display_name.clone()
                 } else {
                     String::new()
                 };
+                let (idx, kind) = stream_routing.begin_attempt(crate::attempt::AttemptTarget {
+                    display_name: &model.display_name,
+                    target_model: &target_model,
+                    model_id: &attempt.id,
+                });
                 // Reserve THIS target's own model rate-limit layers before
                 // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
                 // 429 attempt and move on to the remaining targets in strategy
@@ -1654,9 +1920,11 @@ async fn dispatch(
                                 dispatched: false,
                             },
                         );
-                        // Keep the limiter's own Retry-After hint on the wire:
-                        // when every target is exhausted this error becomes the
-                        // client's 429, and SDKs back off on that header.
+                        // Fallback only: `last_reserve_reject` below carries
+                        // the same refusal un-flattened and takes precedence
+                        // at exhaustion. This stays so the loop still has a
+                        // 429-shaped `last_err` if a later target clears the
+                        // reject without recording one of its own.
                         last_err = Some(BridgeError::upstream_status_with_retry_after(
                             429,
                             format!(
@@ -1665,12 +1933,15 @@ async fn dispatch(
                             ),
                             crate::quota::retry_after_of(&e).map(Duration::from_secs),
                         ));
-                        // Only the policy-layer rejection is worth
-                        // surfacing un-flattened (it carries the
-                        // `error.policy` attribution); the inline model
-                        // layer keeps the established flattened shape.
-                        last_reserve_reject =
-                            matches!(e, ProxyError::PolicyRateLimit { .. }).then_some(e);
+                        // Surface the quota rejection un-flattened. A
+                        // `Bridge` error reads as the PROVIDER's 429 — it
+                        // carries no `error.policy` attribution and no
+                        // `x-ratelimit-*` headers, so a caller refused by this
+                        // gateway's own limiter would see the wire shape of
+                        // somebody else's refusal. `/v1/messages` and
+                        // `/v1/responses` keep theirs too; this arm used to keep
+                        // only the policy layer's.
+                        last_reserve_reject = Some(e);
                         continue 'targets;
                     }
                 };
@@ -1684,7 +1955,7 @@ async fn dispatch(
                 // heartbeats cover the wait for the first token. The
                 // read-timeout wrapper is a no-op when the budget is None.
                 let attempt_stream: Result<aisix_gateway::ChatChunkStream, BridgeError> =
-                    match bridge.chat_stream(req, &ctx).await {
+                    match bridge.chat_stream(upstream_req.as_ref(), &ctx).await {
                         Err(e) => Err(e),
                         Ok(up) => {
                             let up = crate::stream_timeout::with_read_timeout(up, stream_budget);
@@ -1769,12 +2040,12 @@ async fn dispatch(
                             },
                         );
                         let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
-                        tracing::warn!(
-                            target_model = %model.display_name,
-                            target_attempt = attempt_idx + 1,
-                            error = %err,
+                        crate::routing::log_attempt_failure(
+                            &model.display_name,
+                            attempt_idx + 1,
+                            &err,
                             retryable,
-                            "streaming routing target attempt failed",
+                            fallback_statuses,
                         );
                         if retryable {
                             state.health.record_failure(&model.display_name);
@@ -2015,14 +2286,10 @@ async fn dispatch(
                     &model_for_metrics,
                     &api_key_id_for_telem,
                     // A stream the consumer abandoned mid-flight is reported
-                    // as 499, matching what LiteLLM records for the same
-                    // event. The upstream work still happened, so the event
+                    // as 499, one an upstream error ended as that error's
+                    // status. The upstream work still happened, so the event
                     // is emitted either way — only its outcome differs.
-                    if comp.reached_end {
-                        200
-                    } else {
-                        crate::CLIENT_CLOSED_REQUEST
-                    },
+                    stream_terminal_status(&comp),
                     // Scoped to the winning attempt, not the request: the
                     // failed attempts before it emit their own events and
                     // `started` would double-count them (plus the pre-dispatch
@@ -2033,6 +2300,7 @@ async fn dispatch(
                     comp.completion_tokens,
                     UsageExtras {
                         cached_prompt_tokens: comp.cached_prompt_tokens,
+                        cache_write_tokens: comp.cache_write_tokens,
                         reasoning_tokens: comp.reasoning_tokens,
                         cache_creation_tokens: comp.cache_creation_tokens,
                         cache_read_tokens: comp.cache_read_tokens,
@@ -2069,8 +2337,16 @@ async fn dispatch(
                         attempt_index: winner_idx,
                         attempt_kind: winner_kind.to_string(),
                         attempt_model: attempt_model_for_telem.clone(),
-                        error_class: String::new(),
-                        error_message: String::new(),
+                        error_class: comp
+                            .failure
+                            .as_ref()
+                            .map(|f| f.error_class.to_string())
+                            .unwrap_or_default(),
+                        error_message: comp
+                            .failure
+                            .as_ref()
+                            .map(|f| f.error_message.clone())
+                            .unwrap_or_default(),
                         applied_guardrails: applied_guardrails_for_telem.clone(),
                         redacted_entity_counts: {
                             let mut merged = input_redactions_for_telem.clone();
@@ -2130,6 +2406,9 @@ async fn dispatch(
                         input: comp.prompt_tokens,
                         output: comp.completion_tokens,
                         total: comp.total_tokens.min(u64::from(u32::MAX)) as u32,
+                        cached: comp.cached_prompt_tokens,
+                        cache_read: comp.cache_read_tokens,
+                        cache_creation: comp.cache_creation_tokens,
                         spend_usd: 0.0,
                         client_type: &client_type_for_metrics,
                     },
@@ -2141,6 +2420,20 @@ async fn dispatch(
                         provider: &provider_for_metrics,
                         status: 200,
                         streaming: true,
+                        details: UsageLabels {
+                            endpoint: "/v1/chat/completions",
+                            inbound_protocol: "openai",
+                            upstream_protocol: pk.labels().protocol(),
+                            provider: &provider_for_metrics,
+                            model: &bounded_model_for_metrics,
+                            upstream_model: &bounded_upstream_for_metrics,
+                            provider_key_id: pk.labels().id(),
+                            provider_key_name: pk.labels().name(),
+                            api_key_id: &api_key_id_for_telem,
+                            team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
+                            user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
+                            user_name: user_name_for_metrics.as_deref().unwrap_or("unknown"),
+                        },
                     },
                     started.elapsed(),
                 );
@@ -2151,6 +2444,20 @@ async fn dispatch(
                         provider: &provider_for_metrics,
                         status: 200,
                         streaming: true,
+                        details: UsageLabels {
+                            endpoint: "/v1/chat/completions",
+                            inbound_protocol: "openai",
+                            upstream_protocol: pk.labels().protocol(),
+                            provider: &provider_for_metrics,
+                            model: &bounded_model_for_metrics,
+                            upstream_model: &bounded_upstream_for_metrics,
+                            provider_key_id: pk.labels().id(),
+                            provider_key_name: pk.labels().name(),
+                            api_key_id: &api_key_id_for_telem,
+                            team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
+                            user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
+                            user_name: user_name_for_metrics.as_deref().unwrap_or("unknown"),
+                        },
                     },
                     Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
                 );
@@ -2158,6 +2465,7 @@ async fn dispatch(
                     UsageLabels {
                         endpoint: "/v1/chat/completions",
                         inbound_protocol: "openai",
+                        upstream_protocol: pk.labels().protocol(),
                         provider: &provider_for_metrics,
                         model: &bounded_model_for_metrics,
                         upstream_model: &bounded_upstream_for_metrics,
@@ -2197,6 +2505,7 @@ async fn dispatch(
             total_tokens: None,
             cost_usd: 0.0,
             cached_prompt_tokens: 0,
+            cache_write_tokens: None,
             reasoning_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
@@ -2254,7 +2563,7 @@ async fn dispatch(
             entry.value.enabled
                 && entry
                     .value
-                    .parsed_applies_to()
+                    .parsed_applies_to(snapshot)
                     .matches(&req.model, &auth.entry.id)
         })
         .cloned();
@@ -2274,6 +2583,9 @@ async fn dispatch(
             .cloned(),
         _ => None,
     };
+    // Which backend's degradation the gate is reporting on. See
+    // `note_cache_failed`.
+    let policy_backend = matched_policy.as_ref().map(|entry| entry.value.backend);
     let matched_policy_ttl = policy_cache
         .as_ref()
         .and(matched_policy.as_ref())
@@ -2328,7 +2640,12 @@ async fn dispatch(
                     .semantic_for_policy_backend(entry.value.backend, &entry.id, &entry.value.name)?
                     .clone();
                 let text = semantic_prompt_text(req)?;
-                let embed_entry = match snapshot.models.get_by_name(&cfg.embedding_model) {
+                let embedding_model = aisix_core::models::resolve_model_ref(
+                    snapshot,
+                    &cfg.embedding_model,
+                    cfg.embedding_model_id.as_deref(),
+                );
+                let embed_entry = match snapshot.models.get_by_name(&embedding_model) {
                     Some(e) if e.value.is_embedding() => e.clone(),
                     other => {
                         // A stable config error, not a per-request one:
@@ -2341,7 +2658,7 @@ async fn dispatch(
                             tracing::warn!(
                                 target: "aisix::cache",
                                 policy_name = %entry.value.name,
-                                embedding_model = %cfg.embedding_model,
+                                embedding_model = %embedding_model,
                                 found = other.is_some(),
                                 "cache policy references a missing or non-embedding \
                                  embedding_model; semantic matching is skipped until \
@@ -2403,11 +2720,21 @@ async fn dispatch(
                 semantic_gate.as_ref(),
                 request_id,
                 &mut semantic_embedding,
+                policy_backend,
             )
             .await
         };
         match resolved {
             Some((mut cached, hit_layer, hit_similarity)) => {
+                // The request is now answered from the cache and will
+                // contact no upstream, whichever way it exits — so correct
+                // the target attribution HERE, before the output guardrail
+                // below can return a block. Doing it at the success exit
+                // left a blocked hit reporting the target the
+                // single-candidate pre-flight had written
+                // (AISIX-Cloud#1571).
+                let entry_model = &virtual_entry.value;
+                crate::attribution::note_cache_hit_entry(entry_model, hit_layer.as_str());
                 reservation.commit_tokens(0).await;
                 // #448: a cache hit is client-visible output just like a
                 // fresh upstream response, so it must run output guardrails
@@ -2429,7 +2756,7 @@ async fn dispatch(
                     GuardrailVerdict::Block {
                         reason,
                         guardrail_name,
-                        ..
+                        unavailable,
                     } => {
                         tracing::warn!(
                             guardrail_hook = "output",
@@ -2437,11 +2764,10 @@ async fn dispatch(
                             reason = %reason,
                             "guardrail blocked cached response",
                         );
-                        return Err(with_model(ProxyError::ContentFiltered(
-                            crate::error::guardrail_block_message(
-                                "response",
-                                guardrail_name.as_deref(),
-                            ),
+                        return Err(with_model(crate::error::guardrail_block_error(
+                            "response",
+                            guardrail_name.as_deref(),
+                            unavailable.as_deref(),
                         )));
                     }
                     GuardrailVerdict::Bypass { reason } => {
@@ -2469,25 +2795,40 @@ async fn dispatch(
                 // "of which N were cache hits" stat reflects the
                 // original event accurately.
                 let cached_prompt_tokens = cached.usage.cached_prompt_tokens;
+                let cache_write_tokens = cached.usage.cache_write_tokens;
                 let reasoning_tokens = cached.usage.reasoning_tokens;
                 let cache_creation_tokens = cached.usage.cache_creation_tokens;
                 let cache_read_tokens = cached.usage.cache_read_tokens;
-                // The provider label points at the first attempt — for a
-                // cache hit we don't know (or care) which target ran the
-                // original call; the fingerprint identified the answer.
-                let provider_label = attempt_models[0]
-                    .model
+                // The model the ORIGINAL upstream reported for this body —
+                // the one fact the stored response records about the target
+                // that produced it, and the same field the fresh-response
+                // path fills from `upstream.model` (AISIX-Cloud#1571).
+                // Snapshotted here for the same reason as the counters
+                // above: `cached` moves into `render_response` below.
+                let producer_model = cached.model.clone();
+                // A hit dispatched to nothing, so every target-shaped
+                // field here describes the ENTRY the caller addressed and
+                // never a target. For a direct model the two coincide:
+                // provider / provider_key_id / model_name are static
+                // properties of its row, true whether or not a request
+                // ever left. For a Model Group they do not exist, and
+                // reading them off `attempt_models[0]` — whichever
+                // candidate THIS request's strategy happened to rank first
+                // — named a target that never ran, and named a different
+                // one on every hit of the same entry under `round_robin`
+                // (AISIX-Cloud#1571). Which target produced the entry is
+                // recorded nowhere, so a group hit reports `unknown`
+                // rather than a guess.
+                let provider_label = entry_model
                     .provider
                     .as_deref()
                     .map(|p| p.to_ascii_lowercase())
                     .unwrap_or_else(|| "unknown".into());
-                let provider_key_id = attempt_models[0]
-                    .model
+                let provider_key_id = entry_model
                     .provider_key_id
                     .clone()
                     .unwrap_or_else(|| "unknown".into());
-                let upstream_model = attempt_models[0]
-                    .model
+                let upstream_model = entry_model
                     .upstream_model()
                     .unwrap_or("unknown")
                     .to_string();
@@ -2498,8 +2839,15 @@ async fn dispatch(
                 // silent zeros.
                 let (prompt, completion, total, usage_estimated) = if prompt == 0 || completion == 0
                 {
+                    // Tokenizer encoding for the replayed body: the entry's
+                    // own upstream mapping when it has one, and otherwise
+                    // the model the STORED response reports — the one fact
+                    // the entry holds about the target that produced it. A
+                    // group has no mapping of its own, and a candidate's
+                    // would be the same guess the block above just stopped
+                    // making.
                     let est = crate::token_estimate::Estimator::new(
-                        &upstream_model,
+                        entry_model.upstream_model().unwrap_or(&producer_model),
                         crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
                     );
                     let filled = crate::token_estimate::fill_missing(
@@ -2527,6 +2875,13 @@ async fn dispatch(
                 } else {
                     (prompt, completion, total, false)
                 };
+                let total = cache_inclusive_total(
+                    total,
+                    prompt.min(u64::from(u32::MAX)) as u32,
+                    completion.min(u64::from(u32::MAX)) as u32,
+                    cache_creation_tokens,
+                    cache_read_tokens,
+                );
                 // Capture the prompt + cached response for content-capturing
                 // exporters (gated). A cache hit still served content to the
                 // caller, so it's logged like a fresh response.
@@ -2547,6 +2902,19 @@ async fn dispatch(
                         CacheHitLayer::Semantic => "hit_semantic",
                     },
                 );
+                // AISIX-Cloud#1074: a hit replaying a body whose original
+                // upstream never reported usage answers the client with the
+                // same estimate its own usage row gets — the fresh-response
+                // exit below does this too, and a hit is not a different
+                // kind of answer to the caller.
+                let mut cached = cached;
+                if usage_estimated {
+                    apply_estimated_usage(
+                        &mut cached.usage,
+                        prompt.min(u64::from(u32::MAX)) as u32,
+                        completion.min(u64::from(u32::MAX)) as u32,
+                    );
+                }
                 let mut response = Json(render_response(now, cached, &req.model)).into_response();
                 response
                     .headers_mut()
@@ -2569,15 +2937,22 @@ async fn dispatch(
                     total_tokens: Some(total),
                     usage_estimated,
                     cached_prompt_tokens,
+                    cache_write_tokens,
                     reasoning_tokens,
                     cache_creation_tokens,
                     cache_read_tokens,
-                    // The cache stored the original provider response;
-                    // a stable id here would mislead reconciliation
-                    // (the request didn't actually hit the upstream),
-                    // so we leave these blank deliberately.
+                    // The stored response's `id` stays out: re-using a
+                    // provider response id would mislead reconciliation,
+                    // since this request never reached the upstream.
                     provider_request_id: String::new(),
-                    provider_model_version: String::new(),
+                    // The model version does NOT stay out. It answers
+                    // "which model produced the body you were served",
+                    // which a hit can still answer truthfully and which
+                    // nothing else on the row does — for a Model Group it
+                    // is the only thing that names the producer at all
+                    // (AISIX-Cloud#1571). Empty only when the stored
+                    // response carried no model name.
+                    provider_model_version: producer_model,
                     provider_key_id,
                     upstream_model,
                     finish_reason: String::new(),
@@ -2661,6 +3036,7 @@ async fn dispatch(
 
     'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
         let model = &attempt.model;
+        let upstream_req = crate::effort_mapping::chat_request(req, model);
         let Some(provider) = model.provider.as_deref() else {
             last_reserve_reject = None;
             last_err = Some(BridgeError::Config("model has no provider".into()));
@@ -2722,7 +3098,6 @@ async fn dispatch(
             // Per-attempt telemetry kind (#655): the first attempt overall
             // is "initial"; a different target than the previous attempt is
             // a "fallback"; the same target again is a "retry".
-            let (attempt_index, kind) = routing.begin_attempt(&model.display_name);
             // Routing target name only for routing groups; a direct model
             // leaves it empty since `model_id` already identifies it.
             let target_model = if is_routing_request {
@@ -2730,6 +3105,11 @@ async fn dispatch(
             } else {
                 String::new()
             };
+            let (attempt_index, kind) = routing.begin_attempt(crate::attempt::AttemptTarget {
+                display_name: &model.display_name,
+                target_model: &target_model,
+                model_id: &attempt.id,
+            });
 
             // Reserve THIS target's own model rate-limit layers before
             // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
@@ -2771,9 +3151,11 @@ async fn dispatch(
                             dispatched: false,
                         },
                     );
-                    // Keep the limiter's own Retry-After hint on the wire:
-                    // when every target is exhausted this error becomes the
-                    // client's 429, and SDKs back off on that header.
+                    // Fallback only: `last_reserve_reject` below carries the
+                    // same refusal un-flattened and takes precedence at
+                    // exhaustion. This stays so the loop still has a
+                    // 429-shaped `last_err` if a later target clears the
+                    // reject without recording one of its own.
                     last_err = Some(BridgeError::upstream_status_with_retry_after(
                         429,
                         format!(
@@ -2782,12 +3164,15 @@ async fn dispatch(
                         ),
                         crate::quota::retry_after_of(&e).map(Duration::from_secs),
                     ));
-                    // Only the policy-layer rejection is worth surfacing
-                    // un-flattened (it carries the `error.policy`
-                    // attribution); the inline model layer keeps the
-                    // established flattened shape.
-                    last_reserve_reject =
-                        matches!(e, ProxyError::PolicyRateLimit { .. }).then_some(e);
+                    // Surface the quota rejection un-flattened. A
+                    // `Bridge` error reads as the PROVIDER's 429 — it
+                    // carries no `error.policy` attribution and no
+                    // `x-ratelimit-*` headers, so a caller refused by this
+                    // gateway's own limiter would see the wire shape of
+                    // somebody else's refusal. `/v1/messages` and
+                    // `/v1/responses` keep theirs too; this arm used to keep
+                    // only the policy layer's.
+                    last_reserve_reject = Some(e);
                     continue 'targets;
                 }
             };
@@ -2798,7 +3183,7 @@ async fn dispatch(
             // once `bridge.chat` returns; the guard drops at the end of this
             // attempt's scope on both the success-break and failure paths.
             let _in_flight = state.runtime_status.begin_in_flight(&attempt.id);
-            let result = bridge.chat(req, &ctx).await;
+            let result = bridge.chat(upstream_req.as_ref(), &ctx).await;
             let attempt_latency_ms =
                 attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
             match result {
@@ -2853,12 +3238,12 @@ async fn dispatch(
                         },
                     );
                     let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
-                    tracing::warn!(
-                        target_model = %model.display_name,
-                        target_attempt = attempt_idx + 1,
-                        error = %err,
+                    crate::routing::log_attempt_failure(
+                        &model.display_name,
+                        attempt_idx + 1,
+                        &err,
                         retryable,
-                        "routing target attempt failed",
+                        fallback_statuses,
                     );
                     if retryable {
                         state.health.record_failure(&model.display_name);
@@ -2936,50 +3321,25 @@ async fn dispatch(
     // Token-estimation fallback (AISIX-Cloud#1074): when the upstream
     // response carries no usage block, fill the missing counters locally
     // BEFORE the quota commit and telemetry below so neither records
-    // silent zeros. Local variables only — `render_response` serialises
-    // the upstream body untouched, so the client never sees synthesised
-    // usage presented as the provider's.
-    let (prompt_tokens_u32, completion_tokens_u32, usage_estimated) = {
-        let (p, c) = (
-            upstream.usage.prompt_tokens,
-            upstream.usage.completion_tokens,
-        );
-        if p == 0 || c == 0 {
-            let est = crate::token_estimate::Estimator::new(
-                &upstream_model,
-                crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
-            );
-            let filled = crate::token_estimate::fill_missing(
-                &est,
-                p,
-                c,
-                Some(&estimation_output_text(&upstream)),
-            );
-            (
-                filled.prompt_tokens,
-                filled.completion_tokens,
-                filled.estimated,
-            )
-        } else {
-            (p, c, false)
-        }
-    };
+    // silent zeros. The same numbers reach the client, but only at the
+    // exit below — see `apply_estimated_usage` for why the cache write and
+    // the quota total in between must still see the upstream's own.
+    let (prompt_tokens_u32, completion_tokens_u32, usage_estimated) =
+        estimate_missing_chat_usage(&upstream, &upstream_model, req);
     let prompt = prompt_tokens_u32 as u64;
     let completion = completion_tokens_u32 as u64;
-    let total = if usage_estimated {
-        crate::usage_attr::total_tokens_with_cache(
-            prompt_tokens_u32,
-            completion_tokens_u32,
-            upstream.usage.cache_creation_tokens,
-            upstream.usage.cache_read_tokens,
-        )
-    } else {
-        upstream.usage.total_tokens as u64
-    };
+    let total = cache_inclusive_total(
+        u64::from(upstream.usage.total_tokens),
+        prompt_tokens_u32,
+        completion_tokens_u32,
+        upstream.usage.cache_creation_tokens,
+        upstream.usage.cache_read_tokens,
+    );
     // Snapshot the cache / reasoning counters + provider identity before
     // the upstream gets moved into render_response below — we need them
     // on the Success struct for telemetry.
     let cached_prompt_tokens = upstream.usage.cached_prompt_tokens;
+    let cache_write_tokens = upstream.usage.cache_write_tokens;
     let reasoning_tokens = upstream.usage.reasoning_tokens;
     let cache_creation_tokens = upstream.usage.cache_creation_tokens;
     let cache_read_tokens = upstream.usage.cache_read_tokens;
@@ -3016,7 +3376,7 @@ async fn dispatch(
         GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } => {
             // Output filter fires AFTER the upstream call, so the
             // provider has already billed for these tokens. Surface
@@ -3037,6 +3397,7 @@ async fn dispatch(
                 completion_tokens: completion_tokens_u32,
                 usage_estimated,
                 cached_prompt_tokens,
+                cache_write_tokens,
                 reasoning_tokens,
                 cache_creation_tokens,
                 cache_read_tokens,
@@ -3064,10 +3425,11 @@ async fn dispatch(
             return Err(DispatchFailure::new(
                 Some(model_id.clone()),
                 Some(charge),
-                ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                crate::error::guardrail_block_error(
                     "response",
                     guardrail_name.as_deref(),
-                )),
+                    unavailable.as_deref(),
+                ),
             )
             .with_routing(routing));
         }
@@ -3106,8 +3468,12 @@ async fn dispatch(
         // `Cache-Control: no-store` suppresses both layers' writes.
         cc.no_store,
     ) {
-        if let Err(err) = cache.put_with_ttl(key, upstream.clone(), ttl).await {
-            tracing::warn!(error = %err, key = %key, "cache write failed");
+        match cache.put_with_ttl(key, upstream.clone(), ttl).await {
+            Ok(()) => note_cache_ok(state, policy_backend, CacheHalf::Exact),
+            Err(err) if note_cache_failed(state, policy_backend, CacheHalf::Exact) => {
+                tracing::warn!(error = %err, key = %key, "cache write failed");
+            }
+            Err(err) => tracing::debug!(error = %err, key = %key, "cache write failed"),
         }
         // Semantic (L2) write. Reuses the read path's embedding; when
         // the read path was bypassed (`no-cache`) compute one now so
@@ -3121,7 +3487,7 @@ async fn dispatch(
                 None => None,
             };
             if let Some(vector) = vector {
-                if let Err(err) = sem
+                match sem
                     .store
                     .store(
                         &sem.policy_id,
@@ -3135,15 +3501,30 @@ async fn dispatch(
                     )
                     .await
                 {
-                    tracing::warn!(
-                        target: "aisix::cache",
-                        policy_name = %sem.policy_name,
-                        error = %err,
-                        "semantic cache write failed",
-                    );
-                    state
-                        .metrics
-                        .record_cache_semantic_store_failure(&sem.policy_name, "store");
+                    // Re-armed here too, not only on the lookup: a
+                    // `no-cache` request skips the lookup entirely, so
+                    // the write is the only success that half sees.
+                    Ok(()) => note_cache_ok(state, policy_backend, CacheHalf::Semantic),
+                    Err(err) => {
+                        if note_cache_failed(state, policy_backend, CacheHalf::Semantic) {
+                            tracing::warn!(
+                                target: "aisix::cache",
+                                policy_name = %sem.policy_name,
+                                error = %err,
+                                "semantic cache write failed",
+                            );
+                        } else {
+                            tracing::debug!(
+                                target: "aisix::cache",
+                                policy_name = %sem.policy_name,
+                                error = %err,
+                                "semantic cache write failed",
+                            );
+                        }
+                        state
+                            .metrics
+                            .record_cache_semantic_store_failure(&sem.policy_name, "store");
+                    }
                 }
             }
         }
@@ -3161,6 +3542,17 @@ async fn dispatch(
         )
     });
 
+    // AISIX-Cloud#1074: the client reads the same counters the usage record
+    // got. Deliberately here and not at the estimate above — the cache
+    // entry and the quota total in between must see what the upstream
+    // itself reported.
+    if usage_estimated {
+        apply_estimated_usage(
+            &mut upstream.usage,
+            prompt_tokens_u32,
+            completion_tokens_u32,
+        );
+    }
     let mut response = Json(render_response(now, upstream, &req.model)).into_response();
     // Header only when the gate was open — policy-disabled requests have
     // no cache header at all so a user can tell at a glance whether the
@@ -3198,6 +3590,7 @@ async fn dispatch(
         total_tokens: Some(total),
         usage_estimated,
         cached_prompt_tokens,
+        cache_write_tokens,
         reasoning_tokens,
         cache_creation_tokens,
         cache_read_tokens,
@@ -3300,6 +3693,13 @@ async fn dispatch_ensemble(
             "model is not an ensemble".into(),
         ))
     })?;
+    // Resolve the panel's and the judge's model references once, here, so
+    // every read below sees one spelling. A member or judge written as
+    // `model_id` follows a rename of the model it points at; one whose id
+    // resolves to nothing keeps the id as its name and is reported as the
+    // missing member it is, exactly as a dangling `model` is.
+    let ensemble_cfg = ensemble_cfg.with_refs_resolved(snapshot);
+    let ensemble_cfg = &ensemble_cfg;
 
     // Resolve a sub-call's target by display_name → (model_id, provider_key_id,
     // upstream_model). The first two are telemetry attribution; the third is
@@ -3323,62 +3723,79 @@ async fn dispatch_ensemble(
             None => (String::new(), String::new(), display_name.to_string()),
         }
     };
+    let effective_panel_member_usage =
+        |member: &crate::ensemble::PanelOutcome| -> EffectiveSubcallUsage {
+            EffectiveSubcallUsage {
+                usage: member.effective_usage.clone(),
+                estimated: member.usage_estimated,
+            }
+        };
     // Emit one usage event for a single (already-billed) panel member.
     // Defined before the `run_ensemble` match so the InsufficientPanel arm
     // can bill the survivors too — they hit upstream just like a full panel.
     // `bypass` is passed per call (not captured) so the closure holds no
     // borrow of the mutable `bypass_reason`. `attempt_index` is the member's
     // 0-based slot; `blocked` sets the event's `guardrail_blocked` flag.
-    let emit_panel_member =
-        |member: &crate::ensemble::PanelOutcome, index: usize, blocked: bool, bypass: &str| {
-            let (sub_model_id, sub_provider_key_id, sub_upstream_model) =
-                resolve_sub(&member.model);
-            // #1074: a member backend that omitted usage gets its prompt
-            // estimated from the shared client request and its completion
-            // from the member's own answer text, tokenized with the member's
-            // resolved upstream model.
-            let (prompt_tokens, completion_tokens, usage_estimated) = estimate_subcall_tokens(
-                req,
-                &sub_upstream_model,
-                &member.usage,
-                &member.est_output_text,
-            );
-            let pk = crate::usage_attr::ResolvedPk::resolve(snapshot, &sub_provider_key_id);
-            emit_usage_event(
-                state,
-                snapshot,
-                &pk,
-                request_id,
-                &sub_model_id,
-                &req.model,
-                api_key_id,
-                200,
-                started.elapsed(),
-                prompt_tokens,
-                completion_tokens,
-                UsageExtras {
-                    cached_prompt_tokens: member.usage.cached_prompt_tokens,
-                    reasoning_tokens: member.usage.reasoning_tokens,
-                    cache_creation_tokens: member.usage.cache_creation_tokens,
-                    cache_read_tokens: member.usage.cache_read_tokens,
-                    usage_estimated,
-                    bypass_reason: bypass.to_string(),
-                    cache_status: CacheStatus::Disabled.as_str().to_string(),
-                    attempt_index: index as u32,
-                    attempt_kind: "panel".to_string(),
-                    attempt_model: member.model.clone(),
-                    applied_guardrails: applied_guardrails.to_vec(),
-                    ..UsageExtras::default()
-                },
-                /* cost_usd */ 0.0,
-                blocked,
-                client,
-                /* content */ None,
-                /* terminal */ false,
-                /* dispatched */ true,
-                audit,
-            );
+    let emit_panel_member = |member: &crate::ensemble::PanelOutcome,
+                             index: usize,
+                             prepared: Option<&EffectiveSubcallUsage>,
+                             blocked: bool,
+                             bypass: &str| {
+        let (sub_model_id, sub_provider_key_id, _) = resolve_sub(&member.model);
+        let computed;
+        let effective = match prepared {
+            Some(usage) => usage,
+            None => {
+                computed = effective_panel_member_usage(member);
+                &computed
+            }
         };
+        let pk = crate::usage_attr::ResolvedPk::resolve(snapshot, &sub_provider_key_id);
+        emit_usage_event(
+            state,
+            snapshot,
+            &pk,
+            request_id,
+            &sub_model_id,
+            &req.model,
+            api_key_id,
+            200,
+            started.elapsed(),
+            effective.usage.prompt_tokens,
+            effective.usage.completion_tokens,
+            UsageExtras {
+                cached_prompt_tokens: effective.usage.cached_prompt_tokens,
+                cache_write_tokens: effective.usage.cache_write_tokens,
+                reasoning_tokens: effective.usage.reasoning_tokens,
+                cache_creation_tokens: effective.usage.cache_creation_tokens,
+                cache_read_tokens: effective.usage.cache_read_tokens,
+                usage_estimated: effective.estimated,
+                bypass_reason: bypass.to_string(),
+                cache_status: CacheStatus::Disabled.as_str().to_string(),
+                attempt_index: index as u32,
+                attempt_kind: "panel".to_string(),
+                attempt_model: member.model.clone(),
+                applied_guardrails: applied_guardrails.to_vec(),
+                ..UsageExtras::default()
+            },
+            /* cost_usd */ 0.0,
+            blocked,
+            client,
+            /* content */ None,
+            /* terminal */ false,
+            /* dispatched */ true,
+            audit,
+        );
+    };
+    // Failure exits bill every successful panel member even when the
+    // upstream omitted usage. Share the same normalized accounting used by
+    // UsageEvent emission so quota and telemetry cannot diverge.
+    let survivor_total = |panel: &[crate::ensemble::PanelOutcome]| -> u64 {
+        panel
+            .iter()
+            .map(|member| u64::from(effective_panel_member_usage(member).usage.total_tokens))
+            .sum()
+    };
 
     let caller = crate::ensemble::ProxyModelCaller {
         state,
@@ -3416,14 +3833,11 @@ async fn dispatch_ensemble(
         // inline FIRST (mirroring the non-streaming ensemble path), then calls
         // this for the emit + `DispatchFailure`. `panel` is borrowed so the
         // call site still owns it to compute `survivor_total`.
-        let survivor_total = |panel: &[crate::ensemble::PanelOutcome]| -> u64 {
-            panel.iter().map(|p| u64::from(p.usage.total_tokens)).sum()
-        };
         let emit_panel_then_fail =
             |panel: &[crate::ensemble::PanelOutcome], proxy_err: ProxyError| -> DispatchFailure {
                 for (index, member) in panel.iter().enumerate() {
                     emit_panel_member(
-                        member, index, /* blocked */ false, /* bypass */ "",
+                        member, index, None, /* blocked */ false, /* bypass */ "",
                     );
                 }
                 DispatchFailure::new(Some(model_id.to_string()), None, proxy_err)
@@ -3472,6 +3886,7 @@ async fn dispatch_ensemble(
             ));
         };
         let judge_model = &judge_entry.value;
+        let judge_req = crate::effort_mapping::chat_request(&judge_req, judge_model);
         let judge_pk = match crate::dispatch::resolve_provider_key(snapshot, judge_model) {
             Ok(pk) => pk,
             Err(e) => {
@@ -3548,7 +3963,10 @@ async fn dispatch_ensemble(
         // what `upstream_ttft_ms` should be measured against — `started`
         // additionally covers the whole panel that ran before it.
         let judge_started = Instant::now();
-        let judge_stream = match judge_bridge.chat_stream(&judge_req, &judge_ctx).await {
+        let judge_stream = match judge_bridge
+            .chat_stream(judge_req.as_ref(), &judge_ctx)
+            .await
+        {
             Ok(s) => s,
             // Judge connect failed AFTER the panel round-tripped: bill the
             // panel (same invariant as the non-streaming judge-failure path),
@@ -3564,42 +3982,43 @@ async fn dispatch_ensemble(
         // this frame — it fires on stream drop), so the `emit_panel_member` /
         // `resolve_sub` borrowing closures above are unusable inside it. Clone
         // the per-member + judge telemetry inputs up front.
+        // Copy the accounting already resolved by `ProxyModelCaller` so
+        // member quota, parent quota, UsageEvent, and Prometheus share the
+        // same counters inside the `'static` completion closure.
         struct PanelTelem {
             model_id: String,
             provider_key_id: String,
             attempt_model: String,
             usage: aisix_gateway::chat::UsageStats,
-            est_output_text: String,
-            /// Resolved upstream model — the tokenizer key for the #1074
-            /// estimate, pre-resolved here because the `'static` closure
-            /// can't reach the snapshot (mirrors `model_id`).
-            est_model: String,
+            usage_estimated: bool,
         }
         let panel_telem: Vec<PanelTelem> = panel
             .iter()
             .map(|p| {
-                let (model_id, provider_key_id, est_model) = resolve_sub(&p.model);
+                let (model_id, provider_key_id, _) = resolve_sub(&p.model);
                 PanelTelem {
                     model_id,
                     provider_key_id,
                     attempt_model: p.model.clone(),
-                    usage: p.usage.clone(),
-                    est_output_text: p.est_output_text.clone(),
-                    est_model,
+                    usage: p.effective_usage.clone(),
+                    usage_estimated: p.usage_estimated,
                 }
             })
             .collect();
-        // #1074: the `'static` on_complete closure cannot borrow `req`, so
-        // capture one clone for the panel-member prompt estimate (used only
-        // when a member backend omits usage — the guard in
-        // `estimate_subcall_tokens` skips the tokenizer otherwise).
-        let req_for_panel_est = req.clone();
-        let panel_total: u64 = panel.iter().map(|p| u64::from(p.usage.total_tokens)).sum();
+        let panel_total: u64 = panel_telem
+            .iter()
+            .map(|p| u64::from(p.usage.total_tokens))
+            .sum();
         // #614: field-wise panel usage sum (not just total_tokens) folded into
         // the client-facing terminal usage chunk via build_sse_stream's
         // `base_usage`, so a streamed ensemble reports the full panel+judge
         // aggregate — matching the non-streaming path.
         let panel_usage_sum = panel
+            .iter()
+            .fold(aisix_gateway::chat::UsageStats::default(), |acc, p| {
+                acc.saturating_add(&p.usage)
+            });
+        let panel_usage_for_metrics = panel_telem
             .iter()
             .fold(aisix_gateway::chat::UsageStats::default(), |acc, p| {
                 acc.saturating_add(&p.usage)
@@ -3642,6 +4061,7 @@ async fn dispatch_ensemble(
         let client_model_for_telem = req.model.clone();
         let bounded_model_for_telem =
             crate::usage_attr::metric_model_label(snapshot, &req.model).into_owned();
+        let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
         let api_key_id_for_telem = api_key_id.to_string();
         let applied_guardrails_for_telem = applied_guardrails.to_vec();
         // See the single-upstream streaming path.
@@ -3671,7 +4091,7 @@ async fn dispatch_ensemble(
         // their usage separately).
         let judge_estimator = crate::token_estimate::Estimator::new(
             judge_model.upstream_model().unwrap_or("unknown"),
-            crate::token_estimate::PromptInput::Chat(Box::new(judge_req)),
+            crate::token_estimate::PromptInput::Chat(Box::new(judge_req.into_owned())),
         );
         let sse_stream = build_sse_stream(
             judge_stream,
@@ -3700,6 +4120,30 @@ async fn dispatch_ensemble(
                 // Fresh snapshot at stream end, shared by every emit in this
                 // closure (#941) — see the single-model streaming path.
                 let snap = state_for_telem.snapshot.load();
+                let aggregate_input = panel_usage_for_metrics
+                    .prompt_tokens
+                    .saturating_add(comp.prompt_tokens);
+                let aggregate_output = panel_usage_for_metrics
+                    .completion_tokens
+                    .saturating_add(comp.completion_tokens);
+                let aggregate_cached = panel_usage_for_metrics
+                    .cached_prompt_tokens
+                    .saturating_add(comp.cached_prompt_tokens);
+                let aggregate_cache_read = panel_usage_for_metrics
+                    .cache_read_tokens
+                    .saturating_add(comp.cache_read_tokens);
+                let aggregate_cache_creation = panel_usage_for_metrics
+                    .cache_creation_tokens
+                    .saturating_add(comp.cache_creation_tokens);
+                let aggregate_total = cache_inclusive_total(
+                    u64::from(panel_usage_for_metrics.total_tokens)
+                        .saturating_add(comp.total_tokens),
+                    aggregate_input,
+                    aggregate_output,
+                    aggregate_cache_creation,
+                    aggregate_cache_read,
+                )
+                .min(u64::from(u32::MAX)) as u32;
                 // Telemetry: one event per panel member (attempt_kind "panel",
                 // index 0..N) carrying that member's own buffered usage, then
                 // one judge event (attempt_kind "judge", index N) from the
@@ -3708,17 +4152,6 @@ async fn dispatch_ensemble(
                 // moved into on_complete because the judge counts only land on
                 // the terminal SSE chunk.
                 for (index, member) in panel_telem.iter().enumerate() {
-                    // #1074: same or-semantics fallback as the non-streaming
-                    // panel emit — estimate a member's tokens when its backend
-                    // omitted usage (members were buffered, so their answer
-                    // text is available even though the judge is streamed).
-                    let (prompt_tokens, completion_tokens, usage_estimated) =
-                        estimate_subcall_tokens(
-                            &req_for_panel_est,
-                            &member.est_model,
-                            &member.usage,
-                            &member.est_output_text,
-                        );
                     let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &member.provider_key_id);
                     emit_usage_event(
                         &state_for_telem,
@@ -3730,14 +4163,15 @@ async fn dispatch_ensemble(
                         &api_key_id_for_telem,
                         200,
                         started.elapsed(),
-                        prompt_tokens,
-                        completion_tokens,
+                        member.usage.prompt_tokens,
+                        member.usage.completion_tokens,
                         UsageExtras {
                             cached_prompt_tokens: member.usage.cached_prompt_tokens,
+                            cache_write_tokens: member.usage.cache_write_tokens,
                             reasoning_tokens: member.usage.reasoning_tokens,
                             cache_creation_tokens: member.usage.cache_creation_tokens,
                             cache_read_tokens: member.usage.cache_read_tokens,
-                            usage_estimated,
+                            usage_estimated: member.usage_estimated,
                             bypass_reason: bypass_for_telem.clone(),
                             cache_status: CacheStatus::Disabled.as_str().to_string(),
                             attempt_index: index as u32,
@@ -3765,12 +4199,15 @@ async fn dispatch_ensemble(
                     &judge_model_id,
                     &client_model_for_telem,
                     &api_key_id_for_telem,
-                    200,
+                    // The judge's stream is the one the caller reads: its
+                    // abandonment or upstream failure is the request's.
+                    stream_terminal_status(&comp),
                     started.elapsed(),
                     comp.prompt_tokens,
                     comp.completion_tokens,
                     UsageExtras {
                         cached_prompt_tokens: comp.cached_prompt_tokens,
+                        cache_write_tokens: comp.cache_write_tokens,
                         reasoning_tokens: comp.reasoning_tokens,
                         cache_creation_tokens: comp.cache_creation_tokens,
                         cache_read_tokens: comp.cache_read_tokens,
@@ -3792,6 +4229,16 @@ async fn dispatch_ensemble(
                         attempt_index: judge_attempt_index,
                         attempt_kind: "judge".to_string(),
                         attempt_model: judge_attempt_model.clone(),
+                        error_class: comp
+                            .failure
+                            .as_ref()
+                            .map(|f| f.error_class.to_string())
+                            .unwrap_or_default(),
+                        error_message: comp
+                            .failure
+                            .as_ref()
+                            .map(|f| f.error_message.clone())
+                            .unwrap_or_default(),
                         applied_guardrails: applied_guardrails_for_telem.clone(),
                         redacted_entity_counts: {
                             let mut merged = input_redactions_for_telem.clone();
@@ -3817,6 +4264,39 @@ async fn dispatch_ensemble(
                     /* dispatched */ true,
                     &audit_for_telem,
                 );
+                // The per-sub-call UsageEvents above preserve billing
+                // attribution. Prometheus token families are request-level,
+                // so record the client-visible panel+judge aggregate against
+                // the ensemble alias rather than dropping the request from
+                // those series entirely.
+                let caller = metric_caller.as_caller();
+                let ensemble_pk =
+                    crate::usage_attr::ResolvedPk::resolve(&snap, crate::request_metrics::UNKNOWN);
+                crate::request_metrics::record_usage(
+                    &state_for_telem,
+                    "/v1/chat/completions",
+                    caller,
+                    crate::request_metrics::Upstream {
+                        provider: "ensemble",
+                        model: &bounded_model_for_telem,
+                        upstream_model: crate::request_metrics::UNKNOWN,
+                        pk: ensemble_pk.labels(),
+                        stream: true,
+                        is_fallback: false,
+                    },
+                    crate::request_metrics::Tokens {
+                        input: aggregate_input,
+                        output: aggregate_output,
+                        total: aggregate_total,
+                        cached: aggregate_cached,
+                        cache_read: aggregate_cache_read,
+                        cache_creation: aggregate_cache_creation,
+                        spend_usd: 0.0,
+                        client_type: state_for_telem
+                            .client_classifier
+                            .classify(&client_for_telem.user_agent),
+                    },
+                );
                 // SLO histograms (AISIX-Cloud#1011): the handler's
                 // record_success is stream-gated, so the ensemble stream
                 // records its e2e/TTFT here like the plain streaming path.
@@ -3829,6 +4309,20 @@ async fn dispatch_ensemble(
                         provider: "ensemble",
                         status: 200,
                         streaming: true,
+                        details: UsageLabels {
+                            endpoint: "/v1/chat/completions",
+                            inbound_protocol: "openai",
+                            upstream_protocol: ensemble_pk.labels().protocol(),
+                            provider: "ensemble",
+                            model: &bounded_model_for_telem,
+                            upstream_model: crate::request_metrics::UNKNOWN,
+                            provider_key_id: ensemble_pk.labels().id(),
+                            provider_key_name: ensemble_pk.labels().name(),
+                            api_key_id: caller.api_key_id,
+                            team_id: caller.team_id,
+                            user_id: caller.user_id,
+                            user_name: caller.user_name,
+                        },
                     },
                     started.elapsed(),
                 );
@@ -3839,6 +4333,37 @@ async fn dispatch_ensemble(
                         provider: "ensemble",
                         status: 200,
                         streaming: true,
+                        details: UsageLabels {
+                            endpoint: "/v1/chat/completions",
+                            inbound_protocol: "openai",
+                            upstream_protocol: ensemble_pk.labels().protocol(),
+                            provider: "ensemble",
+                            model: &bounded_model_for_telem,
+                            upstream_model: crate::request_metrics::UNKNOWN,
+                            provider_key_id: ensemble_pk.labels().id(),
+                            provider_key_name: ensemble_pk.labels().name(),
+                            api_key_id: caller.api_key_id,
+                            team_id: caller.team_id,
+                            user_id: caller.user_id,
+                            user_name: caller.user_name,
+                        },
+                    },
+                    Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
+                );
+                state_for_telem.metrics.record_time_to_first_token(
+                    UsageLabels {
+                        endpoint: "/v1/chat/completions",
+                        inbound_protocol: "openai",
+                        upstream_protocol: ensemble_pk.labels().protocol(),
+                        provider: "ensemble",
+                        model: &bounded_model_for_telem,
+                        upstream_model: crate::request_metrics::UNKNOWN,
+                        provider_key_id: ensemble_pk.labels().id(),
+                        provider_key_name: ensemble_pk.labels().name(),
+                        api_key_id: caller.api_key_id,
+                        team_id: caller.team_id,
+                        user_id: caller.user_id,
+                        user_name: caller.user_name,
                     },
                     Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
                 );
@@ -3866,13 +4391,14 @@ async fn dispatch_ensemble(
             usage_estimated: false,
             cost_usd: 0.0,
             cached_prompt_tokens: 0,
+            cache_write_tokens: None,
             reasoning_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             provider_request_id: String::new(),
             provider_model_version: String::new(),
-            provider_key_id: String::new(),
-            upstream_model: String::new(),
+            provider_key_id: crate::request_metrics::UNKNOWN.to_string(),
+            upstream_model: crate::request_metrics::UNKNOWN.to_string(),
             finish_reason: String::new(),
             bypass_reason,
             cache_status: CacheStatus::Disabled,
@@ -3922,11 +4448,10 @@ async fn dispatch_ensemble(
                     )),
                 ),
             };
-            let survivor_total: u64 = panel.iter().map(|p| u64::from(p.usage.total_tokens)).sum();
-            reservation.commit_tokens(survivor_total).await;
+            reservation.commit_tokens(survivor_total(&panel)).await;
             for (index, member) in panel.iter().enumerate() {
                 emit_panel_member(
-                    member, index, /* blocked */ false, /* bypass */ "",
+                    member, index, None, /* blocked */ false, /* bypass */ "",
                 );
             }
             return Err(DispatchFailure::new(
@@ -3940,13 +4465,21 @@ async fn dispatch_ensemble(
     // Aggregate client-facing usage: every billed sub-call (panel members
     // + judge) counts against quota, since each one already hit an
     // upstream. Commit once against the single entry-level reservation.
-    let panel_total: u64 = outcome
+    let judge_usage = outcome.response.usage.clone();
+    let effective_panel: Vec<EffectiveSubcallUsage> = outcome
         .panel
         .iter()
-        .map(|p| u64::from(p.usage.total_tokens))
+        .map(effective_panel_member_usage)
+        .collect();
+    let effective_judge = EffectiveSubcallUsage {
+        usage: outcome.judge_effective_usage.clone(),
+        estimated: outcome.judge_usage_estimated,
+    };
+    let panel_total: u64 = effective_panel
+        .iter()
+        .map(|u| u64::from(u.usage.total_tokens))
         .sum();
-    let judge_usage = outcome.response.usage.clone();
-    let total_tokens = panel_total + u64::from(judge_usage.total_tokens);
+    let total_tokens = panel_total + u64::from(effective_judge.usage.total_tokens);
     reservation.commit_tokens(total_tokens).await;
 
     // Emit one usage event per sub-call (each panel member + the judge),
@@ -3970,21 +4503,15 @@ async fn dispatch_ensemble(
                          hits: &[aisix_core::GuardrailMonitorHit],
                          terminal_judge: bool| {
         for (index, member) in outcome.panel.iter().enumerate() {
-            emit_panel_member(member, index, blocked, bypass);
+            emit_panel_member(
+                member,
+                index,
+                Some(&effective_panel[index]),
+                blocked,
+                bypass,
+            );
         }
-        let (judge_model_id, judge_provider_key_id, judge_upstream_model) =
-            resolve_sub(&outcome.judge_model);
-        // #1074: estimate the judge sub-call when its backend omitted usage —
-        // prompt from the judge's synthesis request, completion from the
-        // synthesized answer text (read post-mask; token count is
-        // mask-invariant to within placeholder length), tokenized with the
-        // judge's resolved upstream model.
-        let (judge_prompt, judge_completion, judge_estimated) = estimate_subcall_tokens(
-            &outcome.judge_req,
-            &judge_upstream_model,
-            &judge_usage,
-            &estimation_output_text(&outcome.response),
-        );
+        let (judge_model_id, judge_provider_key_id, _) = resolve_sub(&outcome.judge_model);
         let judge_pk = crate::usage_attr::ResolvedPk::resolve(snapshot, &judge_provider_key_id);
         emit_usage_event(
             state,
@@ -3996,14 +4523,15 @@ async fn dispatch_ensemble(
             api_key_id,
             200,
             started.elapsed(),
-            judge_prompt,
-            judge_completion,
+            effective_judge.usage.prompt_tokens,
+            effective_judge.usage.completion_tokens,
             UsageExtras {
-                cached_prompt_tokens: judge_usage.cached_prompt_tokens,
-                reasoning_tokens: judge_usage.reasoning_tokens,
-                cache_creation_tokens: judge_usage.cache_creation_tokens,
-                cache_read_tokens: judge_usage.cache_read_tokens,
-                usage_estimated: judge_estimated,
+                cached_prompt_tokens: effective_judge.usage.cached_prompt_tokens,
+                cache_write_tokens: effective_judge.usage.cache_write_tokens,
+                reasoning_tokens: effective_judge.usage.reasoning_tokens,
+                cache_creation_tokens: effective_judge.usage.cache_creation_tokens,
+                cache_read_tokens: effective_judge.usage.cache_read_tokens,
+                usage_estimated: effective_judge.estimated,
                 provider_request_id: crate::usage_attr::sanitize_provider_response_id(
                     &outcome.response.id,
                 ),
@@ -4062,7 +4590,7 @@ async fn dispatch_ensemble(
         GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } => {
             tracing::warn!(
                 guardrail_hook = "output",
@@ -4083,10 +4611,11 @@ async fn dispatch_ensemble(
             return Err(DispatchFailure::new(
                 Some(model_id.to_string()),
                 None,
-                ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                crate::error::guardrail_block_error(
                     "response",
                     guardrail_name.as_deref(),
-                )),
+                    unavailable.as_deref(),
+                ),
             ));
         }
         GuardrailVerdict::Bypass { reason } => {
@@ -4128,27 +4657,34 @@ async fn dispatch_ensemble(
         .panel
         .iter()
         .fold(judge_usage.clone(), |acc, p| acc.saturating_add(&p.usage));
-    outcome.response.usage = aggregate_usage;
+    let metric_usage = effective_panel
+        .iter()
+        .fold(effective_judge.usage.clone(), |acc, p| {
+            acc.saturating_add(&p.usage)
+        });
+    outcome.response.usage = aggregate_usage.clone();
     let response = Json(render_response(created_ts, outcome.response, &req.model)).into_response();
     Ok(Success {
         response,
         // No single provider/model/key governs an ensemble response.
         provider: "ensemble".to_string(),
         model_id: model_id.to_string(),
-        // Per-sub-call usage was emitted above; the entry-level telemetry
-        // event is suppressed, so these top-level token fields are unused.
-        prompt_tokens: None,
-        completion_tokens: None,
-        total_tokens: None,
+        // Per-sub-call UsageEvents were emitted above, while record_success
+        // consumes these aggregate fields for the request-level Prometheus
+        // token families keyed by the ensemble alias.
+        prompt_tokens: Some(u64::from(metric_usage.prompt_tokens)),
+        completion_tokens: Some(u64::from(metric_usage.completion_tokens)),
+        total_tokens: Some(u64::from(metric_usage.total_tokens)),
         usage_estimated: false,
-        cached_prompt_tokens: 0,
-        reasoning_tokens: 0,
-        cache_creation_tokens: 0,
-        cache_read_tokens: 0,
+        cached_prompt_tokens: metric_usage.cached_prompt_tokens,
+        cache_write_tokens: metric_usage.cache_write_tokens,
+        reasoning_tokens: metric_usage.reasoning_tokens,
+        cache_creation_tokens: metric_usage.cache_creation_tokens,
+        cache_read_tokens: metric_usage.cache_read_tokens,
         provider_request_id: String::new(),
         provider_model_version: String::new(),
-        provider_key_id: String::new(),
-        upstream_model: String::new(),
+        provider_key_id: crate::request_metrics::UNKNOWN.to_string(),
+        upstream_model: crate::request_metrics::UNKNOWN.to_string(),
         finish_reason: String::new(),
         cost_usd: 0.0,
         bypass_reason,
@@ -4199,7 +4735,6 @@ fn record_success(
     s: &Success,
     elapsed: Duration,
 ) {
-    let metrics = &state.metrics;
     let caller = crate::request_metrics::Caller::new(auth);
     crate::request_metrics::record(
         state,
@@ -4220,15 +4755,19 @@ fn record_success(
     // `elapsed` for a stream is time-to-response-start; the stream's
     // on_complete records the full duration instead.
     if !stream {
-        let bounded_model = crate::usage_attr::metric_model_label(&state.snapshot.load(), model);
-        metrics.record_request_e2e_latency(
-            LatencyLabels {
-                endpoint: "/v1/chat/completions",
-                model: bounded_model.as_ref(),
+        crate::request_metrics::record_e2e_latency(
+            state,
+            "/v1/chat/completions",
+            caller,
+            crate::request_metrics::Upstream {
                 provider,
-                status,
-                streaming: false,
+                model,
+                upstream_model: &s.upstream_model,
+                pk: pk.labels(),
+                stream: false,
+                ..Default::default()
             },
+            status,
             elapsed,
         );
     }
@@ -4252,6 +4791,9 @@ fn record_success(
             input: s.prompt_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
             output: s.completion_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
             total: s.total_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+            cached: s.cached_prompt_tokens,
+            cache_read: s.cache_read_tokens,
+            cache_creation: s.cache_creation_tokens,
             spend_usd: s.cost_usd,
             client_type,
         },
@@ -4267,6 +4809,7 @@ fn record_budget_gauges(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
         user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
+        user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
     };
     if let Some(budget) = budget {
         metrics.set_budget_gauges(
@@ -4340,6 +4883,7 @@ fn emit_usage_event(
         prompt_tokens,
         completion_tokens,
         cached_prompt_tokens: extras.cached_prompt_tokens,
+        cache_write_tokens: extras.cache_write_tokens,
         reasoning_tokens: extras.reasoning_tokens,
         cache_creation_tokens: extras.cache_creation_tokens,
         cache_read_tokens: extras.cache_read_tokens,
@@ -4360,6 +4904,7 @@ fn emit_usage_event(
         // terminal event carries them — a superseded attempt (or an ensemble
         // panel member) would otherwise repeat the same hit.
         guardrail_enforced_hits: crate::usage_attr::terminal_enforced_hits(terminal, audit),
+        guardrail_scores: crate::usage_attr::terminal_guardrail_scores(terminal, audit),
         cache_status: extras.cache_status,
         cache_hit_layer: extras.cache_hit_layer,
         cache_similarity: extras.cache_similarity,
@@ -4396,13 +4941,12 @@ fn emit_usage_event(
         // MCP attribution does not apply to the chat path.
         ..Default::default()
     };
-    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
-    // Guardrail outcome counters (#379). Recorded here — the one place every
-    // chat path (success / error / streaming / cache-hit) funnels through —
-    // from the same guardrail fields the UsageEvent carries.
-    state
-        .metrics
-        .record_guardrail_outcome(guardrail_blocked, &event.guardrail_bypassed_reason);
+    crate::usage_attr::apply_caller_identity(
+        &mut event,
+        client.jwt.as_ref(),
+        client.caller.user_id.as_deref(),
+        client.caller.user_name.as_deref(),
+    );
     // Handler label "chat" matches the documented enumeration for
     // `aisix_usage_events_emitted_total` (#408). Keep `&'static str`
     // so prometheus cardinality stays bounded. Both emit legs (CP sink +
@@ -4413,7 +4957,7 @@ fn emit_usage_event(
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "chat",
+        crate::operation::CHAT,
         event,
         crate::usage_attr::usage_event_labels(&usage_model, pk),
         content.as_ref(),
@@ -4469,6 +5013,7 @@ pub(crate) fn sanitize_tag(s: String) -> String {
 #[derive(Default)]
 struct UsageExtras {
     cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
@@ -4600,6 +5145,10 @@ fn emit_failed_attempts(
                 error_class: rec.error_class.clone(),
                 error_message: rec.error_message.clone(),
                 applied_guardrails: applied_guardrails.to_vec(),
+                // Same reason as the pre-dispatch failure event: the
+                // bypass is a request-scoped fact and every attempt of a
+                // request that failed open went upstream unscreened.
+                bypass_reason: crate::usage_attr::bypass_reason(audit),
                 ..UsageExtras::default()
             },
             /* cost_usd */ 0.0,
@@ -4634,6 +5183,12 @@ fn emit_access_log(
     provider_request_id: Option<&str>,
     routing: &RoutingTelemetry,
     error: Option<&ProxyError>,
+    // How the response cache answered, for a caller that holds the verdict
+    // — the buffered success exit, the only one that can tell a miss from
+    // a bypass. `None` falls back to the request's attribution cell, which
+    // records a HIT and nothing else, so an exit that never saw the gate
+    // still reports one (AISIX-Cloud#1571).
+    cache: Option<aisix_obs::CacheAccessLog<'_>>,
 ) {
     let (error_kind, error) = match error {
         Some(e) => {
@@ -4646,13 +5201,17 @@ fn emit_access_log(
     // plane), carrying user-perceived `latency` + the final status plus a
     // routing summary. The per-attempt detail lives in telemetry only.
     let served_by = routing.winner().map(|w| w.target_model.as_str());
+    let target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method,
         path,
         status,
         latency,
+        duration: latency,
         provider,
         model,
+        upstream_model: target.upstream_model(),
+        provider_key_id: target.provider_key_id(),
         api_key_id,
         prompt_tokens,
         completion_tokens,
@@ -4670,6 +5229,8 @@ fn emit_access_log(
         },
         error_kind,
         error: error.as_deref(),
+        mcp: None,
+        cache: cache.or_else(|| target.cache()),
     }
     .emit();
 }
@@ -4719,6 +5280,7 @@ struct StreamCompletion {
     /// cumulative-tokens accounting can overflow u32 over a long key.
     total_tokens: u64,
     cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
@@ -4796,6 +5358,20 @@ struct StreamCompletion {
     /// still be abandoned midway, and a zero-chunk stream can still
     /// legitimately reach its end (an immediate error frame).
     reached_end: bool,
+    /// The upstream error that ended the stream after its `200` went out,
+    /// if one did. The terminal usage event reports it instead of a `200`.
+    failure: Option<crate::attempt::StreamFailure>,
+}
+
+/// The terminal usage-event status of a chat stream. A guardrail block keeps
+/// what it recorded before upstream failures were told apart: `200` once the
+/// stream ran to its end, `499` if the caller left first.
+fn stream_terminal_status(comp: &StreamCompletion) -> u16 {
+    if comp.guardrail_blocked {
+        crate::attempt::stream_status(comp.reached_end, None)
+    } else {
+        crate::attempt::stream_status(comp.reached_end, comp.failure.as_ref())
+    }
 }
 
 /// Parameters needed to run output-guardrail evaluation at
@@ -4914,6 +5490,13 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
                     );
                 }
             }
+            c.total_tokens = cache_inclusive_total(
+                c.total_tokens,
+                c.prompt_tokens,
+                c.completion_tokens,
+                c.cache_creation_tokens,
+                c.cache_read_tokens,
+            );
             f(c);
         }
     }
@@ -5168,6 +5751,7 @@ where
                         if t > comp.total_tokens {
                             comp.total_tokens = t;
                         }
+                        comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);
                         if u.cached_prompt_tokens > comp.cached_prompt_tokens {
                             comp.cached_prompt_tokens = u.cached_prompt_tokens;
                         }
@@ -5215,6 +5799,7 @@ where
                 }
                 Err(err) => {
                     errored = true;
+                    crate::attempt::StreamFailure::record(&mut guard.comp().failure, &err);
                     let etype = err.error_type();
                     yield Ok::<_, Infallible>(
                         Event::default()
@@ -5283,7 +5868,7 @@ where
                                     aisix_guardrails::GuardrailVerdict::Block {
                                         reason,
                                         guardrail_name,
-                                        ..
+                                        unavailable,
                                     } => {
                                         tracing::warn!(
                                             guardrail_hook = "output",
@@ -5300,7 +5885,7 @@ where
                                                     &crate::error::guardrail_block_message(
                                                         "response",
                                                         guardrail_name.as_deref(),
-                                                    ),
+                                                     unavailable.as_deref()),
                                                 ),
                                             ),
                                         );
@@ -5367,7 +5952,11 @@ where
                                 yield Ok::<_, Infallible>(
                                     Event::default().event("error").data(error_frame_payload(
                                         "content_filter",
-                                        "response blocked by content policy",
+                                        &crate::error::guardrail_block_message(
+                                            "response",
+                                            None,
+                                            Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+                                        ),
                                     )),
                                 );
                                 break;
@@ -5491,7 +6080,7 @@ where
                             aisix_guardrails::GuardrailVerdict::Block {
                                 reason,
                                 guardrail_name,
-                                ..
+                                unavailable,
                             } => {
                                 tracing::warn!(
                                     guardrail_hook = "output",
@@ -5507,7 +6096,7 @@ where
                                         &crate::error::guardrail_block_message(
                                             "response",
                                             guardrail_name.as_deref(),
-                                        ),
+                                         unavailable.as_deref()),
                                     )),
                                 );
                                 true
@@ -5579,7 +6168,7 @@ where
                     aisix_guardrails::GuardrailVerdict::Block {
                         reason,
                         guardrail_name,
-                        ..
+                        unavailable,
                     } => {
                         // Mirror the non-streaming path's #153
                         // redaction contract: the wire-level message
@@ -5603,7 +6192,7 @@ where
                                     &crate::error::guardrail_block_message(
                                         "response",
                                         guardrail_name.as_deref(),
-                                    ),
+                                     unavailable.as_deref()),
                                 )),
                         );
                     }
@@ -5734,9 +6323,51 @@ mod cooldown_tests {
         )
     }
 
+    /// The minimum an operator has to write to turn cooldown on. Every
+    /// default-knob test below runs against it, because an absent
+    /// `enabled` is now "off" and would make them all vacuously pass.
+    fn enabled() -> CooldownConfig {
+        CooldownConfig {
+            enabled: Some(true),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_cooldown_config_never_cools_down() {
+        // AISIX-Cloud#1499: a model whose operator never configured
+        // cooldown stays in rotation, whatever the upstream returns.
+        // Every status in the old built-in trigger list, plus the
+        // transport categories that used to fire on the same default.
+        for status in [401, 408, 429, 500, 502, 503, 504] {
+            assert!(
+                decide_cooldown(&upstream(status), None).is_none(),
+                "status={status} cooled down a model with no cooldown config"
+            );
+        }
+        assert!(decide_cooldown(&BridgeError::Transport("conn refused".into()), None).is_none());
+        assert!(decide_cooldown(&BridgeError::StreamAborted, None).is_none());
+        assert!(decide_cooldown(
+            &BridgeError::Timeout {
+                cause: String::new(),
+                elapsed_ms: 30_000
+            },
+            None
+        )
+        .is_none());
+        // A present block that never says `enabled: true` is the same
+        // "not asked for" — this is the shape the console writes when
+        // the operator only touched another knob.
+        let tuned = CooldownConfig {
+            default_seconds: Some(90),
+            ..Default::default()
+        };
+        assert!(decide_cooldown(&upstream(429), Some(&tuned)).is_none());
+    }
+
     #[test]
     fn default_config_cooldowns_429() {
-        let (ttl, reason) = decide_cooldown(&upstream(429), None).unwrap();
+        let (ttl, reason) = decide_cooldown(&upstream(429), Some(&enabled())).unwrap();
         assert_eq!(ttl, StdDuration::from_secs(30));
         assert_eq!(reason, "upstream_rate_limited");
     }
@@ -5747,21 +6378,21 @@ mod cooldown_tests {
         // (auth failure) should still take the target out of rotation,
         // because the same key will keep failing on subsequent
         // requests. The retry-vs-cooldown split is the whole point.
-        let (ttl, reason) = decide_cooldown(&upstream(401), None).unwrap();
+        let (ttl, reason) = decide_cooldown(&upstream(401), Some(&enabled())).unwrap();
         assert_eq!(ttl, StdDuration::from_secs(30));
         assert_eq!(reason, "upstream_auth_failure");
     }
 
     #[test]
     fn default_config_cooldowns_408() {
-        let (_, reason) = decide_cooldown(&upstream(408), None).unwrap();
+        let (_, reason) = decide_cooldown(&upstream(408), Some(&enabled())).unwrap();
         assert_eq!(reason, "upstream_request_timeout");
     }
 
     #[test]
     fn default_config_cooldowns_5xx() {
         for status in [500, 502, 503, 504] {
-            let (_, reason) = decide_cooldown(&upstream(status), None).unwrap();
+            let (_, reason) = decide_cooldown(&upstream(status), Some(&enabled())).unwrap();
             assert_eq!(reason, "upstream_server_error", "status={status}");
         }
     }
@@ -5770,9 +6401,9 @@ mod cooldown_tests {
     fn default_config_skips_400_and_other_4xx() {
         // Caller bugs (400, 403, 422) are not cooldown signals — the
         // model didn't fail, the request did.
-        assert!(decide_cooldown(&upstream(400), None).is_none());
-        assert!(decide_cooldown(&upstream(403), None).is_none());
-        assert!(decide_cooldown(&upstream(422), None).is_none());
+        assert!(decide_cooldown(&upstream(400), Some(&enabled())).is_none());
+        assert!(decide_cooldown(&upstream(403), Some(&enabled())).is_none());
+        assert!(decide_cooldown(&upstream(422), Some(&enabled())).is_none());
     }
 
     #[test]
@@ -5782,12 +6413,20 @@ mod cooldown_tests {
                 cause: String::new(),
                 elapsed_ms: 30_000
             },
-            None
+            Some(&enabled())
         )
         .is_some());
-        assert!(decide_cooldown(&BridgeError::Transport("conn refused".into()), None).is_some());
-        assert!(decide_cooldown(&BridgeError::StreamAborted, None).is_some());
-        assert!(decide_cooldown(&BridgeError::UpstreamDecode("bad json".into()), None).is_some());
+        assert!(decide_cooldown(
+            &BridgeError::Transport("conn refused".into()),
+            Some(&enabled())
+        )
+        .is_some());
+        assert!(decide_cooldown(&BridgeError::StreamAborted, Some(&enabled())).is_some());
+        assert!(decide_cooldown(
+            &BridgeError::UpstreamDecode("bad json".into()),
+            Some(&enabled())
+        )
+        .is_some());
     }
 
     #[test]
@@ -5806,7 +6445,7 @@ mod cooldown_tests {
         // already handles burst). 500s still cool down.
         let cfg = CooldownConfig {
             trigger_statuses: Some(vec![500, 502, 503]),
-            ..Default::default()
+            ..enabled()
         };
         assert!(decide_cooldown(&upstream(429), Some(&cfg)).is_none());
         assert!(decide_cooldown(&upstream(503), Some(&cfg)).is_some());
@@ -5814,7 +6453,8 @@ mod cooldown_tests {
 
     #[test]
     fn honor_retry_after_uses_upstream_hint() {
-        let (ttl, _) = decide_cooldown(&upstream_with_retry_after(429, 75), None).unwrap();
+        let (ttl, _) =
+            decide_cooldown(&upstream_with_retry_after(429, 75), Some(&enabled())).unwrap();
         assert_eq!(ttl, StdDuration::from_secs(75));
     }
 
@@ -5824,7 +6464,7 @@ mod cooldown_tests {
         // configured max so we don't lose the target for hours.
         let cfg = CooldownConfig {
             max_seconds: Some(60),
-            ..Default::default()
+            ..enabled()
         };
         let (ttl, _) =
             decide_cooldown(&upstream_with_retry_after(429, 100_000), Some(&cfg)).unwrap();
@@ -5836,7 +6476,7 @@ mod cooldown_tests {
         let cfg = CooldownConfig {
             honor_retry_after: Some(false),
             default_seconds: Some(45),
-            ..Default::default()
+            ..enabled()
         };
         let (ttl, _) = decide_cooldown(&upstream_with_retry_after(429, 5), Some(&cfg)).unwrap();
         assert_eq!(ttl, StdDuration::from_secs(45));
@@ -5846,7 +6486,7 @@ mod cooldown_tests {
     fn trigger_on_timeout_false_disables_timeout_cooldown() {
         let cfg = CooldownConfig {
             trigger_on_timeout: Some(false),
-            ..Default::default()
+            ..enabled()
         };
         assert!(decide_cooldown(
             &BridgeError::Timeout {
@@ -5861,7 +6501,9 @@ mod cooldown_tests {
     #[test]
     fn config_error_never_cools_down() {
         // Misconfig = WE are wrong; cooling down doesn't help.
-        assert!(decide_cooldown(&BridgeError::Config("bad key".into()), None).is_none());
+        assert!(
+            decide_cooldown(&BridgeError::Config("bad key".into()), Some(&enabled())).is_none()
+        );
     }
 }
 
@@ -5929,7 +6571,12 @@ mod complete_on_drop_tests {
     //! StreamCompletion, set the shared atomic to simulate "N
     //! chunks delivered to the consumer", drop, observe the
     //! callback args.
-    use super::{estimate_subcall_tokens, AtomicU32, CompleteOnDrop, StreamCompletion};
+    use super::{
+        apply_estimated_usage, cache_inclusive_total, effective_subcall_usage,
+        estimate_missing_chat_usage, estimate_subcall_tokens, AtomicU32, CompleteOnDrop,
+        StreamCompletion,
+    };
+    use aisix_gateway::chat::UsageStats;
     use std::sync::{Arc, Mutex};
 
     /// Build the guard with `delivered_count` pre-set on the
@@ -6053,6 +6700,114 @@ mod complete_on_drop_tests {
         assert!(!out.usage_estimated);
     }
 
+    /// AISIX-Cloud#1074: the client-visible usage carries the same filled
+    /// counters the usage record gets, per counter — a number the upstream
+    /// reported stands, a zero is filled, and a total built beside that
+    /// zero is recomputed from what the client is actually told.
+    ///
+    /// `Usage::from_stats` is asserted through `render_response` because
+    /// the client reads the projection, not the struct: a filled
+    /// `completion_tokens` beside an echoed stale `total_tokens` would
+    /// hand the caller a total that does not add up.
+    #[test]
+    fn non_streaming_usage_fill_reaches_the_client_projection() {
+        let req = subcall_req("Hello");
+        let mut resp = chat_response_for_estimation("Hello world", UsageStats::new(17, 0));
+        // The upstream reported a total beside the zero completion count.
+        resp.usage.total_tokens = 17;
+
+        let (prompt, completion, estimated) =
+            estimate_missing_chat_usage(&resp, "relay-model", &req);
+        assert!(estimated);
+        assert_eq!(prompt, 17, "a reported counter stands");
+        assert_eq!(completion, 2, "the zero is filled");
+
+        apply_estimated_usage(&mut resp.usage, prompt, completion);
+        let rendered = crate::render::render_response(0, resp, "m");
+        assert_eq!(rendered.usage.prompt_tokens, 17);
+        assert_eq!(rendered.usage.completion_tokens, 2);
+        assert_eq!(
+            rendered.usage.total_tokens, 19,
+            "the total the client reads is prompt + completion"
+        );
+    }
+
+    /// The mirror half: a response whose upstream reported both counters is
+    /// left alone, so no estimate can displace real numbers.
+    #[test]
+    fn non_streaming_usage_fill_leaves_reported_usage_alone() {
+        let req = subcall_req("Hello");
+        let mut resp = chat_response_for_estimation("Hello world", UsageStats::new(17, 23));
+        resp.usage.total_tokens = 99;
+
+        let (prompt, completion, estimated) =
+            estimate_missing_chat_usage(&resp, "relay-model", &req);
+        assert!(!estimated);
+        assert_eq!((prompt, completion), (17, 23));
+
+        let rendered = crate::render::render_response(0, resp, "m");
+        assert_eq!(rendered.usage.prompt_tokens, 17);
+        assert_eq!(rendered.usage.completion_tokens, 23);
+        assert_eq!(
+            rendered.usage.total_tokens, 99,
+            "a total the upstream reported is not second-guessed"
+        );
+    }
+
+    /// The estimate must NOT reach the quota total or the cache entry —
+    /// only the client body. `estimate_missing_chat_usage` therefore leaves
+    /// the response untouched, and the upstream's own `total_tokens` is
+    /// still what `cache_inclusive_total` sees. A provider that reports a
+    /// bare total larger than the counters it broke out (overhead we
+    /// cannot see) would otherwise be silently corrected downward — i.e.
+    /// under-billed.
+    #[test]
+    fn estimating_does_not_change_what_is_billed() {
+        let req = subcall_req("Hello");
+        // A degenerate upstream: a bare total, no breakdown at all.
+        let resp = chat_response_for_estimation("Hello world", UsageStats::new(0, 0));
+        let mut resp = resp;
+        resp.usage.total_tokens = 42;
+
+        let (prompt, completion, estimated) =
+            estimate_missing_chat_usage(&resp, "relay-model", &req);
+        assert!(estimated);
+        assert_eq!(
+            (
+                resp.usage.prompt_tokens,
+                resp.usage.completion_tokens,
+                resp.usage.total_tokens
+            ),
+            (0, 0, 42),
+            "the response the cache stores is still the upstream's own",
+        );
+        assert_eq!(
+            cache_inclusive_total(u64::from(resp.usage.total_tokens), prompt, completion, 0, 0),
+            42,
+            "the reported total still wins over the smaller estimate",
+        );
+    }
+
+    fn chat_response_for_estimation(
+        text: &str,
+        usage: UsageStats,
+    ) -> aisix_gateway::chat::ChatResponse {
+        aisix_gateway::chat::ChatResponse {
+            id: "id".into(),
+            model: "relay-model".into(),
+            message: aisix_gateway::chat::ChatMessage {
+                role: aisix_gateway::chat::Role::Assistant,
+                content: Some(text.into()),
+                content_blocks: None,
+                name: None,
+                tool_call_id: None,
+                extra: serde_json::Map::new(),
+            },
+            finish_reason: aisix_gateway::chat::FinishReason::Stop,
+            usage,
+        }
+    }
+
     fn subcall_req(user: &str) -> aisix_gateway::chat::ChatFormat {
         aisix_gateway::chat::ChatFormat::new(
             "relay-model",
@@ -6113,6 +6868,27 @@ mod complete_on_drop_tests {
         assert_eq!(prompt, 17, "reported prompt preserved");
         assert_eq!(completion, 2, "missing completion estimated");
         assert!(estimated);
+    }
+
+    #[test]
+    fn effective_subcall_usage_is_cache_inclusive_and_preserves_overhead() {
+        let reported = aisix_gateway::chat::UsageStats {
+            prompt_tokens: 7,
+            completion_tokens: 11,
+            // Bedrock Converse reports a total that can exclude the two
+            // separate cache counters.
+            total_tokens: 18,
+            cache_creation_tokens: 5,
+            cache_read_tokens: 3,
+            ..Default::default()
+        };
+        let effective =
+            effective_subcall_usage(&subcall_req("Hello"), "relay-model", &reported, "reply");
+        assert_eq!(effective.usage.total_tokens, 26);
+        assert!(!effective.estimated);
+
+        let with_overhead = cache_inclusive_total(31, 7, 11, 5, 3);
+        assert_eq!(with_overhead, 31, "provider-reported overhead is preserved");
     }
 
     #[test]

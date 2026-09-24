@@ -3,7 +3,9 @@
 //! This endpoint proxies rerank requests to the upstream provider.
 //! The `model` field is resolved and authorised via the same path as
 //! chat completions. The body is forwarded verbatim after rewriting the
-//! `model` field to the upstream model name.
+//! `model` field to the upstream model name, and the response is relayed
+//! verbatim except for that same field, restamped back to the name the
+//! caller addressed (`model_echo`).
 //!
 //! Providers that support rerank natively (Cohere, Voyage, etc.) should
 //! be configured with a `base_url` pointing to their rerank endpoint root.
@@ -162,7 +164,13 @@ pub async fn rerank(
             // Skip on 200 without a recognisable usage field — avoids
             // attributing zero-everything noise rows when an
             // upstream returns a malformed / unsupported shape.
-            if let Some(usage) = success.usage {
+            let guardrail_attributed =
+                crate::usage_attr::has_guardrail_attribution(&audit, &success.monitor_hits);
+            if success.usage.is_some() || guardrail_attributed {
+                let usage = success
+                    .usage
+                    .as_ref()
+                    .unwrap_or(&RerankUsage { prompt_tokens: 0 });
                 emit_usage_event(
                     &state,
                     &snapshot,
@@ -176,7 +184,7 @@ pub async fn rerank(
                     &success.applied_guardrails,
                     status,
                     elapsed,
-                    &usage,
+                    usage,
                     &success.provider_request_id,
                     &client,
                     success.redactions.clone(),
@@ -220,15 +228,18 @@ pub async fn rerank(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
-                "rerank",
+                crate::operation::RERANK,
                 "openai",
                 &request_id,
                 &model_name,
                 &api_key_id,
                 status,
                 err.kind(),
+                err.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
+                crate::usage_attr::guardrail_scores(&audit),
+                crate::usage_attr::bypass_reason(&audit),
             );
             err.into_response()
         }
@@ -278,7 +289,7 @@ async fn dispatch(
     let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
-    if !auth.key().can_access(&model_name) {
+    if !auth.key().can_access(snapshot, &model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()));
     }
 
@@ -313,7 +324,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
@@ -323,8 +334,10 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/rerank request",
             );
-            return Err(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
             ));
         }
     }
@@ -472,7 +485,7 @@ async fn dispatch(
         ),
     );
 
-    let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
+    let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
     // Send, check the status, and read the body as one retryable unit, so a
     // transient fault anywhere in that sequence is retried rather than
     // surfacing to the caller. `note_failure` runs per attempt, matching
@@ -549,12 +562,14 @@ async fn dispatch(
     // forward raw bytes downstream — preserves any provider-specific
     // fields (Cohere `meta.api_version`, Jina-specific fields, etc.)
     // that the JSON round-trip would otherwise re-format. A parse
-    // failure here is non-fatal: we just skip emission rather than
-    // failing the request. Audit HIGH: log the parse failure so a
-    // silent billing gap is visible in operator dashboards (the
-    // upstream returned 200 + claimed JSON but the body was
-    // unparseable — this is upstream-malformed, not gateway-bug,
-    // but operators need to see it).
+    // failure here is non-fatal: the request still succeeds, and it
+    // still leaves a usage event whenever a guardrail attributed the
+    // request — only an unattributed one goes unrecorded, which is what
+    // keeps a zero-everything noise row off the ledger. Audit HIGH: log
+    // the parse failure so a silent billing gap is visible in operator
+    // dashboards (the upstream returned 200 + claimed JSON but the body
+    // was unparseable — this is upstream-malformed, not gateway-bug, but
+    // operators need to see it).
     let (usage, provider_request_id) = match serde_json::from_slice::<Value>(&body_bytes) {
         Ok(v) => (
             extract_rerank_usage(&v),
@@ -565,10 +580,28 @@ async fn dispatch(
                 request_id = %request_id,
                 model = %model_name,
                 error = %e,
-                "rerank: upstream body parse failed; skipping UsageEvent emission"
+                "rerank: upstream body parse failed; no usage counts to attribute"
             );
             (None, String::new())
         }
+    };
+
+    // #1087: echo the model name the CALLER addressed, not the id the
+    // upstream answered with (the `model_echo` contract). The request half
+    // already rewrote `model` to the upstream id, so without this the
+    // response half handed that id straight back. Among the supported
+    // rerank shapes only Jina's response names a model — Cohere's and the
+    // OpenAI-compatible one carry none, so this is a no-op there rather
+    // than inventing the field. Spliced rather than re-serialised so every
+    // other byte the provider wrote (relevance-score spellings included)
+    // still reaches the caller exactly as written.
+    let body_bytes = match crate::model_echo::restamp_json_bytes(
+        &body_bytes,
+        &model_name,
+        crate::model_echo::top_level_model,
+    ) {
+        Some(rewritten) => bytes::Bytes::from(rewritten),
+        None => body_bytes,
     };
 
     // Content capture (#700): the relayed response bytes are the JSON the
@@ -716,19 +749,26 @@ fn emit_usage_event(
         redacted_entity_counts,
         guardrail_monitor_hits,
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
+        guardrail_scores: crate::usage_attr::guardrail_scores(audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
         ..Default::default()
     };
     // Per-PK attribution tags (provider_kind / provider_featured /
     // branded_provider / pk_label / byo_label) ARE populated — same lookup as
     // chat / messages / responses / embeddings (AISIX-Cloud#867 parity).
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
-    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
+    crate::usage_attr::apply_caller_identity(
+        &mut event,
+        client.jwt.as_ref(),
+        client.caller.user_id.as_deref(),
+        client.caller.user_name.as_deref(),
+    );
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "rerank",
+        crate::operation::RERANK,
         event,
         crate::usage_attr::usage_event_labels(&usage_model, pk),
         content,
@@ -752,6 +792,10 @@ fn emit_usage_event(
             input: usage.prompt_tokens,
             output: 0,
             total: usage.prompt_tokens,
+            // No upstream on this surface reports prompt-cache detail.
+            cached: 0,
+            cache_read: 0,
+            cache_creation: 0,
             spend_usd: 0.0,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
@@ -804,13 +848,17 @@ fn emit_access_log(
         }
         None => (None, None),
     };
+    let target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method: "POST",
         path: "/v1/rerank",
         status,
         latency: elapsed,
+        duration: elapsed,
         provider: Some(provider),
         model: Some(model),
+        upstream_model: target.upstream_model(),
+        provider_key_id: target.provider_key_id(),
         api_key_id: Some(api_key_id),
         prompt_tokens: None,
         completion_tokens: None,
@@ -822,6 +870,8 @@ fn emit_access_log(
         routing_fallback_count: None,
         error_kind,
         error: error.as_deref(),
+        mcp: None,
+        cache: None,
     }
     .emit();
 }
@@ -848,6 +898,7 @@ mod tests {
             request_id: Default::default(),
             url_rewrites: Vec::new(),
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }
@@ -990,7 +1041,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(cohere_model("rr"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let app = build_app(snap);
         let resp = app
@@ -1026,7 +1077,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(cohere_model("rr"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let app = build_app(snap);
         let resp = app
@@ -1072,7 +1123,7 @@ mod tests {
         snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
         snap.models.insert(cohere_model("rr"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
         let app = build_app(snap);
 
         let resp = app
@@ -1524,7 +1575,7 @@ mod tests {
         snap.apikeys.insert(apikey_entry(&["*"]));
         // ALLOW guardrail: a literal the benign request below never matches, so
         // it governs the request (non-empty applied set) without blocking it.
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -1733,6 +1784,54 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn no_usage_response_still_emits_guardrail_attribution() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "rerank-bare",
+                "results": []
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(openai_model("rerank-openai"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = tower::ServiceExt::oneshot(
+            crate::build_router(state),
+            make_req(serde_json::json!({
+                "model": "rerank-openai",
+                "query": "build version: 9.9.9",
+                "documents": ["clean"]
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a guardrail decision is not token-accounting noise")
+            .expect("usage sink remains open");
+        assert_eq!(ev.prompt_tokens, 0);
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
+        assert_eq!(ev.applied_guardrails.len(), 1);
+    }
+
     /// Per #655 parity (was #405 negative pinning): an upstream 5xx now emits
     /// ONE zero-token UsageEvent so the failed /v1/rerank request is visible in
     /// Logs (status + error class), instead of being dropped. The 200-without-
@@ -1931,7 +2030,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(openai_model("rr"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(pii_mask_guardrail());
+        crate::seed_env_scoped_guardrail(&snap, pii_mask_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -1982,7 +2081,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(openai_model("rerank-model"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -2054,7 +2153,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(openai_model("rerank-model"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(masking_input_guardrail());
+        crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());

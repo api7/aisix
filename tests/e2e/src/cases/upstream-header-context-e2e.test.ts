@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -150,11 +151,16 @@ describe("upstream header context e2e: ${...} variables + client-header allowlis
       user_id: USER_ID,
       allowed_models: ["hdrctx-openai-model", "hdrctx-anthropic-model"],
     });
+    // Seeded last, so it authenticating implies every resource above is
+    // in the snapshot (tests/e2e/AGENTS.md). The spec asserts with BOTH
+    // keys, so the gate has to be the later of the two.
     await seed.createApiKey({
       key_hash: TEAMLESS_KEY_HASH,
       display_name: "teamless-key",
       allowed_models: ["hdrctx-openai-model"],
     });
+    const teamless = new ProxyClient(app.proxyUrl, TEAMLESS_PLAINTEXT);
+    await waitConfigPropagation(async () => (await teamless.listModels()).status === 200);
   });
 
   afterAll(async () => {
@@ -195,11 +201,6 @@ describe("upstream header context e2e: ${...} variables + client-header allowlis
         ctx.skip();
         return;
       }
-      await waitConfigPropagation(async () => {
-        const { status } = await chat(CALLER_PLAINTEXT, {});
-        return status === 200;
-      });
-
       const { status, sent } = await chat(CALLER_PLAINTEXT, {});
       expect(status).toBe(200);
       expect(sent).toHaveLength(1);

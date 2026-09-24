@@ -69,6 +69,11 @@ guardrails:
       - kind: literal
         value: topsecret
 
+guardrail_attachments:
+  - guardrail_id: no-secrets
+    scope_type: env
+    priority: 100
+
 mcp_servers:
   - name: github
     url: https://mcp.example.com/mcp
@@ -156,6 +161,7 @@ fn full_valid_file_loads_every_kind() {
     assert_eq!(snap.models.len(), 3);
     assert_eq!(snap.apikeys.len(), 2);
     assert_eq!(snap.guardrails.len(), 1);
+    assert_eq!(snap.guardrail_attachments.len(), 1);
     assert_eq!(snap.mcp_servers.len(), 1);
     assert_eq!(snap.a2a_agents.len(), 1);
     assert_eq!(snap.cache_policies.len(), 1);
@@ -166,7 +172,10 @@ fn full_valid_file_loads_every_kind() {
 
     // The OIDC provider loads with serde defaults filled.
     let idp = snap.oidc_providers.get_by_name("corp-keycloak").unwrap();
-    assert_eq!(idp.value.issuer, "https://sso.example.com/realms/agents");
+    assert_eq!(
+        idp.value.issuer.as_deref(),
+        Some("https://sso.example.com/realms/agents")
+    );
     assert_eq!(idp.value.identity_claim, "sub");
     assert!(idp.value.enabled);
 
@@ -435,6 +444,434 @@ models:
     for e in &errs {
         assert!(e.contains("does not accept `id`"), "{errs:?}");
     }
+}
+
+#[test]
+fn pricing_key_is_rejected_by_the_file_source() {
+    // The reference names a document only the control plane writes, and
+    // the shared catalog is not even under the prefix a standalone
+    // gateway reads. A file that carried it would leave the model with no
+    // price at all — silently, with `cost` the only thing that could have
+    // supplied one.
+    let contents = r#"
+_format_version: "1"
+models:
+  - display_name: m
+    provider: openai
+    model_name: x
+    provider_key: pk
+    pricing_key: openai/x
+provider_keys:
+  - display_name: pk
+    api_key: sk-x
+"#;
+    let env = env_of(&[]);
+    let errs = errors_of(load(contents, &env));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("does not accept `pricing_key`") && errs[0].contains("cost"),
+        "{errs:?}"
+    );
+
+    // The same file without the field loads, so the rejection is the
+    // field and not anything else in the fixture.
+    let ok = contents.replace("    pricing_key: openai/x\n", "");
+    load(&ok, &env).expect("the same file without the field loads");
+}
+
+#[test]
+fn a_pricing_collection_is_rejected_by_the_file_source() {
+    // Named rather than swept into the generic unknown-key error: it is a
+    // real collection the gateway loads from etcd, so "unknown top-level
+    // key" would read as a typo rather than as the answer it is.
+    let contents = r#"
+_format_version: "1"
+pricing:
+  - key: openai/x
+    input_per_1k: 1.0
+    output_per_1k: 2.0
+provider_keys:
+  - display_name: pk
+    api_key: sk-x
+"#;
+    let env = env_of(&[]);
+    let errs = errors_of(load(contents, &env));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("does not accept a `pricing` collection") && errs[0].contains("cost"),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn allowed_model_ids_is_rejected_by_the_file_source() {
+    // A file's ids are derived from entry names, so no id written here
+    // resolves to a model — the key would silently grant nothing, with
+    // `allowed_models` ignored on top of that. Fail loudly instead.
+    let contents = r#"
+_format_version: "1"
+models:
+  - display_name: m
+    provider: openai
+    model_name: x
+    provider_key: pk
+provider_keys:
+  - display_name: pk
+    api_key: sk-x
+api_keys:
+  - display_name: k
+    key_env: CALLER_KEY
+    allowed_models: ["m"]
+    allowed_model_ids: ["11111111-1111-1111-1111-111111111111"]
+"#;
+    let env = env_of(&[("CALLER_KEY", "sk-caller")]);
+    let errs = errors_of(load(contents, &env));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("does not accept `allowed_model_ids`")
+            && errs[0].contains("allowed_models"),
+        "{errs:?}"
+    );
+
+    // The same file without the field loads, so the rejection is the
+    // field and not anything else in the fixture.
+    let ok = contents.replace(
+        "    allowed_model_ids: [\"11111111-1111-1111-1111-111111111111\"]\n",
+        "",
+    );
+    load(&ok, &env).expect("the same file without the field loads");
+}
+
+/// The MCP server references with an id spelling are refused the same way,
+/// each at the nesting site it appears at. Each is asserted twice: once
+/// with the id field (one error naming it and the name-form field that
+/// replaces it) and once without (the file loads), so the rejection is
+/// pinned to the field rather than to anything else in the fixture.
+#[test]
+fn mcp_server_reference_ids_are_rejected_by_the_file_source() {
+    const PRELUDE: &str = r#"
+_format_version: "1"
+mcp_servers:
+  - name: github
+    url: https://example.test/mcp
+api_keys:
+  - display_name: k
+    key_env: CALLER_KEY
+    allowed_models: []
+"#;
+    // (id-form line, the dotted path the error names, the name-form field)
+    let cases = [
+        (
+            "    mcp_rate_limits_by_id:\n      \"11111111-1111-1111-1111-111111111111\": {rpm: 1}\n",
+            "mcp_rate_limits_by_id",
+            "mcp_rate_limits",
+        ),
+        (
+            "    mcp_access:\n      allow: []\n      allow_ids: [{server_id: \"s-1\", tool: \"*\"}]\n",
+            "mcp_access.allow_ids",
+            "allow",
+        ),
+        (
+            "    mcp_access:\n      allow: [\"*\"]\n      deny_ids: [{server_id: \"s-1\", tool: \"x\"}]\n",
+            "mcp_access.deny_ids",
+            "deny",
+        ),
+    ];
+    let env = env_of(&[("CALLER_KEY", "sk-caller")]);
+    for (line, path, name_field) in cases {
+        let contents = format!("{PRELUDE}{line}");
+        let errs = errors_of(load(&contents, &env));
+        assert_eq!(errs.len(), 1, "{path}: {errs:?}");
+        assert!(
+            errs[0].contains(&format!("does not accept `{path}`")) && errs[0].contains(name_field),
+            "{path}: {errs:?}"
+        );
+
+        load(PRELUDE, &env).expect("the same file without the field loads");
+    }
+}
+
+/// The anonymous ceiling's id spelling is refused too, for the same
+/// reason: a file registers its MCP servers by name and derives their ids
+/// from those names, so a control-plane id written here resolves to
+/// nothing — the ceiling would admit no server while the name spelling
+/// beside it went unread.
+#[test]
+fn the_anonymous_ceiling_server_ids_are_rejected_by_the_file_source() {
+    const PRELUDE: &str = r#"
+_format_version: "1"
+mcp_servers:
+  - name: github
+    url: https://example.test/mcp
+api_keys:
+  - display_name: k
+    key_env: CALLER_KEY
+    allowed_models: []
+mcp_auth_settings:
+  - anonymous:
+      api_key_id: k
+      source_cidrs: ["10.0.0.0/8"]
+      servers: ["github"]
+"#;
+    let env = env_of(&[("CALLER_KEY", "sk-caller")]);
+    let contents =
+        format!("{PRELUDE}      server_ids: [\"11111111-1111-1111-1111-111111111111\"]\n");
+    let errs = errors_of(load(&contents, &env));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("does not accept `anonymous.server_ids`") && errs[0].contains("servers"),
+        "{errs:?}"
+    );
+
+    load(PRELUDE, &env).expect("the same file without the field loads");
+}
+
+/// Every other id-form model reference is refused the same way, at every
+/// nesting site it can appear. Each fixture is asserted twice: once with
+/// the id field (one error naming it and the name-form field that
+/// replaces it) and once without (the file loads), so the rejection is
+/// pinned to the field rather than to anything else in the fixture.
+#[test]
+fn model_reference_ids_are_rejected_by_the_file_source() {
+    const PRELUDE: &str = r#"
+_format_version: "1"
+provider_keys:
+  - display_name: pk
+    api_key: sk-x
+models:
+  - display_name: m
+    provider: openai
+    model_name: x
+    provider_key: pk
+  - display_name: e
+    provider: openai
+    model_name: x
+    provider_key: pk
+    embedding:
+      dimensions: 4
+"#;
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "routing target",
+            "model_id",
+            r#"
+  - display_name: group
+    routing:
+      targets:
+        - model: m
+          model_id: 11111111-1111-1111-1111-111111111111
+"#,
+        ),
+        (
+            "ensemble panel member",
+            "model_id",
+            r#"
+  - display_name: panel
+    ensemble:
+      panel:
+        - model: m
+          model_id: 11111111-1111-1111-1111-111111111111
+      judge:
+        model: m
+"#,
+        ),
+        (
+            "ensemble judge",
+            "model_id",
+            r#"
+  - display_name: judged
+    ensemble:
+      panel:
+        - model: m
+      judge:
+        model: m
+        model_id: 11111111-1111-1111-1111-111111111111
+"#,
+        ),
+        (
+            "semantic embedding model",
+            "embedding_model_id",
+            r#"
+  - display_name: router
+    semantic:
+      embedding_model: e
+      embedding_model_id: 11111111-1111-1111-1111-111111111111
+      routes:
+        - name: r
+          target: m
+          examples: ["hi"]
+      default: m
+      match:
+        threshold: 0.5
+"#,
+        ),
+        (
+            "semantic default",
+            "default_id",
+            r#"
+  - display_name: router
+    semantic:
+      embedding_model: e
+      routes:
+        - name: r
+          target: m
+          examples: ["hi"]
+      default: m
+      default_id: 11111111-1111-1111-1111-111111111111
+      match:
+        threshold: 0.5
+"#,
+        ),
+        (
+            "semantic route target",
+            "target_id",
+            r#"
+  - display_name: router
+    semantic:
+      embedding_model: e
+      routes:
+        - name: r
+          target: m
+          target_id: 11111111-1111-1111-1111-111111111111
+          examples: ["hi"]
+      default: m
+      match:
+        threshold: 0.5
+"#,
+        ),
+        (
+            "semantic on_embedding_failure target",
+            "target_id",
+            r#"
+  - display_name: router
+    semantic:
+      embedding_model: e
+      routes:
+        - name: r
+          target: m
+          examples: ["hi"]
+      default: m
+      match:
+        threshold: 0.5
+      on_embedding_failure:
+        target: m
+        target_id: 11111111-1111-1111-1111-111111111111
+"#,
+        ),
+    ];
+
+    for (label, field, fragment) in cases {
+        let contents = format!("{PRELUDE}{fragment}");
+        let errs = errors_of(load(&contents, &env_of(&[])));
+        assert_eq!(errs.len(), 1, "{label}: {errs:?}");
+        assert!(
+            errs[0].contains(&format!("does not accept `{field}`")),
+            "{label}: {errs:?}"
+        );
+        let without = contents.replace(
+            &format!("          {field}: 11111111-1111-1111-1111-111111111111\n"),
+            "",
+        );
+        let without = without.replace(
+            &format!("      {field}: 11111111-1111-1111-1111-111111111111\n"),
+            "",
+        );
+        let without = without.replace(
+            &format!("        {field}: 11111111-1111-1111-1111-111111111111\n"),
+            "",
+        );
+        assert_ne!(without, contents, "{label}: fixture edit did not apply");
+        load(&without, &env_of(&[]))
+            .unwrap_or_else(|e| panic!("{label}: the same file without the field loads: {e:?}"));
+    }
+}
+
+#[test]
+fn cache_policy_and_guardrail_model_reference_ids_are_rejected() {
+    let with_scope = r#"
+_format_version: "1"
+cache_policies:
+  - name: p
+    applies_to: all
+    applies_to_model_id: 11111111-1111-1111-1111-111111111111
+"#;
+    let errs = errors_of(load(with_scope, &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("does not accept `applies_to_model_id`") && errs[0].contains("applies_to"),
+        "{errs:?}"
+    );
+
+    let with_cache_embedder = r#"
+_format_version: "1"
+provider_keys:
+  - display_name: pk
+    api_key: sk-x
+models:
+  - display_name: e
+    provider: openai
+    model_name: x
+    provider_key: pk
+    embedding:
+      dimensions: 4
+cache_policies:
+  - name: p
+    semantic:
+      embedding_model: e
+      embedding_model_id: 11111111-1111-1111-1111-111111111111
+      threshold: 0.9
+"#;
+    let errs = errors_of(load(with_cache_embedder, &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("does not accept `embedding_model_id`"),
+        "{errs:?}"
+    );
+    let without = with_cache_embedder.replace(
+        "      embedding_model_id: 11111111-1111-1111-1111-111111111111\n",
+        "",
+    );
+    load(&without, &env_of(&[])).expect("the same file without the field loads");
+
+    let with_guardrail_embedder = r#"
+_format_version: "1"
+guardrails:
+  - name: g
+    kind: semantic
+    embedding_model: e
+    embedding_model_id: 11111111-1111-1111-1111-111111111111
+    deny_examples: ["x"]
+    deny_threshold: 0.8
+"#;
+    let errs = errors_of(load(with_guardrail_embedder, &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("does not accept `embedding_model_id`"),
+        "{errs:?}"
+    );
+    let without = with_guardrail_embedder.replace(
+        "    embedding_model_id: 11111111-1111-1111-1111-111111111111\n",
+        "",
+    );
+    load(&without, &env_of(&[])).expect("the same file without the field loads");
+}
+
+/// A guardrail's operator-keyed maps are NOT model references: a
+/// `kind: custom` row may name a script secret anything, including a
+/// string the refusal list happens to contain, and refusing it would make
+/// a valid file unloadable.
+#[test]
+fn an_operator_keyed_secret_named_like_a_model_reference_still_loads() {
+    let contents = r#"
+_format_version: "1"
+guardrails:
+  - name: g
+    kind: custom
+    script: "export function input(ctx) { return { action: 'allow' }; }"
+    secrets:
+      embedding_model_id: shhh
+"#;
+    load(contents, &env_of(&[])).expect("an operator-named secret is not a model reference");
 }
 
 #[test]
@@ -995,4 +1432,254 @@ claim_mappings:
     let errors = errors_of(load(&file, &env_of(&[])));
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("match"), "{errors:?}");
+}
+
+/// A guardrail's scope comes only from its attachments, so the file source
+/// needs the same collection the control plane projects (AISIX-Cloud#1450).
+/// References are written as the names the file already uses and resolved to
+/// derived ids, the way `scope_ref` and `provider_key` are.
+#[test]
+fn guardrail_attachment_resolves_its_references_by_name() {
+    const FILE: &str = r#"
+_format_version: "1"
+
+provider_keys:
+  - display_name: openai-prod
+    provider: openai
+    api_key: sk-test
+
+models:
+  - display_name: gpt-4o
+    provider: openai
+    model_name: gpt-4o-2024-11-20
+    provider_key: openai-prod
+
+guardrails:
+  - name: no-secrets
+    kind: keyword
+    patterns:
+      - kind: literal
+        value: topsecret
+
+guardrail_attachments:
+  - guardrail_id: no-secrets
+    scope_type: model
+    scope_id: gpt-4o
+    priority: 100
+"#;
+    let snap = load(FILE, &HashMap::new()).expect("file must load");
+    assert_eq!(snap.guardrail_attachments.len(), 1);
+
+    let attachment = &snap.guardrail_attachments.entries()[0].value;
+    assert_eq!(
+        attachment.guardrail_id,
+        snap.guardrails.get_by_name("no-secrets").unwrap().id,
+        "guardrail_id must resolve to the guardrail's derived id",
+    );
+    assert_eq!(
+        attachment.scope_id.as_deref(),
+        Some(snap.models.get_by_name("gpt-4o").unwrap().id.as_str()),
+        "scope_id must resolve to the model's derived id",
+    );
+}
+
+/// The reference has to be checked, not silently carried: an attachment
+/// naming a guardrail that is not in the file would load as a scope pointing
+/// at nothing, which is precisely the state that used to be indistinguishable
+/// from "unscoped".
+#[test]
+fn guardrail_attachment_referencing_an_unknown_guardrail_is_a_load_error() {
+    const FILE: &str = r#"
+_format_version: "1"
+
+guardrail_attachments:
+  - guardrail_id: does-not-exist
+    scope_type: env
+    priority: 100
+"#;
+    let errs = errors_of(load(FILE, &HashMap::new()));
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("`guardrail_id` references unknown guardrail")),
+        "unknown guardrail must be named in the error: {errs:?}",
+    );
+}
+
+/// Same triple twice is the control plane's uniqueness constraint, so it is
+/// the file's duplicate too.
+#[test]
+fn attaching_the_same_guardrail_to_the_same_scope_twice_is_a_load_error() {
+    const FILE: &str = r#"
+_format_version: "1"
+
+guardrails:
+  - name: no-secrets
+    kind: keyword
+    patterns:
+      - kind: literal
+        value: topsecret
+
+guardrail_attachments:
+  - guardrail_id: no-secrets
+    scope_type: env
+    priority: 100
+  - guardrail_id: no-secrets
+    scope_type: env
+    priority: 50
+"#;
+    let errs = errors_of(load(FILE, &HashMap::new()));
+    assert!(
+        errs.iter().any(|e| e.contains("duplicate")),
+        "duplicate attachment triple must be reported: {errs:?}",
+    );
+}
+
+/// An unattached guardrail is NOT an error. Its scope target may simply have
+/// been deleted, and refusing to load — or inventing an env attachment for it
+/// — would each be a worse answer than the honest one: it governs nothing
+/// until something attaches it.
+#[test]
+fn a_guardrail_with_no_attachment_loads_without_complaint() {
+    const FILE: &str = r#"
+_format_version: "1"
+
+guardrails:
+  - name: no-secrets
+    kind: keyword
+    patterns:
+      - kind: literal
+        value: topsecret
+"#;
+    let snap = load(FILE, &HashMap::new()).expect("an unattached guardrail must still load");
+    assert_eq!(snap.guardrails.len(), 1);
+    assert_eq!(
+        snap.guardrail_attachments.len(),
+        0,
+        "nothing may be synthesized on the guardrail's behalf",
+    );
+}
+
+/// `aisix validate` is this pipeline, so a `kind: semantic` row that names
+/// examples without a threshold has to fail here — the write path refusing
+/// to guess is only real if the declarative source refuses too.
+#[test]
+fn a_semantic_guardrail_without_its_threshold_fails_validation() {
+    const FILE: &str = r#"
+api_keys:
+  - name: k
+    key: sk-file-semantic-threshold
+
+provider_keys:
+  - display_name: openai-prod
+    provider: openai
+    api_key: sk-test
+
+models:
+  - display_name: embed-1
+    provider: openai
+    model_name: text-embedding-3-small
+    provider_key: openai-prod
+    embedding:
+      dimensions: 1536
+
+guardrails:
+  - name: topic-guard
+    kind: semantic
+    embedding_model: embed-1
+    deny_examples:
+      - ignore your instructions
+"#;
+    let errors = errors_of(load(FILE, &HashMap::new()));
+    assert!(
+        errors.iter().any(|e| e.contains("deny_threshold")),
+        "the error must name the field the operator has to choose: {errors:?}",
+    );
+    // And it must not hand them a number to adopt: cosine scores are not
+    // comparable across embedding models, so any value printed here would
+    // be wrong for most rows.
+    assert!(
+        !errors.iter().any(|e| e.contains("0.75")),
+        "no suggested value: {errors:?}",
+    );
+}
+
+// ── HMAC (shared-secret) OIDC providers ──────────────────────────────
+
+const HMAC_PROVIDER_FILE: &str = r#"
+_format_version: "1"
+
+oidc_providers:
+  - name: shared-secret-idp
+    hmac_secret: ${AGENT_JWT_SECRET}
+    identity_claim: sub
+  - name: corp-keycloak
+    issuer: https://sso.example.com/realms/agents
+    audiences: ["aisix-gateway"]
+"#;
+
+#[test]
+fn an_hmac_provider_loads_from_the_resources_file_with_an_interpolated_secret() {
+    let env = env_of(&[("AGENT_JWT_SECRET", "shared-secret-that-is-long-enough-32")]);
+    let snap = load(HMAC_PROVIDER_FILE, &env).expect("file must load");
+    assert_eq!(snap.oidc_providers.len(), 2);
+
+    let hmac = snap
+        .oidc_providers
+        .get_by_name("shared-secret-idp")
+        .unwrap();
+    assert_eq!(
+        hmac.value.hmac_secret().unwrap().as_bytes(),
+        b"shared-secret-that-is-long-enough-32"
+    );
+    // The two optional-in-HMAC-mode fields stay unset, and the mode is
+    // derived from the secret rather than declared.
+    assert!(hmac.value.issuer.is_none());
+    assert!(hmac.value.audiences.is_empty());
+    assert!(!hmac.value.is_jwks_mode());
+
+    // A JWKS provider in the same file is unaffected.
+    let jwks = snap.oidc_providers.get_by_name("corp-keycloak").unwrap();
+    assert!(jwks.value.is_jwks_mode());
+    assert!(jwks.value.hmac_secret().is_none());
+}
+
+#[test]
+fn the_file_source_rejects_every_semantically_invalid_provider_shape() {
+    let env = env_of(&[]);
+    let secret = "shared-secret-that-is-long-enough-32";
+    for (yaml, expected) in [
+        (
+            format!("hmac_secret: {secret}\n    jwks_uri: https://x/jwks"),
+            "`jwks_uri` must be absent",
+        ),
+        ("audiences: [\"aisix\"]".to_string(), "`issuer` is required"),
+        (
+            "issuer: https://idp.test".to_string(),
+            "`audiences` is required",
+        ),
+        ("hmac_secret: too-short".to_string(), "at least 32 bytes"),
+    ] {
+        let file = format!("_format_version: \"1\"\n\noidc_providers:\n  - name: p\n    {yaml}\n");
+        let errors = errors_of(load(&file, &env));
+        assert!(
+            errors.iter().any(|e| e.contains(expected)),
+            "expected {expected:?} in {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn two_issuerless_providers_are_not_a_duplicate_issuer() {
+    // The duplicate-issuer check must not collapse providers that pin no
+    // issuer at all: a token reaches those by trial in name order, which
+    // is already a total order, so they are not ambiguous.
+    let env = env_of(&[]);
+    let secret = "shared-secret-that-is-long-enough-32";
+    let file = format!(
+        "_format_version: \"1\"\n\noidc_providers:\n  \
+         - name: a\n    hmac_secret: {secret}\n  \
+         - name: b\n    hmac_secret: {secret}\n"
+    );
+    let snap = load(&file, &env).expect("file must load");
+    assert_eq!(snap.oidc_providers.len(), 2);
 }

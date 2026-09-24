@@ -16,20 +16,15 @@ The **Surface** column shows where a capability lands: **Gateway** is the AISIX 
 
 | Capability | What's planned | Surface |
 | --- | --- | --- |
-| MCP governance in Cloud | Manage registered MCP servers, per-tool access, and per-server usage from the dashboard and Cloud Admin API. The gateway-side MCP surface already ships. | Cloud |
 | Enterprise SSO | Single sign-on through SAML and generic OIDC, beyond today's social logins. | Cloud |
-| Directory sync (SCIM) | Provision and deprovision users and groups from your identity provider. | Cloud |
 | Service accounts | Login-less, first-class principals for automated callers. | Cloud |
-| Semantic caching | Serve responses for prompts close in meaning, on top of today's exact-match cache. | Gateway |
 
 ## Next
 
 | Capability | What's planned | Surface |
 | --- | --- | --- |
-| Fine-grained authorization | Custom roles with per-resource and per-action permissions, beyond today's fixed roles and read/write scopes. | Cloud |
-| Conditional and wildcard routing | Route on request metadata, headers, and tags, and match upstreams by wildcard names such as `provider/*`. | Gateway |
 | Prompt management | Store, version, and reuse prompt templates with variables, resolved at the gateway. | Gateway · Cloud |
-| Caller key rotation experience | Self-service key rotation in the dashboard, plus scheduled auto-rotation with a grace overlap. | Cloud |
+| Scheduled key rotation | Scheduled auto-rotation of caller keys with a grace overlap, on top of today's manual rotation. | Cloud |
 | Production-path playground | Run the Cloud playground through a connected AISIX gateway so it reflects real routing, caching, guardrails, and rate limiting. | Cloud |
 | Cross-provider endpoint parity | Consistent embeddings, image generation, and Responses behavior across more providers. | Gateway |
 
@@ -38,7 +33,7 @@ The **Surface** column shows where a capability lands: **Gateway** is the AISIX 
 | Capability | What's planned | Surface |
 | --- | --- | --- |
 | External secret management | Manage provider and API credentials through external KMS and secret stores such as Vault. | Gateway · Cloud |
-| Expanded observability export | OTLP export for metrics and logs, alerting integrations such as Slack and PagerDuty, and first-party data-warehouse sinks. | Gateway · Cloud |
+| Expanded observability export | OTLP export for metrics and logs, and alerting integrations such as Slack and PagerDuty. | Gateway · Cloud |
 | Metered usage billing | Usage-based billing in addition to subscription plans. | Cloud |
 | SDKs and agent-framework integrations | First-party SDKs and integrations with common agent frameworks. | Gateway · Cloud |
 

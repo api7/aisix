@@ -20,6 +20,7 @@
 //! - elapsed deadline → `BridgeError::Timeout { elapsed_ms }`
 
 use aisix_core::{RequestOverrides, ResponseOverrides, StreamDoneMarker};
+use aisix_gateway::structured_output::close_object_schemas;
 use aisix_gateway::url_cache::cached_endpoint_url;
 use aisix_gateway::{
     apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
@@ -100,11 +101,12 @@ impl OpenAiBridge {
     }
 
     /// The client this dispatch runs on: the bridge's shared one, unless
-    /// the resolved Provider Key carries its own TLS settings.
+    /// the resolved Provider Key carries its own connection overrides
+    /// (TLS trust settings, a name-resolution address).
     fn client_for(&self, ctx: &BridgeContext) -> Client {
         aisix_gateway::upstream_tls::client_for_provider_key(
             &self.client,
-            ctx.provider_key.tls.as_ref(),
+            ctx.provider_key.upstream_connection().as_ref(),
         )
     }
 
@@ -178,7 +180,6 @@ impl Default for OpenAiBridge {
 
 fn default_client() -> Client {
     aisix_gateway::client_builder()
-        .user_agent("aisix/0.1")
         .build()
         .unwrap_or_else(|_| Client::new())
 }
@@ -332,6 +333,7 @@ fn prepare_outbound_body<T: serde::Serialize>(
 ) -> Result<Value, BridgeError> {
     let mut body = serde_json::to_value(typed)
         .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
+    close_strict_response_format_schema(&mut body);
     if let Some(r) = request {
         apply_param_renames(&mut body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
@@ -345,14 +347,43 @@ fn prepare_outbound_body<T: serde::Serialize>(
     Ok(body)
 }
 
+/// Apply OpenAI strict mode's schema rule at the edge that declares it:
+/// when `response_format.json_schema.strict` is true, every object in
+/// the schema must carry `additionalProperties: false` and list each of
+/// its declared properties in `required`, or the API rejects it.
+///
+/// Public because every OpenAI-wire edge has to apply it — Azure
+/// OpenAI builds its own body from the same typed structs, and an
+/// edge that skips this rejects a strict schema the caller never had
+/// to write out in full.
+///
+/// This lives here rather than wherever the `response_format` was
+/// assembled because the promotion is only correct for *this* wire. The
+/// same normalised request also reaches the Anthropic, Bedrock and
+/// Gemini edges, and there `required` is an ordinary keyword whose
+/// contents are the caller's own statement — promoting it would silently
+/// make their optional fields mandatory. A caller who sent `strict`
+/// themselves gets the same treatment they would have got from OpenAI's
+/// own validation, so a schema that was already complete is unchanged.
+pub fn close_strict_response_format_schema(body: &mut Value) {
+    let Some(json_schema) = body.pointer_mut("/response_format/json_schema") else {
+        return;
+    };
+    if json_schema.get("strict").and_then(|s| s.as_bool()) != Some(true) {
+        return;
+    }
+    if let Some(schema) = json_schema.get_mut("schema") {
+        close_object_schemas(schema);
+    }
+}
+
 /// Build the base outbound `HeaderMap` (Authorization, Content-Type,
 /// x-aisix-request-id, and optionally Accept: text/event-stream
 /// for streaming calls), then merge any `default_headers` the PK carries.
-/// Bridge-owned headers are inserted before the merge so
-/// [`apply_request_headers`] cannot overwrite them — its skip-if-present
-/// rule plus `RESERVED_UPSTREAM_HEADERS` gives two layers of defense
-/// against an operator-supplied `default_headers` entry (or a forwarded
-/// client header) clobbering auth.
+/// Bridge-owned headers are inserted before the merge, which is what makes
+/// a `default_headers` entry unable to displace them — that merge is
+/// skip-if-present. A FORWARDED client header does displace the credential,
+/// deliberately: see [`apply_request_headers`].
 ///
 /// The previous `bridge_name` parameter + `X-Aisix-Bridge` outbound
 /// header was removed in AISIX-Cloud#468: after the Phase A clean
@@ -399,6 +430,10 @@ fn build_request_headers(
 impl Bridge for OpenAiBridge {
     fn name(&self) -> &'static str {
         "openai"
+    }
+
+    fn wire_protocol(&self) -> &'static str {
+        aisix_core::Adapter::Openai.wire_protocol()
     }
 
     async fn chat(
@@ -793,6 +828,104 @@ fn parse_stream_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── strict structured outputs at the OpenAI edge ──────────────────
+
+    /// The exact `response_format` an Anthropic-shaped `/v1/messages`
+    /// request used to put on the OpenAI wire, when the strict closing
+    /// still happened during the inbound translation. The closing moved
+    /// here so the Anthropic, Bedrock and Gemini edges stop inheriting
+    /// it; this pins that the OpenAI body did not move with it.
+    #[test]
+    fn a_translated_messages_request_reaches_openai_byte_for_byte_as_before() {
+        use aisix_gateway::{ChatFormat, ChatMessage};
+        use aisix_provider_anthropic::wire::translate_extras_to_openai_shape;
+
+        // What the `/v1/messages` caller sent.
+        let mut extra = serde_json::json!({
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {"high": {"type": "number"}},
+                                },
+                            },
+                        },
+                    },
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        translate_extras_to_openai_shape(&mut extra, aisix_core::MappedEffort::AsWritten);
+
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("weather?")]);
+        req.extra = extra;
+        let messages = messages_from(&req);
+        let typed = build_request(&req, "gpt-4o", &messages, false);
+        let body = prepare_outbound_body(&typed, None, None).unwrap();
+
+        assert_eq!(
+            body["response_format"],
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "structured_output",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["city", "days"],
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["high"],
+                                    "properties": {"high": {"type": "number"}},
+                                },
+                            },
+                        },
+                    },
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_response_format_that_is_not_strict_reaches_openai_untouched() {
+        use aisix_gateway::{ChatFormat, ChatMessage};
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+            "required": ["a"],
+        });
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        req.extra.insert(
+            "response_format".into(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "schema": schema, "strict": false},
+            }),
+        );
+        let messages = messages_from(&req);
+        let typed = build_request(&req, "gpt-4o", &messages, false);
+        let body = prepare_outbound_body(&typed, None, None).unwrap();
+        // Not strict: the caller's `required` is theirs, and OpenAI does
+        // not demand the closing.
+        assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
+    }
     use aisix_core::{Model, ProviderKey};
     use aisix_gateway::{ChatMessage, FinishReason, Role};
     use std::sync::Arc;

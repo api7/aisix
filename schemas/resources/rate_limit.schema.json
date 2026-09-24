@@ -1,71 +1,71 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "RateLimit",
-  "type": "object",
+  "additionalProperties": false,
   "properties": {
     "concurrency": {
       "description": "Max concurrent in-flight requests.",
+      "format": "uint32",
+      "minimum": 0.0,
       "type": [
         "integer",
         "null"
-      ],
-      "format": "uint32",
-      "minimum": 0.0
+      ]
     },
     "rpd": {
       "description": "Requests per 86,400-second window.",
+      "format": "uint64",
+      "minimum": 0.0,
       "type": [
         "integer",
         "null"
-      ],
-      "format": "uint64",
-      "minimum": 0.0
+      ]
     },
     "rph": {
       "description": "Requests per 3,600-second window. There is no per-hour token limit field.",
+      "format": "uint64",
+      "minimum": 0.0,
       "type": [
         "integer",
         "null"
-      ],
-      "format": "uint64",
-      "minimum": 0.0
+      ]
     },
     "rpm": {
       "description": "Requests per 60-second window.",
+      "format": "uint64",
+      "minimum": 0.0,
       "type": [
         "integer",
         "null"
-      ],
-      "format": "uint64",
-      "minimum": 0.0
+      ]
     },
     "rps": {
       "description": "Requests per 1-second window. There is no per-second token limit field.",
+      "format": "uint64",
+      "minimum": 0.0,
       "type": [
         "integer",
         "null"
-      ],
-      "format": "uint64",
-      "minimum": 0.0
+      ]
     },
     "tpd": {
       "description": "Tokens per 86,400-second window.",
+      "format": "uint64",
+      "minimum": 0.0,
       "type": [
         "integer",
         "null"
-      ],
-      "format": "uint64",
-      "minimum": 0.0
+      ]
     },
     "tpm": {
       "description": "Tokens per 60-second window.",
+      "format": "uint64",
+      "minimum": 0.0,
       "type": [
         "integer",
         "null"
-      ],
-      "format": "uint64",
-      "minimum": 0.0
+      ]
     }
   },
-  "additionalProperties": false
+  "title": "RateLimit",
+  "type": "object"
 }

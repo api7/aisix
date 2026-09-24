@@ -29,6 +29,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use aisix_core::models::GuardrailInputMessages;
 use aisix_core::AppliedGuardrail;
 
 use crate::{Guardrail, GuardrailChain};
@@ -59,6 +60,10 @@ pub(crate) struct IndexEntry {
     /// Higher = higher precedence. Entries are pre-sorted descending.
     priority: i32,
     guardrail: Arc<dyn Guardrail>,
+    /// The row's `input_messages`, carried onto the resolved chain so a
+    /// `latest_turn` rule is handed only the part of the conversation the
+    /// model has not answered yet.
+    input_messages: GuardrailInputMessages,
     /// The `{kind, hook}` of this entry's guardrail, captured at index-build
     /// time (the only place the domain row's `kind` + `hook_point` are in
     /// scope). `resolve` collects these from the entries it keeps so the
@@ -185,7 +190,7 @@ impl GuardrailIndex {
     /// Complexity: O(n) in the number of attachment entries.
     pub fn resolve(&self, ctx: &RequestContext<'_>) -> GuardrailChain {
         let mut seen: HashSet<&str> = HashSet::new();
-        let mut chain: Vec<(String, Arc<dyn Guardrail>)> = Vec::new();
+        let mut chain: Vec<(String, Arc<dyn Guardrail>, GuardrailInputMessages)> = Vec::new();
         // `applied` mirrors `chain` 1:1 — the `{kind, hook}` of each member
         // we keep, for applied-guardrail telemetry (#379). Pushed on the same
         // (matched + not-deduplicated) path so it never drifts from `chain`.
@@ -199,7 +204,11 @@ impl GuardrailIndex {
                 continue;
             }
             seen.insert(entry.guardrail_id.as_str());
-            chain.push((entry.guardrail_name.clone(), Arc::clone(&entry.guardrail)));
+            chain.push((
+                entry.guardrail_name.clone(),
+                Arc::clone(&entry.guardrail),
+                entry.input_messages,
+            ));
             applied.push(entry.applied.clone());
         }
 
@@ -212,6 +221,7 @@ impl GuardrailIndex {
 // ---------------------------------------------------------------------------
 
 impl GuardrailIndex {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn push_entry(
         guardrail_id: impl Into<String>,
         guardrail_name: impl Into<String>,
@@ -219,6 +229,7 @@ impl GuardrailIndex {
         scope_id: Option<String>,
         priority: i32,
         guardrail: Arc<dyn Guardrail>,
+        input_messages: GuardrailInputMessages,
         applied: AppliedGuardrail,
     ) -> IndexEntry {
         IndexEntry {
@@ -228,12 +239,35 @@ impl GuardrailIndex {
             scope_id,
             priority,
             guardrail,
+            input_messages,
             applied,
         }
     }
 
     pub(crate) fn from_entries(entries: Vec<IndexEntry>) -> Self {
         Self::new(entries)
+    }
+
+    /// The runtime instance behind the first entry for `guardrail_id`.
+    /// Instance identity is what proves a row was, or was not,
+    /// reconstructed across an index rebuild.
+    #[cfg(test)]
+    pub(crate) fn instance_for(&self, guardrail_id: &str) -> Option<&Arc<dyn Guardrail>> {
+        self.entries
+            .iter()
+            .find(|e| e.guardrail_id == guardrail_id)
+            .map(|e| &e.guardrail)
+    }
+
+    /// One entry per attachment, so a guardrail with several attachments
+    /// appears several times — deliberately: sharing ONE instance across
+    /// them is the property under test.
+    #[cfg(test)]
+    pub(crate) fn instances(&self) -> Vec<Arc<dyn Guardrail>> {
+        self.entries
+            .iter()
+            .map(|e| Arc::clone(&e.guardrail))
+            .collect()
     }
 }
 
@@ -246,7 +280,7 @@ mod tests {
     use super::*;
     use crate::{GuardrailVerdict, KeywordBlocklist, KeywordRule};
     use aisix_gateway::{ChatFormat, ChatMessage};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn kw(_name: &'static str, literal: &str) -> Arc<dyn Guardrail> {
         Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal(
@@ -285,6 +319,7 @@ mod tests {
             sid.map(str::to_owned),
             priority,
             g,
+            GuardrailInputMessages::All,
             AppliedGuardrail {
                 kind: "keyword".to_owned(),
                 hook: "both".to_owned(),
@@ -623,15 +658,24 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Benchmark: 1000 attachment entries, resolve < 100ms
+    // Benchmark: 1000 attachment entries, build + 100 resolves stay linear
     // -----------------------------------------------------------------------
 
     /// Performance pin: building the index from 1000 entries and resolving
-    /// 100 contexts must complete in well under 100ms on any CI runner.
-    /// Uses a simple wall-clock assertion — not a criterion benchmark — so
-    /// it runs in `cargo test` without extra tooling.
+    /// 100 contexts must stay far away from quadratic. Uses a simple
+    /// wall-clock assertion — not a criterion benchmark — so it runs in
+    /// `cargo test` without extra tooling.
+    ///
+    /// The bound is 500ms, not the 100ms this originally claimed was
+    /// safe "on any CI runner". CI runs this under `cargo llvm-cov`, and
+    /// instrumentation plus a contended shared runner took a passing
+    /// build to 138ms — a spurious red on a required check, in a test
+    /// whose point is the SHAPE of the cost curve. 500ms keeps that
+    /// point intact: a resolve that went quadratic over 1000 entries ×
+    /// 100 contexts is ~10^8 operations and misses this by orders of
+    /// magnitude, not by the 1.4x a busy runner costs.
     #[test]
-    fn index_rebuild_and_resolve_1000_attachments_under_100ms() {
+    fn index_rebuild_and_resolve_1000_attachments_stays_linear() {
         let mut entries = Vec::with_capacity(1000);
         for i in 0..1000u32 {
             let scope_kind = match i % 4 {
@@ -677,10 +721,13 @@ mod tests {
         }
 
         let elapsed = start.elapsed();
+        // Compare Durations, not as_millis(): the latter truncates, so
+        // 500.9ms would read as 500 and pass a `< 500` check.
         assert!(
-            elapsed.as_millis() < 100,
-            "index build + 100 resolves took {}ms, expected < 100ms",
-            elapsed.as_millis()
+            elapsed < Duration::from_millis(500),
+            "index build + 100 resolves took {:?}, expected < 500ms — that is \
+             far past runner noise and means the cost curve changed shape",
+            elapsed
         );
     }
 }

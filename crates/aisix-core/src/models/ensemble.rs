@@ -13,12 +13,25 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One member of an ensemble panel. `model` references a direct model alias.
+/// One member of an ensemble panel. The member model is named either by
+/// `model` (its display name) or by `model_id` (its resource id); a member
+/// must carry at least one of the two.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct PanelMember {
     /// Model alias for a direct model that receives one panel request.
+    /// Read only when `model_id` is absent.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub model: String,
+    /// Resource id of the direct model that receives one panel request.
+    /// Present, it is authoritative and `model` is ignored: the id is
+    /// resolved against the models in the current configuration, so
+    /// renaming that model keeps this member pointing at it with no edit
+    /// to this document. An id resolving to no model is a panel member
+    /// that does not exist, exactly as a `model` naming no model is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub model_id: Option<String>,
     /// Sampling temperature for this panel member. Omit it to keep the request's temperature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0.0))]
@@ -33,9 +46,17 @@ pub struct PanelMember {
 }
 
 impl PanelMember {
+    /// The display name of the model this member points at, resolved
+    /// against the current configuration: `model_id` when it is set,
+    /// `model` otherwise.
+    pub fn model_ref<'a>(&'a self, snapshot: &super::AisixSnapshot) -> std::borrow::Cow<'a, str> {
+        super::resolve_model_ref(snapshot, &self.model, self.model_id.as_deref())
+    }
+
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
+            model_id: None,
             temperature: None,
             seed: None,
             weight: None,
@@ -44,12 +65,25 @@ impl PanelMember {
 }
 
 /// The judge model that synthesizes the panel responses into one answer.
-/// `model` references a direct model alias.
+/// The judge model is named either by `model` (its display name) or by
+/// `model_id` (its resource id); the judge must carry at least one of the
+/// two.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 pub struct Judge {
     /// Model alias for the direct model that synthesizes panel responses.
+    /// Read only when `model_id` is absent.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub model: String,
+    /// Resource id of the direct model that synthesizes panel responses.
+    /// Present, it is authoritative and `model` is ignored: the id is
+    /// resolved against the models in the current configuration, so
+    /// renaming that model keeps the judge pointing at it with no edit to
+    /// this document. An id resolving to no model is a judge that does not
+    /// exist, exactly as a `model` naming no model is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub model_id: Option<String>,
     /// Override for the built-in synthesis prompt template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
@@ -57,9 +91,17 @@ pub struct Judge {
 }
 
 impl Judge {
+    /// The display name of the model this judge points at, resolved
+    /// against the current configuration: `model_id` when it is set,
+    /// `model` otherwise.
+    pub fn model_ref<'a>(&'a self, snapshot: &super::AisixSnapshot) -> std::borrow::Cow<'a, str> {
+        super::resolve_model_ref(snapshot, &self.model, self.model_id.as_deref())
+    }
+
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
+            model_id: None,
             synthesis_prompt: None,
         }
     }
@@ -88,6 +130,37 @@ pub struct EnsembleConfig {
 }
 
 impl EnsembleConfig {
+    /// This config with every model reference resolved to the display name
+    /// the models table is keyed by — `model_id` when a member or the
+    /// judge sets one, `model` otherwise.
+    ///
+    /// Resolved once per request, up front, rather than at each of the
+    /// dozen places the fan-out reads a member or judge name (dispatch,
+    /// quota reservation, per-sub-call usage attribution, the streamed
+    /// judge's own bridge lookup): a reference the ensemble path resolved
+    /// in only some of them would dispatch to one model and bill another.
+    /// The returned copy carries no ids, so nothing downstream has a second
+    /// spelling to consider.
+    pub fn with_refs_resolved(&self, snapshot: &super::AisixSnapshot) -> Self {
+        Self {
+            panel: self
+                .panel
+                .iter()
+                .map(|m| PanelMember {
+                    model: m.model_ref(snapshot).into_owned(),
+                    model_id: None,
+                    ..m.clone()
+                })
+                .collect(),
+            judge: Judge {
+                model: self.judge.model_ref(snapshot).into_owned(),
+                model_id: None,
+                ..self.judge.clone()
+            },
+            ..self.clone()
+        }
+    }
+
     /// Effective minimum successful panel responses. Defaults to
     /// [`DEFAULT_MIN_RESPONSES`], never exceeds the panel size, and is at
     /// least 1 for a non-empty panel.

@@ -42,6 +42,25 @@ pub enum WatchEvent {
 pub enum ProviderError {
     #[error("etcd connection failed: {0}")]
     Connect(String),
+    /// etcd answered and refused the connection — wrong credentials, a
+    /// user without the required permission, or endpoints that cannot be
+    /// used at all. Distinct from [`ProviderError::Connect`] because it
+    /// does not heal by waiting: the boot path exits on it instead of
+    /// joining the retry loop.
+    #[error("etcd rejected the connection: {0}")]
+    Rejected(String),
+    /// etcd refused the auth token on a connection that had authenticated
+    /// moments earlier — the call was already retried on a freshly
+    /// authenticated connection and refused again.
+    ///
+    /// Kept apart from [`ProviderError::Rejected`] because it points
+    /// somewhere else entirely. A `Rejected` is a configuration mistake
+    /// an operator can go and fix; this one says the credentials are
+    /// being accepted and the token still is not, which is nobody's
+    /// username and password. Sending an operator to check a password
+    /// that is fine is how a real cause stays unfound.
+    #[error("etcd refused an auth token it had just issued: {0}")]
+    TokenRefused(String),
     #[error("etcd range request failed: {0}")]
     Range(String),
     #[error("etcd watch stream failed: {0}")]

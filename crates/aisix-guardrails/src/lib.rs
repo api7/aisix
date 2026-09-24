@@ -29,6 +29,7 @@ mod build;
 mod chain;
 #[cfg(any(feature = "azure-content-safety", feature = "aliyun-text-moderation"))]
 mod chunk;
+mod custom;
 mod index;
 mod keyword;
 #[cfg(feature = "lakera")]
@@ -46,7 +47,7 @@ mod text_moderation;
 mod too_large;
 
 use aisix_core::models::GuardrailMonitorHit;
-use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse};
+use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse, Role};
 use async_trait::async_trait;
 
 /// Max bytes of an upstream guardrail-provider error body to echo into a log
@@ -94,13 +95,6 @@ pub(crate) async fn read_error_body_capped(mut resp: reqwest::Response) -> Strin
 /// body needs a different budget from one that logs a snippet of it: a snippet
 /// can stop anywhere, whereas a truncated body may simply not contain the field
 /// being looked for. See `aliyun::MAX_ERROR_BODY_PARSE_BYTES`.
-#[cfg(any(
-    feature = "azure-content-safety",
-    feature = "aliyun-text-moderation",
-    feature = "lakera",
-    feature = "openai-moderation",
-    feature = "presidio",
-))]
 pub(crate) async fn read_body_capped(resp: &mut reqwest::Response, cap: usize) -> String {
     let mut buf: Vec<u8> = Vec::new();
     while buf.len() < cap {
@@ -128,10 +122,20 @@ pub(crate) async fn read_body_capped(resp: &mut reqwest::Response, cap: usize) -
 ///     payload is serialized so neither a function name nor an argument
 ///     can hide a banned token, matching `ChatResponse::guardrail_output_text`
 ///     and `redact_chat_format`, which already cover this surface.
+///   * `extra["reasoning_content"]` — an assistant turn's reasoning
+///     replayed in history. It is the canonical slot every vendor
+///     spelling is normalised onto, and it travels upstream verbatim
+///     through `extra` like `tool_calls` do, so a payload parked there
+///     reaches the model unread otherwise. Reasoning the model GENERATES
+///     is a different question and stays out of the output scope — this
+///     helper only ever sees REQUEST messages (`check_input`); the output
+///     collectors read `ChatResponse::guardrail_output_text`.
 ///
 /// Non-text content blocks (image/audio) are out of scope — multimodal
-/// moderation is a separate feature. Every guardrail's input/output
-/// collector goes through this so the families can't drift.
+/// moderation is a separate feature. Every guardrail's input collector
+/// goes through this so the families can't drift, and `redact_chat_format`
+/// masks exactly this list — the two must stay in lockstep or a Mask rule
+/// reports a hit on text it then forwards unmasked.
 pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
     let mut parts: Vec<String> = Vec::new();
     let content = m.content_str();
@@ -152,19 +156,87 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
             parts.push(tool_calls.to_string());
         }
     }
+    if let Some(reasoning) = m.extra.get("reasoning_content").and_then(|v| v.as_str()) {
+        if !reasoning.is_empty() {
+            parts.push(reasoning.to_string());
+        }
+    }
     parts.join("\n")
+}
+
+/// The messages a `input_messages: latest_turn` guardrail may read: every
+/// message after the last assistant one, with system messages dropped.
+///
+/// IDE and agent clients replay the whole conversation on every call, so a
+/// rule that matched one message keeps matching for the rest of the
+/// session. The window is the part the model has not answered yet — this
+/// turn's user message together with the tool results answering it
+/// (`Role::Tool` on the OpenAI wire, an Anthropic `tool_result` block, a
+/// Responses `function_call_output` item). A request with no assistant
+/// message narrows to every non-system message.
+///
+/// A TRAILING assistant message does not close the window. It is a
+/// prefill — text the caller wrote for the model to continue, not a turn
+/// the model has answered — so it belongs to the current turn and is
+/// scanned with it. Treating it as a boundary would empty the window and
+/// hand every caller a one-line bypass: append a dummy assistant message
+/// and a `latest_turn` rule goes quiet. Anthropic's documented
+/// assistant-prefill feature reaches the same shape by accident.
+///
+/// "Trailing" is measured against the last NON-SYSTEM message, not the
+/// last message. System messages are outside the window wherever they
+/// sit, so an assistant message followed only by system ones has still
+/// answered nothing — and reading it as a boundary would leave a window
+/// holding system messages alone, which is to say an empty one. Appending
+/// a system message after the prefill would otherwise reopen the same
+/// bypass.
+///
+/// This is the CHECK pass's half of the rule. The masking walkers in
+/// `aisix-proxy::redact` apply the same rule to each wire shape directly,
+/// because their slots are raw JSON with no `ChatFormat` to index against;
+/// the e2e cases pin both halves per protocol.
+pub fn latest_turn_view(req: &ChatFormat) -> ChatFormat {
+    let answered = req
+        .messages
+        .iter()
+        .rposition(|m| m.role != Role::System)
+        .unwrap_or(0);
+    let start = req.messages[..answered]
+        .iter()
+        .rposition(|m| m.role == Role::Assistant)
+        .map_or(0, |i| i + 1);
+    let mut view = req.clone();
+    view.messages = req.messages[start..]
+        .iter()
+        .filter(|m| m.role != Role::System)
+        .cloned()
+        .collect();
+    view
 }
 
 /// The guardrail `kind` discriminators compiled into this binary whose
 /// availability is decided at COMPILE time.
 ///
-/// Every non-keyword kind sits behind a cargo feature (see `build.rs`'s
-/// `BuildError::FeatureDisabled` arms); a DP built without one silently
-/// rejects rows of that kind while the dashboard still offers it
-/// (#519 B.6). The heartbeat reports this list so cp-api can hide /
-/// flag kinds the connected DP can't serve. Strings MUST stay equal to
-/// the serde `kind` tags in `aisix_core::models::GuardrailKind`
-/// (`GuardrailKind::kind_str`).
+/// This is the DP's capability advertisement: the heartbeat forwards it as
+/// `supported_guardrail_kinds`, cp-api unions it across the connected data
+/// planes, and the dashboard disables any kind absent from that union. So a
+/// kind missing here is not a cosmetic gap — the kind becomes unreachable in
+/// the UI and an operator asking "can this DP run that rule" is answered
+/// "no" for something the DP runs perfectly well.
+///
+/// The list therefore covers the WHOLE `GuardrailKind` vocabulary, minus only
+/// the kinds whose cargo feature is off in this build (see `build.rs`'s
+/// `BuildError::FeatureDisabled` arms): a DP built without one silently
+/// rejects rows of that kind, so advertising it would be the mirror-image
+/// lie (#519 B.6). `keyword`, `pii`, `semantic` and `custom` have no feature
+/// gate and are always present.
+///
+/// Strings MUST stay equal to the serde `kind` tags in
+/// `aisix_core::models::GuardrailKind` (`GuardrailKind::kind_str`);
+/// `supported_kinds_advertises_every_schema_kind_this_build_can_run` pins
+/// both halves against the schema `schemars` derives from that enum, so a
+/// newly added kind fails the test until it is either advertised here or
+/// declared feature-gated.
 pub fn supported_kinds() -> &'static [&'static str] {
     &[
         "keyword",
@@ -188,6 +260,9 @@ pub fn supported_kinds() -> &'static [&'static str] {
         // No cargo feature and no on-disk asset: the embedding call goes
         // out over the provider bridges every build already has.
         "semantic",
+        // No cargo feature either: the script engine is an unconditional
+        // dependency, so every build can run a custom guardrail.
+        "custom",
     ]
 }
 
@@ -232,8 +307,15 @@ impl EmbedFailure {
 /// implementation keeps only the hub plus a snapshot handle.
 #[async_trait]
 pub trait GuardrailEmbedder: Send + Sync + 'static {
-    /// Embed `texts` with the `embedding`-kind Model aliased
-    /// `model_alias`, returning one vector per input, in input order.
+    /// Embed `texts` with the `embedding`-kind Model the row names,
+    /// returning one vector per input, in input order.
+    ///
+    /// The model is named by alias, by resource id, or by both. `model_id`
+    /// decides whenever it is `Some` and `model_alias` is then ignored, so
+    /// a row that names its embedder by id keeps working after that model
+    /// is renamed. Neither spelling resolving to an `embedding`-kind Model
+    /// is [`EmbedFailure::Unresolved`] — an id naming nothing behaves as a
+    /// dangling alias does, and the row degrades per its `fail_open`.
     ///
     /// `cacheable` marks CONFIG-derived text — the example prototypes,
     /// which are fixed per row and worth memoising process-wide so a
@@ -243,10 +325,27 @@ pub trait GuardrailEmbedder: Send + Sync + 'static {
     async fn embed(
         &self,
         model_alias: &str,
+        model_id: Option<&str>,
         texts: &[String],
         cacheable: bool,
         timeout: std::time::Duration,
-    ) -> Result<Vec<Vec<f32>>, EmbedFailure>;
+    ) -> Result<Embedded, EmbedFailure>;
+}
+
+/// One embedding call's result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Embedded {
+    /// Current display name of the `embedding`-kind Model that produced
+    /// these vectors.
+    ///
+    /// Returned rather than taken from the row's config because a score is
+    /// unreadable without the model that produced it, and the row's own
+    /// `embedding_model` is not reliably that model: under an id-form
+    /// reference it is ignored, may be stale after a rename, and may be
+    /// absent entirely.
+    pub model: String,
+    /// One vector per input, in input order.
+    pub vectors: Vec<Vec<f32>>,
 }
 
 /// The process-wide guardrail embedder, passed to the chain builders.
@@ -292,7 +391,9 @@ pub use audit::GuardrailAuditLog;
 #[cfg(feature = "bedrock")]
 pub use bedrock::BedrockGuardrail;
 pub use build::{
-    build_chain_from_snapshot, build_index_from_snapshot, LiveGuardrailChain, LiveGuardrailIndex,
+    build_chain_from_snapshot, build_index_from_snapshot, sweep_unattached_guardrails,
+    unattached_guardrail_names, unbuildable_guardrail_rows, LiveGuardrailChain, LiveGuardrailIndex,
+    UnbuildableGuardrailRow, UNATTACHED_SWEEP_INTERVAL,
 };
 pub use chain::GuardrailChain;
 pub use index::{GuardrailIndex, RequestContext};
@@ -663,6 +764,49 @@ pub trait Guardrail: Send + Sync + 'static {
         true
     }
 
+    /// Whether this guardrail actually inspects the INPUT hook — the mirror
+    /// of [`Self::runs_on_output`]. Callers use it to decide whether a
+    /// request-side decision is one this guardrail has any say in: a
+    /// proxy-raised refusal of a body the scanner cannot read is only
+    /// justified when something would have read it, so an output-only
+    /// attachment must not cause a request to be refused (#1113 / #1114).
+    /// Default: `true` (assume input-relevant, secure-leaning); impls that
+    /// carry a hook point override to gate on it.
+    fn runs_on_input(&self) -> bool {
+        true
+    }
+
+    /// Whether an evaluation this guardrail cannot perform on the INPUT
+    /// hook is a refusal rather than a pass — the row's `fail_open`,
+    /// inverted. Default `true` (fail-closed), matching the row default.
+    fn fails_closed_on_input(&self) -> bool {
+        true
+    }
+
+    /// Output-hook counterpart, governed by the kind's own
+    /// `output_fail_open` where it has one. A kind with no configurable
+    /// output policy keeps the fail-closed default.
+    fn fails_closed_on_output(&self) -> bool {
+        true
+    }
+
+    /// Whether this guardrail turns a REQUEST the gateway could not give
+    /// it into a refusal: it reads the request, and its input failure
+    /// policy is fail-closed. This is the gate on the `unscannable_body`
+    /// refusals the proxy raises on the chain's behalf — a guardrail that
+    /// would not have read the body cannot be the reason it is refused,
+    /// and neither can one whose operator asked for `fail_open: true`,
+    /// since the refusal reports itself as `guardrail_unavailable` and
+    /// that is precisely what the setting governs.
+    fn refuses_unevaluable_input(&self) -> bool {
+        self.runs_on_input() && self.fails_closed_on_input()
+    }
+
+    /// Response-side counterpart of [`Self::refuses_unevaluable_input`].
+    fn refuses_unevaluable_output(&self) -> bool {
+        self.runs_on_output() && self.fails_closed_on_output()
+    }
+
     // --- redaction (#932) -------------------------------------------------
     //
     // Redaction is a separate, synchronous, text→text capability rather
@@ -672,6 +816,27 @@ pub trait Guardrail: Send + Sync + 'static {
     // streamed channel) so the caller controls which wire fields are
     // rewritten and structure is preserved. Callers run the check first
     // (Block wins over Mask), then apply the redactor to each field.
+
+    // --- similarity scores (AISIX-Cloud#1467) ------------------------------
+
+    /// Bind this guardrail to one request's score log, returning the bound
+    /// instance. `None` (the default, and every kind but `semantic`) means
+    /// "nothing to bind" and the caller keeps sharing the index's instance.
+    ///
+    /// Scores need a per-request destination, and a leaf guardrail cannot
+    /// hold one: the index hands the SAME `Arc<dyn Guardrail>` to every
+    /// request. Rather than widening the eight check methods with a sink
+    /// argument — the proxy calls those on the chain, so each would have to
+    /// grow a parameter its ~40 call sites do not have — the chain rebinds
+    /// its members once, when its audit log is attached. Decorators forward
+    /// the bind so an `enforcement_mode: monitor` row still scores: monitor
+    /// mode is precisely where an operator is tuning a threshold.
+    fn bind_score_log(
+        &self,
+        _log: &std::sync::Arc<crate::GuardrailAuditLog>,
+    ) -> Option<std::sync::Arc<dyn Guardrail>> {
+        None
+    }
 
     /// `true` when this guardrail can rewrite REQUEST text. Cheap probe so
     /// call sites skip walking the body when nothing would change.
@@ -693,6 +858,23 @@ pub trait Guardrail: Send + Sync + 'static {
     /// Rewrite one response-side text field, masking sensitive spans.
     fn redact_output_text(&self, _text: &str) -> Option<Redaction> {
         None
+    }
+
+    /// [`Self::redact_input_text`], told whether the text sits inside the
+    /// latest-turn window — `false` for a system message and for anything
+    /// the model has already replied to.
+    ///
+    /// Only [`GuardrailChain`] overrides this: it drops the members
+    /// configured `input_messages: latest_turn` for out-of-window text, so
+    /// a mask rule on that setting rewrites the current turn and leaves the
+    /// replayed history byte-identical. A leaf guardrail has no window of
+    /// its own — the setting belongs to the chain member, not the kind —
+    /// so the default ignores the flag and every caller that has no window
+    /// to report (the whole response side, and the single-input endpoints)
+    /// keeps using [`Self::redact_input_text`] directly.
+    fn redact_input_text_in_turn(&self, text: &str, in_latest_turn: bool) -> Option<Redaction> {
+        let _ = in_latest_turn;
+        self.redact_input_text(text)
     }
 
     // --- remote segment moderation (#932 bedrock follow-up) ---------------
@@ -723,6 +905,23 @@ pub trait Guardrail: Send + Sync + 'static {
     /// Moderate the response's text segments in one remote call.
     async fn moderate_output_segments(&self, _texts: &[String]) -> SegmentsOutcome {
         SegmentsOutcome::allow()
+    }
+
+    /// [`Self::moderate_input_segments`] with one window flag per text, in
+    /// the same order (see [`Self::redact_input_text_in_turn`]).
+    ///
+    /// Only [`GuardrailChain`] overrides it: a `latest_turn` member is
+    /// offered the in-window subset and its masked replies are mapped back
+    /// onto the original positions, so the slots it never saw keep the
+    /// caller's text. The per-kind segment hooks are untouched by the
+    /// setting — a kind never learns its own window.
+    async fn moderate_input_segments_in_turn(
+        &self,
+        texts: &[String],
+        in_latest_turn: &[bool],
+    ) -> SegmentsOutcome {
+        let _ = in_latest_turn;
+        self.moderate_input_segments(texts).await
     }
 
     /// `check_input` minus segment-moderating members — used by call
@@ -842,6 +1041,7 @@ pub(crate) fn keep_callsites_enabled() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn truncate_error_body_short_passes_through() {
@@ -935,6 +1135,26 @@ mod tests {
         );
     }
 
+    /// Same bypass class again, via `extra["reasoning_content"]`: an
+    /// assistant turn's replayed reasoning is caller-supplied text that the
+    /// bridges forward upstream verbatim, so parking a payload there must
+    /// not be a way past a deny-list the same text trips in `content`.
+    #[test]
+    fn message_scan_text_scans_replayed_reasoning_content() {
+        let msg: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "nothing to see",
+            "reasoning_content": "hidden reasoning payload"
+        }))
+        .unwrap();
+        let scanned = message_scan_text(&msg);
+        assert!(
+            scanned.contains("hidden reasoning payload"),
+            "scan must cover replayed reasoning_content, got {scanned:?}",
+        );
+        assert!(scanned.contains("nothing to see"));
+    }
+
     #[test]
     fn message_scan_text_scans_tool_call_payload() {
         // Same bypass class via `extra["tool_calls"]`: history-replay tool
@@ -988,42 +1208,104 @@ mod tests {
         ));
     }
 
-    /// Pins `supported_kinds()` under the default feature set (all
-    /// features on): exact contents, and every string round-trips
-    /// through the config parser to the matching
-    /// `GuardrailKind::kind_str` — so the heartbeat-reported list can
-    /// never drift from the wire `kind` discriminators (#519 B.6).
-    #[cfg(all(
-        feature = "bedrock",
-        feature = "azure-content-safety",
-        feature = "aliyun-text-moderation",
-        feature = "lakera",
-        feature = "openai-moderation",
-        feature = "presidio"
-    ))]
+    /// Every top-level guardrail `kind` in the resource vocabulary, read out
+    /// of the schema `schemars` DERIVES from `GuardrailKind`.
+    ///
+    /// Derived rather than restated on purpose. The predecessor of this
+    /// helper was a hand-written list, which froze the bug it was meant to
+    /// catch: `custom` shipped without ever reaching `supported_kinds()`, the
+    /// list was written to match, and the test passed all the way into a
+    /// release candidate. A variant added to the enum lands in this set with
+    /// nobody editing this file, so the assertions below fail until the new
+    /// kind is either advertised or declared feature-gated.
+    ///
+    /// Only the top-level `oneOf` is read: the tagged sub-enums nested inside
+    /// a kind (`literal`/`regex` keyword patterns, the `static` credential
+    /// and `serial`/`timed` latency modes of `bedrock`) live under
+    /// `definitions` and are not selectable provider kinds.
+    fn schema_kind_vocabulary() -> BTreeSet<String> {
+        aisix_core::models::schema::guardrail_root_schema(true)["oneOf"]
+            .as_array()
+            .expect("the guardrail root schema is a `oneOf` over the kinds")
+            .iter()
+            .map(|branch| {
+                branch["properties"]["kind"]["enum"][0]
+                    .as_str()
+                    .expect("each branch pins exactly one kind")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The kinds this build deliberately keeps OUT of the advertisement
+    /// because their cargo feature is off — the only legitimate reason for
+    /// a schema kind to be absent. Under the default feature set this is
+    /// empty and every kind must be advertised.
+    fn feature_disabled_kinds() -> BTreeSet<&'static str> {
+        #[allow(unused_mut)]
+        let mut disabled = BTreeSet::new();
+        #[cfg(not(feature = "azure-content-safety"))]
+        {
+            disabled.insert("azure_content_safety");
+            disabled.insert("azure_content_safety_text_moderation");
+        }
+        #[cfg(not(feature = "aliyun-text-moderation"))]
+        {
+            disabled.insert("aliyun_text_moderation");
+            disabled.insert("aliyun_ai_guardrail");
+        }
+        #[cfg(not(feature = "bedrock"))]
+        disabled.insert("bedrock");
+        #[cfg(not(feature = "lakera"))]
+        disabled.insert("lakera");
+        #[cfg(not(feature = "openai-moderation"))]
+        disabled.insert("openai_moderation");
+        #[cfg(not(feature = "presidio"))]
+        disabled.insert("presidio");
+        disabled
+    }
+
+    /// The capability advertisement must equal "every kind in the schema
+    /// vocabulary that this build can actually run" — in BOTH directions, and
+    /// under any feature set. Under-advertising makes a working kind
+    /// unreachable from the dashboard (which disables anything absent from
+    /// the union the connected DPs report); over-advertising offers an
+    /// operator a kind whose rows this binary drops on load.
     #[test]
-    fn supported_kinds_matches_kind_str_under_default_features() {
+    fn supported_kinds_advertises_every_schema_kind_this_build_can_run() {
+        let vocabulary = schema_kind_vocabulary();
+        let disabled = feature_disabled_kinds();
+        let expected: BTreeSet<&str> = vocabulary
+            .iter()
+            .map(String::as_str)
+            .filter(|kind| !disabled.contains(kind))
+            .collect();
+
+        let advertised: BTreeSet<&str> = supported_kinds().iter().copied().collect();
         assert_eq!(
+            advertised.len(),
+            supported_kinds().len(),
+            "supported_kinds() repeats a kind: {:?}",
             supported_kinds(),
-            &[
-                "keyword",
-                "pii",
-                "azure_content_safety",
-                "azure_content_safety_text_moderation",
-                "aliyun_text_moderation",
-                "aliyun_ai_guardrail",
-                "bedrock",
-                "lakera",
-                "openai_moderation",
-                "presidio",
-                "semantic",
-            ],
         );
-        for kind in supported_kinds() {
-            // Minimal valid config per kind; parse failure or a
-            // kind_str mismatch means the heartbeat list drifted from
-            // the schema's serde tags.
-            let config = match *kind {
+        assert_eq!(
+            advertised, expected,
+            "supported_kinds() drifted from the guardrail schema vocabulary; \
+             a kind this build runs must be advertised, and one it cannot \
+             must be listed in feature_disabled_kinds()",
+        );
+    }
+
+    /// Every kind in the vocabulary parses from a minimal config and reports
+    /// itself under the same discriminator, so the advertised strings, the
+    /// serde tags and `GuardrailKind::kind_str` (three hand-written surfaces
+    /// over one vocabulary) cannot drift apart. Feature-independent: parsing
+    /// lives in `aisix-core`, which compiles every kind regardless of this
+    /// crate's features.
+    #[test]
+    fn every_schema_kind_round_trips_to_its_kind_str() {
+        for kind in schema_kind_vocabulary() {
+            let config = match kind.as_str() {
                 "keyword" => serde_json::json!({
                     "kind": "keyword",
                     "patterns": [{"kind": "literal", "value": "x"}],
@@ -1080,11 +1362,17 @@ mod tests {
                     "analyzer_url": "http://analyzer:3000",
                     "anonymizer_url": "http://anonymizer:3000",
                 }),
-                other => panic!("no parse fixture for kind {other:?}"),
+                "custom" => serde_json::json!({
+                    "kind": "custom",
+                    "script": "export function on_input() { return { action: 'allow' }; }",
+                }),
+                other => panic!(
+                    "guardrail kind {other:?} joined the schema vocabulary with no parse fixture"
+                ),
             };
             let parsed: aisix_core::models::GuardrailKind = serde_json::from_value(config)
                 .unwrap_or_else(|e| panic!("kind {kind:?} failed to parse: {e}"));
-            assert_eq!(parsed.kind_str(), *kind);
+            assert_eq!(parsed.kind_str(), kind);
         }
     }
 

@@ -24,9 +24,11 @@ use aisix_core::{
     A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
     PassthroughRoute, ProviderKey,
 };
-use etcd_client::{Client, GetOptions};
+use aisix_etcd::{kv_client, CallError, LazyEtcdClient};
+use etcd_client::GetOptions;
 use serde::de::DeserializeOwned;
-use tokio::sync::Mutex;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::store::{ConfigStore, StoreError};
 
@@ -43,8 +45,20 @@ pub const A2A_AGENTS_SUBKEY: &str = "a2a_agents";
 pub const PASSTHROUGH_ROUTES_SUBKEY: &str = "passthrough_routes";
 
 pub struct EtcdConfigStore {
-    client: Mutex<Client>,
+    /// The connection, dialled on the first read that needs it. Its KV
+    /// sub-client carries the gateway's raised gRPC decode limit, which
+    /// `Client::get` would not: that reads through a sub-client keeping
+    /// tonic's 4 MiB default, which a full configuration set outgrows.
+    ///
+    /// Lazy for the same reason the config provider is: with etcd
+    /// credentials configured, dialling at boot made an unreachable etcd
+    /// end the process instead of being waited out.
+    client: Arc<LazyEtcdClient>,
     prefix: String,
+    /// `etcd.request_timeout_ms`, applied per call. `None` — the default
+    /// — leaves the reads unbounded, which is what they were before the
+    /// key was wired to anything.
+    request_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for EtcdConfigStore {
@@ -56,11 +70,16 @@ impl std::fmt::Debug for EtcdConfigStore {
 }
 
 impl EtcdConfigStore {
-    pub fn new(client: Client, prefix: impl Into<String>) -> Self {
+    pub fn new(
+        client: Arc<LazyEtcdClient>,
+        prefix: impl Into<String>,
+        request_timeout: Option<Duration>,
+    ) -> Self {
         let prefix = prefix.into().trim_end_matches('/').to_string();
         Self {
-            client: Mutex::new(client),
+            client,
             prefix,
+            request_timeout,
         }
     }
 
@@ -84,17 +103,53 @@ impl EtcdConfigStore {
         full_key.strip_prefix(&needle)
     }
 
+    /// One read against etcd, on this store's own connection — separate
+    /// from the config provider's, so neither queues behind the other's
+    /// connect (`aisix-server` builds the two deliberately). Each
+    /// recovers on its own, and this is where that happens for the admin
+    /// side.
+    ///
+    /// Everything the admin GET surface reads goes through here, for two
+    /// reasons that are easy to lose if a call site is written by hand.
+    /// `request_timeout` bounds the read *and* the dial it may have to
+    /// make first — with etcd credentials configured that dial includes
+    /// an `Authenticate` round trip, and an endpoint that accepts TCP and
+    /// answers nothing would otherwise hang the admin request and every
+    /// other read queued behind the same connect. And a token etcd has
+    /// stopped holding — `--auth-token-ttl` elapses while the admin
+    /// listener is idle, which is what an admin listener mostly is — is
+    /// re-authenticated and retried instead of failing every admin read
+    /// until the gateway is restarted.
+    async fn read<T, F, Fut>(&self, op: F) -> Result<T, StoreError>
+    where
+        F: FnMut(etcd_client::Client) -> Fut,
+        Fut: std::future::Future<Output = Result<T, etcd_client::Error>>,
+    {
+        self.client
+            .call(self.request_timeout, op)
+            .await
+            .map_err(|err| match err {
+                CallError::ConnectTimeout(d) | CallError::CallTimeout(d) => {
+                    StoreError::Backend(format!(
+                        "etcd read exceeded etcd.request_timeout_ms ({} ms)",
+                        d.as_millis()
+                    ))
+                }
+                CallError::Connect(err) => StoreError::Backend(err.to_string()),
+                CallError::Call(err) => StoreError::Backend(err.to_string()),
+            })
+    }
+
     async fn get_one<T: DeserializeOwned>(
         &self,
         key: &str,
     ) -> Result<Option<(T, i64)>, StoreError> {
         let resp = self
-            .client
-            .lock()
-            .await
-            .get(key.as_bytes().to_vec(), None)
-            .await
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+            .read(move |client| {
+                let key = key.as_bytes().to_vec();
+                async move { kv_client(&client).get(key, None).await }
+            })
+            .await?;
         let kv = match resp.kvs().first() {
             Some(kv) => kv,
             None => return Ok(None),
@@ -109,16 +164,18 @@ impl EtcdConfigStore {
         kind: &str,
     ) -> Result<Vec<(String, T, i64)>, StoreError> {
         let prefix = self.range_prefix(kind);
+        // The bound covers the call and not the decode loop below,
+        // which is where it sat before the bound was introduced.
         let resp = self
-            .client
-            .lock()
-            .await
-            .get(
-                prefix.as_bytes().to_vec(),
-                Some(GetOptions::new().with_prefix()),
-            )
-            .await
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+            .read(move |client| {
+                let prefix = prefix.as_bytes().to_vec();
+                async move {
+                    kv_client(&client)
+                        .get(prefix, Some(GetOptions::new().with_prefix()))
+                        .await
+                }
+            })
+            .await?;
 
         let mut out = Vec::with_capacity(resp.kvs().len());
         for kv in resp.kvs() {
@@ -323,19 +380,19 @@ mod tests {
     use super::*;
 
     // Build a store *without* a real client so pure helper tests don't
-    // pay a Docker tax. The client is never used by these tests.
+    // pay a Docker tax. Nothing is dialled until a read needs it, and
+    // these tests never issue one.
+    fn store_for(prefix: &str) -> EtcdConfigStore {
+        let client = Arc::new(LazyEtcdClient::new(
+            vec!["http://127.0.0.1:59999".to_string()],
+            None,
+            None,
+        ));
+        EtcdConfigStore::new(client, prefix, None)
+    }
+
     fn dummy_store() -> EtcdConfigStore {
-        // We can't construct `etcd_client::Client` without connecting, so
-        // build a "real" one pointing at a bogus endpoint — the connect
-        // is lazy and these tests never issue a request.
-        let client_fut = etcd_client::Client::connect(["http://127.0.0.1:59999"], None);
-        let client = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(client_fut)
-            .expect("lazy connect never fails synchronously");
-        EtcdConfigStore::new(client, "/aisix")
+        store_for("/aisix")
     }
 
     #[test]
@@ -366,16 +423,7 @@ mod tests {
 
     #[test]
     fn prefix_trailing_slash_is_trimmed_at_construction() {
-        let client = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(etcd_client::Client::connect(
-                ["http://127.0.0.1:59999"],
-                None,
-            ))
-            .expect("lazy connect never fails synchronously");
-        let store = EtcdConfigStore::new(client, "/aisix/");
+        let store = store_for("/aisix/");
         assert_eq!(store.prefix(), "/aisix");
         assert_eq!(store.key_for("models", "a"), "/aisix/models/a");
     }
@@ -402,10 +450,14 @@ mod tests {
             .expect("container port");
         let endpoint = format!("http://127.0.0.1:{port}");
 
-        let mut client = etcd_client::Client::connect([endpoint], None)
+        let mut client = etcd_client::Client::connect([endpoint.clone()], None)
             .await
             .expect("etcd client");
-        let store = EtcdConfigStore::new(client.clone(), "/aisix-it");
+        let store = EtcdConfigStore::new(
+            Arc::new(LazyEtcdClient::new(vec![endpoint], None, None)),
+            "/aisix-it",
+            None,
+        );
 
         // Resources reach etcd by direct writes (the declarative path);
         // the store is the read side. Seed a model the way an operator

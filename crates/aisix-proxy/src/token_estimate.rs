@@ -3,11 +3,18 @@
 //! When an upstream response — streaming or not — carries no `usage`
 //! block, the emit paths fall back to counting tokens locally so usage
 //! events, post-stream TPM/TPD accounting, and metrics record real
-//! numbers instead of silent zeros. Estimation fills **telemetry only**:
-//! the client-visible response body is never rewritten, and upstream
-//! values always win when non-zero (per-field `or` semantics, matching
-//! the reference stream-rebuild implementations). Any event that carries
-//! an estimated component sets `UsageEvent::usage_estimated`.
+//! numbers instead of silent zeros. Upstream values always win when
+//! non-zero (per-field `or` semantics, matching the reference
+//! stream-rebuild implementations), and any event that carries an
+//! estimated component sets `UsageEvent::usage_estimated`.
+//!
+//! On the bridged `/v1/responses` and `/v1/messages` paths the estimate
+//! is ALSO what the client is told, so the caller cannot read a zero
+//! against a bill they cannot reconcile. Those paths fill per counter,
+//! exactly as the record does: a counter the upstream reported stands,
+//! and one it left at zero is filled even when the other arrived in the
+//! same usage block. A total reported beside such a zero no longer adds
+//! up once it is filled, so it is recomputed rather than echoed.
 //!
 //! Counting follows the OpenAI cookbook message scheme: 3 tokens per
 //! message, +1 per `name`, +3 reply priming, tool definitions rendered

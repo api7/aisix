@@ -14,22 +14,29 @@
 #![deny(rust_2018_idioms)]
 
 pub mod access_log;
+mod log_writer;
+pub mod metric_labels;
 pub mod metrics;
 pub mod otlp_http_sink;
+mod prometheus;
+mod scrape;
 pub mod sink;
 pub mod trace;
 pub mod usage;
 
 use std::io::IsTerminal as _;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use aisix_core::ObservabilityConfig;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-pub use access_log::AccessLog;
+pub use access_log::{AccessLog, CacheAccessLog, McpAccessLog};
 pub use metrics::{
     client_type_from_user_agent, A2aCallOutcome, A2aLabels, BudgetGauges, BudgetLabels,
-    CancelledLabels, ClientTypeClassifier, DeploymentLabels, DeploymentState, HistogramBuckets,
-    LatencyLabels, LlmUsage, Metrics, RequestLabels, RequestOutcome, UsageEventLabels, UsageLabels,
+    CancelledLabels, ClientTypeClassifier, DeploymentLabels, DeploymentState, GaugeFamily,
+    HistogramBuckets, LatencyLabels, LiveGaugeSeries, LlmUsage, Metrics, RequestLabels,
+    RequestOutcome, UsageEventLabels, UsageLabels,
 };
 pub use otlp_http_sink::{content_capture_cap, OtlpHttpFanOut, OtlpSink};
 pub use sink::{
@@ -95,6 +102,10 @@ fn build_filter(cfg: &ObservabilityConfig) -> Result<EnvFilter, ObsError> {
 pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
     let filter = build_filter(cfg)?;
 
+    // Events go through a bounded queue and one writer thread, so a log
+    // consumer that stops reading costs log lines instead of request
+    // latency — see `log_writer`.
+    //
     // Colorize only for a human at a terminal. When stderr is a pipe or a
     // file — every real deployment, where logs go to a container runtime and
     // on to a log store — the escapes land BETWEEN a field's name and its
@@ -102,16 +113,24 @@ pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
     // structured fields are only searchable by bare value
     // (AISIX-Cloud#1060). tracing-subscriber's `ansi` default feature is on
     // and it does not probe the writer itself.
+    let (queue, writer) = log_writer::LogWriter::start(std::io::stderr(), log_writer::CAPACITY);
     let fmt_layer = fmt::layer()
         .with_target(true)
         .with_ansi(std::io::stderr().is_terminal())
-        .with_writer(std::io::stderr);
+        .with_writer(queue);
 
-    tracing_subscriber::registry()
+    if tracing_subscriber::registry()
         .with(filter)
         .with(fmt_layer)
         .try_init()
-        .map_err(|_| ObsError::AlreadyInitialised)?;
+        .is_err()
+    {
+        // Nothing was logged yet, so this drains instantly. Without it the
+        // writer thread and its queue outlive the failed call.
+        writer.shutdown(Duration::from_secs(1));
+        return Err(ObsError::AlreadyInitialised);
+    }
+    let _ = LOG_WRITER.set(writer);
 
     tracing::info!(
         service = %cfg.service_name,
@@ -119,6 +138,29 @@ pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
         "tracing initialised",
     );
     Ok(())
+}
+
+/// The process-wide writer thread, once [`init_tracing`] has installed one.
+static LOG_WRITER: OnceLock<log_writer::LogWriter> = OnceLock::new();
+
+/// Drain the log queue and retire the writer thread.
+///
+/// Called on the way out of `main`: whatever the gateway logged while
+/// shutting down is the part an operator reads to find out why, and the
+/// process exiting would otherwise discard it. Returns whether the queue
+/// emptied within `deadline`. A no-op when [`init_tracing`] was never
+/// called.
+///
+/// A `false` here cannot be reported anywhere. It means the log sink is
+/// not accepting bytes, so `eprintln!` would block on the same descriptor
+/// — and on the very lock the abandoned writer thread is holding inside
+/// its own `write`. The loss shows up as `aisix_log_lines_dropped_total`
+/// and as a log that stops before the shutdown lines; the exit stays
+/// prompt, which is the property worth keeping.
+pub fn shutdown_logging(deadline: Duration) -> bool {
+    LOG_WRITER
+        .get()
+        .is_none_or(|writer| writer.shutdown(deadline))
 }
 
 #[cfg(test)]

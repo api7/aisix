@@ -7,7 +7,9 @@
 //!   gateway-internal `ChatFormat` can't lossily round-trip (cache_control,
 //!   thinking blocks, tool_use, image blocks). Adds `x-api-key` +
 //!   `anthropic-version` headers, rewrites the `model` field to the
-//!   upstream id, and streams the SSE response verbatim.
+//!   upstream id, and relays the SSE response frame-by-frame — every byte
+//!   as the provider wrote it except the caller-facing `model` name, which
+//!   is restamped on `message_start` (see [`crate::model_echo`]).
 //!
 //! - **Non-Anthropic upstream** (`Model.provider == openai|gemini|deepseek`)
 //!   — translates the Anthropic-shape body to the gateway's internal
@@ -162,6 +164,7 @@ pub async fn messages(
         Ok(DispatchOutcome {
             response,
             provider_label,
+            upstream_protocol,
             provider_key_id,
             upstream_model,
             metrics,
@@ -177,21 +180,41 @@ pub async fn messages(
             monitor_hits.extend(output_monitor_hits);
             let elapsed = started.elapsed();
             let status = response.status().as_u16();
-            emit_access_log(
-                &model_name,
-                &provider_label,
-                &api_key_id,
-                status,
-                elapsed,
-                &request_id,
-                // Empty on the streaming path — the id rides the
-                // `message_start` frame, which has not arrived yet. That case
-                // is covered by the per-attempt `provider call completed`
-                // line the usage sink emits (AISIX-Cloud#1289).
-                Some(metrics.provider_request_id.as_str()),
-                &routing,
-                None,
-            );
+            // Conjoined with the request's own streaming flag rather than
+            // resting on `usage_handled_by_stream` alone: a family that ever
+            // reuses that flag to mean "already emitted" on a BUFFERED path,
+            // the way chat's ensemble does, would park a line with no later
+            // emitter to write it — and lose it silently.
+            if stream_requested && usage_handled_by_stream {
+                // A streamed response has no outcome yet: the head exists, nothing
+                // has been delivered, and whether the caller reads it to the end
+                // or walks away is minutes from being known. Park the line and
+                // let whichever terminal emitter ends the request write it, with
+                // that emitter's status, tokens and message (AISIX-Cloud#1571).
+                crate::attribution::defer_access_log(
+                    crate::attribution::PendingAccessLog::new(
+                        "POST",
+                        "/v1/messages",
+                        &request_id,
+                        &api_key_id,
+                        started,
+                    )
+                    .with_model(&provider_label, &model_name)
+                    .with_routing(&routing),
+                );
+            } else {
+                emit_access_log(
+                    &model_name,
+                    &provider_label,
+                    &api_key_id,
+                    status,
+                    elapsed,
+                    &request_id,
+                    Some(metrics.provider_request_id.as_str()),
+                    &routing,
+                    None,
+                );
+            }
             // ONE ProviderKey lookup for both the metric emit and the
             // winner's usage event below (#941).
             let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &provider_key_id);
@@ -213,16 +236,19 @@ pub async fn messages(
             // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only —
             // a stream records its full duration at completion instead.
             if !stream_requested {
-                let bounded_model =
-                    crate::usage_attr::metric_model_label(&state.snapshot.load(), &model_name);
-                state.metrics.record_request_e2e_latency(
-                    LatencyLabels {
-                        endpoint: "/v1/messages",
-                        model: bounded_model.as_ref(),
+                crate::request_metrics::record_e2e_latency(
+                    &state,
+                    "/v1/messages",
+                    crate::request_metrics::Caller::new(&auth),
+                    crate::request_metrics::Upstream {
                         provider: &provider_label,
-                        status,
-                        streaming: false,
+                        model: &model_name,
+                        upstream_model: &upstream_model,
+                        pk: pk.labels(),
+                        stream: false,
+                        ..Default::default()
                     },
+                    status,
                     elapsed,
                 );
             }
@@ -248,6 +274,10 @@ pub async fn messages(
                 None,
                 // ...and the terminal trace spans.
                 /* terminal_last */
+                false,
+                // These are the attempts a WINNER superseded — the request
+                // was served, so no guardrail refused it.
+                /* guardrail_blocked */
                 false,
                 &audit,
             );
@@ -279,10 +309,12 @@ pub async fn messages(
                     &state,
                     &snapshot,
                     &pk,
+                    upstream_protocol,
                     &request_id,
                     event_model_id,
                     &api_key_id,
                     &provider_label,
+                    &model_name,
                     &model_name,
                     &upstream_model,
                     auth.key().team_id.as_deref(),
@@ -293,6 +325,9 @@ pub async fn messages(
                     metrics,
                     &client,
                     attempt,
+                    // The winner served the caller — nothing refused it.
+                    /* guardrail_blocked */
+                    false,
                     applied_guardrails.clone(),
                     redaction_counts.clone(),
                     monitor_hits.clone(),
@@ -339,16 +374,23 @@ pub async fn messages(
                 status,
                 elapsed,
             );
-            state.metrics.record_request_e2e_latency(
-                LatencyLabels {
-                    endpoint: "/v1/messages",
-                    model: metric_model.as_ref(),
-                    provider: last_target.provider(),
-                    status,
-                    streaming: stream_requested,
-                },
+            crate::request_metrics::record_e2e_latency(
+                &state,
+                "/v1/messages",
+                crate::request_metrics::Caller::new(&auth),
+                last_target.upstream(
+                    metric_model.as_ref(),
+                    stream_requested,
+                    routing.fallback_count() > 0,
+                ),
+                status,
                 elapsed,
             );
+            // AISIX-Cloud#1428: a guardrail refusal IS this failure, so the
+            // terminal event must say so — it is what the dashboard's
+            // "Guardrail blocks" view filters on. Every other 4xx/5xx class
+            // leaves the flag alone.
+            let guardrail_blocked = err.is_guardrail_block();
             // AISIX-Cloud#1013: failed requests carry the (post-mask)
             // request body so a 4xx/5xx can be triaged from the log alone.
             // Same opt-in gate and cap as the success path; 401/403 stay
@@ -401,6 +443,7 @@ pub async fn messages(
                 // emission; the pre-dispatch branch below covers empty.
                 /* terminal_last */
                 !routing.attempts.is_empty(),
+                guardrail_blocked,
                 &audit,
             );
             // Pre-dispatch failure (model-not-found, auth, budget, guardrail
@@ -412,10 +455,13 @@ pub async fn messages(
                     &state,
                     &snapshot,
                     &crate::usage_attr::ResolvedPk::unresolved(),
+                    // No attempt won, so no wire was spoken.
+                    aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN,
                     &request_id,
                     &model_id,
                     &api_key_id,
                     "unknown",
+                    &model_name,
                     &model_name,
                     "unknown",
                     auth.key().team_id.as_deref(),
@@ -430,6 +476,7 @@ pub async fn messages(
                         error_class: err.kind().to_string(),
                         ..Default::default()
                     },
+                    guardrail_blocked,
                     applied_guardrails.clone(),
                     // Input masking may have fired before the failure.
                     redaction_counts.clone(),
@@ -479,6 +526,9 @@ fn emit_failed_attempts_anthropic(
     // event is the request's terminal emission, so it carries the trace's
     // SERVER + logical spans. False on the success path.
     terminal_last: bool,
+    // Whether the request ended in a guardrail refusal (AISIX-Cloud#1428).
+    // Rides the same event as the audit handle below, for the same reason.
+    guardrail_blocked: bool,
     // The request's enforced-guardrail audit handle (AISIX-Cloud#1330);
     // stamped only on the event this call marks terminal.
     audit: &crate::usage_attr::GuardrailAudit,
@@ -500,12 +550,16 @@ fn emit_failed_attempts_anthropic(
             state,
             snap,
             &pk,
+            // A failed attempt may not have got as far as choosing a
+            // route, so the key's own wire is the best available answer.
+            pk.labels().protocol(),
             request_id,
             // Each failed attempt records the TARGET it actually hit
             // (AISIX-Cloud#790), not the group it was resolved from.
             &rec.target_model_id,
             api_key_id,
             provider,
+            model,
             model,
             upstream_model,
             team_id,
@@ -516,6 +570,7 @@ fn emit_failed_attempts_anthropic(
             AnthropicUsageMetrics::default(),
             client,
             AttemptInfo::from_record(rec),
+            guardrail_blocked,
             applied_guardrails.to_vec(),
             // Failed attempts carry no per-request redaction detail; the
             // terminal (winner / pre-dispatch) event does.
@@ -569,7 +624,7 @@ async fn dispatch(
     let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
-    if !auth.key().can_access(&model_name) {
+    if !auth.key().can_access(snapshot, &model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()).into());
     }
 
@@ -601,52 +656,108 @@ async fn dispatch(
     // check below blocks it (#379 / closes the anthropic gap in #519).
     *applied_out = resolved_chain.applied().to_vec();
     *audit_out = resolved_chain.audit_log();
-    if !resolved_chain.is_empty() {
-        if let Ok(chat) = aisix_provider_anthropic::parse_inbound_request(body) {
-            let (verdict, hits) = aisix_guardrails::Guardrail::check_input_non_segment_observed(
-                resolved_chain.as_ref(),
-                &chat,
-            )
-            .await;
-            monitor_hits_out.extend(hits);
-            // Segment pass: one Bedrock call over the body's text slots;
-            // an ANONYMIZE disposition writes the masked text back into
-            // the Anthropic-native body (#932 bedrock follow-up).
-            let verdict = crate::redact::moderate_body(
-                resolved_chain.as_ref(),
-                crate::redact::Direction::Input,
-                verdict,
-                redactions_out,
-                monitor_hits_out,
-                |g| crate::redact::redact_anthropic_request(g, body),
-            )
-            .await;
-            if let aisix_guardrails::GuardrailVerdict::Block {
-                reason,
-                guardrail_name,
-                ..
-            } = verdict
+    'input_screen: {
+        if resolved_chain.is_empty() {
+            break 'input_screen;
+        }
+        // Fail CLOSED when the body cannot be parsed into something
+        // scannable. This used to be `if let Ok(chat) = ...`, so a shape
+        // the gateway's Anthropic parser rejects skipped the guardrail
+        // and was forwarded upstream anyway — the check was only as
+        // complete as the parser, and the parser lags the provider by
+        // construction. `/mcp` already takes this arm on an unscannable
+        // body; this is the same rule on the LLM side.
+        let chat = match aisix_provider_anthropic::parse_inbound_request_for_scan(body) {
+            Ok(chat) => chat,
+            // ...but only a guardrail that would have READ the request AND
+            // refuses when it cannot evaluate can be the reason it is
+            // refused. An output-hook-only chain is never offered this
+            // body, and a `fail_open: true` row asked for the opposite
+            // disposition; either way the body leaves exactly as it would
+            // with no guardrail configured at all.
+            Err(err)
+                if !aisix_guardrails::Guardrail::refuses_unevaluable_input(
+                    resolved_chain.as_ref(),
+                ) =>
             {
-                // AISIX-Cloud#1013: mask before returning so the failure
-                // content capture exports post-mask text (see chat.rs).
-                crate::redact::merge_counts(
-                    redactions_out,
-                    crate::redact::redact_anthropic_request(resolved_chain.as_ref(), body),
+                tracing::debug!(
+                    guardrail_hook = "input",
+                    model = %model_name,
+                    error = %err,
+                    "cannot scan /v1/messages body for guardrails; nothing \
+                     attached both reads the request and fails closed",
                 );
+                // The request goes upstream unscreened, so it is a bypass
+                // even though no member ran to report one — recorded under
+                // the tag the fail-CLOSED direction refuses with, so one
+                // unscannable body reads the same whichever way the chain
+                // is configured.
+                resolved_chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+                break 'input_screen;
+            }
+            Err(err) => {
                 tracing::warn!(
                     guardrail_hook = "input",
                     model = %model_name,
-                    reason = %reason,
-                    "guardrail blocked /v1/messages request",
+                    error = %err,
+                    "cannot scan /v1/messages body for guardrails; blocking",
                 );
-                return Err(
-                    ProxyError::ContentFiltered(crate::error::guardrail_block_message(
-                        "request",
-                        guardrail_name.as_deref(),
-                    ))
-                    .into(),
-                );
+                return Err(crate::error::guardrail_block_error(
+                    "request",
+                    None,
+                    Some(crate::error::TAG_UNSCANNABLE_BODY),
+                )
+                .into());
             }
+        };
+        let (verdict, hits) = aisix_guardrails::Guardrail::check_input_non_segment_observed(
+            resolved_chain.as_ref(),
+            &chat,
+        )
+        .await;
+        monitor_hits_out.extend(hits);
+        // Segment pass: one Bedrock call over the body's text slots;
+        // an ANONYMIZE disposition writes the masked text back into
+        // the Anthropic-native body (#932 bedrock follow-up).
+        // Signed `thinking` blocks go in as SCAN-ONLY text: a segment
+        // kind's block rule must still fire on them, and the block itself
+        // must come back byte-identical (#1104). The walker below cannot
+        // carry them — it is also the write-back path.
+        let signed_reasoning = crate::redact::anthropic_signed_reasoning_texts(body);
+        let verdict = crate::redact::moderate_body_scanning(
+            resolved_chain.as_ref(),
+            crate::redact::Direction::Input,
+            verdict,
+            redactions_out,
+            monitor_hits_out,
+            signed_reasoning,
+            |g| crate::redact::redact_anthropic_request(g, body),
+        )
+        .await;
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+            unavailable,
+        } = verdict
+        {
+            // AISIX-Cloud#1013: mask before returning so the failure
+            // content capture exports post-mask text (see chat.rs).
+            crate::redact::merge_counts(
+                redactions_out,
+                crate::redact::redact_anthropic_request(resolved_chain.as_ref(), body),
+            );
+            tracing::warn!(
+                guardrail_hook = "input",
+                model = %model_name,
+                reason = %reason,
+                "guardrail blocked /v1/messages request",
+            );
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            )
+            .into());
         }
         // #932: mask-action PII rules rewrite the Anthropic-native body in
         // place AFTER the block check passes — both the passthrough and the
@@ -684,6 +795,7 @@ async fn dispatch(
     let attempt_models = crate::routing::resolve_attempt_models(
         &state.routing,
         &state.runtime_status,
+        &state.pricing,
         snapshot,
         &model_name,
         &model_entry.id,
@@ -767,12 +879,16 @@ async fn dispatch(
                 });
                 tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32, hint)).await;
             }
-            let (idx, kind) = routing.begin_attempt(&target.model.display_name);
             let target_model = if is_routing_request {
                 target.model.display_name.clone()
             } else {
                 String::new()
             };
+            let (idx, kind) = routing.begin_attempt(crate::attempt::AttemptTarget {
+                display_name: &target.model.display_name,
+                target_model: &target_model,
+                model_id: &target.id,
+            });
             // Reserve THIS target's own model rate-limit layers before
             // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
             // 429 attempt and move on to the remaining targets in strategy
@@ -897,6 +1013,13 @@ async fn dispatch(
                         &e,
                         ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
                     );
+                    crate::routing::log_attempt_failure(
+                        &target.model.display_name,
+                        attempt_idx + 1,
+                        &e,
+                        retryable,
+                        fallback_statuses,
+                    );
                     let (error_class, error_message) = attempt_error_from_proxy(&e);
                     routing.record(
                         state,
@@ -994,6 +1117,21 @@ async fn dispatch_to_target(
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, ProxyError> {
     let model = &target.model;
+    // Anthropic-native clients prepend a billing-attribution line to the
+    // system prompt that only Anthropic's own API consumes. It varies per
+    // request in some deployments and sits at the very front of the
+    // prompt, so forwarding it to any other upstream misses that
+    // provider's prompt cache on every turn. Dropped here, once, so both
+    // the passthrough and the cross-provider branch below are covered —
+    // and after the handler's guardrail scan, which reads the caller's
+    // body as it was sent.
+    let body = if crate::dispatch::is_first_party_anthropic(snapshot, model) {
+        std::borrow::Cow::Borrowed(body)
+    } else {
+        aisix_provider_anthropic::strip_billing_header_attribution(body)
+    };
+    let (mapped, mapped_effort) = crate::effort_mapping::anthropic_request(body.as_ref(), model);
+    let body = mapped.as_ref();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
 
     if !crate::dispatch::speaks_anthropic(snapshot, model) {
@@ -1001,6 +1139,7 @@ async fn dispatch_to_target(
             state,
             snapshot,
             body,
+            mapped_effort,
             model,
             &target.id,
             timeouts,
@@ -1055,8 +1194,9 @@ async fn dispatch_to_target(
 
 /// Anthropic-protocol input -> Anthropic upstream: byte-for-byte
 /// passthrough to `{api_base}/v1/messages`. Adds the `x-api-key` +
-/// `anthropic-version` headers, rewrites the `model` field to the
-/// upstream id, and streams the SSE response verbatim.
+/// `anthropic-version` headers, rewrites the request `model` to the
+/// upstream id, and relays the SSE response frame-by-frame, restamping the
+/// caller-facing `model` on `message_start` (see [`crate::model_echo`]).
 #[allow(clippy::too_many_arguments)]
 async fn anthropic_passthrough_dispatch(
     state: &ProxyState,
@@ -1126,10 +1266,11 @@ async fn anthropic_passthrough_dispatch(
     let url = aisix_gateway::url_cache::cached_endpoint_url(
         pk_id,
         "proxy/messages",
-        // Every resolve_base_url input (#1017) via the shared constructor.
-        &crate::dispatch::pk_url_fingerprint(pk_value),
+        // Every resolve_base_url_for input (#1017) via the shared constructor.
+        &crate::dispatch::pk_surface_url_fingerprint(pk_value, aisix_core::ApiSurface::Messages),
         || {
-            let base = crate::dispatch::resolve_base_url(pk_value)?;
+            let base =
+                crate::dispatch::resolve_base_url_for(pk_value, aisix_core::ApiSurface::Messages)?;
             Ok::<_, crate::error::ProxyError>(crate::dispatch::build_anthropic_url(
                 &base,
                 "/messages",
@@ -1145,13 +1286,12 @@ async fn anthropic_passthrough_dispatch(
 
     // Build the outbound HeaderMap explicitly so the PK's
     // `request.default_headers` / `request.forward_client_headers` can
-    // inject operator-supplied and allowlisted client headers via the
+    // inject operator-supplied and forwarded client headers via the
     // shared apply pipeline. The bridge-owned headers (x-api-key,
     // anthropic-version, content-type, x-aisix-request-id) are inserted
-    // FIRST — `apply_request_headers` skips keys already present + the
-    // reserved auth-header blacklist (`x-api-key` is in
-    // `RESERVED_UPSTREAM_HEADERS`), so neither source can clobber auth
-    // here (ai-gateway#337).
+    // FIRST, which is what stops a `default_headers` entry clobbering
+    // auth here (ai-gateway#337) — that merge is skip-if-present. Only a
+    // header the operator explicitly forwards takes the credential slot.
     let mut headers = axum::http::HeaderMap::new();
     let api_key_hv = HeaderValue::from_str(api_key).map_err(|e| {
         ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
@@ -1178,7 +1318,7 @@ async fn anthropic_passthrough_dispatch(
         &crate::dispatch::upstream_header_ctx(pk_value, pk_id, model, model_id, client_ctx),
     );
 
-    let client = crate::http_client::client_for(pk_value.tls.as_ref());
+    let client = crate::http_client::client_for(pk_value.upstream_connection().as_ref());
     let mut req_builder = url.post_on(&client).headers(headers).json(&body);
     // #554: non-streaming gets the E2E request timeout via reqwest's
     // request-level timeout. Streaming must NOT use it (it would cap the
@@ -1246,7 +1386,28 @@ async fn anthropic_passthrough_dispatch(
     state.health.record_success(&model.display_name);
     state.runtime_status.mark_healthy(model_id);
 
-    let provider_label = "anthropic".to_string();
+    // The target model's own vendor id — same rule as the bridged path
+    // and every other endpoint. The literal predates `apis`: it was
+    // already wrong for `provider: "byo"` + `adapter: anthropic`, which
+    // reports `byo` on /v1/chat/completions and reported `anthropic`
+    // here, and a declared `messages` entry widens that to any vendor.
+    let provider_label = model
+        .provider
+        .as_deref()
+        .unwrap_or("unknown")
+        .to_ascii_lowercase();
+
+    // The relay branch follows what the upstream ACTUALLY sent, not the
+    // request's `stream` flag — see `dispatch::upstream_body_is_sse`. A
+    // JSON document answering `stream: true` takes the non-streaming
+    // buffered scan+mask path below.
+    //
+    // That body needs its own deadline: the request-level timeout above was
+    // deliberately NOT attached for a streaming request, and the per-chunk
+    // read timeout lives on the SSE branch this response no longer takes,
+    // so without one a stalled JSON body would be held with no bound at all.
+    let buffered_body_deadline = if is_stream { timeouts.stream } else { None };
+    let is_stream = is_stream && crate::dispatch::upstream_body_is_sse(upstream_resp.headers());
 
     if is_stream {
         // For SSE streaming: pass through the response body as a streaming
@@ -1259,10 +1420,12 @@ async fn anthropic_passthrough_dispatch(
         // (pre-#554 behavior). A mid-stream stall truncates the forwarded
         // stream — there is no in-band error frame for an opaque passthrough.
         let stream_budget = timeouts.stream;
+        let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
         let wrapped: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
-            Box::pin(crate::stream_timeout::with_read_timeout_bytes(
+            Box::pin(crate::stream_timeout::with_read_timeout_bytes_signalled(
                 upstream_resp.bytes_stream(),
                 stream_budget,
+                read_timeout.clone(),
             ));
         let body_stream: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
             if timeouts.stream_configured {
@@ -1318,12 +1481,13 @@ async fn anthropic_passthrough_dispatch(
         let api_key_id_c = api_key_id.to_string();
         let provider_c = provider_label.clone();
         let model_name_c = model_name.to_string();
-        // Bounded twin for the latency-histogram label (emit-chokepoint
-        // rule) — usage events keep the raw requested string.
-        let bounded_model_c =
-            crate::usage_attr::metric_model_label(&state.snapshot.load(), model_name).into_owned();
         let provider_key_id_c = pk_id.to_string();
         let upstream_model_c = upstream_model.clone();
+        let (metric_model, metric_upstream_model) =
+            crate::usage_attr::metric_model_label_pair(snapshot, model_name, &upstream_model_c);
+        let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
+        let metric_model = metric_model.into_owned();
+        let metric_upstream_model = metric_upstream_model.into_owned();
         let team_id_c = team_id.clone();
         let user_id_c = user_id.clone();
         let user_name_c = user_name.clone();
@@ -1385,6 +1549,7 @@ async fn anthropic_passthrough_dispatch(
         );
         let parsed_stream = build_anthropic_passthrough_stream(
             body_stream,
+            read_timeout,
             started,
             attempt_started,
             stream_guardrail,
@@ -1418,6 +1583,10 @@ async fn anthropic_passthrough_dispatch(
                 let metrics = AnthropicUsageMetrics {
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
+                    // Anthropic upstream: the cache hit arrives as
+                    // `cache_read_input_tokens`, never the OpenAI-shape subset.
+                    cached_prompt_tokens: 0,
+                    cache_write_tokens: None,
                     cache_creation_tokens: usage.cache_creation_tokens,
                     cache_read_tokens: usage.cache_read_tokens,
                     usage_estimated: usage.usage_estimated,
@@ -1427,31 +1596,38 @@ async fn anthropic_passthrough_dispatch(
                     upstream_ttft_ms: usage.upstream_ttft_ms,
                     downstream_latency_ms: usage.downstream_latency_ms,
                 };
-                state_c.metrics.record_request_e2e_latency(
-                    LatencyLabels {
-                        endpoint: "/v1/messages",
-                        model: &bounded_model_c,
+                let snap_c = state_c.snapshot.load();
+                let pk_c = crate::usage_attr::ResolvedPk::resolve(&snap_c, &provider_key_id_c);
+                crate::request_metrics::record_e2e_latency(
+                    &state_c,
+                    "/v1/messages",
+                    metric_caller.as_caller(),
+                    crate::request_metrics::Upstream {
                         provider: &provider_c,
-                        status: 200,
-                        streaming: true,
+                        model: &metric_model,
+                        upstream_model: &metric_upstream_model,
+                        pk: pk_c.labels(),
+                        stream: true,
+                        ..Default::default()
                     },
+                    200,
                     started.elapsed(),
                 );
                 // A stream can outlive several config generations, so the
                 // end-of-stream emit reads a FRESH snapshot rather than the
                 // one the request started on (#941).
-                let snap_c = state_c.snapshot.load();
-                let pk_c = crate::usage_attr::ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 emit_anthropic_usage_event(
                     &state_c,
                     &snap_c,
                     &pk_c,
+                    aisix_core::Adapter::Anthropic.wire_protocol(),
                     &request_id_c,
                     &model_id_c,
                     &api_key_id_c,
                     &provider_c,
                     &model_name_c,
-                    &upstream_model_c,
+                    &metric_model,
+                    &metric_upstream_model,
                     team_id_c.as_deref(),
                     user_id_c.as_deref(),
                     user_name_c.as_deref(),
@@ -1459,17 +1635,35 @@ async fn anthropic_passthrough_dispatch(
                     // as 499, matching LiteLLM. The upstream work still
                     // happened, so the event is emitted either way — only
                     // its outcome differs.
-                    if usage.reached_end {
-                        200
-                    } else {
-                        crate::CLIENT_CLOSED_REQUEST
-                    },
+                    //
+                    // A guardrail refusal is not an abandonment, whatever
+                    // `reached_end` says: the hold-back-overflow arm returns
+                    // mid-stream, so the flag is the only thing that tells
+                    // "the gateway ended this" from "the caller went away".
+                    // chat.rs reaches 200 here by `break`ing to its
+                    // end-of-upstream marker instead; same answer, and this
+                    // way `reached_end` keeps meaning what it says
+                    // (AISIX-Cloud#1428).
+                    //
+                    // An upstream failure after the headers — a transport
+                    // error, a read timeout, an in-band `error` event — is
+                    // recorded as that failure's status and error.
+                    anthropic_stream_status(
+                        usage.reached_end,
+                        usage.guardrail_blocked,
+                        usage.failure.as_ref(),
+                    ),
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
                     attempt_started.elapsed(),
                     metrics,
                     &client_ctx_c,
-                    attempt_c.clone(),
+                    anthropic_stream_attempt(
+                        &attempt_c,
+                        usage.guardrail_blocked,
+                        usage.failure.as_ref(),
+                    ),
+                    usage.guardrail_blocked,
                     applied_guardrails_c.clone(),
                     // #932: input-side mask counts captured before dispatch,
                     // merged with the hold-back release's output-side counts.
@@ -1534,6 +1728,7 @@ async fn anthropic_passthrough_dispatch(
         Ok(DispatchOutcome {
             response,
             provider_label,
+            upstream_protocol: aisix_core::Adapter::Anthropic.wire_protocol(),
             provider_key_id: pk_id.to_string(),
             upstream_model: upstream_model.clone(),
             metrics: AnthropicUsageMetrics::default(),
@@ -1550,18 +1745,18 @@ async fn anthropic_passthrough_dispatch(
         // failures cool down the target — a body the bridge can't
         // parse is a real upstream problem worth taking out of
         // rotation, not a caller bug.
-        let mut json_body: Value = upstream_resp
-            .json()
-            .await
-            .map_err(|e| {
-                crate::cooldown::note_failure(
-                    &state.runtime_status,
-                    model_id,
-                    model.cooldown.as_ref(),
-                    aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
-                )
-            })
-            .map_err(ProxyError::Bridge)?;
+        let mut json_body: Value =
+            crate::dispatch::json_body_within(upstream_resp, buffered_body_deadline)
+                .await
+                .map_err(|be| {
+                    crate::cooldown::note_failure(
+                        &state.runtime_status,
+                        model_id,
+                        model.cooldown.as_ref(),
+                        be,
+                    )
+                })
+                .map_err(ProxyError::Bridge)?;
 
         let mut metrics = anthropic_metrics_from_response_json(&json_body);
         // Token-estimation fallback (AISIX-Cloud#1074): an
@@ -1580,8 +1775,27 @@ async fn anthropic_passthrough_dispatch(
         let mut output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
         if !resolved_chain.is_empty() {
             if let Some(content) = json_body.get("content").and_then(|v| v.as_array()) {
+                // Generated reasoning is out of the output-guardrail scope
+                // on every other `/v1/messages` path — the streaming
+                // accumulator reads `delta.text` and `delta.partial_json`
+                // and never `delta.thinking`. The raw-array dump below was
+                // added for tool-use arguments and swept thinking text in
+                // with them, so the buffered path scanned more than the
+                // streaming one for the same response. Drop the two
+                // reasoning block types from the dump; everything the dump
+                // exists for (`tool_use` name/input, and any block shape
+                // the loop above cannot name) is untouched.
+                let scannable: Vec<&Value> = content
+                    .iter()
+                    .filter(|b| {
+                        !matches!(
+                            b.get("type").and_then(|v| v.as_str()),
+                            Some("thinking") | Some("redacted_thinking")
+                        )
+                    })
+                    .collect();
                 let mut out_text = String::new();
-                for block in content {
+                for block in &scannable {
                     if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
                         if !out_text.is_empty() {
                             out_text.push('\n');
@@ -1592,7 +1806,7 @@ async fn anthropic_passthrough_dispatch(
                 if !out_text.is_empty() {
                     out_text.push('\n');
                 }
-                out_text.push_str(&Value::Array(content.clone()).to_string());
+                out_text.push_str(&serde_json::to_string(&scannable).unwrap_or_default());
 
                 let synth = aisix_gateway::ChatResponse {
                     id: String::new(),
@@ -1620,7 +1834,7 @@ async fn anthropic_passthrough_dispatch(
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                    ..
+                    unavailable,
                 } = verdict
                 {
                     tracing::warn!(
@@ -1629,23 +1843,20 @@ async fn anthropic_passthrough_dispatch(
                         reason = %reason,
                         "guardrail blocked /v1/messages passthrough response",
                     );
-                    return Err(ProxyError::ContentFiltered(
-                        crate::error::guardrail_block_message(
-                            "response",
-                            guardrail_name.as_deref(),
-                        ),
+                    return Err(crate::error::guardrail_block_error(
+                        "response",
+                        guardrail_name.as_deref(),
+                        unavailable.as_deref(),
                     ));
                 }
             }
         }
 
-        // Restore the gateway-facing model name so callers see what they asked for.
-        if let Some(m) = json_body.get_mut("model") {
-            // If the upstream echoes the model name, rewrite to the gateway name.
-            if m.as_str().map(|s| s == upstream_model).unwrap_or(false) {
-                *m = Value::String(model_name.to_string());
-            }
-        }
+        // Restore the gateway-facing model name so callers see what they asked
+        // for. Unconditional: the upstream is free to answer with an id other
+        // than the one it was asked for (a dated snapshot, a server-side
+        // remap), and the caller still addressed the alias.
+        crate::model_echo::restamp_body(&mut json_body, model_name);
 
         // #932: mask-action PII rules rewrite the passthrough response body
         // (text blocks + tool_use input) AFTER the block check passes.
@@ -1677,6 +1888,7 @@ async fn anthropic_passthrough_dispatch(
         Ok(DispatchOutcome {
             response: Json(json_body).into_response(),
             provider_label,
+            upstream_protocol: aisix_core::Adapter::Anthropic.wire_protocol(),
             provider_key_id: pk_id.to_string(),
             upstream_model,
             metrics,
@@ -1780,6 +1992,9 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
     let usage = body.get("usage");
     AnthropicUsageMetrics {
         usage_estimated: false,
+        // Anthropic upstream: see the streaming sibling — no OpenAI-shape subset.
+        cached_prompt_tokens: 0,
+        cache_write_tokens: None,
         prompt_tokens: usage
             .and_then(|u| u.get("input_tokens"))
             .and_then(Value::as_u64)
@@ -1830,6 +2045,10 @@ async fn cross_provider_dispatch(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     body: &Value,
+    // What the target's `effort_mapping` did to this request's
+    // `output_config.effort`, so a removal is not undone by deriving an
+    // upstream effort from the `thinking` block beside it.
+    mapped_effort: aisix_core::MappedEffort,
     model: &aisix_core::Model,
     model_id: &str,
     timeouts: crate::routing::TimeoutBudget,
@@ -1888,7 +2107,7 @@ async fn cross_provider_dispatch(
     // fields (context_management, top_k, mcp_servers, …) are dropped —
     // flattened onto an OpenAI-compatible upstream they 400 as unknown
     // parameters (AISIX-Cloud#953).
-    translate_extras_to_openai_shape(&mut chat.extra);
+    translate_extras_to_openai_shape(&mut chat.extra, mapped_effort);
 
     let is_stream = chat.is_streaming();
 
@@ -1911,6 +2130,12 @@ async fn cross_provider_dispatch(
     };
     if let Some(d) = connect_deadline {
         ctx = ctx.with_deadline(d);
+    }
+    // See chat.rs: the structured-output tool route answers a streaming
+    // request with a non-streaming upstream leg, which is entitled to
+    // the end-to-end budget rather than the per-chunk one.
+    if is_stream {
+        ctx = ctx.with_non_streaming_deadline(timeouts.request);
     }
     let provider_label = provider.to_ascii_lowercase();
     let provider_key_id = model.provider_key_id.as_deref().unwrap_or("unknown");
@@ -1985,10 +2210,16 @@ async fn cross_provider_dispatch(
         let api_key_id_for_telem = api_key_id.to_string();
         let provider_for_telem = provider_label.clone();
         let model_for_telem = model_name.to_string();
-        let bounded_model_for_telem =
-            crate::usage_attr::metric_model_label(&state.snapshot.load(), model_name).into_owned();
         let provider_key_id_for_telem = provider_key_id.to_string();
         let upstream_model_for_telem = upstream_model.clone();
+        let (metric_model, metric_upstream_model) = crate::usage_attr::metric_model_label_pair(
+            snapshot,
+            model_name,
+            &upstream_model_for_telem,
+        );
+        let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
+        let metric_model = metric_model.into_owned();
+        let metric_upstream_model = metric_upstream_model.into_owned();
         let team_id_for_telem = team_id;
         let user_id_for_telem = user_id;
         let user_name_for_telem = user_name;
@@ -2074,6 +2305,8 @@ async fn cross_provider_dispatch(
                 let metrics = AnthropicUsageMetrics {
                     prompt_tokens: comp.prompt_tokens,
                     completion_tokens: comp.completion_tokens,
+                    cached_prompt_tokens: comp.cached_prompt_tokens,
+                    cache_write_tokens: comp.cache_write_tokens,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
                     usage_estimated: comp.usage_estimated,
@@ -2083,45 +2316,57 @@ async fn cross_provider_dispatch(
                     upstream_ttft_ms: comp.upstream_ttft_ms,
                     downstream_latency_ms: comp.downstream_latency_ms,
                 };
-                state_for_telem.metrics.record_request_e2e_latency(
-                    LatencyLabels {
-                        endpoint: "/v1/messages",
-                        model: &bounded_model_for_telem,
-                        provider: &provider_for_telem,
-                        status: 200,
-                        streaming: true,
-                    },
-                    started_for_telem.elapsed(),
-                );
-                // Fresh snapshot at stream end — see the passthrough path.
                 let snap_telem = state_for_telem.snapshot.load();
                 let pk_telem =
                     crate::usage_attr::ResolvedPk::resolve(&snap_telem, &provider_key_id_for_telem);
+                crate::request_metrics::record_e2e_latency(
+                    &state_for_telem,
+                    "/v1/messages",
+                    metric_caller.as_caller(),
+                    crate::request_metrics::Upstream {
+                        provider: &provider_for_telem,
+                        model: &metric_model,
+                        upstream_model: &metric_upstream_model,
+                        pk: pk_telem.labels(),
+                        stream: true,
+                        ..Default::default()
+                    },
+                    200,
+                    started_for_telem.elapsed(),
+                );
+                // Fresh snapshot at stream end — see the passthrough path.
                 emit_anthropic_usage_event(
                     &state_for_telem,
                     &snap_telem,
                     &pk_telem,
+                    // The bridge dispatched through this key's own wire.
+                    pk_telem.labels().protocol(),
                     &request_id_for_telem,
                     &model_id_for_telem,
                     &api_key_id_for_telem,
                     &provider_for_telem,
                     &model_for_telem,
-                    &upstream_model_for_telem,
+                    &metric_model,
+                    &metric_upstream_model,
                     team_id_for_telem.as_deref(),
                     user_id_for_telem.as_deref(),
                     user_name_for_telem.as_deref(),
-                    // See the sibling passthrough path: an abandoned stream
-                    // is reported as 499, matching LiteLLM.
-                    if comp.reached_end {
-                        200
-                    } else {
-                        crate::CLIENT_CLOSED_REQUEST
-                    },
+                    // See the sibling passthrough path.
+                    anthropic_stream_status(
+                        comp.reached_end,
+                        comp.guardrail_blocked,
+                        comp.failure.as_ref(),
+                    ),
                     // Attempt-scoped — see the sibling passthrough path.
                     attempt_started_for_telem.elapsed(),
                     metrics,
                     &client_for_telem,
-                    attempt_for_telem.clone(),
+                    anthropic_stream_attempt(
+                        &attempt_for_telem,
+                        comp.guardrail_blocked,
+                        comp.failure.as_ref(),
+                    ),
+                    comp.guardrail_blocked,
                     applied_guardrails_for_telem.clone(),
                     // #932: input-side mask counts captured before dispatch,
                     // merged with the hold-back release's output-side counts.
@@ -2171,6 +2416,7 @@ async fn cross_provider_dispatch(
         return Ok(DispatchOutcome {
             response,
             provider_label,
+            upstream_protocol: aisix_gateway::upstream_protocol(provider_key),
             provider_key_id: provider_key_id.to_string(),
             upstream_model,
             metrics: AnthropicUsageMetrics::default(),
@@ -2219,7 +2465,7 @@ async fn cross_provider_dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             tracing::warn!(
@@ -2228,8 +2474,10 @@ async fn cross_provider_dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/messages response",
             );
-            return Err(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
+            return Err(crate::error::guardrail_block_error(
+                "response",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
             ));
         }
     }
@@ -2243,6 +2491,8 @@ async fn cross_provider_dispatch(
     let mut metrics = AnthropicUsageMetrics {
         prompt_tokens: resp.usage.prompt_tokens,
         completion_tokens: resp.usage.completion_tokens,
+        cached_prompt_tokens: resp.usage.cached_prompt_tokens,
+        cache_write_tokens: resp.usage.cache_write_tokens,
         cache_creation_tokens: resp.usage.cache_creation_tokens,
         cache_read_tokens: resp.usage.cache_read_tokens,
         usage_estimated: false,
@@ -2254,11 +2504,20 @@ async fn cross_provider_dispatch(
         downstream_latency_ms: 0,
     };
     // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
-    // bridged upstream never reported. Telemetry only — the rendered
-    // Anthropic JSON below carries the upstream's own usage.
+    // bridged upstream never reported, and carry the SAME numbers into the
+    // Anthropic JSON rendered below. The client-visible usage and the usage
+    // record are one number: a caller told `output_tokens: 0` for a
+    // response it can read the text of has no way to reconcile that with
+    // what the dashboard bills. The estimate is reported in the ordinary
+    // usage shape — there is no client-facing marker saying it was
+    // estimated.
     fill_missing_anthropic_metrics(&mut metrics, &upstream_model, body, || {
         crate::chat::estimation_output_text(&resp)
     });
+    if metrics.usage_estimated {
+        resp.usage.prompt_tokens = metrics.prompt_tokens;
+        resp.usage.completion_tokens = metrics.completion_tokens;
+    }
     // Capture the prompt (the Anthropic request body) + assembled assistant
     // text for content-capturing exporters (gated); threaded to `fan_out` via
     // `DispatchOutcome`, never to the CP sink.
@@ -2280,6 +2539,7 @@ async fn cross_provider_dispatch(
     Ok(DispatchOutcome {
         response: Json(json).into_response(),
         provider_label,
+        upstream_protocol: aisix_gateway::upstream_protocol(provider_key),
         provider_key_id: provider_key_id.to_string(),
         upstream_model,
         metrics,
@@ -2394,6 +2654,9 @@ fn build_anthropic_sse_stream(
                     if let Some(u) = chunk.usage.as_ref() {
                         comp.prompt_tokens = comp.prompt_tokens.max(u.prompt_tokens);
                         comp.completion_tokens = comp.completion_tokens.max(u.completion_tokens);
+                        comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);
+                        comp.cached_prompt_tokens =
+                            comp.cached_prompt_tokens.max(u.cached_prompt_tokens);
                         comp.cache_creation_tokens =
                             comp.cache_creation_tokens.max(u.cache_creation_tokens);
                         comp.cache_read_tokens = comp.cache_read_tokens.max(u.cache_read_tokens);
@@ -2452,7 +2715,8 @@ fn build_anthropic_sse_stream(
                                 max_buffer_bytes = max_hold,
                                 "streaming /v1/messages response exceeded hold-back cap; failing closed",
                             );
-                            yield Ok(bytes::Bytes::from(guardrail_block_frame(None)));
+                            guard.comp().guardrail_blocked = true;
+                            yield Ok(bytes::Bytes::from(guardrail_block_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED))));
                             return;
                         }
                         held_chunks.push(chunk);
@@ -2466,6 +2730,7 @@ fn build_anthropic_sse_stream(
                     }
                 }
                 Err(e) => {
+                    crate::attempt::StreamFailure::record(&mut guard.comp().failure, &e);
                     // Hold-back: the held (unscanned) chunks are dropped —
                     // fail closed; only the error frame reaches the client.
                     let frame = format!(
@@ -2549,7 +2814,7 @@ fn build_anthropic_sse_stream(
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                    ..
+                    unavailable,
                 } = verdict
                 {
                     tracing::warn!(
@@ -2560,7 +2825,8 @@ fn build_anthropic_sse_stream(
                     );
                     // Hold-back: the held chunks are dropped — the matched
                     // content never reached the wire.
-                    let frame = guardrail_block_frame(guardrail_name.as_deref());
+                    guard.comp().guardrail_blocked = true;
+                    let frame = guardrail_block_frame(guardrail_name.as_deref(), unavailable.as_deref());
                     yield Ok(bytes::Bytes::from(frame));
                     return;
                 }
@@ -2596,6 +2862,30 @@ fn build_anthropic_sse_stream(
                 }
             }
         }
+        // Token-estimation fallback (AISIX-Cloud#1074), run HERE rather than
+        // only from the Drop guard below: the closing `message_delta` this
+        // relay is about to force out carries the client-visible usage, and
+        // it must be the same number the usage record gets. The guard keeps
+        // its own copy of this fill for the stream a consumer abandoned
+        // before EOF, where no closing pair is emitted at all.
+        if let Some(est) = guard.estimator.take() {
+            let filled = {
+                let comp = guard.comp();
+                crate::token_estimate::fill_missing(
+                    &est,
+                    comp.prompt_tokens,
+                    comp.completion_tokens,
+                    Some(comp.est_output_text.as_str()),
+                )
+            };
+            if filled.estimated {
+                let comp = guard.comp();
+                comp.prompt_tokens = filled.prompt_tokens;
+                comp.completion_tokens = filled.completion_tokens;
+                comp.usage_estimated = true;
+                encoder.set_estimated_usage(filled.prompt_tokens, filled.completion_tokens);
+            }
+        }
         if !encoder.is_finished() {
             for ev in encoder.force_finish() {
                 yield Ok(downstream_bytes!(guard, ev));
@@ -2615,14 +2905,22 @@ fn build_anthropic_sse_stream(
 /// with serde_json so an operator-supplied guardrail name is JSON-escaped
 /// correctly; the message carries the firing guardrail's name (#519 B.4b)
 /// but never the matched-pattern detail (#153).
-fn guardrail_block_frame(guardrail_name: Option<&str>) -> String {
+///
+/// `error.type` is `invalid_request_error`, the same value the HTTP 422
+/// path renders for this refusal (`anthropic_kind_from_status`). It has to
+/// be: Anthropic's `error.type` is a closed enum in its SDK and carries no
+/// `content_filter` member, so emitting one made the streaming half of
+/// this endpoint disagree with the buffered half AND fail the SDK's typed
+/// parse. No `code` field either — the Anthropic envelope has none, and
+/// the caller reads WHICH guardrail fired from the message.
+fn guardrail_block_frame(guardrail_name: Option<&str>, unavailable: Option<&str>) -> String {
     format!(
         "event: error\ndata: {}\n\n",
         serde_json::json!({
             "type": "error",
             "error": {
-                "type": "content_filter",
-                "message": crate::error::guardrail_block_message("response", guardrail_name),
+                "type": "invalid_request_error",
+                "message": crate::error::guardrail_block_message("response", guardrail_name, unavailable),
             }
         })
     )
@@ -2639,6 +2937,35 @@ fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
     }
 }
 
+/// The usage-event status of a `/v1/messages` stream. A guardrail refusal
+/// stays a `200` whatever `reached_end` says (AISIX-Cloud#1428); otherwise see
+/// [`crate::attempt::stream_status`].
+fn anthropic_stream_status(
+    reached_end: bool,
+    guardrail_blocked: bool,
+    failure: Option<&crate::attempt::StreamFailure>,
+) -> u16 {
+    if guardrail_blocked {
+        200
+    } else {
+        crate::attempt::stream_status(reached_end, failure)
+    }
+}
+
+/// The attempt record of a `/v1/messages` stream's usage event, carrying
+/// the upstream failure that ended it, if any.
+fn anthropic_stream_attempt(
+    attempt: &AttemptInfo,
+    guardrail_blocked: bool,
+    failure: Option<&crate::attempt::StreamFailure>,
+) -> AttemptInfo {
+    let mut attempt = attempt.clone();
+    if let Some(f) = failure.filter(|_| !guardrail_blocked) {
+        f.apply_to(&mut attempt);
+    }
+    attempt
+}
+
 #[derive(Default)]
 struct AnthropicStreamCompletion {
     /// `true` once the upstream stream reached its end, i.e. the response
@@ -2648,6 +2975,9 @@ struct AnthropicStreamCompletion {
     reached_end: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// See [`AnthropicUsageMetrics::cached_prompt_tokens`].
+    cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
     /// True when the Drop guard filled any token counter from the local
@@ -2679,6 +3009,16 @@ struct AnthropicStreamCompletion {
     /// check (AISIX-Cloud#562). Merged with the input-side hits by the
     /// on_complete emit.
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// Set when the end-of-stream output check refused the response and the
+    /// held frames were dropped for a terminal `error` frame — or when the
+    /// hold-back buffer overflowed and the stream failed closed. The stream
+    /// had already committed its upstream tokens, so the event keeps them,
+    /// but it must not read as a clean delivery (AISIX-Cloud#1428). Mirrors
+    /// `chat::StreamCompletion::guardrail_blocked`.
+    guardrail_blocked: bool,
+    /// The upstream error that ended the stream after its `200` went out.
+    /// The usage event reports it instead of a `200` or a `499`.
+    failure: Option<crate::attempt::StreamFailure>,
 }
 
 struct CompleteAnthropicStreamOnDrop<F: FnOnce(AnthropicStreamCompletion)> {
@@ -2730,6 +3070,14 @@ impl<F: FnOnce(AnthropicStreamCompletion)> Drop for CompleteAnthropicStreamOnDro
 struct DispatchOutcome {
     response: Response,
     provider_label: String,
+    /// The wire the winning attempt actually spoke, which is not always
+    /// the one the Provider Key defaults to: a key whose adapter is
+    /// `openai` still speaks Anthropic when it declares `apis.messages`
+    /// and this request took that route verbatim. Deriving the label
+    /// from the key would report `openai` for a request that went out on
+    /// the Anthropic wire, which is the one thing this label exists to
+    /// say (AISIX-Cloud#1403).
+    upstream_protocol: &'static str,
     provider_key_id: String,
     upstream_model: String,
     metrics: AnthropicUsageMetrics,
@@ -2786,6 +3134,17 @@ impl From<ProxyError> for MessagesDispatchError {
 struct AnthropicUsageMetrics {
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// OpenAI-shape prompt-cache hit — a SUBSET of `prompt_tokens`,
+    /// non-zero only on the bridged path where the upstream speaks
+    /// OpenAI (AISIX-Cloud#1405). Kept in the upstream's own shape so a
+    /// given upstream call produces the same UsageEvent whichever
+    /// inbound protocol addressed it, and so cp-api's pricing split
+    /// (`prompt - cached` at the prompt rate, `cached` at the cache-read
+    /// rate) stays correct. Never summed into a total — that would
+    /// double-count it, unlike the two Anthropic-shape counters below,
+    /// which sit ON TOP of `prompt_tokens`.
+    cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
     /// True when any token counter was filled by the local estimator
@@ -2819,11 +3178,18 @@ fn emit_anthropic_usage_event(
     // both this event and the handler's `record` (#941 audit L2). The
     // failed-attempt and stream-end callers resolve their own.
     pk: &crate::usage_attr::ResolvedPk<'_>,
+    // The wire this request actually went out on. Not derivable from the
+    // key: one whose adapter is `openai` still speaks Anthropic when it
+    // declares `apis.messages` and the request took that route verbatim,
+    // and reporting the key's default would name a protocol the request
+    // never used (AISIX-Cloud#1403).
+    upstream_protocol: &'static str,
     request_id: &str,
     model_id: &str,
     api_key_id: &str,
     provider: &str,
     model: &str,
+    metric_model: &str,
     upstream_model: &str,
     team_id: Option<&str>,
     user_id: Option<&str>,
@@ -2834,6 +3200,13 @@ fn emit_anthropic_usage_event(
     metrics: AnthropicUsageMetrics,
     client: &ClientContext,
     attempt: AttemptInfo,
+    // Whether a guardrail refused this request — on the input hook before
+    // dispatch, or on the output hook after the upstream answered. The
+    // dashboard's "Guardrail blocks" view filters on exactly this bool, so
+    // an unset one hides a 422 the caller definitely saw
+    // (AISIX-Cloud#1428). Request-scoped like `guardrail_enforced_hits`
+    // below, hence terminal-only.
+    guardrail_blocked: bool,
     // The `{kind, hook}` set of guardrails that governed this request (#379).
     // Empty for the guardrail-free path and pre-resolution failures.
     applied_guardrails: Vec<AppliedGuardrail>,
@@ -2870,6 +3243,8 @@ fn emit_anthropic_usage_event(
         requested_model: model.to_string(),
         prompt_tokens: metrics.prompt_tokens,
         completion_tokens: metrics.completion_tokens,
+        cached_prompt_tokens: metrics.cached_prompt_tokens,
+        cache_write_tokens: metrics.cache_write_tokens,
         cache_creation_tokens: metrics.cache_creation_tokens,
         cache_read_tokens: metrics.cache_read_tokens,
         usage_estimated: metrics.usage_estimated,
@@ -2900,18 +3275,27 @@ fn emit_anthropic_usage_event(
         // the terminal event carries them — a superseded attempt would
         // otherwise repeat the same hit once per retry.
         guardrail_enforced_hits: crate::usage_attr::terminal_enforced_hits(terminal, audit),
+        guardrail_scores: crate::usage_attr::terminal_guardrail_scores(terminal, audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
+        // Same rule, same reason.
+        guardrail_blocked: terminal && guardrail_blocked,
         ..Default::default()
     };
     // Handler label "messages" — Anthropic /v1/messages inbound
     // path. Bucketed prometheus counter (#408).
-    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
+    crate::usage_attr::apply_caller_identity(
+        &mut event,
+        client.jwt.as_ref(),
+        client.caller.user_id.as_deref(),
+        client.caller.user_name.as_deref(),
+    );
     let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
     // The metric code below still reads `event`, so the chokepoint gets
     // its own copy (it stamps `trace_id` on the emitted one).
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "messages",
+        crate::operation::MESSAGES,
         event.clone(),
         crate::usage_attr::usage_event_labels(&usage_model, pk),
         content.as_ref(),
@@ -2942,7 +3326,7 @@ fn emit_anthropic_usage_event(
         },
         crate::request_metrics::Upstream {
             provider,
-            model,
+            model: metric_model,
             upstream_model,
             pk: pk.labels(),
             ..Default::default()
@@ -2951,14 +3335,20 @@ fn emit_anthropic_usage_event(
             input: metrics.prompt_tokens,
             output: metrics.completion_tokens,
             total: total_tokens_all.min(u64::from(u32::MAX)) as u32,
+            cached: metrics.cached_prompt_tokens,
+            cache_read: metrics.cache_read_tokens,
+            cache_creation: metrics.cache_creation_tokens,
             spend_usd: 0.0,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );
     if metrics.upstream_ttft_ms > 0 {
         let snap_for_labels = state.snapshot.load();
-        let (bounded_model, bounded_upstream) =
-            crate::usage_attr::metric_model_label_pair(&snap_for_labels, model, upstream_model);
+        let (bounded_model, bounded_upstream) = crate::usage_attr::metric_model_label_pair(
+            &snap_for_labels,
+            metric_model,
+            upstream_model,
+        );
         state.metrics.record_request_ttft(
             LatencyLabels {
                 endpoint: "/v1/messages",
@@ -2966,6 +3356,20 @@ fn emit_anthropic_usage_event(
                 provider,
                 status: status_code,
                 streaming: true,
+                details: UsageLabels {
+                    endpoint: "/v1/messages",
+                    inbound_protocol: "anthropic",
+                    upstream_protocol,
+                    provider,
+                    model: bounded_model.as_ref(),
+                    upstream_model: bounded_upstream.as_ref(),
+                    provider_key_id: pk.labels().id(),
+                    provider_key_name: pk.labels().name(),
+                    api_key_id,
+                    team_id: team_id.unwrap_or("unknown"),
+                    user_id: user_id.unwrap_or("unknown"),
+                    user_name: user_name.unwrap_or("unknown"),
+                },
             },
             Duration::from_millis(u64::from(metrics.upstream_ttft_ms)),
         );
@@ -2973,6 +3377,7 @@ fn emit_anthropic_usage_event(
             UsageLabels {
                 endpoint: "/v1/messages",
                 inbound_protocol: "anthropic",
+                upstream_protocol,
                 provider,
                 model: bounded_model.as_ref(),
                 upstream_model: bounded_upstream.as_ref(),
@@ -2991,7 +3396,8 @@ fn emit_anthropic_usage_event(
 // ─── Anthropic streaming usage parser (#245) ───────────────────────
 //
 // The Anthropic `/v1/messages` passthrough forwards the upstream SSE
-// byte stream verbatim. To recover token counts for telemetry without
+// byte stream unchanged apart from the caller-facing `model` name. To
+// recover token counts for telemetry without
 // altering the bytes the client sees, `build_anthropic_passthrough_stream`
 // wraps the byte stream: it appends each chunk to a frame buffer,
 // extracts complete SSE events (delimited by a blank line), and parses
@@ -3014,11 +3420,17 @@ pub(crate) const MAX_SSE_FRAME_BUF_BYTES: usize = 1 << 20; // 1 MiB
 /// corresponding frame.
 #[derive(Default)]
 struct AnthropicStreamUsage {
-    /// `true` once the upstream stream reached its end, i.e. the response
-    /// was forwarded in full. Stays `false` when the consumer went away
+    /// `true` once the UPSTREAM stream reached its end. Not the same as
+    /// "the response was forwarded in full": under a hold-back policy the
+    /// relay may have withheld an unterminated frame it could not scan.
+    /// Stays `false` when the consumer went away
     /// first — the generator is dropped at a suspension point and the tail
     /// never runs — which the telemetry closure reports as `499`.
     reached_end: bool,
+    /// The upstream failure that ended the stream after its `200` went out:
+    /// a transport error, a read timeout, or an in-band `error` event. The
+    /// usage event reports it instead of a `200` or a `499`.
+    failure: Option<crate::attempt::StreamFailure>,
     prompt_tokens: u32,
     completion_tokens: u32,
     cache_creation_tokens: u32,
@@ -3063,6 +3475,13 @@ struct AnthropicStreamUsage {
     /// check (AISIX-Cloud#562). Merged with the input-side hits by the
     /// on_complete emit.
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// Set when the end-of-stream output check refused the response and the
+    /// held frames were dropped for a terminal `error` frame — or when the
+    /// hold-back buffer overflowed and the stream failed closed. The stream
+    /// had already committed its upstream tokens, so the event keeps them,
+    /// but it must not read as a clean delivery (AISIX-Cloud#1428). Mirrors
+    /// `chat::StreamCompletion::guardrail_blocked`.
+    guardrail_blocked: bool,
 }
 
 /// Update the accumulator from one parsed SSE `data:` JSON object.
@@ -3083,6 +3502,26 @@ fn update_anthropic_usage(
         acc.upstream_ttft_ms = attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
     }
     match json.get("type").and_then(Value::as_str) {
+        // Anthropic reports a failure inside a committed stream as an
+        // in-band `error` event, forwarded to the caller as-is.
+        Some("error") => {
+            let err = match json.get("error").and_then(|e| {
+                serde_json::from_value::<aisix_provider_anthropic::wire::AnthropicStreamErrorBody>(
+                    e.clone(),
+                )
+                .ok()
+            }) {
+                Some(body) => aisix_provider_anthropic::wire::stream_error_into_bridge_error(&body),
+                // An error event whose body does not parse is still one.
+                None => aisix_gateway::BridgeError::UpstreamInBand {
+                    status: None,
+                    message: "upstream reported an in-band stream error".to_string(),
+                    parsed: None,
+                    wire: aisix_gateway::UpstreamWire::Anthropic,
+                },
+            };
+            crate::attempt::StreamFailure::record(&mut acc.failure, &err);
+        }
         Some("message_start") => {
             let msg = json.get("message");
             if let Some(usage) = msg.and_then(|m| m.get("usage")) {
@@ -3212,24 +3651,47 @@ fn update_anthropic_usage(
     }
 }
 
-/// Drain every complete SSE frame from `buf`, updating `acc`. A frame
-/// ends at the first blank line (`\n\n`). Incomplete trailing bytes are
-/// left in `buf` for the next chunk. The `data:` payload is parsed as
-/// JSON; non-JSON or non-`data` frames are skipped.
+/// Drain every complete SSE frame from `buf`, updating `acc` and
+/// appending the frame to `out` with the client-facing `model` restamped
+/// onto `message_start`. A frame ends at the first blank line (`\n\n`);
+/// incomplete trailing bytes are left in `buf` for the next chunk. The
+/// `data:` payload is parsed as JSON for the usage side; non-JSON or
+/// non-`data` frames are skipped there and forwarded untouched.
+///
+/// `out` is what the client receives, so the relay forwards whole frames
+/// rather than raw chunks: a value can only be spliced once the frame
+/// carrying it has arrived in full. A frame is the SSE protocol's atomic
+/// unit — every conforming parser buffers to the blank-line terminator
+/// anyway — so holding a partial one back is not observable to a client,
+/// and `buf` retains only that partial tail.
 fn drain_anthropic_sse_frames(
     buf: &mut Vec<u8>,
     acc: &mut AnthropicStreamUsage,
     attempt_started: Instant,
     first_token_seen: &mut bool,
+    client_facing_model: &str,
+    out: &mut Vec<u8>,
 ) {
     // SSE event delimiter is a blank line. Anthropic emits `\n\n`;
     // tolerate `\r\n\r\n` defensively by normalising the search.
     while let Some(end) = find_frame_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
-        if let Some(data) = extract_sse_data_line(&frame) {
-            if let Ok(json) = serde_json::from_slice::<Value>(data) {
+        // The frame's WHOLE payload, not just its first `data:` line: this
+        // is what feeds `response_text`, the text the end-of-stream output
+        // guardrail scans, and a payload split over several `data:` lines
+        // parses only once they are joined (#1100).
+        if let Some(payload) = crate::redact::frame_payload(&frame) {
+            if let Ok(json) = serde_json::from_str::<Value>(payload.trim()) {
                 update_anthropic_usage(acc, &json, attempt_started, first_token_seen);
             }
+        }
+        match crate::model_echo::restamp_sse_frame(
+            &frame,
+            client_facing_model,
+            crate::model_echo::anthropic_message_model,
+        ) {
+            Some(rewritten) => out.extend_from_slice(&rewritten),
+            None => out.extend_from_slice(&frame),
         }
     }
 }
@@ -3253,22 +3715,6 @@ pub(crate) fn find_frame_end(buf: &[u8]) -> Option<usize> {
             return Some(i + 4);
         }
         i += 1;
-    }
-    None
-}
-
-/// Extract the `data:` payload bytes from one SSE frame. Returns the
-/// JSON slice (after `data:` and an optional leading space), or `None`
-/// if the frame has no data line. Only the first data line is read —
-/// Anthropic emits single-line data for the frames we care about.
-/// Shared with the `/v1/responses` streaming usage parser (#808).
-pub(crate) fn extract_sse_data_line(frame: &[u8]) -> Option<&[u8]> {
-    for line in frame.split(|&b| b == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if let Some(rest) = line.strip_prefix(b"data:") {
-            let rest = rest.strip_prefix(b" ").unwrap_or(rest);
-            return Some(rest);
-        }
     }
     None
 }
@@ -3366,10 +3812,19 @@ impl<T> Stream for AnthropicDeliveryCounter<T> {
 /// Wrap an Anthropic upstream byte stream so token usage is parsed
 /// in-flight and `on_complete` fires once at end-of-stream (or
 /// client-disconnect) with the accumulated counts. Bytes are forwarded
-/// verbatim — the client sees the exact upstream SSE wire shape.
+/// unchanged apart from the caller-facing `model` on `message_start`: the
+/// client sees the upstream's own SSE wire shape, byte for byte, with that
+/// one value spliced (see [`crate::model_echo`]).
+///
+/// Under a hold-back output policy the relay additionally WITHHOLDS bytes it
+/// could not scan — an unterminated frame at EOF, or one that ran past the
+/// frame cap. See the two arms below; on the live-forward path neither
+/// applies and every byte is delivered.
 #[allow(clippy::too_many_arguments)]
 fn build_anthropic_passthrough_stream<S, F>(
     upstream: S,
+    // Set when `upstream` ended on a read timeout rather than its own end.
+    read_timeout: crate::stream_timeout::ReadTimeoutSignal,
     // Request clock — what the CALLER waited for
     // (`downstream_latency_ms`), spanning every earlier attempt.
     started: Instant,
@@ -3420,15 +3875,19 @@ where
         let mut held: Vec<u8> = Vec::new();
         while let Some(item) = upstream.next().await {
             if let Ok(bytes) = &item {
-                // Side-channel parse: copy into the frame buffer (the
-                // original `bytes` is yielded unchanged below) and drain
-                // any complete SSE frames into the accumulator.
+                // Accumulate, then drain every COMPLETE frame — restamped
+                // with the caller's model name — into `forward`. The client
+                // receives whole frames, never a partial one; `buf` keeps the
+                // trailing remainder until its terminator arrives.
                 buf.extend_from_slice(bytes);
+                let mut forward: Vec<u8> = Vec::new();
                 drain_anthropic_sse_frames(
                     &mut buf,
                     guard.usage(),
                     attempt_started,
                     &mut first_token_seen,
+                    &model_label,
+                    &mut forward,
                 );
                 // Bound the frame buffer (PR #436 audit MEDIUM-2). The
                 // happy path drains complete frames above, so `buf`
@@ -3438,56 +3897,228 @@ where
                 // would otherwise grow `buf` unboundedly (per-request
                 // memory exhaustion). Real Anthropic SSE frames are
                 // well under a few KB, so a 1 MiB ceiling can only be
-                // hit by a non-conformant stream; drop the buffer
-                // (losing usage parsing for that pathological case)
-                // rather than OOM. The bytes themselves still forward
-                // to the client verbatim — only telemetry parsing is
-                // affected.
+                // hit by a non-conformant stream.
+                //
+                // Under a hold-back policy those bytes fail closed, for the
+                // same reason the EOF tail below does: an unterminated frame
+                // never reached `drain_anthropic_sse_frames`, so it never fed
+                // `response_text` and the output guardrail never saw it.
+                // Releasing it with `held` after the scan would be a bypass,
+                // and its size is not what makes it one.
+                //
+                // On the live-forward path there is no scan to bypass, so the
+                // remainder goes downstream rather than being dropped or held
+                // until OOM. Delivery is preserved — only that frame's usage
+                // parse and model restamp are lost.
                 if buf.len() > MAX_SSE_FRAME_BUF_BYTES {
+                    if hold_policy.is_some() {
+                        tracing::warn!(
+                            guardrail_hook = "output",
+                            buffered = buf.len(),
+                            "streaming /v1/messages passthrough buffered an unterminated \
+                             SSE frame past the cap; failing closed rather than releasing \
+                             it unscanned",
+                        );
+                        guard.usage().guardrail_blocked = true;
+                        // `unscannable_body`, not `output_buffer_exceeded`:
+                        // the frame is refused because it never reached the
+                        // scan, not because of its size. The hold-back cap
+                        // below keeps the size-based tag.
+                        yield Ok(Bytes::from(guardrail_block_frame(None, Some(crate::error::TAG_UNSCANNABLE_BODY))));
+                        return;
+                    }
                     tracing::warn!(
                         buffered = buf.len(),
                         "anthropic stream: SSE frame buffer exceeded cap without a \
-                         terminator; dropping buffer (usage parsing skipped for the \
-                         oversized frame)"
+                         terminator; releasing it unparsed (usage parsing and model \
+                         restamp skipped for the oversized frame)"
                     );
-                    buf.clear();
+                    forward.append(&mut buf);
                 }
                 if let Some(max_hold) = hold_policy {
                     // Hold-back: withhold the bytes until the end-of-stream
                     // scan clears (and masks) them. Overflow fails closed —
                     // content that can't be fully buffered to scan must not
                     // be released (mirrors /v1/responses).
-                    if held.len() + bytes.len() > max_hold {
+                    if held.len() + forward.len() > max_hold {
                         tracing::warn!(
                             guardrail_hook = "output",
                             max_buffer_bytes = max_hold,
                             "streaming /v1/messages passthrough exceeded hold-back cap; failing closed",
                         );
-                        yield Ok(Bytes::from(guardrail_block_frame(None)));
+                        guard.usage().guardrail_blocked = true;
+                        yield Ok(Bytes::from(guardrail_block_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED))));
                         return;
                     }
-                    held.extend_from_slice(bytes);
+                    held.extend_from_slice(&forward);
                     continue;
                 }
+                // Nothing completed yet — keep reading rather than yielding
+                // an empty chunk.
+                if forward.is_empty() {
+                    continue;
+                }
+                if guard.usage().downstream_latency_ms == 0 {
+                    guard.usage().downstream_latency_ms =
+                        started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                }
+                yield Ok(Bytes::from(forward));
+                continue;
             }
-            // Forward the original item verbatim (Ok bytes OR Err — an
-            // upstream error mid-stream is passed through; the
-            // accumulator keeps whatever was captured before it). In
+            // An upstream error mid-stream is passed through; the
+            // accumulator keeps whatever was captured before it. In
             // hold-back mode an Err lands here too: it is forwarded and
             // the held (unscanned) content is dropped — fail closed.
-            let errored = item.is_err();
-            if !errored && guard.usage().downstream_latency_ms == 0 {
-                guard.usage().downstream_latency_ms =
-                    started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            if let Err(e) = &item {
+                crate::attempt::StreamFailure::record(
+                    &mut guard.usage().failure,
+                    &crate::dispatch::reqwest_error_to_bridge(e, attempt_started),
+                );
             }
             yield item;
-            if errored && hold_policy.is_some() {
+            if hold_policy.is_some() {
                 return;
             }
         }
-        // Upstream stream over — the response was forwarded in full. Record
-        // it before the scan below, which awaits a remote provider and is a
-        // routine drop point for clients that close on the terminal event.
+        if let Some(e) = read_timeout.fired() {
+            crate::attempt::StreamFailure::record(&mut guard.usage().failure, &e);
+        }
+        // A non-conformant upstream can end without terminating its last
+        // frame. Those bytes were never forwarded (they are still the
+        // partial tail).
+        //
+        // On the live-forward path, release them: the client is no worse off
+        // than it was before this relay became frame-aligned, and truncating
+        // a response over a missing terminator would be a regression.
+        //
+        // Under a hold-back policy, SEAL them: a fragment that parses is
+        // completed with the terminator the upstream left off and held with
+        // the rest, so both the block scan and the redaction pass read it as
+        // an ordinary frame; one that does not parse is dropped, because
+        // nothing can extract its text and releasing it after the output
+        // check is exactly the bypass hold-back exists to prevent.
+        if !buf.is_empty() {
+            let tail = std::mem::take(&mut buf);
+            // The upstream has ended, so this fragment is a final frame it
+            // never terminated — complete, just missing its blank line. Parse
+            // it like any other frame BEFORE the scan below runs, so its text
+            // reaches `response_text` and the output guardrail actually sees
+            // it. Then it is scanned content like everything else and can be
+            // released, which is what keeps a provider that omits the last
+            // terminator from losing its `message_stop` behind a guardrail.
+            //
+            // Its counts are as real as any other frame's, so read them
+            // whether or not the fragment survives the seal below.
+            if let Some(payload) = crate::redact::frame_payload(&tail) {
+                if let Ok(json) = serde_json::from_str::<Value>(payload.trim()) {
+                    update_anthropic_usage(
+                        guard.usage(),
+                        &json,
+                        attempt_started,
+                        &mut first_token_seen,
+                    );
+                }
+            }
+            if let Some(max_hold) = hold_policy {
+                // Scanned like every other frame — hold it with them, but
+                // under the same size policy: this path reaches `held`
+                // outside the loop, so without this the last frame could
+                // carry the buffer past the cap the loop refuses at.
+                let tail = crate::model_echo::restamp_sse_frame(
+                    &tail,
+                    &model_label,
+                    crate::model_echo::anthropic_message_model,
+                )
+                .unwrap_or(tail);
+                if held.len() + tail.len() > max_hold {
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        max_buffer_bytes = max_hold,
+                        "streaming /v1/messages passthrough exceeded hold-back cap on its \
+                         final frame; failing closed",
+                    );
+                    guard.usage().guardrail_blocked = true;
+                    yield Ok(Bytes::from(guardrail_block_frame(
+                        None,
+                        Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+                    )));
+                    return;
+                }
+                held.extend_from_slice(&tail);
+            } else {
+                // Restamp on the way out, for the same reason the `/v1/responses`
+                // relay does: the upstream has ended, so this is a final frame it
+                // never terminated rather than one still arriving.
+                //
+                // Note this is NOT the same as Anthropic's terminal frame. That
+                // one is `message_stop` and carries no model — but an upstream
+                // that dies part-way through leaves whatever frame it was
+                // writing, and if that is `message_start` this restamp is the
+                // only thing standing between the caller and the upstream id.
+                let tail = crate::model_echo::restamp_sse_frame(
+                    &tail,
+                    &model_label,
+                    crate::model_echo::anthropic_message_model,
+                )
+                .unwrap_or(tail);
+                if guard.usage().downstream_latency_ms == 0 {
+                    guard.usage().downstream_latency_ms =
+                        started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                }
+                yield Ok(Bytes::from(tail));
+            }
+        }
+        // #1091/#1100: seal what will actually be released, before either
+        // pass reads it. The block scan takes its text from the frames the
+        // drain loop parsed, while the redaction pass walks the held bytes
+        // as terminator-delimited frames — so anything the drain loop could
+        // not parse was in `held` having been read by neither. Sealing
+        // `held` whole (rather than the EOF fragment alone) is what makes
+        // the two agree: an unterminated final frame that parses gets the
+        // terminator its upstream left off, and a frame whose payload is
+        // not one JSON document is cut, since nothing can mask it.
+        let mut unscanned: Vec<String> = Vec::new();
+        if hold_policy.is_some() {
+            let seal = crate::redact::seal_buffered_sse(&mut held);
+            if let crate::redact::SseTailSeal::Dropped { dropped } = seal.tail {
+                tracing::warn!(
+                    guardrail_hook = "output",
+                    dropped,
+                    "streaming /v1/messages passthrough ended on an SSE frame that \
+                     could not be scanned; dropping it rather than releasing it past \
+                     the output guardrail",
+                );
+            }
+            if !seal.excised.is_empty() {
+                tracing::warn!(
+                    guardrail_hook = "output",
+                    frames = seal.excised.len(),
+                    dropped = seal.excised_bytes,
+                    "streaming /v1/messages passthrough carried SSE frames whose payload \
+                     is not one JSON document; dropping them rather than releasing them \
+                     past the output guardrail (their text is still scanned)",
+                );
+            }
+            // When the cut took the ENTIRE response, dropping it silently
+            // would hand the caller an empty 200 and no signal at all — and
+            // the scan below is skipped too, since nothing ever reached
+            // `response_text`. Refuse explicitly instead, the same shape the
+            // frame-cap arm above uses. A `held` that was empty to begin
+            // with is an empty upstream response and is left alone.
+            if held.is_empty() && seal.cut_anything() {
+                guard.usage().guardrail_blocked = true;
+                yield Ok(Bytes::from(guardrail_block_frame(
+                    None,
+                    Some(crate::error::TAG_UNSCANNABLE_BODY),
+                )));
+                return;
+            }
+            unscanned = seal.excised;
+        }
+        // Upstream stream over. Record it before the scan below, which awaits
+        // a remote provider and is a routine drop point for clients that close
+        // on the terminal event. NOT the same as "all of it was forwarded":
+        // under a hold-back policy an unscannable frame may have been withheld.
         guard.usage().reached_end = true;
         // End-of-stream output guardrail (#448): scan the accumulated
         // assistant text. On a block, emit a terminal Anthropic `error`
@@ -3501,11 +4132,22 @@ where
             // Clone (not take) when content capture is on, so the assembled
             // response survives for the on_complete content capture below;
             // otherwise take it (nothing downstream reads it).
-            let text = if content_cap.is_some() {
+            let mut text = if content_cap.is_some() {
                 guard.usage().response_text.clone()
             } else {
                 std::mem::take(&mut guard.usage().response_text)
             };
+            // #1100: an excised frame is not released, but a forbidden
+            // literal inside it must still block the response — the block
+            // pass reads raw text, so it can scan a payload nothing could
+            // parse. Appended to the scanned copy only: it never reached
+            // the client, so it must not reach the captured content either.
+            for payload in &unscanned {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(payload);
+            }
             if !text.is_empty() {
                 let synth = aisix_gateway::ChatResponse {
                     id: String::new(),
@@ -3565,7 +4207,7 @@ where
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                    ..
+                    unavailable,
                 } = verdict
                 {
                     tracing::warn!(
@@ -3575,7 +4217,8 @@ where
                         "guardrail blocked streaming /v1/messages passthrough response",
                     );
                     blocked = true;
-                    let frame = guardrail_block_frame(guardrail_name.as_deref());
+                    guard.usage().guardrail_blocked = true;
+                    let frame = guardrail_block_frame(guardrail_name.as_deref(), unavailable.as_deref());
                     yield Ok(Bytes::from(frame));
                 }
             }
@@ -3656,13 +4299,17 @@ fn emit_access_log(
         .winner()
         .map(|w| w.target_model.as_str())
         .filter(|s| !s.is_empty());
+    let target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method: "POST",
         path: "/v1/messages",
         status,
         latency,
+        duration: latency,
         provider: Some(provider),
         model: Some(model),
+        upstream_model: target.upstream_model(),
+        provider_key_id: target.provider_key_id(),
         api_key_id: Some(api_key_id),
         prompt_tokens: None,
         completion_tokens: None,
@@ -3680,6 +4327,8 @@ fn emit_access_log(
         },
         error_kind,
         error: error.as_deref(),
+        mcp: None,
+        cache: None,
     }
     .emit();
 }
@@ -3687,6 +4336,42 @@ fn emit_access_log(
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod stream_failure_tests {
+    use super::*;
+
+    /// Anthropic's in-band `error` event is the stream's failure, at the
+    /// status its error type documents; one whose body does not parse is
+    /// still one, just without a status of its own.
+    #[test]
+    fn an_in_band_error_event_is_recorded_even_when_its_body_does_not_parse() {
+        let mut first_token_seen = false;
+        let mut typed = AnthropicStreamUsage::default();
+        let event = serde_json::json!({
+            "type": "error",
+            "error": {"type": "rate_limit_error", "message": "slow down"},
+        });
+        update_anthropic_usage(&mut typed, &event, Instant::now(), &mut first_token_seen);
+        let failure = typed.failure.expect("a typed error event is a failure");
+        assert_eq!(failure.status, 429);
+        assert!(failure.error_message.contains("slow down"));
+
+        let mut malformed = AnthropicStreamUsage::default();
+        let event = serde_json::json!({"type": "error", "error": "not an object"});
+        update_anthropic_usage(
+            &mut malformed,
+            &event,
+            Instant::now(),
+            &mut first_token_seen,
+        );
+        let failure = malformed
+            .failure
+            .expect("a malformed error event is still a failure");
+        assert_eq!(failure.status, 502);
+        assert_eq!(failure.error_class, "upstream_in_band");
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -3712,6 +4397,7 @@ mod tests {
             request_id: Default::default(),
             url_rewrites: Vec::new(),
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }
@@ -4153,12 +4839,11 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_passthrough_default_headers_cannot_overwrite_x_api_key() {
-        // Defense-in-depth: `x-api-key` is in
-        // `aisix_gateway::upstream_headers::RESERVED_UPSTREAM_HEADERS`
-        // — even if cp-api validation slips and lets the operator
-        // register a default_headers entry with `x-api-key`, the apply
-        // function MUST drop it so the PK's secret remains the auth
-        // value upstream sees.
+        // `default_headers` is a fallback, never an override: the
+        // bridge fills `x-api-key` before the merge, so an operator
+        // entry of the same name is declined and the PK's secret stays
+        // the auth value upstream sees. (Putting the CALLER's own
+        // credential there is what `forward_client_headers` is for.)
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
@@ -4753,6 +5438,177 @@ data: [DONE]\n\n";
         assert_eq!(v["usage"]["output_tokens"], 4);
     }
 
+    /// AISIX-Cloud#1405: `/v1/messages` in front of an OpenAI-compatible
+    /// upstream that reports a prompt-cache hit. Pre-fix the hit was
+    /// dropped on BOTH exits — the client's Anthropic `usage` and the
+    /// UsageEvent that drives Logs/billing — so the whole 68k prompt
+    /// billed at the uncached rate and no cache detail existed to
+    /// reconcile against the provider's own bill.
+    ///
+    /// The numbers are the reporter's: MiniMax M3 behind an
+    /// OpenAI-compatible provider, addressed by the Claude CLI.
+    #[tokio::test]
+    async fn messages_openai_upstream_cache_hit_reaches_client_and_usage_event() {
+        use aisix_obs::UsageSink;
+        use aisix_provider_openai::OpenAiBridge;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-cache-test",
+                "model": "MiniMax-M3",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 68_274,
+                    "completion_tokens": 497,
+                    "total_tokens": 68_771,
+                    "prompt_tokens_details": {"cached_tokens": 60_000}
+                }
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("tencent-minimax-m3"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_family(
+            aisix_core::Adapter::Anthropic,
+            Arc::new(AnthropicBridge::new()),
+        );
+        hub.register_family(aisix_core::Adapter::Openai, Arc::new(OpenAiBridge::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = crate::build_router(
+            crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "tencent-minimax-m3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+
+        // Client side: Anthropic semantics — input_tokens excludes the
+        // cache read, which gets its own counter.
+        assert_eq!(v["usage"]["input_tokens"], 8_274);
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 60_000);
+        assert_eq!(v["usage"]["output_tokens"], 497);
+        assert!(
+            v["usage"].get("cache_creation_input_tokens").is_none(),
+            "an OpenAI upstream reports no cache write — never fabricate one"
+        );
+
+        // Telemetry side: the upstream's OWN shape, so this call bills
+        // identically whether OpenAI or Anthropic protocol addressed it,
+        // and cp-api's `prompt - cached` split stays correct.
+        let event = rx.recv().await.expect("usage event was never emitted");
+        assert_eq!(event.prompt_tokens, 68_274);
+        assert_eq!(event.cached_prompt_tokens, 60_000);
+        assert_eq!(event.completion_tokens, 497);
+        // The cache hit is a SUBSET of prompt_tokens, so the Anthropic-shape
+        // additive counters stay 0 and the total is not double-counted.
+        assert_eq!(event.cache_read_tokens, 0);
+        assert_eq!(event.cache_creation_tokens, 0);
+        assert_eq!(
+            crate::usage_attr::total_tokens_with_cache(
+                event.prompt_tokens,
+                event.completion_tokens,
+                event.cache_creation_tokens,
+                event.cache_read_tokens,
+            ),
+            68_771
+        );
+    }
+
+    /// Streaming half of the above: the cache hit rides the trailing
+    /// `include_usage` frame, so the closing `message_delta` is the only
+    /// place the client can learn it.
+    #[tokio::test]
+    async fn messages_openai_upstream_cache_hit_streams_and_reaches_usage_event() {
+        use aisix_obs::UsageSink;
+        use aisix_provider_openai::OpenAiBridge;
+        use futures::StreamExt;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"chatcmpl-cache-test\",\"model\":\"MiniMax-M3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"chatcmpl-cache-test\",\"model\":\"MiniMax-M3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: {\"id\":\"chatcmpl-cache-test\",\"model\":\"MiniMax-M3\",\"choices\":[],\"usage\":{\"prompt_tokens\":68274,\"completion_tokens\":497,\"total_tokens\":68771,\"prompt_tokens_details\":{\"cached_tokens\":60000}}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("tencent-minimax-m3"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_family(
+            aisix_core::Adapter::Anthropic,
+            Arc::new(AnthropicBridge::new()),
+        );
+        hub.register_family(aisix_core::Adapter::Openai, Arc::new(OpenAiBridge::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = crate::build_router(
+            crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "tencent-minimax-m3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+                "stream": true
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut stream = resp.into_body().into_data_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let sse_out = String::from_utf8(bytes).unwrap();
+        let closing = sse_out
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+            .find(|v| v["type"] == "message_delta")
+            .expect("closing message_delta emitted");
+        assert_eq!(closing["usage"]["input_tokens"], 8_274);
+        assert_eq!(closing["usage"]["cache_read_input_tokens"], 60_000);
+        assert_eq!(closing["usage"]["output_tokens"], 497);
+
+        let event = rx.recv().await.expect("usage event was never emitted");
+        assert_eq!(event.prompt_tokens, 68_274);
+        assert_eq!(event.cached_prompt_tokens, 60_000);
+        assert_eq!(event.completion_tokens, 497);
+        assert_eq!(event.cache_read_tokens, 0);
+    }
+
     /// (Anthropic inbound) × (DeepSeek upstream).
     #[tokio::test]
     async fn matrix_anthropic_in_deepseek_upstream_non_streaming() {
@@ -4854,7 +5710,8 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     /// realistic Anthropic SSE response (input_tokens in
     /// `message_start`, running output_tokens in `message_delta`) and
     /// asserts the emitted UsageEvent carries the real counts, plus
-    /// the response bytes still pass through verbatim.
+    /// the response bytes still pass through unchanged apart from the
+    /// caller-facing `model` name.
     #[tokio::test]
     async fn anthropic_passthrough_streaming_records_usage_from_sse_frames() {
         use aisix_obs::UsageSink;
@@ -4903,10 +5760,14 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             "max_tokens": 100,
             "stream": true,
         });
+        // The access-log line goes out with the terminal usage event now
+        // (AISIX-Cloud#1571), so it is captured for the same request.
+        let capture = crate::test_log::Capture::install();
         let resp = app.oneshot(make_req(body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Bytes pass through verbatim — the client still sees the exact
+        // Bytes pass through unchanged apart from the caller-facing
+        // `model` name — the client still sees the exact
         // Anthropic SSE wire shape.
         let streamed =
             String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
@@ -4945,6 +5806,29 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             "streaming /v1/messages telemetry must record TTFT",
         );
         assert!(rx.try_recv().is_err(), "usage event should be emitted once");
+
+        // AISIX-Cloud#1571: the line is written beside that event, so its
+        // token columns have to be the total the row bills. On this path
+        // `prompt_tokens` EXCLUDES the two cache dimensions, so a line that
+        // summed only the two visible columns would report 89 where the row
+        // bills 102 — and the two are supposed to be one record.
+        let line = capture.only("a streamed /v1/messages call");
+        assert_eq!(line.status(), 200);
+        assert_eq!(
+            line.num("total_tokens"),
+            Some(u64::from(
+                event.prompt_tokens
+                    + event.completion_tokens
+                    + event.cache_creation_tokens
+                    + event.cache_read_tokens
+            )),
+            "the line and the row must agree on what the request cost",
+        );
+        assert_eq!(line.num("total_tokens"), Some(102));
+        assert_eq!(
+            line.field("provider_request_id").as_deref(),
+            Some("msg_stream_245")
+        );
     }
 
     /// AISIX-Cloud#952: relay backends that ship NO usage on
@@ -5012,6 +5896,27 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(event.provider_model_version, "mco-5");
     }
 
+    /// A frame whose data line is not splice-able JSON forwards verbatim
+    /// rather than being corrupted or dropped — the restamp is best-effort
+    /// by design, and losing one frame's model name beats mangling a stream.
+    #[test]
+    fn restamp_leaves_unparseable_frames_alone() {
+        use crate::model_echo::{anthropic_message_model, restamp_sse_frame};
+
+        for frame in [
+            &b"data: not json at all\n\n"[..],
+            &b"data: {\"message\":{\"model\":\n\n"[..],
+            &b"data:\n\n"[..],
+            &b"event: ping\n\n"[..],
+        ] {
+            assert!(
+                restamp_sse_frame(frame, "gw-alias", anthropic_message_model).is_none(),
+                "no rewrite for {:?}",
+                String::from_utf8_lossy(frame),
+            );
+        }
+    }
+
     /// Issue #245: the SSE frame parser must reassemble events that
     /// arrive split across byte-chunk boundaries (reqwest's
     /// `bytes_stream()` makes no frame-alignment guarantees). Drives
@@ -5033,7 +5938,15 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":11}}}\n\n\
 event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2",
         );
-        drain_anthropic_sse_frames(&mut buf, &mut acc, started, &mut first_token_seen);
+        let mut out: Vec<u8> = Vec::new();
+        drain_anthropic_sse_frames(
+            &mut buf,
+            &mut acc,
+            started,
+            &mut first_token_seen,
+            "gw-alias",
+            &mut out,
+        );
         // Only the complete first frame is consumed.
         assert_eq!(acc.prompt_tokens, 11, "input_tokens parsed from frame 1");
         assert_eq!(acc.provider_request_id, "m1");
@@ -5041,15 +5954,40 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             acc.completion_tokens, 0,
             "partial frame 2 must NOT be parsed until its terminator arrives",
         );
+        // The completed frame is forwarded with the caller's model name
+        // restamped; the partial one is withheld, so no half-frame reaches
+        // the client and no upstream id leaks on the way past.
+        let emitted = String::from_utf8(std::mem::take(&mut out)).unwrap();
+        assert!(
+            emitted.contains("\"model\":\"gw-alias\"") && !emitted.contains("claude-x"),
+            "message_start forwards with the caller's name: {emitted}",
+        );
+        assert!(
+            emitted.ends_with("}}}\n\n") && !emitted.contains("message_delta"),
+            "the partial second frame is withheld: {emitted}",
+        );
 
         // Second "chunk": the remainder of the message_delta frame.
         buf.extend_from_slice(b"3}}\n\n");
-        drain_anthropic_sse_frames(&mut buf, &mut acc, started, &mut first_token_seen);
+        drain_anthropic_sse_frames(
+            &mut buf,
+            &mut acc,
+            started,
+            &mut first_token_seen,
+            "gw-alias",
+            &mut out,
+        );
         assert_eq!(
             acc.completion_tokens, 23,
             "output_tokens parsed once the split frame is reassembled",
         );
         assert!(buf.is_empty(), "buffer fully drained after both frames");
+        let emitted = String::from_utf8(out).unwrap();
+        assert!(
+            emitted.starts_with("event: message_delta\n")
+                && emitted.contains("\"output_tokens\":23"),
+            "the reassembled frame forwards whole and unaltered: {emitted}",
+        );
     }
 
     /// Issue #245 (audit angle 8c): a stream that carries NO usage
@@ -5072,7 +6010,20 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             b"event: ping\ndata: {\"type\":\"ping\"}\n\n\
 event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\n",
         );
-        drain_anthropic_sse_frames(&mut buf, &mut acc, started, &mut first_token_seen);
+        let mut out: Vec<u8> = Vec::new();
+        let expected = buf.clone();
+        drain_anthropic_sse_frames(
+            &mut buf,
+            &mut acc,
+            started,
+            &mut first_token_seen,
+            "gw-alias",
+            &mut out,
+        );
+        assert_eq!(
+            out, expected,
+            "frames with no model reach the client byte-for-byte",
+        );
 
         assert_eq!(acc.prompt_tokens, 0, "no usage → prompt_tokens stays zero");
         assert_eq!(acc.completion_tokens, 0, "no usage → completion stays zero");
@@ -5419,7 +6370,7 @@ data: [DONE]\n\n";
             }"#,
         )
         .unwrap();
-        snap.guardrails.insert(ResourceEntry::new("g-mask", row, 1));
+        crate::seed_env_scoped_guardrail(snap, ResourceEntry::new("g-mask", row, 1));
     }
 
     #[track_caller]
@@ -5563,5 +6514,708 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             .expect("usage event was never emitted")
             .expect("usage event sender dropped");
         assert_masked_by_eda(&event);
+    }
+
+    /// AISIX-Cloud#1428: a STREAMING `/v1/messages` response the output hook
+    /// refuses must be recorded as a guardrail block.
+    ///
+    /// The refusal happens after the response head is out, so the caller
+    /// gets a 200 followed by a terminal `error` frame — and the usage row,
+    /// which is emitted from the stream's Drop guard, therefore also
+    /// carries 200 with the upstream's tokens. Everything about it read as
+    /// a clean delivery: the request was refused, the held content dropped,
+    /// and neither the row's status nor its flag said so. `guardrail_blocked`
+    /// is the only field that can — the status must stay 200 because that
+    /// is what the caller was actually sent, which is the same shape
+    /// `/v1/chat/completions` records.
+    ///
+    /// Both streaming relays are driven, because each accumulates into its
+    /// own struct and so needed the flag wired separately: the Anthropic
+    /// passthrough (raw upstream SSE bytes, held and released) and the
+    /// cross-provider bridge (`ChatChunk`s re-encoded into Anthropic SSE).
+    #[tokio::test]
+    async fn streaming_output_block_marks_guardrail_blocked_usage_event() {
+        use aisix_obs::UsageSink;
+        use aisix_provider_openai::OpenAiBridge;
+
+        // (relay, upstream path, upstream SSE, model entry, snapshot,
+        //  billed prompt/completion tokens)
+        let anthropic_sse = "\
+event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_block\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"here it is: BLOCKME\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let openai_sse = "\
+data: {\"id\":\"cmpl-block\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-block\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"here it is: BLOCKME\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":9,\"total_tokens\":20}}\n\n\
+data: [DONE]\n\n";
+
+        for (relay, upstream_path, sse) in [
+            ("anthropic passthrough", "/v1/messages", anthropic_sse),
+            ("cross-provider bridge", "/chat/completions", openai_sse),
+        ] {
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(upstream_path))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(sse),
+                )
+                .mount(&upstream)
+                .await;
+
+            let anthropic_upstream = upstream_path == "/v1/messages";
+            let snap = if anthropic_upstream {
+                let snap = new_snap_anthropic(&upstream.uri());
+                snap.models.insert(anthropic_model("my-claude"));
+                snap
+            } else {
+                let snap = new_snap_openai(&upstream.uri());
+                snap.models.insert(openai_model("my-claude"));
+                snap
+            };
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            let row: aisix_core::models::Guardrail = serde_json::from_str(
+                r#"{"name":"out-block","enabled":true,"kind":"keyword","hook_point":"output","fail_open":false,"patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
+            )
+            .unwrap();
+            crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-out", row, 1));
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let hub = Arc::new(Hub::new());
+            hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+            hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+            let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx));
+
+            let resp = crate::build_router(state)
+                .oneshot(make_req(serde_json::json!({
+                    "model": "my-claude",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "stream": true,
+                })))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{relay}");
+            let streamed =
+                String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec())
+                    .unwrap();
+            // Hold-back: the matched content never reached the wire.
+            assert!(
+                !streamed.contains("BLOCKME"),
+                "{relay}: the blocked content was released: {streamed}"
+            );
+
+            let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .expect("usage event was never emitted")
+                .expect("usage event sender dropped");
+            assert!(
+                event.guardrail_blocked,
+                "{relay}: a refused stream must be findable under guardrail_blocked=true"
+            );
+            // The upstream generated (and billed) before the hook refused,
+            // so the tokens stay on the row — under-reporting spend the
+            // customer was charged for would be the wrong repair.
+            assert_eq!(event.prompt_tokens, 11, "{relay}");
+            assert_eq!(event.completion_tokens, 9, "{relay}");
+            // A refusal is not an abandonment. Both relays report the 200 the
+            // caller's response head already committed, which is what
+            // `/v1/chat/completions` records for the same event.
+            assert_eq!(event.status_code, 200, "{relay}");
+        }
+    }
+
+    /// AISIX-Cloud#1428: the hold-back OVERFLOW arm — a response too large to
+    /// buffer for scanning, which fails closed — is a guardrail refusal too,
+    /// and must not be filed as a client abandonment.
+    ///
+    /// This arm returns mid-stream, before the upstream-EOF marker, so
+    /// `reached_end` stays false and the row used to report `499`: "the
+    /// caller went away". Nobody went away — the gateway refused. chat.rs
+    /// gets 200 here by `break`ing out to its EOF marker; this reaches the
+    /// same answer off the flag, which leaves `reached_end` meaning what its
+    /// doc says.
+    #[tokio::test]
+    async fn streaming_holdback_overflow_is_a_block_not_an_abandonment() {
+        use aisix_obs::UsageSink;
+
+        // Past DEFAULT_STREAM_OUTPUT_BUFFER_BYTES (256 KiB) of held text,
+        // and deliberately clean: the cap, not the content, is what refuses.
+        let big = "x".repeat(300_000);
+        let upstream = MockServer::start().await;
+        let sse = format!(
+            "\
+event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_big\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{{\"input_tokens\":11,\"output_tokens\":1}}}}}}\n\n\
+event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{big}\"}}}}\n\n\
+event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":9}}}}\n\n\
+event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        // A row whose streamed-output policy is the whole-response hold-back;
+        // the literal never appears, so only the cap can refuse.
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"out-block","enabled":true,"kind":"keyword","hook_point":"output","fail_open":false,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-out", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "my-claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+                "stream": true,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let streamed =
+            String::from_utf8(to_bytes(resp.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+        assert!(
+            streamed.contains(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+            "the oversized stream must fail closed: {}",
+            &streamed[..streamed.len().min(400)]
+        );
+        assert!(
+            !streamed.contains(&big),
+            "unscannable content must not be released"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("usage event sender dropped");
+        assert_refused_not_abandoned(&event);
+    }
+
+    /// The input-side refusal of a body the Anthropic parser rejects is a
+    /// GUARDRAIL decision, so it needs a guardrail that would have read the
+    /// body. An output-hook-only row is in the resolved chain but never sees
+    /// the request; refusing on its strength turns an output policy into a
+    /// request-shape validator. Fails on `a456ab71` with 422.
+    #[tokio::test]
+    async fn unparseable_body_with_an_output_only_guardrail_is_forwarded() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"out-only","enabled":true,"kind":"keyword","hook_point":"output","fail_open":false,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-out", row, 1));
+
+        // The premise, asserted rather than assumed: the seeded row IS in
+        // the chain this request resolves, and it is not an input-side
+        // one. Without this the forwarding assertion below is the same
+        // observation as the no-guardrail case, and would pass just as
+        // well if the row had never been indexed at all.
+        let probe =
+            aisix_guardrails::LiveGuardrailIndex::new(SnapshotHandle::new(snap.clone()), None)
+                .resolve(&aisix_guardrails::RequestContext {
+                    passthrough_route_id: "",
+                    model_id: "",
+                    mcp_server_id: "",
+                    api_key_id: "",
+                    team_id: None,
+                });
+        assert!(!probe.is_empty(), "the seeded row must reach the chain");
+        assert!(
+            !aisix_guardrails::Guardrail::runs_on_input(&probe),
+            "and it must be output-side only"
+        );
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+
+        // No `messages` key: the scan parser rejects it, the provider is the
+        // one entitled to judge the shape.
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "my-claude",
+                "max_tokens": 100,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// `fail_open: true` opts an input-hook row out of the refusal, on the
+    /// same grounds: it reports itself as `guardrail_unavailable`, which is
+    /// the condition that setting governs. Fails on `8955d6ab` with 422.
+    #[tokio::test]
+    async fn unparseable_body_with_a_fail_open_guardrail_is_forwarded() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"in-open","enabled":true,"kind":"keyword","hook_point":"input","fail_open":true,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-open", row, 1));
+
+        // Premise: the row IS in the chain and DOES read the request; it
+        // simply must not refuse. Without this, a row that never arrived
+        // would forward for an entirely different reason.
+        let probe =
+            aisix_guardrails::LiveGuardrailIndex::new(SnapshotHandle::new(snap.clone()), None)
+                .resolve(&aisix_guardrails::RequestContext {
+                    passthrough_route_id: "",
+                    model_id: "",
+                    mcp_server_id: "",
+                    api_key_id: "",
+                    team_id: None,
+                });
+        assert!(aisix_guardrails::Guardrail::runs_on_input(&probe));
+        assert!(!aisix_guardrails::Guardrail::refuses_unevaluable_input(
+            &probe
+        ));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "my-claude",
+                "max_tokens": 100,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// The forwarding above is a fail-open BYPASS, and it has to be
+    /// findable: the prompt reached the provider with nothing screening
+    /// it, and the usage row otherwise reads exactly like a screened one.
+    /// The tag matches what the fail-CLOSED direction puts in its refusal
+    /// envelope.
+    #[tokio::test]
+    async fn a_forwarded_unparseable_body_records_the_bypass_on_its_usage_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"in-open","enabled":true,"kind":"keyword","hook_point":"input","fail_open":true,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-open", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        // No `messages` — the scan parser rejects it, which is what makes
+        // the body unscannable.
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "my-claude",
+                "max_tokens": 100,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("/v1/messages must emit a usage event")
+            .expect("channel open");
+        assert_eq!(
+            event.guardrail_bypassed_reason,
+            crate::error::TAG_UNSCANNABLE_BODY,
+            "{event:?}",
+        );
+    }
+
+    /// The same unparseable body with an INPUT-hook row attached keeps the
+    /// fail-closed refusal #1022 introduced.
+    #[tokio::test]
+    async fn unparseable_body_with_an_input_guardrail_is_refused() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"in-only","enabled":true,"kind":"keyword","hook_point":"input","fail_open":false,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-in", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "my-claude",
+                "max_tokens": 100,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(crate::error::TAG_UNSCANNABLE_BODY),
+            "{v}"
+        );
+    }
+
+    /// Drive one streamed `/v1/messages` request through a block-capable
+    /// output guardrail (so the hold-back path is in force). `sse` is the
+    /// upstream's raw SSE response; the pair returned is the body the CALLER
+    /// received and the UsageEvent the request emitted — both halves matter,
+    /// since a refusal has to look right on the wire AND in telemetry.
+    ///
+    /// The guardrail's literal never appears in any case below, so a refusal
+    /// can only come from bytes the scan could not see — which is what these
+    /// tests are about.
+    async fn holdback_case(sse: String) -> (String, aisix_obs::UsageEvent) {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        // Block-capable, so the stream is held back; the literal never
+        // appears, so only the unscannable-bytes arms can refuse.
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"out-block","enabled":true,"kind":"keyword","hook_point":"output","fail_open":false,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-out", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "my-claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+                "stream": true,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 1 << 21).await.unwrap().to_vec()).unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("usage event sender dropped");
+        (body, event)
+    }
+
+    /// Every fail-closed arm reports the same way: the gateway ended this, so
+    /// it is a 200 carrying `guardrail_blocked`, not the 499 a client
+    /// abandonment would produce (AISIX-Cloud#1428). Asserted per arm because
+    /// each sets the flag itself — drop `guardrail_blocked = true` from any one
+    /// of them and only its own test can notice.
+    fn assert_refused_not_abandoned(event: &aisix_obs::UsageEvent) {
+        assert!(event.guardrail_blocked, "a refusal is a guardrail block");
+        assert_eq!(
+            event.status_code, 200,
+            "a fail-closed refusal is not a client abandonment"
+        );
+    }
+
+    /// A stream that dies mid-JSON: the scanned frames are delivered, the
+    /// unparseable remainder is not. Nothing can extract that fragment's text,
+    /// so it cannot reach the output scan, and releasing it afterwards would
+    /// be a way around the check. Contrast the test below, where the tail is
+    /// complete JSON and merely lacks its blank line — that one IS delivered.
+    #[tokio::test]
+    async fn holdback_withholds_an_unparseable_tail_but_delivers_what_was_scanned() {
+        let sse = r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_t","role":"assistant","content":[],"model":"claude-3-5-haiku-20241022","stop_reason":null,"usage":{"input_tokens":4,"output_tokens":1}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"SCANNEDTEXT"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"UNSCANNEDTAIL""#;
+        let (streamed, event) = holdback_case(sse.to_string()).await;
+        // Frames WERE delivered, so this is not a refusal — the tail is simply
+        // withheld and the stream reports normally.
+        assert!(
+            !event.guardrail_blocked,
+            "withholding a tail is not a block"
+        );
+        assert!(
+            streamed.contains("SCANNEDTEXT"),
+            "frames that were scanned still reach the caller: {streamed}"
+        );
+        assert!(
+            !streamed.contains("UNSCANNEDTAIL"),
+            "the unterminated tail must not be released: {streamed}"
+        );
+        // The caller's alias, not the upstream id, on the way past.
+        assert!(streamed.contains(r#""model":"my-claude""#));
+        assert!(!streamed.contains("claude-3-5-haiku-20241022"));
+    }
+
+    /// A single frame that never terminates and runs past the 1 MiB frame
+    /// cap. Same bypass as the tail, reached by size instead of by EOF, so it
+    /// takes the same refusal — and `unscannable_body` rather than a
+    /// size-shaped tag, because the scan is what it missed.
+    #[tokio::test]
+    async fn holdback_refuses_a_frame_that_overruns_the_cap_without_terminating() {
+        let huge = "y".repeat(super::MAX_SSE_FRAME_BUF_BYTES + 1024);
+        let sse = format!(
+            concat!(
+                "event: content_block_delta\n",
+                r#"data: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{huge}""#,
+            ),
+            huge = huge
+        );
+        let (streamed, event) = holdback_case(sse).await;
+        assert!(
+            streamed.contains(crate::error::TAG_UNSCANNABLE_BODY),
+            "an unterminated oversized frame is refused, not released: {}",
+            &streamed[..streamed.len().min(400)]
+        );
+        assert!(
+            !streamed.contains(&huge),
+            "unscannable content must not be released"
+        );
+        assert_refused_not_abandoned(&event);
+    }
+
+    /// A provider that omits only the FINAL blank line. The frame is complete
+    /// JSON, so at EOF it can be parsed like any other, which puts its text in
+    /// front of the output guardrail — and once scanned there is no reason to
+    /// withhold it. Dropping it here was a regression: `message_stop` carries
+    /// no text, so withholding it protected nothing while breaking every
+    /// Anthropic SDK client that waits for it (`get_final_message`).
+    #[tokio::test]
+    async fn holdback_delivers_a_complete_tail_that_merely_lacks_its_terminator() {
+        let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ok\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":4,\"output_tokens\":1}}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}";
+        let (streamed, event) = holdback_case(sse.to_string()).await;
+        assert!(
+            streamed.contains("message_stop"),
+            "a complete final frame is delivered even without its blank line: {streamed}"
+        );
+        assert!(streamed.contains("hello"));
+        assert!(
+            !event.guardrail_blocked,
+            "a scannable tail is not a refusal: {streamed}"
+        );
+        assert!(!streamed.contains(crate::error::TAG_UNSCANNABLE_BODY));
+    }
+
+    /// The third arm: the unparseable frame is the WHOLE response, and small
+    /// enough that the frame cap never fires. Nothing was ever drained, so
+    /// nothing was scanned and there is nothing to deliver — dropping it
+    /// silently would hand the caller an empty 200 with no signal at all, so
+    /// it is refused explicitly instead.
+    #[tokio::test]
+    async fn holdback_refuses_when_the_unterminated_frame_is_the_whole_response() {
+        let sse = r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ONLYEVERFRAGMENT""#;
+        let (streamed, event) = holdback_case(sse.to_string()).await;
+        assert!(
+            streamed.contains(crate::error::TAG_UNSCANNABLE_BODY),
+            "an all-fragment response is refused, not silently emptied: {streamed}"
+        );
+        assert!(
+            !streamed.contains("ONLYEVERFRAGMENT"),
+            "unscanned content must not be released: {streamed}"
+        );
+        assert_refused_not_abandoned(&event);
+    }
+
+    /// The two halves of `/v1/messages` must render the same refusal the
+    /// same way. The HTTP 422 path maps that status to
+    /// `invalid_request_error` (`anthropic_kind_from_status`), because
+    /// Anthropic's `error.type` is a closed enum with no `content_filter`
+    /// member — so the streaming terminal frame emitting `content_filter`
+    /// both disagreed with its own sibling and failed the SDK's typed
+    /// parse. The envelope carries no `code` either; Anthropic's shape has
+    /// none.
+    #[test]
+    fn streaming_block_frame_uses_a_legal_anthropic_error_type() {
+        let frame = super::guardrail_block_frame(Some("gr-block"), None);
+        let payload = frame
+            .strip_prefix("event: error\ndata: ")
+            .and_then(|r| r.strip_suffix("\n\n"))
+            .expect("an SSE error frame labelled `error`");
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(v["error"]["message"].as_str().unwrap().contains("gr-block"));
+        assert!(v["error"].get("code").is_none());
+        assert_eq!(v["error"].as_object().unwrap().len(), 2);
+
+        // The same value the buffered half renders for this refusal.
+        assert_eq!(
+            v["error"]["type"].as_str().unwrap(),
+            crate::error::anthropic_kind_from_status(axum::http::StatusCode::UNPROCESSABLE_ENTITY),
+        );
+    }
+
+    /// A streamed `/v1/messages` response writes ONE access-log line, at the
+    /// stream's end rather than when the head went out — so each of the
+    /// three endings a stream has reports its own outcome
+    /// (AISIX-Cloud#1571). Written at the handler tail, all three said
+    /// `200`, including the two where the caller was already gone and the
+    /// request's own usage event said `499`.
+    #[tokio::test]
+    async fn a_streamed_request_writes_one_line_per_stream_ending() {
+        use aisix_provider_openai::OpenAiBridge;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("my-claude-alias"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let app = crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache());
+
+        let endings = crate::test_log::three_stream_endings(app, || {
+            make_req(serde_json::json!({
+                "model": "my-claude-alias",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+                "stream": true,
+            }))
+        })
+        .await;
+        crate::test_log::assert_one_line_per_ending(&endings, "/v1/messages", "k-1");
+        crate::test_log::assert_latency_is_time_to_first_token(&endings);
+        assert_eq!(
+            endings.delivered.field("model").as_deref(),
+            Some("my-claude-alias"),
+        );
+        assert_eq!(
+            endings.abandoned.field("upstream_model").as_deref(),
+            Some("gpt-4o"),
+            "an abandoned stream must still name the target it was dispatched to",
+        );
     }
 }

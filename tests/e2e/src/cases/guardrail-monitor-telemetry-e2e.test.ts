@@ -167,7 +167,7 @@ describe("guardrail monitor-hit telemetry: would_block/would_mask on usage event
     expect(text).toContain(GUARD_NAME);
 
     // A block-action detector in monitor mode: 200 to the caller, upstream
-    // called, would_block hit with the detector name on the event.
+    // called, would_block hit with a code-owned kind/outcome summary.
     const upstreamBefore = upstream.receivedRequests.length;
     const res = await chat(`my id is ${CN_ID} thanks`);
     expect(res.status).toBe(200);
@@ -179,7 +179,8 @@ describe("guardrail monitor-hit telemetry: would_block/would_mask on usage event
     );
     text = decodedTextFor(sls, META_LOGSTORE);
     expect(text).toContain("would_block");
-    expect(text).toContain("china_id_card");
+    expect(text).toContain("pii guardrail policy matched");
+    expect(text).not.toContain("china_id_card");
 
     // No-leak (#153): the matched values never appear in the events.
     expect(text).not.toContain(EMAIL);

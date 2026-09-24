@@ -1,5 +1,16 @@
 import { harnessRequest } from "./http.js";
 
+export interface ProxyResponse {
+  status: number;
+  body: unknown;
+  /**
+   * The gateway's own request id, echoed on every response. Lets a spec
+   * wait for THIS request's access-log line — the FIFO barrier that says
+   * everything the request wrote before it has been written too.
+   */
+  requestId: string;
+}
+
 /**
  * Thin typed wrapper over the proxy surface. Tests that want full SDK
  * compatibility can use the `openai` npm package directly with
@@ -13,11 +24,11 @@ export class ProxyClient {
     private readonly apiKey: string,
   ) {}
 
-  async listModels(): Promise<{ status: number; body: unknown }> {
+  async listModels(): Promise<ProxyResponse> {
     return this.json("GET", "/v1/models");
   }
 
-  async chat(body: unknown): Promise<{ status: number; body: unknown }> {
+  async chat(body: unknown): Promise<ProxyResponse> {
     return this.json("POST", "/v1/chat/completions", body);
   }
 
@@ -25,7 +36,7 @@ export class ProxyClient {
     method: string,
     path: string,
     body?: unknown,
-  ): Promise<{ status: number; body: unknown }> {
+  ): Promise<ProxyResponse> {
     const res = await harnessRequest(`${this.baseUrl}${path}`, {
       method,
       headers: {
@@ -38,6 +49,7 @@ export class ProxyClient {
     return {
       status: res.statusCode,
       body: text ? safeParse(text) : null,
+      requestId: res.headers["x-aisix-request-id"]?.toString() ?? "",
     };
   }
 }

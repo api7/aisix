@@ -216,15 +216,17 @@ where
             .map(|r| r.0.clone())
             .unwrap_or_else(crate::request_id::new_request_id);
 
-        Ok(ClientContext {
+        let api_key = parts
+            .extensions
+            .get::<Arc<aisix_core::ResourceEntry<aisix_core::ApiKey>>>();
+
+        let ctx = ClientContext {
             source_ip,
             user_agent,
             routing_tags,
             request_id,
             headers: Arc::new(parts.headers.clone()),
-            caller: parts
-                .extensions
-                .get::<Arc<aisix_core::ResourceEntry<aisix_core::ApiKey>>>()
+            caller: api_key
                 .map(|e| aisix_gateway::CallerIdentity::from_entry(e))
                 .unwrap_or_default(),
             jwt: parts
@@ -235,7 +237,16 @@ where
                 .extensions
                 .get::<Arc<aisix_obs::RequestTraceBundle>>()
                 .cloned(),
-        })
+        };
+        // Hand the caller to the request's attribution cell as well
+        // (AISIX-Cloud#1571). This extractor is the one place every
+        // client-facing handler resolves who is calling, so it is also the
+        // one place that can hand it to the cancel guard — which emits the
+        // request's usage events when the handler future is dropped before
+        // it can. The api_key id comes from the same extension the `caller`
+        // above does, so the two cannot disagree.
+        crate::attribution::note_client(&ctx, api_key.map(|e| e.id.as_str()).unwrap_or_default());
+        Ok(ctx)
     }
 }
 

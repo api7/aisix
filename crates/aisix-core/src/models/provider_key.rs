@@ -14,6 +14,7 @@
 //! `display_name`.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -57,6 +58,27 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<Adapter>,
 
+    /// API surfaces this upstream serves natively, beyond the one its
+    /// `adapter` already implies, and the base URL each one lives at.
+    ///
+    /// One upstream account often exposes more than one protocol, on
+    /// different paths of the same host — an OpenAI-compatible
+    /// `/v1/chat/completions` under `…/v1` and an Anthropic-compatible
+    /// `/v1/messages` under `…/anthropic`, both authenticated by the same
+    /// credential. `api_base` can only name one of them, so without this
+    /// field every request the declared path cannot serve gets translated
+    /// instead — losing whatever the target protocol carries that the
+    /// canonical chat shape does not (prompt-cache breakpoints, thinking
+    /// blocks). Declaring the second entry here lets each inbound protocol
+    /// reach its own native path under the one credential.
+    ///
+    /// Each surface resolves on its own terms; see [`ProviderApis`].
+    /// Surfaces this map has no key for — embeddings, audio, images,
+    /// videos, files/batches/fine-tuning, rerank — always use `api_base`,
+    /// exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apis: Option<ProviderApis>,
+
     /// Telemetry tags carried alongside the key for metric and log emission.
     #[serde(default)]
     pub telemetry_tags: TelemetryTags,
@@ -81,9 +103,127 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<ProviderKeyTls>,
 
+    /// IP addresses the gateway connects to for this key's `api_base`
+    /// host, instead of resolving that host through DNS. Each entry is an
+    /// IPv4 or IPv6 address literal, without a port and without brackets.
+    ///
+    /// Use this when the upstream is reached over a private link that has
+    /// no DNS entry, while the provider still requires its own hostname in
+    /// the request. Only the connection target changes: the `Host` header,
+    /// the HTTP/2 `:authority`, the TLS server name and the certificate
+    /// check all keep using the hostname from `api_base`, and the port and
+    /// scheme keep coming from `api_base` too.
+    ///
+    /// Several addresses are tried in the order given, as a resolver's
+    /// answer would be: the next one is attempted when a connection cannot
+    /// be established, which is how a private link that terminates on one
+    /// address per availability zone stays reachable when one is down.
+    ///
+    /// Scoped to the `api_base` hostname and nothing else. An `apis` entry
+    /// that serves a second protocol from the same host is reached over
+    /// the same link, because it is the same hostname; one that names a
+    /// different host is resolved normally. A key with no `api_base`, or
+    /// whose `api_base` is already an address literal, has no hostname to
+    /// override and is dispatched unchanged.
+    ///
+    /// Honoured on every surface that dispatches through the Provider
+    /// Key's own client: chat completions, completions, embeddings,
+    /// images, audio, `/v1/messages` (and `count_tokens`), `/v1/responses`,
+    /// rerank, videos, the files/batches/fine-tuning surface and
+    /// `/passthrough/*`. Not honoured for Amazon Bedrock or `/v1/realtime`,
+    /// which connect on their own transports — the same two that
+    /// `tls` does not reach.
+    ///
+    /// Not applicable when the gateway reaches its upstreams through a
+    /// forward proxy (`HTTPS_PROXY` / `ALL_PROXY` in the gateway's
+    /// environment): the proxy is given the hostname and resolves it
+    /// itself, so nothing here is consulted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolve_addresses: Option<Vec<IpAddr>>,
+
     /// Filled in by the snapshot loader from the etcd key path.
     #[serde(skip)]
     pub(crate) runtime_id: String,
+}
+
+/// The API surfaces a Provider Key can declare in [`ProviderKey::apis`].
+///
+/// Only surfaces whose native path the gateway can choose *instead of*
+/// translating belong here — declaring one is a statement about which of
+/// the two it takes. `/v1/chat/completions` is deliberately absent: every
+/// path reaches it through a provider bridge at `api_base`, so there is
+/// no choice to declare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ApiSurface {
+    /// OpenAI-wire `/v1/responses`.
+    Responses,
+    /// Anthropic-wire `/v1/messages`, and its `/count_tokens` sub-route.
+    Messages,
+}
+
+/// Per-surface native entry points on one upstream.
+///
+/// The two surfaces resolve differently, because the evidence for them
+/// differs:
+///
+/// - `messages` is **additive**. An `adapter: anthropic` key (or the
+///   `anthropic` vendor) speaks that wire by declaration and keeps serving
+///   `/v1/messages` natively whatever this map says; listing it here adds
+///   the route to a key whose adapter is something else. That is the
+///   DeepSeek/Zhipu shape — an OpenAI-compatible key whose vendor also
+///   fronts an Anthropic-compatible path. An entry's own `base` always
+///   decides WHERE the Anthropic wire lives, for the verbatim
+///   passthrough and for the bridge that translates into it alike;
+///   without one it is `api_base`.
+/// - `responses` is **authoritative**. Once this map exists, `/v1/responses`
+///   is served natively only if it is listed. The Responses API is a strict
+///   superset of chat completions rather than a rename, so an
+///   OpenAI-compatible endpoint serving one does not necessarily serve the
+///   other, and `adapter: openai` is not evidence either way. Leaving it
+///   out is how an operator says "this endpoint has no `/v1/responses`" and
+///   gets the request translated to chat completions instead of 404'd
+///   upstream.
+///
+/// With no map at all, each falls back to what the gateway inferred
+/// before this field existed: `/v1/messages` from the vendor id or the
+/// `anthropic` adapter, `/v1/responses` from the vendor id alone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+pub struct ProviderApis {
+    /// OpenAI-wire `/v1/responses`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses: Option<ApiEndpoint>,
+
+    /// Anthropic-wire `/v1/messages` (and `/v1/messages/count_tokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages: Option<ApiEndpoint>,
+}
+
+impl ProviderApis {
+    /// The declared entry for `surface`, if any.
+    pub fn get(&self, surface: ApiSurface) -> Option<&ApiEndpoint> {
+        match surface {
+            ApiSurface::Responses => self.responses.as_ref(),
+            ApiSurface::Messages => self.messages.as_ref(),
+        }
+    }
+}
+
+/// One declared entry point.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+pub struct ApiEndpoint {
+    /// Base URL this surface is served at. Omit when it is the same one
+    /// `api_base` names — an entry with no `base` still carries the
+    /// declaration that the surface exists.
+    ///
+    /// Deliberately NOT length-constrained, matching `api_base`. The
+    /// lenient read schema keeps every constraint but the open-object
+    /// one, so a `minLength` here would make an empty string skip the
+    /// whole Provider Key row — and with it every model that references
+    /// the key — where the same empty string on `api_base` is the
+    /// control plane's documented way to clear an override. An empty
+    /// value is treated as "no override" at resolution time instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 /// TLS settings for connections to one Provider Key's `api_base`.
@@ -136,6 +276,82 @@ impl ProviderKeyTls {
     /// settings would build it, so the shared client can be reused.
     pub fn is_noop(&self) -> bool {
         self.ca_cert.as_ref().is_none_or(|p| p.trim().is_empty()) && self.verify
+    }
+}
+
+/// The connection-level overrides one Provider Key applies to every
+/// upstream request dispatched on its behalf.
+///
+/// Built from the key rather than read field-by-field at the dispatch
+/// sites, so the gateway's per-key client cache has one key covering
+/// every input that changes how the connection is made. `Hash` for that
+/// cache; two keys configured identically share one connection pool.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UpstreamConnection {
+    /// Trust settings for the connection, when they differ from the
+    /// gateway's deployment-wide ones.
+    pub tls: Option<ProviderKeyTls>,
+
+    /// Hostname-to-addresses overrides applied instead of DNS resolution,
+    /// from `resolve_addresses`. Empty when the key sets none; each entry
+    /// carries its addresses in the order they are tried.
+    pub resolve: Vec<(String, Vec<IpAddr>)>,
+}
+
+impl UpstreamConnection {
+    /// Whether this leaves the connection exactly as the deployment-wide
+    /// settings would build it, so the shared pool can be reused.
+    ///
+    /// [`ProviderKey::upstream_connection`] already answers `None` in that
+    /// case, but the fields are public and the constructor is not the only
+    /// way to reach [`client_for_provider_key`]: a value that configures
+    /// nothing must not split the connection pool, and must not lose the
+    /// per-worker pool it would otherwise dispatch on.
+    ///
+    /// [`client_for_provider_key`]: https://docs.rs/aisix-gateway
+    pub fn is_noop(&self) -> bool {
+        self.resolve.is_empty() && self.tls.as_ref().is_none_or(ProviderKeyTls::is_noop)
+    }
+}
+
+impl ProviderKey {
+    /// The overrides this key's upstream connections are made with, or
+    /// `None` when it configures none — the overwhelmingly common case,
+    /// and the one that must keep sharing the gateway's connection pool.
+    pub fn upstream_connection(&self) -> Option<UpstreamConnection> {
+        let tls = self.tls.clone().filter(|t| !t.is_noop());
+        let addresses = self
+            .resolve_addresses
+            .as_deref()
+            .filter(|addrs| !addrs.is_empty());
+        let resolve: Vec<(String, Vec<IpAddr>)> = match (addresses, self.base_hostname()) {
+            (Some(addrs), Some(host)) => vec![(host, addrs.to_vec())],
+            _ => Vec::new(),
+        };
+        if tls.is_none() && resolve.is_empty() {
+            return None;
+        }
+        Some(UpstreamConnection { tls, resolve })
+    }
+
+    /// The hostname `api_base` dials, if it names one.
+    ///
+    /// Deliberately narrow. Resolving only what `api_base` names keeps the
+    /// override to the endpoint the operator pointed at: a second protocol
+    /// declared in `apis` on the SAME host is covered because it is the
+    /// same name, and one on a different host keeps resolving normally
+    /// rather than being silently redirected onto the private link.
+    ///
+    /// `None` for a base the gateway cannot parse as a URL, for one whose
+    /// authority is an address literal, and for a key with no base at all:
+    /// none of them has a name to resolve, so the connection is left
+    /// exactly as it was.
+    fn base_hostname(&self) -> Option<String> {
+        let base = self.api_base.as_deref()?.trim();
+        match url::Url::parse(base).ok()?.host()? {
+            url::Host::Domain(domain) => Some(domain.to_string()),
+            url::Host::Ipv4(_) | url::Host::Ipv6(_) => None,
+        }
     }
 }
 
@@ -255,17 +471,70 @@ pub struct RequestOverrides {
     /// variables, such as `"${request.api_key.team_id}"`; a header whose
     /// variables do not all resolve is dropped rather than sent blank. See
     /// [`crate::header_template`] for the closed variable vocabulary.
-    /// Reserved auth headers are dropped as defense-in-depth.
+    ///
+    /// "When the caller did not set them" includes the gateway itself:
+    /// an entry naming the slot this ProviderKey's credential occupies
+    /// is not applied. Use `forward_client_headers` to put the caller's
+    /// own credential there instead.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub default_headers: HashMap<String, String>,
 
-    /// Inbound client headers forwarded to the upstream provider, as
-    /// single-`*` glob patterns matched case-insensitively against the
-    /// header name (`"anthropic-beta"`, `"x-trace-*"`). Empty — the
+    /// Inbound client headers forwarded to the upstream, as single-`*`
+    /// glob patterns matched case-insensitively against the header name
+    /// (`"anthropic-beta"`, `"x-trace-*"`, `"authorization"`). Empty — the
     /// default — forwards nothing, which is the behavior of every
-    /// standard-protocol endpoint before AISIX-Cloud#1167. Auth,
-    /// transport, and gateway-owned headers are never forwarded whatever
-    /// the patterns say.
+    /// standard-protocol endpoint before AISIX-Cloud#1167.
+    ///
+    /// A header the caller sends more than once is forwarded with its
+    /// first value only; the upstream receives one well-formed header
+    /// rather than a list this gateway never interpreted. An HTTP/2
+    /// caller may split `cookie` across several header fields, and only
+    /// the first of them is forwarded.
+    ///
+    /// A header named here reaches the upstream whatever the gateway would
+    /// otherwise do with it. Naming a credential slot — `authorization`,
+    /// `proxy-authorization`, `x-api-key`, `api-key`, `x-goog-api-key`,
+    /// `cookie`, and the AWS SigV4 trio `x-amz-security-token` /
+    /// `x-amz-date` / `x-amz-content-sha256` — hands the upstream the
+    /// caller's own credential in place of the
+    /// one this ProviderKey would inject there, never both. That is what lets an
+    /// internal service that already authorizes on the end user's
+    /// `Authorization` keep doing so unchanged. Any OTHER header the
+    /// gateway had already set is left alone: it selects how the exchange
+    /// works, not who it is from.
+    ///
+    /// A credential slot, and `traceparent` / `tracestate`, are forwarded
+    /// only when a pattern names them exactly — a glob such as `"*"` or
+    /// `"x-*"` is a statement about the operator's own headers, not
+    /// consent to hand a third party the caller's credential or to graft
+    /// the caller's trace onto that party's telemetry.
+    ///
+    /// Two cases where a named header still does not reach the upstream. A
+    /// `default_headers` entry of the same name wins it for every name
+    /// except a credential slot: both are operator configuration and the
+    /// static one is the more specific choice, but in a credential slot the
+    /// forwarded value is precisely the one that was asked for, so it takes
+    /// the slot from the static entry. And on an AWS Bedrock provider the
+    /// request signer owns `authorization`, `x-amz-date`,
+    /// `x-amz-content-sha256`, `x-amz-security-token`, `x-amz-target` and
+    /// `x-amzn-bedrock-accept`, and drops any supplied value — a value
+    /// there would not authenticate anyone: it either loses to the signer
+    /// or breaks the signature.
+    ///
+    /// Naming a credential slot needs a data plane new enough to honor
+    /// it; an older one refuses those names outright, so the pattern has
+    /// no effect there rather than a different one.
+    ///
+    /// Headers whose forwarding would break the exchange rather than
+    /// change who it comes from are never forwarded whatever the patterns
+    /// say: `host`, the hop-by-hop headers that describe the caller's own
+    /// connection, and the gateway's `x-aisix-*` namespace. The headers
+    /// describing a body this gateway re-serializes or a response shape it
+    /// parses (`content-type`, `content-length`, `accept`,
+    /// `anthropic-version`, `x-stainless-*`) are excluded for the same
+    /// reason. `traceparent` and `tracestate` are forwarded only when a
+    /// pattern names them exactly — a glob is not read as consent to graft
+    /// the caller's trace onto the upstream's telemetry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forward_client_headers: Vec<String>,
 
@@ -375,6 +644,143 @@ mod tests {
         let p: ProviderKey =
             serde_json::from_str(r#"{"display_name":"x","secret":"k","extra":1}"#).unwrap();
         assert_eq!(p.display_name, "x");
+    }
+
+    // ---- `resolve_addresses` ----
+
+    fn pk(json: serde_json::Value) -> ProviderKey {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn a_key_with_no_overrides_dispatches_on_the_shared_pool() {
+        let key = pk(serde_json::json!({
+            "display_name": "plain",
+            "api_key": "sk-x",
+            "api_base": "https://api.example.com/v1",
+            "tls": {},
+        }));
+        assert_eq!(key.upstream_connection(), None);
+    }
+
+    #[test]
+    fn resolve_addresses_override_the_api_base_hostname() {
+        let key = pk(serde_json::json!({
+            "display_name": "private-link",
+            "api_key": "sk-x",
+            "api_base": "https://vendor.example.com:8443/v1",
+            "resolve_addresses": ["10.1.2.3"],
+        }));
+        let conn = key.upstream_connection().expect("an override is set");
+        assert_eq!(conn.tls, None);
+        assert_eq!(
+            conn.resolve,
+            vec![(
+                "vendor.example.com".to_string(),
+                vec!["10.1.2.3".parse::<IpAddr>().unwrap()]
+            )]
+        );
+    }
+
+    /// Order is the operator's, and it is the order the connector tries.
+    /// Sorting or deduplicating here would quietly change which address a
+    /// request lands on first.
+    #[test]
+    fn several_addresses_keep_the_order_they_were_written_in() {
+        let key = pk(serde_json::json!({
+            "display_name": "multi-az",
+            "api_key": "sk-x",
+            "api_base": "https://vendor.example.com/v1",
+            "resolve_addresses": ["10.0.3.9", "10.0.1.4", "2001:db8::7"],
+        }));
+        let (host, addrs) = key.upstream_connection().unwrap().resolve.remove(0);
+        assert_eq!(host, "vendor.example.com");
+        assert_eq!(
+            addrs,
+            ["10.0.3.9", "10.0.1.4", "2001:db8::7"]
+                .map(|a| a.parse::<IpAddr>().unwrap())
+                .to_vec()
+        );
+    }
+
+    /// The override follows the NAME, so a second protocol declared on
+    /// the same host is covered by the same entry — and one on a
+    /// different host is deliberately not, rather than being silently
+    /// redirected onto the private link.
+    #[test]
+    fn resolve_addresses_are_scoped_to_the_api_base_hostname() {
+        let key = pk(serde_json::json!({
+            "display_name": "two-surfaces",
+            "api_key": "sk-x",
+            "api_base": "https://vendor.example.com/v1",
+            "apis": {
+                "messages": {"base": "https://elsewhere.example.net/v1"},
+                "responses": {"base": "https://vendor.example.com/openai"},
+            },
+            "resolve_addresses": ["2001:db8::5"],
+        }));
+        let addr: IpAddr = "2001:db8::5".parse().unwrap();
+        assert_eq!(
+            key.upstream_connection().unwrap().resolve,
+            vec![("vendor.example.com".to_string(), vec![addr])]
+        );
+    }
+
+    /// Nothing to resolve: an address literal in the base URL is already
+    /// the connection target, a key with no base has no hostname at all,
+    /// and an empty list asks for nothing. All three leave the connection
+    /// exactly as it was.
+    #[test]
+    fn resolve_addresses_are_inert_without_a_hostname_to_override() {
+        for (base, addrs) in [
+            (None, serde_json::json!(["10.1.2.3"])),
+            (Some("https://10.0.0.7/v1"), serde_json::json!(["10.1.2.3"])),
+            (
+                Some("https://[2001:db8::1]/v1"),
+                serde_json::json!(["10.1.2.3"]),
+            ),
+            (Some("https://vendor.example.com/v1"), serde_json::json!([])),
+        ] {
+            let mut doc = serde_json::json!({
+                "display_name": "no-hostname",
+                "api_key": "sk-x",
+                "resolve_addresses": addrs,
+            });
+            if let Some(base) = base {
+                doc["api_base"] = serde_json::json!(base);
+            }
+            assert_eq!(pk(doc).upstream_connection(), None, "base {base:?}");
+        }
+    }
+
+    /// The two overrides are independent, and a key setting both must get
+    /// one client carrying both — not one of the two.
+    #[test]
+    fn tls_and_resolve_addresses_travel_together() {
+        let key = pk(serde_json::json!({
+            "display_name": "both",
+            "api_key": "sk-x",
+            "api_base": "https://vendor.example.com/v1",
+            "resolve_addresses": ["10.1.2.3"],
+            "tls": {"verify": false},
+        }));
+        let conn = key.upstream_connection().expect("an override is set");
+        assert_eq!(conn.tls.map(|t| t.verify), Some(false));
+        assert_eq!(conn.resolve.len(), 1);
+    }
+
+    /// A value that is not an address fails the row rather than being
+    /// ignored: the operator asked for a specific connection target, and
+    /// dialling the DNS one instead would be a silent downgrade.
+    #[test]
+    fn a_non_address_entry_is_rejected() {
+        let err = serde_json::from_value::<ProviderKey>(serde_json::json!({
+            "display_name": "bad",
+            "api_key": "sk-x",
+            "resolve_addresses": ["10.1.2.3", "vendor.example.com"],
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid IP address"), "{err}");
     }
 
     // ---- `secret` → `api_key` rename ----
@@ -543,11 +949,13 @@ mod tests {
             api_base: None,
             provider: String::new(),
             adapter: None,
+            apis: None,
             telemetry_tags: TelemetryTags::default(),
             request: None,
             response: None,
             strip_headers: default_strip_headers(),
             tls: None,
+            resolve_addresses: None,
             runtime_id: String::new(),
         };
         let s = serde_json::to_string(&original).unwrap();

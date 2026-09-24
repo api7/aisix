@@ -29,6 +29,7 @@ use reqwest::{header, Client, StatusCode};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
+use aisix_provider_openai::close_strict_response_format_schema;
 use aisix_provider_openai::overrides::{
     apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
     apply_param_renames, apply_stream_done_marker_policy, extract_reasoning_field,
@@ -96,14 +97,15 @@ impl AzureOpenAiBridge {
     }
 
     /// The client this dispatch runs on: the bridge's shared one, unless
-    /// the resolved Provider Key carries its own TLS settings. The token
+    /// the resolved Provider Key carries its own connection overrides
+    /// (TLS trust settings, a name-resolution address). The token
     /// minter deliberately keeps the shared client — it talks to the
-    /// identity provider, not to the key's `api_base`, and a private CA
+    /// identity provider, not to the key's `api_base`, and an override
     /// declared for the model endpoint says nothing about that host.
     fn client_for(&self, ctx: &BridgeContext) -> Client {
         aisix_gateway::upstream_tls::client_for_provider_key(
             &self.client,
-            ctx.provider_key.tls.as_ref(),
+            ctx.provider_key.upstream_connection().as_ref(),
         )
     }
 
@@ -193,7 +195,6 @@ impl Default for AzureOpenAiBridge {
 
 fn default_client() -> Client {
     aisix_gateway::client_builder()
-        .user_agent("aisix/0.1")
         .build()
         .unwrap_or_else(|_| Client::new())
 }
@@ -601,6 +602,10 @@ fn prepare_outbound_body<T: serde::Serialize>(
 ) -> Result<Value, BridgeError> {
     let mut body = serde_json::to_value(typed)
         .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
+    // Azure serves the OpenAI wire, so it owes the same strict-mode
+    // schema closing the OpenAI edge applies — one function, not a
+    // second copy, because these two bodies have to stay identical.
+    close_strict_response_format_schema(&mut body);
     if let Some(r) = request {
         apply_param_renames(&mut body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
@@ -627,13 +632,15 @@ fn prepare_outbound_body<T: serde::Serialize>(
 ///
 /// In both branches the bridge also sets `Content-Type: application/json`,
 /// `x-aisix-request-id: <ctx.request_id>`, and (for streaming)
-/// `Accept: text/event-stream`. Bridge-owned headers are inserted
-/// before `apply_request_headers` so the reserved-headers list in
-/// `aisix-gateway::upstream_headers` (which already covers `api-key`,
-/// `authorization`, `x-api-key`, plus proxy-auth / session headers)
-/// cannot overwrite them. Defense in depth: the reserved-list blocks
-/// even before the skip-if-present guard inside
-/// `apply_request_headers`.
+/// `Accept: text/event-stream`. Bridge-owned headers are inserted before
+/// `apply_request_headers`, which is what stops a `default_headers` entry
+/// displacing them — that merge is skip-if-present. Note this bridge fills
+/// exactly ONE credential slot per auth mode, so the OTHER slot is not
+/// bridge-owned and operator config reaches it: on `api-key` auth an
+/// `authorization` entry is honoured, which is how an Azure-shaped
+/// upstream behind its own bearer-authenticated hop is reached. A
+/// forwarded client header displaces even the filled slot, deliberately —
+/// see `apply_request_headers`.
 fn build_request_headers(
     auth: &AzureAuth,
     request_id: &str,
@@ -693,6 +700,10 @@ fn build_request_headers(
 impl Bridge for AzureOpenAiBridge {
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    fn wire_protocol(&self) -> &'static str {
+        aisix_core::Adapter::AzureOpenai.wire_protocol()
     }
 
     async fn chat(
@@ -939,6 +950,76 @@ fn parse_stream_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Azure serves the OpenAI wire, so an Anthropic-shaped
+    /// `/v1/messages` request translated onto an Azure deployment must
+    /// arrive with exactly the schema the OpenAI edge would send. Azure
+    /// keeps its own copy of the outbound-body pipeline, which is
+    /// precisely how it came to be missing the strict-mode closing.
+    #[test]
+    fn a_translated_messages_request_reaches_azure_byte_for_byte_as_before() {
+        use aisix_gateway::{ChatFormat, ChatMessage};
+        use aisix_provider_anthropic::wire::translate_extras_to_openai_shape;
+
+        let mut extra = serde_json::json!({
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {"high": {"type": "number"}},
+                                },
+                            },
+                        },
+                    },
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        translate_extras_to_openai_shape(&mut extra, aisix_core::MappedEffort::AsWritten);
+
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("weather?")]);
+        req.extra = extra;
+        let messages = messages_from(&req);
+        let typed = build_request(&req, "ci-chat", &messages, false);
+        let body = prepare_outbound_body(&typed, None, None).unwrap();
+
+        assert_eq!(
+            body["response_format"],
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "structured_output",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["city", "days"],
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["high"],
+                                    "properties": {"high": {"type": "number"}},
+                                },
+                            },
+                        },
+                    },
+                },
+            })
+        );
+    }
 
     /// AISIX-Cloud#1222 scenario 3: an in-band `data: {"error":{...}}`
     /// frame inside the committed 200 stream surfaces as the typed
@@ -1312,6 +1393,14 @@ mod tests {
         }
     }
 
+    /// Test helper: build an [`AzureAuth`] for the AAD-bearer branch.
+    fn bearer_auth(token: &str) -> AzureAuth {
+        AzureAuth {
+            api_key: None,
+            bearer_token: Some(token.to_string()),
+        }
+    }
+
     fn mock_chat_url(mock_uri: &str, deployment: &str) -> String {
         format!(
             "{}/openai/deployments/{}/chat/completions?api-version=2024-10-21",
@@ -1442,16 +1531,17 @@ mod tests {
     }
 
     #[test]
-    fn build_request_headers_default_headers_cannot_override_api_key() {
-        // Defense in depth: even if an operator's RequestOverrides
-        // includes `default_headers.api-key`, the apply pipeline's
-        // reserved-headers list must block it. Otherwise an org admin
-        // who set up a Provider Key could exfil API traffic through
-        // any header rewrite.
+    fn default_headers_cannot_displace_the_slot_this_bridge_filled() {
+        // `default_headers` is a fallback, never an override: the bridge
+        // fills its credential slot first, so an entry of the same name is
+        // declined. The OTHER slot is a different question — this bridge
+        // does not fill `authorization` under `api-key` auth, so an
+        // operator entry reaches it, which is how an Azure-shaped upstream
+        // behind its own bearer-authenticated hop is reached.
         use std::collections::HashMap;
         let mut default_headers = HashMap::new();
-        default_headers.insert("api-key".to_string(), "ATTACKER-KEY".to_string());
-        default_headers.insert("authorization".to_string(), "Bearer ATTACKER".to_string());
+        default_headers.insert("api-key".to_string(), "OVERRIDE-KEY".to_string());
+        default_headers.insert("authorization".to_string(), "Bearer hop-token".to_string());
         let request_overrides = RequestOverrides {
             default_headers,
             ..Default::default()
@@ -1466,12 +1556,26 @@ mod tests {
         assert_eq!(
             headers.get("api-key").unwrap(),
             "legit-key",
-            "reserved-headers list must prevent api-key override"
+            "the bridge filled this slot first, so the entry is declined"
         );
-        assert!(
-            !headers.contains_key("authorization"),
-            "Authorization must not be set at all for Azure"
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer hop-token",
+            "a slot no auth mode fills is the operator's to set"
         );
+
+        // AAD auth fills `authorization` instead, and then it is the
+        // declined one — the rule is which slot the bridge filled, not
+        // which name it is.
+        let headers = build_request_headers(
+            &bearer_auth("aad-token"),
+            "req-1",
+            false,
+            &UpstreamHeaderContext::from_overrides(Some(&request_overrides)),
+        )
+        .unwrap();
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer aad-token");
+        assert_eq!(headers.get("api-key").unwrap(), "OVERRIDE-KEY");
     }
 
     #[test]

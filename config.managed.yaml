@@ -19,6 +19,22 @@
 #   AISIX_MANAGED__CP_KEY_PEM=...
 #   AISIX_MANAGED__CP_CA_PEM=...
 #
+# `CP_BASE_URL` may omit the scheme — a bare `host:port` is read as
+# `https://host:port`, which is what a managed control plane serves.
+# Anything else fails the boot rather than being carried into the
+# heartbeat, telemetry and budget-check calls: a scheme, when written
+# out, must be exactly `http://` or `https://` in lower case, and the
+# rest must be a real host — an unreplaced `<placeholder>` is rejected
+# too. The scheme governs those three REST calls only; the etcd channel
+# is mTLS whatever is set here, so an `http://` base does not give you a
+# plaintext gateway — it gives you REST calls that cannot reach a TLS
+# control plane. `CP_ETCD_ENDPOINT` carries the opposite convention: it
+# is a bare `host:port` by contract, because the gateway attaches
+# `https://` to it itself. A leading `http://` or `https://` written
+# there is stripped rather than doubled up; anything else that is not a
+# bare `host[:port]` — a path, a query, userinfo, a port that is not a
+# number — fails the boot naming the variable.
+#
 # Plus optionally `AISIX_PROXY__ADDR`, `AISIX_OBSERVABILITY__LOG_LEVEL`,
 # `AISIX_CACHE__BACKEND`, etc. — every config field is reachable via
 # `AISIX_<UPPER>__<UPPER>` (see crates/aisix-core/src/config.rs).
@@ -28,6 +44,34 @@
 # (api7/AISIX-Cloud#798):
 #   AISIX_RATELIMIT__BACKEND=redis
 #   AISIX_RATELIMIT__REDIS__URL=redis://<host>:6379
+#   AISIX_RATELIMIT__REDIS__TIMEOUT_SECS=5   # optional; this is the default
+#
+# `timeout_secs` bounds one Redis round trip, and the connection the
+# gateway makes at startup (in `cluster`/`sentinel` mode the startup
+# connection gets this budget once per configured endpoint the discovery
+# walks, plus one). The limiter fails open to per-replica counting when
+# Redis errors, but an unreachable Redis produces no error at all until
+# something times out, so without the bound a rate-limited request waits
+# on TCP retransmission for minutes. Lower it for a Redis on the same
+# node; it must be >= 1. After a failure the limiter short-circuits for
+# 30 seconds and then lets one request probe, so an outage costs this
+# budget once per 30 seconds rather than once per request.
+#
+# A Redis that is unreachable when the gateway STARTS does not stop it:
+# the listeners bind, the limiter counts per replica (so cluster-wide
+# limits are not enforced) and one WARN names the backend. The shared
+# backend is attached in the background as soon as Redis answers — which
+# is the node-reboot case, where Redis comes up after the gateway. The
+# gateway never silently falls back to the `memory` backend.
+#
+# A Redis that ANSWERS and refuses the credential degrades the same way
+# rather than ending the boot, but the WARN says the server REFUSED
+# instead of blaming a timeout that never happened.
+# It is retried too: the credential may be corrected on the server, and
+# the shared backend is then attached without restarting the gateway.
+# The credential may be embedded in the URL or given separately as
+# `AISIX_RATELIMIT__REDIS__USERNAME` / `__PASSWORD` / `__DATABASE`,
+# which override whatever the URL carries.
 #
 # Subsequent boots re-use the mTLS bundle written under
 # `managed.mtls_dir`.
@@ -37,14 +81,55 @@ etcd:
   endpoints:
     - "https://placeholder-overridden-at-register:2379"
   prefix: "/aisix"
-  dial_timeout_ms: 5000
-  request_timeout_ms: 5000
+  # `0` means unbounded on either key — the same reading a model's
+  # `timeout: 0` gets. (A model's `stream_timeout: 0` instead falls back
+  # to the next level of a resolution chain these flat startup keys do
+  # not have.)
+  # `dial_timeout_ms` bounds a dial — the TCP connect, the TLS handshake
+  # above it and the authentication exchange when `user` is set — and an
+  # expired dial is retried, not fatal. The whole dial gets it once per
+  # configured endpoint (`dial_timeout_ms x max(1, endpoints)`), as
+  # headroom for a cluster with unreachable members. The window in which
+  # no listener is bound is `dial_timeout_ms x endpoints x 2`, because
+  # boot dials two providers one after the other. It defaults to 5000,
+  # because boot awaits the dial before binding any listener: a control
+  # plane that accepts the connection and then answers nothing would
+  # otherwise hold the proxy and metrics ports closed indefinitely, with
+  # the snapshot cache unread behind it. Set `0` for the old unbounded
+  # behaviour.
+  # `request_timeout_ms` is unset by default, and unset means unbounded.
+  # It bounds a single request/response call (the configuration range
+  # read, creating the watch, the admin reads) but never the established
+  # watch stream. A `request_timeout_ms` the range read cannot finish
+  # inside makes the gateway retry it forever without ever serving
+  # traffic, so leave it unset unless a slow etcd must fail fast.
+  # dial_timeout_ms: 5000   # this is the default; 0 = unbounded
+  # request_timeout_ms: 5000
 
 proxy:
   addr: "0.0.0.0:3000"
   # 0 = no request-body cap (the default); set a value to bound
   # per-request memory.
   # request_body_limit_bytes: 0
+  # TLS on the single listener `addr` describes.
+  # tls:
+  #   cert_file: "/etc/aisix/tls/proxy.crt"
+  #   key_file:  "/etc/aisix/tls/proxy.key"
+  # Several proxy listeners, each with its own optional TLS — HTTPS and
+  # plaintext HTTP served at the same time. Set, this is the COMPLETE set
+  # of proxy listeners: only the addresses listed here are bound, `addr`
+  # above is ignored (it stays required, and the gateway logs one line at
+  # startup saying so), and `tls` above must be absent — a certificate that would
+  # apply to no listener is a configuration error. A managed deployment
+  # reaches this through the environment rather than by editing this file,
+  # as one JSON array:
+  # AISIX_PROXY__LISTENERS='[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/etc/aisix/tls/proxy.crt","key_file":"/etc/aisix/tls/proxy.key"}},{"addr":"0.0.0.0:3000"}]'
+  # listeners:
+  #   - addr: "0.0.0.0:3443"
+  #     tls:
+  #       cert_file: "/etc/aisix/tls/proxy.crt"
+  #       key_file:  "/etc/aisix/tls/proxy.key"
+  #   - addr: "0.0.0.0:3000"
   # Serving topology; on for Linux by default. A managed deployment
   # reaches these through the environment rather than by editing this
   # file: AISIX_PROXY__THREAD_PER_CORE, AISIX_PROXY__WORKERS.
@@ -64,8 +149,12 @@ proxy:
   # legacy URL shapes, e.g. per-server MCP paths served on the
   # /mcp/{server} endpoint. When configuring through env vars only, set
   # one JSON array: AISIX_PROXY__URL_REWRITES='[{"match":"...","rewrite":"..."}]'
+  # Runs before ALL routing, including host-matched passthrough routes.
+  # Optional hosts restrict a rule to those inbound hosts; omit for all hosts.
+  # Host matching ignores case/port; *.example.com matches one extra label.
   # url_rewrites:
   #   - name: per-server-mcp-compat
+  #     hosts: ["gateway.example.com"]
   #     match: "^/mcp-servers/([^/]+)/mcp$"
   #     rewrite: "/mcp/$1"
 
@@ -82,6 +171,21 @@ observability:
   log_level: "info"
   access_log: true
   metrics:
+    # Complete label lists per metric. Omitted metrics retain their defaults.
+    # Restart after changing labels. [] removes all optional business labels;
+    # gauges retain required identity labels. See the variable reference:
+    # https://docs.api7.ai/ai-gateway/dev/reference/metric-labels
+    # Env: AISIX_OBSERVABILITY__METRICS__LABELS='{"aisix_request_ttft_seconds":["provider_key_name","model"]}'
+    # labels:
+    #   aisix_request_ttft_seconds:
+    #     - env_id
+    #     - endpoint
+    #     - model
+    #     - provider
+    #     - status_class
+    #     - streaming
+    #     - provider_key_name
+    labels: {}
     prometheus:
       enabled: true
       path: "/metrics"
@@ -111,11 +215,10 @@ managed:
   # bake secrets into the image.
   mtls_dir: "/var/lib/aisix/mtls"
   dp_id_file: "/var/lib/aisix/dp_id"
-  # On-disk snapshot cache (prd-09 §9.7.2). The supervisor writes the
-  # last-known etcd contents here on every successful resync / put /
-  # delete, and re-loads it at boot before opening the etcd connection
-  # — so the proxy stays up across CP outages and full restarts.
-  # Set to "" to disable.
+  # Optional recovery across restarts while the configuration store is
+  # unavailable. Each instance needs its own writable cache location.
+  # The cache contains unencrypted credentials; restrict directory access.
+  snapshot_cache_enabled: false
   snapshot_cache_path: "/var/lib/aisix/config_cache.json"
 
   # Heartbeat interval, in seconds. The DP POSTs a heartbeat to

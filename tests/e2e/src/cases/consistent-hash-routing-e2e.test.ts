@@ -350,7 +350,7 @@ describe("consistent-hash routing + priority tiers e2e", () => {
       },
     });
     await createMember("ch-recover-a1", a1, {
-      cooldown: { default_seconds: 1 },
+      cooldown: { enabled: true, default_seconds: 1 },
     });
     await createMember("ch-recover-b1", b1);
     await waitMembersVisible(["ch-recover-a1", "ch-recover-b1"]);

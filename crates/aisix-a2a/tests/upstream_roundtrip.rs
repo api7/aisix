@@ -30,6 +30,23 @@ fn upstream(url: String, auth: A2aAuth) -> A2aUpstream {
     }
 }
 
+/// Every header an inbound request carried, name -> the list of values sent
+/// under it. A list rather than one value on purpose: a gateway that appended
+/// its own credential behind a forwarded one would still read correctly under
+/// `get`, and only the arity shows it.
+fn header_dump(headers: &HeaderMap) -> Value {
+    let mut out = serde_json::Map::new();
+    for name in headers.keys() {
+        let values: Vec<Value> = headers
+            .get_all(name)
+            .iter()
+            .map(|v| Value::String(v.to_str().unwrap_or("<non-ascii>").to_string()))
+            .collect();
+        out.insert(name.as_str().to_string(), Value::Array(values));
+    }
+    Value::Object(out)
+}
+
 /// Read back the `A2A-Version` an inbound request carried, or `null`.
 fn seen_version(headers: &HeaderMap) -> Value {
     headers
@@ -50,6 +67,7 @@ async fn spawn_agent() -> SocketAddr {
             "version": "1.0.0",
             "skills": [{"id": "echo", "name": "Echo"}],
             "echoed_version": seen_version(&headers),
+            "echoed_headers": header_dump(&headers),
         }))
     }
 
@@ -72,6 +90,7 @@ async fn spawn_agent() -> SocketAddr {
                 "echoed_auth": auth,
                 "echoed_api_key": api_key,
                 "echoed_version": seen_version(&headers),
+                "echoed_headers": header_dump(&headers),
             }
         }))
     }
@@ -357,6 +376,7 @@ async fn the_card_fetch_deadline_covers_the_whole_candidate_walk() {
 /// across chunk boundaries rather than assuming one chunk is one event.
 async fn spawn_streaming_agent() -> SocketAddr {
     async fn stream(headers: HeaderMap) -> impl IntoResponse {
+        let seen_headers = header_dump(&headers).to_string();
         let seen_version = seen_version(&headers).to_string();
         let accept = headers
             .get("accept")
@@ -365,7 +385,7 @@ async fn spawn_streaming_agent() -> SocketAddr {
             .to_string();
         let chunks: Vec<Result<String, std::convert::Infallible>> = vec![
             Ok(format!(
-                ": open\ndata: {{\"jsonrpc\":\"2.0\",\"id\":\"s\",\"result\":{{\"seq\":1,\"version\":{seen_version},\"accept\":\"{accept}\"}}}}\n\n\
+                ": open\ndata: {{\"jsonrpc\":\"2.0\",\"id\":\"s\",\"result\":{{\"seq\":1,\"version\":{seen_version},\"accept\":\"{accept}\",\"headers\":{seen_headers}}}}}\n\n\
                  event: status-update\ndata: {{\"jsonrpc\":\"2.0\",\"id\":\"s\",\"result\":{{\"seq\":2}}}}\n\n"
             )),
             Ok("data: {\"jsonrpc\":\"2.0\",\"id\":\"s\",\"resu".to_string()),
@@ -540,5 +560,245 @@ async fn a_malformed_final_line_fails_the_stream() {
     assert!(
         events[1].is_err(),
         "a truncated trailing event must fail the stream, not end it quietly"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `forward_client_headers` — the operator names inbound client headers that
+// must reach this agent. The gateway rebuilds the outbound JSON-RPC message,
+// so the shared resolver applies both blocking tiers; `a2a-version` is the one
+// slot this surface owns on top of them.
+// ---------------------------------------------------------------------------
+
+/// A registered agent forwarding `patterns`.
+fn agent_forwarding(patterns: &[&str]) -> aisix_core::A2aAgent {
+    serde_json::from_value(json!({
+        "name": "fwd",
+        "url": "https://agents.example.com/a2a",
+        "forward_client_headers": patterns,
+    }))
+    .expect("agent deserialises")
+}
+
+/// The headers a caller sent to the gateway.
+fn client_sent(pairs: &[(&str, &str)]) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for (name, value) in pairs {
+        map.insert(
+            axum::http::HeaderName::try_from(*name).expect("header name"),
+            axum::http::HeaderValue::from_str(value).expect("header value"),
+        );
+    }
+    map
+}
+
+/// What the gateway resolves out of a caller's request for that agent — the
+/// exact call the `/a2a` handlers make.
+fn resolved(
+    patterns: &[&str],
+    sent: &[(&str, &str)],
+) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
+    aisix_a2a::forwarded_client_headers(&agent_forwarding(patterns), Some(&client_sent(sent)))
+}
+
+/// Values the upstream saw under `name`, from an echoed header dump.
+fn seen(dump: &Value, name: &str) -> Vec<String> {
+    dump.get(name)
+        .and_then(Value::as_array)
+        .map(|vs| {
+            vs.iter()
+                .map(|v| v.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A forwarded client header reaches the upstream agent on a JSON-RPC call.
+#[tokio::test]
+async fn a_forwarded_client_header_reaches_the_upstream_agent() {
+    let addr = spawn_agent().await;
+    let bridge = HttpBridge::new(upstream(format!("http://{addr}/a2a"), A2aAuth::None))
+        .with_forwarded_client_headers(resolved(
+            &["x-user-jwt"],
+            &[("x-user-jwt", "eyJhbGciOi.caller")],
+        ));
+
+    let resp = bridge.send(&message_send("f-1")).await.unwrap();
+    assert_eq!(
+        seen(&resp["result"]["echoed_headers"], "x-user-jwt"),
+        vec!["eyJhbGciOi.caller"]
+    );
+}
+
+/// Forwarding `authorization` hands the agent the caller's own credential
+/// INSTEAD of the gateway-held bearer — exactly one credential on the wire.
+#[tokio::test]
+async fn a_forwarded_authorization_replaces_the_gateway_bearer() {
+    let addr = spawn_agent().await;
+    let bridge = HttpBridge::new(upstream(
+        format!("http://{addr}/a2a"),
+        A2aAuth::Bearer("gateway-held-secret".into()),
+    ))
+    .with_forwarded_client_headers(resolved(
+        &["authorization"],
+        &[("authorization", "Bearer caller-token")],
+    ));
+
+    let resp = bridge.send(&message_send("f-2")).await.unwrap();
+    // The arity is the assertion: `reqwest`'s `header` appends, so a gateway
+    // credential that failed to stand aside would ride behind the caller's and
+    // read correctly under the first value alone.
+    assert_eq!(
+        seen(&resp["result"]["echoed_headers"], "authorization"),
+        vec!["Bearer caller-token"]
+    );
+}
+
+/// The same, in the other credential slot: `api_key` auth sends `x-api-key`,
+/// and a forwarded copy displaces it rather than joining it.
+#[tokio::test]
+async fn a_forwarded_api_key_replaces_the_gateway_key() {
+    let addr = spawn_agent().await;
+    let bridge = HttpBridge::new(upstream(
+        format!("http://{addr}/a2a"),
+        A2aAuth::ApiKey("gateway-held-key".into()),
+    ))
+    .with_forwarded_client_headers(resolved(
+        &["x-api-key"],
+        &[("x-api-key", "callers-own-key")],
+    ));
+
+    let resp = bridge.send(&message_send("f-3")).await.unwrap();
+    assert_eq!(
+        seen(&resp["result"]["echoed_headers"], "x-api-key"),
+        vec!["callers-own-key"]
+    );
+}
+
+/// An agent forwarding nothing still gets the gateway's own credential and
+/// nothing else — the default every registered agent keeps.
+#[tokio::test]
+async fn without_a_forward_the_gateway_bearer_is_still_the_only_credential() {
+    let addr = spawn_agent().await;
+    let bridge = HttpBridge::new(upstream(
+        format!("http://{addr}/a2a"),
+        A2aAuth::Bearer("gateway-held-secret".into()),
+    ))
+    .with_forwarded_client_headers(resolved(&[], &[("authorization", "Bearer caller-token")]));
+
+    let resp = bridge.send(&message_send("f-4")).await.unwrap();
+    assert_eq!(
+        seen(&resp["result"]["echoed_headers"], "authorization"),
+        vec!["Bearer gateway-held-secret"]
+    );
+}
+
+/// A forwarded value never reaches a log through `Debug` — it may be the
+/// caller's own credential, and the dispatch path formats the bridge on error.
+#[test]
+fn a_forwarded_value_is_redacted_in_debug() {
+    let bridge = HttpBridge::new(upstream("http://x/a2a".into(), A2aAuth::None))
+        .with_forwarded_client_headers(resolved(
+            &["x-user-jwt"],
+            &[("x-user-jwt", "eyJhbGciOi.caller")],
+        ));
+    let rendered = format!("{bridge:?}");
+    assert!(
+        rendered.contains("x-user-jwt"),
+        "the slot stays diagnosable: {rendered}"
+    );
+    assert!(
+        !rendered.contains("eyJhbGciOi.caller"),
+        "the value must not print: {rendered}"
+    );
+}
+
+/// `a2a-version` is the gateway's own announcement of the pinned wire version,
+/// so a caller cannot claim it — not even under `["*"]`, which admits every
+/// ordinary header beside it.
+#[tokio::test]
+async fn the_version_announcement_is_never_forwardable() {
+    let sent = &[("a2a-version", "0.3"), ("x-plain", "kept")][..];
+    let names: Vec<String> = resolved(&["*"], sent)
+        .into_iter()
+        .map(|(n, _)| n.as_str().to_string())
+        .collect();
+    assert_eq!(names, vec!["x-plain"], "a glob must not reach a2a-version");
+    // Named exactly, it is still refused: unlike a credential slot, this one
+    // is the gateway's own assertion rather than an identity the operator may
+    // delegate.
+    assert!(resolved(&["a2a-version"], sent).is_empty());
+
+    // And on the wire the agent sees the pinned version, once.
+    let addr = spawn_agent().await;
+    let bridge = HttpBridge::new(upstream(format!("http://{addr}/a2a"), A2aAuth::None))
+        .with_forwarded_client_headers(resolved(&["*"], sent));
+    let resp = bridge.send(&message_send("f-5")).await.unwrap();
+    assert_eq!(
+        seen(&resp["result"]["echoed_headers"], "a2a-version"),
+        vec!["1.0"]
+    );
+    assert_eq!(
+        seen(&resp["result"]["echoed_headers"], "x-plain"),
+        vec!["kept"]
+    );
+}
+
+/// The card fetch is an upstream call like any other, so it forwards too — an
+/// agent that gates card discovery on the end user's own credential is exactly
+/// the deployment this capability exists for.
+#[tokio::test]
+async fn the_agent_card_fetch_forwards_too() {
+    let addr = spawn_agent().await;
+    let bridge = HttpBridge::new(upstream(format!("http://{addr}/a2a"), A2aAuth::None))
+        .with_forwarded_client_headers(resolved(
+            &["x-user-jwt"],
+            &[("x-user-jwt", "eyJhbGciOi.caller")],
+        ));
+
+    let card = bridge.fetch_agent_card().await.unwrap();
+    assert_eq!(
+        seen(&card.rest["echoed_headers"], "x-user-jwt"),
+        vec!["eyJhbGciOi.caller"]
+    );
+}
+
+/// And so does the streaming path, which opens its request at a different call
+/// site than the buffered one.
+#[tokio::test]
+async fn a_streaming_call_forwards_too() {
+    use futures::StreamExt;
+
+    let addr = spawn_streaming_agent().await;
+    // `["*"]` and a caller that really sends `accept`: this call negotiates
+    // its own response shape and then parses SSE, so the assertion below is
+    // about the blocked set rather than about a pattern that never matched.
+    let bridge = HttpBridge::new(upstream(format!("http://{addr}/a2a"), A2aAuth::None))
+        .with_forwarded_client_headers(resolved(
+            &["*"],
+            &[
+                ("x-user-jwt", "eyJhbGciOi.caller"),
+                ("accept", "application/json"),
+            ],
+        ));
+
+    let events: Vec<Value> = bridge
+        .send_stream(&json!({"jsonrpc":"2.0","id":"s","method":"message/stream"}))
+        .await
+        .expect("stream opens")
+        .map(|e| e.expect("event parses"))
+        .collect()
+        .await;
+
+    assert_eq!(
+        seen(&events[0]["result"]["headers"], "x-user-jwt"),
+        vec!["eyJhbGciOi.caller"]
+    );
+    // The arity is what pins it: the builder APPENDS, so a caller's `accept`
+    // that got through would ride behind the gateway's and leave the agent
+    // choosing which body shape to send.
+    assert_eq!(
+        seen(&events[0]["result"]["headers"], "accept"),
+        vec!["text/event-stream"]
     );
 }

@@ -24,9 +24,11 @@ use futures::StreamExt;
 use reqwest::{header, Client, StatusCode};
 use std::time::{Duration, Instant};
 
+use aisix_gateway::structured_output::{response_into_fake_stream_chunks, unwrap_json_tool_call};
+
 use crate::wire::{
     build_request, inject_cache_breakpoints, response_into_chat_response, split_system,
-    AnthropicResponse, AnthropicStreamEvent, StreamState,
+    structured_output_for, AnthropicResponse, AnthropicStreamEvent, StreamState, StructuredOutput,
 };
 
 /// Matches the API header that Anthropic bakes backwards-compat into.
@@ -57,11 +59,12 @@ impl AnthropicBridge {
     }
 
     /// The client this dispatch runs on: the bridge's shared one, unless
-    /// the resolved Provider Key carries its own TLS settings.
+    /// the resolved Provider Key carries its own connection overrides
+    /// (TLS trust settings, a name-resolution address).
     fn client_for(&self, ctx: &BridgeContext) -> Client {
         aisix_gateway::upstream_tls::client_for_provider_key(
             &self.client,
-            ctx.provider_key.tls.as_ref(),
+            ctx.provider_key.upstream_connection().as_ref(),
         )
     }
 
@@ -79,7 +82,6 @@ impl Default for AnthropicBridge {
 
 fn default_client() -> Client {
     aisix_gateway::client_builder()
-        .user_agent("aisix/0.1")
         .build()
         .unwrap_or_else(|_| Client::new())
 }
@@ -110,7 +112,35 @@ fn normalize_api_base(base: &str) -> String {
     trimmed.to_string()
 }
 
+/// The `apis.messages` base this key declares, or `""`. Feeds the URL
+/// cache fingerprint so editing the entry rebuilds the cached URL, the
+/// same way editing `api_base` does.
+fn declared_messages_base(ctx: &BridgeContext) -> &str {
+    ctx.provider_key
+        .apis
+        .as_ref()
+        .and_then(|apis| apis.messages.as_ref())
+        .and_then(|entry| entry.base.as_deref())
+        .unwrap_or("")
+}
+
 fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
+    // A Provider Key that declares `apis.messages` names where the
+    // Anthropic wire lives on this upstream, which is where this bridge
+    // dispatches — so the declaration has to reach here too, or the
+    // `/v1/messages` passthrough and the translated path would send the
+    // same upstream route to two different hosts.
+    if let Some(base) = ctx
+        .provider_key
+        .apis
+        .as_ref()
+        .and_then(|apis| apis.messages.as_ref())
+        .and_then(|entry| entry.base.as_deref())
+        .map(str::trim)
+        .filter(|base| !base.is_empty())
+    {
+        return Ok(normalize_api_base(base));
+    }
     match ctx.provider_key.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => Ok(normalize_api_base(b.trim())),
         _ => {
@@ -261,10 +291,65 @@ where
     }
 }
 
+/// Build this bridge's outbound `HeaderMap`.
+///
+/// Bridge-owned headers go in FIRST, then the ProviderKey's
+/// `request.default_headers` / `request.forward_client_headers` through the
+/// shared pipeline: a static operator header cannot displace them, and a
+/// forwarded client header displaces only the credential slot it was
+/// explicitly pointed at. Building a map rather than chaining
+/// `RequestBuilder::header` — which APPENDS — is what keeps a slot both
+/// sides name single-valued on the wire.
+fn build_request_headers(
+    api_key_str: &str,
+    api_version: &'static str,
+    request_id: &str,
+    sse: bool,
+    hdr: &aisix_gateway::UpstreamHeaderContext<'_>,
+) -> Result<reqwest::header::HeaderMap, BridgeError> {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    // Suppressed when the operator forwards the caller's own credential
+    // into this slot: two `x-api-key` values would let the upstream pick.
+    if !aisix_gateway::ForwardedClientHeaders::resolve(hdr).claims("x-api-key") {
+        let key = HeaderValue::from_str(api_key_str).map_err(|e| {
+            BridgeError::InvalidUpstreamCredentials(format!(
+                "api key contains invalid header chars: {e}"
+            ))
+        })?;
+        headers.insert(HeaderName::from_static("x-api-key"), key);
+    }
+    headers.insert(
+        HeaderName::from_static("anthropic-version"),
+        HeaderValue::from_static(api_version),
+    );
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let rid = HeaderValue::from_str(request_id).map_err(|e| {
+        BridgeError::Config(format!("request_id contains invalid header chars: {e}"))
+    })?;
+    headers.insert(HeaderName::from_static("x-aisix-request-id"), rid);
+    if sse {
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+    }
+    aisix_gateway::apply_request_headers(&mut headers, hdr);
+    Ok(headers)
+}
+
 #[async_trait]
 impl Bridge for AnthropicBridge {
     fn name(&self) -> &'static str {
         "anthropic"
+    }
+
+    fn wire_protocol(&self) -> &'static str {
+        aisix_core::Adapter::Anthropic.wire_protocol()
     }
 
     async fn chat(
@@ -278,11 +363,16 @@ impl Bridge for AnthropicBridge {
         let (system, messages) =
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
         let mut body = build_request(req, upstream, system, messages, false);
+        let synthetic_json_tool = matches!(
+            structured_output_for(req, upstream),
+            StructuredOutput::Tool(_)
+        );
         maybe_inject_cache_breakpoints(&mut body, ctx);
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "anthropic/messages",
             &[
+                declared_messages_base(ctx),
                 ctx.provider_key.api_base.as_deref().unwrap_or(""),
                 &ctx.provider_key.provider,
             ],
@@ -292,14 +382,13 @@ impl Bridge for AnthropicBridge {
         let api_version = self.api_version;
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
+        let headers =
+            build_request_headers(key, api_version, &request_id, false, &ctx.header_ctx())?;
 
         with_deadline(ctx.deadline, started, async move {
             let resp = url
                 .post_on(&client)
-                .header("x-api-key", key)
-                .header("anthropic-version", api_version)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("x-aisix-request-id", &request_id)
+                .headers(headers)
                 .json(&body)
                 .send()
                 .await
@@ -314,7 +403,11 @@ impl Bridge for AnthropicBridge {
                 .json()
                 .await
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            Ok(response_into_chat_response(parsed))
+            let mut chat = response_into_chat_response(parsed);
+            if synthetic_json_tool {
+                unwrap_json_tool_call(&mut chat);
+            }
+            Ok(chat)
         })
         .await
     }
@@ -327,6 +420,23 @@ impl Bridge for AnthropicBridge {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
+        // The tool path's JSON only exists once the synthetic tool call
+        // has been assembled, so it cannot be streamed as it arrives.
+        // Run the request non-streaming and fake-stream the translated
+        // result: the client sees an ordinary chunk sequence, and usage
+        // rides its own terminal chunk exactly as on a real stream.
+        if matches!(
+            structured_output_for(req, upstream),
+            StructuredOutput::Tool(_)
+        ) {
+            // The leg is not streaming, so it runs under the budget a
+            // non-streaming call would have got — the streaming budget
+            // this context carries bounds a chunk gap, not a completion.
+            let chunks =
+                response_into_fake_stream_chunks(self.chat(req, &ctx.non_streaming_ctx()).await?);
+            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+        }
+
         let (system, messages) =
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
         let mut body = build_request(req, upstream, system, messages, true);
@@ -335,6 +445,7 @@ impl Bridge for AnthropicBridge {
             &ctx.provider_key_id,
             "anthropic/messages",
             &[
+                declared_messages_base(ctx),
                 ctx.provider_key.api_base.as_deref().unwrap_or(""),
                 &ctx.provider_key.provider,
             ],
@@ -344,14 +455,12 @@ impl Bridge for AnthropicBridge {
         let api_version = self.api_version;
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
+        let headers =
+            build_request_headers(key, api_version, &request_id, true, &ctx.header_ctx())?;
 
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
-                .header("x-api-key", key)
-                .header("anthropic-version", api_version)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCEPT, "text/event-stream")
-                .header("x-aisix-request-id", &request_id)
+                .headers(headers)
                 .json(&body)
                 .send()
                 .await
@@ -470,6 +579,77 @@ mod tests {
             })))
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn a_small_stream_budget_does_not_cut_the_fake_stream_leg() {
+        // On a streaming dispatch the deadline is the streaming budget,
+        // which bounds a chunk gap rather than a whole completion. The
+        // tool route's upstream leg is not streaming, so it runs under
+        // the end-to-end budget carried beside it.
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(250))
+                    .set_body_json(serde_json::json!({
+                        "id": "msg_json",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-3-5-haiku-20241022",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_json",
+                            "name": "json_tool_call",
+                            "input": {"name": "Ada"},
+                        }],
+                        "stop_reason": "tool_use",
+                        "usage": {"input_tokens": 9, "output_tokens": 4},
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "my-claude",
+            "provider": "anthropic",
+            // Older family: takes the tool route, which cannot stream.
+            "model_name": "claude-3-5-haiku-20241022",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111",
+        }))
+        .unwrap();
+        let ctx = BridgeContext::new("req-1", Arc::new(model), sample_provider_key(&server.uri()))
+            .with_deadline(std::time::Duration::from_millis(50))
+            .with_non_streaming_deadline(Some(std::time::Duration::from_secs(30)));
+
+        let mut req = ChatFormat::new("my-claude", vec![ChatMessage::user("who is Ada")]);
+        req.stream = Some(true);
+        req.extra.insert(
+            "response_format".into(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "person",
+                    "schema": {"type": "object", "properties": {"name": {"type": "string"}}},
+                    "strict": true,
+                },
+            }),
+        );
+
+        let stream = AnthropicBridge::new()
+            .chat_stream(&req, &ctx)
+            .await
+            .expect("the fake-stream leg must not be cut by the chunk-gap budget");
+        let chunks: Vec<ChatChunk> = futures::StreamExt::collect::<Vec<_>>(stream)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            chunks[1].delta.content.as_deref(),
+            Some(r#"{"name":"Ada"}"#)
+        );
     }
 
     #[tokio::test]

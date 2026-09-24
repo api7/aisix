@@ -9,9 +9,13 @@
 //!
 //! The surface is ACTIVE only when the environment's
 //! [`McpAuthSettings`] row carries a valid `resource_url` AND at least
-//! one enabled `oidc_providers` row exists. Dormant otherwise: the
-//! well-known routes 404 and no challenge header is attached, so every
-//! pre-#1143 environment is byte-identical to before.
+//! one enabled JWKS-mode `oidc_providers` row exists. Dormant
+//! otherwise: the well-known routes 404 and no challenge header is
+//! attached, so every pre-#1143 environment is byte-identical to
+//! before. A shared-secret (`hmac_secret`) provider does not count and
+//! is never advertised — it names no authorization server a client
+//! could obtain a token from. Bearer acceptance on `/mcp` is a separate,
+//! shared path and treats both modes alike.
 //!
 //! The same row carries this environment's anonymous-access settings
 //! (AISIX-Cloud#1313), resolved by [`anonymous_entry`] — the two are
@@ -26,7 +30,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Once;
 
-use aisix_core::models::McpAuthSettings;
+use aisix_core::models::{McpAuthSettings, McpServerAllowlist};
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
 use axum::extract::{Request, State};
@@ -79,7 +83,13 @@ pub(crate) fn discovery_identity(snapshot: &AisixSnapshot) -> Option<DiscoveryId
         return None;
     };
 
-    if !crate::jwt::any_enabled_provider(snapshot) {
+    // Only a JWKS-mode provider counts here: the document's whole job is
+    // to name authorization servers, and a shared-secret provider has
+    // none. An environment whose only enabled providers verify by shared
+    // secret keeps the surface dormant rather than publish an empty
+    // `authorization_servers` list. Bearer acceptance on `/mcp` is a
+    // separate, shared path and is unaffected.
+    if !crate::jwt::any_enabled_jwks_provider(snapshot) {
         return None;
     }
     Some(identity)
@@ -155,10 +165,25 @@ pub(crate) fn anonymous_entry(
     // listed. An unlisted (or unknown) server answers exactly like a
     // configured-but-unreachable one: 401 before the 404, so the
     // registered set stays invisible to an anonymous prober.
-    let entry_allowed = match scope {
-        Some(server) => anon.servers.iter().any(|s| s == server),
-        None => anon.aggregate_entry,
-    };
+    //
+    // The allowlist is read through the one chokepoint that decides
+    // between its two spellings, so the gate and the ceiling below can
+    // never disagree about which one governs.
+    //
+    // An allowlist that names nothing closes the aggregated entry too,
+    // whatever `aggregate_entry` says: serving it would admit an
+    // uncredentialed caller as the principal with no tool to reach, and
+    // suppress the `WWW-Authenticate` discovery hint on the way. Only
+    // the id spelling can reach that state — `servers` is required and
+    // non-empty on both schemas for exactly this reason.
+    let allowlist = anon.server_allowlist();
+    let entry_allowed = !allowlist.is_empty()
+        && match scope {
+            Some(server) => {
+                allowlist.admits_server(&state.mcp_servers.for_snapshot(snapshot), server)
+            }
+            None => anon.aggregate_entry,
+        };
     if !entry_allowed {
         return None;
     }
@@ -200,7 +225,7 @@ pub(crate) fn anonymous_entry(
             jwt: None,
             anonymous: true,
         },
-        servers: anon.servers.clone(),
+        allowlist,
     })
 }
 
@@ -210,13 +235,14 @@ pub(crate) struct AnonymousEntry {
     /// authenticated one downstream, which is the point: ACL, quota,
     /// guardrails, budget and usage all key on it unchanged.
     pub auth: crate::auth::AuthenticatedKey,
-    /// The configured server allowlist. It is not only the entry gate
-    /// but the principal's CEILING: the caller may reach these servers'
-    /// tools and no others, on the aggregated endpoint as much as the
-    /// scoped one. Without that, a principal whose own grant is wider
-    /// than the list could name `<unlisted>__<tool>` on the aggregated
-    /// endpoint and reach a server whose scoped entry is closed.
-    pub servers: Vec<String>,
+    /// The configured server allowlist, in the spelling the settings row
+    /// used. It is not only the entry gate but the principal's CEILING:
+    /// the caller may reach these servers' tools and no others, on the
+    /// aggregated endpoint as much as the scoped one. Without that, a
+    /// principal whose own grant is wider than the list could name
+    /// `<unlisted>__<tool>` on the aggregated endpoint and reach a server
+    /// whose scoped entry is closed.
+    pub allowlist: McpServerAllowlist,
 }
 
 /// Parse and validate the configured resource URL: absolute `http`/
@@ -251,17 +277,27 @@ fn validate_resource_url(resource_url: &str) -> Option<DiscoveryIdentity> {
 }
 
 /// The RFC 9728 Protected Resource Metadata document, derived entirely
-/// from configuration: `authorization_servers` lists the enabled trust
-/// providers' issuers, `scopes_supported` the union of their
-/// `required_scopes` (omitted when empty).
+/// from configuration: `authorization_servers` lists the enabled
+/// JWKS-mode trust providers' issuers, `scopes_supported` the union of
+/// their `required_scopes` (omitted when empty).
+///
+/// Shared-secret providers are excluded from both lists. They name no
+/// authorization server a client could obtain a token from, so listing
+/// an issuer they merely assert would send clients to an endpoint that
+/// does not exist — and their scope requirements describe tokens the
+/// client cannot get here either.
 fn prm_document(snapshot: &AisixSnapshot, identity: &DiscoveryIdentity) -> serde_json::Value {
     let mut issuers: Vec<String> = Vec::new();
     let mut scopes: BTreeSet<String> = BTreeSet::new();
     for entry in snapshot.oidc_providers.entries() {
-        if !entry.value.enabled {
+        if !entry.value.enabled || !entry.value.is_jwks_mode() {
             continue;
         }
-        issuers.push(entry.value.issuer.clone());
+        // Mandatory in JWKS mode — a row without one never loads.
+        let Some(issuer) = entry.value.issuer.clone() else {
+            continue;
+        };
+        issuers.push(issuer);
         scopes.extend(entry.value.required_scopes.iter().cloned());
     }
     issuers.sort();
@@ -289,6 +325,11 @@ pub(crate) async fn protected_resource_metadata(
     method: axum::http::Method,
     State(state): State<ProxyState>,
 ) -> Response {
+    // Discovery files no usage row on any outcome, and an unrecognised path
+    // normalizes to the passthrough family's own label — so it says so,
+    // rather than resting on being unauthenticated today
+    // (AISIX-Cloud#1571).
+    crate::attribution::note_unmetered_route();
     let snapshot = state.snapshot.load();
     let Some(identity) = discovery_identity(&snapshot) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -537,6 +578,43 @@ mod tests {
         );
         assert_eq!(doc["bearer_methods_supported"], json!(["header"]));
         assert_eq!(doc["scopes_supported"], json!(["mcp:read", "mcp:tools"]));
+    }
+
+    #[test]
+    fn shared_secret_providers_are_never_advertised() {
+        let snap = active_snapshot();
+        // A shared-secret provider issues no tokens of its own and runs
+        // no authorization server, so neither its issuer nor its scope
+        // requirements may reach the metadata document — a client sent
+        // to either would find nothing there.
+        snap.oidc_providers.insert(provider_entry(
+            "op-hmac",
+            r#"{"name":"shared","issuer":"https://shared.example.com",
+                "audiences":["https://gw.example.com/mcp"],
+                "required_scopes":["mcp:shared"],
+                "hmac_secret":"shared-secret-that-is-long-enough-32"}"#,
+        ));
+        let identity = discovery_identity(&snap).unwrap();
+        let doc = prm_document(&snap, &identity);
+        assert_eq!(
+            doc["authorization_servers"],
+            json!(["https://sso.example.com/realms/agents"])
+        );
+        assert_eq!(doc["scopes_supported"], json!(["mcp:tools"]));
+    }
+
+    #[test]
+    fn dormant_when_every_enabled_provider_verifies_by_shared_secret() {
+        let snap = AisixSnapshot::new();
+        snap.mcp_auth_settings
+            .insert(settings_entry("env-1", "https://gw.example.com/mcp"));
+        snap.oidc_providers.insert(provider_entry(
+            "op-hmac",
+            r#"{"name":"shared","hmac_secret":"shared-secret-that-is-long-enough-32"}"#,
+        ));
+        // There is nothing to publish, so the surface answers as though
+        // it did not exist rather than serve an empty server list.
+        assert!(discovery_identity(&snap).is_none());
     }
 
     #[test]

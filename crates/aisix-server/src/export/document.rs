@@ -84,6 +84,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
     let provider_key_names = id_to_name(&snapshot.provider_keys, |pk| pk.display_name.clone());
     let model_names = id_to_name(&snapshot.models, |m| m.display_name.clone());
     let api_key_names = id_to_name(&snapshot.apikeys, |k| synthetic_api_key_name(&k.key_hash));
+    let mcp_server_names = id_to_name(&snapshot.mcp_servers, |s| s.name.clone());
 
     let mut collections: Vec<(&'static str, Vec<Value>)> = Vec::new();
 
@@ -134,7 +135,11 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             |m| m.display_name.clone(),
             "models",
             &mut diag,
-            |doc, identity, diag| resugar_provider_key(doc, identity, &provider_key_names, diag),
+            |doc, identity, diag| {
+                resugar_provider_key(doc, identity, &provider_key_names, diag);
+                resugar_model_refs(doc, "models", "model", identity, &model_names, diag);
+                drop_pricing_key(doc, identity, diag);
+            },
             |_, _| {},
         ),
     );
@@ -148,10 +153,12 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             |k| synthetic_api_key_name(&k.key_hash),
             "api_keys",
             &mut diag,
-            |doc, identity, _warnings| {
+            |doc, identity, diag| {
                 if let Value::Object(map) = doc {
                     map.insert("display_name".into(), Value::String(identity.to_string()));
                 }
+                resugar_allowed_models(doc, identity, &model_names, diag);
+                resugar_mcp_refs(doc, identity, &mcp_server_names, diag);
             },
             |_, _| {},
         ),
@@ -159,32 +166,21 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
 
     // guardrails — identity: name; recursive credential redaction.
     //
-    // The file has no attachment collection, so every file-defined
-    // guardrail applies gateway-wide. Only a guardrail already gateway-wide
-    // in etcd (via an env-scoped attachment) round-trips without changing
-    // its effect; an attachment-scoped or unattached guardrail would widen
-    // to ALL traffic on import (or activate a rule that was never attached).
-    // Those are omitted with a warning — the file still loads without them.
-    let gateway_wide = gateway_wide_guardrail_ids(snapshot);
-    let mut gateway_wide_names: BTreeSet<String> = BTreeSet::new();
-    for entry in snapshot.guardrails.entries() {
-        if gateway_wide.contains(&entry.id) {
-            gateway_wide_names.insert(entry.value.name.clone());
-        } else {
-            diag.warnings.push(format!(
-                "guardrail {:?} is attachment-scoped or unattached in etcd; the resources file \
-                 has no attachment collection, so exporting it would apply it to ALL traffic — \
-                 omitted. Re-declare it in the file only if a gateway-wide rule is intended.",
-                entry.value.name
-            ));
-        }
-    }
+    // Every guardrail is exported, attached or not: the file format now
+    // carries `guardrail_attachments`, and both sources agree that a
+    // guardrail's scope is its attachments and nothing else, so an
+    // unattached guardrail is inert on either side (AISIX-Cloud#1450). It
+    // used to be the opposite — the file had no attachment collection and a
+    // file-defined guardrail applied gateway-wide — so anything not already
+    // env-scoped had to be dropped or it would WIDEN on import.
     let mut guardrails = emit_entries(
         &snapshot.guardrails,
         |g| g.name.clone(),
         "guardrails",
         &mut diag,
-        |_, _, _| {},
+        |doc, identity, diag| {
+            resugar_model_refs(doc, "guardrails", "guardrail", identity, &model_names, diag)
+        },
         |doc, identity| {
             let mut ctx = RedactionCtx {
                 kind_token: "GUARDRAIL",
@@ -196,12 +192,21 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             redact_by_key(doc, GUARDRAIL_SECRET_KEYS, &mut ctx);
         },
     );
-    guardrails.retain(|v| {
-        v.get("name")
+    guardrails.sort_by(|a, b| {
+        a.get("name")
             .and_then(Value::as_str)
-            .is_some_and(|n| gateway_wide_names.contains(n))
+            .cmp(&b.get("name").and_then(Value::as_str))
     });
     push_kind(&mut collections, "guardrails", guardrails);
+
+    // guardrail_attachments — the scope that makes each guardrail apply.
+    // References are emitted as the file identities the other collections
+    // use, since the loader resolves them back to derived ids.
+    push_kind(
+        &mut collections,
+        "guardrail_attachments",
+        emit_guardrail_attachments(snapshot, &model_names, &api_key_names, &mut diag),
+    );
 
     // mcp_servers — identity: name; secret: secret.
     push_kind(
@@ -212,7 +217,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             |s| s.name.clone(),
             "mcp_servers",
             &mut diag,
-            |_, _, _| {},
+            |_, identity, diag| flag_star_in_mcp_server_name(identity, diag),
             |doc, identity| {
                 let mut ctx = RedactionCtx {
                     kind_token: "MCP_SERVER",
@@ -258,7 +263,17 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             |c| c.name.clone(),
             "cache_policies",
             &mut diag,
-            |doc, identity, diag| resugar_cache_applies_to(doc, identity, &api_key_names, diag),
+            |doc, identity, diag| {
+                resugar_cache_applies_to(doc, identity, &api_key_names, diag);
+                resugar_model_refs(
+                    doc,
+                    "cache_policies",
+                    "cache policy",
+                    identity,
+                    &model_names,
+                    diag,
+                );
+            },
             |_, _| {},
         ),
     );
@@ -303,8 +318,10 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
         ),
     );
 
-    // oidc_providers — identity: name; no secrets (issuer / audiences /
-    // JWKS endpoint are all public trust configuration).
+    // oidc_providers — identity: name; secret: hmac_secret. Issuer,
+    // audiences and the JWKS endpoint are public trust configuration; a
+    // shared-secret provider's `hmac_secret` is the credential every one
+    // of its callers authenticates with.
     push_kind(
         &mut collections,
         "oidc_providers",
@@ -314,7 +331,16 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             "oidc_providers",
             &mut diag,
             |_, _, _| {},
-            |_, _| {},
+            |doc, identity| {
+                let mut ctx = RedactionCtx {
+                    kind_token: "OIDC_PROVIDER",
+                    kind: "oidc_providers",
+                    identity,
+                    reveal: reveal_secrets,
+                    out: &mut placeholders,
+                };
+                redact_top_level(doc, "hmac_secret", &mut ctx);
+            },
         ),
     );
 
@@ -343,13 +369,13 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             |_| "mcp_auth_settings".to_string(),
             "mcp_auth_settings",
             &mut diag,
-            |_, _, _| {},
+            |doc, _, diag| resugar_anonymous_servers(doc, &mcp_server_names, diag),
             |_, _| {},
         ),
     );
 
-    // guardrail_attachments are consumed above to decide which guardrails
-    // are gateway-wide; they are not a file collection of their own.
+    // guardrail_attachments are emitted above as their own collection, with
+    // every id reference rewritten to the identity its collection is keyed by.
 
     // Two entries whose identities differ only in characters `sanitize`
     // folds to `_` (e.g. `openai-prod` vs `openai.prod`) derive the SAME
@@ -380,18 +406,118 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
     }
 }
 
-/// Ids of guardrails that already apply gateway-wide in etcd — i.e. that
-/// have at least one env-scoped guardrail attachment (`scope_type: env`
-/// matches every request). These are the only guardrails whose effect is
-/// unchanged when exported into the attachment-less file format.
-fn gateway_wide_guardrail_ids(snapshot: &AisixSnapshot) -> BTreeSet<String> {
-    snapshot
-        .guardrail_attachments
-        .entries()
-        .into_iter()
-        .filter(|a| matches!(a.value.scope_type, GuardrailScopeType::Env))
-        .map(|a| a.value.guardrail_id.clone())
-        .collect()
+/// Build the file's `guardrail_attachments` entries, rewriting every id
+/// reference into the identity its own collection is keyed by in the file.
+///
+/// A `team` scope carries its id through verbatim, the way
+/// `resugar_scope_ref` already does for a team-scoped rate-limit policy:
+/// there is no teams collection to name, but `api_keys[].team_id` IS a file
+/// field and the runtime compares the two ids as bare strings, so the scope
+/// really does resolve standalone. Dropping it would narrow a guardrail while
+/// the rate limit beside it survived.
+///
+/// An attachment the file genuinely cannot express is dropped with a warning
+/// rather than emitted dangling: a `passthrough_route` scope (the export
+/// carries no routes collection to point at) and a `scope_id` naming a
+/// resource missing from the snapshot. Dropping is the safe direction — the
+/// guardrail loses that scope and governs less, never more.
+fn emit_guardrail_attachments(
+    snapshot: &AisixSnapshot,
+    model_names: &BTreeMap<String, String>,
+    api_key_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) -> Vec<Value> {
+    let guardrail_names = id_to_name(&snapshot.guardrails, |g| g.name.clone());
+    let mcp_server_names = id_to_name(&snapshot.mcp_servers, |s| s.name.clone());
+
+    let mut out: Vec<Value> = Vec::new();
+    for entry in snapshot.guardrail_attachments.entries() {
+        let a = &entry.value;
+        let Some(guardrail) = guardrail_names.get(&a.guardrail_id) else {
+            diag.warnings.push(format!(
+                "guardrail attachment {:?} references a guardrail that is not in the snapshot; omitted",
+                entry.id
+            ));
+            continue;
+        };
+        let scope_name = match a.scope_type {
+            GuardrailScopeType::Env => None,
+            GuardrailScopeType::Model => Some(("model", model_names.get(scope_ref(a)))),
+            GuardrailScopeType::McpServer => {
+                Some(("MCP server", mcp_server_names.get(scope_ref(a))))
+            }
+            GuardrailScopeType::ApiKey => Some(("api key", api_key_names.get(scope_ref(a)))),
+            // The export carries no `passthrough_routes` collection, so a
+            // route-scoped attachment has nothing to point at in the file —
+            // emitting the name anyway makes the whole file fail to load.
+            GuardrailScopeType::PassthroughRoute => {
+                diag.warnings.push(format!(
+                    "guardrail {guardrail:?} has a passthrough-route-scoped attachment; the \
+                     export does not carry passthrough routes, so that scope is omitted",
+                ));
+                continue;
+            }
+            // Verbatim: `api_keys[].team_id` is a file field and
+            // `IndexEntry::applies_to` compares the two ids as bare strings.
+            GuardrailScopeType::Team => Some(("team", a.scope_id.as_ref())),
+        };
+        let resolved = match scope_name {
+            None => None,
+            Some((label, Some(name))) => {
+                let _ = label;
+                Some(name.clone())
+            }
+            Some((label, None)) => {
+                diag.warnings.push(format!(
+                    "guardrail {guardrail:?} is scoped to a {label} that is not in the snapshot; \
+                     that scope is omitted",
+                ));
+                continue;
+            }
+        };
+
+        let mut doc = serde_json::Map::new();
+        doc.insert("guardrail_id".into(), Value::String(guardrail.clone()));
+        doc.insert(
+            "scope_type".into(),
+            serde_json::to_value(&a.scope_type).unwrap_or(Value::Null),
+        );
+        if let Some(name) = resolved {
+            doc.insert("scope_id".into(), Value::String(name));
+        }
+        doc.insert("priority".into(), Value::from(a.priority));
+        if !a.enabled {
+            doc.insert("enabled".into(), Value::Bool(false));
+        }
+        // Same `$` escaping every other collection gets from `emit_entries`:
+        // the loader unescapes `$$` before interpolating, so a name carrying
+        // a `$` must be written escaped on BOTH sides of the reference or the
+        // two stop matching.
+        let mut doc = Value::Object(doc);
+        escape_dollars(&mut doc);
+        out.push(doc);
+    }
+    // Deterministic file output: same snapshot must emit the same bytes.
+    out.sort_by(|a, b| {
+        (
+            a.get("guardrail_id").and_then(Value::as_str),
+            a.get("scope_type").and_then(Value::as_str),
+            a.get("scope_id").and_then(Value::as_str),
+        )
+            .cmp(&(
+                b.get("guardrail_id").and_then(Value::as_str),
+                b.get("scope_type").and_then(Value::as_str),
+                b.get("scope_id").and_then(Value::as_str),
+            ))
+    });
+    out
+}
+
+/// An attachment's `scope_id`, or the empty string — which never matches a
+/// real resource id, so an absent scope on a narrow scope_type resolves to
+/// "not in the snapshot" and is reported as such.
+fn scope_ref(a: &aisix_core::models::GuardrailAttachment) -> &str {
+    a.scope_id.as_deref().unwrap_or("")
 }
 
 /// Deterministic file identity for a canonical api-key document, which
@@ -551,6 +677,347 @@ fn resugar_provider_key(
              will not load until it is resolved)"
         )),
     }
+}
+
+/// Drop `model.pricing_key` — a control-plane projection with no file
+/// form.
+///
+/// A pricing document lives in a collection the resources file does not
+/// have, and the shared catalog lives outside the exported prefix
+/// entirely, so the reference cannot be resugared into anything a file
+/// can resolve.
+///
+/// Dropping it always changes what the model costs, so it is always
+/// reported. A model carrying an inline `cost` too is NOT safe to pass
+/// over: the document wins at runtime, so the exported file prices that
+/// model at its `cost` instead — silently, and by a different number
+/// whenever the two disagree.
+fn drop_pricing_key(doc: &mut Value, model: &str, diag: &mut Diagnostics) {
+    let Some(map) = doc.as_object_mut() else {
+        return;
+    };
+    let Some(Value::String(key)) = map.remove("pricing_key") else {
+        return;
+    };
+    if map.contains_key("cost") {
+        diag.warnings.push(format!(
+            "model {model:?} is priced by the pricing document {key:?}, which a resources file \
+             cannot express — the exported model falls back to its inline `cost`, which is a \
+             different price whenever the two disagree"
+        ));
+        return;
+    }
+    diag.warnings.push(format!(
+        "model {model:?} takes its price from the pricing document {key:?}, which a resources \
+         file cannot express — the exported model carries no price and will rank last under \
+         `least_cost`; set `cost` on it if the price matters"
+    ));
+}
+
+/// `api_key.allowed_model_ids` (etcd ids) → `allowed_models` names.
+///
+/// The file source grants models by name, so the export resolves each id to
+/// the identity the models collection is keyed by and emits the name form the
+/// key already carries a field for. The id form is a control-plane projection
+/// and is never written to a resources file.
+///
+/// An id naming no exported model is dropped with a warning rather than kept:
+/// dropping it makes the key reach LESS, while emitting an unresolvable name
+/// would fail the loader's model cross-reference and take the whole file down.
+fn resugar_allowed_models(
+    doc: &mut Value,
+    api_key: &str,
+    model_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    let Some(map) = doc.as_object_mut() else {
+        return;
+    };
+    let Some(Value::Array(ids)) = map.remove("allowed_model_ids") else {
+        return;
+    };
+
+    let mut names = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let Some(id) = id.as_str() else { continue };
+        match model_names.get(id) {
+            Some(name) => names.push(Value::String(name.clone())),
+            None => diag.warnings.push(format!(
+                "api key {api_key:?} grants model id {id:?}, which is not among the exported \
+                 models — the grant is dropped (the gateway already treats it as granting \
+                 nothing)"
+            )),
+        }
+    }
+    map.insert("allowed_models".into(), Value::Array(names));
+}
+
+/// Every id-form model reference in `doc` → its name-form spelling.
+///
+/// The id form is a control-plane projection: it names a model by the id
+/// the control plane assigned it, and a file's ids are derived from its
+/// entry names, so the export resolves each id to the identity the models
+/// collection is keyed by and emits the name the document already has a
+/// field for. The fields and the places they can appear come from
+/// `aisix_core::filesource`, the same pair of tables the file source
+/// refuses them by, so the two cannot drift.
+///
+/// An id naming no exported model is emitted as the name form carrying the
+/// raw id, which is exactly how the gateway already treats it — the id
+/// stands in as a name that resolves to nothing. That keeps the export
+/// honest about a reference that was already dangling instead of inventing
+/// or silently dropping one. It is blocking for a model, whose targets the
+/// loader cross-checks (the file will not load until it is fixed), and a
+/// warning where the loader does not (the reference is simply inert, as it
+/// already was).
+fn resugar_model_refs(
+    doc: &mut Value,
+    kind: &'static str,
+    label: &str,
+    identity: &str,
+    model_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    let fields = aisix_core::filesource::model_ref_id_fields(kind);
+    let mut blocking: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    aisix_core::filesource::for_each_model_ref_node(kind, doc, &mut |node| {
+        for reference in fields {
+            let (id_field, name_field) = (reference.field, reference.name_field);
+            // Only a STRING id is rewritten here. `api_keys` carries an
+            // array of them and has its own resugar
+            // (`resugar_allowed_models`), so leaving a non-string in
+            // place is what keeps the two from colliding if this ever
+            // gains that kind.
+            let Some(Value::String(id)) = node.get(id_field).cloned() else {
+                continue;
+            };
+            node.remove(id_field);
+            let resolved = model_names.get(&id).cloned();
+            if resolved.is_none() {
+                let message = format!(
+                    "{label} {identity:?} references model id {id:?} in `{id_field}`, which is \
+                     not among the exported models — emitted under `{name_field}` as a name \
+                     that resolves to nothing (dangling reference in the source data)"
+                );
+                if kind == "models" {
+                    blocking.push(message);
+                } else {
+                    warnings.push(message);
+                }
+            }
+            let name = resolved.unwrap_or(id);
+            // A cache policy's model scope folds into the free-form
+            // `applies_to` string rather than a field of its own, and
+            // overrides whatever that string held — the same precedence
+            // the gateway applies.
+            let value = if id_field == "applies_to_model_id" {
+                format!("model:{name}")
+            } else {
+                name
+            };
+            node.insert(name_field.to_string(), Value::String(value));
+        }
+    });
+    diag.blocking.extend(blocking);
+    diag.warnings.extend(warnings);
+}
+
+/// An API key's MCP references (etcd server ids) → the name form.
+///
+/// Three fields carry a server by id: `mcp_rate_limits_by_id`, and the
+/// `allow_ids` / `deny_ids` sides of `mcp_access`. The file source grants
+/// and limits MCP servers by name, so each is resolved to the identity the
+/// `mcp_servers` collection is keyed by and re-emitted under the name field
+/// it shadows. The id form is a control-plane projection and is never
+/// written to a resources file.
+///
+/// The id form is authoritative at runtime, so the name form it shadows is
+/// REPLACED rather than merged: keeping both would export a key whose stored
+/// grant and exported grant differ.
+///
+/// An entry naming no exported server is dropped with a warning. For a grant
+/// that makes the key reach LESS, which is the safe direction and the one the
+/// gateway already takes for an unresolvable id; for a limit it means the
+/// exported key is bounded by its own `rate_limit` alone, which is why that
+/// case warns too.
+///
+/// An entry whose server's NAME contains a `*` gets no name form at all: see
+/// the comment at the match below. The per-server limits are unaffected —
+/// they key a map by the exact name rather than building a glob.
+fn resugar_mcp_refs(
+    doc: &mut Value,
+    api_key: &str,
+    mcp_server_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    let Some(map) = doc.as_object_mut() else {
+        return;
+    };
+
+    if let Some(Value::Object(by_id)) = map.remove("mcp_rate_limits_by_id") {
+        let mut by_name = serde_json::Map::new();
+        for (id, limits) in by_id {
+            match mcp_server_names.get(&id) {
+                Some(name) => {
+                    by_name.insert(name.clone(), limits);
+                }
+                None => diag.warnings.push(format!(
+                    "api key {api_key:?} limits MCP server id {id:?}, which is not among the \
+                     exported MCP servers — the limit is dropped (the gateway already treats it \
+                     as imposing nothing)"
+                )),
+            }
+        }
+        map.insert("mcp_rate_limits".into(), Value::Object(by_name));
+    }
+
+    let Some(Value::Object(access)) = map.get_mut("mcp_access") else {
+        return;
+    };
+    for (id_field, name_field) in [("allow_ids", "allow"), ("deny_ids", "deny")] {
+        let Some(Value::Array(refs)) = access.remove(id_field) else {
+            continue;
+        };
+        let mut patterns = Vec::with_capacity(refs.len());
+        for entry in &refs {
+            let (Some(id), Some(tool)) = (
+                entry.get("server_id").and_then(Value::as_str),
+                entry.get("tool").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            match mcp_server_names.get(id) {
+                // A registered name may legally contain a `*` — the name
+                // pattern only forbids `__` and a trailing `_` — and the
+                // name form is glob-matched, so `gh*__read` built from a
+                // server named `gh*` would also cover `ghost__read`. The
+                // runtime never does this (it compares the server id
+                // exactly); neither may the export. The name form simply
+                // cannot express such a reference, so the entry does not
+                // get one — dropped on the allow side, where reaching less
+                // is the safe direction, and blocking on the deny side,
+                // where dropping it would let the file permit what the
+                // gateway forbids.
+                Some(name) if name.contains('*') => {
+                    let note = format!(
+                        "api key {api_key:?} names MCP server {name:?} under \
+                         `mcp_access.{id_field}`, whose name contains `*`; a \
+                         `<server>__<tool>` pattern built from it would match a different \
+                         server"
+                    );
+                    if name_field == "deny" {
+                        diag.blocking.push(format!(
+                            "{note} — the exported file cannot express this denial and would \
+                             permit a tool the gateway blocks"
+                        ));
+                    } else {
+                        diag.warnings.push(format!("{note} — the entry is dropped"));
+                    }
+                }
+                Some(name) => patterns.push(Value::String(format!("{name}__{tool}"))),
+                None => diag.warnings.push(format!(
+                    "api key {api_key:?} names MCP server id {id:?} under \
+                     `mcp_access.{id_field}`, which is not among the exported MCP servers — the \
+                     entry is dropped (the gateway already treats it as matching nothing)"
+                )),
+            }
+        }
+        access.insert(name_field.into(), Value::Array(patterns));
+    }
+}
+
+/// A registered MCP server whose name contains a `*` is emitted verbatim
+/// and reported as blocking.
+///
+/// Such a row loads from etcd — the read schema deliberately keeps the
+/// looser name pattern so an already-registered server is never dropped —
+/// but the WRITE pattern refuses it, so `aisix validate` fails on the file
+/// this export just produced. The blocking diagnostics answer "will this
+/// file load as-is", and without this one they would answer yes.
+///
+/// Reported even when nothing references the server: every name-form
+/// pattern built from such a name is wrong in one direction or the other
+/// (see `NAME_PATTERN_STRICT`), so the name is what has to change.
+///
+/// Not fixed up here: renaming the server would silently detach every
+/// name-form grant, limit and anonymous ceiling that points at it, which
+/// is a decision for the operator and not for an export.
+fn flag_star_in_mcp_server_name(identity: &str, diag: &mut Diagnostics) {
+    if identity.contains('*') {
+        diag.blocking.push(format!(
+            "MCP server {identity:?} has a `*` in its name, which the resources file no longer \
+             accepts — the exported file will not load until the server is renamed (its stored \
+             row keeps loading from etcd unchanged)"
+        ));
+    }
+}
+
+/// The anonymous ceiling's `anonymous.server_ids` (etcd server ids) → the
+/// name form `anonymous.servers`.
+///
+/// The id form is authoritative at runtime, so the name form it shadows is
+/// REPLACED rather than merged: keeping both would export a settings row
+/// whose stored ceiling and exported ceiling differ.
+///
+/// An id naming no exported server is dropped with a warning — the ceiling
+/// then admits less, which is the direction the gateway already takes for an
+/// unresolvable id. Two cases the name form genuinely cannot express are
+/// blocking instead:
+///
+/// - a server whose name contains a `*`. The ceiling is applied as
+///   `<server>__*`, so the emitted pattern would carry TWO `*` and
+///   `wildcard_matches` refuses any pattern with more than one — the file
+///   would state a ceiling admitting none of that server's tools, where the
+///   stored one admits all of them. (The allow/deny sides fail the opposite
+///   way for the same character, which is why the write path now rejects such
+///   a name outright.)
+/// - a ceiling that resolves to no server at all, including the empty array
+///   that denies every anonymous caller: `servers` must name at least one
+///   server, so the file has no spelling for it.
+fn resugar_anonymous_servers(
+    doc: &mut Value,
+    mcp_server_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    let Some(Value::Object(anon)) = doc.get_mut("anonymous") else {
+        return;
+    };
+    let Some(Value::Array(ids)) = anon.remove("server_ids") else {
+        return;
+    };
+    let mut names = Vec::with_capacity(ids.len());
+    // A ceiling whose only entries were dropped for a `*` name is already
+    // blocking and already explained; adding "admits no server — disable
+    // anonymous access instead" on top would advise the wrong fix.
+    let mut unexpressible = false;
+    for id in ids.iter().filter_map(Value::as_str) {
+        match mcp_server_names.get(id) {
+            Some(name) if name.contains('*') => {
+                unexpressible = true;
+                diag.blocking.push(format!(
+                    "the anonymous MCP ceiling admits server {name:?}, whose name contains `*`; \
+                     the ceiling is written as `<server>__*`, and a pattern carrying two `*` \
+                     matches nothing — the exported file would state a ceiling admitting none \
+                     of that server's tools"
+                ));
+            }
+            Some(name) => names.push(Value::String(name.clone())),
+            None => diag.warnings.push(format!(
+                "the anonymous MCP ceiling admits MCP server id {id:?}, which is not among the \
+                 exported MCP servers — the entry is dropped (the gateway already treats it as \
+                 admitting nothing)"
+            )),
+        }
+    }
+    if names.is_empty() && !unexpressible {
+        diag.blocking.push(
+            "the anonymous MCP ceiling admits no server, which `anonymous.servers` cannot \
+             express — it must name at least one; disable anonymous access instead"
+                .to_string(),
+        );
+    }
+    anon.insert("servers".into(), Value::Array(names));
 }
 
 /// `claim_mapping.resolve.api_key_id` (etcd id) → `resolve.api_key`

@@ -109,6 +109,13 @@ export interface ReceivedRequest {
   method: string;
   path: string;
   headers: Record<string, string>;
+  /**
+   * Header names as they arrived, one entry per occurrence and in wire
+   * order. `headers` collapses a repeated name (node keeps only the first
+   * `authorization`), so an assertion that a slot carries EXACTLY ONE
+   * value — the shape a doubled credential breaks — has to count here.
+   */
+  headerNames: string[];
   body: string;
 }
 
@@ -148,6 +155,9 @@ export async function startOpenAiUpstream(
             Array.isArray(v) ? v.join(",") : (v ?? ""),
           ]),
         ),
+        headerNames: req.rawHeaders
+          .filter((_, i) => i % 2 === 0)
+          .map((n) => n.toLowerCase()),
         body: raw,
       });
 

@@ -107,6 +107,8 @@ describe("status/models: etcd mode — equivalence with the admin endpoint", () 
         provider: "openai",
         model_name: "gpt-4o-mini",
         provider_key_id: failPk.id,
+        // Cooldown is opt-in; this test's subject is the cooldown row.
+        cooldown: { enabled: true },
       })
     ).id;
     stableModelID = (

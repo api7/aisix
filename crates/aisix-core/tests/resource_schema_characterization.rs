@@ -8,11 +8,13 @@
 //! case is obvious. New resources append their own table as they migrate.
 
 use aisix_core::models::schema::{
-    unknown_field_paths, validate_apikey, validate_cache_policy, validate_guardrail,
-    validate_guardrail_attachment, validate_observability_exporter, validate_provider_key,
-    validate_rate_limit_policy,
+    resource_root_schema, unknown_field_paths, validate_apikey, validate_cache_policy,
+    validate_guardrail, validate_guardrail_attachment, validate_observability_exporter,
+    validate_provider_key, validate_rate_limit_policy, RESOURCES,
 };
 use serde_json::{json, Value};
+use std::fs;
+use std::path::Path;
 
 /// Run a corpus of `(label, expect_accept, payload)` against `validate`.
 ///
@@ -81,6 +83,26 @@ fn cache_policy_corpus() {
                 true,
                 json!({"name": "k", "applies_to": "api_key:11111111-1111-1111-1111-111111111111"}),
             ),
+            (
+                "model scope by resource id",
+                true,
+                json!({"name": "k", "applies_to_model_id": "m-1"}),
+            ),
+            (
+                "similarity embedder named by resource id alone",
+                true,
+                json!({"name": "k", "semantic": {"embedding_model_id": "m-e", "threshold": 0.9}}),
+            ),
+            (
+                "similarity embedder named neither way",
+                false,
+                json!({"name": "k", "semantic": {"threshold": 0.9}}),
+            ),
+            (
+                "empty applies_to_model_id",
+                false,
+                json!({"name": "k", "applies_to_model_id": ""}),
+            ),
             // CachePolicy has no deny_unknown_fields → forward-compat fields tolerated.
             (
                 "unknown field tolerated",
@@ -140,7 +162,21 @@ fn apikey_corpus() {
                 true,
                 json!({"key_hash": "h", "allowed_models": []}),
             ),
-            ("missing allowed_models", false, json!({"key_hash": "h"})),
+            // Neither grant field: a key may grant models by name
+            // (`allowed_models`) or by resource id (`allowed_model_ids`),
+            // so neither is required — carrying neither is a valid
+            // document that grants no model access.
+            ("no grant field at all", true, json!({"key_hash": "h"})),
+            (
+                "allowed_model_ids alone",
+                true,
+                json!({"key_hash": "h", "allowed_model_ids": ["m-1"]}),
+            ),
+            (
+                "allowed_model_ids of non-strings",
+                false,
+                json!({"key_hash": "h", "allowed_model_ids": [1]}),
+            ),
             ("missing key_hash", false, json!({"allowed_models": ["a"]})),
             (
                 "empty key_hash",
@@ -633,6 +669,24 @@ fn guardrail_corpus() {
                 false,
                 json!({"name": "k", "kind": "keyword", "patterns": [{"kind": "literal", "value": "x", "extra": 1}]}),
             ),
+            (
+                "semantic embedder named by resource id alone",
+                true,
+                json!({"name": "s", "kind": "semantic", "embedding_model_id": "m-e",
+                       "deny_examples": ["x"], "deny_threshold": 0.8}),
+            ),
+            (
+                "semantic embedder named neither way",
+                false,
+                json!({"name": "s", "kind": "semantic",
+                       "deny_examples": ["x"], "deny_threshold": 0.8}),
+            ),
+            (
+                "semantic embedder id present but empty",
+                false,
+                json!({"name": "s", "kind": "semantic", "embedding_model_id": "",
+                       "deny_examples": ["x"], "deny_threshold": 0.8}),
+            ),
             // top-level / kind discriminator
             (
                 "missing name",
@@ -836,4 +890,769 @@ fn guardrail_attachment_corpus() {
             ),
         ],
     );
+}
+
+// ---------------------------------------------------------------------------
+// Published schema files — `schemas/resources/` (strict, the write contract)
+// and `schemas/resources-lenient/` (the etcd loader's read contract).
+//
+// The corpora above pin what the in-process validators do. This section pins
+// that the files a downstream consumer vendors ARE those validators, so the
+// control plane can read the read contract instead of re-deriving it from the
+// strict files.
+// ---------------------------------------------------------------------------
+
+/// Parse one published schema file out of `schemas/<dir>/`.
+fn schemas_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("CARGO_MANIFEST_DIR has two ancestors")
+        .join("schemas")
+}
+
+/// Sorted file names published under `schemas/<sub>/`. Read off the directory
+/// rather than a hard-coded list so a file the dump starts (or stops) emitting
+/// reaches the checks below.
+fn published_file_names(sub: &str) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(schemas_dir().join(sub))
+        .unwrap_or_else(|e| panic!("read schemas/{sub}: {e}"))
+        .map(|e| {
+            e.expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+fn published_schema(dir: &str, resource: &str) -> Value {
+    let path = schemas_dir()
+        .join(dir)
+        .join(format!("{resource}.schema.json"));
+    let bytes =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    serde_json::from_str(&bytes).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+}
+
+/// Every published lenient file is exactly what `LENIENT_SCHEMAS` compiles.
+///
+/// `Schemas::compile(false)` builds each validator from
+/// `resource_root_schema(resource, false)`, so equality here is the whole
+/// provenance claim: the file is the loader's schema, not a transformation of
+/// the strict one that happens to agree today.
+#[test]
+fn published_lenient_schemas_are_what_the_loader_compiles() {
+    for resource in RESOURCES {
+        assert_eq!(
+            published_schema("resources-lenient", resource),
+            resource_root_schema(resource, false),
+            "schemas/resources-lenient/{resource}.schema.json is not \
+             resource_root_schema({resource:?}, false) — re-run \
+             `cargo run -p aisix-core --bin dump-schema`"
+        );
+    }
+}
+
+/// The strict twin of the check above: every published strict file is exactly
+/// what the write validators compile. Those files are also `include_str!`ed
+/// into the DP admin OpenAPI document, so they are worth pinning here and not
+/// only in the CI drift job.
+#[test]
+fn published_strict_schemas_are_what_the_write_path_compiles() {
+    for resource in RESOURCES {
+        assert_eq!(
+            published_schema("resources", resource),
+            resource_root_schema(resource, true),
+            "schemas/resources/{resource}.schema.json is not \
+             resource_root_schema({resource:?}, true) — re-run \
+             `cargo run -p aisix-core --bin dump-schema`"
+        );
+    }
+}
+
+/// Where the two published sets differ BEYOND unknown fields, pinned as the
+/// exhaustive list of JSON paths at which the strict file (with every
+/// `additionalProperties: false` stripped) and the lenient file disagree.
+///
+/// A consumer that models the lenient set as "the strict set with the
+/// closures removed" is wrong for these five, and the difference is not
+/// cosmetic: the loader accepts an `mcp_policy` with no `allow` and reads the
+/// field's default. Registering the paths rather than a prose reason is what
+/// makes the table checkable — a claim that some OTHER field relaxed, or that
+/// one of these stopped relaxing, moves a path and fails.
+///
+/// Three shapes appear here, and `schemas/README.md` must keep telling them
+/// apart:
+///
+/// - a `required` / `minLength` / `pattern` / `not` change, which really does
+///   let the loader accept a document the write path rejects (`api_key`,
+///   `mcp_policy`, `mcp_server`, `model`, and the `semantic` guardrail
+///   branch). `mcp_server`'s is the label pattern, which forbids a `*` only
+///   on the write path — a stored row that already carries one must keep
+///   loading, and a read-path tightening would drop the row rather than the
+///   character. The
+///   `McpToolRef` `required` / `minLength` paths are this shape: a
+///   half-written entry has to keep deserializing, because the loader
+///   skips a row it cannot deserialize whole and for an `api_key` that
+///   costs the key every kind of traffic, not just MCP access;
+/// - an `allOf` overlay the STRICT producer injects and the lenient one
+///   does not. `mcp_policy`'s `/allOf` holds both the team-scope guard,
+///   which is on both sets, and the strict-only "write the name form beside
+///   the id form" guard — so the whole keyword differs even though half of
+///   its contents do not. `api_key`'s two are strict-only outright;
+/// - a `default` annotation the STRICT producer strips on purpose and the
+///   lenient one keeps, which changes nothing about what validates but does
+///   feed a schema-driven form generator a value the same branch would refuse
+///   (the `custom` guardrail's `script`, whose `default: ""` sits beside
+///   `minLength: 1`; both halves of `McpToolRef`, for the same reason; the
+///   semantic thresholds' `default: 0.75`). `script` itself is required on
+///   BOTH sets.
+const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
+    (
+        "api_key",
+        &[
+            "/allOf",
+            "/definitions/McpAccess/allOf",
+            "/definitions/McpAccess/required",
+            "/definitions/McpToolRef/properties/server_id/default",
+            "/definitions/McpToolRef/properties/server_id/minLength",
+            "/definitions/McpToolRef/properties/tool/default",
+            "/definitions/McpToolRef/properties/tool/minLength",
+            "/definitions/McpToolRef/required",
+        ],
+    ),
+    (
+        "guardrail",
+        &[
+            "/oneOf/10/allOf",
+            "/oneOf/10/properties/allow_threshold/default",
+            "/oneOf/10/properties/deny_threshold/default",
+            "/oneOf/11/properties/script/default",
+        ],
+    ),
+    (
+        "mcp_policy",
+        &[
+            "/allOf",
+            "/definitions/McpToolRef/properties/server_id/default",
+            "/definitions/McpToolRef/properties/server_id/minLength",
+            "/definitions/McpToolRef/properties/tool/default",
+            "/definitions/McpToolRef/properties/tool/minLength",
+            "/definitions/McpToolRef/required",
+            "/required",
+        ],
+    ),
+    (
+        "mcp_server",
+        &[
+            "/properties/display_name/pattern",
+            "/properties/name/pattern",
+        ],
+    ),
+    (
+        "model",
+        &[
+            "/oneOf/0/not/anyOf",
+            "/oneOf/1/not/anyOf",
+            "/oneOf/2/not/anyOf",
+            "/oneOf/3/not/anyOf",
+            "/properties/effort_mapping/additionalProperties/minLength",
+            "/properties/effort_mapping/properties//minLength",
+        ],
+    ),
+];
+
+/// Every field the resources file refuses as an id-form model reference
+/// is a field this build's schema actually declares.
+///
+/// The refusal list (`filesource::model_ref_id_fields`) is written by
+/// hand, and `aisix export` rewrites the same list back to name form. A
+/// typo in either half is silent in both directions: the file would
+/// accept an id that resolves to nothing, and the export would leave one
+/// in a file that then refuses to load. Neither shows up as a test
+/// failure anywhere else, because a name nothing declares simply never
+/// matches.
+#[test]
+fn every_refused_model_reference_id_is_a_declared_field() {
+    fn declares(node: &Value, field: &str) -> bool {
+        match node {
+            Value::Object(map) => {
+                map.get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|p| p.contains_key(field))
+                    || map.values().any(|v| declares(v, field))
+            }
+            Value::Array(items) => items.iter().any(|v| declares(v, field)),
+            _ => false,
+        }
+    }
+
+    // (resources-file collection, the resource whose schema declares it)
+    for (kind, resource) in [
+        ("api_keys", "api_key"),
+        ("models", "model"),
+        ("cache_policies", "cache_policy"),
+        ("guardrails", "guardrail"),
+    ] {
+        let schema = resource_root_schema(resource, true);
+        let fields = aisix_core::filesource::model_ref_id_fields(kind);
+        assert!(
+            !fields.is_empty(),
+            "{kind} has model references but refuses none"
+        );
+        for reference in fields {
+            let (id_field, name_field) = (reference.field, reference.name_field);
+            assert!(
+                declares(&schema, id_field),
+                "{kind} refuses `{id_field}`, which the {resource} schema does not declare"
+            );
+            assert!(
+                declares(&schema, name_field),
+                "{kind} rewrites `{id_field}` to `{name_field}`, which the {resource} schema \
+                 does not declare"
+            );
+            // The hint is what an operator is told to write instead, so it
+            // has to START with the name field — a hint naming a different
+            // field would send them somewhere the reference does not live.
+            assert!(
+                reference.hint.starts_with(name_field),
+                "{kind}'s hint for `{id_field}` ({:?}) does not name `{name_field}`",
+                reference.hint
+            );
+        }
+    }
+}
+
+/// The same check for the OTHER reference with an id spelling: every
+/// field the resources file refuses as an id-form MCP server reference,
+/// and every name field it points the operator at, is one this build's
+/// schema actually declares.
+///
+/// `filesource::mcp_ref_id_fields` is hand-written per collection and
+/// `aisix export` rewrites the same list back to the name form, so a typo
+/// in either half is silent in both directions — the file would accept an
+/// id that resolves to nothing, and the export would emit one into a file
+/// that then refuses to load.
+#[test]
+fn every_refused_mcp_reference_id_is_a_declared_field() {
+    /// The object `path` names, walked from the schema root through
+    /// `properties`, following a `$ref` into `definitions` at each step.
+    ///
+    /// Walked rather than searched, because `path` is exactly as
+    /// typo-prone as the field names beside it and a whole-document
+    /// search cannot see it: `mcp_ref_id_field` navigates the DOCUMENT by
+    /// that path, so a path naming no object makes the refusal silently
+    /// never fire — the file then loads a ceiling built from
+    /// control-plane ids, which resolves to nothing, with the name form
+    /// beside it unread.
+    fn object_at<'a>(schema: &'a Value, path: &[&str]) -> Option<&'a Value> {
+        let mut node = schema;
+        for segment in path {
+            let property = node.get("properties")?.get(segment)?;
+            node = resolve_ref(schema, property)?;
+        }
+        Some(node)
+    }
+
+    /// Follow one indirection into `definitions`: a bare `$ref`, or the
+    /// single `$ref` branch of the `allOf` / `anyOf` wrapper `schemars`
+    /// emits for a described or nullable field.
+    fn resolve_ref<'a>(schema: &'a Value, node: &'a Value) -> Option<&'a Value> {
+        let referenced = node.get("$ref").or_else(|| {
+            ["allOf", "anyOf", "oneOf"]
+                .iter()
+                .filter_map(|k| node.get(k))
+                .filter_map(Value::as_array)
+                .find_map(|branches| branches.iter().find_map(|b| b.get("$ref")))
+        });
+        match referenced.and_then(Value::as_str) {
+            Some(pointer) => schema.pointer(pointer.trim_start_matches('#')),
+            None => Some(node),
+        }
+    }
+
+    // (resources-file collection, the resource whose schema declares it)
+    for (kind, resource) in [
+        ("api_keys", "api_key"),
+        ("mcp_auth_settings", "mcp_auth_settings"),
+    ] {
+        let schema = resource_root_schema(resource, true);
+        let fields = aisix_core::filesource::mcp_ref_id_fields(kind);
+        assert!(
+            !fields.is_empty(),
+            "{kind} carries MCP server references but refuses none"
+        );
+        for reference in fields {
+            let (path, id_field, name_field) =
+                (reference.path, reference.field, reference.name_field);
+            let holder = object_at(&schema, path).unwrap_or_else(|| {
+                panic!(
+                    "{kind} refuses `{id_field}` under path {path:?}, which the {resource} \
+                     schema declares no object at"
+                )
+            });
+            let declares = |field: &str| {
+                holder
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|p| p.contains_key(field))
+            };
+            assert!(
+                declares(id_field),
+                "{kind} refuses `{id_field}`, which the {resource} schema does not declare at \
+                 {path:?}"
+            );
+            assert!(
+                declares(name_field),
+                "{kind} rewrites `{id_field}` to `{name_field}`, which the {resource} schema \
+                 does not declare at {path:?}"
+            );
+        }
+    }
+}
+
+/// Every `<name>` / `<name>_id` pair a resource declares is registered as
+/// a model reference.
+///
+/// The other direction of the check above, and the one that actually
+/// rots: a future site gains an id spelling, nobody adds it to
+/// `filesource::model_ref_id_fields`, and from then on the resources file
+/// SILENTLY accepts an id it can never resolve (with the name spelling
+/// ignored on top) while `aisix export` silently drops it. Nothing else
+/// notices, because a field no table mentions simply never matches.
+///
+/// Detected structurally rather than by name or by prose: a property
+/// ending `_id` (or `_ids`) whose name-form sibling is declared on the
+/// SAME object is the shape every model reference has. Sibling-less ids
+/// — `provider_key_id`, `team_id`, `user_id` — are not pairs and are not
+/// reported. A reference whose name form is spelled differently
+/// (`applies_to_model_id` → `applies_to`) cannot be found this way, which
+/// is why it is registered by hand; this check only ever demands MORE
+/// registration, never less.
+#[test]
+fn every_declared_name_and_id_pair_is_registered_as_a_model_reference() {
+    /// The name-form sibling `field` would pair with, if any.
+    fn name_form(field: &str) -> Option<String> {
+        if let Some(stem) = field.strip_suffix("_ids") {
+            return Some(format!("{stem}s"));
+        }
+        field.strip_suffix("_id").map(str::to_owned)
+    }
+
+    fn collect_pairs(node: &Value, out: &mut Vec<String>) {
+        match node {
+            Value::Object(map) => {
+                if let Some(Value::Object(properties)) = map.get("properties") {
+                    for field in properties.keys() {
+                        if name_form(field).is_some_and(|n| properties.contains_key(&n)) {
+                            out.push(field.clone());
+                        }
+                    }
+                }
+                for child in map.values() {
+                    collect_pairs(child, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect_pairs(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (kind, resource) in [
+        ("api_keys", "api_key"),
+        ("models", "model"),
+        ("cache_policies", "cache_policy"),
+        ("guardrails", "guardrail"),
+    ] {
+        let mut found = Vec::new();
+        collect_pairs(&resource_root_schema(resource, true), &mut found);
+        found.sort();
+        found.dedup();
+        let registered = aisix_core::filesource::model_ref_id_fields(kind);
+        for field in found {
+            assert!(
+                registered.iter().any(|r| r.field == field),
+                "the {resource} schema declares `{field}` beside its name form, but \
+                 `filesource::model_ref_id_fields(\"{kind}\")` does not list it — the \
+                 resources file would accept an id it can never resolve, and `aisix export` \
+                 would drop it"
+            );
+        }
+    }
+}
+
+/// The published files are exactly the ones `dump-schema` emits today.
+///
+/// `dump-schema` only ever writes, so a file it STOPPED emitting would sit in
+/// the tree, keep matching its twin, and go on being vendored as a contract
+/// this build no longer has. Every other check here is driven off `RESOURCES`
+/// or off the directory itself, and neither can see such an orphan.
+#[test]
+fn published_directories_hold_exactly_what_the_dump_emits() {
+    // The nested struct types `dump-schema` publishes beside the resources.
+    // They have no runtime validator, so `RESOURCES` does not name them.
+    const NESTED: [&str; 5] = ["embedding", "ensemble", "rate_limit", "routing", "semantic"];
+
+    let mut expected: Vec<String> = RESOURCES
+        .iter()
+        .chain(NESTED.iter())
+        .map(|n| format!("{n}.schema.json"))
+        .collect();
+    expected.sort();
+    for dir in ["resources", "resources-lenient"] {
+        assert_eq!(
+            published_file_names(dir),
+            expected,
+            "schemas/{dir}/ holds a file dump-schema no longer emits, or is \
+             missing one it does"
+        );
+    }
+}
+
+/// The two published sets differ ONLY by `additionalProperties: false`,
+/// except at the paths [`EXTRA_RELAXATIONS`] registers.
+///
+/// Strips every closure out of the strict file and requires the result to
+/// equal the lenient one. This is the claim `schemas/README.md` makes to
+/// downstream consumers, and the claim the control plane cannot make
+/// unconditionally when it derives one set from the other.
+#[test]
+fn published_sets_differ_only_where_registered() {
+    fn without_closures(node: &Value) -> Value {
+        match node {
+            Value::Object(obj) => Value::Object(
+                obj.iter()
+                    .filter(|(k, v)| !(k.as_str() == "additionalProperties" && *v == &json!(false)))
+                    .map(|(k, v)| (k.clone(), without_closures(v)))
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.iter().map(without_closures).collect()),
+            other => other.clone(),
+        }
+    }
+
+    /// Every JSON path at which `a` and `b` disagree, deepest name that still
+    /// differs. A length mismatch reports the array itself.
+    fn diff_paths(a: &Value, b: &Value, at: &str, out: &mut Vec<String>) {
+        match (a, b) {
+            (Value::Object(x), Value::Object(y)) => {
+                let mut keys: Vec<&String> = x.keys().chain(y.keys()).collect();
+                keys.sort();
+                keys.dedup();
+                for k in keys {
+                    match (x.get(k), y.get(k)) {
+                        (Some(l), Some(r)) => diff_paths(l, r, &format!("{at}/{k}"), out),
+                        _ => out.push(format!("{at}/{k}")),
+                    }
+                }
+            }
+            (Value::Array(x), Value::Array(y)) if x.len() == y.len() => {
+                for (i, (l, r)) in x.iter().zip(y).enumerate() {
+                    diff_paths(l, r, &format!("{at}/{i}"), out);
+                }
+            }
+            _ if a != b => out.push(at.to_string()),
+            _ => {}
+        }
+    }
+
+    let mut found: Vec<(String, Vec<String>)> = Vec::new();
+    for name in published_file_names("resources-lenient") {
+        let resource = name.trim_end_matches(".schema.json").to_string();
+        let opened = without_closures(&published_schema("resources", &resource));
+        let mut paths = Vec::new();
+        diff_paths(
+            &opened,
+            &published_schema("resources-lenient", &resource),
+            "",
+            &mut paths,
+        );
+        paths.sort();
+        if !paths.is_empty() {
+            found.push((resource, paths));
+        }
+    }
+    found.sort();
+
+    let mut registered: Vec<(String, Vec<String>)> = EXTRA_RELAXATIONS
+        .iter()
+        .map(|(r, paths)| {
+            (
+                (*r).to_string(),
+                paths.iter().map(|p| (*p).to_string()).collect(),
+            )
+        })
+        .collect();
+    registered.sort();
+    assert_eq!(
+        found, registered,
+        "the published sets differ beyond `additionalProperties: false` at a \
+         path EXTRA_RELAXATIONS does not register (or register one that no \
+         longer differs). schemas/README.md describes this list in prose — \
+         update both."
+    );
+}
+
+/// No published lenient file closes anything, at any depth.
+///
+/// This is the property `open_unknown_fields` exists for and the one a
+/// consumer of these files relies on: a closure left standing anywhere — a
+/// `definitions` entry, a `oneOf` branch, a nested property — is a whole
+/// stored row lost the first time a newer control plane writes a field under
+/// it (#1014). Walks the directory rather than a hard-coded list so a file
+/// the dump starts emitting cannot skip the check.
+#[test]
+fn published_lenient_schemas_close_nothing_at_any_depth() {
+    fn closed_paths(node: &Value, path: &str, out: &mut Vec<String>) {
+        match node {
+            Value::Object(obj) => {
+                if obj.get("additionalProperties") == Some(&Value::Bool(false)) {
+                    out.push(path.to_string());
+                }
+                for (k, v) in obj {
+                    closed_paths(v, &format!("{path}/{k}"), out);
+                }
+            }
+            Value::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    closed_paths(v, &format!("{path}/{i}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // The two sets publish the same resources under the same file names — the
+    // lenient set is a full twin, not a subset of interesting cases.
+    assert_eq!(
+        published_file_names("resources"),
+        published_file_names("resources-lenient")
+    );
+
+    for name in published_file_names("resources-lenient") {
+        let resource = name.trim_end_matches(".schema.json");
+        let schema = published_schema("resources-lenient", resource);
+        let mut closed = Vec::new();
+        closed_paths(&schema, "", &mut closed);
+        assert!(
+            closed.is_empty(),
+            "{name} still closes unknown fields at {closed:?}"
+        );
+    }
+}
+
+/// One probe case: a valid `resource` document, and the JSON pointer to the
+/// object the unknown field is inserted into (`""` selects the root).
+struct Probe {
+    resource: &'static str,
+    pointer: &'static str,
+    document: fn() -> Value,
+}
+
+/// One valid document per resource, pointed at a position that resource's
+/// write contract closes — nested wherever the resource has a nested closure.
+/// The test inserts a field no build knows there: the strict file must then
+/// reject the document it accepted a moment ago, and the lenient file must
+/// still accept it.
+///
+/// Asserting the un-probed document passes the strict file is what makes the
+/// rejection attributable to the unknown field rather than to anything else in
+/// the fixture (a missing credential, an unsatisfied `oneOf`).
+///
+/// A non-empty pointer is the case a root-only check cannot see, and the one
+/// an older gateway got wrong before #1014 — a field added inside a nested
+/// config object took the whole row down. Six resources close only their root
+/// and say so with `""` rather than silently testing the weaker property.
+const UNKNOWN_FIELD_TOLERANCE: &[Probe] = &[
+    Probe {
+        resource: "model",
+        pointer: "/rate_limit",
+        document: || {
+            json!({"display_name": "m", "provider": "openai", "model_name": "gpt-4o",
+                   "provider_key_id": "pk-1", "rate_limit": {"rpm": 10}})
+        },
+    },
+    Probe {
+        resource: "api_key",
+        pointer: "/rate_limit",
+        document: || json!({"key_hash": "h", "allowed_models": ["a"], "rate_limit": {"rpm": 10}}),
+    },
+    Probe {
+        resource: "provider_key",
+        pointer: "/tls",
+        document: || json!({"display_name": "pk", "api_key": "sk-x", "tls": {"verify": false}}),
+    },
+    Probe {
+        resource: "guardrail",
+        pointer: "/detectors/0",
+        document: || json!({"name": "g", "kind": "pii", "detectors": [{"type": "email"}]}),
+    },
+    Probe {
+        resource: "rate_limit_policy",
+        pointer: "/limits",
+        document: || json!({"name": "p", "limits": {"rpm": 10}}),
+    },
+    Probe {
+        resource: "claim_mapping",
+        pointer: "/resolve",
+        document: || {
+            json!({"name": "c", "jwt_provider": "p",
+                   "match": [{"claim": "sub", "op": "exact", "values": ["a"]}],
+                   "resolve": {"api_key_id": "k"}})
+        },
+    },
+    Probe {
+        resource: "mcp_auth_settings",
+        pointer: "/anonymous",
+        document: || {
+            json!({"anonymous": {"api_key_id": "k", "servers": ["s"],
+                                 "source_cidrs": ["10.0.0.0/8"]}})
+        },
+    },
+    // Root-only: these resources embed no object their write contract closes.
+    Probe {
+        resource: "observability_exporter",
+        pointer: "",
+        document: || {
+            json!({"name": "e", "kind": "otlp_http",
+                   "endpoint": "https://collector.example/v1/traces"})
+        },
+    },
+    Probe {
+        resource: "mcp_server",
+        pointer: "",
+        document: || json!({"name": "s", "url": "https://example.com/mcp"}),
+    },
+    Probe {
+        resource: "mcp_policy",
+        pointer: "",
+        document: || json!({"scope": "env", "allow": ["*"]}),
+    },
+    Probe {
+        resource: "a2a_agent",
+        pointer: "",
+        document: || json!({"name": "ag", "url": "https://example.com/a2a"}),
+    },
+    Probe {
+        resource: "oidc_provider",
+        pointer: "",
+        document: || json!({"name": "o", "issuer": "https://issuer.example", "audiences": ["a"]}),
+    },
+    Probe {
+        resource: "passthrough_route",
+        pointer: "",
+        document: || {
+            json!({"name": "r", "path_prefix": "/proxy",
+                   "target_url": "https://upstream.example",
+                   "provider_key_id": "pk-1"})
+        },
+    },
+    // A pricing document is closed on write at its root: the three
+    // fields ARE the document, so anything else there is a mistake the
+    // control plane should hear about. The loader still takes the row —
+    // a price it can read is worth more than a field it cannot.
+    Probe {
+        resource: "pricing",
+        pointer: "",
+        document: || json!({"key": "openai/gpt-4o", "input_per_1k": 0.005, "output_per_1k": 0.015}),
+    },
+];
+
+/// The two resources whose write contract closes NOTHING — not the root, not
+/// a nested object — so no document can separate their strict and lenient
+/// files. They are checked in the opposite direction: the strict file must
+/// still accept the unknown field. The day one of them closes, that assertion
+/// fails and it moves into the table above.
+const OPEN_ON_WRITE: &[Probe] = &[
+    Probe {
+        resource: "guardrail_attachment",
+        pointer: "",
+        document: || json!({"guardrail_id": "gid", "scope_type": "env", "priority": 1}),
+    },
+    Probe {
+        resource: "cache_policy",
+        pointer: "",
+        document: || json!({"name": "c"}),
+    },
+];
+
+/// The field name every probe inserts. Long and unmistakable so a failure
+/// message says which key the schema tripped over.
+const PROBE: &str = "from_a_newer_control_plane";
+
+/// Insert [`PROBE`] into the object `pointer` selects (the root for `""`).
+fn probed(mut document: Value, pointer: &str) -> Value {
+    let target = document
+        .pointer_mut(pointer)
+        .unwrap_or_else(|| panic!("pointer {pointer:?} resolves in the fixture"))
+        .as_object_mut()
+        .unwrap_or_else(|| panic!("pointer {pointer:?} selects an object"));
+    target.insert(PROBE.to_string(), json!(1));
+    document
+}
+
+#[test]
+fn published_lenient_schemas_tolerate_what_the_strict_ones_reject() {
+    let compile = |dir: &str, resource: &str| {
+        jsonschema::validator_for(&published_schema(dir, resource))
+            .unwrap_or_else(|e| panic!("schemas/{dir}/{resource}.schema.json compiles: {e}"))
+    };
+
+    for probe in UNKNOWN_FIELD_TOLERANCE {
+        let resource = probe.resource;
+        let pointer = probe.pointer;
+        let base = (probe.document)();
+        let with_unknown = probed(base.clone(), pointer);
+        let strict = compile("resources", resource);
+        let lenient = compile("resources-lenient", resource);
+
+        if let Err(e) = strict.validate(&base) {
+            panic!("{resource}: the fixture is not a valid document to begin with: {e}");
+        }
+        assert!(
+            strict.validate(&with_unknown).is_err(),
+            "{resource}: the strict file accepted `{PROBE}` at {pointer:?} — \
+             that position is no longer closed on write"
+        );
+        if let Err(e) = lenient.validate(&with_unknown) {
+            panic!(
+                "{resource}: the lenient file rejected `{PROBE}` at {pointer:?}, so the \
+                 loader would skip a row a newer control plane wrote: {e}"
+            );
+        }
+    }
+
+    for probe in OPEN_ON_WRITE {
+        let resource = probe.resource;
+        let with_unknown = probed((probe.document)(), probe.pointer);
+        assert!(
+            compile("resources", resource)
+                .validate(&with_unknown)
+                .is_ok(),
+            "{resource} now closes unknown fields on write — move it into \
+             UNKNOWN_FIELD_TOLERANCE with a pointer at the closed position"
+        );
+        assert!(compile("resources-lenient", resource)
+            .validate(&with_unknown)
+            .is_ok());
+    }
+
+    // Exhaustive over the resource list, so a new resource cannot be added
+    // without deciding which of the two tables it belongs in.
+    let mut covered: Vec<&str> = UNKNOWN_FIELD_TOLERANCE
+        .iter()
+        .chain(OPEN_ON_WRITE)
+        .map(|p| p.resource)
+        .collect();
+    covered.sort_unstable();
+    let mut all = RESOURCES.to_vec();
+    all.sort_unstable();
+    assert_eq!(covered, all);
 }

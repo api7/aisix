@@ -260,11 +260,6 @@ pub enum ProxyError {
     /// `allowed_routes` grants.
     #[error("API key is not allowed to use passthrough route {0:?}")]
     RouteForbidden(String),
-    /// A removed endpoint whose replacement exists: 410 with a fixed
-    /// migration message (the implicit `/passthrough/:provider/*rest`
-    /// tunnel, superseded by explicit passthrough routes).
-    #[error("{0}")]
-    Gone(String),
     #[error("request payload is invalid: {0}")]
     InvalidRequest(String),
     /// A non-WebSocket request reached the WebSocket-only realtime
@@ -295,8 +290,26 @@ pub enum ProxyError {
     /// [`guardrail_block_message`] — generic policy wording plus the NAME
     /// of the guardrail that fired (#519 B.4b) — and emits the rich
     /// detail to `tracing` for operators.
-    #[error("{0}")]
-    ContentFiltered(String),
+    ///
+    /// `unavailable` carries the guardrail's bounded failure tag when the
+    /// refusal was an AVAILABILITY failure on a `fail_open: false` row —
+    /// the screening service was unreachable, or an operator-supplied
+    /// script produced no usable verdict — rather than a content decision.
+    /// It is the same closed, label-safe vocabulary
+    /// `GuardrailVerdict::Block::unavailable` carries, never free text and
+    /// never matched content, so it is safe on the wire.
+    ///
+    /// Keeping the two inside ONE variant is deliberate: `status()`,
+    /// `kind()`, and the dispatch-loop predicates must not diverge between
+    /// them (a guardrail refusal is a guardrail refusal for retry,
+    /// failover and outcome-classification purposes), so the distinction
+    /// lives only where it is read by a human or branched on by an SDK —
+    /// the message and `error.code`.
+    #[error("{message}")]
+    ContentFiltered {
+        message: String,
+        unavailable: Option<String>,
+    },
     // Carries cp-api's structured reason. Display forwards the cp-api
     // message verbatim (it's already a complete customer sentence —
     // "<scope> budget '<name>' exceeded ($X/period). Resets …"); the
@@ -335,6 +348,23 @@ pub enum ProxyError {
     Bridge(#[from] BridgeError),
 }
 
+/// Failure tags for the two refusals the PROXY itself raises on a
+/// guardrail's behalf, where no `GuardrailVerdict` exists to carry one.
+/// Same closed, label-safe vocabulary as a kind's own tag, and here for
+/// the same reason: in both cases the content was never screened, so
+/// telling the caller its content violated a policy states something that
+/// did not happen.
+///
+/// `output_buffer_exceeded` — a streamed response outgrew the hold-back
+/// cap and the row is fail-closed, so it is refused unscanned.
+/// `unscannable_body` — the body could not be walked, so the guardrail was
+/// never offered the content to scan.
+/// `mask_writeback_failed` — a mask verdict could not be spliced back into
+/// the body, so the request is refused rather than forwarded unmasked.
+pub(crate) const TAG_OUTPUT_BUFFER_EXCEEDED: &str = "output_buffer_exceeded";
+pub(crate) const TAG_UNSCANNABLE_BODY: &str = "unscannable_body";
+pub(crate) const TAG_MASK_WRITEBACK_FAILED: &str = "mask_writeback_failed";
+
 /// The caller-visible message for a guardrail `Block` verdict.
 ///
 /// Carries WHICH guardrail fired — `guardrail_name` is operator-assigned
@@ -346,10 +376,46 @@ pub enum ProxyError {
 /// family builds its rejection text through this helper so the wording can't
 /// drift between siblings, even where the envelope differs (422 or an SSE
 /// error event on the LLM routes; an `isError` tool result on `/mcp`).
-pub(crate) fn guardrail_block_message(side: &str, guardrail_name: Option<&str>) -> String {
-    match guardrail_name {
-        Some(name) => format!("{side} blocked by content policy (guardrail '{name}')"),
-        None => format!("{side} blocked by content policy"),
+///
+/// `unavailable` splits the sentence in two. A guardrail that REFUSED the
+/// content and a guardrail that COULD NOT EVALUATE it are the same 422 to
+/// every consumer downstream, and until this parameter existed they were
+/// also the same sentence — so an operator whose fail-closed row was
+/// broken (a screening service down, a script returning a verdict the
+/// gateway does not understand) saw their own working policy's message on
+/// every single request, with nothing in the response to suggest
+/// otherwise. AISIX-Cloud#1365 split the two on the audit event and the
+/// metric; this is the third surface, the one the caller actually reads.
+/// The tag is named in the text because it is what an operator greps for
+/// and what the dashboard shows.
+pub(crate) fn guardrail_block_message(
+    side: &str,
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> String {
+    match (unavailable, guardrail_name) {
+        (Some(tag), Some(name)) => {
+            format!("{side} rejected: guardrail '{name}' could not evaluate it ({tag})")
+        }
+        (Some(tag), None) => format!("{side} rejected: a guardrail could not evaluate it ({tag})"),
+        (None, Some(name)) => format!("{side} blocked by content policy (guardrail '{name}')"),
+        (None, None) => format!("{side} blocked by content policy"),
+    }
+}
+
+/// [`guardrail_block_message`] wrapped in the error the LLM handlers
+/// return. The `Option<String>` sites (SSE error frames, `/mcp` tool
+/// results, hand-built JSON bodies) use the message helper directly; every
+/// site that returns a [`ProxyError`] goes through this one so the message
+/// and the `unavailable` tag can never be set from different verdicts.
+pub(crate) fn guardrail_block_error(
+    side: &str,
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> ProxyError {
+    ProxyError::ContentFiltered {
+        message: guardrail_block_message(side, guardrail_name, unavailable),
+        unavailable: unavailable.map(str::to_owned),
     }
 }
 
@@ -372,14 +438,13 @@ impl ProxyError {
             ProxyError::ModelIpRestricted(_) => StatusCode::FORBIDDEN,
             ProxyError::RouteIpRestricted(_) => StatusCode::FORBIDDEN,
             ProxyError::RouteForbidden(_) => StatusCode::FORBIDDEN,
-            ProxyError::Gone(_) => StatusCode::GONE,
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             ProxyError::WebSocketUpgradeRequired { status, .. } => *status,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::AllCandidatesUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            ProxyError::ContentFiltered(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            ProxyError::ContentFiltered { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
@@ -410,7 +475,6 @@ impl ProxyError {
             ProxyError::ModelIpRestricted(_) => "permission_denied",
             ProxyError::RouteIpRestricted(_) => "permission_denied",
             ProxyError::RouteForbidden(_) => "permission_denied",
-            ProxyError::Gone(_) => "invalid_request_error",
             ProxyError::ModelNotFound(_) => "model_not_found",
             ProxyError::VideoNotFound(_) => "video_not_found",
             ProxyError::InvalidRequest(_) => "invalid_request_error",
@@ -418,12 +482,34 @@ impl ProxyError {
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
             ProxyError::AllCandidatesUnavailable { .. } => "all_candidates_unavailable",
-            ProxyError::ContentFiltered(_) => "content_filter",
+            ProxyError::ContentFiltered { .. } => "content_filter",
             ProxyError::BudgetExceeded(_) => "billing_error",
             ProxyError::RateLimit(_) => "rate_limit_exceeded",
             ProxyError::PolicyRateLimit { .. } => "rate_limit_exceeded",
             ProxyError::Bridge(b) => b.error_type(),
         }
+    }
+
+    /// Whether this failure IS a guardrail refusal — the request was
+    /// stopped by the guardrail machinery rather than by an upstream, a
+    /// quota, a credential or a malformed body.
+    ///
+    /// Drives `UsageEvent::guardrail_blocked`, which is the indexed column
+    /// the dashboard's "Guardrail blocks" view and the
+    /// `guardrail_blocked=true` usage query filter on. Every failure-path
+    /// emitter reads it from here rather than re-deriving the match, so a
+    /// new handler cannot join the family with the flag silently left at
+    /// its `false` default (AISIX-Cloud#1428).
+    ///
+    /// A fail-closed refusal (`unavailable: Some(_)` — the guardrail could
+    /// not evaluate the request and its row refuses what it cannot check)
+    /// counts too: the guardrail machinery is still what stopped the
+    /// request, and hiding it from the Blocked view would leave an operator
+    /// with a 422 that nothing accounts for. Which of the two it was stays
+    /// legible on `guardrail_enforced_hits.action`
+    /// (`blocked` vs `blocked_unavailable`).
+    pub(crate) fn is_guardrail_block(&self) -> bool {
+        matches!(self, ProxyError::ContentFiltered { .. })
     }
 
     /// Seconds the client should wait before retrying. Only present for
@@ -521,9 +607,6 @@ impl ProxyError {
             // ModelForbidden (#557 AC-1).
             ProxyError::ModelIpRestricted(_) => env.with_code("ip_restricted"),
             ProxyError::RouteIpRestricted(_) => env.with_code("ip_restricted"),
-            // Stable code so migration tooling can detect the removed
-            // tunnel without matching on the message text.
-            ProxyError::Gone(_) => env.with_code("endpoint_removed"),
             // Stable machine-readable codes so SDKs can branch on the
             // lifecycle reason without parsing the message, while the
             // `error.type` stays the family-wide `invalid_api_key`.
@@ -543,6 +626,18 @@ impl ProxyError {
             }
             ProxyError::JwtIdentityUnmapped => env.with_code("jwt_identity_unmapped"),
             ProxyError::JwksUnavailable => env.with_code("jwks_unavailable"),
+            // Same stable-code convention, for the one distinction a
+            // caller cannot make from `error.type`: `content_filter`
+            // covers both a policy refusal and a fail-closed row that
+            // could not evaluate the request. The `type` stays
+            // `content_filter` — it is a shipped contract and both really
+            // are guardrail refusals — while the code lets an SDK branch,
+            // and lets an operator's dashboard stop counting a broken
+            // script as policy volume.
+            ProxyError::ContentFiltered {
+                unavailable: Some(_),
+                ..
+            } => env.with_code("guardrail_unavailable"),
             _ => env,
         }
     }
@@ -632,19 +727,72 @@ impl ProxyError {
     }
 }
 
+impl ProxyError {
+    /// The gateway limit that refused this request, when the gateway's
+    /// OWN limiter is what refused it.
+    ///
+    /// `None` for every other 429: a budget rejection caps spend in
+    /// dollars, not requests or tokens, and an upstream 429 reports the
+    /// provider's quota, which the gateway does not know. Both would
+    /// have to invent the numbers. That makes the presence of the
+    /// `x-ratelimit-*` trio on a 429 the caller's signal that AISIX
+    /// itself rejected the request rather than relaying somebody else's
+    /// rejection.
+    fn rate_limit_detail(&self) -> Option<aisix_ratelimit::LimitDetail> {
+        match self {
+            ProxyError::RateLimit(e) => Some(e.detail()),
+            ProxyError::PolicyRateLimit { source, .. } => Some(source.detail()),
+            _ => None,
+        }
+    }
+}
+
+/// Write the retry / rate-limit headers both envelopes owe a rejection.
+///
+/// Shared so the OpenAI-shape and Anthropic-shape renderers cannot
+/// drift: `/v1/messages` answering a 429 without the headers
+/// `/v1/chat/completions` carries would be the same class of bug #336
+/// fixed for the body.
+///
+/// `X-RateLimit-Reset` is delta-seconds, deliberately the same number
+/// as `Retry-After` for a windowed dimension — a caller may read either
+/// one and back off identically, with no clock sync against the
+/// gateway. `X-RateLimit-Scope` is an AISIX extension naming which
+/// dimension fired; without it `x-ratelimit-limit: 100` cannot be told
+/// apart between an rpm, a tpm and a concurrency cap, whose units all
+/// differ.
+fn apply_retry_headers(
+    response: &mut Response,
+    retry_after_secs: Option<u64>,
+    detail: Option<aisix_ratelimit::LimitDetail>,
+) {
+    let headers = response.headers_mut();
+    let mut set = |name: &'static str, value: String| {
+        if let Ok(v) = HeaderValue::from_str(&value) {
+            headers.insert(name, v);
+        }
+    };
+    if let Some(secs) = retry_after_secs {
+        set("retry-after", secs.to_string());
+    }
+    if let Some(d) = detail {
+        set("x-ratelimit-limit", d.limit.to_string());
+        set("x-ratelimit-remaining", d.remaining.to_string());
+        set("x-ratelimit-reset", d.reset_secs.to_string());
+        set("x-ratelimit-scope", d.dimension.to_string());
+    }
+}
+
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let challenge = self.auth_challenge();
         let status = self.status();
         let retry_after = self.retry_after_secs();
+        let rate_limit_detail = self.rate_limit_detail();
         let upgrade_reject = matches!(self, ProxyError::WebSocketUpgradeRequired { .. });
         let body = self.envelope();
         let mut response = (status, Json(body)).into_response();
-        if let Some(secs) = retry_after {
-            if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
-                response.headers_mut().insert("retry-after", value);
-            }
-        }
+        apply_retry_headers(&mut response, retry_after, rate_limit_detail);
         if let Some(challenge) = challenge {
             response.extensions_mut().insert(challenge);
         }
@@ -712,7 +860,7 @@ struct AnthropicErrorBody {
 /// (The OpenAI envelope's inner `error.type` keeps the DP-stable
 /// strings per ai-gateway#327; that contract is unchanged on
 /// `/v1/chat/completions`.)
-fn anthropic_kind_from_status(status: StatusCode) -> &'static str {
+pub(crate) fn anthropic_kind_from_status(status: StatusCode) -> &'static str {
     match status.as_u16() {
         400 | 422 => "invalid_request_error",
         401 => "authentication_error",
@@ -754,6 +902,7 @@ impl ProxyError {
     pub fn into_anthropic_response(self) -> Response {
         let status = self.status();
         let retry_after = self.retry_after_secs();
+        let rate_limit_detail = self.rate_limit_detail();
         let kind = anthropic_kind_from_status(status).to_string();
         // Reuse OpenAI envelope only for the SAFE-MESSAGE logic
         // (5xx body redaction, 4xx upstream-message pass-through).
@@ -768,11 +917,7 @@ impl ProxyError {
             },
         };
         let mut response = (status, Json(anth_body)).into_response();
-        if let Some(secs) = retry_after {
-            if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
-                response.headers_mut().insert("retry-after", value);
-            }
-        }
+        apply_retry_headers(&mut response, retry_after, rate_limit_detail);
         response
     }
 }
@@ -1125,6 +1270,56 @@ mod tests {
         json
     }
 
+    #[test]
+    fn a_guardrail_that_could_not_evaluate_does_not_claim_a_content_decision() {
+        // The whole defect in one assertion: the two refusals shared a
+        // sentence, so a broken fail-closed row looked exactly like a
+        // working policy to the caller.
+        let policy = guardrail_block_error("request", Some("my-guard"), None);
+        let broken = guardrail_block_error("request", Some("my-guard"), Some("custom_no_verdict"));
+        assert_eq!(
+            policy.to_string(),
+            "request blocked by content policy (guardrail 'my-guard')"
+        );
+        assert_ne!(policy.to_string(), broken.to_string());
+        assert!(broken.to_string().contains("could not evaluate"));
+        assert!(!broken.to_string().contains("content policy"));
+        // The tag is named so an operator can grep the message straight
+        // onto the dashboard series that carries the same value.
+        assert!(broken.to_string().contains("custom_no_verdict"));
+        // Both still name the firing row (#519 B.4b) and neither carries
+        // matched content (#153).
+        assert!(broken.to_string().contains("my-guard"));
+    }
+
+    #[test]
+    fn an_unattributed_availability_refusal_still_says_which_kind_of_refusal_it_is() {
+        let msg = guardrail_block_message("response", None, Some("output_buffer_exceeded"));
+        assert_eq!(
+            msg,
+            "response rejected: a guardrail could not evaluate it (output_buffer_exceeded)"
+        );
+    }
+
+    #[test]
+    fn the_availability_refusal_keeps_the_status_and_type_but_adds_a_machine_readable_code() {
+        let policy = guardrail_block_error("request", Some("g"), None);
+        let broken = guardrail_block_error("request", Some("g"), Some("custom_unknown_action"));
+        // Same shipped contract: an SDK branching on status or type sees
+        // no change, and an operator alert on `content_filter` keeps
+        // counting both.
+        assert_eq!(policy.status(), broken.status());
+        assert_eq!(policy.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(policy.kind(), "content_filter");
+        assert_eq!(broken.kind(), "content_filter");
+        // The code is the new discriminator.
+        assert_eq!(policy.envelope().error.code, None);
+        assert_eq!(
+            broken.envelope().error.code.as_deref(),
+            Some("guardrail_unavailable")
+        );
+    }
+
     #[tokio::test]
     async fn anthropic_envelope_404_maps_to_not_found_error() {
         let err = ProxyError::ModelNotFound("claude-x".into());
@@ -1181,7 +1376,7 @@ mod tests {
         // Content-filter rejections share 422 with the OpenAI side;
         // Anthropic-canonical 422 maps to `invalid_request_error`
         // (no dedicated content-filter type in the SDK literal).
-        let err = ProxyError::ContentFiltered("request blocked by content policy".into());
+        let err = guardrail_block_error("request", None, None);
         let resp = err.into_anthropic_response();
         assert_anthropic_envelope(
             resp,
@@ -1310,6 +1505,146 @@ mod tests {
             msg.contains("503"),
             "redacted message must still surface the upstream status, got: {msg}",
         );
+    }
+
+    /// The four headers a gateway-produced 429 owes the caller, on the
+    /// OpenAI-shape envelope. `x-ratelimit-reset` is delta-seconds and
+    /// equals `retry-after` for a windowed dimension, so a client may
+    /// back off on either without a clock shared with the gateway.
+    #[tokio::test]
+    async fn gateway_429_carries_the_standard_rate_limit_headers() {
+        let err = ProxyError::RateLimit(aisix_ratelimit::RateLimitError::Requests {
+            scope: aisix_core::RateLimitScope::Requests,
+            detail: aisix_ratelimit::LimitDetail {
+                dimension: "rpm",
+                limit: 100,
+                remaining: 0,
+                reset_secs: 43,
+            },
+        });
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let h = resp.headers();
+        assert_eq!(h.get("retry-after").unwrap(), "43");
+        assert_eq!(h.get("x-ratelimit-limit").unwrap(), "100");
+        assert_eq!(h.get("x-ratelimit-remaining").unwrap(), "0");
+        assert_eq!(h.get("x-ratelimit-reset").unwrap(), "43");
+        assert_eq!(h.get("x-ratelimit-scope").unwrap(), "rpm");
+    }
+
+    /// `/v1/messages` answers in the Anthropic envelope but owes the
+    /// same headers — the renderers share one writer precisely so this
+    /// cannot drift per endpoint.
+    #[tokio::test]
+    async fn anthropic_envelope_429_carries_the_same_rate_limit_headers() {
+        let err = ProxyError::RateLimit(aisix_ratelimit::RateLimitError::Tokens {
+            scope: aisix_core::RateLimitScope::Tokens,
+            detail: aisix_ratelimit::LimitDetail {
+                dimension: "tpm",
+                limit: 50_000,
+                remaining: 0,
+                reset_secs: 12,
+            },
+        });
+        let resp = err.into_anthropic_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let h = resp.headers();
+        assert_eq!(h.get("retry-after").unwrap(), "12");
+        assert_eq!(h.get("x-ratelimit-limit").unwrap(), "50000");
+        assert_eq!(h.get("x-ratelimit-remaining").unwrap(), "0");
+        assert_eq!(h.get("x-ratelimit-reset").unwrap(), "12");
+        assert_eq!(h.get("x-ratelimit-scope").unwrap(), "tpm");
+    }
+
+    /// A policy-layer rejection is the same rejection with an attributed
+    /// policy — it reports the policy's own limit, not a blank.
+    #[tokio::test]
+    async fn policy_429_reports_the_policy_layer_limit() {
+        let err = ProxyError::PolicyRateLimit {
+            source: aisix_ratelimit::RateLimitError::Requests {
+                scope: aisix_core::RateLimitScope::Requests,
+                detail: aisix_ratelimit::LimitDetail {
+                    dimension: "rpd",
+                    limit: 5_000,
+                    remaining: 0,
+                    reset_secs: 3_600,
+                },
+            },
+            policy_id: "pol-1".into(),
+            policy_name: "team-daily".into(),
+        };
+        let resp = err.into_response();
+        let h = resp.headers();
+        assert_eq!(h.get("x-ratelimit-limit").unwrap(), "5000");
+        assert_eq!(h.get("x-ratelimit-scope").unwrap(), "rpd");
+        assert_eq!(h.get("x-ratelimit-reset").unwrap(), "3600");
+    }
+
+    /// A concurrency cap has no window, so it reports a fixed hint —
+    /// but it DOES report all four headers. Before this contract a
+    /// concurrency 429 carried no retry hint at all, leaving a client
+    /// with nothing to back off on.
+    #[tokio::test]
+    async fn concurrency_429_carries_all_four_headers() {
+        let err = ProxyError::RateLimit(aisix_ratelimit::RateLimitError::Concurrency {
+            detail: aisix_ratelimit::LimitDetail {
+                dimension: aisix_ratelimit::CONCURRENCY_DIMENSION,
+                limit: 8,
+                remaining: 0,
+                reset_secs: aisix_ratelimit::CONCURRENCY_RETRY_AFTER_SECS,
+            },
+        });
+        let resp = err.into_response();
+        let h = resp.headers();
+        assert_eq!(h.get("retry-after").unwrap(), "60");
+        assert_eq!(h.get("x-ratelimit-limit").unwrap(), "8");
+        assert_eq!(h.get("x-ratelimit-remaining").unwrap(), "0");
+        assert_eq!(h.get("x-ratelimit-reset").unwrap(), "60");
+        assert_eq!(h.get("x-ratelimit-scope").unwrap(), "concurrency");
+    }
+
+    /// An upstream 429 is the provider's rejection, not the gateway's.
+    /// Its `Retry-After` is forwarded, but the gateway must NOT invent
+    /// `x-ratelimit-*` values for a quota it does not know — their
+    /// absence is how a caller tells the two 429s apart.
+    #[tokio::test]
+    async fn upstream_429_forwards_retry_after_but_no_gateway_ratelimit_headers() {
+        let err = ProxyError::Bridge(BridgeError::upstream_status_with_retry_after(
+            429,
+            "rate limited by provider",
+            Some(std::time::Duration::from_secs(30)),
+        ));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let h = resp.headers();
+        assert_eq!(h.get("retry-after").unwrap(), "30");
+        assert!(h.get("x-ratelimit-limit").is_none());
+        assert!(h.get("x-ratelimit-remaining").is_none());
+        assert!(h.get("x-ratelimit-reset").is_none());
+        assert!(h.get("x-ratelimit-scope").is_none());
+    }
+
+    /// A budget rejection caps spend in dollars. It shares the 429
+    /// status but has no request/token dimension, so the trio must stay
+    /// absent rather than carry a number in the wrong unit.
+    #[tokio::test]
+    async fn budget_429_keeps_retry_after_without_rate_limit_headers() {
+        let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
+            message: "budget exceeded".into(),
+            scope: None,
+            scope_ref: None,
+            limit_usd: Some("1.00".into()),
+            spent_usd: Some("2.00".into()),
+            period: None,
+            period_resets_at: None,
+            retry_after_seconds: Some(600),
+        }));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let h = resp.headers();
+        assert_eq!(h.get("retry-after").unwrap(), "600");
+        assert!(h.get("x-ratelimit-limit").is_none());
+        assert!(h.get("x-ratelimit-scope").is_none());
     }
 
     #[tokio::test]

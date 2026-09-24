@@ -24,6 +24,10 @@
 
 use aisix_gateway::{
     sse::{SseDecoder, SseEvent},
+    structured_output::{
+        apply_schema_limits, json_schema_from_response_format, response_into_fake_stream_chunks,
+        unwrap_json_tool_call, GEMINI_OPENAPI_SCHEMA_LIMITS,
+    },
     Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatFormat,
     ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest, EmbeddingResponse,
     EmbeddingUsage, EmbeddingVector, FinishReason, Role, UsageStats,
@@ -52,7 +56,7 @@ use crate::wire;
 // `StreamState` (the same decoder the direct Anthropic bridge uses).
 use aisix_provider_anthropic::wire::{
     build_request as build_anthropic_request, response_into_chat_response, split_system,
-    AnthropicResponse, AnthropicStreamEvent, StreamState,
+    structured_output_for, AnthropicResponse, AnthropicStreamEvent, StreamState, StructuredOutput,
 };
 
 // Llama + the OpenAI-compatible MaaS family on Vertex use the OpenAI
@@ -122,14 +126,15 @@ impl VertexBridge {
     }
 
     /// The client this dispatch runs on: the bridge's shared one, unless
-    /// the resolved Provider Key carries its own TLS settings. The token
+    /// the resolved Provider Key carries its own connection overrides
+    /// (TLS trust settings, a name-resolution address). The token
     /// minter deliberately keeps the shared client — it talks to the
-    /// identity provider, not to the key's `api_base`, and a private CA
+    /// identity provider, not to the key's `api_base`, and an override
     /// declared for the model endpoint says nothing about that host.
     fn client_for(&self, ctx: &BridgeContext) -> Client {
         aisix_gateway::upstream_tls::client_for_provider_key(
             &self.client,
-            ctx.provider_key.tls.as_ref(),
+            ctx.provider_key.upstream_connection().as_ref(),
         )
     }
 
@@ -275,7 +280,6 @@ impl Default for VertexBridge {
 
 fn default_client() -> Client {
     aisix_gateway::client_builder()
-        .user_agent("aisix/0.1")
         .build()
         .unwrap_or_else(|_| Client::new())
 }
@@ -661,6 +665,10 @@ impl Bridge for VertexBridge {
         self.name
     }
 
+    fn wire_protocol(&self) -> &'static str {
+        aisix_core::Adapter::Vertex.wire_protocol()
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,
@@ -700,6 +708,27 @@ impl Bridge for VertexBridge {
                  mistral-* / jamba-*"
             ))
         })?;
+        // The Claude tool route's JSON only exists once the synthetic
+        // tool call has been assembled, so it cannot be streamed as it
+        // arrives. Run the request non-streaming and fake-stream the
+        // translated result: the client sees an ordinary chunk sequence,
+        // and usage rides its own terminal chunk exactly as on a real
+        // stream. Gemini never takes that route — this bridge sends it
+        // no tools — and the OpenAI-shim publishers speak
+        // `response_format` natively.
+        if publisher == VertexPublisher::Anthropic
+            && matches!(
+                structured_output_for(req, upstream_id),
+                StructuredOutput::Tool(_)
+            )
+        {
+            // The leg is not streaming, so it runs under the budget a
+            // non-streaming call would have got — the streaming budget
+            // this context carries bounds a chunk gap, not a completion.
+            let chunks =
+                response_into_fake_stream_chunks(self.chat(req, &ctx.non_streaming_ctx()).await?);
+            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+        }
         match publisher {
             VertexPublisher::Google => self.chat_gemini_stream(req, ctx, upstream_id).await,
             VertexPublisher::OpenAiCompat => {
@@ -876,7 +905,7 @@ impl VertexBridge {
             },
         )?;
 
-        let typed = build_gemini_request(req);
+        let typed = build_gemini_request(req, upstream_id);
         // Audit LOW-4: Gemini requires `contents` to be a non-empty
         // array. If the caller passed system-only messages (lifted to
         // `systemInstruction`), `contents` ends up empty and Vertex
@@ -988,6 +1017,10 @@ impl VertexBridge {
         // body shaping, differing only in the version string.
         let (system, messages) =
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
+        let synthetic_json_tool = matches!(
+            structured_output_for(req, upstream_id),
+            StructuredOutput::Tool(_)
+        );
         let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, false);
         let mut body_value = serde_json::to_value(&anthropic_req)
             .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
@@ -1027,7 +1060,11 @@ impl VertexBridge {
                 .json()
                 .await
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            Ok(response_into_chat_response(parsed))
+            let mut chat = response_into_chat_response(parsed);
+            if synthetic_json_tool {
+                unwrap_json_tool_call(&mut chat);
+            }
+            Ok(chat)
         })
         .await
     }
@@ -1608,7 +1645,7 @@ impl VertexBridge {
             },
         )?;
 
-        let typed = build_gemini_request(req);
+        let typed = build_gemini_request(req, upstream_id);
         if typed.contents.is_empty() {
             return Err(BridgeError::Config(
                 "vertex chat: messages must include at least one user / \
@@ -1743,17 +1780,9 @@ fn gemini_chunk_into_chat_chunks(
         .as_deref()
         .map(|s| map_gemini_finish_reason(Some(s)));
 
-    let usage = raw.usage_metadata.map(|u| UsageStats {
-        prompt_tokens: u.prompt_token_count,
-        completion_tokens: u.candidates_token_count,
-        total_tokens: if u.total_token_count > 0 {
-            u.total_token_count
-        } else {
-            u.prompt_token_count
-                .saturating_add(u.candidates_token_count)
-        },
-        ..Default::default()
-    });
+    let usage = raw
+        .usage_metadata
+        .map(GeminiUsageMetadata::into_usage_stats);
 
     let mut chunks = Vec::with_capacity(2);
 
@@ -1865,6 +1894,10 @@ fn apply_body_overrides(body: &mut serde_json::Value, ctx: &BridgeContext) {
 
 // ─── Gemini wire shapes ────────────────────────────────────────────────
 
+/// The only `responseMimeType` this bridge sets: Gemini's structured
+/// output is gated on it, and both schema fields are inert without it.
+const GEMINI_JSON_MIME_TYPE: &str = "application/json";
+
 /// Gemini's `generateContent` request body per
 /// <https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/gemini>.
 ///
@@ -1904,6 +1937,158 @@ struct GeminiGenerationConfig {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "maxOutputTokens")]
     max_output_tokens: Option<u32>,
+    /// Gemini's constrained-decoding switch. `"application/json"` is the
+    /// only value this bridge sets; without it neither schema field has
+    /// any effect.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "responseMimeType")]
+    response_mime_type: Option<&'static str>,
+    /// Gemini 2 and later: a standard JSON Schema, sent as the caller
+    /// wrote it.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "responseJsonSchema")]
+    response_json_schema: Option<serde_json::Value>,
+    /// Gemini 1.x: the older OpenAPI-flavoured schema dialect. See
+    /// [`gemini_openapi_schema`].
+    #[serde(skip_serializing_if = "Option::is_none", rename = "responseSchema")]
+    response_schema: Option<serde_json::Value>,
+}
+
+/// What a caller's OpenAI `response_format` becomes in Gemini's
+/// `generationConfig`.
+///
+/// Gemini has no tool-call fallback here — this bridge sends no `tools`
+/// at all, so there is nothing to force — and no prompt injection: a
+/// model that cannot constrain its decoding is left to answer as it
+/// would have.
+#[derive(Debug, PartialEq, Eq)]
+enum GeminiJsonOutput {
+    /// No `response_format`, or `{"type":"text"}`: nothing to emit.
+    None,
+    /// `{"type":"json_object"}` — JSON, but no schema to constrain it to.
+    MimeOnly,
+    /// Gemini 2+: `responseJsonSchema`, standard JSON Schema.
+    JsonSchema(serde_json::Value),
+    /// Gemini 1.x: `responseSchema`, the OpenAPI-flavoured dialect.
+    OpenApiSchema(serde_json::Value),
+}
+
+/// Decide what `response_format` becomes for `upstream_model`.
+///
+/// Both schema fields carry the same document; which one Gemini reads it
+/// out of is a generation thing. `responseJsonSchema` takes ordinary
+/// JSON Schema and only exists from Gemini 2 onwards; `responseSchema`
+/// is the older OpenAPI-derived subset every generation accepts. An
+/// unrecognisable model name therefore falls back to `responseSchema`,
+/// the one that works everywhere.
+fn gemini_json_output(req: &ChatFormat, upstream_model: &str) -> GeminiJsonOutput {
+    let Some(response_format) = req.extra.get("response_format") else {
+        return GeminiJsonOutput::None;
+    };
+    let Some(schema) = json_schema_from_response_format(response_format) else {
+        return match response_format.get("type").and_then(|t| t.as_str()) {
+            Some("json_object") => GeminiJsonOutput::MimeOnly,
+            _ => GeminiJsonOutput::None,
+        };
+    };
+    if gemini_major_version(upstream_model).is_some_and(|major| major >= 2) {
+        GeminiJsonOutput::JsonSchema(schema)
+    } else {
+        GeminiJsonOutput::OpenApiSchema(gemini_openapi_schema(&schema))
+    }
+}
+
+/// Read the generation off a Gemini model name: `2` from
+/// `gemini-2.5-flash`, `3` from `gemini-3-pro-preview`. The gateway
+/// holds no capability map, so the name is all there is.
+///
+/// `None` for anything that is not a `gemini-<digits>` name — including
+/// the undated experimental aliases (`gemini-exp-1206`) — which lands on
+/// the older schema field, the one every generation accepts.
+fn gemini_major_version(model: &str) -> Option<u32> {
+    let lowered = model.trim().to_ascii_lowercase();
+    // Vertex accepts both the bare id and the `models/<id>` spelling.
+    let name = lowered.rsplit('/').next().unwrap_or(&lowered);
+    let rest = name.strip_prefix("gemini")?.trim_start_matches(['-', '_']);
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Rewrite a JSON Schema into the OpenAPI-derived dialect Gemini 1.x
+/// reads out of `responseSchema`:
+///
+///   * `type` is an upper-case OpenAPI type name (`OBJECT`, `STRING`),
+///   * members outside the `Schema` type — `additionalProperties`
+///     among them — do not exist and are rejected by name, which
+///     [`apply_schema_limits`] has already dealt with,
+///   * `propertyOrdering` fixes the order the model emits an object's
+///     members in — omitted, the order is unspecified.
+///
+/// Run after [`apply_schema_limits`], which has already removed the
+/// keywords the dialect has no member for and inlined its `$ref`s.
+///
+/// The ordering emitted is the order the properties appear in the schema
+/// as this gateway serialises it, so the request is self-consistent.
+fn gemini_openapi_schema(schema: &serde_json::Value) -> serde_json::Value {
+    let mut out = schema.clone();
+    // First narrow the schema to the dialect's vocabulary — this is
+    // also what inlines `$ref`, which the dialect has no spelling for —
+    // then rewrite what survives into the dialect's own shape.
+    apply_schema_limits(&mut out, &GEMINI_OPENAPI_SCHEMA_LIMITS);
+    rewrite_gemini_openapi_schema(&mut out);
+    out
+}
+
+fn rewrite_gemini_openapi_schema(schema: &mut serde_json::Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+    match obj.get_mut("type") {
+        Some(serde_json::Value::String(ty)) => *ty = ty.to_ascii_uppercase(),
+        // A union type (`["string","null"]`, how strict mode spells an
+        // optional field) would otherwise reach the wire with lower-case
+        // names Vertex does not recognise.
+        Some(serde_json::Value::Array(types)) => {
+            for ty in types.iter_mut() {
+                if let serde_json::Value::String(ty) = ty {
+                    *ty = ty.to_ascii_uppercase();
+                }
+            }
+        }
+        _ => {}
+    }
+    if let Some(properties) = obj.get("properties").and_then(|p| p.as_object()) {
+        let ordering: Vec<serde_json::Value> =
+            properties.keys().map(|k| k.as_str().into()).collect();
+        if !ordering.is_empty() {
+            obj.insert("propertyOrdering".to_string(), ordering.into());
+        }
+    }
+    if let Some(properties) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        for property in properties.values_mut() {
+            rewrite_gemini_openapi_schema(property);
+        }
+    }
+    // `items` also has the draft-07 tuple form. Gemini's `Schema.items`
+    // is a single schema, so a tuple array is a shape this dialect
+    // cannot express at all and Vertex rejects it — the same standing
+    // as an unresolvable `$ref`. The elements are still rewritten, so
+    // the two walkers agree about where schemas live and the request
+    // that goes up is the caller's own, not a half-converted one.
+    match obj.get_mut("items") {
+        Some(serde_json::Value::Array(items)) => {
+            for item in items {
+                rewrite_gemini_openapi_schema(item);
+            }
+        }
+        Some(items) => rewrite_gemini_openapi_schema(items),
+        None => {}
+    }
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(branches) = obj.get_mut(key).and_then(|b| b.as_array_mut()) {
+            for branch in branches {
+                rewrite_gemini_openapi_schema(branch);
+            }
+        }
+    }
 }
 
 /// Translate the gateway's [`ChatFormat`] into Gemini's
@@ -1919,10 +2104,20 @@ struct GeminiGenerationConfig {
 /// - Tool messages: out of scope for D5.2.a; treated as user text
 ///   (preserves conversation history without 400ing the upstream)
 /// - `temperature`, `top_p`, `max_tokens` → `generationConfig.*`
-fn build_gemini_request(req: &ChatFormat) -> GeminiGenerateContentRequest {
+/// - `response_format` → `generationConfig.responseMimeType` plus the
+///   schema field this model's generation reads — see
+///   [`gemini_json_output`]. Every other `extra` field is dropped: this
+///   body carries only the fields named on the struct, so an OpenAI-only
+///   knob can never ride onto the wire and 400.
+fn build_gemini_request(req: &ChatFormat, upstream_model: &str) -> GeminiGenerateContentRequest {
     let mut system_parts: Vec<String> = Vec::new();
     let mut contents: Vec<GeminiContent> = Vec::new();
     for m in &req.messages {
+        // `generateContent` has no slot for replayed reasoning; a turn that
+        // holds only that would become an empty `model` turn.
+        if m.is_reasoning_only() {
+            continue;
+        }
         match m.role {
             Role::System | Role::Developer => system_parts.push(m.content_str().to_string()),
             Role::User | Role::Tool => contents.push(GeminiContent {
@@ -1949,16 +2144,33 @@ fn build_gemini_request(req: &ChatFormat) -> GeminiGenerateContentRequest {
             }],
         })
     };
-    let generation_config =
-        if req.temperature.is_some() || req.top_p.is_some() || req.max_tokens.is_some() {
-            Some(GeminiGenerationConfig {
-                temperature: req.temperature,
-                top_p: req.top_p,
-                max_output_tokens: req.max_tokens,
-            })
-        } else {
-            None
+    let json_output = gemini_json_output(req, upstream_model);
+    let generation_config = if req.temperature.is_some()
+        || req.top_p.is_some()
+        || req.max_tokens.is_some()
+        || json_output != GeminiJsonOutput::None
+    {
+        let (response_mime_type, response_json_schema, response_schema) = match json_output {
+            GeminiJsonOutput::None => (None, None, None),
+            GeminiJsonOutput::MimeOnly => (Some(GEMINI_JSON_MIME_TYPE), None, None),
+            GeminiJsonOutput::JsonSchema(schema) => {
+                (Some(GEMINI_JSON_MIME_TYPE), Some(schema), None)
+            }
+            GeminiJsonOutput::OpenApiSchema(schema) => {
+                (Some(GEMINI_JSON_MIME_TYPE), None, Some(schema))
+            }
         };
+        Some(GeminiGenerationConfig {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            max_output_tokens: req.max_tokens,
+            response_mime_type,
+            response_json_schema,
+            response_schema,
+        })
+    } else {
+        None
+    };
     GeminiGenerateContentRequest {
         contents,
         system_instruction,
@@ -2003,6 +2215,82 @@ struct GeminiUsageMetadata {
     candidates_token_count: u32,
     #[serde(default, rename = "totalTokenCount")]
     total_token_count: u32,
+    /// Context-cache hits, which Gemini reports as a SUBSET of
+    /// `promptTokenCount` — the OpenAI accounting shape, so it maps onto
+    /// `UsageStats::cached_prompt_tokens` and must not be added to the
+    /// prompt total (AISIX-Cloud#1404).
+    #[serde(default, rename = "cachedContentTokenCount")]
+    cached_content_token_count: u32,
+    /// Thinking tokens. Gemini bills these as output but reports them
+    /// in their own counter, and — depending on model version — either
+    /// inside `candidatesTokenCount` or beside it. OpenAI accounting has
+    /// no third bucket: reasoning is a SUBSET of `completion_tokens`.
+    /// See [`GeminiUsageMetadata::into_usage_stats`].
+    #[serde(default, rename = "thoughtsTokenCount")]
+    thoughts_token_count: u32,
+    /// Tokens fed back to the model from tool results — INPUT that
+    /// `promptTokenCount` does not include. Always 0 today because this
+    /// bridge sends no tools, and mapped anyway: it is a term in
+    /// Gemini's own `totalTokenCount` identity, which is what decides
+    /// whether `candidatesTokenCount` already contains the thoughts. A
+    /// version of this code that assumed the term away would start
+    /// double-counting thinking tokens the day tools are added here,
+    /// with nothing to catch it.
+    #[serde(default, rename = "toolUsePromptTokenCount")]
+    tool_use_prompt_token_count: u32,
+}
+
+impl GeminiUsageMetadata {
+    /// Project Gemini's counters onto [`UsageStats`]' OpenAI accounting
+    /// shape. Shared by the streaming and non-streaming decoders so the
+    /// two cannot report a different completion total for the same call.
+    ///
+    /// `thoughtsTokenCount` is the subtle one. Gemini changed its mind
+    /// about whether `candidatesTokenCount` includes it, so neither
+    /// answer can be hard-coded; `totalTokenCount` settles it, exactly
+    /// as LiteLLM's adapter decides the same question. Left unmapped
+    /// (the pre-fix behaviour) a thinking model reported
+    /// `reasoning_tokens: 0` and a `completion_tokens` short of what
+    /// Google billed, which every client-facing protocol then inherited
+    /// (AISIX-Cloud#1447).
+    fn into_usage_stats(self) -> UsageStats {
+        // Gemini's identity is
+        //   total = prompt + candidates + toolUsePrompt + thoughts
+        // so `candidates` still summing to the total means it has
+        // already absorbed the thoughts, and adding them again would
+        // bill the thinking twice.
+        let prompt_tokens = self
+            .prompt_token_count
+            .saturating_add(self.tool_use_prompt_token_count);
+        //
+        // `thoughts <= candidates` is part of the test, not a safety
+        // clamp: "the candidates already contain the thoughts" cannot be
+        // true of a count smaller than the thoughts it supposedly
+        // contains. A streaming frame mid-thinking hits exactly that —
+        // thoughts accrue while `candidatesTokenCount` is still 0, and a
+        // `totalTokenCount` that has not caught up satisfies the sum. On
+        // the inclusive reading that frame yields
+        // `reasoning_tokens > completion_tokens`, which cp-api rejects
+        // outright, dropping the request from Logs and billing with only
+        // a warning. Reading it as exclusive is also simply correct.
+        let candidates_inclusive = self.total_token_count > 0
+            && prompt_tokens.saturating_add(self.candidates_token_count) == self.total_token_count
+            && self.thoughts_token_count <= self.candidates_token_count;
+        let completion_tokens = if candidates_inclusive {
+            self.candidates_token_count
+        } else {
+            self.candidates_token_count
+                .saturating_add(self.thoughts_token_count)
+        };
+        UsageStats {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            cached_prompt_tokens: self.cached_content_token_count,
+            reasoning_tokens: self.thoughts_token_count,
+            ..Default::default()
+        }
+    }
 }
 
 /// Translate Gemini's response into the gateway's [`ChatResponse`].
@@ -2032,17 +2320,7 @@ fn gemini_response_into_chat_response(
     };
     let usage = raw
         .usage_metadata
-        .map(|u| UsageStats {
-            prompt_tokens: u.prompt_token_count,
-            completion_tokens: u.candidates_token_count,
-            total_tokens: if u.total_token_count > 0 {
-                u.total_token_count
-            } else {
-                u.prompt_token_count
-                    .saturating_add(u.candidates_token_count)
-            },
-            ..Default::default()
-        })
+        .map(GeminiUsageMetadata::into_usage_stats)
         .unwrap_or_default();
     ChatResponse {
         id: String::new(), // Gemini doesn't return a request id in the body
@@ -2624,7 +2902,7 @@ mod tests {
     #[test]
     fn build_gemini_request_translates_user_turn() {
         let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
-        let body = build_gemini_request(&req);
+        let body = build_gemini_request(&req, "gemini-2.0-flash");
         assert_eq!(body.contents.len(), 1);
         assert_eq!(body.contents[0].role, "user");
         assert_eq!(body.contents[0].parts[0].text, "hi");
@@ -2641,11 +2919,34 @@ mod tests {
                 ChatMessage::assistant("hello back"),
             ],
         );
-        let body = build_gemini_request(&req);
+        let body = build_gemini_request(&req, "gemini-2.0-flash");
         assert_eq!(body.contents.len(), 2);
         assert_eq!(body.contents[0].role, "user");
         // Gemini uses `model`, NOT `assistant`.
         assert_eq!(body.contents[1].role, "model");
+    }
+
+    /// A replayed turn that holds only `reasoning_content` is skipped
+    /// rather than sent as an empty `model` turn.
+    #[test]
+    fn build_gemini_request_skips_a_reasoning_only_assistant_turn() {
+        let reasoning_only: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant", "content": null, "reasoning_content": "thinking",
+        }))
+        .unwrap();
+        let req = ChatFormat::new(
+            "my-gemini",
+            vec![
+                ChatMessage::user("q1"),
+                reasoning_only,
+                ChatMessage::user("q2"),
+                ChatMessage::assistant("a"),
+            ],
+        );
+        let body = build_gemini_request(&req, "gemini-2.0-flash");
+        let roles: Vec<&str> = body.contents.iter().map(|c| c.role).collect();
+        assert_eq!(roles, ["user", "user", "model"]);
+        assert!(body.contents.iter().all(|c| !c.parts[0].text.is_empty()));
     }
 
     #[test]
@@ -2657,7 +2958,7 @@ mod tests {
                 ChatMessage::user("hi"),
             ],
         );
-        let body = build_gemini_request(&req);
+        let body = build_gemini_request(&req, "gemini-2.0-flash");
         // System NOT in contents[].
         assert_eq!(body.contents.len(), 1);
         assert_eq!(body.contents[0].role, "user");
@@ -2691,7 +2992,7 @@ mod tests {
                 ChatMessage::user("hi"),
             ],
         );
-        let body = build_gemini_request(&req);
+        let body = build_gemini_request(&req, "gemini-2.0-flash");
         let sys = body.system_instruction.as_ref().unwrap();
         assert_eq!(sys.parts[0].text, "rule 1\n\nrule 2");
     }
@@ -2702,11 +3003,227 @@ mod tests {
         req.temperature = Some(0.7);
         req.top_p = Some(0.9);
         req.max_tokens = Some(100);
-        let body = build_gemini_request(&req);
+        let body = build_gemini_request(&req, "gemini-2.0-flash");
         let gc = body.generation_config.as_ref().unwrap();
         assert_eq!(gc.temperature, Some(0.7));
         assert_eq!(gc.top_p, Some(0.9));
         assert_eq!(gc.max_output_tokens, Some(100));
+    }
+
+    // ─── Gemini structured outputs ─────────────────────────────────────
+
+    fn gemini_request_with_response_format(response_format: serde_json::Value) -> ChatFormat {
+        let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("who are you")]);
+        req.extra.insert("response_format".into(), response_format);
+        req
+    }
+
+    fn json_schema_format(schema: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"name": "answer", "schema": schema, "strict": true},
+        })
+    }
+
+    fn person_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "pet": {"type": "object", "properties": {"kind": {"type": "string"}}},
+            },
+            "required": ["name"],
+            "additionalProperties": false,
+        })
+    }
+
+    #[test]
+    fn gemini_generation_gate_reads_the_major_off_the_model_name() {
+        for (name, major) in [
+            ("gemini-2.0-flash", Some(2)),
+            ("gemini-2.5-flash", Some(2)),
+            ("gemini-2.5-pro-preview-05-06", Some(2)),
+            ("gemini-3-pro-preview", Some(3)),
+            ("gemini-3", Some(3)),
+            ("gemini-10-ultra", Some(10)),
+            ("GEMINI-2.5-FLASH", Some(2)),
+            ("models/gemini-2.5-flash", Some(2)),
+            ("gemini-1.5-pro", Some(1)),
+            ("gemini-1.0-pro-002", Some(1)),
+            // Not a `gemini-<digits>` name: no generation to read.
+            ("gemini-exp-1206", None),
+            ("gemini", None),
+            ("text-embedding-005", None),
+            ("claude-sonnet-4-5", None),
+        ] {
+            assert_eq!(gemini_major_version(name), major, "{name}");
+        }
+    }
+
+    #[test]
+    fn gemini_2_and_later_carry_the_schema_in_response_json_schema() {
+        let req = gemini_request_with_response_format(json_schema_format(person_schema()));
+        let body = build_gemini_request(&req, "gemini-2.5-flash");
+        let gc = body.generation_config.as_ref().unwrap();
+        assert_eq!(gc.response_mime_type, Some("application/json"));
+        // Standard JSON Schema, forwarded as the caller wrote it.
+        assert_eq!(gc.response_json_schema.as_ref(), Some(&person_schema()));
+        assert!(gc.response_schema.is_none());
+    }
+
+    #[test]
+    fn gemini_1_x_carries_the_schema_in_the_openapi_dialect() {
+        let req = gemini_request_with_response_format(json_schema_format(person_schema()));
+        let body = build_gemini_request(&req, "gemini-1.5-pro");
+        let gc = body.generation_config.as_ref().unwrap();
+        assert_eq!(gc.response_mime_type, Some("application/json"));
+        assert!(gc.response_json_schema.is_none());
+        let schema = gc.response_schema.as_ref().unwrap();
+        // Upper-case OpenAPI type names, no `additionalProperties`
+        // (Gemini rejects it), and an explicit member ordering.
+        assert_eq!(schema["type"], "OBJECT");
+        assert_eq!(schema["properties"]["name"]["type"], "STRING");
+        assert_eq!(schema["properties"]["pet"]["type"], "OBJECT");
+        assert_eq!(
+            schema["properties"]["pet"]["properties"]["kind"]["type"],
+            "STRING"
+        );
+        assert!(schema.get("additionalProperties").is_none());
+        assert_eq!(
+            schema["propertyOrdering"],
+            serde_json::json!(["name", "pet"])
+        );
+        assert_eq!(
+            schema["properties"]["pet"]["propertyOrdering"],
+            serde_json::json!(["kind"])
+        );
+        // `required` is the caller's own statement on both dialects.
+        assert_eq!(schema["required"], serde_json::json!(["name"]));
+    }
+
+    #[test]
+    fn gemini_openapi_dialect_reaches_arrays_and_branches() {
+        let req = gemini_request_with_response_format(json_schema_format(serde_json::json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"id": {"type": "integer"}},
+                "additionalProperties": false,
+            },
+            "anyOf": [{"type": "string"}],
+        })));
+        let body = build_gemini_request(&req, "gemini-1.5-flash");
+        let schema = body.generation_config.unwrap().response_schema.unwrap();
+        assert_eq!(schema["type"], "ARRAY");
+        assert_eq!(schema["items"]["type"], "OBJECT");
+        assert_eq!(schema["items"]["properties"]["id"]["type"], "INTEGER");
+        assert!(schema["items"].get("additionalProperties").is_none());
+        assert_eq!(schema["anyOf"][0]["type"], "STRING");
+    }
+
+    #[test]
+    fn gemini_property_ordering_matches_the_schema_as_it_goes_on_the_wire() {
+        // `propertyOrdering` is only useful if it names the properties
+        // in the order the request itself presents them; a list that
+        // disagrees with the accompanying `properties` object would fix
+        // an order the schema does not show.
+        let req = gemini_request_with_response_format(json_schema_format(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "zeta": {"type": "string"},
+                "alpha": {"type": "string"},
+                "mid": {"type": "string"},
+            },
+        })));
+        let body = serde_json::to_value(build_gemini_request(&req, "gemini-1.5-pro")).unwrap();
+        let schema = &body["generationConfig"]["responseSchema"];
+        let on_the_wire: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let ordering: Vec<&str> = schema["propertyOrdering"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(ordering, on_the_wire);
+    }
+
+    #[test]
+    fn gemini_openapi_dialect_inlines_definitions_and_uppercases_union_types() {
+        // The dialect is an OpenAPI `Schema` object: it rejects members
+        // by name, so `$defs` cannot ride along and `$ref` has no
+        // spelling. The definitions are inlined and the blocks removed
+        // before the dialect rewrite, so what `$ref` pointed at gets the
+        // same upper-casing as everything else.
+        let req = gemini_request_with_response_format(json_schema_format(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pet": {"$ref": "#/$defs/Pet"},
+                "nickname": {"type": ["string", "null"]},
+            },
+            "$defs": {
+                "Pet": {
+                    "type": "object",
+                    "properties": {"kind": {"type": "string"}},
+                    "additionalProperties": false,
+                },
+            },
+        })));
+        let schema = build_gemini_request(&req, "gemini-1.5-pro")
+            .generation_config
+            .unwrap()
+            .response_schema
+            .unwrap();
+        assert!(schema.get("$defs").is_none(), "{schema}");
+        let pet = &schema["properties"]["pet"];
+        assert!(pet.get("$ref").is_none(), "{schema}");
+        assert_eq!(pet["type"], "OBJECT");
+        assert_eq!(pet["properties"]["kind"]["type"], "STRING");
+        assert!(pet.get("additionalProperties").is_none());
+        assert_eq!(
+            schema["properties"]["nickname"]["type"],
+            serde_json::json!(["STRING", "NULL"])
+        );
+    }
+
+    #[test]
+    fn gemini_json_object_asks_for_json_without_a_schema() {
+        for model in ["gemini-2.5-flash", "gemini-1.5-pro"] {
+            let req =
+                gemini_request_with_response_format(serde_json::json!({"type": "json_object"}));
+            let gc = build_gemini_request(&req, model).generation_config.unwrap();
+            assert_eq!(gc.response_mime_type, Some("application/json"));
+            assert!(gc.response_json_schema.is_none());
+            assert!(gc.response_schema.is_none());
+        }
+    }
+
+    #[test]
+    fn gemini_response_format_text_emits_no_generation_config_at_all() {
+        let req = gemini_request_with_response_format(serde_json::json!({"type": "text"}));
+        assert!(build_gemini_request(&req, "gemini-2.5-flash")
+            .generation_config
+            .is_none());
+    }
+
+    #[test]
+    fn gemini_response_format_never_reaches_the_wire_verbatim() {
+        // It has no top-level Gemini counterpart; forwarding it 400s.
+        let req = gemini_request_with_response_format(json_schema_format(person_schema()));
+        let body = serde_json::to_value(build_gemini_request(&req, "gemini-2.5-flash")).unwrap();
+        assert!(body.get("response_format").is_none());
+        assert_eq!(
+            body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert_eq!(
+            body["generationConfig"]["responseJsonSchema"],
+            person_schema()
+        );
     }
 
     // ─── Gemini response translation ───────────────────────────────────
@@ -2732,6 +3249,53 @@ mod tests {
         assert_eq!(chat.message.role, Role::Assistant);
         assert_eq!(chat.finish_reason, FinishReason::Stop);
         assert_eq!(chat.usage.total_tokens, 6);
+    }
+
+    /// AISIX-Cloud#1404: Gemini reports context-cache hits in
+    /// `cachedContentTokenCount`, which is a SUBSET of
+    /// `promptTokenCount` — the OpenAI accounting shape. It therefore
+    /// maps onto `cached_prompt_tokens` and must NOT be added to the
+    /// prompt or total counts, which already contain it.
+    #[test]
+    fn gemini_response_maps_cached_content_tokens_as_a_prompt_subset() {
+        let raw: GeminiGenerateContentResponse = serde_json::from_str(
+            r#"{
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "hello"}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "candidatesTokenCount": 10,
+                    "totalTokenCount": 110,
+                    "cachedContentTokenCount": 80
+                }
+            }"#,
+        )
+        .unwrap();
+        let chat = gemini_response_into_chat_response(raw, "gemini-1.5-pro");
+        assert_eq!(chat.usage.cached_prompt_tokens, 80);
+        assert_eq!(chat.usage.prompt_tokens, 100);
+        assert_eq!(chat.usage.total_tokens, 110);
+        // The Anthropic-shape counters stay empty: Gemini reports no
+        // cache tokens outside its prompt count.
+        assert_eq!(chat.usage.cache_read_tokens, 0);
+        assert_eq!(chat.usage.cache_creation_tokens, 0);
+    }
+
+    /// An upstream that omits the field reports no cache hit, rather
+    /// than one inferred from the prompt size.
+    #[test]
+    fn gemini_response_without_cached_content_reports_no_cache_hit() {
+        let raw: GeminiGenerateContentResponse = serde_json::from_str(
+            r#"{
+                "candidates": [{"content": {"parts": [{"text": "hi"}]}, "finishReason": "STOP"}],
+                "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 1, "totalTokenCount": 6}
+            }"#,
+        )
+        .unwrap();
+        let chat = gemini_response_into_chat_response(raw, "gemini-1.5-pro");
+        assert_eq!(chat.usage.cached_prompt_tokens, 0);
     }
 
     #[test]
@@ -2780,6 +3344,114 @@ mod tests {
         .unwrap();
         let chat = gemini_response_into_chat_response(raw, "gemini-1.5-pro");
         assert_eq!(chat.usage.total_tokens, 0);
+    }
+
+    fn gemini_usage(json: &str) -> UsageStats {
+        serde_json::from_str::<GeminiUsageMetadata>(json)
+            .unwrap()
+            .into_usage_stats()
+    }
+
+    /// A thinking model whose `candidatesTokenCount` EXCLUDES the
+    /// thoughts: `totalTokenCount` is the giveaway (100 + 20 != 150).
+    /// Google bills thoughts as output, and OpenAI accounting has no
+    /// third bucket, so they fold into `completion_tokens` with
+    /// `reasoning_tokens` naming the subset. Left unmapped they vanished
+    /// from every client-facing protocol (AISIX-Cloud#1447).
+    #[test]
+    fn gemini_thoughts_fold_into_completion_when_reported_beside_candidates() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":20,
+                "thoughtsTokenCount":30,"totalTokenCount":150}"#,
+        );
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.reasoning_tokens, 30);
+        assert_eq!(u.total_tokens, 150, "matches Gemini's own totalTokenCount");
+        assert_eq!(u.openai_total_tokens(), 150);
+    }
+
+    /// Other Gemini versions already count thoughts INSIDE
+    /// `candidatesTokenCount` — here 50 covers both, and
+    /// `100 + 50 == 150` says so. Adding them again would bill the
+    /// thinking twice, so the total settles which reading applies.
+    #[test]
+    fn gemini_thoughts_are_not_double_counted_when_already_inclusive() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":50,
+                "thoughtsTokenCount":30,"totalTokenCount":150}"#,
+        );
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.reasoning_tokens, 30);
+        assert_eq!(u.total_tokens, 150);
+    }
+
+    /// Tool-result tokens are INPUT that `promptTokenCount` excludes, so
+    /// they join the prompt — and they are a term in the identity that
+    /// decides inclusiveness. Here `100 + 20 + 15 + 30 == 165`, so the
+    /// candidates are exclusive and the thoughts fold in.
+    #[test]
+    fn gemini_tool_use_prompt_tokens_join_the_input() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":20,"toolUsePromptTokenCount":15,
+                "thoughtsTokenCount":30,"totalTokenCount":165}"#,
+        );
+        assert_eq!(u.prompt_tokens, 115);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.total_tokens, 165, "matches Gemini's own totalTokenCount");
+    }
+
+    /// The same reading with INCLUSIVE candidates: `100 + 50 + 15 == 165`
+    /// leaves nothing for the thoughts, so they are already inside the
+    /// 50. Judging inclusiveness without the tool-use term would read
+    /// this as exclusive and bill the 30 thinking tokens twice — the
+    /// reason that term is mapped at all while this bridge sends no
+    /// tools.
+    #[test]
+    fn gemini_tool_use_tokens_do_not_break_the_inclusive_reading() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":50,"toolUsePromptTokenCount":15,
+                "thoughtsTokenCount":30,"totalTokenCount":165}"#,
+        );
+        assert_eq!(u.prompt_tokens, 115);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.total_tokens, 165);
+    }
+
+    /// `reasoning_tokens` is a SUBSET of `completion_tokens` in OpenAI
+    /// accounting, and cp-api enforces that by REJECTING an event that
+    /// violates it — the request then leaves no row in Logs and is never
+    /// billed. A thinking frame that has accrued thoughts before any
+    /// visible output is the shape that produces it, so pin that it
+    /// stays consistent.
+    #[test]
+    fn gemini_thinking_frame_never_reports_more_reasoning_than_output() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":0,
+                "thoughtsTokenCount":50,"totalTokenCount":100}"#,
+        );
+        assert!(
+            u.reasoning_tokens <= u.completion_tokens,
+            "reasoning {} > completion {} would be dropped by cp-api",
+            u.reasoning_tokens,
+            u.completion_tokens
+        );
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.reasoning_tokens, 50);
+    }
+
+    /// Context-cache hits stay the OpenAI shape: a SUBSET of the prompt,
+    /// never added on top of it.
+    #[test]
+    fn gemini_cached_content_stays_a_subset_of_the_prompt() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":20,
+                "cachedContentTokenCount":70,"totalTokenCount":120}"#,
+        );
+        assert_eq!(u.openai_prompt_tokens(), 100);
+        assert_eq!(u.openai_cached_tokens(), 70);
+        assert_eq!(u.anthropic_input_tokens(), 30);
+        assert_eq!(u.anthropic_cache_read_input_tokens(), 70);
     }
 
     // ─── Pre-dispatch validation ───────────────────────────────────────
@@ -2928,7 +3600,7 @@ mod tests {
 
     // ─── Dispatch end-to-end against wiremock via api_base override ──
 
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, path_regex};
     use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
     #[derive(Clone, Default)]
@@ -3074,6 +3746,132 @@ mod tests {
             obj.contains_key("max_tokens"),
             "max_tokens is required by the Anthropic Messages wire: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn vertex_claude_carries_the_schema_in_output_config_on_a_4_5_family() {
+        // Claude on Vertex speaks the Anthropic Messages wire, so a
+        // caller's `response_format` becomes whatever the shared
+        // serializer makes of it — the native control here, since the
+        // Vertex model id IS the Claude name (`@date`, not `-date`).
+        let server = MockServer::start().await;
+        let responder = CapturingAnthropicResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/v1/projects/.+:rawPredict$"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-sonnet-4-5@20250929"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = gemini_request_with_response_format(json_schema_format(person_schema()));
+        let _ = bridge.chat(&req, &ctx).await.unwrap();
+
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(
+            body["output_config"]["format"]["schema"]["additionalProperties"],
+            false
+        );
+        assert!(body.get("response_format").is_none(), "body={body}");
+        assert!(body.get("tools").is_none(), "body={body}");
+    }
+
+    #[tokio::test]
+    async fn a_small_stream_budget_does_not_cut_the_fake_stream_leg() {
+        // On a streaming dispatch the deadline is the streaming budget,
+        // which bounds a chunk gap rather than a whole completion. The
+        // Claude tool route's upstream leg is not streaming, so it runs
+        // under the end-to-end budget carried beside it.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/v1/projects/.+:rawPredict$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(250))
+                    .set_body_json(serde_json::json!({
+                        "id": "msg_json",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-3-5-sonnet",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_json",
+                            "name": "json_tool_call",
+                            "input": {"name": "Ada"},
+                        }],
+                        "stop_reason": "tool_use",
+                        "usage": {"input_tokens": 3, "output_tokens": 5},
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-3-5-sonnet-v2@20241022"),
+            sample_pk_with_secret(valid_secret_json()),
+        )
+        .with_deadline(std::time::Duration::from_millis(50))
+        .with_non_streaming_deadline(Some(std::time::Duration::from_secs(30)));
+
+        let mut req = gemini_request_with_response_format(json_schema_format(person_schema()));
+        req.stream = Some(true);
+        let stream = bridge
+            .chat_stream(&req, &ctx)
+            .await
+            .expect("the fake-stream leg must not be cut by the chunk-gap budget");
+        let chunks: Vec<ChatChunk> = futures::StreamExt::collect::<Vec<_>>(stream)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            chunks[1].delta.content.as_deref(),
+            Some(r#"{"name":"Ada"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn vertex_claude_synthetic_tool_reply_comes_back_as_json_content() {
+        // An older Claude family takes the tool route, and the call it
+        // makes is the answer — the client must not be handed a tool
+        // call it never offered.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/v1/projects/.+:rawPredict$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_json",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3-5-sonnet",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_json",
+                    "name": "json_tool_call",
+                    "input": {"name": "Ada"},
+                }],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 3, "output_tokens": 5},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-3-5-sonnet-v2@20241022"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = gemini_request_with_response_format(json_schema_format(person_schema()));
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+        assert_eq!(chat.message.content.as_deref(), Some(r#"{"name":"Ada"}"#));
+        assert!(!chat.message.extra.contains_key("tool_calls"));
+        assert_eq!(chat.finish_reason, FinishReason::Stop);
     }
 
     /// Capturing responder that returns a native Anthropic SSE stream

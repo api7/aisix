@@ -172,13 +172,20 @@ impl ObservabilitySink for DatadogSink {
             });
         }
 
+        let retry_after = super::retry_after_of(status, resp.headers());
         let body = resp.text().await.unwrap_or_default();
         let detail = parse_datadog_error(status, &body);
         // 429 (rate limit) and 5xx (502/503/504, transient server faults) are
         // worth retrying; other 4xx (400 malformed / 401/403 auth / 413 too
         // large) are config/auth/payload errors that fail identically on retry.
         if is_transient_status(status) {
-            Err(SinkError::Transient(detail))
+            Err(match retry_after {
+                Some(retry_after) => SinkError::Throttled {
+                    retry_after,
+                    detail,
+                },
+                None => SinkError::Transient(detail),
+            })
         } else {
             Err(SinkError::Permanent(detail))
         }
@@ -373,7 +380,8 @@ fn is_loopback_site(site: &str) -> bool {
 /// is upper-cased with non-alphanumerics folded to `_`, then read from
 /// `DD_CRED_<REF>_API_KEY`. The prefix is deliberately NOT `AISIX_`: that
 /// namespace is owned by the config loader (`Environment::with_prefix("AISIX")`),
-/// so an `AISIX_`-named secret would be reinterpreted as a config override.
+/// which reads such a name as a configuration override or warns about it on
+/// every boot.
 /// Returns `None` when the key is unset or blank — the caller then lets the
 /// misconfiguration surface as a delivery-health auth error rather than POST
 /// with an empty key. (Mirrors `resolve_sls_credential` /
@@ -479,6 +487,7 @@ mod tests {
             upstream_latency_ms: 123,
             provider_model_version: "gpt-4o-2024-08-06".into(),
             finish_reason: "stop".into(),
+            operation: "image_generation".into(),
             ..UsageEvent::default()
         };
         let ack = sink
@@ -526,6 +535,11 @@ mod tests {
         assert_eq!(log["aisix.request_id"], "req-42");
         assert_eq!(log["aisix.model_id"], "gpt-4o");
         assert_eq!(log["aisix.upstream_latency_ms"], 123);
+        // The request's kind, under the `aisix.` prefix every field without a
+        // semconv key takes (AISIX-Cloud#1461). Datadog is the sink where a
+        // consumer would otherwise have only `gen_ai.operation.name`, which
+        // this encoder does not emit at all.
+        assert_eq!(log["aisix.operation"], "image_generation");
 
         // The API key must NEVER appear in the body anywhere.
         let body_text = serde_json::to_string(&logs).unwrap();

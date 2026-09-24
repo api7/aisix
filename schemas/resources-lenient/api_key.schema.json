@@ -1,0 +1,331 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "McpAccess": {
+      "description": "The API key's own layer of the MCP tool ACL, the same `allow`/`deny` shape an MCP access policy carries. Present means the key constrains its grant; omitted means the key adds no constraint of its own and takes whatever the environment and team layers leave.",
+      "properties": {
+        "allow": {
+          "default": [],
+          "description": "Namespaced `<server>__<tool>` patterns this key allows, intersected with the environment and team layers. Same single-`*` glob matching a policy's `allow` uses; an empty list leaves the key no MCP access, and `[\"*\"]` narrows nothing (useful with `deny` alone).\n\nRequired on the write path and defaulted by the runtime loader, for the reason given on [`McpPolicy::allow`]. Read only when `allow_ids` is absent; ignored entirely when it is present.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "allow_ids": {
+          "description": "This key's allow side written by MCP server resource id instead of by server name, so renaming a server does not change what the key may reach. Present — including as an empty array — it is authoritative and `allow` is ignored; an empty array therefore allows nothing. Absent or `null`, the key falls back to `allow`.\n\nIt cannot express \"every server\": each entry names one server exactly and `server_id` is never a glob, so an enumeration of the servers registered today silently fails to cover one registered tomorrow. To allow (or deny) every server, present and future, leave this absent and use the name form's `\"*\"`.",
+          "items": {
+            "$ref": "#/definitions/McpToolRef"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "deny": {
+          "description": "Namespaced `<server>__<tool>` patterns subtracted from this key's effective grant, using the same single-`*` glob matching as `allow`. Read only when `deny_ids` is absent.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "deny_ids": {
+          "description": "This key's deny side written by MCP server resource id instead of by server name. Present — including as an empty array — it is authoritative and `deny` is ignored; an empty array subtracts nothing. Absent or `null`, the key falls back to `deny`.\n\nIt cannot express \"every server\": each entry names one server exactly and `server_id` is never a glob, so an enumeration of the servers registered today silently fails to cover one registered tomorrow. To allow (or deny) every server, present and future, leave this absent and use the name form's `\"*\"`.",
+          "items": {
+            "$ref": "#/definitions/McpToolRef"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "McpRateLimit": {
+      "description": "Limits for one API key's calls to one MCP server (`ApiKey::mcp_rate_limits`).\n\nCarries only the request-count dimensions of [`RateLimit`]: an MCP `tools/call` commits no tokens, so a token-rate cap here would never be consumed — the shape leaves `tpm`/`tpd` out rather than accepting a knob that is silently inert.",
+      "properties": {
+        "concurrency": {
+          "description": "Max concurrent in-flight tool calls.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rpd": {
+          "description": "Tool calls per 86,400-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rph": {
+          "description": "Tool calls per 3,600-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rpm": {
+          "description": "Tool calls per 60-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rps": {
+          "description": "Tool calls per 1-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "McpToolRef": {
+      "description": "One tool on one MCP server, the server named by its resource id and the tool by name.\n\nThe tool half is matched with the same single-`*` glob rule the name form uses, so `tool: \"*\"` is the id spelling of `<server>__*`. The server half is an exact id: it is compared against the id of the server the addressed tool actually belongs to, never glob-matched, so a server whose *name* happens to contain a `*` cannot widen a grant.\n\nBoth halves are required on the WRITE path and defaulted by the runtime loader — the strict schemas add them to this definition's `required`, the types do not. An entry these were required of at the type level would fail to deserialize, and the loader skips a row it cannot deserialize whole: one malformed entry in one `allow_ids` array would stop the entire `api_key` from authenticating any traffic at all, not merely lose it MCP access. Defaulted, the malformed entry matches nothing instead — an empty `server_id` names no registered server, and an empty `tool` glob covers no tool name the gateway exposes.",
+      "properties": {
+        "server_id": {
+          "default": "",
+          "description": "Resource id of the registered MCP server (`mcp_servers/<id>`) this entry refers to. An id matching no registered server refers to nothing: the entry never matches, and the other entries are unaffected.",
+          "type": "string"
+        },
+        "tool": {
+          "default": "",
+          "description": "Tool on that server, matched as a single-`*` glob against the bare tool name — the part after the `<server>__` namespace prefix. `\"*\"` covers every tool the server exposes.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RateLimit": {
+      "properties": {
+        "concurrency": {
+          "description": "Max concurrent in-flight requests.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rpd": {
+          "description": "Requests per 86,400-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rph": {
+          "description": "Requests per 3,600-second window. There is no per-hour token limit field.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rpm": {
+          "description": "Requests per 60-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rps": {
+          "description": "Requests per 1-second window. There is no per-second token limit field.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tpd": {
+          "description": "Tokens per 86,400-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tpm": {
+          "description": "Tokens per 60-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  "properties": {
+    "allowed_agents": {
+      "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access — access is granted explicitly.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "allowed_model_ids": {
+      "description": "Models this key may use, named by resource id rather than by name, so renaming a model does not change what this key may reach. Present — including as an empty array — it is authoritative and `allowed_models` is ignored; each id is resolved against the current models in the snapshot and the resolved name is matched with the same single-`*` glob rule. An id naming a wildcard model therefore grants every name that model's pattern covers — including a name an exact-match model of its own serves, which is how the name form behaves too. An id matching no model grants nothing.\n\nSet to `null` it means the same as omitted: the key falls back to `allowed_models`. A producer must therefore write `[]`, never `null`, for a key that is meant to grant no model — the two are opposite grants, and an empty list is the one that is authoritative.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "allowed_models": {
+      "default": [],
+      "description": "Model names this key may use, matched as single-`*` globs. Read only when `allowed_model_ids` is absent; ignored entirely when it is present. When both are omitted the key may use no model — model access is granted explicitly.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "allowed_routes": {
+      "description": "Passthrough routes this key may use, named by their registered names. Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every route and an entry without a `*` matches one route exactly. When omitted, set to `null`, or set to an empty list, the key may use no passthrough route — access is granted explicitly.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "disabled": {
+      "description": "Administratively disabled. A disabled key is rejected with `401` until it is enabled again; the key itself is preserved. Treated as `false` when omitted.",
+      "type": "boolean"
+    },
+    "display_name": {
+      "description": "Operator-facing label for this key, as shown in the dashboard. Read only by the `${request.api_key.name}` header template (AISIX-Cloud#1112); never used for authentication or routing.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "expires_at": {
+      "description": "RFC 3339 timestamp after which the key stops authenticating. Requests presenting an expired key are rejected with `401`. When omitted or set to `null`, the key never expires.",
+      "format": "date-time",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "jwt_provider": {
+      "description": "Name of the `oidc_providers` entry permitted to assert this key's `jwt_subject`. A subject is only ever resolved for the trust provider named here, so a second trusted provider cannot mint a token impersonating this provider's identity of the same name. Required whenever `jwt_subject` is set; ignored otherwise.",
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "jwt_subject": {
+      "description": "External identity bound to this key for JWT authentication. When a request presents a valid JWT issued by the `oidc_providers` entry named in `jwt_provider`, the value of that provider's `identity_claim` selects the key whose `jwt_subject` equals it, and the request proceeds with this key's permissions, rate limits, and budget. The `(jwt_provider, jwt_subject)` pair is unique within the environment. When omitted, the key is never selected by JWT authentication.",
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "key_hash": {
+      "description": "SHA-256 hexadecimal hash of the plaintext bearer. The proxy hashes incoming bearer tokens before lookup.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "mcp_access": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/McpAccess"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "This key's own layer of the MCP tool ACL, as namespaced `<server>__<tool>` glob patterns, or as `allow_ids` / `deny_ids` entries naming the server by resource id. It is intersected with the environment and team MCP access policies: every present layer must allow a tool and no layer may deny it. When omitted the key adds no constraint of its own — but with no layer present anywhere the grant is empty, so MCP access is always granted explicitly."
+    },
+    "mcp_rate_limits": {
+      "additionalProperties": {
+        "$ref": "#/definitions/McpRateLimit"
+      },
+      "description": "Per-MCP-server limits for this key, keyed by the registered MCP server name — the `<server>` half of the `<server>__<tool>` names the gateway exposes. A `tools/call` is metered against the entry for the server it targets **and** the key's own `rate_limit`, each in its own counter, so a burst against one server never consumes another's budget. A server with no entry here is bounded by `rate_limit` alone. Only tool calls are metered; the `initialize` / `tools/list` handshake is not.\n\nRead only when `mcp_rate_limits_by_id` is absent; ignored entirely when it is present.",
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "mcp_rate_limits_by_id": {
+      "additionalProperties": {
+        "$ref": "#/definitions/McpRateLimit"
+      },
+      "description": "The same per-server limits, keyed by the MCP server's resource id (`mcp_servers/<id>`) rather than by its name, so renaming a server does not detach the limit that was set for it.\n\nPresent — including as an empty object — it is authoritative and `mcp_rate_limits` is ignored; an empty object therefore leaves every server bounded by `rate_limit` alone. A key naming no registered server imposes nothing, and the other entries are unaffected. Set to `null` it means the same as omitted: the key falls back to `mcp_rate_limits`.\n\nEach key names one server exactly; there is no \"every server\" key, which is the same as today — a server with no entry is bounded by `rate_limit` alone.",
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "rate_limit": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RateLimit"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Request, token, and concurrency limits for this key."
+    },
+    "team_id": {
+      "description": "Team this API key belongs to. Used for matching team-scope rate limit policies.",
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "user_id": {
+      "description": "Org member who owns this key. Used for matching member-scope rate limit policies.",
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "user_name": {
+      "description": "Readable display name of the owning member. Used only for telemetry labels alongside `user_id`; never used for authentication or routing. When omitted, telemetry reports the user name as `\"unknown\"`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "key_hash"
+  ],
+  "title": "ApiKey",
+  "type": "object"
+}

@@ -23,6 +23,12 @@ import {
 //   - `/v1/messages/count_tokens` serves it. The same vendor-id gate
 //     rejected it outright with a 400, while its sibling `/v1/messages`
 //     happily served the very same model.
+//
+// The converse also has to hold, and a first-party model on the same mock
+// upstream is seeded here as its control: a request rewrite that exists
+// because the upstream is NOT Anthropic must key on the vendor id and
+// leave the catalog vendor alone. That is what the billing-attribution
+// cases at the bottom of this file pin, in both directions.
 
 const CALLER_PLAINTEXT = "sk-byo-anthropic-e2e";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -31,6 +37,11 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 const UPSTREAM_MODEL_ID = "claude-sonnet-4-5";
 const MODEL_ALIAS = "byo-claude-e2e";
+// A model on the SAME mock upstream reached through the `anthropic`
+// catalog vendor, so the two differ in nothing but the vendor id.
+const FIRST_PARTY_ALIAS = "first-party-claude-e2e";
+const BILLING_LINE =
+  "x-anthropic-billing-header: cc_version=2.1.0; cc_entrypoint=cli; cch=7f3a91;";
 
 const anthropicHeaders = {
   "content-type": "application/json",
@@ -72,9 +83,22 @@ describe("byo + anthropic adapter e2e: the Anthropic-native routes key on the ad
       model_name: UPSTREAM_MODEL_ID,
       provider_key_id: pk.id,
     });
+    const firstPartyPk = await seed.createProviderKey({
+      display_name: "first-party-anthropic-pk",
+      secret: "sk-first-party-upstream",
+      api_base: upstream.baseUrl,
+      provider: "anthropic",
+      adapter: "anthropic",
+    });
+    await seed.createModel({
+      display_name: FIRST_PARTY_ALIAS,
+      provider: "anthropic",
+      model_name: UPSTREAM_MODEL_ID,
+      provider_key_id: firstPartyPk.id,
+    });
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: [MODEL_ALIAS],
+      allowed_models: [MODEL_ALIAS, FIRST_PARTY_ALIAS],
     });
   });
 
@@ -166,5 +190,140 @@ describe("byo + anthropic adapter e2e: the Anthropic-native routes key on the ad
     expect((JSON.parse(req!.body) as { model?: string }).model).toBe(
       UPSTREAM_MODEL_ID,
     );
+  });
+  // The billing-attribution line Anthropic-native clients prepend to the
+  // system prompt is metadata for Anthropic's own API. It carries a
+  // per-request-varying segment and sits at the very front of the prompt,
+  // so an upstream that cannot read it still pays for it: every turn
+  // presents a different prefix and misses that provider's prompt cache.
+  // The vendor id is what decides, not the protocol — this key speaks the
+  // Anthropic wire and is still not Anthropic.
+  test("/v1/messages drops the billing-attribution block for a third-party Anthropic upstream", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const baseline = upstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: anthropicHeaders,
+      body: JSON.stringify({
+        model: MODEL_ALIAS,
+        max_tokens: 64,
+        system: [
+          { type: "text", text: BILLING_LINE },
+          {
+            type: "text",
+            text: "long shared preamble",
+            cache_control: { type: "ephemeral", ttl: "5m" },
+          },
+        ],
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    const req = upstream.receivedRequests
+      .slice(baseline)
+      .find((r) => r.path === "/v1/messages");
+    expect(req).toBeDefined();
+    expect(req!.body).not.toContain("x-anthropic-billing-header");
+
+    const sent = JSON.parse(req!.body) as {
+      system?: Array<{ type?: string; text?: string; cache_control?: unknown }>;
+    };
+    // Everything else survives the rewrite, cache_control included — the
+    // block that stays is what the upstream's prompt cache keys on.
+    expect(sent.system).toEqual([
+      {
+        type: "text",
+        text: "long shared preamble",
+        cache_control: { type: "ephemeral", ttl: "5m" },
+      },
+    ]);
+  });
+
+  test("/v1/messages/count_tokens drops it too, so the count matches what would be sent", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const baseline = upstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/messages/count_tokens`, {
+      method: "POST",
+      headers: anthropicHeaders,
+      body: JSON.stringify({
+        model: MODEL_ALIAS,
+        system: [
+          { type: "text", text: BILLING_LINE },
+          { type: "text", text: "long shared preamble" },
+        ],
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    const req = upstream.receivedRequests
+      .slice(baseline)
+      .find((r) => r.path === "/v1/messages/count_tokens");
+    expect(req).toBeDefined();
+    expect(req!.body).not.toContain("x-anthropic-billing-header");
+    const sent = JSON.parse(req!.body) as { system?: Array<{ text?: string }> };
+    expect(sent.system).toEqual([
+      { type: "text", text: "long shared preamble" },
+    ]);
+  });
+
+  test("/v1/messages keeps the billing-attribution block for the anthropic vendor", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const system = [
+      { type: "text", text: BILLING_LINE },
+      {
+        type: "text",
+        text: "long shared preamble",
+        cache_control: { type: "ephemeral", ttl: "5m" },
+      },
+    ];
+
+    const send = () =>
+      fetch(`${app!.proxyUrl}/v1/messages`, {
+        method: "POST",
+        headers: anthropicHeaders,
+        body: JSON.stringify({
+          model: FIRST_PARTY_ALIAS,
+          max_tokens: 64,
+          system,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+
+    await waitConfigPropagation(async () => {
+      try {
+        return (await send()).ok;
+      } catch {
+        return false;
+      }
+    });
+
+    const baseline = upstream.receivedRequests.length;
+    const res = await send();
+    expect(res.status).toBe(200);
+
+    const req = upstream.receivedRequests
+      .slice(baseline)
+      .find((r) => r.path === "/v1/messages");
+    expect(req).toBeDefined();
+
+    // Anthropic's own API is the one consumer of this line, so it goes
+    // through untouched — the strip must key on the vendor id and nothing
+    // else.
+    const sent = JSON.parse(req!.body) as { system?: unknown };
+    expect(sent.system).toEqual(system);
   });
 });

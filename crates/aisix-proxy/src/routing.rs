@@ -34,6 +34,7 @@
 //! - **least_busy**: least-loaded target first, by in-flight requests
 //!   divided by target `weight` (the APISIX least_conn score).
 
+use aisix_core::models::{LivePricingIndex, PricingIndex};
 use aisix_core::{
     AisixSnapshot, HashOnType, Model, Routing, RoutingStrategy, RoutingTarget,
     WhenAllUnavailablePolicy,
@@ -96,12 +97,58 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
         // mistake — retrying or failing over won't help, same as a
         // non-429 4xx.
         BridgeError::InvalidUpstreamConfig(_) | BridgeError::InvalidUpstreamCredentials(_) => false,
+        // A capability the adapter simply does not implement. Static per
+        // adapter, so the same call answers the same way every time and a
+        // retry can only add latency to a refusal the caller is going to
+        // get anyway. Spelled as `Config` before #1093, which made it
+        // retryable and burned the whole budget before the 501 surfaced.
+        //
+        // There is no failover to preserve underneath this `false`. The
+        // three routes that can raise it — `/v1/completions`,
+        // `/v1/embeddings`, `/v1/images/generations` — dispatch through
+        // `retrying_dispatch`, which walks no candidates, and they refuse a
+        // routing model outright in `dispatch::require_provider`. The one
+        // loop that does fail over (chat's) only ever calls `chat` /
+        // `chat_stream`, which have no default impl to raise this.
+        BridgeError::UnsupportedCapability(_) => false,
         BridgeError::Timeout { .. }
         | BridgeError::Transport(_)
         | BridgeError::UpstreamDecode(_)
         | BridgeError::Config(_)
         | BridgeError::StreamAborted => true,
     }
+}
+
+/// One WARN per failed routing-target attempt, naming the target, the
+/// error, whether the loop will move on, and the `fallback_on_statuses`
+/// list that answer was computed against.
+///
+/// Kept in one place because the endpoint family had already drifted:
+/// `/v1/chat/completions` wrote this line on both its branches while
+/// `/v1/messages`, `/v1/responses` and `/v1/messages/count_tokens`
+/// emitted nothing at all on a failed attempt, at any level.
+///
+/// The status list is on the line because the retry/failover decision is
+/// not reconstructable without it. A group configured to fail over on an
+/// upstream 400, whose projected snapshot never carried the list, refuses
+/// to fail over and leaves exactly the trace a group with one reachable
+/// candidate leaves — one attempt, error class `upstream_status`
+/// (AISIX-Cloud#1499).
+pub(crate) fn log_attempt_failure(
+    target_model: &str,
+    attempt_number: usize,
+    err: &dyn std::fmt::Display,
+    retryable: bool,
+    fallback_on_statuses: &[u16],
+) {
+    tracing::warn!(
+        target_model = %target_model,
+        target_attempt = attempt_number,
+        error = %err,
+        retryable,
+        ?fallback_on_statuses,
+        "routing target attempt failed",
+    );
 }
 
 /// Base delay before the first same-target retry. Each subsequent retry
@@ -863,12 +910,12 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 /// Combined per-1K unit price used to rank `least_cost` targets. A target
-/// Model without a configured `cost` sorts last (treated as +∞) so a
-/// misconfigured target is deprioritised rather than silently preferred.
-fn cost_key(model: &Model) -> f64 {
-    model
-        .cost
-        .as_ref()
+/// Model with no price at all — no `pricing_key` that resolves, and no
+/// inline `cost` — sorts last (treated as +∞) so a misconfigured target
+/// is deprioritised rather than silently preferred.
+fn cost_key(pricing: &PricingIndex, model: &Model) -> f64 {
+    pricing
+        .resolve(model)
         .map(|c| c.input_per_1k + c.output_per_1k)
         .unwrap_or(f64::INFINITY)
 }
@@ -890,10 +937,18 @@ fn order_attempts_by_metric(
     strategy: RoutingStrategy,
     attempts: &mut [AttemptModel],
     runtime_status: &crate::ModelRuntimeStatusTracker,
+    snapshot: &AisixSnapshot,
+    pricing: &LivePricingIndex,
 ) {
     match strategy {
         RoutingStrategy::LeastCost => {
-            attempts.sort_by(|a, b| cost_key(&a.model).total_cmp(&cost_key(&b.model)));
+            // Built here rather than per comparison: the sort calls the
+            // key function O(n log n) times, and the index is shared with
+            // whatever else prices this snapshot.
+            let pricing = pricing.for_snapshot(snapshot);
+            attempts.sort_by(|a, b| {
+                cost_key(&pricing, &a.model).total_cmp(&cost_key(&pricing, &b.model))
+            });
         }
         RoutingStrategy::LeastLatency => {
             attempts.sort_by(|a, b| {
@@ -927,20 +982,62 @@ pub(crate) struct AttemptModel {
     pub weight: u32,
 }
 
+/// A candidate the health/cooldown filter dropped, kept so the caller can
+/// say WHICH target went and WHY.
+///
+/// Without it the exclusion is invisible: the request records one attempt
+/// against the surviving target and nothing anywhere names the one that was
+/// never tried, so "the group failed over to nobody" and "the group only
+/// ever had one candidate" produce the identical trace
+/// (AISIX-Cloud#1499).
+pub(crate) struct ExcludedCandidate {
+    /// Snapshot id of the dropped target — the key health/cooldown state
+    /// is tracked under.
+    pub id: String,
+    /// The target's configured `display_name`, i.e. the name the operator
+    /// wrote in `routing.targets`.
+    pub model: String,
+    pub reason: &'static str,
+}
+
+/// `reason` on an [`ExcludedCandidate`] dropped for an unexpired
+/// request-path cooldown.
+pub(crate) const EXCLUDED_COOLING: &str = "cooling";
+/// `reason` on an [`ExcludedCandidate`] dropped because its background
+/// health check has it marked down.
+pub(crate) const EXCLUDED_UNHEALTHY: &str = "unhealthy";
+
 /// Outcome of routing-candidate filtering. Lifts the "all candidates
 /// excluded" case out into a typed result so the dispatch loop can
 /// short-circuit to a 503 + Retry-After instead of sending traffic to
 /// a target we just confirmed is bad.
 pub(crate) enum FilterOutcome {
-    /// At least one candidate survived the filter. The returned vector
-    /// is the filtered attempt list, in the original strategy order
-    /// minus the excluded entries.
-    Selected(Vec<AttemptModel>),
+    /// At least one candidate survived the filter. `attempts` is the
+    /// filtered list, in the original strategy order minus the excluded
+    /// entries; `excluded` names what was dropped to get there.
+    Selected {
+        attempts: Vec<AttemptModel>,
+        excluded: Vec<ExcludedCandidate>,
+    },
     /// Every candidate is currently background-unhealthy and the
     /// routing model is configured with `when_all_unavailable: fail`. The
     /// caller should surface a 503 with the supplied Retry-After hint
     /// (in seconds), if any.
-    AllUnhealthy { retry_after_secs: Option<u64> },
+    AllUnhealthy {
+        retry_after_secs: Option<u64>,
+        excluded: Vec<ExcludedCandidate>,
+    },
+}
+
+fn excluded(attempts: &[AttemptModel], reason: &'static str) -> Vec<ExcludedCandidate> {
+    attempts
+        .iter()
+        .map(|a| ExcludedCandidate {
+            id: a.id.clone(),
+            model: a.model.display_name.clone(),
+            reason,
+        })
+        .collect()
 }
 
 pub(crate) fn filter_attempt_models(
@@ -950,7 +1047,7 @@ pub(crate) fn filter_attempt_models(
 ) -> FilterOutcome {
     let mut healthy = Vec::new();
     let mut cooldown_only = Vec::new();
-    let mut unhealthy_count = 0usize;
+    let mut unhealthy = Vec::new();
 
     for attempt in attempts.iter().cloned() {
         let stale_after = attempt
@@ -960,7 +1057,7 @@ pub(crate) fn filter_attempt_models(
             .map(|cfg| Duration::from_secs(cfg.stale_after_seconds));
         let snapshot = runtime_status.status_with_stale(&attempt.id, stale_after);
         match snapshot.status {
-            crate::RuntimeStatus::Unhealthy => unhealthy_count += 1,
+            crate::RuntimeStatus::Unhealthy => unhealthy.push(attempt),
             crate::RuntimeStatus::Cooldown => cooldown_only.push(attempt),
             crate::RuntimeStatus::Healthy | crate::RuntimeStatus::NotApplicable => {
                 healthy.push(attempt)
@@ -969,7 +1066,12 @@ pub(crate) fn filter_attempt_models(
     }
 
     if !healthy.is_empty() {
-        return FilterOutcome::Selected(healthy);
+        let mut dropped = excluded(&cooldown_only, EXCLUDED_COOLING);
+        dropped.extend(excluded(&unhealthy, EXCLUDED_UNHEALTHY));
+        return FilterOutcome::Selected {
+            attempts: healthy,
+            excluded: dropped,
+        };
     }
     // No healthy candidates — prefer cooldown over unhealthy when
     // some non-unhealthy candidates exist. Sending to a target whose
@@ -983,8 +1085,11 @@ pub(crate) fn filter_attempt_models(
     // race window — a candidate flipping to unhealthy between the two
     // reads could yield an empty `Selected`, which streaming callers
     // turn into a panic by indexing `attempt_models[0]`.
-    if unhealthy_count < attempts.len() && !cooldown_only.is_empty() {
-        return FilterOutcome::Selected(cooldown_only);
+    if !cooldown_only.is_empty() {
+        return FilterOutcome::Selected {
+            excluded: excluded(&unhealthy, EXCLUDED_UNHEALTHY),
+            attempts: cooldown_only,
+        };
     }
     // All candidates are excluded. Policy decides.
     //
@@ -998,8 +1103,14 @@ pub(crate) fn filter_attempt_models(
     match policy {
         WhenAllUnavailablePolicy::Fail => FilterOutcome::AllUnhealthy {
             retry_after_secs: Some(FALLBACK_ALL_UNHEALTHY_RETRY_AFTER.as_secs()),
+            excluded: excluded(&unhealthy, EXCLUDED_UNHEALTHY),
         },
-        WhenAllUnavailablePolicy::TryAnyway => FilterOutcome::Selected(attempts),
+        // `try_anyway` dispatches the unfiltered list, so nothing was
+        // dropped and there is no exclusion to report.
+        WhenAllUnavailablePolicy::TryAnyway => FilterOutcome::Selected {
+            attempts,
+            excluded: Vec::new(),
+        },
     }
 }
 
@@ -1056,9 +1167,11 @@ fn targets_allowed_for_ip(
 ///
 /// Shared by `/v1/chat/completions` and `/v1/messages` so both endpoints
 /// dispatch Model Groups identically (ai-gateway#471).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_attempt_models(
     routing_registry: &RoutingRegistry,
     runtime_status: &crate::ModelRuntimeStatusTracker,
+    pricing: &LivePricingIndex,
     snapshot: &AisixSnapshot,
     virtual_name: &str,
     virtual_id: &str,
@@ -1084,6 +1197,44 @@ pub(crate) fn resolve_attempt_models(
             req.tags
         )));
     }
+    // Normalize each target's model reference to the display name the
+    // models table is keyed by, before ANY of the machinery below looks one
+    // up: the IP pre-filter, the balancing state (WRR fingerprints, hash
+    // rings) and the resolution loop all key on `target.model`, so
+    // resolving once here is what keeps a `model_id` target from having to
+    // be handled at each of them. A target written as `model_id` follows a
+    // rename of the model it points at; one whose id resolves to nothing
+    // keeps the id as its name and is reported below as the missing target
+    // it is — the same outcome a dangling `model` gets.
+    //
+    // Collapsing to one entry per resolved model is part of the same step,
+    // and not an optimisation: the loop below finds a picked name's target
+    // with `find`, so two entries resolving to the same model would give
+    // the second attempt the FIRST one's weight and priority and spend two
+    // `max_fallbacks` slots on one upstream. The write path rejects
+    // duplicate targets, but it can only compare the spelling each entry
+    // used — `{"model": "beta"}` beside `{"model_id": "<beta>"}` is one
+    // model written two ways and reaches this side intact.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let eligible: Vec<RoutingTarget> = eligible
+        .into_iter()
+        .filter_map(|t| {
+            let model = t.model_ref(snapshot).into_owned();
+            if !seen.insert(model.clone()) {
+                tracing::debug!(
+                    virtual_model = %virtual_name,
+                    target_model = %model,
+                    "routing targets resolve to the same model; keeping the first",
+                );
+                return None;
+            }
+            Some(RoutingTarget {
+                model,
+                model_id: None,
+                ..t
+            })
+        })
+        .collect();
     // Client-IP pre-filter (AISIX-Cloud#1087 follow-up): a target whose own
     // `allowed_cidrs` excludes this caller is not a candidate. Applied BEFORE
     // the strategy picks, so `max_fallbacks` budgets attempts across the
@@ -1121,8 +1272,8 @@ pub(crate) fn resolve_attempt_models(
                 "routing target {name:?} does not resolve to a Model"
             ))
         })?;
-        // Duplicate target models are rejected at the write path, so the
-        // first match is the only match.
+        // One entry per resolved model (see the normalization above), so
+        // the first match is the only match.
         let target = routing
             .targets
             .iter()
@@ -1141,7 +1292,13 @@ pub(crate) fn resolve_attempt_models(
     // metric sort runs first, then a stable sort on priority — so tiers
     // concatenate highest-first with the metric order preserved inside each.
     if routing.strategy.is_metric_based() {
-        order_attempts_by_metric(routing.strategy, &mut resolved, runtime_status);
+        order_attempts_by_metric(
+            routing.strategy,
+            &mut resolved,
+            runtime_status,
+            snapshot,
+            pricing,
+        );
         resolved.sort_by_key(|a| std::cmp::Reverse(a.priority));
         resolved.truncate(routing.max_fallbacks_or_default() + 1);
     }
@@ -1150,8 +1307,15 @@ pub(crate) fn resolve_attempt_models(
         resolved,
         routing.when_all_unavailable_or_default(),
     ) {
-        FilterOutcome::Selected(list) => Ok(list),
-        FilterOutcome::AllUnhealthy { retry_after_secs } => {
+        FilterOutcome::Selected { attempts, excluded } => {
+            log_candidate_exclusions(runtime_status, virtual_name, attempts.len(), &excluded);
+            Ok(attempts)
+        }
+        FilterOutcome::AllUnhealthy {
+            retry_after_secs,
+            excluded,
+        } => {
+            log_candidate_exclusions(runtime_status, virtual_name, 0, &excluded);
             tracing::warn!(
                 virtual_model = %virtual_name,
                 retry_after_secs,
@@ -1162,10 +1326,42 @@ pub(crate) fn resolve_attempt_models(
     }
 }
 
+/// Name every target the health/cooldown filter dropped, and how many
+/// candidates the dispatch loop is left with.
+///
+/// At WARN, because a group running on fewer targets than the operator
+/// configured is a degraded state they want to see without having raised
+/// verbosity first — an incident is diagnosed from the log level the
+/// gateway was already running at, and `info` is the default. Throttled per
+/// (target, reason) by
+/// [`crate::ModelRuntimeStatusTracker::should_log_exclusion`] so a cooling
+/// target in a busy group produces one line a minute rather than one per
+/// request.
+fn log_candidate_exclusions(
+    runtime_status: &crate::ModelRuntimeStatusTracker,
+    virtual_name: &str,
+    candidates: usize,
+    excluded: &[ExcludedCandidate],
+) {
+    for ex in excluded {
+        if !runtime_status.should_log_exclusion(virtual_name, &ex.id, ex.reason) {
+            continue;
+        }
+        tracing::warn!(
+            virtual_model = %virtual_name,
+            target_model = %ex.model,
+            reason = ex.reason,
+            candidates,
+            "routing candidate excluded before dispatch",
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use aisix_core::{Routing, RoutingStrategy, RoutingTarget};
+    use aisix_gateway::BridgeCapability;
 
     fn r(
         strategy: RoutingStrategy,
@@ -1336,6 +1532,122 @@ mod tests {
             model_names(&eligible_targets(&targets, &[])),
             vec!["eu", "us"]
         );
+    }
+
+    // ───────────────── targets named by resource id ─────────────────
+
+    /// A routing model whose targets are named by `model_id`. Every stage
+    /// downstream of the normalization keys on `target.model`, so the
+    /// assertion that matters is what the whole resolution walk hands back.
+    fn resolve_group(
+        snapshot: &AisixSnapshot,
+        targets: Vec<RoutingTarget>,
+    ) -> Result<Vec<String>, ProxyError> {
+        let group: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "group",
+            "routing": {"strategy": "failover", "targets": []},
+        }))
+        .unwrap();
+        let mut group = group;
+        group.routing = Some(r(RoutingStrategy::Failover, targets, None));
+        resolve_attempt_models(
+            &RoutingRegistry::new(),
+            &crate::ModelRuntimeStatusTracker::new(),
+            &LivePricingIndex::new(),
+            snapshot,
+            "group",
+            "g-1",
+            &group,
+            RoutingRequest::default(),
+        )
+        .map(|attempts| attempts.into_iter().map(|a| a.model.display_name).collect())
+    }
+
+    #[test]
+    fn a_target_named_by_id_resolves_to_that_model() {
+        // `ip_snapshot` assigns ids `m-0`, `m-1`, … in declaration order.
+        let snap = ip_snapshot(&[("alpha", None), ("beta", None)]);
+        assert_eq!(
+            resolve_group(&snap, vec![RoutingTarget::by_id("m-1")]).unwrap(),
+            vec!["beta"]
+        );
+    }
+
+    #[test]
+    fn a_target_named_by_id_follows_a_rename() {
+        let target = vec![RoutingTarget::by_id("m-0")];
+        let before = ip_snapshot(&[("alpha", None)]);
+        assert_eq!(
+            resolve_group(&before, target.clone()).unwrap(),
+            vec!["alpha"]
+        );
+        // Same id, new display name; the routing document is untouched.
+        let after = ip_snapshot(&[("alpha-v2", None)]);
+        assert_eq!(resolve_group(&after, target).unwrap(), vec!["alpha-v2"]);
+    }
+
+    #[test]
+    fn an_id_target_wins_over_the_name_beside_it() {
+        let snap = ip_snapshot(&[("alpha", None), ("beta", None)]);
+        let conflicting = RoutingTarget {
+            model: "alpha".into(),
+            model_id: Some("m-1".into()),
+            weight: None,
+            priority: None,
+            tags: None,
+        };
+        assert_eq!(
+            resolve_group(&snap, vec![conflicting]).unwrap(),
+            vec!["beta"]
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_id_target_fails_like_an_unresolvable_name() {
+        let snap = ip_snapshot(&[("alpha", None)]);
+        let by_id = resolve_group(&snap, vec![RoutingTarget::by_id("m-gone")]).unwrap_err();
+        let by_name = resolve_group(&snap, vec![RoutingTarget::new("m-gone")]).unwrap_err();
+        assert!(
+            matches!(by_id, ProxyError::InvalidRequest(_)),
+            "expected the same config error a dangling name raises, got {by_id:?}"
+        );
+        assert_eq!(by_id.to_string(), by_name.to_string());
+    }
+
+    /// The per-target IP allowlist keys on the target's Model, so it has to
+    /// see the resolved one — a group that gated only name-form targets
+    /// would let an id-form target through a restriction the operator set.
+    #[test]
+    fn an_id_target_is_still_subject_to_its_own_ip_allowlist() {
+        let snap = ip_snapshot(&[("restricted", Some(vec!["10.0.0.0/8"]))]);
+        let group: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "group",
+            "routing": {"strategy": "failover", "targets": []},
+        }))
+        .unwrap();
+        let mut group = group;
+        group.routing = Some(r(
+            RoutingStrategy::Failover,
+            vec![RoutingTarget::by_id("m-0")],
+            None,
+        ));
+        let out_of_range = resolve_attempt_models(
+            &RoutingRegistry::new(),
+            &crate::ModelRuntimeStatusTracker::new(),
+            &LivePricingIndex::new(),
+            &snap,
+            "group",
+            "g-1",
+            &group,
+            RoutingRequest {
+                source_ip: "8.8.8.8",
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            out_of_range,
+            Err(ProxyError::ModelIpRestricted(_))
+        ));
     }
 
     // ───────────────── per-target client-IP allowlist ─────────────────
@@ -1761,6 +2073,64 @@ mod tests {
             false,
             &[]
         ));
+        // #1093: the adapter simply does not implement this operation, and
+        // that is static — the same call answers the same way every time.
+        assert!(!is_retryable(
+            &BridgeError::UnsupportedCapability(BridgeCapability::TextCompletions),
+            false,
+            &[]
+        ));
+    }
+
+    /// The classifier answering `false` is only worth something if the loop
+    /// stops on it. This is the half that would go red if
+    /// `retrying_dispatch` ever consulted something other than
+    /// `is_retryable` — and the `Config` control is what shows the harness
+    /// can see a retry at all, so a mis-wired counter cannot pass by
+    /// reporting one call for both.
+    #[tokio::test(start_paused = true)]
+    async fn the_retry_loop_spends_no_attempt_on_a_capability_gap() {
+        let state = crate::ProxyState::new(
+            aisix_core::snapshot::SnapshotHandle::new(aisix_core::AisixSnapshot::new()),
+            std::sync::Arc::new(aisix_gateway::Hub::new()),
+            &aisix_core::ProxyConfig {
+                addr: "127.0.0.1:0".into(),
+                request_body_limit_bytes: 1_048_576,
+                tls: None,
+                listeners: Vec::new(),
+                real_ip: Default::default(),
+                request_id: Default::default(),
+                thread_per_core: None,
+                workers: None,
+                url_rewrites: Vec::new(),
+            },
+        );
+        let model = model_with_retries(Some(2));
+
+        let calls = std::cell::Cell::new(0u32);
+        let err = retrying_dispatch(&state, &model, "/v1/completions", || {
+            calls.set(calls.get() + 1);
+            async {
+                Err::<(), _>(BridgeError::UnsupportedCapability(
+                    BridgeCapability::TextCompletions,
+                ))
+            }
+        })
+        .await
+        .expect_err("the capability gap surfaces");
+        assert!(matches!(err, BridgeError::UnsupportedCapability(_)));
+        assert_eq!(calls.get(), 1, "a capability gap must not spend a retry");
+
+        // Control: the shape this used to have. Two configured retries mean
+        // three calls, which is the budget the 501 was burning before the
+        // variant was typed.
+        let calls = std::cell::Cell::new(0u32);
+        let _ = retrying_dispatch(&state, &model, "/v1/completions", || {
+            calls.set(calls.get() + 1);
+            async { Err::<(), _>(BridgeError::Config("serialize request body: eof".into())) }
+        })
+        .await;
+        assert_eq!(calls.get(), 3);
     }
 
     /// AISIX-Cloud#1222: in-band stream errors follow the same status
@@ -2253,6 +2623,187 @@ mod tests {
     }
 
     // ── order_attempts_by_metric (least_cost) ─────────────────────
+
+    /// A snapshot with no pricing documents — the cases below rank by
+    /// the models' own inline `cost`, which is what every deployment
+    /// written before pricing documents existed still does.
+    fn unpriced() -> AisixSnapshot {
+        AisixSnapshot::new()
+    }
+
+    /// A snapshot whose shared catalog prices `key` at `input`/`output`.
+    fn priced(key: &str, input: f64, output: f64) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.global_pricing.insert(aisix_core::ResourceEntry::new(
+            "p-1",
+            serde_json::from_str(&format!(
+                r#"{{"key":"{key}","input_per_1k":{input},"output_per_1k":{output}}}"#
+            ))
+            .unwrap(),
+            1,
+        ));
+        snap
+    }
+
+    /// A target priced only by reference — no inline `cost` to fall back
+    /// on, so a resolution that does not happen ranks it last.
+    fn am_with_pricing_key(id: &str, key: &str) -> AttemptModel {
+        let model: Model = serde_json::from_str(&format!(
+            r#"{{
+              "display_name": "{id}",
+              "provider": "openai",
+              "model_name": "gpt-4o-mini",
+              "provider_key_id": "pk-{id}",
+              "pricing_key": "{key}"
+            }}"#
+        ))
+        .unwrap();
+        AttemptModel {
+            id: id.to_string(),
+            model,
+            priority: 0,
+            weight: 1,
+        }
+    }
+
+    /// Every reader of a model's price must go through
+    /// [`PricingIndex::resolve`], so ranking and billing cannot disagree
+    /// about what a model costs.
+    ///
+    /// A census rather than a list of the three known sites, for the
+    /// reason `guardrail_coverage.rs` gives: the readers here come in a
+    /// family (`least_cost` ordering, the realtime session's `cost_usd`,
+    /// the batch attribution's), a fourth is added by writing one more
+    /// `.cost`, and a hand-written list agrees with itself forever. The
+    /// symptom of missing one is silent — a model priced by reference
+    /// bills zero on the site that still reads the field.
+    #[test]
+    fn no_one_reads_a_models_price_off_the_field() {
+        use std::path::Path;
+
+        /// The two places allowed to touch the field, by PATH rather
+        /// than by file name: excluding a bare name would also excuse a
+        /// same-named file in another crate, and excluding a whole file
+        /// is how the first version of this census stopped covering
+        /// `cost_key`.
+        const AUTHORIZED: [&str; 2] = [
+            // Defines `ModelCost` and clears it in strip_kind_inapplicable.
+            "aisix-core/src/models/model.rs",
+            // The resolver every other reader must go through.
+            "aisix-core/src/models/pricing.rs",
+        ];
+
+        fn walk(dir: &Path, needle: &str, out: &mut Vec<(String, usize, String)>) {
+            for e in std::fs::read_dir(dir).expect("crates dir is readable") {
+                let path = e.expect("dir entry").path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    walk(&path, needle, out);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    let name = path.to_string_lossy().replace('\\', "/");
+                    if AUTHORIZED.iter().any(|ok| name.ends_with(ok)) {
+                        continue;
+                    }
+                    let src = std::fs::read_to_string(&path).expect("source is utf-8");
+                    for (i, line) in src.lines().enumerate() {
+                        // `.cost` as a field access, not `cost_usd` /
+                        // `cost_saved_usd` / a local named `*_cost`, and
+                        // not a comment.
+                        let trimmed = line.trim_start();
+                        if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                            continue;
+                        }
+                        let mut rest = line;
+                        while let Some(at) = rest.find(needle) {
+                            let after = &rest[at + needle.len()..];
+                            let boundary = after
+                                .chars()
+                                .next()
+                                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+                            if boundary {
+                                out.push((name.clone(), i + 1, line.trim().to_string()));
+                                break;
+                            }
+                            rest = after;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Assembled rather than written out, so this file is scanned
+        // like every other one: excluding it to stop the census matching
+        // its own text would also stop it covering `cost_key`, which
+        // lives here and is the reader most likely to regress.
+        let needle = format!(".{}", "cost");
+        let mut hits = Vec::new();
+        // The whole workspace, not just this crate: a usage event is
+        // assembled in more than one of them, and a direct read added
+        // anywhere else would be just as silent.
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the crate lives under crates/")
+            .to_path_buf();
+        walk(&crates, &needle, &mut hits);
+        assert!(
+            hits.is_empty(),
+            "these read a model's price off the field instead of through \
+             PricingIndex::resolve, so `pricing_key` is ignored there: {hits:#?}",
+        );
+        // The census is worthless if it scans nothing; prove it reached
+        // the crates it is meant to cover.
+        assert!(
+            crates.join("aisix-server/src").is_dir() && crates.join("aisix-obs/src").is_dir(),
+            "the census did not reach the other crates: {}",
+            crates.display(),
+        );
+    }
+
+    #[test]
+    fn least_cost_ranks_a_referenced_price_against_an_inline_one() {
+        let t = crate::ModelRuntimeStatusTracker::new();
+        // The referenced price (2/1K) undercuts the inline one (6/1K).
+        // Reversed against the same models with no catalog, below, so
+        // neither ordering can be the accidental one.
+        let snap = priced("vendor/x", 1.0, 1.0);
+        let mut attempts = vec![
+            am_with_cost("inline", 3.0, 3.0),
+            am_with_pricing_key("referenced", "vendor/x"),
+        ];
+        order_attempts_by_metric(
+            RoutingStrategy::LeastCost,
+            &mut attempts,
+            &t,
+            &snap,
+            &LivePricingIndex::new(),
+        );
+        let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["referenced", "inline"]);
+    }
+
+    #[test]
+    fn least_cost_ranks_an_unresolved_reference_last() {
+        let t = crate::ModelRuntimeStatusTracker::new();
+        // Same two targets, no catalog: the reference resolves to
+        // nothing and the model carries no inline cost, so it is +∞ and
+        // sorts behind the priced one.
+        let mut attempts = vec![
+            am_with_pricing_key("referenced", "vendor/x"),
+            am_with_cost("inline", 3.0, 3.0),
+        ];
+        order_attempts_by_metric(
+            RoutingStrategy::LeastCost,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
+        let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["inline", "referenced"]);
+    }
+
     fn am_with_cost(id: &str, input_per_1k: f64, output_per_1k: f64) -> AttemptModel {
         let model: Model = serde_json::from_str(&format!(
             r#"{{
@@ -2280,7 +2831,13 @@ mod tests {
             am_with_cost("cheap", 1.0, 2.0),    // 3 / 1K
             am_with_cost("mid", 5.0, 5.0),      // 10 / 1K
         ];
-        order_attempts_by_metric(RoutingStrategy::LeastCost, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastCost,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["cheap", "mid", "pricey"]);
     }
@@ -2293,7 +2850,13 @@ mod tests {
             am_with_cost("cheap", 1.0, 1.0), // 2 / 1K
             am("no-cost-b"),                 // +∞
         ];
-        order_attempts_by_metric(RoutingStrategy::LeastCost, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastCost,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         // Priced target first; equal (missing-cost) targets keep their
         // declaration order thanks to the stable sort.
@@ -2304,7 +2867,13 @@ mod tests {
     fn non_metric_strategy_leaves_order_untouched() {
         let t = crate::ModelRuntimeStatusTracker::new();
         let mut attempts = vec![am_with_cost("b", 9.0, 9.0), am_with_cost("a", 1.0, 1.0)];
-        order_attempts_by_metric(RoutingStrategy::Failover, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::Failover,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["b", "a"]);
     }
@@ -2317,7 +2886,13 @@ mod tests {
         t.record_latency("fast", 50);
         t.record_latency("mid", 300);
         let mut attempts = vec![am("slow"), am("fast"), am("mid")];
-        order_attempts_by_metric(RoutingStrategy::LeastLatency, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastLatency,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["fast", "mid", "slow"]);
     }
@@ -2329,7 +2904,13 @@ mod tests {
         // "unseen-a"/"unseen-b" have no samples → rank first (−∞), keeping
         // their declaration order via the stable sort.
         let mut attempts = vec![am("measured"), am("unseen-a"), am("unseen-b")];
-        order_attempts_by_metric(RoutingStrategy::LeastLatency, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastLatency,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["unseen-a", "unseen-b", "measured"]);
     }
@@ -2354,7 +2935,13 @@ mod tests {
         let _m1 = t.begin_in_flight("mid"); // 1 in-flight
                                             // "idle" has 0 in-flight.
         let mut attempts = vec![am("busy"), am("idle"), am("mid")];
-        order_attempts_by_metric(RoutingStrategy::LeastBusy, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastBusy,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["idle", "mid", "busy"]);
     }
@@ -2364,7 +2951,13 @@ mod tests {
         let t = crate::ModelRuntimeStatusTracker::new();
         // All idle (0 in-flight) → stable sort preserves declaration order.
         let mut attempts = vec![am("a"), am("b"), am("c")];
-        order_attempts_by_metric(RoutingStrategy::LeastBusy, &mut attempts, &t);
+        order_attempts_by_metric(
+            RoutingStrategy::LeastBusy,
+            &mut attempts,
+            &t,
+            &unpriced(),
+            &LivePricingIndex::new(),
+        );
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b", "c"]);
     }
@@ -2405,8 +2998,9 @@ mod tests {
         let t = crate::ModelRuntimeStatusTracker::new();
         let attempts = vec![am("a"), am("b")];
         match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
-            FilterOutcome::Selected(list) => {
-                assert_eq!(list.len(), 2);
+            FilterOutcome::Selected { attempts, excluded } => {
+                assert_eq!(attempts.len(), 2);
+                assert!(excluded.is_empty());
             }
             other => panic!(
                 "expected Selected, got {:?}",
@@ -2421,9 +3015,43 @@ mod tests {
         t.mark_cooldown("a", Duration::from_secs(30), "retryable_failure");
         let attempts = vec![am("a"), am("b")];
         match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
-            FilterOutcome::Selected(list) => {
-                assert_eq!(list.len(), 1);
-                assert_eq!(list[0].id, "b");
+            FilterOutcome::Selected { attempts, excluded } => {
+                assert_eq!(attempts.len(), 1);
+                assert_eq!(attempts[0].id, "b");
+                // The dropped target is named, with why — the record the
+                // dispatch loop turns into the WARN line.
+                assert_eq!(excluded.len(), 1);
+                assert_eq!(excluded[0].id, "a");
+                assert_eq!(excluded[0].model, "a");
+                assert_eq!(excluded[0].reason, EXCLUDED_COOLING);
+            }
+            _ => panic!("expected Selected"),
+        }
+    }
+
+    #[test]
+    fn healthy_survivor_reports_both_cooling_and_unhealthy_drops() {
+        // The three-or-more-target group, which is the common production
+        // shape: one healthy survivor, one cooling, one background-dead.
+        // Without this case the `extend` that appends the unhealthy
+        // drops could be deleted outright and every other filter test
+        // would still pass — the group would quietly lose a target with
+        // nothing naming it, which is the whole failure this record
+        // exists to remove.
+        let t = crate::ModelRuntimeStatusTracker::new();
+        t.mark_cooldown("b", Duration::from_secs(30), "x");
+        t.mark_unhealthy("c", Some(503), "background_check_failed");
+        let attempts = vec![am("a"), am("b"), am("c")];
+        match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
+            FilterOutcome::Selected { attempts, excluded } => {
+                assert_eq!(attempts.len(), 1);
+                assert_eq!(attempts[0].id, "a");
+                let mut got: Vec<(&str, &str)> = excluded
+                    .iter()
+                    .map(|e| (e.model.as_str(), e.reason))
+                    .collect();
+                got.sort_unstable();
+                assert_eq!(got, [("b", EXCLUDED_COOLING), ("c", EXCLUDED_UNHEALTHY)]);
             }
             _ => panic!("expected Selected"),
         }
@@ -2440,8 +3068,15 @@ mod tests {
         t.mark_unhealthy("b", Some(503), "background_check_failed");
         let attempts = vec![am("a"), am("b")];
         match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
-            FilterOutcome::AllUnhealthy { retry_after_secs } => {
+            FilterOutcome::AllUnhealthy {
+                retry_after_secs,
+                excluded,
+            } => {
                 assert_eq!(retry_after_secs, Some(30));
+                let mut names: Vec<&str> = excluded.iter().map(|e| e.model.as_str()).collect();
+                names.sort_unstable();
+                assert_eq!(names, ["a", "b"]);
+                assert!(excluded.iter().all(|e| e.reason == EXCLUDED_UNHEALTHY));
             }
             _ => panic!("expected AllUnhealthy"),
         }
@@ -2458,9 +3093,16 @@ mod tests {
         t.mark_cooldown("c", Duration::from_secs(30), "x");
         let attempts = vec![am("a"), am("b"), am("c")];
         match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
-            FilterOutcome::Selected(list) => {
-                assert_eq!(list.len(), 1);
-                assert_eq!(list[0].id, "c");
+            FilterOutcome::Selected { attempts, excluded } => {
+                assert_eq!(attempts.len(), 1);
+                assert_eq!(attempts[0].id, "c");
+                // `c` was dispatched, so only the two unhealthy targets
+                // count as excluded — a candidate that gets used is not
+                // reported as dropped.
+                let mut names: Vec<&str> = excluded.iter().map(|e| e.model.as_str()).collect();
+                names.sort_unstable();
+                assert_eq!(names, ["a", "b"]);
+                assert!(excluded.iter().all(|e| e.reason == EXCLUDED_UNHEALTHY));
             }
             _ => panic!("expected Selected with cooldown candidate"),
         }
@@ -2474,8 +3116,11 @@ mod tests {
         t.mark_unhealthy("b", Some(503), "background_check_failed");
         let attempts = vec![am("a"), am("b")];
         match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::TryAnyway) {
-            FilterOutcome::Selected(list) => {
-                assert_eq!(list.len(), 2);
+            FilterOutcome::Selected { attempts, excluded } => {
+                assert_eq!(attempts.len(), 2);
+                // Nothing was dropped: `try_anyway` dispatches the whole
+                // list, so reporting an exclusion here would be a lie.
+                assert!(excluded.is_empty());
             }
             _ => panic!("expected Selected under TryAnyway policy"),
         }
@@ -2491,8 +3136,9 @@ mod tests {
         t.mark_cooldown("b", Duration::from_secs(30), "x");
         let attempts = vec![am("a"), am("b")];
         match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
-            FilterOutcome::Selected(list) => {
-                assert_eq!(list.len(), 2);
+            FilterOutcome::Selected { attempts, excluded } => {
+                assert_eq!(attempts.len(), 2);
+                assert!(excluded.is_empty());
             }
             _ => panic!("expected Selected for cooldown-only"),
         }

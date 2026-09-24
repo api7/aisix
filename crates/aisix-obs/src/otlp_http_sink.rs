@@ -51,6 +51,7 @@ use aisix_core::models::{
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::metrics::Metrics;
 use crate::sink::{
     build_object_store_sink, resolve_datadog_credential, resolve_sls_credential, AliyunSlsSink,
     BatchUnit, CapturedContent, DatadogSink, EventBatch, ExporterPipelines, IdempotencyMarker,
@@ -63,10 +64,6 @@ use crate::usage::UsageEvent;
 /// Tight on purpose — we never want a slow exporter to backlog tokio
 /// tasks for a wedged user receiver.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// `User-Agent` header so vendor receivers can attribute traces back
-/// to AISIX in their own analytics. Not a contract; informational.
-const USER_AGENT: &str = concat!("aisix-dp/", env!("CARGO_PKG_VERSION"));
 
 /// Fans usage events out to every configured observability exporter — any
 /// [`ExporterKind`], dispatched per kind to the matching
@@ -105,16 +102,34 @@ fn exporter_pipeline_config() -> PipelineConfig {
 
 impl OtlpHttpFanOut {
     pub fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// As [`Self::new`], emitting the per-exporter fan-out drop and
+    /// failure counters on `metrics`. Without it the fan-out still runs
+    /// and still accounts drops in [`SinkStatsSnapshot`] — but nothing
+    /// reaches `GET /metrics`, which is the gap #1060 names.
+    pub fn with_metrics(metrics: Metrics) -> Self {
+        Self::build(Some(metrics))
+    }
+
+    fn build(metrics: Option<Metrics>) -> Self {
         let client = aisix_gateway::client_builder()
             .timeout(REQUEST_TIMEOUT)
-            .user_agent(USER_AGENT)
+            .user_agent(format!("aisix-dp/{}", aisix_core::BUILD_VERSION))
             .build()
             // The client builder only fails on illegal TLS roots; the
             // default config is always valid.
             .expect("reqwest::Client default config is valid");
         Self {
             inner: Arc::new(FanOutInner {
-                exporters: ExporterPipelines::new(exporter_pipeline_config()),
+                exporters: {
+                    let p = ExporterPipelines::new(exporter_pipeline_config());
+                    match metrics {
+                        Some(m) => p.with_metrics(m),
+                        None => p,
+                    }
+                },
                 client,
             }),
         }
@@ -572,6 +587,7 @@ impl ObservabilitySink for OtlpSink {
                         ..SinkAck::default()
                     });
                 }
+                let retry_after = crate::sink::retry_after_of(status, resp.headers());
                 let text = resp.text().await.unwrap_or_default();
                 let detail = format!(
                     "HTTP {}: {}",
@@ -584,7 +600,13 @@ impl ObservabilitySink for OtlpSink {
                     || status == reqwest::StatusCode::REQUEST_TIMEOUT
                     || status == reqwest::StatusCode::TOO_MANY_REQUESTS
                 {
-                    Err(SinkError::Transient(detail))
+                    Err(match retry_after {
+                        Some(retry_after) => SinkError::Throttled {
+                            retry_after,
+                            detail,
+                        },
+                        None => SinkError::Transient(detail),
+                    })
                 } else {
                     Err(SinkError::Permanent(detail))
                 }
@@ -757,6 +779,9 @@ fn structural_attributes(event: &UsageEvent, exporter_name: &str) -> Vec<Value> 
         attr_string("aisix.request_id", &event.request_id),
         attr_int("http.response.status_code", event.status_code as i64),
     ];
+    if !event.operation.is_empty() {
+        attributes.push(attr_string("aisix.operation", &event.operation));
+    }
     if !event.requested_model.is_empty() {
         attributes.push(attr_string("gen_ai.request.model", &event.requested_model));
     }
@@ -781,6 +806,16 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
         attr_string("gen_ai.system", "aisix"),
         attr_string("gen_ai.operation.name", operation_name(event)),
     ];
+    // The gateway's own, finer reading of the same thing. The semconv value
+    // above is constrained to OpenTelemetry's vocabulary, so every
+    // OpenAI-shaped route lands on `chat` there — which cannot separate a
+    // conversation from an image or a video (AISIX-Cloud#1461). Carried on
+    // the structural spans too, so a trace can be filtered by kind at its
+    // root rather than only on the attempt span. Absent, like every other
+    // optional attribute here, when the event carries no value.
+    if !event.operation.is_empty() {
+        attributes.push(attr_string("aisix.operation", &event.operation));
+    }
     // The model alias the client sent (`model` field) — a Model-Group
     // name for routed requests (AISIX-Cloud#790). Semconv key for the
     // requested (vs response) model.
@@ -821,6 +856,12 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
         // Custom attribute (no semconv yet) so reviewers can join
         // spans back to the AISIX api_key dashboard.
         attributes.push(attr_string("aisix.api_key_id", &event.api_key_id));
+    }
+    // The org member behind the credential (AISIX-Cloud#1389). Exported
+    // beside the key rather than derived from it downstream: a member can
+    // hold several keys, and a key can be rebound to someone else.
+    if !event.user_id.is_empty() {
+        attributes.push(attr_string("aisix.user_id", &event.user_id));
     }
     if !event.model_id.is_empty() {
         attributes.push(attr_string("aisix.model_id", &event.model_id));
@@ -1237,6 +1278,7 @@ mod tests {
             provider_model_version: "gpt-4o-2024-08-06".into(),
             finish_reason: "stop".into(),
             cost_usd: 0.001,
+            operation: "image_generation".into(),
             ..Default::default()
         }
     }
@@ -1334,6 +1376,24 @@ mod tests {
         assert!(keys(attempt).contains(&"gen_ai.response.id".to_string()));
         assert!(!keys(server).contains(&"gen_ai.response.id".to_string()));
         assert!(keys(server).contains(&"aisix.request_id".to_string()));
+        // The request's kind is one of the joining keys, on every level:
+        // a trace backend filters a whole trace by it at the SERVER root,
+        // which reading it off the attempt span alone would not allow
+        // (AISIX-Cloud#1461).
+        let operation_of = |span: &Value| -> String {
+            span["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["key"] == "aisix.operation")
+                .expect("aisix.operation must be present")["value"]["stringValue"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        for span in [server, logical, attempt] {
+            assert_eq!(operation_of(span), "image_generation");
+        }
 
         // Timestamps bracket: server ⊇ logical ⊇ attempt.
         let nanos =
@@ -1761,6 +1821,15 @@ mod tests {
         let keys: Vec<&str> = attrs.iter().map(|a| a["key"].as_str().unwrap()).collect();
         assert!(keys.contains(&"gen_ai.system"));
         assert!(keys.contains(&"gen_ai.operation.name"));
+        // The semconv value collapses every OpenAI-shaped route onto `chat`;
+        // this is the one that says which endpoint (AISIX-Cloud#1461), so the
+        // VALUE is what has to be checked — the key alone would be satisfied
+        // by an empty attribute.
+        let operation = attrs
+            .iter()
+            .find(|a| a["key"] == "aisix.operation")
+            .expect("aisix.operation must be present");
+        assert_eq!(operation["value"]["stringValue"], "image_generation");
         assert!(keys.contains(&"gen_ai.response.model"));
         assert!(keys.contains(&"gen_ai.response.id"));
         assert!(keys.contains(&"gen_ai.usage.input_tokens"));
@@ -2106,7 +2175,7 @@ mod tests {
             "test-exp",
             format!("{}/v1/traces", server.uri()),
             BTreeMap::new(),
-            otlp_test_client(),
+            OtlpHttpFanOut::new().inner.client.clone(),
         );
 
         let ack = sink
@@ -2117,6 +2186,10 @@ mod tests {
 
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(reqs.len(), 1, "one batched request, not three spawns");
+        assert_eq!(
+            reqs[0].headers["user-agent"],
+            format!("aisix-dp/{}", aisix_core::BUILD_VERSION)
+        );
         let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
         let spans = body["resourceSpans"][0]["scopeSpans"][0]["spans"]
             .as_array()

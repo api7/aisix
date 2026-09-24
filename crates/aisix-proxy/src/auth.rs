@@ -40,7 +40,6 @@ pub struct AuthenticatedKey {
 }
 
 /// The verified JWT identity a request authenticated as.
-#[derive(Debug)]
 pub struct JwtIdentity {
     /// Value of the trust provider's identity claim (`sub` by default).
     pub subject: String,
@@ -49,6 +48,29 @@ pub struct JwtIdentity {
     /// Name of the claim mapping that selected the API key, or `None`
     /// when the subject was bound to the key directly via `jwt_subject`.
     pub claim_mapping: Option<String>,
+}
+
+impl JwtIdentity {
+    pub fn new(subject: String, provider: String, claim_mapping: Option<String>) -> Self {
+        Self {
+            subject,
+            provider,
+            claim_mapping,
+        }
+    }
+}
+
+/// Hand-written so this type keeps a single, reviewed print shape: it is
+/// carried on the request extensions through every handler, and a derived
+/// form would follow whatever fields it grows next.
+impl std::fmt::Debug for JwtIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtIdentity")
+            .field("subject", &self.subject)
+            .field("provider", &self.provider)
+            .field("claim_mapping", &self.claim_mapping)
+            .finish()
+    }
 }
 
 /// Per-request context carried onto an authentication denial.
@@ -171,6 +193,24 @@ where
 /// key lookup on failure, so a rejected JWT can never be retried as a
 /// key. Everything else is looked up as an API key by hash.
 pub(crate) async fn authenticate_token(
+    state: &ProxyState,
+    token: &str,
+    ctx: DenialContext<'_>,
+) -> Result<AuthenticatedKey, ProxyError> {
+    let authed = authenticate_token_inner(state, token, ctx).await?;
+    // Hand the principal to the request's attribution cell, so a caller
+    // that hangs up still files an ATTRIBUTABLE usage row
+    // (AISIX-Cloud#1571). Here rather than in the extractor above because
+    // three surfaces authenticate without it — a passthrough route's own
+    // `auth_mode`, `/v1/realtime`'s WebSocket subprotocol, and `/mcp` —
+    // and two of them build no `ClientContext` either. The two places that
+    // mint an ANONYMOUS principal instead of verifying a credential note it
+    // themselves (`mcp::resolve_caller`, `passthrough_route::authenticate`).
+    crate::attribution::note_authenticated(&authed);
+    Ok(authed)
+}
+
+async fn authenticate_token_inner(
     state: &ProxyState,
     token: &str,
     ctx: DenialContext<'_>,
@@ -468,6 +508,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1 << 20,
             tls: None,
+            listeners: Vec::new(),
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),

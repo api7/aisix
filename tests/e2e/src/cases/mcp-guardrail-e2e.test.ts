@@ -117,18 +117,18 @@ describe("mcp guardrails e2e: /mcp", () => {
       name: "mcp-alpha-only",
       kind: "keyword",
       patterns: [{ kind: "literal", value: ALPHA_ONLY_PATTERN }],
-    });
+    }, { attach: false });
     const everywhere = await seed.createGuardrail({
       name: "mcp-everywhere",
       kind: "keyword",
       patterns: [{ kind: "literal", value: EVERYWHERE_PATTERN }],
-    });
+    }, { attach: false });
     const structured = await seed.createGuardrail({
       name: "mcp-structured",
       kind: "keyword",
       hook_point: "output",
       patterns: [{ kind: "literal", value: STRUCTURED_PATTERN }],
-    });
+    }, { attach: false });
 
     await seed.update("guardrail_attachments", randomUUID(), {
       guardrail_id: alphaOnly.id,

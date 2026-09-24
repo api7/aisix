@@ -71,6 +71,8 @@ const MAX_SOURCE_DEPTH: usize = 8;
 pub struct UpstreamHttpConfig {
     /// Max time for DNS + TCP + TLS before the attempt fails. Without it a
     /// black-holed upstream is only bounded by the model's overall timeout.
+    /// The Realtime dial — the one outbound stack with no deadline of its
+    /// own — spends it on the WebSocket handshake exchange too.
     pub connect_timeout: Option<Duration>,
     /// Idle time before the kernel sends the first TCP keepalive probe.
     /// Keeps a long wait for a slow first token from being reaped by a NAT
@@ -131,12 +133,19 @@ pub fn config() -> &'static UpstreamHttpConfig {
     CONFIG.get_or_init(UpstreamHttpConfig::default)
 }
 
-/// A `reqwest::ClientBuilder` with the connection settings **and the
-/// deployment's outbound TLS trust** applied. Callers add their own
-/// `user_agent` and `build()`.
+/// A `reqwest::ClientBuilder` with the connection settings, deployment's
+/// outbound TLS trust, and versioned `aisix` user agent applied.
 pub fn client_builder() -> reqwest::ClientBuilder {
     let cfg = config();
     let mut b = reqwest::Client::builder()
+        .user_agent(format!("aisix/{}", aisix_core::BUILD_VERSION))
+        // Every client in the process resolves through the one cache, so
+        // a burst of new connections to a host costs one lookup however
+        // many clients it is spread over — including the per-ProviderKey
+        // and per-guardrail ones rebuilt on each configuration snapshot.
+        // Per-name overrides (`resolve_to_addrs`, the private-link
+        // address pin) still apply on top and never reach it.
+        .dns_resolver(crate::dns_cache::shared())
         .pool_idle_timeout(cfg.pool_idle_timeout)
         .tcp_keepalive(cfg.tcp_keepalive);
     if let Some(d) = cfg.connect_timeout {
@@ -349,17 +358,19 @@ mod tests {
 
     /// The outbound stacks that are *not* reqwest each have exactly one
     /// sanctioned construction site, and each of those sites is the only
-    /// thing standing between `upstream.tls` and a client that quietly
-    /// trusts the wrong set of roots.
+    /// thing standing between the `upstream` block and a client that
+    /// quietly trusts the wrong set of roots or dials on a budget nobody
+    /// configured.
     ///
     /// Nothing else catches a regression here: a client built without the
-    /// shared trust material works perfectly against every public
-    /// provider and fails only against the private CA the setting exists
-    /// for — which is to say, only in the customer's environment.
+    /// shared material works perfectly against every public provider and
+    /// fails only against the private CA the setting exists for, or only
+    /// once a hop starts reaping connections — which is to say, only in
+    /// the customer's environment.
     ///
     /// Each entry is (probe, what the file must also mention, why).
     #[test]
-    fn every_non_reqwest_outbound_stack_applies_the_shared_tls_settings() {
+    fn every_non_reqwest_outbound_stack_applies_the_shared_upstream_settings() {
         const RULES: &[(&str, &str, &str)] = &[
             (
                 // Catches a *new* WebSocket call site: `connect_async`
@@ -379,24 +390,61 @@ mod tests {
                  `upstream_tls::rustls_client_config()`",
             ),
             (
+                // Both WebSocket probes again, for the other half of the
+                // `upstream` block: the Realtime dial is the one upstream
+                // path with no deadline of its own — the session's idle
+                // cap only starts once the socket is up, so an unbounded
+                // dial hangs the upgrade until the kernel exhausts its
+                // SYN retries, minutes after every other route would have
+                // failed at `upstream.connect_timeout`.
+                "tokio_tungstenite::connect_async(",
+                "upstream_http::config().connect_timeout",
+                "the Realtime WebSocket dial must be bounded by \
+                 `upstream.connect_timeout`",
+            ),
+            (
+                "connect_async_tls_with_config",
+                "upstream_http::config().connect_timeout",
+                "the Realtime WebSocket dial must be bounded by \
+                 `upstream.connect_timeout`",
+            ),
+            (
                 "aws_config::SdkConfig::builder()",
-                "aws_http_client",
+                // Spelled in full: `build_aws_http_client()` contains
+                // the bare name, and it is the un-memoized builder a
+                // production call site must NOT reach.
+                "upstream_tls::aws_http_client()",
                 "Bedrock SDK clients must be built on `upstream_tls::aws_http_client()`",
             ),
             (
+                // A `SdkConfig` without one does not fall back to the
+                // shared settings: the SDK's own default plugins put
+                // their 3.1s connect timeout back, so the operator's
+                // `upstream.connect_timeout` reaches every outbound
+                // client except this one.
+                "aws_config::SdkConfig::builder()",
+                "timeout_config",
+                "Bedrock SDK clients must carry a `TimeoutConfig` built from \
+                 `upstream_http::config()`",
+            ),
+            (
+                // `object_store`'s own `ClientOptions` defaults carry
+                // neither the deployment's trust roots nor its pool and
+                // dial budgets — it leaves `pool_idle_timeout` unset,
+                // which is reqwest's 90s.
                 "AmazonS3Builder::",
-                "tls_client_options",
-                "object-store exporters must pass `tls_client_options()` as client options",
+                "upstream_client_options",
+                "object-store exporters must pass `upstream_client_options()` as client options",
             ),
             (
                 "MicrosoftAzureBuilder::",
-                "tls_client_options",
-                "object-store exporters must pass `tls_client_options()` as client options",
+                "upstream_client_options",
+                "object-store exporters must pass `upstream_client_options()` as client options",
             ),
             (
                 "GoogleCloudStorageBuilder::",
-                "tls_client_options",
-                "object-store exporters must pass `tls_client_options()` as client options",
+                "upstream_client_options",
+                "object-store exporters must pass `upstream_client_options()` as client options",
             ),
         ];
 
@@ -414,9 +462,71 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "these reach an external service without the deployment's outbound TLS \
-             trust:\n{}",
+             trust or its connection settings:\n{}",
             offenders.join("\n"),
         );
+    }
+
+    /// A file-level scan cannot bind the rule above to the production
+    /// call site: one qualified mention of `aws_http_client()` anywhere
+    /// in the file would excuse a `cfg(not(test))` branch that reached
+    /// the un-memoized builder instead. That branch would rebuild the
+    /// connector, and re-read the platform trust store, on every Bedrock
+    /// request — `build_client` runs per call. So every CALL of the
+    /// builder must sit in a function the compiler drops from a release
+    /// build.
+    #[test]
+    fn the_uncached_aws_client_is_only_called_under_cfg_test() {
+        let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        let mut offenders = Vec::new();
+        for file in rust_sources(crates_dir) {
+            // This file names the probe in the scan's own source; the
+            // builders it guards live in `upstream_tls`.
+            if file.ends_with("aisix-gateway/src/upstream_http.rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&file).expect("read source");
+            let lines: Vec<&str> = src.lines().collect();
+            for (n, line) in lines.iter().enumerate() {
+                let trimmed = line.trim();
+                if !trimmed.contains("build_aws_http_client()")
+                    // The declaration itself, and prose about it.
+                    || trimmed.contains("fn build_aws_http_client()")
+                    || trimmed.starts_with("//")
+                {
+                    continue;
+                }
+                if !cfg_test_gated(&lines, n) {
+                    offenders.push(format!("{}:{}", file.display(), n + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "`build_aws_http_client()` is the un-memoized constructor and must only be \
+             called from a `#[cfg(test)]` function; production calls \
+             `upstream_tls::aws_http_client()`:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    /// Whether the function containing line `n` is `#[cfg(test)]`:
+    /// walk back to its signature, then over the attributes and doc
+    /// comments stacked above it.
+    fn cfg_test_gated(lines: &[&str], n: usize) -> bool {
+        let Some(sig) = lines[..n].iter().rposition(|l| {
+            l.trim_start().starts_with("fn ") || l.trim_start().starts_with("pub fn ")
+        }) else {
+            return false;
+        };
+        lines[..sig]
+            .iter()
+            .rev()
+            .take_while(|l| {
+                let t = l.trim();
+                t.starts_with('#') || t.starts_with("///") || t.starts_with("//")
+            })
+            .any(|l| l.trim() == "#[cfg(test)]")
     }
 
     /// The part of a source file that is not the test module.
@@ -447,9 +557,8 @@ mod tests {
     }
 
     /// On a thread-per-core worker every dispatch runs on that worker's
-    /// own pool, and that one pool stands in for all of the clients
-    /// below — so it is built with a single user agent
-    /// (`upstream_tls::DISPATCH_USER_AGENT`).
+    /// own pool, and that one pool stands in for all dispatch clients.
+    /// They must inherit the same user agent from `client_builder`.
     ///
     /// That substitution is only invisible while the clients it replaces
     /// agree on the user agent. Give one bridge its own and the header
@@ -460,30 +569,32 @@ mod tests {
     #[test]
     fn every_dispatch_client_presents_the_same_user_agent() {
         let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
-        // Only literals: the telemetry, heartbeat, and OTLP clients build
-        // theirs from a version string or a named constant, and none of
-        // them talks to a model provider or reaches the per-worker pool.
-        const NEEDLE: &str = ".user_agent(\"";
         let mut offenders = Vec::new();
         for file in rust_sources(crates_dir) {
+            // These clients never reach the dispatch pools; their
+            // existing control-plane/exporter identities are separate.
+            if [
+                "aisix-gateway/src/upstream_http.rs",
+                "aisix-server/src/telemetry.rs",
+                "aisix-server/src/heartbeat.rs",
+                "aisix-obs/src/otlp_http_sink.rs",
+            ]
+            .iter()
+            .any(|path| file.ends_with(path))
+            {
+                continue;
+            }
             let src = std::fs::read_to_string(&file).expect("read source");
             for (n, line) in production_half(&src).lines().enumerate() {
-                let Some(rest) = line.split_once(NEEDLE).map(|(_, r)| r) else {
-                    continue;
-                };
-                let Some((agent, _)) = rest.split_once('"') else {
-                    continue;
-                };
-                if agent != crate::upstream_tls::DISPATCH_USER_AGENT {
-                    offenders.push(format!("{}:{}: {agent}", file.display(), n + 1));
+                if line.contains(".user_agent(") {
+                    offenders.push(format!("{}:{}", file.display(), n + 1));
                 }
             }
         }
         assert!(
             offenders.is_empty(),
-            "these dispatch clients present a user agent the per-worker \
-             pool would replace with `{}`:\n{}",
-            crate::upstream_tls::DISPATCH_USER_AGENT,
+            "these clients override the user agent inherited from \
+             `client_builder`, which the per-worker pool also uses:\n{}",
             offenders.join("\n"),
         );
     }

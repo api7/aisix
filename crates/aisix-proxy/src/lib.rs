@@ -31,6 +31,7 @@ mod audio;
 mod auth;
 pub mod background;
 pub mod budget;
+mod cancel;
 mod chat;
 mod client_ip;
 mod completions;
@@ -38,25 +39,35 @@ pub(crate) mod cooldown;
 mod count_tokens;
 mod dispatch;
 mod ebml;
+mod effort_mapping;
 mod embeddings;
 mod ensemble;
 mod error;
 mod error_translate;
+#[cfg(test)]
+mod guardrail_blocked_telemetry;
+#[cfg(test)]
+mod guardrail_coverage;
 mod guardrail_embedder;
 mod guardrail_stream;
 pub mod health;
+mod host;
 mod http_client;
 mod images;
 mod images_edits;
 mod jobs;
 mod json_splice;
 mod jwt;
+mod jwt_index;
 mod mcp;
 mod mcp_auth;
 mod messages;
+mod model_echo;
 mod model_resolve;
 mod models;
+mod operation;
 mod passthrough_route;
+mod policy_index;
 mod quota;
 mod realtime;
 mod redact;
@@ -73,8 +84,16 @@ mod semantic;
 pub mod sse_keepalive;
 mod state;
 mod stream_timeout;
+#[cfg(test)]
+mod test_log;
 mod token_estimate;
 mod usage_attr;
+/// The `model` metric label for a request that resolved no model. Exported
+/// because the retirement sweep's liveness predicate lives in the server
+/// crate and must recognise it as a placeholder — spelling it there as a
+/// literal would let this constant change underneath it and start retiring
+/// live series.
+pub use usage_attr::UNRESOLVED_MODEL_LABEL;
 mod util;
 mod videos;
 
@@ -83,7 +102,7 @@ pub use error::{ErrorEnvelope, ProxyError};
 pub use health::{
     HealthTracker, LivezState, ModelRuntimeStatusTracker, RuntimeStatus, RuntimeStatusSnapshot,
 };
-pub use state::{CacheBackends, ProxyState};
+pub use state::{CacheBackends, ProxyState, SemanticRedisCell};
 
 use aisix_obs::{AccessLog, CancelledLabels};
 use axum::extract::State;
@@ -210,8 +229,8 @@ pub fn build_router(state: ProxyState) -> Router {
         )
         // Path-prefix passthrough routes match here, AFTER every typed
         // route has had its chance — a route can never shadow the
-        // gateway's own API. No-match requests keep the plain 404 (or the
-        // `/passthrough/*` 410 migration tombstone) inside the handler.
+        // gateway's own API. No-match requests keep the plain 404 inside
+        // the handler.
         // Registered before the layers so fallback traffic gets the same
         // body-limit / telemetry / Server-header treatment as the routes.
         .fallback(passthrough_route::entry);
@@ -228,6 +247,24 @@ pub fn build_router(state: ProxyState) -> Router {
         body_limit,
     )
     .with_state(state.clone());
+
+    // Host-based passthrough-route dispatch. A request whose `Host`
+    // matches an enabled route's `hosts` was never addressed to this
+    // gateway's own API (forward-proxy traffic delivered with the
+    // original host), so it must not fall into a typed route that
+    // happens to share the path. URL rewriting runs before this dispatch,
+    // so both host and path routes see the rewritten URI.
+    // Wrapped unconditionally: routes arrive dynamically via the
+    // snapshot, and the per-request probe is one arc-swap load plus a
+    // scan of the (typically tiny) route table. Matched requests go to
+    // `host_entry_stack`, which carries the same shared layers as the
+    // main stack (see above).
+    let router = Router::new()
+        .fallback_service(router)
+        .layer(middleware::from_fn_with_state(
+            (state.clone(), host_entry_stack),
+            passthrough_route::host_dispatch,
+        ));
 
     // Pre-routing URL rewriting (`proxy.url_rewrites`). `Router::layer`
     // middleware runs AFTER route matching, so a URI rewritten there could
@@ -247,24 +284,6 @@ pub fn build_router(state: ProxyState) -> Router {
                 rewrite::rewrite_request_uri,
             ))
     };
-
-    // Host-based passthrough-route dispatch. A request whose `Host`
-    // matches an enabled route's `hosts` was never addressed to this
-    // gateway's own API (forward-proxy traffic delivered with the
-    // original host), so it must not fall into a typed route that
-    // happens to share the path — this seat is pre-routing AND outside
-    // the rewrite layer, so `url_rewrites` never touches foreign-host
-    // paths. Wrapped unconditionally: routes arrive dynamically via the
-    // snapshot, and the per-request probe is one arc-swap load plus a
-    // scan of the (typically tiny) route table. Matched requests go to
-    // `host_entry_stack`, which carries the same shared layers as the
-    // main stack (see above).
-    let router = Router::new()
-        .fallback_service(router)
-        .layer(middleware::from_fn_with_state(
-            (state.clone(), host_entry_stack),
-            passthrough_route::host_dispatch,
-        ));
 
     // Outermost: mint the request id into the request extensions
     // before any handler/extractor runs — including the rewrite layer,
@@ -366,9 +385,10 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         _ if path.starts_with("/v1/fine_tuning/jobs/") => "/v1/fine_tuning/jobs/:id",
         _ if path.starts_with("/mcp/") => "/mcp/{server}",
         _ if path.starts_with("/a2a/") => "/a2a",
-        // The removed implicit tunnel: 410-tombstoned requests and any
-        // path-prefix route an operator claims under the old namespace
-        // both label as the passthrough_route family.
+        // Any path-prefix route an operator claims under this namespace
+        // labels as the passthrough_route family; unclaimed paths reach
+        // the router's miss path and are labelled here only by the
+        // pre-routing in-flight gauge, which must stay bounded (#451).
         _ if path.starts_with("/passthrough/") => "/passthrough_route",
         _ => "other",
     }
@@ -476,13 +496,21 @@ const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
 /// decremented on guard drop — including cancellation.
 ///
 /// Client-cancel: records a request whose caller hung up before the
-/// response head was written. Every endpoint logs and meters itself at
-/// the end of its own handler — 29 `emit_access_log` call sites across
-/// 12 modules. When the client disconnects first, axum drops the
-/// handler future and *none* of that code runs: the request leaves no
-/// access-log line, no usage event and no metric. It is invisible
-/// exactly where an operator most needs it, because the usual reason a
-/// caller gives up is a long time-to-first-token.
+/// response head was written. Every endpoint logs, meters and emits its
+/// usage events at the end of its own handler — 29 `emit_access_log`
+/// call sites across 12 modules. When the client disconnects first,
+/// axum drops the handler future and *none* of that code runs: the
+/// request leaves no access-log line, no usage event and no metric. It
+/// is invisible exactly where an operator most needs it, because the
+/// usual reason a caller gives up is a long time-to-first-token.
+///
+/// So the guard writes all three: the line, the metric, and the
+/// request's usage events (`crate::cancel`) — the attempts that had
+/// already failed, then a terminal `499`. Everything it needs comes off
+/// the request's attribution cell, which the handlers fill at
+/// chokepoints they already pass through. The LINE is written only when
+/// no response head went out at all; past that point the handler has
+/// written the request's line already, and the guard adds the row alone.
 ///
 /// A cancelled future is only observable from `Drop`, so arm a guard,
 /// disarm it once the inner service yields a response, and emit from
@@ -497,8 +525,23 @@ const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
 /// response head is already committed, so the handler has logged and the
 /// per-stream `Drop` guard emits the usage event (see
 /// `chat::build_sse_stream`). Response bodies are polled after this
-/// middleware has returned, so a mid-stream hang-up leaves the guard
-/// disarmed and is not double-counted here.
+/// middleware has returned, so a mid-stream hang-up finds the guard in
+/// its body phase, sees the body was polled, and is not double-counted
+/// here.
+///
+/// What the guard does still owe after the head is the window before
+/// that first poll: those stream guards are built INSIDE the stream's
+/// generator, which first runs on the first poll, so a body dropped
+/// before it emits nothing anywhere. The guard rides the body precisely
+/// to cover that window — see `GuardPhase` and `TelemetryBody`.
+///
+/// All three shapes report `499` with `error_class =
+/// "client_disconnected"`; only the message says where the caller left.
+/// The LINE says the same, because a streaming handler does not write it
+/// at all: it parks it on the request's cell
+/// (`attribution::PendingAccessLog`) and whichever terminal emitter ends
+/// the request writes it, with that emitter's status and message. One
+/// line per request, in every ending.
 async fn record_request_telemetry(
     State(state): State<ProxyState>,
     request: Request<axum::body::Body>,
@@ -518,7 +561,7 @@ async fn record_request_telemetry(
     // future never gets to hand anything back.
     let attribution = std::sync::Arc::new(attribution::RequestAttribution::default());
     let mut guard = ClientCancelGuard {
-        armed: true,
+        phase: GuardPhase::Head,
         state: state.clone(),
         attribution: attribution.clone(),
         endpoint,
@@ -529,6 +572,13 @@ async fn record_request_telemetry(
             .get::<request_id::RequestId>()
             .map(|id| id.0.clone())
             .unwrap_or_default(),
+        // Read here rather than off the `ClientContext`, which `/mcp` and
+        // `/a2a` never build — a cancelled request on those routes would
+        // otherwise be the only one of its family with no trace.
+        trace: request
+            .extensions()
+            .get::<std::sync::Arc<aisix_obs::RequestTraceBundle>>()
+            .cloned(),
         started: std::time::Instant::now(),
     };
     let _in_flight = InFlightGuard::new(
@@ -564,27 +614,117 @@ async fn record_request_telemetry(
         );
     }
     let mut response = attribution::scope(attribution, next.run(request)).await;
-    guard.armed = false;
+    // The head exists; from here the guard rides the body (see `GuardPhase`).
+    guard.phase = GuardPhase::Body {
+        owed: response.status().is_success()
+            && http_body::Body::size_hint(response.body())
+                .exact()
+                .is_none(),
+        polled: false,
+    };
     // Sampled AFTER the handler, not before: a request that arrived just
     // ahead of the signal and finished inside the window is riding one of
     // the pooled connections that most needs retiring.
     if state.livez.is_shutting_down() {
         retire_connection(&version, &mut response);
     }
-    hold_until_body_done(response, drain)
+    hold_until_body_done(response, drain, guard)
 }
 
-/// Move `drain` into the response body so the count stays raised until the
-/// body is fully written — or dropped, when the client hangs up mid-stream.
-fn hold_until_body_done(response: Response, drain: DrainGuard) -> Response {
-    use http_body_util::BodyExt;
+/// Move `drain` and the cancel guard into the response body, so the drain
+/// count stays raised until the body is fully written — or dropped, when
+/// the client hangs up — and so the guard can see whether the body was ever
+/// read (see `GuardPhase::Body`).
+fn hold_until_body_done(
+    response: Response,
+    drain: DrainGuard,
+    guard: ClientCancelGuard,
+) -> Response {
     let (parts, body) = response.into_parts();
-    let body = axum::body::Body::new(body.map_frame(move |frame| {
-        // The closure owns the guard; the mapped body owns the closure.
-        let _hold = &drain;
-        frame
-    }));
+    let body = axum::body::Body::new(TelemetryBody {
+        inner: Some(body),
+        _drain: drain,
+        guard,
+    });
     Response::from_parts(parts, body)
+}
+
+/// The response body with the request's two lifetime-scoped telemetry
+/// guards attached.
+///
+/// It exists for the one thing a mapped body cannot observe: whether the
+/// body was ever POLLED. A streaming family emits its usage event from a
+/// `Drop` guard built inside the stream's own generator, and that generator
+/// first runs on the body's first poll — so a body dropped before it
+/// (the client went away between the head being handed to hyper and hyper
+/// asking for the first frame) emitted nothing at all, and the request left
+/// a `200` access-log line and no usage row (AISIX-Cloud#1571). One poll,
+/// even one that returns `Pending`, means the generator exists and owns the
+/// emission; no poll means the guard does.
+struct TelemetryBody {
+    /// `None` only inside [`Drop`], which takes the body out to drop it
+    /// inside the request's attribution scope.
+    inner: Option<axum::body::Body>,
+    _drain: DrainGuard,
+    guard: ClientCancelGuard,
+}
+
+impl Drop for TelemetryBody {
+    fn drop(&mut self) {
+        // Drop the inner body FIRST, and inside the request's own
+        // attribution cell. Two families (`/a2a` streaming, passthrough)
+        // build their stream's terminal emitter outside the generator, so
+        // it fires even on a body nobody polled — and running that drop in
+        // scope is what lets it say so (`attribution::note_usage_emitted`),
+        // which the guard below reads before deciding it owes a row. The
+        // guard is a field, so it drops after this runs.
+        if let Some(inner) = self.inner.take() {
+            attribution::sync_scope(&self.guard.attribution, move || drop(inner));
+        }
+    }
+}
+
+impl axum::body::HttpBody for TelemetryBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        if let GuardPhase::Body { polled, .. } = &mut this.guard.phase {
+            *polled = true;
+        }
+        // Poll the stream inside the request's own attribution cell. The
+        // body is driven by the server long after the middleware returned,
+        // so without this the generator's end-of-stream emitter — which is
+        // where a streamed request's terminal usage event AND its
+        // access-log line go out (AISIX-Cloud#1571) — would run with no
+        // cell to read the parked line from, and a delivered stream would
+        // log nothing at all. `Drop` covers the abandoned endings; this
+        // covers the delivered one.
+        let cell = &this.guard.attribution;
+        match this.inner.as_mut() {
+            Some(inner) => {
+                attribution::sync_scope(cell, || std::pin::Pin::new(inner).poll_frame(cx))
+            }
+            None => std::task::Poll::Ready(None),
+        }
+    }
+
+    // `size_hint` is deliberately NOT forwarded, matching the `map_frame`
+    // wrapper this replaces: `MapFrame` does not override it either, so every
+    // response leaving this middleware has always had an unknown size and
+    // been framed chunked unless its handler set `Content-Length` itself.
+    // Forwarding it here would change the framing of every response on the
+    // listener — a wire-visible change that has nothing to do with
+    // telemetry. (`owed` reads the hint off the INNER body, before the
+    // wrap, so it is unaffected.)
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.as_ref().is_none_or(|b| b.is_end_stream())
+    }
 }
 
 /// Ask an HTTP/1.1 client to retire this connection once the response is
@@ -609,13 +749,11 @@ fn hold_until_body_done(response: Response, drain: DrainGuard) -> Response {
 /// this header's.
 ///
 /// HTTP/2 forbids this header (RFC 9113 §8.2.2 — it is connection-specific)
-/// and has no header in its place: the h2 retirement signal is GOAWAY, a
-/// connection-level frame. hyper emits one when the listener shuts down,
-/// which is after the drain, so an h2 downstream goes the whole window
-/// unsignalled. Emitting it at SIGTERM instead needs the hyper connection
-/// future, which `axum_server` owns internally and only retires together
-/// with the listener (AISIX-Cloud#1395) — nothing added to the response
-/// here can reach an h2 peer.
+/// and has no header in its place, so nothing added to the response here
+/// can reach an h2 peer. Its retirement signal is GOAWAY, a
+/// connection-level frame, and the listener sends it when the drain
+/// starts — see `serve_connection` in the aisix-server binary
+/// (AISIX-Cloud#1395).
 fn retire_connection(version: &axum::http::Version, response: &mut Response) {
     if *version == axum::http::Version::HTTP_2 || *version == axum::http::Version::HTTP_3 {
         return;
@@ -625,10 +763,36 @@ fn retire_connection(version: &axum::http::Version, response: &mut Response) {
         .insert(header::CONNECTION, HeaderValue::from_static("close"));
 }
 
+/// How far the request had got when the guard was dropped — which is what
+/// decides whether the guard owes it a record, and which of the two
+/// caller-walked-away shapes that record describes.
+enum GuardPhase {
+    /// The handler future is still running. A drop here is the head-phase
+    /// cancel: no response head was ever produced, so nothing else wrote
+    /// anything about this request at all.
+    Head,
+    /// The handler produced a response and the guard now rides its body.
+    ///
+    /// `owed` says whether the request can still owe a record at all. Only
+    /// an open-ended body can: one whose length was already known when the
+    /// head went out was produced in full by a handler that therefore also
+    /// finished its telemetry, and a response that FAILED wrote its own
+    /// record on the way out. Neither is made any less complete by a caller
+    /// that never reads it — a `HEAD` request and a discarded response both
+    /// land here on every route.
+    ///
+    /// `polled` is the interlock. A body that was polled at least once has
+    /// started its own stream generator, whose `Drop` emitter owns the
+    /// request's terminal event from then on (that is the mid-stream
+    /// shape); a body dropped without a single poll started nothing, so
+    /// the guard is again the only thing that can speak for the request.
+    Body { owed: bool, polled: bool },
+}
+
 struct ClientCancelGuard {
-    /// Cleared when the inner service returns. Still set at drop time
-    /// means the future was cancelled rather than completed.
-    armed: bool,
+    /// See [`GuardPhase`]. Advanced from `Head` to `Body` the moment the
+    /// inner service returns.
+    phase: GuardPhase,
     /// Held for the metrics sink AND the snapshot the attribution labels
     /// are resolved against at drop time.
     state: ProxyState,
@@ -641,6 +805,9 @@ struct ClientCancelGuard {
     /// read on the cancel path, so the happy path pays no formatting.
     uri: axum::http::Uri,
     request_id: String,
+    /// The request's trace bundle, so the guard's own events land under the
+    /// trace the rest of the request reports.
+    trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     started: std::time::Instant,
 }
 
@@ -654,35 +821,121 @@ impl Drop for ClientCancelGuard {
         // task failure and hyper drops the connection), so stay silent and
         // let that stand. Emitting here would also risk a double panic,
         // which aborts the process.
-        if !self.armed || std::thread::panicking() {
+        if std::thread::panicking() {
             return;
         }
+        let phase = match self.phase {
+            GuardPhase::Head => cancel::Phase::BeforeHead,
+            // The body was read: whatever the response owed, its own
+            // stream guard owns (the mid-stream shape). Not this guard's.
+            GuardPhase::Body { polled: true, .. } => return,
+            GuardPhase::Body { owed: false, .. } => return,
+            // A `HEAD` response carries no body BY PROTOCOL: hyper drops it
+            // without a poll on every such request, whatever the handler
+            // built. That is the protocol working, not a caller walking
+            // away — and on a route that relays an open-ended body there is
+            // nothing else to tell the two apart, so a client sizing a
+            // download before fetching it would raise the cancel counter on
+            // every probe.
+            GuardPhase::Body { .. } if self.method == axum::http::Method::HEAD => return,
+            // …and nothing at all on a route that files no usage row, where
+            // the line and the counter would be its whole record — one an
+            // operator cannot find in the usage log by its `request_id`,
+            // which is the shape this change exists to remove. The HEAD
+            // phase keeps its line on such a route, because there the
+            // request produced no record anywhere else either.
+            // (`/v1/videos/:id/content` is the live case: it relays an
+            // open-ended body and was metered by the submission.)
+            GuardPhase::Body { .. }
+                if crate::operation::surface_for_endpoint(self.endpoint).is_none() =>
+            {
+                return
+            }
+            GuardPhase::Body { .. } => cancel::Phase::BeforeBody,
+        };
         let latency = self.started.elapsed();
         let resolved = self.attribution.get();
-        AccessLog {
-            method: self.method.as_str(),
-            path: self.uri.path(),
-            status: CLIENT_CLOSED_REQUEST,
-            latency,
-            // The log line takes the RAW names: it is bounded by request
-            // volume, not by label cardinality, so it can say exactly
-            // which target the abandoned request was waiting on.
-            provider: (!resolved.provider.is_empty()).then_some(resolved.provider.as_str()),
-            model: (!resolved.requested_model.is_empty())
-                .then_some(resolved.requested_model.as_str()),
-            api_key_id: None,
-            prompt_tokens: None,
-            completion_tokens: None,
-            total_tokens: None,
-            request_id: &self.request_id,
-            provider_request_id: None,
-            served_by_model: None,
-            routing_attempt_count: None,
-            routing_fallback_count: None,
-            error_kind: Some(CLIENT_DISCONNECTED_KIND),
-            error: Some("client closed the request before the response head was written"),
+        let cancel_ctx = self.attribution.take_cancel_context();
+        // A response whose handler already wrote the request's terminal
+        // event is complete; a caller that never reads it has not made it
+        // any less complete. `cancel::emit` refuses to double the EVENT on
+        // its own, but the line and the counter below have no such check —
+        // and an open-ended body does not tell the two apart, because a
+        // family may relay one while metering at its own tail, before the
+        // bytes flow.
+        if matches!(phase, cancel::Phase::BeforeBody) && cancel_ctx.emitted_terminal {
+            return;
         }
-        .emit();
+        // The head phase builds its OWN line, because the handler normally
+        // never reached the tail that would have parked one. The body phase
+        // does not: a streamed response left its line on the cell, and that
+        // line rides the terminal usage event below, carrying the same
+        // `499` and the same message. Building a second one here would make
+        // one request read as two.
+        //
+        // "Normally" is why the head phase asks as well. A streaming family
+        // parks its line at its tail and can still be cancelled at the next
+        // await — chat peeks the rate limiter there, to fill the
+        // `x-ratelimit-*` headers — which lands here with the line already
+        // parked. That line is the fuller one (it names the model, the
+        // target and the routing counts) and `cancel::emit` below writes it
+        // under this same `499`, so this one stands down. It cannot fall
+        // between the two: a parked line means the request authenticated on
+        // a metering surface, which is exactly the gate `cancel::emit`
+        // applies before it emits the terminal event that carries the line.
+        if matches!(phase, cancel::Phase::BeforeHead) && !self.attribution.has_pending_access_log()
+        {
+            let target = attribution::AccessLogTarget::from_resolved(resolved.clone());
+            AccessLog {
+                method: self.method.as_str(),
+                path: self.uri.path(),
+                status: CLIENT_CLOSED_REQUEST,
+                latency,
+                // Nothing was ever delivered, so what the caller waited for
+                // IS how long the request ran.
+                duration: latency,
+                // The log line takes the RAW names: it is bounded by request
+                // volume, not by label cardinality, so it can say exactly
+                // which target the abandoned request was waiting on.
+                provider: (!resolved.provider.is_empty()).then_some(resolved.provider.as_str()),
+                model: (!resolved.requested_model.is_empty())
+                    .then_some(resolved.requested_model.as_str()),
+                upstream_model: target.upstream_model(),
+                provider_key_id: target.provider_key_id(),
+                api_key_id: (!cancel_ctx.api_key_id.is_empty())
+                    .then_some(cancel_ctx.api_key_id.as_str()),
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: None,
+                request_id: &self.request_id,
+                provider_request_id: None,
+                served_by_model: None,
+                routing_attempt_count: None,
+                routing_fallback_count: None,
+                error_kind: Some(CLIENT_DISCONNECTED_KIND),
+                error: Some(phase.message()),
+                mcp: None,
+                cache: None,
+            }
+            .emit();
+        }
+        // The usage events the dropped handler never got to write
+        // (AISIX-Cloud#1571) — and, on the body phase, the request's parked
+        // access-log line, which goes out of the same chokepoint as the
+        // terminal event so the two agree on the outcome. `Drop` runs
+        // outside every scope, so the cell has to be installed for the call
+        // or the chokepoint has nothing to take the line from.
+        attribution::sync_scope(&self.attribution, || {
+            cancel::emit(
+                &self.state,
+                self.endpoint,
+                &self.request_id,
+                &resolved,
+                cancel_ctx,
+                phase,
+                self.trace.as_ref(),
+            )
+        });
         // Bound the labels the same way every other emit does: the model
         // through the configured set, the ProviderKey name off the row its
         // id names — a cancelled request must not be able to mint series
@@ -1012,11 +1265,13 @@ fn warn_allowed(outcome: DrainOutcome) -> bool {
     true
 }
 
+/// Takes no [`ProxyState`]: liveness answers whether the process should
+/// be restarted, and nothing about the gateway's state changes that
+/// answer. See [`crate::health::livez_response`].
 async fn livez(
-    State(state): State<ProxyState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    crate::health::livez_response(&state.livez, params.contains_key("verbose"))
+    crate::health::livez_response(params.contains_key("verbose"))
 }
 
 async fn readyz(
@@ -1028,6 +1283,34 @@ async fn readyz(
         .as_ref()
         .and_then(|probe| crate::health::config_readiness_block(probe()));
     crate::health::readyz_response(&state.livez, config_block, params.contains_key("verbose"))
+}
+
+/// Inserts a guardrail together with the env-scoped attachment that puts it
+/// in force.
+///
+/// A guardrail's scope is its attachments and nothing else — an unattached
+/// guardrail governs nothing (AISIX-Cloud#1450 retired the fallback that
+/// applied a zero-attachment guardrail to the whole environment). Tests that
+/// want a guardrail to fire on the request under test go through here rather
+/// than inserting into `snap.guardrails` alone; a test about scoping writes
+/// the attachment it means instead.
+#[cfg(test)]
+pub(crate) fn seed_env_scoped_guardrail(
+    snap: &aisix_core::AisixSnapshot,
+    guardrail: aisix_core::ResourceEntry<aisix_core::Guardrail>,
+) {
+    let attachment: aisix_core::models::GuardrailAttachment = serde_json::from_str(&format!(
+        r#"{{"guardrail_id": "{}", "scope_type": "env", "priority": 100}}"#,
+        guardrail.id
+    ))
+    .expect("env attachment must parse");
+    snap.guardrail_attachments
+        .insert(aisix_core::ResourceEntry::new(
+            format!("att-{}", guardrail.id),
+            attachment,
+            1,
+        ));
+    snap.guardrails.insert(guardrail);
 }
 
 #[cfg(test)]
@@ -1087,6 +1370,7 @@ mod tests {
             request_id: Default::default(),
             url_rewrites: Vec::new(),
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }
@@ -1802,7 +2086,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn livez_returns_503_when_shutting_down() {
+    async fn livez_stays_200_when_shutting_down() {
         let hub = Arc::new(Hub::new());
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
         let state = build_state(snap, hub);
@@ -1816,10 +2100,12 @@ mod tests {
             .unwrap();
 
         let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
-        let text = std::str::from_utf8(&bytes).unwrap();
-        assert!(text.contains("livez check failed"));
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a draining process is healthy; failing liveness asks the platform \
+             to restart it, which kills the requests the drain is finishing",
+        );
     }
 
     #[tokio::test]
@@ -2328,6 +2614,7 @@ mod tests {
             request_id: Default::default(),
             url_rewrites: Vec::new(),
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         };
@@ -3973,6 +4260,115 @@ data: [DONE]\n\n"
         ResourceEntry::new("model-id-1", model, 1)
     }
 
+    /// A request that failed OPEN and then died before any attempt still
+    /// has to report the bypass.
+    ///
+    /// This is `chat.rs`'s `routing.attempts.is_empty()` terminal arm, and
+    /// it is not reachable from the router-derived census in
+    /// `guardrail_coverage`: that fixture's upstream refuses the
+    /// connection, so an attempt is always recorded and the failed-attempt
+    /// emitter runs instead. The arm is live in production — a quota
+    /// refusal, a budget refusal, or a pre-dispatch resolution failure all
+    /// land here — and the guardrail chain has already run and already
+    /// failed open by then.
+    ///
+    /// Driven with `rpm: 1`: the first request goes upstream unscreened,
+    /// the second is refused before dispatch. Both events must name the
+    /// bypass; the refusal is not what stopped the FIRST one from leaving.
+    #[tokio::test]
+    async fn a_pre_dispatch_failure_after_a_fail_open_still_reports_the_bypass() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-1",
+                "object": "chat.completion",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry_with_rate_limit(
+            "rl-open",
+            serde_json::json!({"rpm": 1}),
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["rl-open"]));
+        // Faults instead of deciding. Input hook only: `custom` reads its
+        // output policy from `output_fail_open`, which fails CLOSED by
+        // default, and a refused response would not be a bypass.
+        let row: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "rl-fail-open",
+            "enabled": true,
+            "kind": "custom",
+            "hook_point": "input",
+            "fail_open": true,
+            "script": "export function checkInput() { throw new Error('x'); }",
+            "timeout_ms": 5000,
+        }))
+        .unwrap();
+        seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-rl-open", row, 1));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"rl-open","messages":[{"role":"user","content":"go"}]}"#,
+                ))
+                .unwrap()
+        };
+
+        let first = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            first.status(),
+            StatusCode::OK,
+            "premise: a fail-open row must not refuse",
+        );
+        let second = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "premise: the second request must die BEFORE any attempt",
+        );
+
+        let mut events = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await
+        {
+            events.push(event);
+        }
+        assert_eq!(events.len(), 2, "{events:?}");
+        for event in &events {
+            assert_eq!(
+                event.guardrail_bypassed_reason, "custom_script_error",
+                "{event:?}",
+            );
+        }
+        // The one that pins the arm: the refused request recorded no
+        // attempt, so its event came from the pre-dispatch emitter.
+        let refused = events
+            .iter()
+            .find(|e| e.status_code == 429)
+            .expect("the refusal must emit its own event");
+        assert_eq!(refused.attempt_kind, "initial", "{refused:?}");
+    }
+
     #[tokio::test]
     async fn passthrough_enforces_model_rate_limit_from_body_model_field() {
         let upstream = MockServer::start().await;
@@ -5052,6 +5448,82 @@ data: [DONE]\n\n";
         assert_eq!(hit_event.completion_tokens, 11);
     }
 
+    /// AISIX-Cloud#1571: a cache hit answers "which model produced the body
+    /// you were served". That is the only thing on a hit row that names the
+    /// producer at all — a Model Group's hit reports no target, because
+    /// which of its targets wrote the entry is recorded nowhere else.
+    ///
+    /// The upstream below reports a model the Model row does NOT carry
+    /// (`model_name` is `gpt-4o`), so a passing assertion can only have
+    /// read it off the STORED response. `provider_request_id` stays empty
+    /// on the hit for the opposite reason: it is an identifier something
+    /// reconciles against, and this request never reached the upstream.
+    #[tokio::test]
+    async fn cache_hit_reports_the_model_that_produced_the_stored_response() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-producer",
+                "model": "gpt-4o-2026-09-16",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "cached"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 11, "total_tokens": 18}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        seed_cache_policy(&snap, "producer-cache");
+        let state = build_state_with_cache(snap, hub).with_usage_sink(UsageSink::new(tx));
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let _ = run(build_router(state.clone()), make_req()).await;
+        let miss = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("miss event was never emitted")
+            .expect("sender dropped");
+        assert_eq!(miss.cache_status, "miss");
+        assert_eq!(miss.provider_model_version, "gpt-4o-2026-09-16");
+        assert_eq!(miss.provider_request_id, "cmpl-producer");
+
+        let _ = run(build_router(state), make_req()).await;
+        let hit = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("hit event was never emitted")
+            .expect("sender dropped");
+        assert_eq!(hit.cache_status, "hit");
+        // Same producer as the row for the original call — not the Model
+        // row's own `model_name`, and not empty.
+        assert_eq!(hit.provider_model_version, miss.provider_model_version);
+        assert_eq!(
+            hit.provider_request_id, "",
+            "a hit must not replay the provider's response id",
+        );
+    }
+
     #[tokio::test]
     async fn cache_miss_when_request_payload_differs() {
         let upstream = MockServer::start().await;
@@ -5458,6 +5930,23 @@ data: [DONE]\n\n";
     /// can mount multiple Models in one snapshot. `pk_id` lets each
     /// model point at its own ProviderKey row — useful for routing
     /// tests that use multiple upstream MockServers.
+    fn model_entry_with_limits(
+        id: &str,
+        name: &str,
+        pk_id: &str,
+        rate_limit: serde_json::Value,
+    ) -> ResourceEntry<Model> {
+        let cfg = serde_json::json!({
+            "display_name": name,
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": pk_id,
+            "rate_limit": rate_limit,
+        });
+        let model: Model = serde_json::from_value(cfg).unwrap();
+        ResourceEntry::new(id, model, 1)
+    }
+
     fn model_entry_with_id(id: &str, name: &str, pk_id: &str) -> ResourceEntry<Model> {
         let cfg = format!(
             r#"{{
@@ -5481,6 +5970,118 @@ data: [DONE]\n\n";
 
     /// Build a virtual routing Model that points at `targets` (other
     /// Model.display_name values) using the given strategy.
+    /// A routing group whose every target is over its own model limit
+    /// is still THIS gateway refusing the request, so its 429 must carry
+    /// the same headers a direct model's refusal does.
+    ///
+    /// The dispatch loop turns a per-target quota rejection into a
+    /// failed attempt and keeps going; when nothing is left, whatever
+    /// the loop kept is what the caller sees. Wrapping that in a
+    /// `Bridge` error — the shape an UPSTREAM 429 takes — would strip
+    /// the headers and tell the caller the provider refused them.
+    #[tokio::test]
+    async fn exhausted_routing_group_429_still_carries_the_rate_limit_headers() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-1", &upstream.uri()));
+        // The group's only target carries an INLINE model limit — the
+        // layer that used to be flattened away. A policy-layer rejection
+        // was already surfaced un-flattened.
+        snap.models.insert(model_entry_with_limits(
+            "m-1",
+            "primary",
+            "pk-1",
+            serde_json::json!({"rpm": 1}),
+        ));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary"],
+            None,
+            None,
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let app = build_router(build_state(snap, hub));
+        // The streaming and non-streaming dispatch loops are separate
+        // copies of the same logic and drifted apart once already, so
+        // both are exercised here against the one shared bucket.
+        let call = |stream: bool| {
+            let app = app.clone();
+            async move {
+                let body = serde_json::json!({
+                    "model": "smart",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": stream,
+                });
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer sk-caller")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                run(app, req).await
+            }
+        };
+
+        fn assert_headers(resp: axum::http::Response<Body>, which: &str) {
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "{which}");
+            let headers = resp.headers();
+            assert_eq!(
+                headers
+                    .get("x-ratelimit-scope")
+                    .and_then(|v| v.to_str().ok()),
+                Some("rpm"),
+                "{which}: an exhausted group must report the target limit that refused it",
+            );
+            assert_eq!(
+                headers
+                    .get("x-ratelimit-limit")
+                    .and_then(|v| v.to_str().ok()),
+                Some("1"),
+                "{which}",
+            );
+            assert_eq!(
+                headers
+                    .get("x-ratelimit-remaining")
+                    .and_then(|v| v.to_str().ok()),
+                Some("0"),
+                "{which}",
+            );
+            assert!(headers.contains_key("x-ratelimit-reset"), "{which}");
+            assert!(headers.contains_key("retry-after"), "{which}");
+        }
+
+        // Non-streaming: the first call burns the target's only slot.
+        assert_eq!(call(false).await.status(), StatusCode::OK);
+        assert_headers(call(false).await, "non-streaming");
+
+        // Streaming runs the second copy of the loop against the same,
+        // now-exhausted bucket.
+        assert_headers(call(true).await, "streaming");
+    }
+
     fn routing_entry(
         name: &str,
         strategy: &str,
@@ -6955,8 +7556,15 @@ data: [DONE]\n\n";
             .insert(pk_entry_with_id("pk-flaky", &flaky_upstream.uri()));
         snap.provider_keys
             .insert(pk_entry_with_id("pk-stable", &stable_upstream.uri()));
-        snap.models
-            .insert(model_entry_with_id("m-flaky", "primary", "pk-flaky"));
+        // Cooldown is opt-in (AISIX-Cloud#1499): the primary has to ask
+        // to be taken out of rotation. The subject is that a retryable
+        // failure on request 1 keeps it out on request 2.
+        let mut flaky = model_entry_with_id("m-flaky", "primary", "pk-flaky");
+        flaky.value.cooldown = Some(aisix_core::CooldownConfig {
+            enabled: Some(true),
+            ..Default::default()
+        });
+        snap.models.insert(flaky);
         snap.models
             .insert(model_entry_with_id("m-stable", "secondary", "pk-stable"));
         snap.models.insert(routing_entry(
@@ -7123,6 +7731,99 @@ data: [DONE]\n\n";
                 .get("x-ratelimit-remaining-requests")
                 .and_then(|v| v.to_str().ok()),
             Some("99"),
+        );
+    }
+
+    /// The 429 the customer's client actually receives, through the
+    /// whole router rather than the renderer alone: the quota gate's
+    /// rejection has to reach `IntoResponse` with its dimension intact.
+    /// A unit test on the renderer would still pass if the gate lost
+    /// the detail on the way out.
+    #[tokio::test]
+    async fn ratelimit_429_carries_the_standard_headers_end_to_end() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot_with_limits(
+            "my-gpt4",
+            &["my-gpt4"],
+            &upstream.uri(),
+            serde_json::json!({"rpm": 1}),
+        );
+        let app = build_router(build_state(snap, hub));
+
+        let call = || {
+            let app = app.clone();
+            async move {
+                let body = serde_json::json!({
+                    "model": "my-gpt4",
+                    "messages": [{"role": "user", "content": "hi"}]
+                });
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer sk-caller")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                run(app, req).await
+            }
+        };
+
+        assert_eq!(call().await.status(), StatusCode::OK);
+
+        let resp = call().await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let headers = resp.headers();
+        assert_eq!(
+            headers
+                .get("x-ratelimit-limit")
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+        );
+        assert_eq!(
+            headers
+                .get("x-ratelimit-remaining")
+                .and_then(|v| v.to_str().ok()),
+            Some("0"),
+        );
+        assert_eq!(
+            headers
+                .get("x-ratelimit-scope")
+                .and_then(|v| v.to_str().ok()),
+            Some("rpm"),
+        );
+        // Reset and Retry-After are the same delta-seconds count down to
+        // the minute boundary, so a client may read either one.
+        let reset = headers
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("x-ratelimit-reset present and numeric");
+        let retry_after = headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("retry-after present and numeric");
+        assert_eq!(reset, retry_after);
+        assert!(
+            (1..=60).contains(&reset),
+            "an rpm window resets within the minute, got {reset}",
         );
     }
 
@@ -7476,7 +8177,23 @@ data: [DONE]\n\n";
             event.status_code, CLIENT_CLOSED_REQUEST,
             "an abandoned stream must be recorded as a client cancel, not as a success"
         );
+        // One vocabulary for both shapes of a caller walking away
+        // (AISIX-Cloud#1571): the status alone left `error_class` empty
+        // here, so a mid-stream abandonment was the only 499 an operator
+        // could not filter for by class. The message is what distinguishes
+        // it from the head-phase shape.
+        assert_eq!(event.error_class, CLIENT_DISCONNECTED_KIND);
+        assert_eq!(event.error_message, cancel::CANCELLED_MID_STREAM);
         assert!(!event.guardrail_blocked);
+        // And exactly one row. The request-level guard rides the response
+        // body to cover the window BEFORE its first poll, where this
+        // stream's own guard does not exist yet; one poll is what hands
+        // ownership over, so a stream that was read must not be reported
+        // twice under two different messages (AISIX-Cloud#1571).
+        assert!(
+            rx.try_recv().is_err(),
+            "the stream's own guard already filed this request — a second row would contradict it",
+        );
     }
 
     /// The counterpart to the test above: a stream the consumer reads to
@@ -7536,6 +8253,15 @@ data: [DONE]\n\n";
         assert_eq!(
             event.status_code, 200,
             "a fully consumed stream must not be reported as a client cancel"
+        );
+        // And it is the request's ONLY row. The request-level cancel guard
+        // rides the response body to cover the window before its first poll
+        // (AISIX-Cloud#1571); a guard that did not stand down once the body
+        // was read would file a second, `499` row behind every successful
+        // stream — where nothing else about the request looks wrong.
+        assert!(
+            rx.try_recv().is_err(),
+            "a delivered stream filed a second row",
         );
     }
 
@@ -7682,6 +8408,1136 @@ data: [DONE]\n\n";
         );
     }
 
+    /// A `499` snapshot the cancel tests below assert against: the caller
+    /// walked away, so there are no tokens and no cost, and the vocabulary
+    /// is the same one the mid-stream shape uses.
+    fn assert_head_phase_cancel(event: &aisix_obs::UsageEvent) {
+        assert_eq!(event.status_code, CLIENT_CLOSED_REQUEST, "{event:?}");
+        assert_eq!(event.error_class, CLIENT_DISCONNECTED_KIND, "{event:?}");
+        assert_eq!(
+            event.error_message,
+            cancel::CANCELLED_BEFORE_HEAD,
+            "{event:?}"
+        );
+        assert_eq!(event.prompt_tokens, 0);
+        assert_eq!(event.completion_tokens, 0);
+        assert_eq!(event.cost_usd, 0.0);
+        // Attributable, or the control plane has nowhere to file the row.
+        assert_eq!(event.api_key_id, "key-id-1", "{event:?}");
+    }
+
+    /// A routing group pointing at `targets`, keyed so the tests can assert
+    /// on the TARGET's Model uuid rather than the group's.
+    fn seed_routing_group(group: &str, targets: &[(&str, &str, &str)]) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        for (model_id, name, api_base) in targets {
+            let pk_id = format!("pk-{model_id}");
+            snap.provider_keys
+                .insert(pk_entry_with_id(&pk_id, api_base));
+            snap.models
+                .insert(model_entry_with_id(model_id, name, &pk_id));
+        }
+        let names: Vec<&str> = targets.iter().map(|(_, name, _)| *name).collect();
+        snap.models
+            .insert(routing_entry(group, "failover", &names, None, None, None));
+        snap.apikeys.insert(apikey_entry("sk-caller", &[group]));
+        snap
+    }
+
+    fn cancellable_chat_request(model: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    /// Drive `req` and drop the in-flight future part-way — precisely what
+    /// axum does when the client's connection goes away before the handler
+    /// produced a response head.
+    async fn cancel_in_flight(app: Router, req: Request<Body>) {
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(400), app.oneshot(req)).await;
+        assert!(
+            outcome.is_err(),
+            "the request completed on its own — this is not modelling a cancel"
+        );
+    }
+
+    async fn next_event(
+        rx: &mut tokio::sync::mpsc::Receiver<aisix_obs::UsageEvent>,
+    ) -> aisix_obs::UsageEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a cancelled request emitted no usage event")
+            .expect("sender dropped without sending")
+    }
+
+    /// A cancel that lands BEFORE any target was picked — here during the
+    /// input guardrail scan, which runs after the model resolves and before
+    /// the dispatch loop.
+    ///
+    /// The group is what the caller addressed, so it is what
+    /// `requested_model` says; `model_id` stays EMPTY, because a routing
+    /// group's own uuid prices nothing and writing it there would attribute
+    /// spend to a row that has no pricing (the AISIX-Cloud#790 class).
+    #[tokio::test]
+    async fn head_phase_cancel_before_dispatch_reports_the_group_and_no_model_id() {
+        use aisix_obs::UsageSink;
+
+        // The upstream is never reached; the guardrail endpoint is what the
+        // request is still waiting on when the caller goes away.
+        let upstream = MockServer::start().await;
+        let scanner = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&scanner)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_routing_group("smart", &[("m-primary", "primary", &upstream.uri())]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        seed_guardrail(
+            &state.snapshot,
+            "g-slow-input",
+            &format!(
+                r#"{{"name":"slow-input","kind":"azure_content_safety_text_moderation","hook_point":"input","endpoint":"{}","api_key":"k"}}"#,
+                scanner.uri()
+            ),
+        );
+        let app = build_router(state);
+
+        cancel_in_flight(app, cancellable_chat_request("smart")).await;
+
+        let event = next_event(&mut rx).await;
+        assert_head_phase_cancel(&event);
+        assert_eq!(event.requested_model, "smart");
+        assert_eq!(
+            event.model_id, "",
+            "the group the caller addressed must never be reported as the model that served",
+        );
+        assert_eq!(event.attempt_model, "", "no attempt had begun");
+        assert_eq!(event.attempt_kind, "");
+        assert_eq!(event.operation, "chat");
+        assert!(
+            rx.try_recv().is_err(),
+            "a cancel with no attempts must emit exactly one event",
+        );
+    }
+
+    /// The same cancel one step later: an attempt is in flight, so the
+    /// event names the TARGET it was waiting on — the identity the access
+    /// log's `model=` (the group) cannot give, and which is not reachable
+    /// by request id anywhere else.
+    #[tokio::test]
+    async fn head_phase_cancel_mid_attempt_reports_the_target_in_flight() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({
+                        "id": "cmpl-never", "model": "gpt-4o", "choices": []
+                    })),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_routing_group("smart", &[("m-primary", "primary", &upstream.uri())]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        cancel_in_flight(app, cancellable_chat_request("smart")).await;
+
+        let event = next_event(&mut rx).await;
+        assert_head_phase_cancel(&event);
+        assert_eq!(event.requested_model, "smart");
+        assert_eq!(
+            event.model_id, "m-primary",
+            "the event must price against the TARGET, not the group",
+        );
+        assert_eq!(event.attempt_model, "primary");
+        assert_eq!(event.attempt_index, 0);
+        assert_eq!(event.attempt_kind, "initial");
+        assert!(rx.try_recv().is_err(), "one attempt, one event");
+    }
+
+    /// A cancel in the middle of a fallback chain. The attempts that had
+    /// already failed are the ones `emit_failed_attempts` would have
+    /// written — on this path the handler never reaches it, so the guard
+    /// does, and the request's whole history survives rather than only its
+    /// last moment.
+    #[tokio::test]
+    async fn head_phase_cancel_keeps_the_attempts_that_already_failed() {
+        use aisix_obs::UsageSink;
+
+        let bad = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
+            .mount(&bad)
+            .await;
+        let slow = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({
+                        "id": "cmpl-never", "model": "gpt-4o", "choices": []
+                    })),
+            )
+            .mount(&slow)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_routing_group(
+            "smart",
+            &[
+                ("m-primary", "primary", &bad.uri()),
+                ("m-secondary", "secondary", &slow.uri()),
+            ],
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        cancel_in_flight(app, cancellable_chat_request("smart")).await;
+
+        // The failed attempt first, then the request's terminal event —
+        // the order the handler's own emitters produce.
+        let failed = next_event(&mut rx).await;
+        assert_eq!(failed.status_code, 502, "{failed:?}");
+        assert_eq!(failed.attempt_index, 0);
+        assert_eq!(failed.attempt_kind, "initial");
+        assert_eq!(failed.attempt_model, "primary");
+        assert_eq!(failed.model_id, "m-primary");
+        assert_eq!(failed.error_class, "upstream_status");
+
+        let terminal = next_event(&mut rx).await;
+        assert_head_phase_cancel(&terminal);
+        assert_eq!(terminal.attempt_index, 1);
+        assert_eq!(terminal.attempt_kind, "fallback");
+        assert_eq!(terminal.attempt_model, "secondary");
+        assert_eq!(terminal.model_id, "m-secondary");
+        assert_eq!(terminal.requested_model, "smart");
+        assert!(rx.try_recv().is_err(), "two attempts, two events");
+    }
+
+    /// A cancel does not only land INSIDE an attempt. Here the winning
+    /// attempt has already settled and the handler is in its post-dispatch
+    /// work — an output guardrail scan — when the caller goes away.
+    ///
+    /// There is no attempt to name at that point, but there is very much a
+    /// target: the access-log line names it, and so must the row. Clearing
+    /// the in-flight marker on settle without keeping the target's identity
+    /// put a routing request right back to reporting a `499` that names no
+    /// model at all.
+    #[tokio::test]
+    async fn head_phase_cancel_after_the_winner_settled_still_names_the_target() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-won",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "answered"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+        // The upstream answers at once; the OUTPUT scan is what the request
+        // is still waiting on when the caller hangs up.
+        let scanner = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&scanner)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_routing_group("smart", &[("m-primary", "primary", &upstream.uri())]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        seed_guardrail(
+            &state.snapshot,
+            "g-slow-output",
+            &format!(
+                r#"{{"name":"slow-output","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k"}}"#,
+                scanner.uri()
+            ),
+        );
+        let app = build_router(state);
+
+        cancel_in_flight(app, cancellable_chat_request("smart")).await;
+
+        let event = next_event(&mut rx).await;
+        assert_head_phase_cancel(&event);
+        assert_eq!(event.requested_model, "smart");
+        assert_eq!(
+            event.model_id, "m-primary",
+            "a target HAD been selected — the row must not report the request as \
+             having reached nothing",
+        );
+        // The winner's own event is the one the handler never got to write,
+        // so nothing of this request carries its index yet and the terminal
+        // event can name it in full.
+        assert_eq!(event.attempt_model, "primary");
+        assert_eq!(event.attempt_index, 0);
+        assert_eq!(event.attempt_kind, "initial");
+        assert!(
+            rx.try_recv().is_err(),
+            "the winner succeeded, so it is the only row"
+        );
+    }
+
+    /// A `499` snapshot for the body phase: the head went out, the caller
+    /// never read a byte of it, and the row must still price against the
+    /// target that had already answered.
+    fn assert_body_phase_cancel(event: &aisix_obs::UsageEvent) {
+        assert_eq!(event.status_code, CLIENT_CLOSED_REQUEST, "{event:?}");
+        assert_eq!(event.error_class, CLIENT_DISCONNECTED_KIND, "{event:?}");
+        assert_eq!(
+            event.error_message,
+            cancel::CANCELLED_BEFORE_BODY,
+            "{event:?}"
+        );
+        assert_eq!(event.prompt_tokens, 0, "nothing was delivered");
+        assert_eq!(event.completion_tokens, 0);
+        assert_eq!(event.cost_usd, 0.0);
+        assert_eq!(event.api_key_id, "key-id-1", "{event:?}");
+    }
+
+    /// Hand the response's body straight to `Drop` without polling it once.
+    ///
+    /// That is what hyper does when the connection goes away between the
+    /// head being handed over and the first frame being asked for — the one
+    /// window neither the handler (already returned) nor the stream's own
+    /// Drop emitter (built on first poll, so not yet in existence) can see.
+    /// Driven directly rather than by timing, because the window is
+    /// microseconds wide on a real connection.
+    fn drop_body_unpolled(response: Response) {
+        let (_parts, body) = response.into_parts();
+        drop(body);
+    }
+
+    /// An SSE upstream that answers at once, for the body-phase tests: the
+    /// gateway must reach the point of handing a streaming response back.
+    fn sse_chat_response() -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(
+                "\
+data: {\"id\":\"cmpl-body\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+data: [DONE]\n\n",
+            )
+    }
+
+    /// The stream a ROUTING group answered with, dropped before its first
+    /// poll. Nothing else speaks for this request: the handler returned, so
+    /// its own emitters are done, and the stream's `CompleteOnDrop` is
+    /// built inside the generator and therefore does not exist yet.
+    ///
+    /// The row must still name the target that answered — an upstream had
+    /// produced a head, so the winner is known and its id is what the
+    /// control plane prices against.
+    #[tokio::test]
+    async fn a_stream_dropped_before_its_first_poll_reports_the_winner() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_chat_response())
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_routing_group("smart", &[("m-primary", "primary", &upstream.uri())]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let mut req = cancellable_chat_request("smart");
+        *req.body_mut() = Body::from(
+            serde_json::json!({
+                "model": "smart",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            })
+            .to_string(),
+        );
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "the head must exist");
+
+        drop_body_unpolled(response);
+
+        let event = next_event(&mut rx).await;
+        assert_body_phase_cancel(&event);
+        assert_eq!(event.requested_model, "smart");
+        assert_eq!(
+            event.model_id, "m-primary",
+            "the upstream had answered, so the row must name the target it answered from",
+        );
+        assert_eq!(event.attempt_model, "primary");
+        assert_eq!(event.attempt_index, 0);
+        assert_eq!(event.attempt_kind, "initial");
+        assert_eq!(event.operation, "chat");
+        assert!(rx.try_recv().is_err(), "one request, one row");
+    }
+
+    /// The same window on a second family, reached through a different
+    /// bridge and a different stream builder: `/v1/messages`. The mechanism
+    /// is in the middleware, so every streaming family inherits it — this is
+    /// what proves it is not chat-shaped.
+    #[tokio::test]
+    async fn a_messages_stream_dropped_before_its_first_poll_is_reported_too() {
+        use aisix_obs::UsageSink;
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+                    ),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-claude"]));
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "my-claude",
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": true
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop_body_unpolled(response);
+
+        let event = next_event(&mut rx).await;
+        assert_body_phase_cancel(&event);
+        assert_eq!(event.requested_model, "my-claude");
+        assert_eq!(event.model_id, "model-anthropic-1");
+        assert_eq!(event.operation, "messages");
+        assert!(rx.try_recv().is_err(), "one request, one row");
+    }
+
+    /// A passthrough route relaying an SSE upstream, seeded so the two
+    /// tests below can drive the same response two ways.
+    async fn passthrough_sse_app() -> (
+        Router,
+        tokio::sync::mpsc::Receiver<aisix_obs::UsageEvent>,
+        MockServer,
+        std::sync::Arc<aisix_obs::Metrics>,
+    ) {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"hello\":\"world\"}\n\ndata: [DONE]\n\n",
+                "text/event-stream",
+            ))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        snap.passthrough_routes
+            .insert(passthrough_route_entry(&upstream.uri()));
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let metrics = state.metrics.clone();
+        (build_router(state), rx, upstream, metrics)
+    }
+
+    fn passthrough_sse_request() -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/passthrough/openai/v1/anything")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap()
+    }
+
+    /// A relayed stream read to the end files exactly one row, and it is the
+    /// route's own `200`.
+    ///
+    /// This family emits at the stream's natural end — from INSIDE the
+    /// generator, on a poll, where the request-level guard cannot see it.
+    /// So the guard has to stand down on the fact that the body was read at
+    /// all; without that, every delivered passthrough stream would carry a
+    /// second `499` row behind it (AISIX-Cloud#1571).
+    #[tokio::test]
+    async fn a_delivered_relay_stream_files_one_row() {
+        let (app, mut rx, _upstream, _metrics) = passthrough_sse_app().await;
+
+        let response = app.oneshot(passthrough_sse_request()).await.unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream"),
+            "premise: the relay must be streaming, not buffered",
+        );
+        let _ = to_bytes(response.into_body(), 65536).await.unwrap();
+
+        let event = next_event(&mut rx).await;
+        assert_eq!(event.status_code, 200, "{event:?}");
+        assert_eq!(event.operation, "passthrough");
+        assert!(
+            rx.try_recv().is_err(),
+            "a delivered relay stream filed a second row",
+        );
+    }
+
+    /// The same stream dropped before its first poll. This family builds its
+    /// telemetry guard OUTSIDE the generator, so that guard fires here on
+    /// its own — and the request-level guard must not add a second row.
+    ///
+    /// The interlock is `TelemetryBody` dropping the body inside the
+    /// request's own attribution cell: that is the only reason an emission
+    /// running after the handler, on no task of its own, is visible to the
+    /// guard that drops a moment later.
+    #[tokio::test]
+    async fn an_unpolled_relay_stream_is_filed_once_by_the_route_itself() {
+        let (app, mut rx, _upstream, metrics) = passthrough_sse_app().await;
+
+        let response = app.oneshot(passthrough_sse_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop_body_unpolled(response);
+
+        let event = next_event(&mut rx).await;
+        assert_eq!(event.status_code, CLIENT_CLOSED_REQUEST, "{event:?}");
+        assert_eq!(event.operation, "passthrough");
+        assert!(
+            rx.try_recv().is_err(),
+            "the route's own stream guard already filed this request — a second row would \
+             contradict it",
+        );
+        // The cancel counter and its line share the guard's branch, so the
+        // route's own filing must keep the guard from counting it again.
+        assert!(
+            !metrics.render().contains(CANCEL_METRIC),
+            "a request the route already filed was counted again as a client cancel",
+        );
+    }
+
+    /// A HOST-matched passthrough route, whose caller keeps the upstream's
+    /// own path space — the forward-proxy shape.
+    fn host_matched_route_entry(target_url: &str) -> ResourceEntry<aisix_core::PassthroughRoute> {
+        let cfg = format!(
+            r#"{{
+                "name": "forwarded-openai",
+                "hosts": ["api.openai.example"],
+                "target_url": "{target_url}",
+                "provider_key_id": "{PK_ID}"
+            }}"#
+        );
+        let route: aisix_core::PassthroughRoute = serde_json::from_str(&cfg).unwrap();
+        ResourceEntry::new("route-id-host", route, 1)
+    }
+
+    /// A cancelled request on a passthrough route the PATH cannot identify.
+    ///
+    /// A host-matched route relays the upstream's own path space, so the
+    /// caller's path is `/v1/chat/completions` — which normalizes to the
+    /// chat label. Reading the surface off that label files the row as an
+    /// abandoned chat call carrying no model, under an `operation` a
+    /// per-operation figure counts as chat traffic. The route the request
+    /// actually matched is what decides, and it says `passthrough` on both
+    /// fields, exactly as this family's completed rows do.
+    #[tokio::test]
+    async fn a_cancelled_host_matched_relay_is_filed_as_passthrough() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        snap.passthrough_routes
+            .insert(host_matched_route_entry(&upstream.uri()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            // The gateway's own chat path, on someone else's host.
+            .uri("/v1/chat/completions")
+            .header("host", "api.openai.example")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"model": "gpt-4o", "messages": []}).to_string(),
+            ))
+            .unwrap();
+        cancel_in_flight(app, req).await;
+
+        let event = next_event(&mut rx).await;
+        assert_head_phase_cancel(&event);
+        assert_eq!(
+            event.operation, "passthrough",
+            "the route it matched decides, not the path it arrived on",
+        );
+        assert_eq!(event.inbound_protocol, "passthrough");
+        assert_eq!(event.passthrough_route_name, "forwarded-openai");
+        assert_eq!(event.requested_model, "", "this family names no model");
+        assert_eq!(event.model_id, "");
+    }
+
+    /// Build a guard in its body phase, as the middleware leaves one when a
+    /// handler has returned an open-ended body nobody has read yet.
+    ///
+    /// Driven directly, the way `cancel_guard_stays_silent_during_unwind`
+    /// is: both arms below are decisions the guard makes from values no
+    /// route in the tree currently combines, and a router-level test would
+    /// be answered by one of the other interlocks before reaching them.
+    fn body_phase_guard(
+        state: &ProxyState,
+        method: axum::http::Method,
+        endpoint: &'static str,
+    ) -> ClientCancelGuard {
+        ClientCancelGuard {
+            phase: GuardPhase::Body {
+                owed: true,
+                polled: false,
+            },
+            state: state.clone(),
+            attribution: std::sync::Arc::new(attribution::RequestAttribution::default()),
+            endpoint,
+            method,
+            uri: endpoint.parse().unwrap(),
+            request_id: "req-body-phase".to_string(),
+            trace: None,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// A `HEAD` response's body is dropped unpolled on every such request —
+    /// hyper never writes one, whatever the handler built. Counting that as
+    /// a client cancel would make the signal fire on a download route's
+    /// ordinary size probes, which is what an operator alerts on.
+    #[test]
+    fn a_head_response_is_never_a_client_cancel() {
+        let state = build_state(AisixSnapshot::new(), Arc::new(Hub::new()));
+        let probe = state.metrics.clone();
+
+        drop(body_phase_guard(
+            &state,
+            axum::http::Method::HEAD,
+            "/v1/files/:id",
+        ));
+
+        assert!(
+            !probe.render().contains(CANCEL_METRIC),
+            "a HEAD probe was counted as a client cancel: {}",
+            probe.render(),
+        );
+    }
+
+    /// …and a route that files no usage row writes nothing in the body
+    /// phase either.
+    ///
+    /// The line and the counter would be the request's whole record, and it
+    /// would be one an operator cannot find in the usage log by its
+    /// `request_id` — the exact shape this change exists to remove.
+    /// `/v1/videos/:id/content` is the live case: it relays an open-ended
+    /// body and was metered by the submission instead.
+    #[test]
+    fn the_body_phase_is_silent_on_a_route_that_files_no_row() {
+        let state = build_state(AisixSnapshot::new(), Arc::new(Hub::new()));
+        let probe = state.metrics.clone();
+
+        drop(body_phase_guard(
+            &state,
+            axum::http::Method::GET,
+            "/v1/videos/:id",
+        ));
+
+        assert!(
+            !probe.render().contains(CANCEL_METRIC),
+            "a route with no usage row still reported a cancel: {}",
+            probe.render(),
+        );
+
+        // Not vacuous: the same guard on a metering route DOES report one.
+        drop(body_phase_guard(
+            &state,
+            axum::http::Method::GET,
+            "/v1/files/:id",
+        ));
+        assert!(
+            probe.render().contains(CANCEL_METRIC),
+            "the probe cannot detect a cancel at all: {}",
+            probe.render(),
+        );
+    }
+
+    /// One request, one access-log line — on all three ways a streamed
+    /// response can end.
+    ///
+    /// The line and the usage event are meant to give the same picture of a
+    /// request, which they cannot do if one request writes two lines under
+    /// two statuses. This counts them; what each line SAYS is a separate
+    /// question (a streamed request's line is written when the head goes
+    /// out, so its status is `200` and its latency is time-to-first-token —
+    /// see the `access_log` module docs and AISIX-Cloud#1394).
+    #[tokio::test]
+    async fn a_streamed_request_writes_exactly_one_access_log_line() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_chat_response())
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_routing_group("smart", &[("m-primary", "primary", &upstream.uri())]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let streaming_request = || {
+            let mut req = cancellable_chat_request("smart");
+            *req.body_mut() = Body::from(
+                serde_json::json!({
+                    "model": "smart",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": true
+                })
+                .to_string(),
+            );
+            req
+        };
+
+        let endings = crate::test_log::three_stream_endings(app.clone(), streaming_request).await;
+        crate::test_log::assert_one_line_per_ending(&endings, "/v1/chat/completions", "key-id-1");
+        crate::test_log::assert_latency_is_time_to_first_token(&endings);
+
+        // The line and the row are ONE record of ONE request, so they agree
+        // on the outcome down to the sentence. They can only disagree if the
+        // line is written somewhere other than the terminal emit — which is
+        // exactly what writing it at the handler tail was.
+        for (what, line) in [
+            ("a delivered stream", &endings.delivered),
+            ("a stream abandoned mid-flight", &endings.abandoned),
+            ("a stream dropped before its first poll", &endings.unread),
+        ] {
+            let event = next_event(&mut rx).await;
+            assert_eq!(
+                u64::from(event.status_code),
+                line.status(),
+                "{what}: the line and the usage event disagree on the status",
+            );
+            assert_eq!(
+                line.field("error").unwrap_or_default(),
+                event.error_message,
+                "{what}: the line and the usage event disagree on why",
+            );
+            assert_eq!(
+                line.field("error_kind").unwrap_or_default(),
+                event.error_class,
+                "{what}: the line and the usage event disagree on the class",
+            );
+        }
+
+        // The two abandoned endings are different phases and say so — the
+        // one message an operator reads to tell "left while it was
+        // streaming" from "never read a byte of it" apart.
+        assert_eq!(
+            endings.abandoned.field("error").as_deref(),
+            Some(cancel::CANCELLED_MID_STREAM),
+        );
+        assert_eq!(
+            endings.unread.field("error").as_deref(),
+            Some(cancel::CANCELLED_BEFORE_BODY),
+        );
+
+        // The delivered line carries what only the stream's END knows: the
+        // upstream's response id and the token counts. At head time neither
+        // existed, which is why the old line had to leave them out.
+        assert_eq!(
+            endings.delivered.field("provider_request_id").as_deref(),
+            Some("cmpl-body"),
+        );
+        assert!(
+            endings.delivered.num("total_tokens").is_some(),
+            "a delivered stream's line must carry the counts its event billed",
+        );
+        // And the target it dispatched to, on every ending — a routing
+        // group's own name answers "which member served this" nowhere.
+        for (what, line) in [
+            ("a delivered stream", &endings.delivered),
+            ("a stream abandoned mid-flight", &endings.abandoned),
+            ("a stream dropped before its first poll", &endings.unread),
+        ] {
+            assert_eq!(line.field("model").as_deref(), Some("smart"), "{what}");
+            assert_eq!(
+                line.field("upstream_model").as_deref(),
+                Some("gpt-4o"),
+                "{what}: the dispatched target is missing",
+            );
+            assert!(
+                line.field("provider_key_id").is_some(),
+                "{what}: the ProviderKey that served is missing",
+            );
+        }
+    }
+
+    /// A relayed speech body the caller never reads. `/v1/audio/speech`
+    /// files its usage when the audio ends, from a guard built inside the
+    /// relay, so a body dropped before its first poll is the same window
+    /// every streaming family has: the request's cancel guard files it,
+    /// once, as a body-phase cancel.
+    #[tokio::test]
+    async fn a_speech_body_left_unread_is_filed_once_as_a_body_phase_cancel() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"ID3\x03\x00\x00\x00".to_vec()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-tts", &["my-tts"], &upstream.uri());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"my-tts","input":"Hello","voice":"alloy"}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            rx.try_recv().is_err(),
+            "the handler no longer meters: the audio has not streamed yet",
+        );
+
+        drop_body_unpolled(response);
+
+        let event = next_event(&mut rx).await;
+        assert_body_phase_cancel(&event);
+        assert_eq!(event.operation, "speech");
+        assert!(rx.try_recv().is_err(), "one request, one row");
+    }
+
+    /// A COMPLETED response whose buffered body the caller never read is
+    /// not a cancel: the handler ran to the end and wrote its own row, and
+    /// a second `499` beside it would contradict it. (`HEAD` on any
+    /// metering GET route takes exactly this path — axum drops the body
+    /// unpolled — so this is routine traffic, not an edge case.)
+    #[tokio::test]
+    async fn an_unread_buffered_response_is_not_reported_as_a_cancel() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: {\"hello\":\"world\"}\n\n"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        snap.passthrough_routes
+            .insert(passthrough_route_entry(&upstream.uri()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/passthrough/openai/v1/anything")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_ne!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream"),
+            "premise: this relay must be BUFFERED — a streamed one takes the other branch",
+        );
+        drop_body_unpolled(response);
+
+        let event = next_event(&mut rx).await;
+        assert_eq!(
+            event.status_code, 200,
+            "the handler completed — its own row is the request's row",
+        );
+        assert_eq!(event.operation, "passthrough");
+        assert!(
+            rx.try_recv().is_err(),
+            "the handler already wrote this request's terminal row — the guard must not add a \
+             second, contradicting one",
+        );
+    }
+
+    /// A body that never finishes uploading, so the request is cancelled
+    /// before it names a model at all.
+    ///
+    /// It still files a row. The gate is ATTRIBUTABILITY, not a model: the
+    /// `auth` extractor runs before the body one, so the api_key is known,
+    /// and the guard writes a `499` access-log line for this request either
+    /// way — a line with no row to join it to is the gap AISIX-Cloud#1571
+    /// exists to close. The model fields are simply empty, the same shape
+    /// the model-less families report.
+    #[tokio::test]
+    async fn a_cancel_before_the_model_is_named_files_an_attributable_row() {
+        use aisix_obs::UsageSink;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://127.0.0.1:1");
+        let state = build_state(snap, Arc::new(Hub::new())).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        cancel_in_flight(app, unfinished_upload("Bearer sk-caller")).await;
+
+        let event = next_event(&mut rx).await;
+        assert_head_phase_cancel(&event);
+        assert_eq!(event.requested_model, "", "no model was ever named");
+        assert_eq!(event.model_id, "");
+        assert_eq!(event.attempt_model, "");
+        assert_eq!(event.operation, "chat");
+        assert!(rx.try_recv().is_err(), "one request, one row");
+    }
+
+    /// A cancelled request that never authenticated files nothing: there is
+    /// no api_key to attribute the row to, and an unauthenticated caller
+    /// must not be able to mint usage rows at all. This is the line the
+    /// pre-dispatch rejections in `reject.rs` already sit on, and it is now
+    /// the only thing the gate checks besides the route — driven directly,
+    /// because every unauthenticated route answers before there is anything
+    /// to cancel.
+    #[tokio::test]
+    async fn a_cancel_with_nothing_to_attribute_emits_nothing() {
+        use aisix_obs::UsageSink;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://127.0.0.1:1");
+        let state = build_state(snap, Arc::new(Hub::new())).with_usage_sink(UsageSink::new(tx));
+
+        cancel::emit(
+            &state,
+            "/v1/chat/completions",
+            "req-anon",
+            &attribution::Resolved::default(),
+            attribution::CancelContext::default(),
+            cancel::Phase::BeforeHead,
+            None,
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "an unauthenticated request has nothing to attribute a row to",
+        );
+    }
+
+    /// A request whose body starts as valid JSON and never finishes, so the
+    /// `Json` extractor is still awaiting bytes when the future is dropped.
+    fn unfinished_upload(authorization: &str) -> Request<Body> {
+        let body = Body::from_stream(async_stream::stream! {
+            yield Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"{\"model\":\"my-"));
+            std::future::pending::<()>().await;
+            yield Ok(axum::body::Bytes::new());
+        });
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", authorization)
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap()
+    }
+
+    /// The single-target families have no attempt loop, so their cancel
+    /// event takes its `model_id` from the entry the caller addressed —
+    /// which for them IS the target. Embeddings stands for the family;
+    /// `surface_for_endpoint`'s census is what keeps the rest in step.
+    #[tokio::test]
+    async fn head_phase_cancel_on_a_single_target_family_reports_its_model() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({"data": [], "model": "gpt-4o"})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"model": "my-gpt4", "input": "hello"}).to_string(),
+            ))
+            .unwrap();
+        cancel_in_flight(app, req).await;
+
+        let event = next_event(&mut rx).await;
+        assert_head_phase_cancel(&event);
+        assert_eq!(event.requested_model, "my-gpt4");
+        assert_eq!(event.model_id, "model-id-1");
+        assert_eq!(event.operation, "embeddings");
+    }
+
+    /// A passthrough route names no model at all, so the row a cancelled one
+    /// files is attributed by the ROUTE. Without that the request appears in
+    /// the usage log as an anonymous `499` an operator cannot trace back to
+    /// anything they configured.
+    #[tokio::test]
+    async fn head_phase_cancel_on_a_passthrough_route_reports_the_route() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        snap.passthrough_routes
+            .insert(passthrough_route_entry(&upstream.uri()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/passthrough/openai/v1/anything")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        cancel_in_flight(app, req).await;
+
+        let event = next_event(&mut rx).await;
+        assert_head_phase_cancel(&event);
+        assert_eq!(event.operation, "passthrough");
+        assert_eq!(
+            event.passthrough_route_name, "openai-tunnel",
+            "the route is this family's whole attribution",
+        );
+        assert_eq!(event.requested_model, "", "this family names no model");
+        assert_eq!(event.model_id, "");
+        assert_eq!(event.attempt_model, "");
+        assert!(rx.try_recv().is_err(), "one request, one row");
+    }
+
     /// The guard must stay silent on the happy path. A completed request
     /// is already logged and metered by its own handler; counting it as a
     /// client cancel too would make the new series useless for alerting.
@@ -7731,8 +9587,78 @@ data: [DONE]\n\n";
         );
     }
 
-    /// A panicking handler drops the guard mid-unwind with `armed` still
-    /// set, which looks identical to a cancel from `Drop`'s point of view.
+    /// A cancel that lands AFTER the handler parked this request's line but
+    /// before it returned writes that line — not a second one beside it.
+    ///
+    /// The window is real rather than theoretical: a streaming family parks
+    /// its line at its tail and chat then awaits once more, peeking the rate
+    /// limiter to fill the `x-ratelimit-*` headers. A caller that hangs up
+    /// there leaves the guard in its HEAD phase with the line already on the
+    /// cell, and both emitters would speak — under the same `499`, with the
+    /// same message, so one request would read as two identical ones and a
+    /// count of `499` lines would double.
+    #[tokio::test]
+    async fn a_head_phase_cancel_writes_the_parked_line_instead_of_a_second_one() {
+        use aisix_obs::UsageSink;
+
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let state = build_state(snap, Arc::new(Hub::new())).with_usage_sink(UsageSink::new(tx));
+        let cell = std::sync::Arc::new(attribution::RequestAttribution::default());
+
+        // What a streaming handler leaves behind on its way out: the caller
+        // it authenticated, and its line.
+        attribution::sync_scope(&cell, || {
+            attribution::note_client(&crate::client_ip::ClientContext::default(), "key-id-1");
+            attribution::defer_access_log(
+                attribution::PendingAccessLog::new(
+                    "POST",
+                    "/v1/chat/completions",
+                    "req-parked",
+                    "key-id-1",
+                    std::time::Instant::now(),
+                )
+                .with_model("openai", "my-gpt4"),
+            );
+        });
+
+        let capture = crate::test_log::Capture::install();
+        drop(ClientCancelGuard {
+            phase: GuardPhase::Head,
+            state: state.clone(),
+            attribution: cell,
+            endpoint: "/v1/chat/completions",
+            method: axum::http::Method::POST,
+            uri: "/v1/chat/completions".parse().unwrap(),
+            request_id: "req-parked".to_string(),
+            trace: None,
+            started: std::time::Instant::now(),
+        });
+
+        let line = capture.only("a head-phase cancel with a parked line");
+        assert_eq!(line.status(), u64::from(CLIENT_CLOSED_REQUEST));
+        assert_eq!(
+            line.field("error_kind").as_deref(),
+            Some(CLIENT_DISCONNECTED_KIND),
+        );
+        // The PARKED line is the one that went out — the guard's own names
+        // no model, because nothing resolved one into the cell here.
+        assert_eq!(
+            line.field("model").as_deref(),
+            Some("my-gpt4"),
+            "the guard wrote its own, thinner line instead of the parked one",
+        );
+        let event = next_event(&mut rx).await;
+        assert_eq!(event.status_code, CLIENT_CLOSED_REQUEST);
+        assert_eq!(
+            u64::from(event.status_code),
+            line.status(),
+            "one record, one outcome",
+        );
+    }
+
+    /// A panicking handler drops the guard mid-unwind still in its head
+    /// phase, which looks identical to a cancel from `Drop`'s point of view.
     /// Recording it would invent a client disconnect that never happened and
     /// bury the panic under a benign 499, so the guard must stay silent and
     /// let the panic's own signal stand.
@@ -7743,13 +9669,14 @@ data: [DONE]\n\n";
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = ClientCancelGuard {
-                armed: true,
+                phase: GuardPhase::Head,
                 state: state.clone(),
                 attribution: std::sync::Arc::new(attribution::RequestAttribution::default()),
                 endpoint: "/v1/chat/completions",
                 method: axum::http::Method::POST,
                 uri: "/v1/chat/completions".parse().unwrap(),
                 request_id: "req-unwind".to_string(),
+                trace: None,
                 started: std::time::Instant::now(),
             };
             panic!("handler blew up");
@@ -10236,5 +12163,626 @@ data: [DONE]\n\n";
         // policy" must continue to mean.
         assert_eq!(hit.action, "blocked");
         assert!(hit.error_type.is_empty());
+    }
+
+    // ─── Usage accounting across the protocol-conversion matrix ────
+    //
+    // AISIX-Cloud#1447. `UsageStats` stores whichever accounting shape
+    // the UPSTREAM used; the client must be answered in ITS OWN
+    // protocol's shape. That makes six cells, three of which convert:
+    //
+    //   client            upstream shape   conversion?
+    //   /v1/chat/…        OpenAI           no  (identity)
+    //   /v1/chat/…        Anthropic        YES
+    //   /v1/responses     OpenAI           no  (verbatim passthrough)
+    //   /v1/responses     Anthropic        YES
+    //   /v1/messages      OpenAI           YES
+    //   /v1/messages      Anthropic        no  (verbatim passthrough)
+    //
+    // …times streaming/non-streaming. Every cell is walked below, and
+    // each is checked on BOTH exits: the bytes the client reads, and the
+    // UsageEvent that drives Logs/billing. The two answer different
+    // questions and must not be conflated — the event keeps the
+    // upstream's raw counters so a call bills identically whichever
+    // protocol addressed it, while the client sees its own protocol's
+    // accounting.
+    //
+    // One call, described by both upstreams: 40 uncached input tokens,
+    // a 30-token cache write, a 70-token cache read, 10 output. The
+    // model read 140 input tokens and 150 in total, and no client may be
+    // told otherwise.
+    const UM_UNCACHED_IN: u32 = 40;
+    const UM_CACHE_WRITE: u32 = 30;
+    const UM_CACHE_READ: u32 = 70;
+    const UM_OUT: u32 = 10;
+    const UM_TOTAL_IN: u32 = UM_UNCACHED_IN + UM_CACHE_WRITE + UM_CACHE_READ; // 140
+    const UM_TOTAL: u32 = UM_TOTAL_IN + UM_OUT; // 150
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum UmClient {
+        Chat,
+        Responses,
+        Messages,
+    }
+
+    /// Which accounting shape the upstream reports in. Not "which
+    /// vendor" — bedrock reports in the Anthropic shape, and every
+    /// OpenAI-compatible provider (deepseek, gemini, azure, …) in the
+    /// OpenAI one, so these two exhaust the axis.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum UmUpstream {
+        OpenAiShape,
+        AnthropicShape,
+    }
+
+    /// The OpenAI-shape upstream's account of the call: one `prompt_tokens`
+    /// that already contains the cache read. OpenAI has no cache-WRITE
+    /// bucket, so those 30 tokens are simply part of the prompt here.
+    fn um_openai_usage_json() -> serde_json::Value {
+        serde_json::json!({
+            "prompt_tokens": UM_TOTAL_IN,
+            "completion_tokens": UM_OUT,
+            "total_tokens": UM_TOTAL,
+            "prompt_tokens_details": {"cached_tokens": UM_CACHE_READ},
+        })
+    }
+
+    /// The same call as the Anthropic-shape upstream reports it: cache
+    /// counters BESIDE a non-cached `input_tokens`.
+    fn um_anthropic_usage_json() -> serde_json::Value {
+        serde_json::json!({
+            "input_tokens": UM_UNCACHED_IN,
+            "output_tokens": UM_OUT,
+            "cache_creation_input_tokens": UM_CACHE_WRITE,
+            "cache_read_input_tokens": UM_CACHE_READ,
+        })
+    }
+
+    async fn um_mount_upstream(mock: &MockServer, upstream: UmUpstream, streaming: bool) {
+        match (upstream, streaming) {
+            (UmUpstream::OpenAiShape, false) => {
+                let body = serde_json::json!({
+                    "id": "chatcmpl-um",
+                    "model": "gpt-4o",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": um_openai_usage_json(),
+                });
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(mock)
+                    .await;
+            }
+            (UmUpstream::OpenAiShape, true) => {
+                let sse = format!(
+                    "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    serde_json::json!({
+                        "id": "chatcmpl-um",
+                        "model": "gpt-4o",
+                        "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}]
+                    }),
+                    serde_json::json!({
+                        "id": "chatcmpl-um",
+                        "model": "gpt-4o",
+                        "choices": [],
+                        "usage": um_openai_usage_json(),
+                    }),
+                );
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .set_body_raw(sse.into_bytes(), "text/event-stream"),
+                    )
+                    .mount(mock)
+                    .await;
+            }
+            (UmUpstream::AnthropicShape, false) => {
+                let body = serde_json::json!({
+                    "id": "msg_um",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-3-5-haiku-20241022",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": um_anthropic_usage_json(),
+                });
+                Mock::given(method("POST"))
+                    .and(path("/v1/messages"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(mock)
+                    .await;
+            }
+            (UmUpstream::AnthropicShape, true) => {
+                // `message_start` carries the input side (including both
+                // cache counters); `message_delta` closes with the output
+                // side. That split is Anthropic's, not ours.
+                let sse = format!(
+                    "event: message_start\ndata: {}\n\n\
+event: content_block_delta\ndata: {}\n\n\
+event: message_delta\ndata: {}\n\n\
+event: message_stop\ndata: {}\n\n",
+                    serde_json::json!({
+                        "type": "message_start",
+                        "message": {
+                            "id": "msg_um",
+                            "role": "assistant",
+                            "content": [],
+                            "model": "claude-3-5-haiku-20241022",
+                            "stop_reason": null,
+                            "usage": {
+                                "input_tokens": UM_UNCACHED_IN,
+                                "cache_creation_input_tokens": UM_CACHE_WRITE,
+                                "cache_read_input_tokens": UM_CACHE_READ,
+                                "output_tokens": 1
+                            }
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": "ok"}
+                    }),
+                    serde_json::json!({
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn"},
+                        "usage": {"output_tokens": UM_OUT}
+                    }),
+                    serde_json::json!({"type": "message_stop"}),
+                );
+                Mock::given(method("POST"))
+                    .and(path("/v1/messages"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .set_body_raw(sse.into_bytes(), "text/event-stream"),
+                    )
+                    .mount(mock)
+                    .await;
+            }
+        }
+    }
+
+    /// The `/v1/responses` OpenAI target takes the verbatim passthrough
+    /// rather than the bridge, so that cell needs the upstream to speak
+    /// Responses too.
+    async fn um_mount_responses_upstream(mock: &MockServer, streaming: bool) {
+        let usage = serde_json::json!({
+            "input_tokens": UM_TOTAL_IN,
+            "input_tokens_details": {"cached_tokens": UM_CACHE_READ},
+            "output_tokens": UM_OUT,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": UM_TOTAL,
+        });
+        let completed = serde_json::json!({
+            "id": "resp_um",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "model": "gpt-4o",
+            "output": [{
+                "type": "message",
+                "id": "msg_um",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+            }],
+            "usage": usage,
+        });
+        let template = if streaming {
+            let sse = format!(
+                "event: response.completed\ndata: {}\n\n",
+                serde_json::json!({
+                    "type": "response.completed",
+                    "sequence_number": 1,
+                    "response": completed,
+                }),
+            );
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse.into_bytes(), "text/event-stream")
+        } else {
+            ResponseTemplate::new(200).set_body_json(completed)
+        };
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(template)
+            .mount(mock)
+            .await;
+    }
+
+    /// Drive one matrix cell and return `(client-facing usage, UsageEvent)`.
+    async fn um_call(
+        client: UmClient,
+        upstream: UmUpstream,
+        streaming: bool,
+    ) -> (serde_json::Value, aisix_obs::UsageEvent) {
+        use aisix_obs::UsageSink;
+        use aisix_provider_anthropic::AnthropicBridge;
+        use aisix_provider_openai::OpenAiBridge;
+
+        let mock = MockServer::start().await;
+        let responses_verbatim =
+            client == UmClient::Responses && upstream == UmUpstream::OpenAiShape;
+        if responses_verbatim {
+            um_mount_responses_upstream(&mock, streaming).await;
+        } else {
+            um_mount_upstream(&mock, upstream, streaming).await;
+        }
+
+        let snap = AisixSnapshot::new();
+        let model_name = match upstream {
+            UmUpstream::OpenAiShape => {
+                snap.provider_keys.insert(provider_key_entry(&mock.uri()));
+                snap.models.insert(model_entry("um-model"));
+                "um-model"
+            }
+            UmUpstream::AnthropicShape => {
+                snap.provider_keys.insert(matrix_anthropic_pk(&mock.uri()));
+                snap.models.insert(anthropic_model_entry("um-model"));
+                "um-model"
+            }
+        };
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &[model_name]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        hub.register_family(
+            aisix_core::Adapter::Anthropic,
+            Arc::new(AnthropicBridge::new()),
+        );
+        hub.register_family(aisix_core::Adapter::Openai, Arc::new(OpenAiBridge::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+
+        let (uri, body) = match client {
+            UmClient::Chat => (
+                "/v1/chat/completions",
+                serde_json::json!({
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": streaming,
+                    "stream_options": {"include_usage": true},
+                }),
+            ),
+            UmClient::Responses => (
+                "/v1/responses",
+                serde_json::json!({"model": model_name, "input": "hi", "stream": streaming}),
+            ),
+            UmClient::Messages => (
+                "/v1/messages",
+                serde_json::json!({
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 100,
+                    "stream": streaming,
+                }),
+            ),
+        };
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json");
+        if !streaming {
+            builder = builder.header("accept", "application/json");
+        }
+        let req = builder.body(Body::from(body.to_string())).unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "{client:?}/{upstream:?}/stream={streaming}"
+        );
+        let raw = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8(raw.to_vec()).unwrap();
+
+        let usage = if streaming {
+            um_usage_from_sse(client, &text)
+        } else {
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["usage"].clone()
+        };
+        assert!(
+            usage.is_object(),
+            "{client:?}/{upstream:?}/stream={streaming} produced no client usage; body: {text}"
+        );
+        // Take the SERVED attempt's event, not simply the first one.
+        // Every attempt emits its own (#655), so a connection hiccup
+        // against the mock puts a failed attempt's zeroed event on the
+        // channel ahead of the real one — which is how this read failed
+        // intermittently under CI load while passing locally.
+        //
+        // The sender lives in the router this function still owns, so
+        // the channel never closes on its own: a cell that stops
+        // emitting would hang here and surface as the suite timeout
+        // rather than naming itself.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let event = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let next = tokio::time::timeout(remaining, rx.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{client:?}/{upstream:?}/stream={streaming}: no served UsageEvent")
+                })
+                .unwrap_or_else(|| {
+                    panic!("{client:?}/{upstream:?}/stream={streaming}: usage sink closed")
+                });
+            if next.status_code == 200 {
+                break next;
+            }
+        };
+        (usage, event)
+    }
+
+    /// Pull the client-facing usage out of a streamed body.
+    ///
+    /// Chat and Responses each put a COMPLETE usage block on one
+    /// terminal frame, so the last one wins. Anthropic deliberately
+    /// splits it: `message_start` carries the input side (and the cache
+    /// counters), `message_delta` the output side — so a `/v1/messages`
+    /// client accumulates across frames, and this reader must too.
+    /// Merging field-wise by max also covers the translated stream,
+    /// where the input side is only known once the upstream's usage
+    /// frame lands and therefore rides the closing `message_delta`.
+    fn um_usage_from_sse(client: UmClient, body: &str) -> serde_json::Value {
+        let mut merged = serde_json::Map::new();
+        let mut last = serde_json::Value::Null;
+        for line in body.lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if data.trim() == "[DONE]" {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            let candidate = match client {
+                UmClient::Chat => v.get("usage").cloned(),
+                // `message_start` nests it under `message`; `message_delta`
+                // puts it at the top level. Both are Anthropic's shape.
+                UmClient::Messages => v
+                    .get("usage")
+                    .or_else(|| v.get("message").and_then(|m| m.get("usage")))
+                    .cloned(),
+                UmClient::Responses => v.get("response").and_then(|r| r.get("usage")).cloned(),
+            };
+            let Some(c) = candidate.filter(serde_json::Value::is_object) else {
+                continue;
+            };
+            last = c.clone();
+            for (k, val) in c.as_object().unwrap() {
+                let keep = match (
+                    merged.get(k).and_then(serde_json::Value::as_u64),
+                    val.as_u64(),
+                ) {
+                    (Some(prev), Some(next)) => serde_json::json!(prev.max(next)),
+                    _ => val.clone(),
+                };
+                merged.insert(k.clone(), keep);
+            }
+        }
+        match client {
+            UmClient::Messages => serde_json::Value::Object(merged),
+            _ => last,
+        }
+    }
+
+    /// Every cell, regardless of conversion: the event carries the
+    /// UPSTREAM's own counters, so the same call bills identically no
+    /// matter which client protocol addressed it.
+    fn um_assert_event_keeps_upstream_shape(
+        event: &aisix_obs::UsageEvent,
+        upstream: UmUpstream,
+        label: &str,
+    ) {
+        assert_eq!(event.completion_tokens, UM_OUT, "{label}: completion");
+        match upstream {
+            UmUpstream::AnthropicShape => {
+                assert_eq!(event.prompt_tokens, UM_UNCACHED_IN, "{label}: prompt");
+                assert_eq!(event.cached_prompt_tokens, 0, "{label}: cached_prompt");
+                assert_eq!(
+                    event.cache_creation_tokens, UM_CACHE_WRITE,
+                    "{label}: cache_creation"
+                );
+                assert_eq!(
+                    event.cache_read_tokens, UM_CACHE_READ,
+                    "{label}: cache_read"
+                );
+            }
+            UmUpstream::OpenAiShape => {
+                assert_eq!(event.prompt_tokens, UM_TOTAL_IN, "{label}: prompt");
+                assert_eq!(
+                    event.cached_prompt_tokens, UM_CACHE_READ,
+                    "{label}: cached_prompt"
+                );
+                assert_eq!(event.cache_creation_tokens, 0, "{label}: cache_creation");
+                assert_eq!(event.cache_read_tokens, 0, "{label}: cache_read");
+            }
+        }
+    }
+
+    /// A semantic-cache hit replays the stored `UsageStats`, so it must
+    /// travel the same projection as the original call. Serving the hit
+    /// from a path that copies the stored fields would report a
+    /// different `prompt_tokens` for the same answer depending on
+    /// whether it came from cache — with only the Anthropic-upstream
+    /// numbers ever wrong, which is the hardest kind of drift to notice.
+    #[tokio::test]
+    async fn usage_matrix_cache_hit_replays_the_same_client_facing_usage() {
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let mock = MockServer::start().await;
+        um_mount_upstream(&mock, UmUpstream::AnthropicShape, false).await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(matrix_anthropic_pk(&mock.uri()));
+        snap.models.insert(anthropic_model_entry("um-model"));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["um-model"]));
+        seed_cache_policy(&snap, "usage-matrix-cache");
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        hub.register_family(
+            aisix_core::Adapter::Anthropic,
+            Arc::new(AnthropicBridge::new()),
+        );
+        let state = build_state_with_cache(snap, hub);
+
+        let mut seen = Vec::new();
+        for expect_cache in ["miss", "hit"] {
+            let resp = run(
+                build_router(state.clone()),
+                r1447_style_req(serde_json::json!({
+                    "model": "um-model",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get("x-aisix-cache")
+                    .and_then(|v| v.to_str().ok()),
+                Some(expect_cache),
+            );
+            let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            seen.push(v["usage"].clone());
+        }
+
+        assert_eq!(seen[0]["prompt_tokens"], UM_TOTAL_IN);
+        assert_eq!(seen[0]["total_tokens"], UM_TOTAL);
+        assert_eq!(
+            seen[0], seen[1],
+            "a cache hit must report the same usage as the call it replays"
+        );
+    }
+
+    fn r1447_style_req(body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// An OpenAI client reads the SAME numbers whichever upstream served
+    /// it — that equality is the whole contract, and pre-fix an Anthropic
+    /// upstream broke every field of it.
+    #[tokio::test]
+    async fn usage_matrix_openai_client_is_upstream_agnostic() {
+        for streaming in [false, true] {
+            for upstream in [UmUpstream::OpenAiShape, UmUpstream::AnthropicShape] {
+                let label = format!("chat/{upstream:?}/stream={streaming}");
+                let (usage, event) = um_call(UmClient::Chat, upstream, streaming).await;
+                assert_eq!(
+                    usage["prompt_tokens"], UM_TOTAL_IN,
+                    "{label}: prompt_tokens"
+                );
+                assert_eq!(usage["completion_tokens"], UM_OUT, "{label}: completion");
+                assert_eq!(usage["total_tokens"], UM_TOTAL, "{label}: total");
+                assert_eq!(
+                    usage["prompt_tokens_details"]["cached_tokens"], UM_CACHE_READ,
+                    "{label}: cached_tokens"
+                );
+                assert_eq!(
+                    usage["prompt_tokens"].as_u64().unwrap()
+                        + usage["completion_tokens"].as_u64().unwrap(),
+                    usage["total_tokens"].as_u64().unwrap(),
+                    "{label}: total must decompose"
+                );
+                um_assert_event_keeps_upstream_shape(&event, upstream, &label);
+            }
+        }
+    }
+
+    /// Same contract on the Responses surface, where the pre-fix bug was
+    /// louder still: `cached_tokens` could exceed `input_tokens`.
+    #[tokio::test]
+    async fn usage_matrix_responses_client_is_upstream_agnostic() {
+        for streaming in [false, true] {
+            for upstream in [UmUpstream::OpenAiShape, UmUpstream::AnthropicShape] {
+                let label = format!("responses/{upstream:?}/stream={streaming}");
+                let (usage, event) = um_call(UmClient::Responses, upstream, streaming).await;
+                assert_eq!(usage["input_tokens"], UM_TOTAL_IN, "{label}: input_tokens");
+                assert_eq!(usage["output_tokens"], UM_OUT, "{label}: output_tokens");
+                assert_eq!(usage["total_tokens"], UM_TOTAL, "{label}: total");
+                assert_eq!(
+                    usage["input_tokens_details"]["cached_tokens"], UM_CACHE_READ,
+                    "{label}: cached_tokens"
+                );
+                assert!(
+                    usage["input_tokens_details"]["cached_tokens"]
+                        .as_u64()
+                        .unwrap()
+                        <= usage["input_tokens"].as_u64().unwrap(),
+                    "{label}: cached_tokens must stay a subset of input_tokens"
+                );
+                um_assert_event_keeps_upstream_shape(&event, upstream, &label);
+            }
+        }
+    }
+
+    /// The Anthropic client's three input counters must always sum to
+    /// the 140 tokens the model read. They do NOT split it identically
+    /// across upstreams, and correctly so: an OpenAI-shape upstream has
+    /// no cache-write bucket to report, so its non-hit input is all
+    /// plain `input_tokens`. Fabricating a `cache_creation_input_tokens`
+    /// to make the two look alike would invent a number no upstream sent.
+    #[tokio::test]
+    async fn usage_matrix_messages_client_conserves_total_input() {
+        for streaming in [false, true] {
+            for upstream in [UmUpstream::OpenAiShape, UmUpstream::AnthropicShape] {
+                let label = format!("messages/{upstream:?}/stream={streaming}");
+                let (usage, event) = um_call(UmClient::Messages, upstream, streaming).await;
+                let get = |k: &str| usage.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                assert_eq!(get("output_tokens"), u64::from(UM_OUT), "{label}: output");
+                assert_eq!(
+                    get("input_tokens")
+                        + get("cache_creation_input_tokens")
+                        + get("cache_read_input_tokens"),
+                    u64::from(UM_TOTAL_IN),
+                    "{label}: the three input counters must sum to the real input"
+                );
+                assert_eq!(
+                    get("cache_read_input_tokens"),
+                    u64::from(UM_CACHE_READ),
+                    "{label}: cache read is reportable by both shapes"
+                );
+                match upstream {
+                    UmUpstream::AnthropicShape => {
+                        assert_eq!(get("input_tokens"), u64::from(UM_UNCACHED_IN), "{label}");
+                        assert_eq!(
+                            get("cache_creation_input_tokens"),
+                            u64::from(UM_CACHE_WRITE),
+                            "{label}"
+                        );
+                    }
+                    UmUpstream::OpenAiShape => {
+                        assert_eq!(
+                            get("input_tokens"),
+                            u64::from(UM_UNCACHED_IN + UM_CACHE_WRITE),
+                            "{label}: OpenAI has no cache-write bucket"
+                        );
+                        assert!(
+                            usage.get("cache_creation_input_tokens").is_none(),
+                            "{label}: never fabricate a cache write the upstream never reported"
+                        );
+                    }
+                }
+                um_assert_event_keeps_upstream_shape(&event, upstream, &label);
+            }
+        }
     }
 }

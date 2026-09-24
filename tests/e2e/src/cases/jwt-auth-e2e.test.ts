@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   agentClaims,
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startMockIdp,
@@ -170,11 +171,14 @@ describe("jwt auth e2e: OIDC trust providers + jwt_subject key binding", () => {
       disabled: true,
     });
 
-    await waitConfigPropagation(async () => {
-      const res = await chat(app!, idp!.sign(validClaims()));
-      await res.text();
-      return res.status === 200;
+    // The final key proves all JWT bindings are applied without testing JWT auth.
+    const readyKey = "sk-jwt-ready-probe";
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update(readyKey).digest("hex"),
+      allowed_models: [],
     });
+    const proxy = new ProxyClient(app.proxyUrl, readyKey);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
   });
 
   afterAll(async () => {

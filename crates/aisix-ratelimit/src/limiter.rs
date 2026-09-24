@@ -324,13 +324,113 @@ mod tests {
         let _r2 = limiter.pre_commit("k1", &l).await.unwrap();
         let err = limiter.pre_commit("k1", &l).await.unwrap_err();
         match err {
-            RateLimitError::Requests {
-                retry_after_secs, ..
-            } => {
-                assert!(retry_after_secs > 0);
+            RateLimitError::Requests { detail, .. } => {
+                assert!(detail.reset_secs > 0);
+                // The refusal names the exact window that fired, not
+                // just "some request limit" — the 429's headers report
+                // this dimension.
+                assert_eq!(detail.dimension, "rpm");
+                assert_eq!(detail.limit, 2);
+                assert_eq!(detail.remaining, 0);
             }
             other => panic!("expected Requests, got {other:?}"),
         }
+    }
+
+    /// The 429's `x-ratelimit-*` headers name ONE dimension, so which
+    /// one a multi-dimension key reports has to be pinned: it is the
+    /// dimension that actually refused, which is the first one the
+    /// acquire order reaches. rps is tighter than rpm here, so a burst
+    /// must be attributed to rps even though rpm is also configured.
+    #[tokio::test]
+    async fn refusal_names_the_dimension_that_actually_fired() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = limits_full(Some(1), Some(100), None, None);
+
+        let _r1 = limiter.pre_commit("k", &l).await.unwrap();
+        let detail = limiter.pre_commit("k", &l).await.unwrap_err().detail();
+        assert_eq!(detail.dimension, "rps");
+        assert_eq!(detail.limit, 1);
+        assert_eq!(detail.remaining, 0);
+
+        // Move past the second but stay inside the minute, and exhaust
+        // rpm instead: the same key now reports the other dimension.
+        let l = limits_full(Some(100), Some(1), None, None);
+        clock.advance(1);
+        let _r2 = limiter.pre_commit("k2", &l).await.unwrap();
+        let detail = limiter.pre_commit("k2", &l).await.unwrap_err().detail();
+        assert_eq!(detail.dimension, "rpm");
+        assert_eq!(detail.limit, 1);
+    }
+
+    /// A token refusal reports the token window and its cap, not the
+    /// request one — the two carry different units, which is why the
+    /// wire names the dimension alongside the number.
+    #[tokio::test]
+    async fn token_refusal_reports_the_token_window() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = limits(Some(100), Some(50), None);
+
+        // Overrun tpm: checked-but-not-incremented means the refusal
+        // lands on the NEXT request after the commit.
+        let r = limiter.pre_commit("k", &l).await.unwrap();
+        r.commit_tokens(1_000).await;
+
+        let detail = limiter.pre_commit("k", &l).await.unwrap_err().detail();
+        assert_eq!(detail.dimension, "tpm");
+        assert_eq!(detail.limit, 50);
+        // The counter overran the cap; remaining floors at zero.
+        assert_eq!(detail.remaining, 0);
+    }
+
+    /// `x-ratelimit-reset` is delta-seconds to the window boundary, and
+    /// it must never reach zero — a client that reads `0` and retries
+    /// immediately is exactly the retry storm the header exists to
+    /// prevent. Walks the whole minute rather than sampling one point.
+    #[tokio::test]
+    async fn reset_counts_down_to_the_window_boundary_and_never_hits_zero() {
+        // Window [60, 120): the counter is exhausted at t=60 and every
+        // later second inside it must report the remaining distance.
+        let clock = TestClock::new(60);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = limits(Some(1), None, None);
+        let _r = limiter.pre_commit("k", &l).await.unwrap();
+
+        for offset in 0..60u64 {
+            let detail = limiter.pre_commit("k", &l).await.unwrap_err().detail();
+            assert_eq!(
+                detail.reset_secs,
+                60 - offset,
+                "at t=60+{offset} the minute window has {} s left",
+                60 - offset
+            );
+            assert!(detail.reset_secs >= 1, "reset must never be zero");
+            clock.advance(1);
+        }
+
+        // t=120 rolls the window: the request is admitted again, which
+        // is what the last reported reset (1 s) promised.
+        assert!(limiter.pre_commit("k", &l).await.is_ok());
+    }
+
+    /// A concurrency refusal has no window to count down, so it reports
+    /// the fixed hint plus the gauge's own state.
+    #[tokio::test]
+    async fn concurrency_refusal_reports_the_gauge_and_the_fixed_hint() {
+        let clock = TestClock::new(0);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = limits(None, None, Some(2));
+
+        let _r1 = limiter.pre_commit("k", &l).await.unwrap();
+        let _r2 = limiter.pre_commit("k", &l).await.unwrap();
+        let detail = limiter.pre_commit("k", &l).await.unwrap_err().detail();
+
+        assert_eq!(detail.dimension, "concurrency");
+        assert_eq!(detail.limit, 2);
+        assert_eq!(detail.remaining, 0);
+        assert_eq!(detail.reset_secs, 60);
     }
 
     #[tokio::test]
@@ -357,7 +457,7 @@ mod tests {
         let r2 = limiter.pre_commit("k1", &l).await.unwrap();
         assert!(matches!(
             limiter.pre_commit("k1", &l).await.unwrap_err(),
-            RateLimitError::Concurrency,
+            RateLimitError::Concurrency { .. },
         ));
 
         // Drop r1 — concurrency should free up.
@@ -395,6 +495,37 @@ mod tests {
 
         clock.advance(61); // roll the window
         let _r2 = limiter.pre_commit("k1", &l).await.unwrap();
+    }
+
+    /// #950: the boundary case the overshoot test above does not reach.
+    /// Committed usage landing EXACTLY on the cap means the budget is
+    /// gone; admitting there let the next request spend a further whole
+    /// response on top of the overshoot post-paid accounting already
+    /// implies.
+    #[tokio::test]
+    async fn tpm_blocks_the_next_request_at_exactly_the_limit() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = limits(Some(10), Some(1_000), None);
+
+        let r1 = limiter.pre_commit("k1", &l).await.unwrap();
+        r1.commit_tokens(1_000).await; // the whole minute's budget, exactly
+
+        let err = limiter.pre_commit("k1", &l).await.unwrap_err();
+        match err {
+            RateLimitError::Tokens { detail, .. } => {
+                assert_eq!(detail.dimension, "tpm");
+                assert_eq!(detail.limit, 1_000);
+                assert_eq!(detail.remaining, 0);
+            }
+            other => panic!("expected Tokens, got {other:?}"),
+        }
+
+        // One token short of the cap still admits — the check is the
+        // budget being spent, not merely being close.
+        let r2 = limiter.pre_commit("k2", &l).await.unwrap();
+        r2.commit_tokens(999).await;
+        let _r3 = limiter.pre_commit("k2", &l).await.unwrap();
     }
 
     #[tokio::test]
@@ -656,7 +787,7 @@ mod tests {
         // request is rejected.
         assert!(matches!(
             limiter.pre_commit("k", &l).await.unwrap_err(),
-            RateLimitError::Concurrency
+            RateLimitError::Concurrency { .. }
         ));
 
         // Stream completes/cancels → guard drops → slot released.

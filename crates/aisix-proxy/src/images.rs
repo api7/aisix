@@ -11,7 +11,7 @@
 //! 8. Providers that don't support image generation return 501.
 
 use aisix_core::AppliedGuardrail;
-use aisix_gateway::BridgeError;
+use aisix_gateway::{BridgeCapability, BridgeError};
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -49,9 +49,8 @@ struct ImageDispatchSuccess {
     /// event so the request is visible + attributed.
     usage: Option<(u32, u32)>,
     /// `false` on the 501 NotImplemented branch (provider lacks image
-    /// generation → no upstream call). Gates emission so the
-    /// not-implemented path stays out of /logs (same convention as
-    /// embeddings #402).
+    /// generation → no upstream call). That path emits only when screening
+    /// already produced guardrail attribution.
     upstream_called: bool,
     /// Per-detector PII mask counts (#932/#696) applied to the prompt.
     /// Attached to the emitted UsageEvent. Empty = no redaction.
@@ -154,19 +153,22 @@ pub async fn image_generations(
             // Issue #407: emit UsageEvent so cp-api's budget ledger +
             // /logs see image-generation traffic. Pre-#407 the handler
             // dropped the event entirely. Emit on a real upstream call
-            // (even zero tokens — request visible/attributed); skip the
-            // 501 NotImplemented path. Tokens come from the upstream
+            // (even zero tokens — request visible/attributed). A 501 emits
+            // only to preserve a guardrail decision. Tokens come from the upstream
             // `usage` block when present (gpt-image-1); dall-e-3 has no
             // usage block → zero tokens (precise per-image cost is a
             // documented cross-repo follow-up — needs image-count /
             // size / quality on the wire + cp-api pricing).
-            if success.upstream_called {
+            if success.upstream_called
+                || crate::usage_attr::has_guardrail_attribution(&audit, &success.monitor_hits)
+            {
                 let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
                 emit_usage_event(
                     &state,
                     &snapshot,
                     &pk,
                     "/v1/images/generations",
+                    crate::operation::IMAGE_GENERATION,
                     &request_id,
                     &success.model_id,
                     &model_name,
@@ -174,7 +176,7 @@ pub async fn image_generations(
                     &success.provider,
                     &success.upstream_model,
                     &success.applied_guardrails,
-                    200,
+                    status,
                     elapsed,
                     prompt_tokens,
                     completion_tokens,
@@ -183,6 +185,7 @@ pub async fn image_generations(
                     success.monitor_hits.clone(),
                     success.captured_content.as_ref(),
                     &audit,
+                    success.upstream_called,
                 );
             }
             success.response
@@ -220,15 +223,18 @@ pub async fn image_generations(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
-                "images",
+                crate::operation::IMAGE_GENERATION,
                 "openai",
                 &request_id,
                 &model_name,
                 &api_key_id,
                 status,
                 err.kind(),
+                err.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
+                crate::usage_attr::guardrail_scores(&audit),
+                crate::usage_attr::bypass_reason(&audit),
             );
             err.into_response()
         }
@@ -267,12 +273,35 @@ async fn dispatch(
     let model_entry = crate::model_resolve::resolve_model(snapshot, model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.to_string()))?;
 
-    if !auth.key().can_access(model_name) {
+    if !auth.key().can_access(snapshot, model_name) {
         return Err(ProxyError::ModelForbidden(model_name.to_string()));
     }
 
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
+
+    // #1101: partial-image SSE (`stream: true`) is not relayed on this
+    // route, and the dispatch below reads the upstream answer as a single
+    // JSON document. Forwarding `stream` had the provider generate — and
+    // charge for — a stream the gateway then failed to decode; that decode
+    // failure is retryable, and this route dispatches through
+    // `retrying_dispatch`, so ONE caller request re-ran the generation for
+    // the whole retry budget and still answered 502.
+    //
+    // Refuse it here, before the provider is contacted, and in the same
+    // words `/v1/images/edits` already uses — the two are one family and a
+    // caller should not have to learn two refusals. Unlike /v1/completions
+    // there is no streaming route to point at, so the message names none.
+    //
+    // Rejected AFTER model resolution so an unknown model still answers 404
+    // (matching the other JSON endpoints' precedence), and BEFORE the
+    // guardrail chain and the rate-limit reservation so a request that
+    // cannot be served burns neither.
+    if body.get("stream").and_then(Value::as_bool) == Some(true) {
+        return Err(ProxyError::InvalidRequest(
+            "`stream` is not supported on /v1/images/generations".into(),
+        ));
+    }
 
     // #545: /v1/images/generations must run input guardrails. Before this it
     // forwarded the user `prompt` with no configured content/DLP check, so a
@@ -302,7 +331,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
@@ -312,8 +341,10 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/images/generations request",
             );
-            return Err(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
             ));
         }
     }
@@ -434,10 +465,10 @@ async fn dispatch(
                 captured_content,
             })
         }
-        Err(BridgeError::Config(msg)) if msg.contains("does not support image generation") => {
+        Err(e @ BridgeError::UnsupportedCapability(BridgeCapability::ImageGeneration)) => {
             // No upstream call → no tokens to count; release the reservation.
             reservation.commit_tokens(0).await;
-            let env = ErrorEnvelope::new(msg, "not_implemented");
+            let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(ImageDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
                 provider: provider_label,
@@ -446,7 +477,8 @@ async fn dispatch(
                 upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 usage: None,
-                // No upstream call happened → handler skips emit.
+                // No upstream call happened; only guardrail attribution can
+                // make the handler emit this branch.
                 upstream_called: false,
                 redactions,
                 monitor_hits: monitor_hits.clone(),
@@ -496,8 +528,11 @@ pub(crate) fn emit_usage_event(
     snap: &aisix_core::AisixSnapshot,
     pk: &crate::usage_attr::ResolvedPk<'_>,
     // `/v1/images/generations` or `/v1/images/edits` — the two image
-    // surfaces share this emit (AISIX-Cloud#1360).
+    // surfaces share this emit (AISIX-Cloud#1360), so which one this is
+    // has to come from the caller: they share a handler label and must
+    // NOT share an operation (AISIX-Cloud#1461).
     endpoint: &'static str,
+    surface: crate::operation::Surface,
     request_id: &str,
     model_id: &str,
     requested_model: &str,
@@ -523,6 +558,7 @@ pub(crate) fn emit_usage_event(
     // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
     // Shared by both image surfaces, like the rest of this emit.
     audit: &crate::usage_attr::GuardrailAudit,
+    dispatched: bool,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -544,23 +580,29 @@ pub(crate) fn emit_usage_event(
         redacted_entity_counts,
         guardrail_monitor_hits,
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
+        guardrail_scores: crate::usage_attr::guardrail_scores(audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
-    // Handler label "images" — bucketed prometheus counter (#408).
-    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
+    crate::usage_attr::apply_caller_identity(
+        &mut event,
+        client.jwt.as_ref(),
+        client.caller.user_id.as_deref(),
+        client.caller.user_name.as_deref(),
+    );
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "images",
+        surface,
         event,
         crate::usage_attr::usage_event_labels(&usage_model, pk),
         content,
         client.trace.as_ref(),
         /* terminal */ true,
-        /* dispatched */ true,
+        dispatched,
     );
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     crate::request_metrics::record_usage(
@@ -578,6 +620,10 @@ pub(crate) fn emit_usage_event(
             input: prompt_tokens,
             output: completion_tokens,
             total: prompt_tokens.saturating_add(completion_tokens),
+            // No upstream on this surface reports prompt-cache detail.
+            cached: 0,
+            cache_read: 0,
+            cache_creation: 0,
             spend_usd: 0.0,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
@@ -601,13 +647,17 @@ pub(crate) fn emit_access_log(
         }
         None => (None, None),
     };
+    let target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method: "POST",
         path: endpoint,
         status,
         latency,
+        duration: latency,
         provider: Some(provider),
         model: Some(model),
+        upstream_model: target.upstream_model(),
+        provider_key_id: target.provider_key_id(),
         api_key_id: Some(api_key_id),
         prompt_tokens: None,
         completion_tokens: None,
@@ -621,6 +671,8 @@ pub(crate) fn emit_access_log(
         routing_fallback_count: None,
         error_kind,
         error: error.as_deref(),
+        mcp: None,
+        cache: None,
     }
     .emit();
 }
@@ -648,6 +700,7 @@ mod tests {
             request_id: Default::default(),
             url_rewrites: Vec::new(),
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }
@@ -769,7 +822,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("dalle"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let app = build_app(snap);
         let body = serde_json::json!({"model": "dalle", "prompt": "draw BLOCKME please"});
@@ -802,7 +855,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("dalle"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let app = build_app(snap);
         let body = serde_json::json!({"model": "dalle", "prompt": "a serene landscape"});
@@ -1040,11 +1093,9 @@ mod tests {
         assert_eq!(event.inbound_protocol, "openai");
     }
 
-    /// Issue #456 (#226 family): the 501 NotImplemented path (resolved
-    /// bridge doesn't support image generation) must NOT emit a
-    /// UsageEvent — no upstream call happened. Mirrors
-    /// `completions.rs::provider_lacking_complete_returns_501_without_emit`
-    /// and the embeddings sibling. Unlike those, /v1/images/generations
+    /// A 501 without a guardrail decision stays out of usage, while a 501
+    /// reached after a mask must preserve that attribution in a zero-token
+    /// event (#1083). Unlike completions and embeddings, /v1/images/generations
     /// rejects non-OpenAI providers with 400 *before* dispatch (see
     /// `non_openai_provider_returns_400_invalid_request`) and the real
     /// `OpenAiBridge` overrides `generate_image`, so the only way to reach
@@ -1052,7 +1103,7 @@ mod tests {
     /// leaves `Bridge::generate_image` at the trait default. We register a
     /// minimal stub under the "openai" key to exercise exactly that.
     #[tokio::test]
-    async fn resolved_bridge_lacking_generate_image_returns_501_without_emit_issue_456() {
+    async fn image_501_emits_only_for_guardrail_attribution() {
         use aisix_gateway::{
             Bridge, BridgeContext, BridgeError, ChatChunkStream, ChatFormat, ChatMessage,
             ChatResponse, FinishReason, UsageStats,
@@ -1095,6 +1146,7 @@ mod tests {
         let snap = new_snap("https://api.openai.com");
         snap.models.insert(model_entry("stub-image"));
         snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -1106,7 +1158,7 @@ mod tests {
         let app = crate::build_router(state);
 
         let body = serde_json::json!({"model": "stub-image", "prompt": "a cat", "n": 1});
-        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+        let resp = tower::ServiceExt::oneshot(app.clone(), make_req(body))
             .await
             .unwrap();
         assert_eq!(
@@ -1124,6 +1176,24 @@ mod tests {
                 ev.prompt_tokens, ev.status_code,
             );
         }
+
+        let body = serde_json::json!({
+            "model": "stub-image",
+            "prompt": "draw version: 9.9.9",
+            "n": 1
+        });
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the masked 501 must emit its guardrail attribution")
+            .expect("usage sink remains open");
+        assert_eq!(ev.status_code, 501);
+        assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
     }
 
     /// AISIX-Cloud#867 parity: a successful /v1/images/generations 200 must
@@ -1193,7 +1263,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("dall-e"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let app = build_app_with_sink(snap, tx);
@@ -1292,7 +1362,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("img"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(pii_mask_guardrail());
+        crate::seed_env_scoped_guardrail(&snap, pii_mask_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let app = build_app_with_sink(snap, tx);
@@ -1336,7 +1406,15 @@ mod tests {
             .await;
 
         let snap = new_snap(&upstream.uri());
-        snap.models.insert(model_entry("img"));
+        // Cooldown is opt-in (AISIX-Cloud#1499). The subject here is that
+        // this handler routes its failures through the cooldown
+        // chokepoint at all, so the model has to ask for cooldown.
+        let mut entry = model_entry("img");
+        entry.value.cooldown = Some(aisix_core::CooldownConfig {
+            enabled: Some(true),
+            ..Default::default()
+        });
+        snap.models.insert(entry);
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let hub = Arc::new(Hub::new());
@@ -1371,7 +1449,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("my-image"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -1436,7 +1514,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("dalle"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(masking_input_guardrail());
+        crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());

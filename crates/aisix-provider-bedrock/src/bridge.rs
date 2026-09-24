@@ -16,6 +16,9 @@
 //! set) is forwarded as the SDK's `endpoint_url` so operators can
 //! point at a private deployment / VPC endpoint.
 
+use aisix_gateway::structured_output::{
+    response_into_fake_stream_chunks, unwrap_json_tool_call, JSON_TOOL_DESCRIPTION, JSON_TOOL_NAME,
+};
 use aisix_gateway::{
     Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatFormat,
     ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest, EmbeddingResponse,
@@ -33,7 +36,8 @@ use aws_sdk_bedrockruntime::primitives::Blob;
 use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
 use aws_sdk_bedrockruntime::types::{
     AnyToolChoice, ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole,
-    ConverseStreamOutput, InferenceConfiguration, Message as BedrockMessage, SpecificToolChoice,
+    ConverseStreamOutput, InferenceConfiguration, JsonSchemaDefinition, Message as BedrockMessage,
+    OutputConfig, OutputFormat, OutputFormatStructure, OutputFormatType, SpecificToolChoice,
     StopReason as SdkStopReason, SystemContentBlock, Tool, ToolChoice, ToolConfiguration,
     ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolSpecification, ToolUseBlock,
 };
@@ -44,7 +48,9 @@ use serde::Deserialize;
 use std::time::{Duration, Instant};
 
 use aisix_provider_anthropic::wire::{
-    build_request, response_into_chat_response, split_system, AnthropicResponse,
+    build_request, response_into_chat_response, split_system, structured_output_for,
+    tool_choice_states_a_preference, translate_reasoning_effort_to_anthropic, AnthropicResponse,
+    StructuredOutput,
 };
 
 // Per-`ProviderKey` request override pipeline (#302 §5 / #340). The JSON-body
@@ -332,6 +338,26 @@ impl BedrockSecret {
     }
 }
 
+/// The HTTP stack every Bedrock SDK client is built on.
+///
+/// One pool for the process is right for the gateway, which runs a
+/// single tokio runtime for as long as it lives. It is wrong for this
+/// crate's test binary, where each `#[tokio::test]` owns a runtime and
+/// drops it while the process-wide pool keeps the connections that were
+/// spawned on it. A later test handed such a connection gets hyper's
+/// `DispatchGone` — "runtime dropped the dispatch task" — which arrives
+/// here as a transport error in place of whatever the upstream
+/// answered. Under test, therefore, one pool per client.
+#[cfg(not(test))]
+fn sdk_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    aisix_gateway::upstream_tls::aws_http_client()
+}
+
+#[cfg(test)]
+fn sdk_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    aisix_gateway::upstream_tls::build_aws_http_client()
+}
+
 /// Build a Bedrock SDK Client from the parsed credentials plus the
 /// optional endpoint override.
 fn build_client(
@@ -380,10 +406,11 @@ fn build_client(
         .region(Region::new(creds.region.clone()))
         .credentials_provider(SharedCredentialsProvider::new(aws_creds))
         .timeout_config(timeouts.build())
-        // Shared HTTP stack carrying `upstream.tls.ca_file`, so a
+        // The HTTP stack carrying `upstream.tls.ca_file`, so a
         // Bedrock-compatible endpoint behind a private CA is reachable
-        // on the same setting every other upstream uses.
-        .http_client(aisix_gateway::upstream_tls::aws_http_client())
+        // on the same setting every other upstream uses. Shared across
+        // the process in production; see `sdk_http_client`.
+        .http_client(sdk_http_client())
         // Retries belong to the gateway's own budget
         // (`routing::effective_retries`), which emits per-attempt telemetry
         // and honours per-model config. Left at its default the SDK would
@@ -413,17 +440,43 @@ fn build_client(
 }
 
 /// Resolve the ProviderKey's extra headers (rendered `default_headers` plus
-/// allowlisted client headers) and drop the SigV4-owned names
+/// forwarded client headers) and drop the SigV4-owned names
 /// ([`wire::reserved_sigv4_headers`]) before they reach the signing
-/// interceptor. cp-api SHOULD reject those at write time (#302 §5), but the DP
-/// enforces it again here as defense-in-depth — an override naming e.g.
-/// `x-amz-date` or `authorization` must never perturb the signature. Matching
-/// is case-insensitive (HTTP header names are).
+/// interceptor. Matching is case-insensitive (HTTP header names are).
+///
+/// This is the ONE place SigV4's inputs are protected. Everywhere else in
+/// the gateway an operator who names a header on a specific upstream gets
+/// it, credential slots included — but here the signer DERIVES
+/// `authorization` and the `x-amz-*` inputs from the canonical request, so
+/// a supplied value does not authenticate anyone: it either loses to the
+/// signer or breaks the signature. The interceptor that consumes this list
+/// is FIRST-WINS (see `intercept` below), the opposite of every other
+/// delivery site, so the value would vanish with no failure to look at.
+/// It is dropped here instead, with a warning, so the operator can see it.
 fn filtered_extra_headers(hdr: &UpstreamHeaderContext<'_>) -> Vec<(String, String)> {
     let reserved = wire::reserved_sigv4_headers();
+    // An operator's `default_headers` entry is a standing misconfiguration
+    // and warns. A forwarded CLIENT header is not — the caller chooses
+    // whether to send one, so a warning there is a log-volume lever in the
+    // caller's hand rather than something the operator can act on.
+    let forwarded = aisix_gateway::ForwardedClientHeaders::resolve(hdr);
     aisix_gateway::resolve_extra_headers(hdr)
         .into_iter()
-        .filter(|(name, _)| !reserved.contains(&name.as_str()))
+        .filter(|(name, _)| {
+            if reserved.contains(&name.as_str()) {
+                let dropped = "header not sent to a Bedrock upstream: AWS SigV4 derives \
+                               this header from the request it signs, so a supplied \
+                               value would break the signature rather than reach the \
+                               upstream";
+                if forwarded.claims(name.as_str()) {
+                    tracing::debug!(header = %name, "{dropped}");
+                } else {
+                    tracing::warn!(header = %name, "{dropped}");
+                }
+                return false;
+            }
+            true
+        })
         .map(|(name, value)| {
             (
                 name.as_str().to_string(),
@@ -637,6 +690,10 @@ impl Bridge for BedrockBridge {
         self.name
     }
 
+    fn wire_protocol(&self) -> &'static str {
+        aisix_core::Adapter::Bedrock.wire_protocol()
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,
@@ -691,6 +748,28 @@ impl Bridge for BedrockBridge {
                  (optionally prefixed with a cross-region inference profile like us. / eu. / apac.)"
             ))
         })?;
+        // The tool route's JSON only exists once the synthetic tool call
+        // has been assembled, so it cannot be streamed as it arrives.
+        // Run the request non-streaming — through `chat`, so each
+        // publisher keeps the wire it answers on — and fake-stream the
+        // translated result: the client sees an ordinary chunk sequence,
+        // and usage rides its own terminal chunk exactly as on a real
+        // stream.
+        if matches!(
+            bedrock_structured_output(req, upstream_id),
+            StructuredOutput::Tool(_)
+        ) {
+            // The leg is not streaming, so it runs under the budget a
+            // non-streaming call would have got — the streaming budget
+            // this context carries bounds a chunk gap, not a completion.
+            let chunks =
+                response_into_fake_stream_chunks(self.chat(req, &ctx.non_streaming_ctx()).await?);
+            return Ok(Box::pin(async_stream::stream! {
+                for chunk in chunks {
+                    yield Ok(chunk);
+                }
+            }));
+        }
         // Phase G productionization (#302 Step 3): unified Converse
         // stream path for all publishers — same SDK call (.converse_stream)
         // owns the AWS event-stream binary frame decoding internally,
@@ -832,7 +911,17 @@ impl BedrockBridge {
 
         let (system, messages) =
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
-        let anthropic_req = build_request(req, upstream_id, system, messages, false);
+        // The Anthropic request builder reads the Claude family version
+        // off the model name to pick a structured-output shape, and
+        // `anthropic.claude-…` is not a name it can read. Hand it the
+        // Claude name the Bedrock id carries; the `model` field it lands
+        // in is stripped below, since /invoke keys the model off the URL.
+        let anthropic_model = bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id);
+        let synthetic_json_tool = matches!(
+            structured_output_for(req, anthropic_model),
+            StructuredOutput::Tool(_)
+        );
+        let anthropic_req = build_request(req, anthropic_model, system, messages, false);
         let mut body_value = serde_json::to_value(&anthropic_req)
             .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
         // Apply the per-ProviderKey body override pipeline (#340) BEFORE the
@@ -866,7 +955,11 @@ impl BedrockBridge {
 
         let parsed: AnthropicResponse = serde_json::from_slice(resp.body().as_ref())
             .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-        Ok(response_into_chat_response(parsed))
+        let mut chat = response_into_chat_response(parsed);
+        if synthetic_json_tool {
+            unwrap_json_tool_call(&mut chat);
+        }
+        Ok(chat)
     }
 
     /// Resolve credentials + build an SDK client. Pulled out of
@@ -948,11 +1041,31 @@ impl BedrockBridge {
         if let Some(cfg) = build_inference_config(req, pk_param_constraints(ctx)) {
             call = call.inference_config(cfg);
         }
+        if let Some(fields) = build_converse_additional_model_request_fields(req, upstream_id) {
+            call = call.additional_model_request_fields(fields);
+        }
+        // A caller's `response_format` becomes one of two request shapes
+        // here, picked by whether the model constrains its own decoding.
+        let structured = bedrock_structured_output(req, upstream_id);
+        let mut json_tool_schema = None;
+        match &structured {
+            StructuredOutput::None => {}
+            StructuredOutput::Native(schema) => {
+                if let Some(cfg) = build_output_config(req, schema) {
+                    call = call.output_config(cfg);
+                }
+            }
+            StructuredOutput::Tool(schema) => json_tool_schema = Some(schema),
+        }
         // #560: forward OpenAI `tools` / `tool_choice` into Converse's
         // `toolConfig`. Without this every Converse publisher silently
         // drops tool calling and improvises the call as prose
         // (finish_reason=stop, tool_calls=[]).
-        if let Some(tc) = build_tool_config(req) {
+        if let Some(tc) = build_tool_config(
+            req,
+            json_tool_schema,
+            BedrockPublisher::from_model_id(upstream_id),
+        ) {
             call = call.tool_config(tc);
         }
 
@@ -960,7 +1073,11 @@ impl BedrockBridge {
             .send()
             .await
             .map_err(|e| map_converse_sdk_error(e, started, deadline))?;
-        Ok(converse_output_into_chat_response(resp, upstream_id))
+        let mut chat = converse_output_into_chat_response(resp, upstream_id);
+        if json_tool_schema.is_some() {
+            unwrap_json_tool_call(&mut chat);
+        }
+        Ok(chat)
     }
 
     /// Dispatch Bedrock chat via the unified Converse stream API.
@@ -1018,9 +1135,21 @@ impl BedrockBridge {
         if let Some(cfg) = build_inference_config(req, pk_param_constraints(ctx)) {
             call = call.inference_config(cfg);
         }
+        if let Some(fields) = build_converse_additional_model_request_fields(req, upstream_id) {
+            call = call.additional_model_request_fields(fields);
+        }
+        // Only the native structured-output shape reaches this path —
+        // `chat_stream` diverts the tool route before it gets here,
+        // because a tool call cannot be streamed before it is complete.
+        if let StructuredOutput::Native(schema) = bedrock_structured_output(req, upstream_id) {
+            if let Some(cfg) = build_output_config(req, &schema) {
+                call = call.output_config(cfg);
+            }
+        }
         // #560: forward tools on the stream path too (all publishers,
         // incl. Anthropic, stream through Converse).
-        if let Some(tc) = build_tool_config(req) {
+        if let Some(tc) = build_tool_config(req, None, BedrockPublisher::from_model_id(upstream_id))
+        {
             call = call.tool_config(tc);
         }
 
@@ -1083,6 +1212,13 @@ fn build_converse_inputs(
     let mut pending_tool_results: Vec<ContentBlock> = Vec::new();
 
     for msg in &req.messages {
+        // Converse has no slot for replayed reasoning, and a turn that
+        // holds only that would become a blank text block, which Converse
+        // rejects. Skipped before the flush below, so tool results on
+        // either side of it still coalesce as if it were not there.
+        if msg.is_reasoning_only() {
+            continue;
+        }
         // Flush buffered tool results as one user message before any
         // non-tool message opens.
         if !matches!(msg.role, Role::Tool) && !pending_tool_results.is_empty() {
@@ -1238,12 +1374,19 @@ fn converse_output_into_chat_response(
         }
         _ => (ChatMessage::assistant(String::new()), FinishReason::Stop),
     };
+    // Converse reports prompt-cache tokens as counters SEPARATE from
+    // `inputTokens`, the Anthropic accounting shape — so they map onto
+    // the Anthropic-shape `UsageStats` fields, not `cached_prompt_tokens`
+    // (AISIX-Cloud#1404). Absent for models and regions with no prompt
+    // caching, which reads as 0 and emits no series.
     let usage = resp
         .usage()
         .map(|u| UsageStats {
             prompt_tokens: u.input_tokens().max(0) as u32,
             completion_tokens: u.output_tokens().max(0) as u32,
             total_tokens: u.total_tokens().max(0) as u32,
+            cache_read_tokens: u.cache_read_input_tokens().unwrap_or(0).max(0) as u32,
+            cache_creation_tokens: u.cache_write_input_tokens().unwrap_or(0).max(0) as u32,
             ..Default::default()
         })
         .unwrap_or_default();
@@ -1417,6 +1560,11 @@ fn emit_converse_chunk(
                         prompt_tokens: u.input_tokens.max(0) as u32,
                         completion_tokens: u.output_tokens.max(0) as u32,
                         total_tokens: u.total_tokens.max(0) as u32,
+                        // Same mapping as the non-streaming branch — the
+                        // metadata event carries the identical shape.
+                        cache_read_tokens: u.cache_read_input_tokens.unwrap_or(0).max(0) as u32,
+                        cache_creation_tokens: u.cache_write_input_tokens.unwrap_or(0).max(0)
+                            as u32,
                         ..Default::default()
                     }),
                 });
@@ -1720,6 +1868,157 @@ fn build_inference_config(
     Some(b.build())
 }
 
+/// Carry Anthropic-specific reasoning controls through Bedrock Converse.
+/// Anthropic non-streaming requests use the native `/invoke` envelope, where
+/// `build_request` already translates `reasoning_effort`; streaming has to use
+/// Converse and therefore places the same provider fields under
+/// `additionalModelRequestFields`. Other Bedrock publishers must not receive
+/// Anthropic parameters they may reject.
+fn build_converse_additional_model_request_fields(
+    req: &ChatFormat,
+    upstream_id: &str,
+) -> Option<aws_smithy_types::Document> {
+    if BedrockPublisher::from_model_id(upstream_id) != Some(BedrockPublisher::Anthropic) {
+        return None;
+    }
+
+    let mut extras = req.extra.clone();
+    translate_reasoning_effort_to_anthropic(&mut extras);
+    let mut fields = serde_json::Map::new();
+    for name in ["thinking", "output_config", "anthropic_beta"] {
+        if let Some(value) = extras.remove(name) {
+            fields.insert(name.to_string(), value);
+        }
+    }
+    if fields.is_empty() {
+        None
+    } else {
+        Some(json_to_document(&serde_json::Value::Object(fields)))
+    }
+}
+
+/// Decide what a request's OpenAI `response_format` becomes on Bedrock.
+///
+/// The decision is the Anthropic crate's — same gate, same schema
+/// sealing — asked with the Claude model name Bedrock's id *carries*
+/// rather than the id itself, which that gate cannot read. Every model
+/// that is not a Claude one keeps [`StructuredOutput::Tool`], which
+/// needs no capability beyond tool calling; AWS's native structured
+/// output on Converse covers the same Claude families Anthropic's own
+/// API does.
+fn bedrock_structured_output(req: &ChatFormat, upstream_id: &str) -> StructuredOutput {
+    let decided = structured_output_for(
+        req,
+        bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id),
+    );
+    // The tool route only exists where the model can call a tool at
+    // all. Attaching a `toolConfig` to a publisher whose Converse
+    // implementation has none fails the whole request — and it would
+    // fail a request carrying no tools of its own, purely because the
+    // caller asked for JSON. Leaving the field unhonoured is the lesser
+    // outcome, and is what these models did before.
+    if matches!(decided, StructuredOutput::Tool(_))
+        && !converse_supports_tool_use(BedrockPublisher::from_model_id(upstream_id))
+    {
+        tracing::debug!(
+            model = %upstream_id,
+            "dropping response_format: this Bedrock publisher supports neither native structured output nor tool use"
+        );
+        return StructuredOutput::None;
+    }
+    decided
+}
+
+/// Whether this publisher's Converse implementation supports tool use at
+/// all, per AWS's supported-model table. Titan Text has none, and
+/// `Other` is the set this bridge has not classified — several of which
+/// (DeepSeek R1 among them) also reject `toolConfig`.
+///
+/// Only the *synthetic* tool is gated on this. A caller who sent their
+/// own `tools` still gets them forwarded: an explicit unsupported tool
+/// request is theirs to see rejected, which is what #560 shipped.
+fn converse_supports_tool_use(publisher: Option<BedrockPublisher>) -> bool {
+    matches!(
+        publisher,
+        Some(BedrockPublisher::Anthropic)
+            | Some(BedrockPublisher::AmazonNova)
+            | Some(BedrockPublisher::Meta)
+            | Some(BedrockPublisher::Mistral)
+            | Some(BedrockPublisher::Cohere)
+    )
+}
+
+/// Pull the Anthropic model name out of a Bedrock model id:
+/// `anthropic.claude-sonnet-4-5-20250929-v1:0` and its region-prefixed
+/// (`us.anthropic.…`) and ARN (`arn:…:inference-profile/us.anthropic.…`)
+/// spellings all yield `claude-sonnet-4-5-20250929-v1:0`.
+///
+/// `None` for every other id — another publisher, or a
+/// provisioned-model / application-inference-profile ARN whose last
+/// segment is an opaque id. An opaque id names a model the gateway
+/// cannot identify, so it takes the tool path, which works regardless.
+fn bedrock_claude_model_name(model_id: &str) -> Option<&str> {
+    // An inference-profile or provisioned-model ARN carries the model id
+    // in its last path segment; a bare id has no `/` and is unchanged.
+    let tail = model_id.rsplit('/').next().unwrap_or(model_id);
+    let (tag, rest) = strip_region_prefix(tail).split_once('.')?;
+    if !tag.eq_ignore_ascii_case("anthropic") {
+        return None;
+    }
+    rest.get(..6)
+        .is_some_and(|head| head.eq_ignore_ascii_case("claude"))
+        .then_some(rest)
+}
+
+/// The `outputConfig` carrying a schema Bedrock constrains decoding to.
+///
+/// Converse takes the schema as a JSON **string**, not as an object —
+/// `jsonSchema.schema` is typed `String` in the API. `name` is the
+/// caller's own schema name where they sent one, since it is what they
+/// see quoted back in a schema-compilation error.
+fn build_output_config(req: &ChatFormat, schema: &serde_json::Value) -> Option<OutputConfig> {
+    let json_schema = req.extra.get("response_format")?.get("json_schema");
+    let mut definition = JsonSchemaDefinition::builder().schema(schema.to_string());
+    definition = definition.name(
+        json_schema
+            .and_then(|j| j.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or(DEFAULT_JSON_SCHEMA_NAME),
+    );
+    if let Some(description) = json_schema
+        .and_then(|j| j.get("description"))
+        .and_then(|d| d.as_str())
+    {
+        definition = definition.description(description);
+    }
+    let format = OutputFormat::builder()
+        .r#type(OutputFormatType::JsonSchema)
+        .structure(OutputFormatStructure::JsonSchema(definition.build().ok()?))
+        .build()
+        .ok()?;
+    Some(OutputConfig::builder().text_format(format).build())
+}
+
+/// Schema name sent when the caller did not name theirs. `name` is
+/// required on the wire even though the SDK models it as optional.
+const DEFAULT_JSON_SCHEMA_NAME: &str = "structured_output";
+
+/// Whether Converse honours an explicit `toolChoice` for this
+/// publisher. Per AWS, forcing a specific tool is Anthropic Claude and
+/// Amazon Nova only; every other publisher rejects the field, so the
+/// synthetic tool is merely offered there and the model is trusted to
+/// take the only tool on the table.
+///
+/// This gates only the forcing the *gateway* adds. A `tool_choice` the
+/// caller set themselves still goes through unchanged — an explicit
+/// unsupported force is theirs to see rejected.
+fn converse_honours_forced_tool_choice(publisher: Option<BedrockPublisher>) -> bool {
+    matches!(
+        publisher,
+        Some(BedrockPublisher::Anthropic) | Some(BedrockPublisher::AmazonNova)
+    )
+}
+
 /// Build a Converse [`ToolConfiguration`] from the OpenAI `tools` /
 /// `tool_choice` the caller sent — they arrive in [`ChatFormat::extra`]
 /// (the gateway captures unknown top-level request fields there). Returns
@@ -1741,15 +2040,49 @@ fn build_inference_config(
 /// References:
 /// <https://platform.openai.com/docs/api-reference/chat/create#chat-create-tool_choice>,
 /// <https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ToolChoice.html>
-fn build_tool_config(req: &ChatFormat) -> Option<ToolConfiguration> {
+///
+/// `json_tool_schema` is the structured-output tool route: a schema to
+/// append as the synthetic [`JSON_TOOL_NAME`] tool and force the model
+/// onto. Forcing is what makes the reply JSON rather than a suggestion
+/// the model may ignore, and three things outrank it — a `tool_choice`
+/// the caller set themselves, extended thinking (which Anthropic rejects
+/// beside a forced choice), and a publisher whose Converse
+/// implementation has no `toolChoice` at all. Each leaves the synthetic
+/// tool on offer under the model's own `auto`.
+fn build_tool_config(
+    req: &ChatFormat,
+    json_tool_schema: Option<&serde_json::Value>,
+    publisher: Option<BedrockPublisher>,
+) -> Option<ToolConfiguration> {
     // OpenAI `tool_choice:"none"` means "don't call any tool this turn".
     // Converse has no `none`, so send no toolConfig — the model answers
     // in prose, honouring the user-visible contract (no tool call). Tool
     // visibility is lost, but that matches the intent of "none".
-    if req.extra.get("tool_choice").and_then(|v| v.as_str()) == Some("none") {
+    //
+    // A `response_format` asking for JSON contradicts it: the JSON has
+    // to come out of a tool call on this route. The schema wins — the
+    // caller's `response_format` is the more specific statement about
+    // what the answer must be — and the contradiction still costs the
+    // forcing, so the model is only offered the tool.
+    let caller_forbade_tools =
+        req.extra.get("tool_choice").and_then(|v| v.as_str()) == Some("none");
+    if caller_forbade_tools && json_tool_schema.is_none() {
         return None;
     }
-    let tools_json = req.extra.get("tools").and_then(|v| v.as_array())?;
+    // With `response_format` beside it the schema wins — the JSON has to
+    // come out of a tool call on this route — but only the synthetic
+    // tool goes on the table. Putting the caller's own tools back under
+    // no `toolChoice` would hand the model exactly what "none" told it
+    // not to use.
+    let tools_json = if caller_forbade_tools {
+        &[][..]
+    } else {
+        req.extra
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    };
     let mut tools: Vec<Tool> = Vec::new();
     for entry in tools_json {
         // OpenAI only defines `type:"function"` tools today; skip any
@@ -1785,11 +2118,36 @@ fn build_tool_config(req: &ChatFormat) -> Option<ToolConfiguration> {
             tools.push(Tool::ToolSpec(spec));
         }
     }
+    if let Some(schema) = json_tool_schema {
+        if let Ok(spec) = ToolSpecification::builder()
+            .name(JSON_TOOL_NAME)
+            .description(JSON_TOOL_DESCRIPTION)
+            .input_schema(ToolInputSchema::Json(json_to_document(schema)))
+            .build()
+        {
+            tools.push(Tool::ToolSpec(spec));
+        }
+    }
     if tools.is_empty() {
         return None;
     }
     let mut config = ToolConfiguration::builder().set_tools(Some(tools));
-    if let Some(choice) = req.extra.get("tool_choice").and_then(map_tool_choice) {
+    let client_set_tool_choice = tool_choice_states_a_preference(req.extra.get("tool_choice"));
+    let thinking_enabled = req
+        .extra
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t != "disabled");
+    let force_json_tool = json_tool_schema.is_some()
+        && !client_set_tool_choice
+        && !thinking_enabled
+        && converse_honours_forced_tool_choice(publisher);
+    if force_json_tool {
+        if let Ok(choice) = SpecificToolChoice::builder().name(JSON_TOOL_NAME).build() {
+            config = config.tool_choice(ToolChoice::Tool(choice));
+        }
+    } else if let Some(choice) = req.extra.get("tool_choice").and_then(map_tool_choice) {
         config = config.tool_choice(choice);
     }
     config.build().ok()
@@ -1824,6 +2182,27 @@ fn map_tool_choice(choice: &serde_json::Value) -> Option<ToolChoice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+
+    async fn consume_invalid_mock_stream(result: Result<ChatChunkStream, BridgeError>) {
+        match result {
+            Err(BridgeError::Transport(message)) => {
+                assert!(
+                    !message.is_empty(),
+                    "transport error must explain the failure"
+                );
+            }
+            Err(other) => panic!("unexpected mock stream error: {other:?}"),
+            Ok(mut stream) => {
+                while let Some(chunk) = stream.next().await {
+                    assert!(
+                        chunk.is_err(),
+                        "a non-eventstream mock must not yield a valid chat chunk"
+                    );
+                }
+            }
+        }
+    }
 
     // ─── Mid-stream event errors (AISIX-Cloud#1222) ──────────────────
 
@@ -2526,6 +2905,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn anthropic_effort_reaches_both_invoke_and_converse_stream_wires() {
+        let server = MockServer::start().await;
+        let invoke = CapturingResponder::default();
+        let stream = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(invoke.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse-stream$"))
+            .respond_with(stream.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-effort",
+            sample_model_with("anthropic.claude-opus-4-5-20251101-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let mut req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        req.extra
+            .insert("reasoning_effort".to_string(), serde_json::json!("high"));
+
+        bridge.chat(&req, &ctx).await.unwrap();
+        consume_invalid_mock_stream(bridge.chat_stream(&req, &ctx).await).await;
+
+        let invoke_body = invoke.captured_body.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            invoke_body
+                .pointer("/output_config/effort")
+                .and_then(|v| v.as_str()),
+            Some("high"),
+            "legacy non-streaming wire lost reasoning effort; body={invoke_body}"
+        );
+        let stream_body = stream.captured_body.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            stream_body
+                .pointer("/additionalModelRequestFields/output_config/effort")
+                .and_then(|v| v.as_str()),
+            Some("high"),
+            "ConverseStream wire must carry the same Anthropic effort; body={stream_body}"
+        );
+        assert!(
+            stream_body.pointer("/reasoning_effort").is_none(),
+            "OpenAI-shaped reasoning_effort must not leak onto the Bedrock wire; body={stream_body}"
+        );
+    }
+
+    #[tokio::test]
     async fn chat_anthropic_uses_sigv4_authorization_header() {
         // The SDK signs with SigV4: `Authorization: AWS4-HMAC-SHA256 ...`.
         // This is a wire-level pin that the SDK actually signed (vs.
@@ -3066,7 +3498,7 @@ mod tests {
         // valid eventstream) OR returns Err directly from the SDK.
         // Both prove the dispatch reached wiremock — wiremock's
         // `.expect(1)` enforces this on drop.
-        let _ = bridge.chat_stream(&req, &ctx).await;
+        consume_invalid_mock_stream(bridge.chat_stream(&req, &ctx).await).await;
     }
 
     #[tokio::test]
@@ -3091,7 +3523,7 @@ mod tests {
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
-        let _ = bridge.chat_stream(&req, &ctx).await;
+        consume_invalid_mock_stream(bridge.chat_stream(&req, &ctx).await).await;
     }
 
     /// Audit HIGH-1+HIGH-2 (PR #389): Converse 4xx must preserve
@@ -3505,6 +3937,620 @@ mod tests {
         );
     }
 
+    // ─── Structured outputs: chat `response_format` → Bedrock ─────────
+
+    /// The schema shape a caller sends, and the Bedrock spellings of one
+    /// Claude model id.
+    fn structured_request(schema: serde_json::Value) -> ChatFormat {
+        let mut req = ChatFormat::new("my-model", vec![ChatMessage::user("who are you")]);
+        req.extra.insert(
+            "response_format".into(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "person", "schema": schema, "strict": true},
+            }),
+        );
+        req
+    }
+
+    fn person_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "nickname": {"type": "string"},
+            },
+            "required": ["name"],
+        })
+    }
+
+    /// Drive the real dispatch against wiremock and hand back what
+    /// reached the wire. `route` is the Bedrock operation suffix
+    /// (`invoke`, `converse`, `converse-stream`); the canned reply is
+    /// deliberately not a valid one for every route — the request is
+    /// captured before the response is decoded.
+    async fn capture_bedrock_body(
+        model_id: &str,
+        route: &str,
+        req: &ChatFormat,
+        streaming: bool,
+    ) -> serde_json::Value {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(format!(r"^/model/.+/{route}$")))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with(model_id),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        if streaming {
+            let _ = bridge.chat_stream(req, &ctx).await;
+        } else {
+            let _ = bridge.chat(req, &ctx).await;
+        }
+        let body = responder.captured_body.lock().unwrap().clone();
+        body.unwrap_or_else(|| panic!("no {route} request was captured"))
+    }
+
+    #[test]
+    fn native_gate_reads_the_claude_name_out_of_the_bedrock_model_id() {
+        // Bedrock wraps the Anthropic model name in a publisher tag, an
+        // optional cross-region prefix and (for profiles) an ARN path.
+        // The native structured-output gate has to see through all three
+        // or every Claude on Bedrock silently takes the tool path.
+        let req = structured_request(person_schema());
+        for id in [
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "eu.anthropic.claude-opus-4-5-20251101-v1:0",
+            "arn:aws:bedrock:us-east-1:1234:inference-profile/us.anthropic.claude-sonnet-4-5-v1:0",
+        ] {
+            assert!(
+                matches!(
+                    bedrock_structured_output(&req, id),
+                    StructuredOutput::Native(_)
+                ),
+                "{id} should take the native path"
+            );
+        }
+        for id in [
+            // Claude, but older than the families that constrain their
+            // own decoding — the trailing release date is not a minor.
+            "anthropic.claude-sonnet-4-20250514-v1:0",
+            "us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "anthropic.claude-3-haiku-20240307-v1:0",
+            // Other publishers whose Converse supports tool use.
+            "amazon.nova-pro-v1:0",
+            "meta.llama3-3-70b-instruct-v1:0",
+            "mistral.mistral-large-2407-v1:0",
+            "cohere.command-r-plus-v1:0",
+        ] {
+            assert!(
+                matches!(
+                    bedrock_structured_output(&req, id),
+                    StructuredOutput::Tool(_)
+                ),
+                "{id} should take the tool path"
+            );
+        }
+        for id in [
+            // No native structured output AND no Converse tool use, so
+            // there is no shape to translate into. Dropping the field
+            // keeps these models answering as they did before rather
+            // than failing the request on a `toolConfig` they reject.
+            "amazon.titan-text-express-v1",
+            "deepseek.r1-v1:0",
+            "ai21.jamba-1-5-large-v1:0",
+            // A profile ARN whose last segment is an opaque id naming no
+            // model this gateway can identify.
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abcd1234",
+            "arn:aws:bedrock:us-east-1:123456789012:provisioned-model/xyz",
+        ] {
+            assert!(
+                matches!(bedrock_structured_output(&req, id), StructuredOutput::None),
+                "{id} has no structured-output shape and must drop the field"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invoke_path_carries_the_schema_in_output_config_for_a_4_5_claude() {
+        // Claude on Bedrock answers non-streaming over the Anthropic
+        // Messages wire at /invoke, whose native control is
+        // `output_config.format` — AWS documents it on that route.
+        let body = capture_bedrock_body(
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "invoke",
+            &structured_request(person_schema()),
+            false,
+        )
+        .await;
+        let format = &body["output_config"]["format"];
+        assert_eq!(format["type"], "json_schema");
+        assert_eq!(format["schema"]["additionalProperties"], false);
+        // A caller's optional property stays optional.
+        assert_eq!(format["schema"]["required"], serde_json::json!(["name"]));
+        assert!(body.get("response_format").is_none(), "body={body}");
+        assert!(body.get("tools").is_none(), "body={body}");
+    }
+
+    #[tokio::test]
+    async fn a_messages_request_to_bedrock_claude_keeps_its_optional_properties() {
+        // The `/v1/messages` inbound translation used to apply OpenAI
+        // strict mode's all-required promotion before any bridge saw the
+        // request, which made a caller's optional property mandatory on
+        // this edge. The promotion now happens at the OpenAI edge only.
+        let mut extra = serde_json::json!({
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "nickname": {"type": "string"},
+                        },
+                        "required": ["name"],
+                    },
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        aisix_provider_anthropic::wire::translate_extras_to_openai_shape(
+            &mut extra,
+            aisix_core::MappedEffort::AsWritten,
+        );
+        let mut req = ChatFormat::new("my-model", vec![ChatMessage::user("who are you")]);
+        req.extra = extra;
+
+        let body = capture_bedrock_body(
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "invoke",
+            &req,
+            false,
+        )
+        .await;
+        let schema = &body["output_config"]["format"]["schema"];
+        assert_eq!(schema["required"], serde_json::json!(["name"]));
+        // Sealing still happens — Bedrock rejects an open object.
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[tokio::test]
+    async fn invoke_path_falls_back_to_the_synthetic_tool_on_an_older_claude() {
+        let body = capture_bedrock_body(
+            "anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "invoke",
+            &structured_request(person_schema()),
+            false,
+        )
+        .await;
+        let tools = body["tools"]
+            .as_array()
+            .expect("synthetic tool on the wire");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], JSON_TOOL_NAME);
+        assert_eq!(tools[0]["input_schema"]["additionalProperties"], false);
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!({"type": "tool", "name": JSON_TOOL_NAME})
+        );
+        assert!(body.get("output_config").is_none(), "body={body}");
+    }
+
+    #[tokio::test]
+    async fn converse_stream_carries_the_schema_as_a_json_string_in_output_config() {
+        // Streaming goes through Converse for every publisher, and
+        // Converse takes the schema as a STRING, not as an object.
+        let body = capture_bedrock_body(
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "converse-stream",
+            &structured_request(person_schema()),
+            true,
+        )
+        .await;
+        let text_format = &body["outputConfig"]["textFormat"];
+        assert_eq!(text_format["type"], "json_schema");
+        let definition = &text_format["structure"]["jsonSchema"];
+        // The caller's own schema name, so a compilation error quotes
+        // something they recognise.
+        assert_eq!(definition["name"], "person");
+        let schema: serde_json::Value = serde_json::from_str(
+            definition["schema"]
+                .as_str()
+                .expect("schema is a JSON string"),
+        )
+        .expect("schema string parses back");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], serde_json::json!(["name"]));
+        assert!(body.get("toolConfig").is_none(), "body={body}");
+    }
+
+    #[tokio::test]
+    async fn converse_output_config_carries_the_narrowed_schema() {
+        // Bedrock documents the same unsupported-keyword set as
+        // Anthropic for its structured outputs, so what goes into the
+        // `outputConfig` string has already been narrowed.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"name": {"type": "string", "maxLength": 20}},
+        });
+        let mut req = structured_request(schema);
+        req.stream = Some(true);
+        let body = capture_bedrock_body(
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "converse-stream",
+            &req,
+            true,
+        )
+        .await;
+        let sent: serde_json::Value = serde_json::from_str(
+            body["outputConfig"]["textFormat"]["structure"]["jsonSchema"]["schema"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(sent["properties"]["name"].get("maxLength").is_none());
+        assert_eq!(sent["properties"]["name"]["description"], "maxLength: 20");
+    }
+
+    #[tokio::test]
+    async fn converse_tool_path_appends_the_synthetic_tool_and_forces_it_on_nova() {
+        let body = capture_bedrock_body(
+            "amazon.nova-pro-v1:0",
+            "converse",
+            &structured_request(person_schema()),
+            false,
+        )
+        .await;
+        let tools = body["toolConfig"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["toolSpec"]["name"], JSON_TOOL_NAME);
+        assert_eq!(
+            tools[0]["toolSpec"]["inputSchema"]["json"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            body["toolConfig"]["toolChoice"]["tool"]["name"],
+            JSON_TOOL_NAME
+        );
+        assert!(body.get("outputConfig").is_none(), "body={body}");
+    }
+
+    #[tokio::test]
+    async fn converse_tool_path_leaves_the_choice_auto_where_the_family_has_none() {
+        // Converse honours an explicit `toolChoice` on Anthropic and
+        // Amazon Nova only; sending one anywhere else fails the whole
+        // request, so the synthetic tool is offered rather than forced.
+        let body = capture_bedrock_body(
+            "meta.llama3-3-70b-instruct-v1:0",
+            "converse",
+            &structured_request(person_schema()),
+            false,
+        )
+        .await;
+        let tools = body["toolConfig"]["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["toolSpec"]["name"], JSON_TOOL_NAME);
+        assert!(
+            body["toolConfig"].get("toolChoice").is_none(),
+            "body={body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn converse_tool_path_keeps_the_callers_tools_and_their_tool_choice() {
+        let mut req = structured_request(person_schema());
+        req.extra.insert(
+            "tools".into(),
+            serde_json::json!([{
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}},
+            }]),
+        );
+        req.extra.insert(
+            "tool_choice".into(),
+            serde_json::json!({"type": "function", "function": {"name": "get_weather"}}),
+        );
+        let body = capture_bedrock_body("amazon.nova-pro-v1:0", "converse", &req, false).await;
+        let tools = body["toolConfig"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["toolSpec"]["name"], "get_weather");
+        assert_eq!(tools[1]["toolSpec"]["name"], JSON_TOOL_NAME);
+        // A choice the caller made themselves outranks the forcing.
+        assert_eq!(
+            body["toolConfig"]["toolChoice"]["tool"]["name"],
+            "get_weather"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_choice_of_auto_still_outranks_forcing_the_synthetic_tool() {
+        // `auto` is the client saying the model decides. Overriding it
+        // would mean an agent loop's own tools could never be called
+        // while `response_format` is set. The synthetic tool is still
+        // offered, so the model can reach the JSON by itself.
+        let mut req = structured_request(person_schema());
+        req.extra.insert("tool_choice".into(), "auto".into());
+        let body = capture_bedrock_body("amazon.nova-pro-v1:0", "converse", &req, false).await;
+        assert_eq!(
+            body["toolConfig"]["tools"][0]["toolSpec"]["name"],
+            JSON_TOOL_NAME
+        );
+        assert!(
+            body["toolConfig"].get("toolChoice").is_none(),
+            "body={body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn converse_tool_choice_none_offers_only_the_synthetic_tool() {
+        // "none" means the caller wants no tool call this turn. The
+        // schema still has to come out of one on this route, but their
+        // own tools must not go back on the table unforced.
+        let mut req = structured_request(person_schema());
+        req.extra.insert(
+            "tools".into(),
+            serde_json::json!([{
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}},
+            }]),
+        );
+        req.extra.insert("tool_choice".into(), "none".into());
+        let body = capture_bedrock_body("amazon.nova-pro-v1:0", "converse", &req, false).await;
+        let tools = body["toolConfig"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["toolSpec"]["name"], JSON_TOOL_NAME);
+        assert!(
+            body["toolConfig"].get("toolChoice").is_none(),
+            "body={body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_publisher_without_tool_use_gets_no_tool_config_from_response_format() {
+        // Titan Text has no Converse tool support; a `toolConfig` it
+        // never asked for would fail the whole request.
+        let body = capture_bedrock_body(
+            "amazon.titan-text-express-v1",
+            "converse",
+            &structured_request(person_schema()),
+            false,
+        )
+        .await;
+        assert!(body.get("toolConfig").is_none(), "body={body}");
+        assert!(body.get("outputConfig").is_none(), "body={body}");
+    }
+
+    #[tokio::test]
+    async fn converse_tool_path_leaves_the_choice_auto_under_extended_thinking() {
+        let mut req = structured_request(person_schema());
+        req.extra.insert(
+            "thinking".into(),
+            serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
+        );
+        let body = capture_bedrock_body("amazon.nova-pro-v1:0", "converse", &req, false).await;
+        assert_eq!(
+            body["toolConfig"]["tools"][0]["toolSpec"]["name"],
+            JSON_TOOL_NAME
+        );
+        assert!(
+            body["toolConfig"].get("toolChoice").is_none(),
+            "body={body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_object_without_a_schema_emits_nothing_on_either_bedrock_path() {
+        let mut req = ChatFormat::new("my-model", vec![ChatMessage::user("hi")]);
+        req.extra.insert(
+            "response_format".into(),
+            serde_json::json!({"type": "json_object"}),
+        );
+        let invoke = capture_bedrock_body(
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "invoke",
+            &req,
+            false,
+        )
+        .await;
+        assert!(invoke.get("output_config").is_none(), "body={invoke}");
+        assert!(invoke.get("tools").is_none(), "body={invoke}");
+        assert!(invoke.get("response_format").is_none(), "body={invoke}");
+
+        let converse = capture_bedrock_body("amazon.nova-pro-v1:0", "converse", &req, false).await;
+        assert!(converse.get("outputConfig").is_none(), "body={converse}");
+        assert!(converse.get("toolConfig").is_none(), "body={converse}");
+    }
+
+    #[tokio::test]
+    async fn a_small_stream_budget_does_not_cut_the_fake_stream_leg() {
+        // On a streaming dispatch `ctx.deadline` is the streaming budget,
+        // which bounds a chunk gap rather than a whole completion. The
+        // tool route's upstream leg is not streaming, so it runs under
+        // the end-to-end budget the context carries alongside it.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(250))
+                    .set_body_json(serde_json::json!({
+                        "id": "msg_json",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-3-5-sonnet-20240620-v1",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_json",
+                            "name": JSON_TOOL_NAME,
+                            "input": {"name": "Ada"},
+                        }],
+                        "stop_reason": "tool_use",
+                        "usage": {"input_tokens": 9, "output_tokens": 4},
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("anthropic.claude-3-5-sonnet-20240620-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        )
+        // A chunk-gap budget the completion would blow through, beside
+        // the end-to-end budget it fits inside.
+        .with_deadline(Duration::from_millis(50))
+        .with_non_streaming_deadline(Some(Duration::from_secs(30)));
+
+        let mut req = structured_request(person_schema());
+        req.stream = Some(true);
+        let stream = bridge
+            .chat_stream(&req, &ctx)
+            .await
+            .expect("the fake-stream leg must not be cut by the chunk-gap budget");
+        let chunks: Vec<ChatChunk> = futures::StreamExt::collect::<Vec<_>>(stream)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            chunks[1].delta.content.as_deref(),
+            Some(r#"{"name":"Ada"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn converse_synthetic_tool_reply_comes_back_as_json_content() {
+        // The reverse translation: the model's call to the synthetic
+        // tool is the answer, so the client sees plain JSON content and
+        // no tool call it never asked for.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": {"message": {"role": "assistant", "content": [
+                    {"toolUse": {
+                        "toolUseId": "tooluse_json",
+                        "name": JSON_TOOL_NAME,
+                        "input": {"name": "Ada"}
+                    }}
+                ]}},
+                "stopReason": "tool_use",
+                "usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15},
+                "metrics": {"latencyMs": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("amazon.nova-pro-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let chat = bridge
+            .chat(&structured_request(person_schema()), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(chat.message.content.as_deref(), Some(r#"{"name":"Ada"}"#));
+        assert!(!chat.message.extra.contains_key("tool_calls"));
+        assert_eq!(chat.finish_reason, FinishReason::Stop);
+    }
+
+    #[tokio::test]
+    async fn invoke_synthetic_tool_reply_comes_back_as_json_content() {
+        // The /invoke half of the reverse translation: Claude families
+        // that cannot constrain their own decoding answer by calling the
+        // synthetic tool, and that call is the answer.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_json",
+                "model": "claude-3-5-sonnet-20240620-v1",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_json",
+                    "name": JSON_TOOL_NAME,
+                    "input": {"name": "Ada"},
+                }],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 9, "output_tokens": 4},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("anthropic.claude-3-5-sonnet-20240620-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let chat = bridge
+            .chat(&structured_request(person_schema()), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(chat.message.content.as_deref(), Some(r#"{"name":"Ada"}"#));
+        assert!(!chat.message.extra.contains_key("tool_calls"));
+        assert_eq!(chat.finish_reason, FinishReason::Stop);
+    }
+
+    #[tokio::test]
+    async fn streaming_the_tool_path_fake_streams_the_non_streaming_answer() {
+        // The JSON only exists once the tool call is complete, so the
+        // stream request never reaches Converse: it runs over the
+        // publisher's own non-streaming wire and is rendered as chunks.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_json",
+                "model": "claude-3-5-sonnet-20240620-v1",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_json",
+                    "name": JSON_TOOL_NAME,
+                    "input": {"name": "Ada"},
+                }],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 9, "output_tokens": 4},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("anthropic.claude-3-5-sonnet-20240620-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let mut req = structured_request(person_schema());
+        req.stream = Some(true);
+        let stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        let chunks: Vec<ChatChunk> = futures::StreamExt::collect::<Vec<_>>(stream)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks[0].delta.role, Some(Role::Assistant));
+        assert_eq!(
+            chunks[1].delta.content.as_deref(),
+            Some(r#"{"name":"Ada"}"#)
+        );
+        assert_eq!(chunks[2].finish_reason, Some(FinishReason::Stop));
+        assert!(chunks[3].usage.is_some());
+    }
+
     #[tokio::test]
     async fn chat_converse_translates_tool_use_response_to_tool_calls() {
         // The other half of #560: a Converse `toolUse` content block must
@@ -3576,6 +4622,188 @@ mod tests {
             chat.message.content.is_none(),
             "content must be null alongside tool_calls when there is no prose"
         );
+    }
+
+    /// AISIX-Cloud#1404: Converse reports prompt-cache tokens as
+    /// counters SEPARATE from `inputTokens` — the Anthropic accounting
+    /// shape — so they must land on the Anthropic-shape `UsageStats`
+    /// fields and leave `inputTokens` alone. Before this mapping the
+    /// bridge discarded them, and every Bedrock prompt-cache series read
+    /// as a permanent zero.
+    #[tokio::test]
+    async fn chat_converse_maps_prompt_cache_tokens_beside_the_input_count() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": {"message": {"role": "assistant", "content": [{"text": "cached"}]}},
+                "stopReason": "end_turn",
+                "usage": {
+                    "inputTokens": 40,
+                    "outputTokens": 11,
+                    "totalTokens": 51,
+                    "cacheReadInputTokens": 800,
+                    "cacheWriteInputTokens": 200
+                },
+                "metrics": {"latencyMs": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        // Nova rather than Claude: Anthropic-on-Bedrock dispatches
+        // through the legacy `/invoke` path, so Converse is only
+        // reachable with a publisher `chat()` routes there.
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("amazon.nova-lite-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-nova", vec![ChatMessage::user("cached prompt")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+
+        assert_eq!(chat.usage.cache_read_tokens, 800);
+        assert_eq!(chat.usage.cache_creation_tokens, 200);
+        // The upstream's own input and total counts pass through
+        // untouched — the cache counters sit beside them, and adding
+        // them in here would double-count against the gateway's
+        // cache-inclusive total.
+        assert_eq!(chat.usage.prompt_tokens, 40);
+        assert_eq!(chat.usage.total_tokens, 51);
+        // Bedrock reports no OpenAI-shape cached subset.
+        assert_eq!(chat.usage.cached_prompt_tokens, 0);
+
+        // …and because they sit beside `inputTokens`, a client asking in
+        // OpenAI accounting must be told the full 1040 input, not the 40
+        // (AISIX-Cloud#1447). Converse's own `totalTokens` excludes the
+        // cache entirely, which is why the client-facing total is
+        // recomputed rather than echoed.
+        assert_eq!(chat.usage.openai_prompt_tokens(), 1040);
+        assert_eq!(chat.usage.openai_cached_tokens(), 800);
+        assert_eq!(chat.usage.openai_total_tokens(), 1051);
+        assert_eq!(chat.usage.anthropic_input_tokens(), 40);
+    }
+
+    /// Claude on Bedrock dispatches through the legacy `/invoke` path,
+    /// not Converse, so that is where Bedrock prompt-cache traffic
+    /// actually lands today. The Anthropic wire decoder already carries
+    /// the two counters; this pins that they survive the Bedrock
+    /// envelope rather than being dropped on the way through.
+    #[tokio::test]
+    async fn chat_invoke_anthropic_carries_prompt_cache_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_bedrock_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3-5-haiku-20241022",
+                "content": [{"type": "text", "text": "cached"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 40,
+                    "output_tokens": 11,
+                    "cache_read_input_tokens": 800,
+                    "cache_creation_input_tokens": 200
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("anthropic.claude-3-5-haiku-20241022-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let chat = bridge
+            .chat(
+                &ChatFormat::new("my-claude", vec![ChatMessage::user("cached prompt")]),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(chat.usage.cache_read_tokens, 800);
+        assert_eq!(chat.usage.cache_creation_tokens, 200);
+        assert_eq!(chat.usage.prompt_tokens, 40);
+        // The cache-inclusive total folds them in (#906), and the
+        // OpenAI-shape subset stays empty.
+        assert_eq!(chat.usage.total_tokens, 40 + 11 + 800 + 200);
+        assert_eq!(chat.usage.cached_prompt_tokens, 0);
+    }
+
+    /// A model or region without prompt caching omits both fields, which
+    /// must read as zero rather than as an inferred value.
+    #[tokio::test]
+    async fn chat_converse_without_cache_fields_reports_no_cache_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 5, "outputTokens": 4, "totalTokens": 9},
+                "metrics": {"latencyMs": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("amazon.nova-lite-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let chat = bridge
+            .chat(
+                &ChatFormat::new("my-nova", vec![ChatMessage::user("hi")]),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(chat.usage.cache_read_tokens, 0);
+        assert_eq!(chat.usage.cache_creation_tokens, 0);
+    }
+
+    /// A replayed turn that holds only `reasoning_content` is skipped
+    /// rather than sent as a blank text block, which leaves the history
+    /// alternating the way Converse requires.
+    #[test]
+    fn build_converse_inputs_skips_a_reasoning_only_assistant_turn() {
+        let req: ChatFormat = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "15C"},
+                {"role": "assistant", "content": null, "reasoning_content": "it is mild"},
+                {"role": "assistant", "content": "15C in Paris."}
+            ]
+        }))
+        .unwrap();
+        let (_systems, messages) = build_converse_inputs(&req).unwrap();
+        let roles: Vec<ConversationRole> = messages.iter().map(|m| m.role().clone()).collect();
+        assert_eq!(
+            roles,
+            [
+                ConversationRole::User,
+                ConversationRole::Assistant,
+                ConversationRole::User,
+                ConversationRole::Assistant,
+            ]
+        );
+        assert!(matches!(
+            messages[3].content(),
+            [ContentBlock::Text(t)] if t == "15C in Paris."
+        ));
     }
 
     #[test]
@@ -4379,7 +5607,7 @@ mod tests {
                 "param_constraints": { "temperature_max": 1.0 }
             })),
         );
-        let _ = bridge.chat_stream(&req, &ctx).await;
+        consume_invalid_mock_stream(bridge.chat_stream(&req, &ctx).await).await;
 
         let body = responder.captured_body.lock().unwrap().clone().unwrap();
         let cfg = body
@@ -4548,6 +5776,92 @@ mod tests {
                 assert!(msg.contains("cohere.embed-"));
             }
             other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod forwarded_header_tests {
+    use super::*;
+    use aisix_core::RequestOverrides;
+    use std::collections::HashMap;
+
+    fn overrides(defaults: &[(&str, &str)], forward: &[&str]) -> RequestOverrides {
+        RequestOverrides {
+            default_headers: defaults
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<HashMap<_, _>>(),
+            forward_client_headers: forward.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn header_map(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::new();
+        for (k, v) in pairs {
+            map.insert(
+                k.parse::<http::HeaderName>().unwrap(),
+                http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn a_forwarded_header_reaches_the_interceptor() {
+        let r = overrides(&[], &["x-user-jwt"]);
+        let inbound = header_map(&[("x-user-jwt", "callers-own")]);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+        assert_eq!(
+            filtered_extra_headers(&ctx),
+            vec![("x-user-jwt".to_string(), "callers-own".to_string())]
+        );
+    }
+
+    /// The interceptor that consumes this list is FIRST-WINS, unlike every
+    /// other delivery site, so the two features must already be ordered by
+    /// the time they get here: an operator's static header wins.
+    #[test]
+    fn an_operator_header_outranks_a_forwarded_one_of_the_same_name() {
+        let r = overrides(&[("x-user-jwt", "static")], &["x-user-jwt"]);
+        let inbound = header_map(&[("x-user-jwt", "callers-own")]);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+        assert_eq!(
+            filtered_extra_headers(&ctx),
+            vec![("x-user-jwt".to_string(), "static".to_string())]
+        );
+    }
+
+    /// A credential slot is the one name the forward takes from the static
+    /// entry, here as on every other face. The signer-owned slots are
+    /// dropped from this list entirely (below), so the names this actually
+    /// reaches are the ones a Bedrock-compatible endpoint reads for itself.
+    #[test]
+    fn a_forwarded_credential_outranks_a_static_operator_one() {
+        for slot in ["x-api-key", "cookie", "api-key"] {
+            let r = overrides(&[(slot, "operator-static")], &[slot]);
+            let inbound = header_map(&[(slot, "callers-own")]);
+            let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+            assert_eq!(
+                filtered_extra_headers(&ctx),
+                vec![(slot.to_string(), "callers-own".to_string())],
+                "{slot}"
+            );
+        }
+    }
+
+    /// The SigV4 filter is this bridge's own, narrower rule: the signer
+    /// DERIVES these headers, so a configured value cannot authenticate
+    /// anyone here — unlike every other upstream, where naming a credential
+    /// slot is exactly the point.
+    #[test]
+    fn a_signed_slot_is_refused_from_both_sources() {
+        for slot in ["authorization", "x-amz-date", "x-amz-content-sha256"] {
+            let r = overrides(&[(slot, "static")], &[slot]);
+            let inbound = header_map(&[(slot, "callers-own")]);
+            let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+            assert!(filtered_extra_headers(&ctx).is_empty(), "{slot}");
         }
     }
 }

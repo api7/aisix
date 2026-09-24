@@ -44,18 +44,17 @@ jobs:
 
           VERSION="${TAG#v}"            # v0.4.0 -> 0.4.0 (image tags carry no leading v)
 
-          # Rolling-tags sentence. docker-image.yml publishes the :X.Y (and
-          # :latest) tags only for stable releases; docker/metadata-action skips
-          # major.minor for pre-release semver, so a -rc draft must not advertise
-          # an :X.Y tag that never gets pushed.
+          # Rolling-tag sentence. A version tag is published in full only —
+          # there is no :X.Y or :X abbreviation — and docker-image.yml moves
+          # :latest for stable releases only, so a -rc draft must not advertise
+          # a `latest` tag that never points at it.
           PKG="https://github.com/orgs/api7/packages/container/package/aisix"
           case "$TAG" in
             *-*)
               ROLLING="Other image tags and the \`docker.io/api7/aisix\` mirror for private/offline deployments are listed on the [package page]($PKG)."
               ;;
             *)
-              MINOR="${VERSION%.*}"     # 0.4.0 -> 0.4
-              ROLLING="Rolling tags (\`$MINOR\`, \`latest\`) and the \`docker.io/api7/aisix\` mirror for private/offline deployments are listed on the [package page]($PKG)."
+              ROLLING="The rolling \`latest\` tag and the \`docker.io/api7/aisix\` mirror for private/offline deployments are listed on the [package page]($PKG)."
               ;;
           esac
 

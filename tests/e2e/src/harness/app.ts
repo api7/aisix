@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { stringify as yamlStringify } from "yaml";
 
 import { pickFreePorts } from "./ports.js";
-import { EtcdClient } from "./etcd.js";
+import { EtcdClient, etcdEndpoint } from "./etcd.js";
 import { harnessRequest } from "./http.js";
 
 export interface AppOverrides {
@@ -54,7 +54,21 @@ export interface AppOverrides {
    * rewriting: first matching rule wins, `rewrite` replaces the matched
    * portion of the path.
    */
-  urlRewrites?: Array<{ name?: string; match: string; rewrite: string }>;
+  urlRewrites?: Array<{ name?: string; hosts?: string[]; match: string; rewrite: string }>;
+  /**
+   * `proxy.listeners` — the COMPLETE set of proxy listeners, replacing
+   * the single `proxy.addr` one (AISIX-Cloud#1662). One harness-picked
+   * free port per entry; the bound URLs come back as
+   * `SpawnedApp.proxyUrls`, in the same order, `https://` for an entry
+   * that carries `tls`.
+   *
+   * `proxy.addr` is still written — the field stays required — and is
+   * NOT bound. At least one entry has to be plaintext: readiness and
+   * `SpawnedApp.proxyUrl` use the first one that is, and a set with no
+   * plaintext listener would leave the harness probing a port nothing
+   * serves plain HTTP on.
+   */
+  proxyListeners?: Array<{ tls?: { cert_file: string; key_file: string } }>;
   /**
    * `proxy.request_body_limit_bytes`. A dedicated override (like
    * `realIp`) because `extra` replaces whole top-level blocks and the
@@ -71,6 +85,13 @@ export interface AppOverrides {
    * AccessKey deliberately never travels on the config path.
    */
   extraEnv?: Record<string, string>;
+  /**
+   * Start the binary with NO `--config` argument, handing it the generated
+   * config's path through `AISIX_CONFIG` instead — the clap env fallback a
+   * `command:`-less container image relies on. Off by default: every other
+   * spec should exercise the argument, which is what the entrypoint passes.
+   */
+  configViaEnv?: boolean;
   /**
    * `proxy.thread_per_core`. Omitted, the binary picks its platform
    * default, which is what the suite should normally exercise.
@@ -119,6 +140,32 @@ export interface AppOverrides {
    */
   etcdPrefix?: string;
   /**
+   * Whether readiness waits for the proxy `/livez` to answer. **Defaults
+   * to `true`**; `false` skips that gate.
+   *
+   * The proxy listener does not bind until the gateway has applied its
+   * first configuration, so a spec that deliberately starves the gateway
+   * of configuration would otherwise fail in `spawnApp` instead of in its
+   * own assertions. Readiness then rests on the metrics listener, which
+   * binds regardless of the configuration source — so `prometheus` (or
+   * `admin`) must stay on, and `spawnApp` rejects the combination that
+   * would leave it with nothing to wait for.
+   */
+  awaitProxyListener?: boolean;
+  /**
+   * Whether readiness waits for ANY listener. **Defaults to `true`.**
+   *
+   * `false` returns as soon as the process is spawned, for the one shape
+   * `awaitProxyListener` cannot express: a gateway that binds nothing at
+   * all. The boot dials etcd before any listener is opened, so an
+   * endpoint that accepts TCP and then goes silent leaves the process
+   * running with no port at all — which now takes an explicit
+   * `dial_timeout_ms: 0`, since the key defaults to 5000 ms. A spec that
+   * opts out has only `output()` to assert on, so it must poll for the
+   * line it expects rather than assume the binary got anywhere.
+   */
+  awaitListeners?: boolean;
+  /**
    * `managed.snapshot_cache_path` — enables the on-disk snapshot cache
    * (#871) without managed mode. Point two sequential apps (same
    * `etcdPrefix`) at one path to exercise cache-restored restarts.
@@ -128,7 +175,17 @@ export interface AppOverrides {
 }
 
 export interface SpawnedApp {
+  /**
+   * The proxy base URL to drive. With `proxyListeners`, the first
+   * plaintext listener of the set; otherwise the single `proxy.addr`
+   * listener.
+   */
   proxyUrl: string;
+  /**
+   * Every bound proxy listener, in configured order. One element unless
+   * `proxyListeners` asked for more.
+   */
+  proxyUrls: string[];
   adminUrl: string;
   adminKey: string;
   etcdPrefix: string;
@@ -149,6 +206,18 @@ export interface SpawnedApp {
    * instead of sleeping.
    */
   output(): string;
+  /**
+   * Stop reading the binary's stdout/stderr, leaving its log pipe to
+   * fill exactly as a container runtime's log shim does while kubelet
+   * rotates and compresses the container log. Everything written after
+   * this is invisible to `output()` until `releaseLogSink()`.
+   *
+   * For asserting that a stalled log consumer does not stall the
+   * gateway. Nothing else should need it.
+   */
+  holdLogSink(): void;
+  /** Resume draining after `holdLogSink()`. */
+  releaseLogSink(): void;
   signal(signal: NodeJS.Signals): void;
   /**
    * Resolves when the process exits on its own — no signal is sent, no
@@ -234,8 +303,9 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   // file source stays exercisable even without the shared etcd.
   if (!fileMode && !(await etcd.ping())) {
     throw new Error(
-      `etcd not reachable at ${process.env.AISIX_E2E_ETCD ?? "http://127.0.0.1:2379"} ` +
-        "(set AISIX_E2E_ETCD or run `docker run --rm -p 2379:2379 quay.io/coreos/etcd:v3.5.15`)",
+      `etcd not reachable at ${etcdEndpoint()} ` +
+        "(set AISIX_E2E_ETCD_ENDPOINTS — which takes precedence — or AISIX_E2E_ETCD, " +
+          "or run `docker run --rm -p 2379:2379 quay.io/coreos/etcd:v3.5.15`)",
     );
   }
 
@@ -251,7 +321,45 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       "spawnApp: control the admin listener with the `admin` boolean override, not `extra.admin`",
     );
   }
-  const [proxyPort, adminPort, metricsPort] = await pickFreePorts(3);
+  if (overrides.awaitListeners === false && overrides.awaitProxyListener !== undefined) {
+    throw new Error(
+      "spawnApp: awaitListeners:false already skips every readiness gate — " +
+        "drop the awaitProxyListener override, which reads as if `/livez` were " +
+        "still being waited on",
+    );
+  }
+  if (overrides.awaitProxyListener === false) {
+    // Readiness now rests entirely on the other two listeners, so both the
+    // ways of turning them off have to be refused. `extra` counts: it
+    // replaces whole top-level blocks, so an `extra.observability` can
+    // disable the metrics listener the readiness probe is waiting on while
+    // `prometheusEnabled` still reads true — spawnApp would then sit out its
+    // full readiness timeout.
+    if (!adminEnabled && !prometheusEnabled) {
+      throw new Error(
+        "spawnApp: awaitProxyListener:false needs `admin` or `prometheus` on — " +
+          "with all three off nothing is waited on, so spawnApp would return before " +
+          "the binary has started and a later non-zero exit could not surface",
+      );
+    }
+    if (overrides.extra && "observability" in overrides.extra) {
+      throw new Error(
+        "spawnApp: awaitProxyListener:false cannot be combined with " +
+          "`extra.observability` — it replaces the generated metrics block, which is " +
+          "what readiness waits on once the proxy listener is not",
+      );
+    }
+  }
+  const listenerSpecs = overrides.proxyListeners;
+  if (listenerSpecs && !listenerSpecs.some((l) => l.tls === undefined)) {
+    throw new Error(
+      "spawnApp: `proxyListeners` needs at least one plaintext entry — readiness " +
+        "and `proxyUrl` use the first one, and the harness has no TLS-trusting client",
+    );
+  }
+  const [proxyPort, adminPort, metricsPort, ...listenerPorts] = await pickFreePorts(
+    3 + (listenerSpecs?.length ?? 0),
+  );
   const adminKey = overrides.adminKey ?? `admin-${randomUUID()}`;
   const etcdPrefix = overrides.etcdPrefix ?? `/aisix-e2e-${randomUUID()}`;
 
@@ -267,11 +375,16 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     ...(fileMode
       ? { resources_file: resourcesPath }
       : {
+          // Neither timeout key is set: `request_timeout_ms` is then
+          // unbounded, which is the shipped default — a suite-wide bound
+          // on the configuration range read would be a source of flakes
+          // that no case is asking for. `dial_timeout_ms` takes its own
+          // shipped default (5000 ms) here for the same reason, so the
+          // suite exercises what an operator ships with; the cases that
+          // ARE about those keys set them through `extra`.
           etcd: {
-            endpoints: [process.env.AISIX_E2E_ETCD ?? "http://127.0.0.1:2379"],
+            endpoints: [etcdEndpoint()],
             prefix: etcdPrefix,
-            dial_timeout_ms: 5000,
-            request_timeout_ms: 5000,
           },
         }),
     proxy: {
@@ -283,6 +396,14 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
         ? { thread_per_core: overrides.threadPerCore ?? suiteThreadPerCore }
         : {}),
       ...(overrides.urlRewrites ? { url_rewrites: overrides.urlRewrites } : {}),
+      ...(listenerSpecs
+        ? {
+            listeners: listenerSpecs.map((listener, i) => ({
+              addr: `127.0.0.1:${listenerPorts[i]}`,
+              ...(listener.tls ? { tls: listener.tls } : {}),
+            })),
+          }
+        : {}),
     },
     admin: adminEnabled
       ? { addr: `127.0.0.1:${adminPort}`, admin_keys: [adminKey] }
@@ -311,8 +432,13 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     // specs rely on. Drain immediately here; the drain spec sets its own
     // window through `extra`.
     shutdown: { min_drain_secs: 0 },
-    ...(overrides.snapshotCachePath
-      ? { managed: { snapshot_cache_path: overrides.snapshotCachePath } }
+    ...(overrides.snapshotCachePath !== undefined
+      ? {
+          managed: {
+            snapshot_cache_enabled: overrides.snapshotCachePath !== "",
+            snapshot_cache_path: overrides.snapshotCachePath,
+          },
+        }
       : {}),
     ...(overrides.extra ?? {}),
   };
@@ -341,19 +467,21 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   for (const [k, v] of Object.entries(overrides.extraEnv ?? {})) {
     childEnv[k] = v;
   }
+  if (overrides.configViaEnv) childEnv.AISIX_CONFIG = cfgPath;
 
-  const child = spawn(BIN_PATH, ["--config", cfgPath], {
+  const args = overrides.configViaEnv ? [] : ["--config", cfgPath];
+  const child = spawn(BIN_PATH, args, {
     stdio: ["ignore", "pipe", "pipe"],
     env: childEnv,
   });
+  const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
 
   let stderrBuf = "";
-  child.stderr?.on("data", (c: Buffer) => {
+  const drain = (c: Buffer) => {
     stderrBuf += c.toString("utf8");
-  });
-  child.stdout?.on("data", (c: Buffer) => {
-    stderrBuf += c.toString("utf8");
-  });
+  };
+  child.stderr?.on("data", drain);
+  child.stdout?.on("data", drain);
   let exitErr: string | undefined;
   // Reject the readiness wait the moment the binary exits non-zero, so
   // an intentional boot failure (e.g. a malformed resources file)
@@ -367,55 +495,75 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     });
   });
 
-  const proxyUrl = `http://127.0.0.1:${proxyPort}`;
+  const proxyUrls = listenerSpecs
+    ? listenerSpecs.map(
+        (listener, i) =>
+          `${listener.tls ? "https" : "http"}://127.0.0.1:${listenerPorts[i]}`,
+      )
+    : [`http://127.0.0.1:${proxyPort}`];
+  // `proxy.addr` is unbound once a listener set is configured, so every
+  // gate and every client the harness hands back has to speak to a
+  // listener that exists.
+  const proxyUrl = proxyUrls.find((url) => url.startsWith("http://"))!;
   const adminUrl = `http://127.0.0.1:${adminPort}`;
   const metricsUrl = `http://127.0.0.1:${metricsPort}`;
 
   try {
-    await Promise.race([
-      Promise.all([
-        waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS),
-        // The admin health endpoint only exists when the admin listener is
-        // bound; with `admin: false` there is no admin surface, so gate on
-        // the proxy `/livez` and the metrics listener alone. (If both
-        // `admin` and `prometheus` are off, readiness reduces to the proxy
-        // `/livez` — liveness only; a case that needs config-propagation
-        // readiness should keep prometheus on, as the default does.)
-        ...(adminEnabled
-          ? [waitForReady(`${adminUrl}/admin/v1/health`, READY_TIMEOUT_MS, adminKey)]
-          : []),
-        // Gate on the dedicated metrics listener too, so scrapes in the test
-        // never race the listener coming up. Skipped when prometheus is
-        // disabled — nothing binds the metrics port then.
-        ...(prometheusEnabled
-          ? [
-              waitForReady(
-                `${metricsUrl}${overrides.prometheusPath ?? "/metrics"}`,
-                READY_TIMEOUT_MS,
-              ),
-            ]
-          : []),
-      ]),
-      exitedEarly,
-    ]);
+    // A spec that opted out of every gate owns its own waiting: nothing
+    // is listening to probe, so `output()` is the only signal there is.
+    if (overrides.awaitListeners === false) {
+      // `exitedEarly` is armed either way, and nothing is racing it here.
+      // Left alone, an early non-zero exit would surface as a bare
+      // unhandled rejection under vitest instead of through `waitForExit`
+      // and `output()`, which is where such a spec looks.
+      exitedEarly.catch(() => {});
+    } else {
+      await Promise.race([
+        Promise.all([
+          // The proxy listener binds only once a configuration has been
+          // applied, so a spec that holds configuration back opts out here.
+          ...((overrides.awaitProxyListener ?? true)
+            ? [waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS)]
+            : []),
+          // The admin health endpoint only exists when the admin listener is
+          // bound; with `admin: false` there is no admin surface, so gate on
+          // the proxy `/livez` and the metrics listener alone. (If both
+          // `admin` and `prometheus` are off, readiness reduces to the proxy
+          // `/livez` — liveness only; a case that needs config-propagation
+          // readiness should keep prometheus on, as the default does.)
+          ...(adminEnabled
+            ? [waitForReady(`${adminUrl}/admin/v1/health`, READY_TIMEOUT_MS, adminKey)]
+            : []),
+          // Gate on the dedicated metrics listener too, so scrapes in the test
+          // never race the listener coming up. Skipped when prometheus is
+          // disabled — nothing binds the metrics port then.
+          ...(prometheusEnabled
+            ? [
+                waitForReady(
+                  `${metricsUrl}${overrides.prometheusPath ?? "/metrics"}`,
+                  READY_TIMEOUT_MS,
+                ),
+              ]
+            : []),
+        ]),
+        exitedEarly,
+      ]);
+    }
   } catch (err) {
     const detail = exitErr ?? "still running";
-    // Keep the head too — a startup error (anyhow's `Error: …` line)
-    // prints before its backtrace, and a tail-only excerpt used to cut
-    // exactly the line that says what went wrong.
-    const stderr =
-      stderrBuf.length <= 3000
-        ? stderrBuf
-        : `${stderrBuf.slice(0, 1500)}\n  […]\n${stderrBuf.slice(-1500)}`;
     await terminate(child);
+    // `exit` can precede the final pipe data. Assertions need the full
+    // diagnostic, including an error between startup logs and a backtrace.
+    await closed;
     await cleanup(fileMode ? undefined : etcd, etcdPrefix, dir);
     throw new Error(
-      `${(err as Error).message}\n  binary state: ${detail}\n  stderr:\n${stderr}`,
+      `${(err as Error).message}\n  binary state: ${detail}\n  stderr:\n${stderrBuf}`,
     );
   }
 
   return {
     proxyUrl,
+    proxyUrls,
     adminUrl,
     adminKey,
     etcdPrefix,
@@ -423,6 +571,20 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     resourcesPath,
     output() {
       return stderrBuf;
+    },
+    holdLogSink() {
+      // `pause()` alone is not enough: a `data` listener puts the stream
+      // in flowing mode and keeps reading the fd.
+      child.stderr?.off("data", drain);
+      child.stdout?.off("data", drain);
+      child.stderr?.pause();
+      child.stdout?.pause();
+    },
+    releaseLogSink() {
+      child.stderr?.on("data", drain);
+      child.stdout?.on("data", drain);
+      child.stderr?.resume();
+      child.stdout?.resume();
     },
     signal(signal: NodeJS.Signals) {
       if (child.exitCode === null) child.kill(signal);

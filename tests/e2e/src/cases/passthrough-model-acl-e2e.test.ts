@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -56,6 +57,8 @@ describe("passthrough route ACL (allowed_routes)", () => {
       allowed_models: ["*"],
       allowed_routes: ["unrelated-route"],
     });
+    const proxy = new ProxyClient(app.proxyUrl, DENIED);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
   });
 
   afterAll(async () => {

@@ -11,10 +11,10 @@
 //! metrics/status listener to serve `GET /status/config`, `GET /status/ready`,
 //! and the `aisix_config_*` Prometheus series.
 //!
-//! Nothing here does new *tracking* — the etcd supervisor and the file source
-//! already collect rejected entries and revisions. This module gives that
-//! internal state one canonical, source-agnostic shape and derives the
-//! reported [`ConfigState`] from it.
+//! The etcd supervisor and file source supply loader observations. Runtime
+//! builders may add rejections for rows that passed the lenient loader but
+//! could not materialise; those are retained independently so a subsequent
+//! loader observation cannot erase a still-broken runtime row.
 //!
 //! ## Reported state
 //!
@@ -37,17 +37,52 @@
 //!   last-known-good bytes for keys serving stale (#871, see
 //!   `serving_stale_since` on `rejected[]`), and nothing for a rejected key
 //!   with no last good. When everything is accepted the two hashes are
-//!   equal; a rejection makes them diverge, with `rejected[]` as the
-//!   authoritative per-resource explanation.
+//!   equal; a rejection makes them diverge, with `rejected[]` (or, for a
+//!   `kind` segment this build does not know, `unknown_kinds[]`) as the
+//!   authoritative per-resource explanation. A row rejected later by a
+//!   runtime builder is removed from the reported count and derives a stable
+//!   effective hash from that loader hash plus the sorted rejected identities;
+//!   this keeps the source/applied hashes divergent without retaining a second
+//!   copy of every source document in the status handle.
 //! - **file**: `sha256` over the raw file bytes. On a clean load the applied
 //!   `config_hash` equals `source_hash` (the whole file is applied); on a
 //!   rejected reload the applied hash stays at the last-good file's hash.
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use ring::digest::{Context, SHA256};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
+use tokio::sync::watch;
+
+/// Maximum number of source + runtime rejection details retained for status
+/// and heartbeat reporting. Aggregate counts and the runtime identity digest
+/// still cover every rejection.
+pub const MAX_CONFIG_REJECTIONS: usize = 256;
+
+/// Maximum unknown-kind details retained, in its own budget so a newer
+/// control plane's forward-compatible volume can never evict a real
+/// rejection from [`MAX_CONFIG_REJECTIONS`] — a single new resource kind
+/// can account for one row per model in the environment.
+pub const MAX_CONFIG_UNKNOWN_KINDS: usize = 256;
+
+/// The loader's `RejectionKind::UnknownKind` rendered snake_case: the key
+/// named a `kind` segment this build does not know.
+///
+/// This is forward compatibility, not a load failure. Under the supported
+/// upgrade order the control plane upgrades first, and a new resource kind
+/// is a free change — every gateway in the field then reports the key as an
+/// unknown kind until it is upgraded, while serving, readiness and later
+/// configuration updates are unaffected. Such rows are therefore reported
+/// apart from real rejections: `unknown_kinds[]` rather than `rejected[]`,
+/// their own gauge rather than `aisix_config_rejected_resources`, and they
+/// never flip `last_reload.successful` (issue #1207). What does NOT change
+/// is the heartbeat: [`ConfigStatus::rejection_snapshots`] keeps reporting
+/// them to the control plane, which filters them by this same reason.
+const UNKNOWN_KIND_ERROR_KIND: &str = "unknown_kind";
+
+const MAX_REJECTION_ERROR_CHARS: usize = 256;
 
 /// Which source the data plane reads configuration from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -68,7 +103,8 @@ impl SourceKind {
 #[serde(rename_all = "snake_case")]
 pub enum ConfigState {
     /// Applied config matches the latest observed snapshot and nothing was
-    /// rejected.
+    /// rejected. Rows of a kind this build does not know are reported in
+    /// `unknown_kinds[]` and do not disturb this state (issue #1207).
     Synced,
     /// Applied config is serving, but the latest snapshot carried entries the
     /// gateway rejected.
@@ -131,7 +167,10 @@ pub struct RejectedResource {
     /// Resource id; empty when unparseable.
     pub resource_id: String,
     /// Snake-case failure kind: `bad_key | non_json | schema_failed |
-    /// parse_failed | unknown_kind` for etcd; a file classification otherwise.
+    /// parse_failed` for etcd; a file classification otherwise. `unknown_kind`
+    /// is deliberately absent — those rows are reported in
+    /// [`ConfigStatusView::unknown_kinds`] instead, and reach the control
+    /// plane through [`ConfigRejectionSnapshot`], which does carry them.
     pub last_error_kind: String,
     /// Human-readable error message. Schema-validation messages are
     /// credential-masked at the schema layer (instance values redacted before
@@ -155,6 +194,28 @@ pub struct RejectedResource {
     pub serving_stale_age_seconds: Option<u64>,
 }
 
+/// One resource whose `kind` segment this build does not know, as reported
+/// on the wire under `unknown_kinds[]`. Not a rejection: nothing an operator
+/// can fix, and nothing that means the last reload failed — see
+/// [`UNKNOWN_KIND_ERROR_KIND`].
+///
+/// Deliberately narrower than [`RejectedResource`]: `last_error_kind` is
+/// implied by the field, and `serving_stale_since` can never apply because a
+/// kind this build does not know has never had a value that served.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnknownKindResource {
+    /// Plural resource kind as written in the key (`pricing`, …).
+    pub resource_kind: String,
+    /// Resource id; empty when the key was unparseable.
+    pub resource_id: String,
+    /// Human-readable explanation from the load path.
+    pub last_error: String,
+    /// RFC3339 UTC timestamp the row was first observed this boot.
+    pub first_seen_at: String,
+    /// RFC3339 UTC timestamp the row was most recently observed.
+    pub last_seen_at: String,
+}
+
 /// One rejected entry handed to [`ConfigStatus`] by a load path. `identity`
 /// (the etcd key or file scope) is the stable merge key used to preserve
 /// `first_seen_at` across reloads; it is never serialized.
@@ -172,10 +233,26 @@ pub struct IncomingRejection {
     pub serving_stale_since: Option<DateTime<Utc>>,
 }
 
+/// A retained rejection snapshot for consumers outside the status HTTP
+/// surface, notably the managed-mode heartbeat.
+///
+/// `key` is the load path's stable identity. Loader rejections use the source
+/// key; runtime builders use a synthetic, stable identity for the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigRejectionSnapshot {
+    pub key: String,
+    pub kind: String,
+    pub error: String,
+    pub timestamp_unix_secs: u64,
+    pub stale_serving_since_unix_secs: Option<u64>,
+}
+
 /// One partially compatible observation, aggregated per (kind, field):
 /// `count` resources of `resource_kind` are currently served with `field`
-/// ignored because this gateway version does not know it — typically a
-/// field added by a newer control plane (issue #871). Shown next to
+/// ignored because this gateway version does not know it — a field the
+/// control plane added after this build, or one this build retired after
+/// the control plane; the two are indistinguishable from here (issue
+/// #871, AISIX-Cloud#1435). Shown next to
 /// `rejected[]` on `GET /status/config` so a matching `config_hash` can
 /// never silently hide that enforcement differs from the stored
 /// documents.
@@ -190,11 +267,154 @@ pub struct PartialCompatResource {
     pub count: usize,
 }
 
+/// A configuration digest, computed the first time something reports it.
+///
+/// Hashing is proportional to the whole configuration, not to the change
+/// that triggered the apply, so a gateway under a stream of small writes
+/// spends most of an apply re-digesting rows nothing touched — 44% of the
+/// apply thread's CPU at 53k api_keys and 14 writes a second. Nothing on
+/// the request path reads a digest: it reaches `GET /status/config`, the
+/// `aisix_config_hash_info` series and the heartbeat, all of which run at
+/// their own cadence and are happy to pay for it there. So an apply hands
+/// over the *means* to compute the digest and the identity of the bytes it
+/// would cover, and the first reader after that apply computes it once.
+///
+/// `version` identifies those bytes: two values with the same `version`
+/// digest the same input, which is what lets [`ConfigStatus`] decide
+/// whether the applied configuration changed without resolving either
+/// side. It is NOT a digest and never reaches the wire.
+///
+/// Resolution runs on a background-priority thread ([`crate::run_demoted`])
+/// because it is the same whole-configuration work an apply was demoted
+/// for; a caller inside an async runtime must therefore reach it from a
+/// blocking context.
+#[derive(Clone)]
+pub struct LazyHash {
+    version: u64,
+    inner: Arc<LazyHashInner>,
+}
+
+struct LazyHashInner {
+    compute: Box<dyn Fn() -> String + Send + Sync>,
+    value: OnceLock<String>,
+}
+
+impl LazyHash {
+    /// A digest that will be computed by `compute` on first report.
+    ///
+    /// `version` must change whenever the bytes `compute` would digest
+    /// change. The converse is owed only as far as the producer can give
+    /// it without digesting them: `apply_seq` keys on this, so a version
+    /// that moves where the digest would not costs an extra advance,
+    /// while one that fails to move loses an apply entirely.
+    pub fn deferred(version: u64, compute: impl Fn() -> String + Send + Sync + 'static) -> Self {
+        Self {
+            version,
+            inner: Arc::new(LazyHashInner {
+                compute: Box::new(compute),
+                value: OnceLock::new(),
+            }),
+        }
+    }
+
+    /// The same digest under a different identity.
+    ///
+    /// Two surfaces can report one digest and still disagree about when
+    /// it counts as having changed — the observed configuration and the
+    /// served one are the same bytes until something is rejected. This
+    /// shares the value, so reporting both costs one computation.
+    pub fn rekeyed(&self, version: u64) -> Self {
+        Self {
+            version,
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// A digest already in hand — the file source, where hashing is one
+    /// pass over bytes already read, and tests.
+    pub fn ready(value: impl Into<String>) -> Self {
+        let value = value.into();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        value.hash(&mut hasher);
+        let version = hasher.finish();
+        let cell = OnceLock::new();
+        let _ = cell.set(value);
+        Self {
+            version,
+            inner: Arc::new(LazyHashInner {
+                compute: Box::new(|| unreachable!("a ready digest is never computed")),
+                value: cell,
+            }),
+        }
+    }
+
+    /// Identity of the bytes this digest covers.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// The digest, computed once per [`LazyHash`] and shared by every
+    /// later reader of the same one.
+    pub fn get(&self) -> String {
+        if let Some(value) = self.inner.value.get() {
+            return value.clone();
+        }
+        self.inner
+            .value
+            .get_or_init(|| crate::run_demoted("config-hash", || (self.inner.compute)()))
+            .clone()
+    }
+}
+
+/// The applied digest as the status handle holds it: the served-bytes
+/// digest, plus the identities of rows a runtime builder rejected folded
+/// over it.
+///
+/// It exists so a reader can take it out from under the status lock and
+/// resolve it outside: `/readyz`, every configuration apply and the
+/// heartbeat take that lock, and the digest underneath is computed on a
+/// background-priority thread that a saturated core may keep waiting.
+#[derive(Debug, Clone)]
+struct EffectiveHash {
+    base: LazyHash,
+    runtime_rejections: Option<String>,
+}
+
+impl EffectiveHash {
+    fn get(&self) -> String {
+        let base = self.base.get();
+        let Some(identity_hash) = self.runtime_rejections.as_ref() else {
+            return base;
+        };
+        let mut hasher = Context::new(&SHA256);
+        hasher.update(b"aisix-runtime-filtered-v1\0");
+        hasher.update(base.as_bytes());
+        hasher.update(&[0u8]);
+        hasher.update(identity_hash.as_bytes());
+        hex(hasher.finish().as_ref())
+    }
+}
+
+impl<T: Into<String>> From<T> for LazyHash {
+    fn from(value: T) -> Self {
+        Self::ready(value)
+    }
+}
+
+impl std::fmt::Debug for LazyHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyHash")
+            .field("version", &self.version)
+            .field("resolved", &self.inner.value.get())
+            .finish()
+    }
+}
+
 /// The result of a snapshot the gateway actually applied (served).
 #[derive(Debug, Clone)]
 pub struct AppliedSnapshot {
     /// Hash of the accepted (served) entry set.
-    pub config_hash: String,
+    pub config_hash: LazyHash,
     /// etcd revision the applied snapshot reflects; `None` in file mode.
     pub revision: Option<i64>,
     /// Per-kind counts of served resources.
@@ -205,7 +425,7 @@ pub struct AppliedSnapshot {
 #[derive(Debug, Clone)]
 pub struct LoadObservation {
     /// Hash of the full raw snapshot observed from the source.
-    pub source_hash: String,
+    pub source_hash: LazyHash,
     /// etcd revision the observed snapshot reflects; `None` in file mode.
     pub observed_revision: Option<i64>,
     /// The applied snapshot, when this load produced/kept a served snapshot.
@@ -240,6 +460,12 @@ pub struct LoadObservation {
 #[derive(Debug, Clone)]
 pub struct ConfigStatus {
     inner: Arc<Mutex<ConfigStatusInner>>,
+    /// Level-triggered mirror of `inner.ever_applied`, so the boot path can
+    /// *await* the first apply instead of polling [`Self::is_ready`].
+    /// A `watch` rather than a `Notify` deliberately: a waiter that arrives
+    /// after the first apply resolves immediately instead of hanging on a
+    /// notification that already fired.
+    ever_applied_tx: Arc<watch::Sender<bool>>,
 }
 
 #[derive(Debug)]
@@ -260,12 +486,12 @@ struct ConfigStatusInner {
     // Observed (latest raw snapshot seen from the source).
     connected: bool,
     observed_revision: Option<i64>,
-    source_hash: Option<String>,
+    source_hash: Option<LazyHash>,
     observed_at: Option<DateTime<Utc>>,
 
     // Applied (last snapshot actually served).
     ever_applied: bool,
-    config_hash: Option<String>,
+    config_hash: Option<LazyHash>,
     applied_revision: Option<i64>,
     applied_at: Option<DateTime<Utc>>,
     apply_seq: u64,
@@ -284,6 +510,21 @@ struct ConfigStatusInner {
 
     // Retained rejections, keyed by source identity to keep first_seen stable.
     rejected: BTreeMap<String, RetainedRejection>,
+    rejected_counts: BTreeMap<String, usize>,
+
+    // Rows whose `kind` segment this build does not know, kept apart from
+    // the rejections above on both budget and classification
+    // (UNKNOWN_KIND_ERROR_KIND). Same identity keying, same replace-wholesale
+    // lifecycle as `rejected`.
+    unknown_kind: BTreeMap<String, RetainedRejection>,
+    unknown_kind_counts: BTreeMap<String, usize>,
+
+    // Rows accepted by the loader but rejected by a runtime builder. Kept
+    // separate because `record_load` replaces only the loader's observation;
+    // a watch event unrelated to the broken row must not clear its signal.
+    build_rejected: BTreeMap<String, RetainedRejection>,
+    build_rejected_counts: BTreeMap<String, usize>,
+    build_rejected_identity_hash: Option<String>,
 
     // Partially compatible observations for the served snapshot (#871).
     // Replaced wholesale on every load; the load paths own the retention.
@@ -310,6 +551,7 @@ impl ConfigStatus {
     /// Construct a status handle for a source. Starts in `never_loaded`.
     pub fn new(source_kind: SourceKind) -> Self {
         Self {
+            ever_applied_tx: Arc::new(watch::channel(false).0),
             inner: Arc::new(Mutex::new(ConfigStatusInner {
                 source_kind,
                 connected: false,
@@ -328,6 +570,12 @@ impl ConfigStatus {
                 last_reload_success_at: None,
                 last_failure: None,
                 rejected: BTreeMap::new(),
+                rejected_counts: BTreeMap::new(),
+                unknown_kind: BTreeMap::new(),
+                unknown_kind_counts: BTreeMap::new(),
+                build_rejected: BTreeMap::new(),
+                build_rejected_counts: BTreeMap::new(),
+                build_rejected_identity_hash: None,
                 partially_compatible: Vec::new(),
                 partially_compatible_rows_by_kind: BTreeMap::new(),
                 stale_served_rows_by_kind: BTreeMap::new(),
@@ -343,6 +591,8 @@ impl ConfigStatus {
     pub fn record_load(&self, obs: LoadObservation) {
         let now = Utc::now();
         let mut inner = self.inner.lock().unwrap();
+        let previous_effective_version = inner.effective_config_version();
+        let was_applied = inner.ever_applied;
 
         inner.connected = true;
         inner.observed_at = Some(now);
@@ -351,10 +601,10 @@ impl ConfigStatus {
         inner.latest_wholly_rejected = obs.wholly_rejected;
 
         if let Some(applied) = obs.applied {
-            let changed = inner.config_hash.as_deref() != Some(applied.config_hash.as_str());
-            if changed || !inner.ever_applied {
-                inner.apply_seq += 1;
-                inner.applied_at = Some(now);
+            if !was_applied {
+                // Open the boot-time proxy-listener gate. Sending under the
+                // inner lock is safe: waiters are woken, not run inline.
+                self.ever_applied_tx.send_replace(true);
             }
             inner.ever_applied = true;
             inner.config_hash = Some(applied.config_hash);
@@ -362,21 +612,58 @@ impl ConfigStatus {
             inner.resource_counts = applied.resource_counts;
         }
 
-        // Merge rejections, preserving first_seen for identities still present.
+        // Keep aggregate state for every rejection while retaining only a
+        // bounded detail set for unauthenticated status and heartbeat output.
+        // Unknown kinds are split out first: they are forward compatibility,
+        // so they contribute to neither the rejection counts, the reload
+        // reasons, nor the sticky failure (see UNKNOWN_KIND_ERROR_KIND).
+        let mut all_rejected = BTreeMap::new();
+        let mut all_unknown_kind = BTreeMap::new();
+        for rejection in obs.rejected {
+            if rejection.last_error_kind == UNKNOWN_KIND_ERROR_KIND {
+                all_unknown_kind.insert(rejection.identity.clone(), rejection);
+            } else {
+                all_rejected.insert(rejection.identity.clone(), rejection);
+            }
+        }
+        let mut rejected_counts = BTreeMap::new();
+        for rejection in all_rejected.values() {
+            *rejected_counts
+                .entry(rejection.resource_kind.clone())
+                .or_insert(0) += 1;
+        }
+        let mut unknown_kind_counts = BTreeMap::new();
+        for row in all_unknown_kind.values() {
+            *unknown_kind_counts
+                .entry(row.resource_kind.clone())
+                .or_insert(0) += 1;
+        }
+        let reload_reasons: BTreeMap<&'static str, ()> = all_rejected
+            .values()
+            .map(|r| {
+                (
+                    ReloadReason::from_error_kind(&r.last_error_kind).as_str(),
+                    (),
+                )
+            })
+            .collect();
+
+        // Merge details, preserving first_seen for identities still present.
         let mut merged: BTreeMap<String, RetainedRejection> = BTreeMap::new();
-        for r in obs.rejected {
+        let loader_limit = MAX_CONFIG_REJECTIONS.saturating_sub(inner.build_rejected.len());
+        for (identity, r) in all_rejected.into_iter().take(loader_limit) {
             let first_seen_at = inner
                 .rejected
-                .get(&r.identity)
+                .get(&identity)
                 .map(|prev| prev.first_seen_at)
                 .unwrap_or(r.seen_at);
             merged.insert(
-                r.identity,
+                identity,
                 RetainedRejection {
                     resource_kind: r.resource_kind,
                     resource_id: r.resource_id,
                     last_error_kind: r.last_error_kind,
-                    last_error: r.last_error,
+                    last_error: bounded_rejection_error(r.last_error),
                     first_seen_at,
                     last_seen_at: r.seen_at,
                     serving_stale_since: r.serving_stale_since,
@@ -384,11 +671,42 @@ impl ConfigStatus {
             );
         }
         inner.rejected = merged;
+        inner.rejected_counts = rejected_counts;
+
+        let mut merged_unknown: BTreeMap<String, RetainedRejection> = BTreeMap::new();
+        for (identity, r) in all_unknown_kind.into_iter().take(MAX_CONFIG_UNKNOWN_KINDS) {
+            let first_seen_at = inner
+                .unknown_kind
+                .get(&identity)
+                .map(|prev| prev.first_seen_at)
+                .unwrap_or(r.seen_at);
+            merged_unknown.insert(
+                identity,
+                RetainedRejection {
+                    resource_kind: r.resource_kind,
+                    resource_id: r.resource_id,
+                    last_error_kind: r.last_error_kind,
+                    last_error: bounded_rejection_error(r.last_error),
+                    first_seen_at,
+                    last_seen_at: r.seen_at,
+                    serving_stale_since: r.serving_stale_since,
+                },
+            );
+        }
+        inner.unknown_kind = merged_unknown;
+        inner.unknown_kind_counts = unknown_kind_counts;
         inner.partially_compatible = obs.partially_compatible;
         inner.partially_compatible_rows_by_kind = obs.partially_compatible_rows_by_kind;
         inner.stale_served_rows_by_kind = obs.stale_served_rows_by_kind;
 
-        let clean = inner.rejected.is_empty();
+        if inner.ever_applied
+            && (!was_applied || previous_effective_version != inner.effective_config_version())
+        {
+            inner.apply_seq += 1;
+            inner.applied_at = Some(now);
+        }
+
+        let clean = !inner.has_rejections();
         inner.last_reload_successful = clean;
         inner.last_reload_at = Some(now);
         if clean {
@@ -396,6 +714,7 @@ impl ConfigStatus {
         } else if let Some((kind, err)) = inner
             .rejected
             .values()
+            .chain(inner.build_rejected.values())
             .next()
             .map(|r| (r.last_error_kind.clone(), r.last_error.clone()))
         {
@@ -409,16 +728,92 @@ impl ConfigStatus {
         if obs.is_reload {
             inner.reloads_total += 1;
             // One increment per reason category present in this reload.
-            let mut reasons: BTreeMap<&'static str, ()> = BTreeMap::new();
-            for r in inner.rejected.values() {
-                reasons.insert(
-                    ReloadReason::from_error_kind(&r.last_error_kind).as_str(),
-                    (),
-                );
-            }
-            for reason in reasons.keys() {
+            for reason in reload_reasons.keys() {
                 *inner.reload_failures.entry(reason).or_insert(0) += 1;
             }
+        }
+    }
+
+    /// Replace the runtime-builder rejection set while preserving loader
+    /// rejections and each still-broken row's first-seen time.
+    ///
+    /// Called after a lazy runtime rebuild. Passing an empty vector clears
+    /// stale build failures after the offending row is fixed or removed.
+    pub fn record_build_rejections(&self, rejected: Vec<IncomingRejection>) {
+        let now = Utc::now();
+        let mut inner = self.inner.lock().unwrap();
+        let previous_effective_version = inner.effective_config_version();
+        let mut all_rejected = BTreeMap::new();
+        for rejection in rejected {
+            all_rejected.insert(rejection.identity.clone(), rejection);
+        }
+        let mut counts = BTreeMap::new();
+        for rejection in all_rejected.values() {
+            *counts.entry(rejection.resource_kind.clone()).or_insert(0) += 1;
+        }
+        let identity_hash = if all_rejected.is_empty() {
+            None
+        } else {
+            let mut hasher = Context::new(&SHA256);
+            hasher.update(b"aisix-runtime-rejections-v1\0");
+            for identity in all_rejected.keys() {
+                hasher.update(identity.as_bytes());
+                hasher.update(b"\n");
+            }
+            Some(hex(hasher.finish().as_ref()))
+        };
+
+        let mut merged = BTreeMap::new();
+        let build_limit = MAX_CONFIG_REJECTIONS.saturating_sub(inner.rejected.len());
+        for (identity, r) in all_rejected.into_iter().take(build_limit) {
+            let first_seen_at = inner
+                .build_rejected
+                .get(&identity)
+                .map(|prev| prev.first_seen_at)
+                .unwrap_or(r.seen_at);
+            merged.insert(
+                identity,
+                RetainedRejection {
+                    resource_kind: r.resource_kind,
+                    resource_id: r.resource_id,
+                    last_error_kind: r.last_error_kind,
+                    last_error: bounded_rejection_error(r.last_error),
+                    first_seen_at,
+                    last_seen_at: r.seen_at,
+                    serving_stale_since: r.serving_stale_since,
+                },
+            );
+        }
+        inner.build_rejected = merged;
+        inner.build_rejected_counts = counts;
+        inner.build_rejected_identity_hash = identity_hash;
+        if inner.ever_applied && previous_effective_version != inner.effective_config_version() {
+            inner.apply_seq += 1;
+            inner.applied_at = Some(now);
+        }
+
+        // A builder is constructed before the first source observation on a
+        // cold start. Its empty result must not fabricate a successful reload.
+        let clean = inner.connected && !inner.has_rejections();
+        inner.last_reload_successful = clean;
+        if inner.connected {
+            inner.last_reload_at = Some(now);
+            if clean {
+                inner.last_reload_success_at = Some(now);
+            }
+        }
+        if let Some((kind, err)) = inner
+            .build_rejected
+            .values()
+            .chain(inner.rejected.values())
+            .next()
+            .map(|r| (r.last_error_kind.clone(), r.last_error.clone()))
+        {
+            inner.last_failure = Some(StickyFailure {
+                at: now,
+                last_error_kind: kind,
+                last_error: err,
+            });
         }
     }
 
@@ -449,29 +844,127 @@ impl ConfigStatus {
         self.inner.lock().unwrap().ever_applied
     }
 
+    /// Resolve once a configuration has been applied — the awaitable form of
+    /// [`Self::is_ready`]. Returns immediately when an apply already
+    /// happened, so a caller cannot miss the signal by racing it.
+    ///
+    /// The boot path gates the proxy listener on this: an instance that has
+    /// never applied a configuration must not accept client traffic, because
+    /// a platform that reads "the TCP port accepts" as "this instance is
+    /// ready" would route to a gateway with nothing to serve.
+    pub async fn wait_until_applied(&self) {
+        // `wait_for` inspects the current value before it awaits.
+        // The error arm is unreachable — `self` owns the sender.
+        let _ = self.ever_applied_tx.subscribe().wait_for(|v| *v).await;
+    }
+
     /// The hash of the last applied (served) config snapshot, or `None`
     /// when no snapshot has been applied yet this boot. A cheap targeted
     /// read for callers that need only the hash — the heartbeat's
     /// per-node config-verification field — without building the full
     /// [`Self::view`] / [`Self::metrics`] snapshot.
     pub fn applied_config_hash(&self) -> Option<String> {
-        self.inner.lock().unwrap().config_hash.clone()
+        let hash = self.inner.lock().unwrap().effective_hash();
+        hash.map(|hash| hash.get())
+    }
+
+    /// Current loader + runtime-builder rejections for heartbeat reporting.
+    ///
+    /// Unknown kinds are included, with their `unknown_kind` reason intact:
+    /// the control plane is the one party that can tell "a kind no released
+    /// gateway reads yet" from "a kind this gateway alone is too old for",
+    /// and it filters them by that reason. Reporting them apart on the local
+    /// status surface (issue #1207) does not change what it receives.
+    pub fn rejection_snapshots(&self) -> Vec<ConfigRejectionSnapshot> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<_> = inner
+            .rejected
+            .iter()
+            .chain(inner.unknown_kind.iter())
+            .chain(inner.build_rejected.iter())
+            .map(|(key, r)| ConfigRejectionSnapshot {
+                key: key.clone(),
+                kind: r.last_error_kind.clone(),
+                error: r.last_error.clone(),
+                timestamp_unix_secs: r.last_seen_at.timestamp().max(0) as u64,
+                stale_serving_since_unix_secs: r
+                    .serving_stale_since
+                    .map(|at| at.timestamp().max(0) as u64),
+            })
+            .collect();
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        out
     }
 
     /// Point-in-time JSON view for `GET /status/config`.
+    ///
+    /// The two digests are resolved after the status lock is released, so
+    /// they are the ones the rest of the view was built from unless an
+    /// apply landed while they were being computed.
     pub fn view(&self) -> ConfigStatusView {
-        self.inner.lock().unwrap().view()
+        let (mut view, source, applied) = self.inner.lock().unwrap().view();
+        view.source.source_hash = source.map(|hash| hash.get());
+        if let Some(rendered) = view.applied.as_mut() {
+            rendered.config_hash = applied.map(|hash| hash.get()).unwrap_or_default();
+        }
+        view
     }
 
     /// Point-in-time numeric view for the `aisix_config_*` Prometheus series.
     pub fn metrics(&self) -> ConfigMetricsView {
-        self.inner.lock().unwrap().metrics()
+        let (mut metrics, applied) = self.inner.lock().unwrap().metrics();
+        metrics.config_hash = applied.map(|hash| hash.get());
+        metrics
     }
 }
 
 impl ConfigStatusInner {
+    fn has_rejections(&self) -> bool {
+        !self.rejected_counts.is_empty() || !self.build_rejected_counts.is_empty()
+    }
+
+    /// Identity of the applied configuration, without digesting it.
+    ///
+    /// Two observations with the same value cover the same bytes, which
+    /// is all `apply_seq` / `applied_at` need to decide whether the
+    /// applied configuration moved. Whether it is exact is the
+    /// producer's to say: the etcd source's is exact while everything
+    /// loads, and conservative once something is rejected — a write that
+    /// lands as a rejection counts as an apply even though what serves
+    /// did not change, because knowing otherwise means digesting the
+    /// served bytes, which is the cost this exists to defer.
+    fn effective_config_version(&self) -> Option<u64> {
+        let base = self.config_hash.as_ref()?.version();
+        let Some(identity_hash) = self.build_rejected_identity_hash.as_ref() else {
+            return Some(base);
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        base.hash(&mut hasher);
+        identity_hash.hash(&mut hasher);
+        Some(hasher.finish())
+    }
+
+    /// The reported applied digest, still unresolved. Resolving it walks
+    /// the whole observed configuration, so it is deliberately handed out
+    /// rather than computed here — see [`EffectiveHash`].
+    fn effective_hash(&self) -> Option<EffectiveHash> {
+        Some(EffectiveHash {
+            base: self.config_hash.clone()?,
+            runtime_rejections: self.build_rejected_identity_hash.clone(),
+        })
+    }
+
+    fn effective_resource_counts(&self) -> BTreeMap<String, usize> {
+        let mut counts = self.resource_counts.clone();
+        for (kind, rejected) in &self.build_rejected_counts {
+            let count = counts.entry(kind.clone()).or_default();
+            *count = count.saturating_sub(*rejected);
+        }
+        counts
+    }
+
     fn applied_total(&self) -> usize {
-        self.resource_counts.values().sum()
+        self.effective_resource_counts().values().sum()
     }
 
     fn derive_state(&self) -> ConfigState {
@@ -482,7 +975,7 @@ impl ConfigStatusInner {
             return ConfigState::OutOfSync;
         }
         let total = self.applied_total();
-        if !self.rejected.is_empty() {
+        if self.has_rejections() {
             // A whole-snapshot rejection that stored an empty snapshot still
             // reads as out-of-sync; a partial rejection is degraded.
             if total == 0 {
@@ -497,22 +990,24 @@ impl ConfigStatusInner {
         }
     }
 
-    fn view(&self) -> ConfigStatusView {
+    /// The view, minus the two digests: those come back unresolved so the
+    /// caller can compute them with the status lock released.
+    fn view(&self) -> (ConfigStatusView, Option<LazyHash>, Option<EffectiveHash>) {
         let etcd = self.source_kind.is_etcd();
         let source = SourceView {
             source_type: self.source_kind,
             connected: etcd.then_some(self.connected),
             observed_revision: if etcd { self.observed_revision } else { None },
-            source_hash: self.source_hash.clone(),
+            source_hash: None,
             observed_at: self.observed_at.map(rfc3339),
         };
         let applied = if self.ever_applied {
             Some(AppliedView {
                 applied_revision: if etcd { self.applied_revision } else { None },
-                config_hash: self.config_hash.clone().unwrap_or_default(),
+                config_hash: String::new(),
                 apply_seq: self.apply_seq,
                 applied_at: self.applied_at.map(rfc3339).unwrap_or_default(),
-                resource_counts: self.resource_counts.clone(),
+                resource_counts: self.effective_resource_counts(),
             })
         } else {
             None
@@ -530,6 +1025,7 @@ impl ConfigStatusInner {
         let mut rejected: Vec<RejectedResource> = self
             .rejected
             .values()
+            .chain(self.build_rejected.values())
             .map(|r| RejectedResource {
                 resource_kind: r.resource_kind.clone(),
                 resource_id: r.resource_id.clone(),
@@ -548,40 +1044,62 @@ impl ConfigStatusInner {
         rejected.sort_by(|a, b| {
             (&a.resource_kind, &a.resource_id).cmp(&(&b.resource_kind, &b.resource_id))
         });
+        let mut unknown_kinds: Vec<UnknownKindResource> = self
+            .unknown_kind
+            .values()
+            .map(|r| UnknownKindResource {
+                resource_kind: r.resource_kind.clone(),
+                resource_id: r.resource_id.clone(),
+                last_error: r.last_error.clone(),
+                first_seen_at: rfc3339(r.first_seen_at),
+                last_seen_at: rfc3339(r.last_seen_at),
+            })
+            .collect();
+        unknown_kinds.sort_by(|a, b| {
+            (&a.resource_kind, &a.resource_id).cmp(&(&b.resource_kind, &b.resource_id))
+        });
         let mut partially_compatible = self.partially_compatible.clone();
         partially_compatible
             .sort_by(|a, b| (&a.resource_kind, &a.field).cmp(&(&b.resource_kind, &b.field)));
-        ConfigStatusView {
-            state: self.derive_state(),
-            source,
-            applied,
-            last_reload,
-            last_failure,
-            rejected,
-            partially_compatible,
-        }
+        (
+            ConfigStatusView {
+                state: self.derive_state(),
+                source,
+                applied,
+                last_reload,
+                last_failure,
+                rejected,
+                unknown_kinds,
+                partially_compatible,
+            },
+            self.source_hash.clone(),
+            self.effective_hash(),
+        )
     }
 
-    fn metrics(&self) -> ConfigMetricsView {
+    /// As [`Self::view`]: the applied digest comes back unresolved.
+    fn metrics(&self) -> (ConfigMetricsView, Option<EffectiveHash>) {
         let etcd = self.source_kind.is_etcd();
-        let mut rejected_by_kind: BTreeMap<String, usize> = BTreeMap::new();
-        for r in self.rejected.values() {
-            *rejected_by_kind.entry(r.resource_kind.clone()).or_insert(0) += 1;
+        let mut rejected_by_kind = self.rejected_counts.clone();
+        for (kind, count) in &self.build_rejected_counts {
+            *rejected_by_kind.entry(kind.clone()).or_insert(0) += count;
         }
-        ConfigMetricsView {
+        let metrics = ConfigMetricsView {
             source_kind: self.source_kind,
             last_reload_successful: self.last_reload_successful,
             last_reload_success_ts: self.last_reload_success_at.map(|t| t.timestamp()),
             reloads_total: self.reloads_total,
             reload_failures: self.reload_failures.iter().map(|(k, v)| (*k, *v)).collect(),
             rejected_by_kind,
+            unknown_kind_by_kind: self.unknown_kind_counts.clone(),
             partially_compatible_by_kind: self.partially_compatible_rows_by_kind.clone(),
             stale_served_by_kind: self.stale_served_rows_by_kind.clone(),
             observed_revision: if etcd { self.observed_revision } else { None },
             applied_revision: if etcd { self.applied_revision } else { None },
-            config_hash: self.config_hash.clone(),
+            config_hash: None,
             connected: etcd.then_some(self.connected),
-        }
+        };
+        (metrics, self.effective_hash())
     }
 }
 
@@ -597,6 +1115,14 @@ pub struct ConfigStatusView {
     /// `null` when no failure has occurred this boot.
     pub last_failure: Option<FailureView>,
     pub rejected: Vec<RejectedResource>,
+    /// Resources whose `kind` segment this build does not know, sorted.
+    /// Forward compatibility rather than failure, so these rows are absent
+    /// from `rejected[]`, leave `state` and `last_reload.successful` alone,
+    /// and are counted by `aisix_config_unknown_kind_resources` instead of
+    /// `aisix_config_rejected_resources` (issue #1207). They are not served,
+    /// so they are the other reason `applied.config_hash` can differ from
+    /// `source.source_hash`.
+    pub unknown_kinds: Vec<UnknownKindResource>,
     /// Resources served with unknown fields ignored, aggregated per
     /// (kind, field) and sorted. Empty when every served document matched
     /// its schema exactly. The companion to `applied.config_hash`: the
@@ -652,6 +1178,9 @@ pub struct ConfigMetricsView {
     pub reloads_total: u64,
     pub reload_failures: BTreeMap<&'static str, u64>,
     pub rejected_by_kind: BTreeMap<String, usize>,
+    /// Rows per kind whose `kind` segment this build does not know
+    /// (issue #1207). Disjoint from `rejected_by_kind`.
+    pub unknown_kind_by_kind: BTreeMap<String, usize>,
     /// Served resources per kind carrying at least one ignored field.
     pub partially_compatible_by_kind: BTreeMap<String, usize>,
     /// Served resources per kind running on their last known good value
@@ -667,35 +1196,78 @@ fn rfc3339(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+fn bounded_rejection_error(error: String) -> String {
+    if error.chars().count() <= MAX_REJECTION_ERROR_CHARS {
+        return error;
+    }
+    let mut out: String = error.chars().take(MAX_REJECTION_ERROR_CHARS - 1).collect();
+    out.push('…');
+    out
+}
+
 /// Hash an etcd entry set: `sha256` over `key '\0' canonical_value '\n'` for
 /// each entry, in ascending key order. See the module docs for the exact
 /// definition. `entries` is `(key, raw_value_bytes)`.
+///
+/// The digest is a published contract — the control plane stores what the
+/// gateway reports and never recomputes it, and the algorithm is documented
+/// in the public Admin API reference — so its output must stay byte-identical
+/// across releases.
 pub fn hash_entries<'a, I>(entries: I) -> String
 where
     I: IntoIterator<Item = (&'a str, &'a [u8])>,
 {
     let mut sorted: Vec<(&str, &[u8])> = entries.into_iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
-    let mut hasher = Sha256::new();
-    for (key, value) in sorted {
-        hasher.update(key.as_bytes());
-        hasher.update([0u8]);
-        match serde_json::from_slice::<serde_json::Value>(value) {
-            Ok(v) => hasher.update(canonical_json(&v).as_bytes()),
-            // Not JSON (rejected as non_json): hash the raw bytes so the
-            // observed hash still changes deterministically with the input.
-            Err(_) => hasher.update(value),
-        }
-        hasher.update([b'\n']);
+    hash_records(
+        sorted
+            .into_iter()
+            .map(|(key, value)| hash_record(key, value)),
+    )
+}
+
+/// The exact bytes one entry contributes to [`hash_entries`]:
+/// `key '\0' canonical_value '\n'`.
+///
+/// Split out so a caller that hashes the same entry set repeatedly can
+/// compute this once per entry version and keep it — the JSON parse and
+/// canonical re-serialisation are what make a full-config digest
+/// expensive, and re-running them for every unchanged row on every watch
+/// event is the cost AISIX-Cloud#1542 measured.
+pub fn hash_record(key: &str, value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(key.len() + value.len() + 2);
+    out.extend_from_slice(key.as_bytes());
+    out.push(0u8);
+    match serde_json::from_slice::<serde_json::Value>(value) {
+        Ok(v) => out.extend_from_slice(canonical_json(&v).as_bytes()),
+        // Not JSON (rejected as non_json): hash the raw bytes so the
+        // observed hash still changes deterministically with the input.
+        Err(_) => out.extend_from_slice(value),
     }
-    hex(hasher.finalize().as_slice())
+    out.push(b'\n');
+    out
+}
+
+/// Digest pre-computed [`hash_record`]s. The caller supplies them in
+/// ascending key order — the ordering [`hash_entries`] establishes by
+/// sorting.
+pub fn hash_records<I, R>(records: I) -> String
+where
+    I: IntoIterator<Item = R>,
+    R: AsRef<[u8]>,
+{
+    let mut hasher = Context::new(&SHA256);
+    for record in records {
+        hasher.update(record.as_ref());
+    }
+    hex(hasher.finish().as_ref())
 }
 
 /// Hash raw file bytes: `sha256` hex.
 pub fn hash_bytes(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
+    let mut hasher = Context::new(&SHA256);
     hasher.update(bytes);
-    hex(hasher.finalize().as_slice())
+    hex(hasher.finish().as_ref())
 }
 
 /// Serialize a JSON value with object keys sorted recursively and no
@@ -773,7 +1345,7 @@ mod tests {
 
     fn applied(hash: &str, counts: &[(&str, usize)]) -> AppliedSnapshot {
         AppliedSnapshot {
-            config_hash: hash.to_string(),
+            config_hash: hash.into(),
             revision: Some(7),
             resource_counts: counts.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
         }
@@ -784,6 +1356,65 @@ mod tests {
         let cs = ConfigStatus::new(SourceKind::Etcd);
         assert_eq!(cs.view().state, ConfigState::NeverLoaded);
         assert!(!cs.is_ready());
+    }
+
+    fn clean_load() -> LoadObservation {
+        LoadObservation {
+            source_hash: "h".into(),
+            observed_revision: Some(7),
+            applied: Some(applied("h", &[("models", 1)])),
+            rejected: vec![],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        }
+    }
+
+    // The boot path gates the proxy listener on this: a waiter that never
+    // resolves would hang a gateway that HAS a configuration, and one that
+    // resolves early would bind a listener with nothing to serve.
+    #[tokio::test]
+    async fn wait_until_applied_resolves_on_the_first_apply() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        let waiter = tokio::spawn({
+            let cs = cs.clone();
+            async move { cs.wait_until_applied().await }
+        });
+        // Nothing applied yet, so the waiter must still be pending.
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        cs.record_load(clean_load());
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_until_applied_returns_immediately_after_an_earlier_apply() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(clean_load());
+        // Subscribing after the fact must not miss the signal — the reason
+        // this is a watch channel and not a one-shot notification.
+        cs.wait_until_applied().await;
+    }
+
+    #[tokio::test]
+    async fn wait_until_applied_stays_pending_while_every_load_is_rejected() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(LoadObservation {
+            applied: None,
+            wholly_rejected: true,
+            ..clean_load()
+        });
+        cs.record_fetch_failure();
+        assert!(!cs.is_ready());
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            cs.wait_until_applied(),
+        )
+        .await
+        .expect_err("no configuration was applied, so the gate must stay closed");
     }
 
     #[test]
@@ -904,6 +1535,149 @@ mod tests {
         assert_eq!(v.rejected[0].resource_kind, "models");
         assert_eq!(v.rejected[0].last_error_kind, "schema_failed");
         assert!(v.last_failure.is_some());
+    }
+
+    #[test]
+    fn runtime_build_rejections_merge_with_loader_state_and_clear_independently() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(LoadObservation {
+            source_hash: "src".into(),
+            observed_revision: Some(9),
+            applied: Some(applied("src", &[("guardrails", 1), ("models", 1)])),
+            rejected: vec![],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+        let clean = cs.view();
+        let clean_hash = clean.applied.as_ref().unwrap().config_hash.clone();
+        let clean_seq = clean.applied.as_ref().unwrap().apply_seq;
+        cs.record_build_rejections(vec![incoming(
+            "/aisix/runtime/guardrails/g-1",
+            "guardrails",
+            "g-1",
+            "schema_failed",
+            "guardrail failed to build",
+        )]);
+        let runtime_rejected = cs.view();
+        assert_eq!(runtime_rejected.state, ConfigState::Degraded);
+        let effective = runtime_rejected.applied.as_ref().unwrap();
+        assert_ne!(effective.config_hash, clean_hash);
+        assert_ne!(
+            effective.config_hash,
+            runtime_rejected.source.source_hash.unwrap()
+        );
+        assert_eq!(effective.resource_counts["guardrails"], 0);
+        assert_eq!(effective.resource_counts["models"], 1);
+        assert_eq!(effective.apply_seq, clean_seq + 1);
+        assert_eq!(
+            cs.applied_config_hash().as_deref(),
+            Some(effective.config_hash.as_str())
+        );
+        assert_eq!(
+            cs.metrics().config_hash.as_deref(),
+            Some(effective.config_hash.as_str())
+        );
+        assert_eq!(
+            cs.rejection_snapshots()[0].key,
+            "/aisix/runtime/guardrails/g-1"
+        );
+
+        cs.record_load(LoadObservation {
+            source_hash: "src2".into(),
+            observed_revision: Some(10),
+            applied: Some(applied("applied2", &[("guardrails", 1), ("models", 1)])),
+            rejected: vec![incoming(
+                "/aisix/models/bad",
+                "models",
+                "bad",
+                "schema_failed",
+                "model schema failed",
+            )],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: false,
+            wholly_rejected: false,
+        });
+        assert_eq!(cs.view().rejected.len(), 2);
+
+        cs.record_build_rejections(vec![]);
+        let view = cs.view();
+        assert_eq!(view.state, ConfigState::Degraded);
+        assert_eq!(view.rejected.len(), 1);
+        assert_eq!(view.rejected[0].resource_kind, "models");
+        assert_eq!(
+            view.applied.as_ref().unwrap().resource_counts["guardrails"],
+            1
+        );
+    }
+
+    #[test]
+    fn rejection_reporting_is_bounded_across_loader_and_runtime_sources() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(LoadObservation {
+            source_hash: "src".into(),
+            observed_revision: Some(1),
+            applied: Some(applied("src", &[("guardrails", 300)])),
+            rejected: (0..300)
+                .map(|i| {
+                    incoming(
+                        &format!("/aisix/models/l-{i}"),
+                        "models",
+                        "l",
+                        "schema_failed",
+                        &"x".repeat(1000),
+                    )
+                })
+                .collect(),
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+        cs.record_build_rejections(
+            (0..300)
+                .map(|i| {
+                    incoming(
+                        &format!("/aisix/runtime/guardrails/g-{i}"),
+                        "guardrails",
+                        "g",
+                        "schema_failed",
+                        &"y".repeat(1000),
+                    )
+                })
+                .collect(),
+        );
+
+        let rejected = cs.view().rejected;
+        assert_eq!(rejected.len(), MAX_CONFIG_REJECTIONS);
+        assert!(rejected
+            .iter()
+            .all(|row| row.last_error.chars().count() <= MAX_REJECTION_ERROR_CHARS));
+        assert_eq!(cs.rejection_snapshots().len(), MAX_CONFIG_REJECTIONS);
+        let view = cs.view();
+        assert_eq!(view.applied.unwrap().resource_counts["guardrails"], 0);
+        assert_ne!(cs.applied_config_hash().as_deref(), Some("src"));
+        let metrics = cs.metrics();
+        assert_eq!(metrics.rejected_by_kind.get("models"), Some(&300));
+        assert_eq!(metrics.rejected_by_kind.get("guardrails"), Some(&300));
+        assert_eq!(metrics.config_hash, cs.applied_config_hash());
+    }
+
+    #[test]
+    fn an_initial_empty_build_does_not_fabricate_a_reload() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_build_rejections(vec![]);
+
+        let view = cs.view();
+        assert_eq!(view.state, ConfigState::NeverLoaded);
+        assert!(view.last_reload.is_none());
+        assert!(!cs.metrics().last_reload_successful);
+        assert!(cs.metrics().last_reload_success_ts.is_none());
     }
 
     #[test]
@@ -1210,6 +1984,228 @@ mod tests {
         assert_eq!(m.rejected_by_kind.get("provider_keys"), Some(&1));
     }
 
+    // Issue #1207. A resource of a kind this build does not know is forward
+    // compatibility, not a load failure: the control plane upgrades first and
+    // a new resource kind is a free change, so every gateway in the field
+    // reports the key until it is upgraded while serving is unaffected.
+    #[test]
+    fn an_unknown_kind_alone_keeps_the_reload_successful() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(LoadObservation {
+            source_hash: "src".into(),
+            observed_revision: Some(9),
+            applied: Some(applied("applied", &[("models", 1)])),
+            rejected: vec![incoming(
+                "/aisix/global/pricing/p-1",
+                "pricing",
+                "p-1",
+                "unknown_kind",
+                "unknown kind \"pricing\"",
+            )],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+
+        let v = cs.view();
+        assert_eq!(v.state, ConfigState::Synced);
+        assert!(v.rejected.is_empty(), "{:?}", v.rejected);
+        assert_eq!(v.unknown_kinds.len(), 1);
+        assert_eq!(v.unknown_kinds[0].resource_kind, "pricing");
+        assert_eq!(v.unknown_kinds[0].resource_id, "p-1");
+        assert!(
+            v.last_reload.as_ref().unwrap().successful,
+            "an unknown kind must not report the last reload as failed",
+        );
+        assert!(v.last_failure.is_none(), "{:?}", v.last_failure);
+
+        let m = cs.metrics();
+        assert!(m.last_reload_successful);
+        assert!(m.rejected_by_kind.is_empty(), "{:?}", m.rejected_by_kind);
+        assert_eq!(m.unknown_kind_by_kind.get("pricing"), Some(&1));
+        assert!(m.reload_failures.is_empty(), "{:?}", m.reload_failures);
+        assert!(m.last_reload_success_ts.is_some());
+    }
+
+    // The other half of the same rule: a genuine rejection in the same
+    // reload still fails it, and the two classes never mix in either view.
+    #[test]
+    fn a_real_rejection_beside_an_unknown_kind_still_fails_the_reload() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(LoadObservation {
+            source_hash: "src".into(),
+            observed_revision: Some(9),
+            applied: Some(applied("applied", &[("models", 1)])),
+            rejected: vec![
+                incoming(
+                    "/aisix/env/pricing/p-1",
+                    "pricing",
+                    "p-1",
+                    "unknown_kind",
+                    "unknown kind \"pricing\"",
+                ),
+                incoming(
+                    "/aisix/env/models/bad",
+                    "models",
+                    "bad",
+                    "schema_failed",
+                    "schema validation failed at `/display_name`",
+                ),
+            ],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+
+        let v = cs.view();
+        assert_eq!(v.state, ConfigState::Degraded);
+        assert_eq!(v.rejected.len(), 1);
+        assert_eq!(v.rejected[0].resource_kind, "models");
+        assert_eq!(v.unknown_kinds.len(), 1);
+        assert!(!v.last_reload.as_ref().unwrap().successful);
+        assert_eq!(
+            v.last_failure.as_ref().map(|f| f.last_error_kind.as_str()),
+            Some("schema_failed"),
+            "the sticky failure must name the real rejection, not the unknown kind",
+        );
+
+        let m = cs.metrics();
+        assert!(!m.last_reload_successful);
+        assert_eq!(m.rejected_by_kind.get("models"), Some(&1));
+        assert!(!m.rejected_by_kind.contains_key("pricing"));
+        assert_eq!(m.unknown_kind_by_kind.get("pricing"), Some(&1));
+        assert_eq!(m.reload_failures.get("validate"), Some(&1));
+    }
+
+    // The control plane is the only party that can tell "a kind no released
+    // gateway reads yet" from "a kind this gateway alone is too old for", and
+    // it filters on the `unknown_kind` reason. Splitting the local views must
+    // not change what it receives.
+    #[test]
+    fn unknown_kinds_still_reach_the_heartbeat_with_their_reason() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(LoadObservation {
+            source_hash: "src".into(),
+            observed_revision: Some(9),
+            applied: Some(applied("applied", &[("models", 1)])),
+            rejected: vec![
+                incoming(
+                    "/aisix/global/pricing/p-1",
+                    "pricing",
+                    "p-1",
+                    "unknown_kind",
+                    "unknown kind \"pricing\"",
+                ),
+                incoming(
+                    "/aisix/env/models/bad",
+                    "models",
+                    "bad",
+                    "schema_failed",
+                    "boom",
+                ),
+            ],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+
+        let beat = cs.rejection_snapshots();
+        let reported: BTreeMap<&str, &str> = beat
+            .iter()
+            .map(|r| (r.key.as_str(), r.kind.as_str()))
+            .collect();
+        assert_eq!(
+            reported.get("/aisix/global/pricing/p-1"),
+            Some(&"unknown_kind"),
+        );
+        assert_eq!(
+            reported.get("/aisix/env/models/bad"),
+            Some(&"schema_failed")
+        );
+    }
+
+    // One new resource kind can be one row per model in the environment, so
+    // the two detail sets get independent budgets: forward-compatible volume
+    // must never evict the rejection an operator can actually fix. This
+    // covers the budget at THIS layer; the etcd supervisor's own retention
+    // buffer, which truncates before a load observation is ever built, is
+    // split the same way and tested there (`MAX_RETAINED_UNKNOWN_KINDS`).
+    #[test]
+    fn unknown_kind_volume_does_not_evict_a_real_rejection() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        let mut rejected: Vec<IncomingRejection> = (0..MAX_CONFIG_UNKNOWN_KINDS + 50)
+            .map(|i| {
+                incoming(
+                    &format!("/aisix/global/pricing/p-{i:04}"),
+                    "pricing",
+                    &format!("p-{i:04}"),
+                    "unknown_kind",
+                    "unknown kind \"pricing\"",
+                )
+            })
+            .collect();
+        rejected.push(incoming(
+            "/aisix/env/models/zzz-bad",
+            "models",
+            "zzz-bad",
+            "schema_failed",
+            "boom",
+        ));
+        cs.record_load(LoadObservation {
+            source_hash: "src".into(),
+            observed_revision: Some(9),
+            applied: Some(applied("applied", &[("models", 1)])),
+            rejected,
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+
+        let v = cs.view();
+        assert_eq!(
+            v.rejected.len(),
+            1,
+            "the real rejection must survive unknown-kind volume",
+        );
+        assert_eq!(v.rejected[0].resource_id, "zzz-bad");
+        assert_eq!(v.unknown_kinds.len(), MAX_CONFIG_UNKNOWN_KINDS);
+        // Counts cover every row, bounded detail or not.
+        let m = cs.metrics();
+        assert_eq!(
+            m.unknown_kind_by_kind.get("pricing"),
+            Some(&(MAX_CONFIG_UNKNOWN_KINDS + 50)),
+        );
+    }
+
+    #[test]
+    fn unknown_kinds_clear_when_the_rows_go_away() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(LoadObservation {
+            rejected: vec![incoming(
+                "/aisix/global/pricing/p-1",
+                "pricing",
+                "p-1",
+                "unknown_kind",
+                "unknown kind \"pricing\"",
+            )],
+            ..clean_load()
+        });
+        assert_eq!(cs.view().unknown_kinds.len(), 1);
+        cs.record_load(clean_load());
+        let v = cs.view();
+        assert!(v.unknown_kinds.is_empty());
+        assert_eq!(v.state, ConfigState::Synced);
+        assert!(cs.metrics().unknown_kind_by_kind.is_empty());
+    }
+
     #[test]
     fn fetch_failure_marks_disconnected_and_counts_fetch_reason() {
         let cs = ConfigStatus::new(SourceKind::Etcd);
@@ -1280,9 +2276,80 @@ mod tests {
             ReloadReason::from_error_kind("bad_key"),
             ReloadReason::Validate
         );
-        assert_eq!(
-            ReloadReason::from_error_kind("unknown_kind"),
-            ReloadReason::Validate
+    }
+
+    // The digest is a published contract (see `hash_entries`): cp-api stores
+    // what the gateway reports and never recomputes it, and the algorithm is
+    // rendered into the public Admin API reference. These two constants were
+    // produced by the implementation as it stood before the record cache was
+    // introduced (AISIX-Cloud#1542); they must never change. The fixture
+    // deliberately carries what the canonicalisation actually has to get
+    // right: nested objects whose keys arrive unsorted, an array of objects
+    // (arrays keep their order, the objects inside them do not), a `null`,
+    // a value that is not JSON at all, and keys whose etcd order differs
+    // from their sorted order.
+    const HASH_FIXTURE: &[(&str, &str)] = &[
+        (
+            "/aisix/env/models/b",
+            r#"{"z":1,"a":{"d":[3,1],"c":"x"},"m":null}"#,
+        ),
+        (
+            "/aisix/env/api_keys/a",
+            r#"{"key_hash":"deadbeef","allowed_models":["m2","m1"]}"#,
+        ),
+        ("/aisix/env/guardrails/c", "not json at all"),
+        (
+            "/aisix/env/models/z",
+            r#"{"nested":{"y":{"b":2,"a":1}},"arr":[{"q":1,"p":2}]}"#,
+        ),
+    ];
+    const HASH_FIXTURE_ALL: &str =
+        "19ad332bd0ec12bd419a56786f81ca90b17d9796ac60f46545b9f77642427129";
+    /// The same fixture minus `/aisix/env/models/z` — the shape
+    /// `config_hash` takes when a key is rejected with nothing to serve,
+    /// so the two digests differ.
+    const HASH_FIXTURE_ACCEPTED: &str =
+        "f0b4b0cdc9ae4da988e11b3e64b47e802212859e6ed2d08b64434967a9d41308";
+
+    #[test]
+    fn hash_backend_matches_sha256_across_chunk_boundaries() {
+        use sha2::{Digest, Sha256};
+        for len in [0, 1, 55, 56, 63, 64, 65, 127, 128, 129, 4096, 65537] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let expected = hex(Sha256::digest(&bytes).as_slice());
+            assert_eq!(hash_bytes(&bytes), expected);
+            for chunk in [1, 7, 64, 1024] {
+                assert_eq!(hash_records(bytes.chunks(chunk)), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn hash_entries_output_is_pinned() {
+        let all = hash_entries(HASH_FIXTURE.iter().map(|(k, v)| (*k, v.as_bytes())));
+        let accepted = hash_entries(
+            HASH_FIXTURE
+                .iter()
+                .filter(|(k, _)| *k != "/aisix/env/models/z")
+                .map(|(k, v)| (*k, v.as_bytes())),
         );
+        assert_eq!(all, HASH_FIXTURE_ALL);
+        assert_eq!(accepted, HASH_FIXTURE_ACCEPTED);
+        assert_ne!(all, accepted);
+    }
+
+    #[test]
+    fn hash_records_reproduces_hash_entries() {
+        // Records supplied in ascending key order, the ordering
+        // `hash_entries` establishes by sorting its own input.
+        let mut sorted: Vec<(&str, &str)> = HASH_FIXTURE.to_vec();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        let from_records = hash_records(
+            sorted
+                .iter()
+                .map(|(k, v)| hash_record(k, v.as_bytes()))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(from_records, HASH_FIXTURE_ALL);
     }
 }

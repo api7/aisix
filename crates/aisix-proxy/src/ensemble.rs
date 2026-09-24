@@ -72,9 +72,16 @@ Candidate answers:
 /// Dispatches one resolved chat request to a model by its `display_name`.
 /// The production impl resolves the name to a Bridge + ProviderKey and
 /// calls `Bridge::chat`; tests supply a scripted mock.
+#[derive(Debug)]
+pub struct ModelCallOutcome {
+    pub response: ChatResponse,
+    pub effective_usage: UsageStats,
+    pub usage_estimated: bool,
+}
+
 #[async_trait]
 pub trait ModelCaller: Send + Sync {
-    async fn call(&self, target: &str, req: &ChatFormat) -> Result<ChatResponse, BridgeError>;
+    async fn call(&self, target: &str, req: &ChatFormat) -> Result<ModelCallOutcome, BridgeError>;
 }
 
 /// Production [`ModelCaller`] used by the chat dispatch layer. Resolves
@@ -100,7 +107,7 @@ pub(crate) struct ProxyModelCaller<'a> {
 
 #[async_trait]
 impl ModelCaller for ProxyModelCaller<'_> {
-    async fn call(&self, target: &str, req: &ChatFormat) -> Result<ChatResponse, BridgeError> {
+    async fn call(&self, target: &str, req: &ChatFormat) -> Result<ModelCallOutcome, BridgeError> {
         // Resolve the member's display_name against the live snapshot.
         // A missing entry is a misconfigured ensemble (a panel/judge name
         // that no longer points at a real Model) → 400 InvalidUpstreamConfig.
@@ -185,14 +192,25 @@ impl ModelCaller for ProxyModelCaller<'_> {
         // `ctx`'s deadline is per attempt while the ensemble's own
         // `config.timeout()` — applied by the caller — remains the ceiling on
         // the whole attempt sequence.
+        let upstream_req = crate::effort_mapping::chat_request(req, model);
         let response = crate::routing::retrying_dispatch(self.state, model, "ensemble", || {
-            bridge.chat(req, &ctx)
+            bridge.chat(upstream_req.as_ref(), &ctx)
         })
         .await?;
+        let effective = crate::chat::effective_subcall_usage(
+            req,
+            model.upstream_model().unwrap_or(target),
+            &response.usage,
+            &crate::chat::estimation_output_text(&response),
+        );
         reservation
-            .commit_tokens(u64::from(response.usage.total_tokens))
+            .commit_tokens(u64::from(effective.usage.total_tokens))
             .await;
-        Ok(response)
+        Ok(ModelCallOutcome {
+            response,
+            effective_usage: effective.usage,
+            usage_estimated: effective.estimated,
+        })
     }
 }
 
@@ -201,12 +219,12 @@ impl ModelCaller for ProxyModelCaller<'_> {
 #[derive(Debug)]
 pub struct PanelOutcome {
     pub model: String,
+    /// Provider-reported usage retained for the client-facing aggregate.
     pub usage: UsageStats,
-    /// The member's answer text (content + reasoning + tool-call text),
-    /// captured so the dispatch layer can estimate this sub-call's
-    /// completion tokens when the member backend reports no usage
-    /// (AISIX-Cloud#1074). Never billed directly — only a fallback.
-    pub est_output_text: String,
+    /// Final accounting shared by member quota, parent quota, telemetry, and
+    /// request-level metrics. Local estimates never replace `usage` above.
+    pub effective_usage: UsageStats,
+    pub usage_estimated: bool,
 }
 
 /// Everything the dispatch layer needs after an ensemble run: the judge's
@@ -218,12 +236,8 @@ pub struct EnsembleOutcome {
     pub response: ChatResponse,
     pub panel: Vec<PanelOutcome>,
     pub judge_model: String,
-    /// The judge's synthesis request, kept so the dispatch layer can
-    /// estimate the judge sub-call's prompt tokens when the judge backend
-    /// reports no usage (AISIX-Cloud#1074). The streaming path builds its
-    /// own judge estimator from `run_ensemble_panel`'s `judge_req`; this
-    /// field carries the same request out of the buffered path.
-    pub judge_req: ChatFormat,
+    pub judge_effective_usage: UsageStats,
+    pub judge_usage_estimated: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -303,11 +317,13 @@ pub(crate) async fn run_ensemble_panel(
     let mut candidates: Vec<ChatResponse> = Vec::new();
     for (model, result) in results {
         match result {
-            Ok(resp) => {
+            Ok(outcome) => {
+                let resp = outcome.response;
                 panel.push(PanelOutcome {
                     model,
                     usage: resp.usage.clone(),
-                    est_output_text: crate::chat::estimation_output_text(&resp),
+                    effective_usage: outcome.effective_usage,
+                    usage_estimated: outcome.usage_estimated,
                 });
                 candidates.push(resp);
             }
@@ -350,7 +366,7 @@ pub async fn run_ensemble(
     // the judge model's own retry budget — it used to be a hardcoded single
     // retry here, which both ignored the operator's configuration and would
     // have stacked on top of the caller-level budget.
-    let response =
+    let judge =
         match call_with_optional_timeout(caller, &config.judge.model, &judge_req, config.timeout())
             .await
         {
@@ -361,10 +377,11 @@ pub async fn run_ensemble(
         };
 
     Ok(EnsembleOutcome {
-        response,
+        response: judge.response,
         panel,
         judge_model: config.judge.model.clone(),
-        judge_req,
+        judge_effective_usage: judge.effective_usage,
+        judge_usage_estimated: judge.usage_estimated,
     })
 }
 
@@ -399,6 +416,10 @@ fn judge_request(req: &ChatFormat, judge: &Judge, candidates: &[ChatResponse]) -
         .replace("{labeled_candidates}", &label_candidates(candidates));
 
     let mut out = ChatFormat::new(judge.model.clone(), vec![ChatMessage::user(prompt)]);
+    if let Some(effort) = req.extra.get("reasoning_effort") {
+        out.extra
+            .insert("reasoning_effort".to_string(), effort.clone());
+    }
     out.temperature = Some(JUDGE_TEMPERATURE);
     out.stream = Some(false);
     out
@@ -458,7 +479,7 @@ async fn call_with_optional_timeout(
     target: &str,
     req: &ChatFormat,
     timeout: Option<Duration>,
-) -> Result<ChatResponse, BridgeError> {
+) -> Result<ModelCallOutcome, BridgeError> {
     match timeout {
         Some(d) => match tokio::time::timeout(d, caller.call(target, req)).await {
             Ok(result) => result,
@@ -519,7 +540,11 @@ mod tests {
 
     #[async_trait]
     impl ModelCaller for MockCaller {
-        async fn call(&self, target: &str, req: &ChatFormat) -> Result<ChatResponse, BridgeError> {
+        async fn call(
+            &self,
+            target: &str,
+            req: &ChatFormat,
+        ) -> Result<ModelCallOutcome, BridgeError> {
             self.calls
                 .lock()
                 .unwrap()
@@ -528,9 +553,14 @@ mod tests {
             let queue = scripted
                 .get_mut(target)
                 .unwrap_or_else(|| panic!("no scripted response for target {target:?}"));
-            queue
+            let response = queue
                 .pop_front()
-                .unwrap_or_else(|| panic!("scripted responses exhausted for target {target:?}"))
+                .unwrap_or_else(|| panic!("scripted responses exhausted for target {target:?}"))?;
+            Ok(ModelCallOutcome {
+                effective_usage: response.usage.clone(),
+                response,
+                usage_estimated: false,
+            })
         }
     }
 
@@ -561,9 +591,10 @@ mod tests {
         let cfg =
             config(r#"{"panel":[{"model":"gpt"},{"model":"claude"}],"judge":{"model":"judge"}}"#);
 
-        let out = run_ensemble(&user_request("what is 2+2?"), &cfg, &caller)
-            .await
-            .unwrap();
+        let mut req = user_request("what is 2+2?");
+        req.extra
+            .insert("reasoning_effort".to_string(), "medium".into());
+        let out = run_ensemble(&req, &cfg, &caller).await.unwrap();
 
         assert_eq!(out.response.message.content_str(), "synthesized answer");
         assert_eq!(out.panel.len(), 2);
@@ -579,6 +610,10 @@ mod tests {
         assert!(judge_prompt.contains("answer from gpt"));
         assert!(judge_prompt.contains("answer from claude"));
         assert!(judge_prompt.contains("what is 2+2?"));
+        assert_eq!(
+            caller.calls_to("judge")[0].extra["reasoning_effort"],
+            "medium"
+        );
     }
 
     #[tokio::test]

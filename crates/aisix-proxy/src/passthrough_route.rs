@@ -31,9 +31,9 @@
 //! - [`entry`] — the proxy router's **fallback** handler. Path-prefix
 //!   routes match here, after every typed route has had its chance, so a
 //!   route can never shadow `/v1/*`, `/mcp`, or `/a2a`. A no-match request
-//!   keeps the pre-existing plain 404; `/passthrough/*` no-matches return
-//!   the 410 migration tombstone.
-//! - [`host_dispatch`] — a **pre-routing** middleware (outermost wrap in
+//!   keeps the pre-existing plain 404, `/passthrough/*` included — that
+//!   namespace is claimed by explicit routes like any other.
+//! - [`host_dispatch`] — a **pre-routing** middleware (after URL rewriting in
 //!   `build_router`). A request whose `Host` matches an enabled route's
 //!   `hosts` was never addressed to this gateway's own API, so it must not
 //!   fall into a typed route that happens to share the path (forward-proxy
@@ -74,6 +74,7 @@ use aisix_core::{PassthroughAuthMode, PassthroughCredentialMode, PassthroughRout
 
 use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
+use crate::host::inbound_host;
 use crate::state::ProxyState;
 
 /// Bounded `model` metric label for passthrough-route requests. Route
@@ -84,10 +85,6 @@ const PASSTHROUGH_MODEL_LABEL: &str = "passthrough";
 /// `provider` metric label for `forward_client` routes, which have no
 /// ProviderKey to take a provider name from.
 const BYO_PROVIDER_LABEL: &str = "byo";
-
-/// `provider` label for 410-tombstoned hits on the removed tunnel's
-/// namespace — the caller-supplied path segment must never mint a series.
-const UNRESOLVED_LABEL: &str = "unresolved";
 
 /// Endpoint label for metrics/usage attribution: one family for all
 /// passthrough-route traffic (route names are operator data, not label
@@ -125,20 +122,6 @@ const ALWAYS_STRIP: &[&str] = &[
     "x-aisix-request-id",
 ];
 
-/// Fixed 410 message for the removed implicit tunnel.
-///
-/// COMPAT-SINCE: 0.10.0 #1010 — 0.10.0 removed the implicit
-/// `/passthrough/:provider/*rest` tunnel, and a migration pointer beats a
-/// bare 404 while un-migrated callers are still out there; the public docs
-/// promise the 410 for one release, then plain 404s.
-///
-/// Retiring it drops this constant, the `entry` branch that serves it, its
-/// WARN and the `UNRESOLVED_LABEL` metric series, and leaves the namespace
-/// entirely the operator's to claim with explicit routes.
-const LEGACY_TUNNEL_GONE: &str = "the implicit /passthrough/:provider tunnel has been removed; \
-     configure an explicit passthrough_route resource for this path \
-     (see the provider passthrough documentation for the migration)";
-
 // ---------------------------------------------------------------------------
 // Routing entry points
 // ---------------------------------------------------------------------------
@@ -153,27 +136,6 @@ fn has_host_match(snapshot: &aisix_core::AisixSnapshot, host: Option<&str>) -> b
         .entries()
         .iter()
         .any(|e| e.value.enabled && e.value.matches_host(host))
-}
-
-/// The request's inbound host: the `Host` header (origin-form requests),
-/// falling back to the URI authority (absolute-form requests from a
-/// chained proxy). Lowercased, `:port` stripped.
-fn inbound_host(req: &Request) -> Option<String> {
-    let raw = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| req.uri().authority().map(|a| a.as_str()))?;
-    let no_port = raw.rsplit_once(':').map_or(raw, |(head, port)| {
-        // Only treat the suffix as a port when it is all digits — an
-        // IPv6 literal's last group would otherwise be truncated.
-        if port.chars().all(|c| c.is_ascii_digit()) {
-            head
-        } else {
-            raw
-        }
-    });
-    Some(no_port.trim_end_matches('.').to_ascii_lowercase())
 }
 
 /// Pre-routing middleware: dispatch foreign-host traffic to the entry
@@ -319,50 +281,17 @@ pub async fn entry(
     let request_id = client.request_id.clone();
 
     let Some(matched) = match_route(&snapshot, host.as_deref(), &path) else {
-        if path.starts_with("/passthrough/") {
-            // The removed implicit tunnel's namespace: a fixed 410 with
-            // the migration pointer beats a bare 404 while callers migrate
-            // (release-debt marker on LEGACY_TUNNEL_GONE).
-            // Logged AND counted (unresolved-provider labels, like the
-            // old tunnel's failure path) so operators can locate and
-            // size un-migrated callers.
-            tracing::warn!(
-                path = %path,
-                "removed /passthrough tunnel hit with no matching passthrough_route (410)",
-            );
-            let err = ProxyError::Gone(LEGACY_TUNNEL_GONE.into());
-            let status = err.status().as_u16();
-            let elapsed = started.elapsed();
-            emit_access_log(
-                &method,
-                &path,
-                UNRESOLVED_LABEL,
-                "",
-                status,
-                elapsed,
-                &request_id,
-                None,
-                Some(&err),
-            );
-            crate::request_metrics::record(
-                &state,
-                ENDPOINT_LABEL,
-                crate::request_metrics::Caller::unattributed(None),
-                crate::request_metrics::Upstream {
-                    provider: UNRESOLVED_LABEL,
-                    model: PASSTHROUGH_MODEL_LABEL,
-                    ..Default::default()
-                },
-                status,
-                elapsed,
-            );
-            return err.into_response();
-        }
-        // Preserve the router's pre-existing no-match behavior exactly.
+        // Every unmatched path, `/passthrough/*` included, takes the
+        // router's ordinary miss path: the namespace is entirely the
+        // operator's to claim with explicit `passthrough_route` resources.
         return StatusCode::NOT_FOUND.into_response();
     };
 
     let route_name = matched.entry.value.name.clone();
+    // The route is this family's attribution — it names no model — so the
+    // cancel guard needs it to file a row for a caller that hangs up while
+    // the upstream is still thinking (AISIX-Cloud#1571).
+    crate::attribution::note_passthrough_route(&route_name);
 
     // Filled inside `dispatch` at chain resolution, so the failure branch
     // — where an input-guardrail block lands — stamps the enforced hits
@@ -384,6 +313,7 @@ pub async fn entry(
                 &route_name,
                 api_key_id,
                 status,
+                elapsed,
                 elapsed,
                 &request_id,
                 None,
@@ -408,8 +338,11 @@ pub async fn entry(
                 api_key_id,
                 status,
                 error.kind(),
+                error.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
+                crate::usage_attr::guardrail_scores(&audit),
+                crate::usage_attr::bypass_reason(&audit),
             );
             // The route matched before the pipeline failed, so a rejected
             // request still attributes to it — an operator triaging 401s
@@ -420,7 +353,7 @@ pub async fn entry(
             crate::usage_attr::emit_prepared_usage_event(
                 &state,
                 &snapshot,
-                "passthrough_route",
+                crate::operation::PASSTHROUGH,
                 event.clone(),
                 crate::usage_attr::usage_event_labels(
                     &usage_model,
@@ -646,7 +579,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
@@ -657,10 +590,11 @@ async fn dispatch(
                 "guardrail blocked passthrough-route request",
             );
             return Err(RouteError::of(
-                ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                crate::error::guardrail_block_error(
                     "request",
                     guardrail_name.as_deref(),
-                )),
+                    unavailable.as_deref(),
+                ),
                 &auth,
             ));
         }
@@ -703,8 +637,10 @@ async fn dispatch(
 
     // ----- outbound request -----
 
-    let tls = pk_entry.as_ref().and_then(|pk| pk.value.tls.as_ref());
-    let http_client = crate::http_client::client_for(tls);
+    let conn = pk_entry
+        .as_ref()
+        .and_then(|pk| pk.value.upstream_connection());
+    let http_client = crate::http_client::client_for(conn.as_ref());
 
     // Strip set: protocol metadata always; per-mode credential handling.
     let mut strip: std::collections::HashSet<String> =
@@ -756,25 +692,101 @@ async fn dispatch(
         }
     }
 
+    // A route forwards the caller's headers by default, so the operator's
+    // `forward_client_headers` is an OVERRIDE of the strip set above: the
+    // names it admits ride upstream even though this route would otherwise
+    // have removed them. That is what puts the caller's own credential on
+    // an internal upstream that authorizes on it — in `gateway_key` mode
+    // `authorization` is exactly the header the gateway just consumed to
+    // identify this caller, and the strip set would otherwise take it.
+    //
+    // `header_forward_blocked` still holds: `host`, the hop-by-hop
+    // headers, and the gateway's own namespace break the exchange rather
+    // than changing who it comes from, so no pattern reaches them. And
+    // `content-length` on top of it, which the standard pipeline gets from
+    // its second tier: reqwest derives the outbound length from the body
+    // it is handed, but hyper honours a caller-set value verbatim instead,
+    // so a relayed copy is a request-framing bug waiting for the first
+    // body this route rewrites.
+    //
+    // The exact-name rule is per ROUTE here. `/v1/*` and MCP read the
+    // caller's credential out of `authorization` or `x-api-key`, both on
+    // the shared list, but a route names its own slots: under `auth_mode:
+    // header_key` the gateway credential arrives in `auth_header_name`,
+    // and `identity_header` is one the route promises to strip. Neither
+    // can be a name the shared list already covers in any way that helps:
+    // the route schema rejects most of them outright, and the two it
+    // permits are on that list anyway. So without this a `["x-*"]`
+    // pattern would relay the very header this gateway authenticated the
+    // caller with. Naming either in full still forwards it — the rule is
+    // unchanged, only its input.
+    //
+    // A fixed array rather than a collected `Vec`: there are at most two,
+    // on a per-request path. An unset slot stands as `""`, which matches
+    // nothing — a header name is never empty, on the wire or in the
+    // schema, so the empty entry needs no filtering out.
+    let route_slots = [
+        route.auth_header_name.as_deref().unwrap_or_default(),
+        route.identity_header.as_deref().unwrap_or_default(),
+    ];
+    let forwards = |name: &str| {
+        aisix_core::forward_pattern_admits_with(&route.forward_client_headers, name, &route_slots)
+            && !aisix_core::header_forward_blocked(name)
+            && name != "content-length"
+    };
+
     let mut builder = http_client.request(method.clone(), &url);
+    // Which slots the caller's own headers are taking, so the injection
+    // below leaves them alone. Resolved from what the caller ACTUALLY
+    // sent, not from the configuration: an operator who opts a slot in
+    // must not blank the gateway's credential for every caller who happens
+    // to send nothing there.
+    let mut forwarded_slots: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, value) in &incoming_headers {
-        if strip.contains(&name.as_str().to_ascii_lowercase()) {
+        let lower = name.as_str().to_ascii_lowercase();
+        // Asked of EVERY inbound header, not only the ones the strip set
+        // named: `x-aisix-*` is the gateway's own namespace, and only
+        // `x-aisix-request-id` was ever in `ALWAYS_STRIP`, so a caller's
+        // `x-aisix-routing-tags` used to ride upstream and forge a
+        // gateway assertion there. Nothing an operator writes overrides
+        // this, which is what the field's own description promises.
+        if aisix_core::header_forward_blocked(&lower) {
             continue;
+        }
+        if strip.contains(&lower) {
+            if !forwards(&lower) {
+                continue;
+            }
+            forwarded_slots.insert(lower);
         }
         builder = builder.header(name, value);
     }
 
     // Inject the gateway-held upstream credential (inject mode only).
-    // Strip ran first, so the wire stays single-valued (#411 ordering).
+    // Strip ran first, so this never adds a second value to a slot the
+    // caller's own header already took (#411 ordering). That is a
+    // statement about the INJECTION, not about the wire: a caller who
+    // repeated the slot still has every value relayed below, which is
+    // what `forward_client_headers` promises on this surface.
     if let Some(pk) = pk_entry.as_ref() {
         let api_key = pk.value.api_key.as_str();
         let provider_lower = pk.value.provider.to_ascii_lowercase();
         if provider_lower == "anthropic" {
             // Anthropic's documented auth shape (#166): `x-api-key` +
             // `anthropic-version`, never a redundant Bearer alongside.
-            builder = builder.header("x-api-key", api_key);
-            builder = builder.header("anthropic-version", "2023-06-01");
-        } else {
+            if !forwarded_slots.contains("x-api-key") {
+                builder = builder.header("x-api-key", api_key);
+            }
+            // Only when the caller sent none. `RequestBuilder::header`
+            // appends, and `anthropic-version` is in no strip set — every
+            // Anthropic SDK sends its own, so injecting unconditionally
+            // put two revisions on the wire and let the upstream pick.
+            // A route relays the body verbatim and decodes nothing, so
+            // the caller's revision is the right one to keep.
+            if !incoming_headers.contains_key("anthropic-version") {
+                builder = builder.header("anthropic-version", "2023-06-01");
+            }
+        } else if !forwarded_slots.contains("authorization") {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {api_key}"));
         }
     }
@@ -821,6 +833,14 @@ async fn dispatch(
 
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
+    // Explicit `text/event-stream` only. Deliberately STRICTER than
+    // `dispatch::upstream_body_is_sse`, which the typed relays use: a
+    // passthrough route carries arbitrary REST traffic where most responses
+    // are not SSE, so an unknown content type buffers — the arm that scans
+    // — here, while on a relay that has just asked an LLM to stream the
+    // same guess would 502 an upstream that merely mislabels itself. Not
+    // drift: see that function's doc comment for why the two populations
+    // take opposite defaults.
     let is_sse = resp_headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -848,6 +868,8 @@ async fn dispatch(
         path: path.clone(),
         request_id: client.request_id.clone(),
         api_key_id: auth.entry.id.clone(),
+        user_id: auth.entry.value.user_id.clone(),
+        user_name: auth.entry.value.user_name.clone(),
         jwt: auth.jwt.clone(),
         anonymous: auth.anonymous,
         client_identity,
@@ -864,6 +886,7 @@ async fn dispatch(
         streaming: false,
         error_class: String::new(),
         error_message: String::new(),
+        failure_status: None,
         monitor_hits,
         audit: audit_out.clone(),
         captured_prompt,
@@ -926,7 +949,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             tracing::warn!(
@@ -940,10 +963,11 @@ async fn dispatch(
             // let the shared error path report the 422.
             telemetry.emitted = true;
             return Err(RouteError::of(
-                ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                crate::error::guardrail_block_error(
                     "response",
                     guardrail_name.as_deref(),
-                )),
+                    unavailable.as_deref(),
+                ),
                 &auth,
             ));
         }
@@ -1028,11 +1052,17 @@ async fn authenticate(
                 return Err(ProxyError::ApiKeyExpired);
             }
             state.metrics.record_auth_decision("anonymous", true, "");
-            Ok(AuthenticatedKey {
+            let authed = AuthenticatedKey {
                 entry,
                 jwt: None,
                 anonymous: true,
-            })
+            };
+            // Verified credentials are noted inside `authenticate_token`;
+            // a minted anonymous principal has to note itself, or a caller
+            // that hangs up on an anonymous route files no row at all
+            // (AISIX-Cloud#1571).
+            crate::attribution::note_authenticated(&authed);
+            Ok(authed)
         }
     }
 }
@@ -1079,15 +1109,22 @@ fn content_text(v: &serde_json::Value) -> String {
 }
 
 /// The text a guardrail scans from ONE chat-envelope message: its content
-/// plus the whole serialized `tool_calls` payload.
+/// plus the whole serialized `tool_calls` payload, and — on the request
+/// side only — an assistant turn's replayed `reasoning_content`.
 ///
 /// The tool-call half is what the typed endpoints scan (`message_scan_text`
 /// in the guardrails crate), and it is not optional: a request whose only
 /// sensitive text sits in a tool call's `arguments` would otherwise pass a
 /// deny-list that the same body sent to `/v1/chat/completions` trips.
 /// Serialising the whole payload means no function name or argument can
-/// escape inspection regardless of the provider-specific shape.
-fn message_scan_text(msg: &serde_json::Value) -> String {
+/// escape inspection regardless of the provider-specific shape. The same
+/// argument carries `reasoning_content`, which relays upstream verbatim.
+///
+/// `reasoning` splits the two callers because this helper reads BOTH the
+/// request's `messages[]` and the buffered response's `choices[].message`:
+/// caller-replayed reasoning is request text and in scope, while reasoning
+/// the model generated is out of the output-guardrail scope.
+fn message_scan_text(msg: &serde_json::Value, reasoning: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
     let content = msg.get("content").map(content_text).unwrap_or_default();
     if !content.is_empty() {
@@ -1095,6 +1132,15 @@ fn message_scan_text(msg: &serde_json::Value) -> String {
     }
     if let Some(tool_calls) = msg.get("tool_calls").filter(|t| !t.is_null()) {
         parts.push(tool_calls.to_string());
+    }
+    if reasoning {
+        if let Some(r) = msg
+            .get("reasoning_content")
+            .and_then(|v| v.as_str())
+            .filter(|r| !r.is_empty())
+        {
+            parts.push(r.to_string());
+        }
     }
     parts.join("\n")
 }
@@ -1206,19 +1252,40 @@ fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String 
             .and_then(|m| m.as_array())
             .map(|msgs| {
                 msgs.iter()
-                    .map(message_scan_text)
+                    .map(|m| message_scan_text(m, true))
                     .filter(|t| !t.is_empty())
                     .collect::<Vec<_>>()
                     .join("\n")
             })
             .unwrap_or_default(),
         // Responses API: `input` is either a bare string or an array of
-        // items whose `content` parts carry the text.
+        // items, and the text can sit in any of FOUR slots — the same four
+        // the typed route reads (`responses::responses_item_text`):
+        // `content` on a message, `output` on a tool result fed back,
+        // `reason` on an `mcp_approval_response`, and `summary` on a
+        // replayed `reasoning` item.
+        //
+        // All four, not just the common one: the raw-body fallback below
+        // fires only when the WHOLE extraction came back empty, so a body
+        // mixing a benign message item with a `function_call_output`
+        // produces non-empty text and the tool result is never scanned —
+        // while `/v1/responses` blocks that same body. A passthrough route
+        // must not enforce less than the typed route in front of the same
+        // envelope.
         PassthroughProtocol::OpenaiResponses => match v.get("input") {
             Some(serde_json::Value::String(t)) => t.clone(),
             Some(serde_json::Value::Array(items)) => items
                 .iter()
-                .filter_map(|i| i.get("content").map(content_text))
+                .flat_map(|i| {
+                    [
+                        i.get("content"),
+                        i.get("output"),
+                        i.get("reason"),
+                        i.get("summary"),
+                    ]
+                })
+                .flatten()
+                .map(content_text)
                 .filter(|t| !t.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -1266,6 +1333,15 @@ fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String
             .map(|items| {
                 items
                     .iter()
+                    // Generated reasoning is out of the output-guardrail
+                    // scope, and a `reasoning` item DOES carry `content[]`
+                    // with `text` parts — so reading `content` off every
+                    // item regardless of type sweeps it in. The typed
+                    // `/v1/responses` handler skips it for the same reason
+                    // (`responses::responses_output_text`); without this a
+                    // block rule matching only inside reasoning would refuse
+                    // a response here that the typed route allows.
+                    .filter(|i| i.get("type").and_then(|t| t.as_str()) != Some("reasoning"))
                     .filter_map(|i| i.get("content").map(content_text))
                     .filter(|t| !t.is_empty())
                     .collect::<Vec<_>>()
@@ -1282,7 +1358,9 @@ fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String
     let texts: Vec<String> = choices
         .iter()
         .filter_map(|c| match protocol {
-            PassthroughProtocol::OpenaiChat => c.get("message").map(message_scan_text),
+            PassthroughProtocol::OpenaiChat => {
+                c.get("message").map(|m| message_scan_text(m, false))
+            }
             PassthroughProtocol::OpenaiCompletions => {
                 c.get("text").and_then(|t| t.as_str()).map(str::to_string)
             }
@@ -1312,6 +1390,7 @@ struct PassthroughUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
     cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
@@ -1330,6 +1409,7 @@ impl PassthroughUsage {
         self.prompt_tokens = self.prompt_tokens.max(other.prompt_tokens);
         self.completion_tokens = self.completion_tokens.max(other.completion_tokens);
         self.cached_prompt_tokens = self.cached_prompt_tokens.max(other.cached_prompt_tokens);
+        self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
         self.reasoning_tokens = self.reasoning_tokens.max(other.reasoning_tokens);
         self.cache_creation_tokens = self.cache_creation_tokens.max(other.cache_creation_tokens);
         self.cache_read_tokens = self.cache_read_tokens.max(other.cache_read_tokens);
@@ -1378,6 +1458,8 @@ fn usage_of(usage: &serde_json::Value) -> Option<PassthroughUsage> {
         .filter(|&n| n > 0)
         .or_else(|| nested("input_tokens_details", "cached_tokens").filter(|&n| n > 0))
         .or_else(|| flat(&["prompt_cache_hit_tokens", "cached_tokens"]));
+    let cache_write = nested("prompt_tokens_details", "cache_write_tokens")
+        .or_else(|| nested("input_tokens_details", "cache_write_tokens"));
     let reasoning = nested("completion_tokens_details", "reasoning_tokens")
         .filter(|&n| n > 0)
         .or_else(|| nested("output_tokens_details", "reasoning_tokens").filter(|&n| n > 0))
@@ -1391,6 +1473,7 @@ fn usage_of(usage: &serde_json::Value) -> Option<PassthroughUsage> {
         prompt,
         completion,
         cached_prompt,
+        cache_write,
         reasoning,
         cache_creation,
         cache_read,
@@ -1402,6 +1485,7 @@ fn usage_of(usage: &serde_json::Value) -> Option<PassthroughUsage> {
         prompt_tokens: prompt.unwrap_or(0),
         completion_tokens: completion.unwrap_or(0),
         cached_prompt_tokens: cached_prompt.unwrap_or(0),
+        cache_write_tokens: cache_write,
         reasoning_tokens: reasoning.unwrap_or(0),
         cache_creation_tokens: cache_creation.unwrap_or(0),
         cache_read_tokens: cache_read.unwrap_or(0),
@@ -1593,6 +1677,42 @@ fn is_usage_labelled_frame(frame_text: &str) -> bool {
 ///
 /// Frames accumulate field-wise (see [`PassthroughUsage::merge`]) at the
 /// call site, so a partial report never truncates an earlier one.
+/// The upstream failure an SSE frame reports in-band, read with the same
+/// mappings the typed endpoints use for the protocol the route carries. An
+/// opaque (`Raw`) stream has no error envelope the gateway could recognise.
+fn frame_in_band_error(
+    protocol: PassthroughProtocol,
+    frame: &[u8],
+) -> Option<aisix_gateway::BridgeError> {
+    if matches!(protocol, PassthroughProtocol::Raw) {
+        return None;
+    }
+    let payload = crate::redact::frame_payload(frame)?;
+    let payload = payload.trim();
+    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    match protocol {
+        PassthroughProtocol::Raw => None,
+        PassthroughProtocol::OpenaiResponses => crate::responses::responses_in_band_error(&value),
+        // The chat envelope carries Anthropic Messages traffic too, whose
+        // in-band failure is a `type: "error"` event.
+        PassthroughProtocol::OpenaiChat | PassthroughProtocol::OpenaiCompletions => {
+            if value.get("type").and_then(|t| t.as_str()) == Some("error") {
+                if let Some(body) = value.get("error").and_then(|e| {
+                    serde_json::from_value::<
+                            aisix_provider_anthropic::wire::AnthropicStreamErrorBody,
+                        >(e.clone())
+                        .ok()
+                }) {
+                    return Some(
+                        aisix_provider_anthropic::wire::stream_error_into_bridge_error(&body),
+                    );
+                }
+            }
+            aisix_gateway::capture_in_band_error(payload, aisix_gateway::UpstreamWire::OpenAI)
+        }
+    }
+}
+
 fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<PassthroughUsage>) {
     let frame_text = String::from_utf8_lossy(frame);
     let usage_labelled = matches!(protocol, PassthroughProtocol::Raw)
@@ -1604,18 +1724,33 @@ fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<P
             .get_or_insert_with(PassthroughUsage::default)
             .merge(found);
     };
-    for line in frame_text.lines() {
-        let Some(payload) = line.strip_prefix("data:").map(str::trim_start) else {
-            continue;
+    // ONE read and ONE parse per frame: a payload spread over several
+    // `data:` lines is one document joined with `\n`, so parsing each line
+    // independently produced N unparseable fragments — no usage read, and
+    // on a `Raw` stream the JSON source text pushed into the guardrail
+    // scan instead of the values (#1100). `frame_payload` also strips the
+    // per-line `\r` a CRLF-framed upstream leaves behind, and returns
+    // `None` for a comment-only frame (`: OPENROUTER PROCESSING`).
+    'payload: {
+        let Some(payload) = crate::redact::frame_payload(frame) else {
+            break 'payload;
         };
-        if payload == "[DONE]" {
-            continue;
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            break 'payload;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
-            if matches!(protocol, PassthroughProtocol::Raw) {
-                text.push_str(payload);
-            }
-            continue;
+            // Unparseable joined payload — a non-conformant upstream that
+            // put two independent JSON documents on two `data:` lines, say.
+            // The frame is still FORWARDED, so scanning nothing here is a
+            // way past an output block rule. Fall back to the raw payload
+            // text on every protocol, not just `Raw`: over-scanning can only
+            // produce a false positive, while under-scanning a frame the
+            // client receives is the bypass. (Per-line parsing used to catch
+            // the two-document case incidentally; this covers it and every
+            // other shape that does not parse.)
+            text.push_str(payload);
+            break 'payload;
         };
         if let Some(u) = v.get("usage").and_then(usage_of) {
             merge(u);
@@ -1696,11 +1831,11 @@ fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<P
 }
 
 /// The SSE error frame appended when an output guardrail blocks mid-relay.
-fn guardrail_error_frame(guardrail_name: Option<&str>) -> Bytes {
+fn guardrail_error_frame(guardrail_name: Option<&str>, unavailable: Option<&str>) -> Bytes {
     let payload = serde_json::json!({
         "error": {
             "type": "content_filter",
-            "message": crate::error::guardrail_block_message("response", guardrail_name),
+            "message": crate::error::guardrail_block_message("response", guardrail_name, unavailable),
         }
     });
     Bytes::from(format!("event: error\ndata: {payload}\n\n"))
@@ -1755,9 +1890,7 @@ fn stream_response(
                     // no status left to carry the failure — record it on the
                     // event instead of ending as a silent success.
                     let bridge = crate::dispatch::reqwest_error_to_bridge(&err, telemetry.started);
-                    telemetry.error_class =
-                        crate::attempt::routing_error_class(&bridge).to_string();
-                    telemetry.error_message = crate::attempt::attempt_error_message(&bridge);
+                    telemetry.record_failure(&bridge);
                     tracing::warn!(
                         route = %route_name,
                         error = %telemetry.error_message,
@@ -1777,6 +1910,9 @@ fn stream_response(
                     .min(u32::MAX as u128) as u32;
             }
             for frame in splitter.push(&chunk) {
+                if let Some(err) = frame_in_band_error(protocol, &frame) {
+                    telemetry.record_failure(&err);
+                }
                 let (delta, usage) = frame_delta(protocol, &frame);
                 if let Some(u) = usage {
                     telemetry.usage.merge(u);
@@ -1812,7 +1948,7 @@ fn stream_response(
                                 GuardrailVerdict::Block {
                                     reason,
                                     guardrail_name,
-                                    ..
+                                    unavailable,
                                 } => {
                                     tracing::warn!(
                                         guardrail_hook = "output",
@@ -1821,7 +1957,7 @@ fn stream_response(
                                         "guardrail blocked passthrough-route stream (window)",
                                     );
                                     blocked = true;
-                                    yield Ok(guardrail_error_frame(guardrail_name.as_deref()));
+                                    yield Ok(guardrail_error_frame(guardrail_name.as_deref(), unavailable.as_deref()));
                                     break 'outer;
                                 }
                                 _ => {
@@ -1855,7 +1991,7 @@ fn stream_response(
                                     "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
                                 );
                                 blocked = true;
-                                yield Ok(guardrail_error_frame(None));
+                                yield Ok(guardrail_error_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
                                 break 'outer;
                             }
                         }
@@ -1890,7 +2026,7 @@ fn stream_response(
                 if let GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
-                ..
+                unavailable,
             } =
                     scan_output(&chain, &route_name, &text, &mut telemetry).await
                 {
@@ -1904,7 +2040,7 @@ fn stream_response(
                     // forwarded under EndOfStreamCheck cannot be unsent —
                     // the error frame is the caller-visible signal either way.
                     pending.clear();
-                    yield Ok(guardrail_error_frame(guardrail_name.as_deref()));
+                    yield Ok(guardrail_error_frame(guardrail_name.as_deref(), unavailable.as_deref()));
                     telemetry.guardrail_blocked = true;
                     telemetry.stream_reached_end = true;
                     telemetry.emit();
@@ -2019,6 +2155,13 @@ struct RouteTelemetry {
     path: String,
     request_id: String,
     api_key_id: String,
+    /// Org member the authenticating key belongs to (AISIX-Cloud#1389),
+    /// and that member's display name for the `user_name` metric label
+    /// (AISIX-Cloud#1455). Both `None` for a key bound to no member —
+    /// including the anonymous route key, which belongs to the route
+    /// rather than to a person.
+    user_id: Option<String>,
+    user_name: Option<String>,
     jwt: Option<Arc<crate::auth::JwtIdentity>>,
     /// Whether the caller reached this route through `auth_mode:
     /// anonymous` rather than a credential of its own. Stamped onto the
@@ -2062,6 +2205,11 @@ struct RouteTelemetry {
     /// the response head is already on the wire.
     error_class: String,
     error_message: String,
+    /// The status that same failure gets before the response head
+    /// ([`aisix_gateway::BridgeError::http_status`]). The emit records it in
+    /// place of the upstream's `200`: the caller's response line cannot
+    /// change any more, but the record of what happened can.
+    failure_status: Option<u16>,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// The request's ENFORCE-mode audit handle (AISIX-Cloud#1330). Held
     /// rather than snapshotted at construction: this struct's emit runs
@@ -2076,6 +2224,19 @@ struct RouteTelemetry {
 }
 
 impl RouteTelemetry {
+    /// Record the upstream failure that ended a streamed relay after its
+    /// head went out. The first one is the cause; later ones do not replace
+    /// it.
+    fn record_failure(&mut self, err: &aisix_gateway::BridgeError) {
+        if self.failure_status.is_some() {
+            return;
+        }
+        let failure = crate::attempt::StreamFailure::from_bridge(err);
+        self.error_class = failure.error_class.to_string();
+        self.error_message = failure.error_message;
+        self.failure_status = Some(failure.status);
+    }
+
     /// Stamp the caller's wait at the first RELAYED frame handed
     /// downstream.
     ///
@@ -2105,8 +2266,14 @@ impl RouteTelemetry {
         // generator's end. The upstream status is then not what happened
         // to the request, so record the same 499 the typed streaming
         // endpoints do rather than a success the caller never received.
-        if self.streaming && !self.stream_reached_end {
-            self.status = crate::CLIENT_CLOSED_REQUEST;
+        // One an upstream failure ended records that failure's status
+        // instead, unless a guardrail refused it.
+        if self.streaming {
+            match self.failure_status.filter(|_| !self.guardrail_blocked) {
+                Some(status) => self.status = status,
+                None if !self.stream_reached_end => self.status = crate::CLIENT_CLOSED_REQUEST,
+                None => {}
+            }
         }
         let elapsed = self.started.elapsed();
         let snapshot = self.state.snapshot.load();
@@ -2118,6 +2285,18 @@ impl RouteTelemetry {
             &self.route_name,
             &self.api_key_id,
             self.status,
+            // Same rule as the typed streaming endpoints, and the same
+            // figure this emit puts on the usage event below: a streamed
+            // relay reports the wait to its first relayed frame, a buffered
+            // one the whole response. A relay that delivered nothing waited
+            // the whole request for nothing, which is what `elapsed` says.
+            if self.streaming {
+                self.downstream_first_ms
+                    .map(|ms| Duration::from_millis(u64::from(ms)))
+                    .unwrap_or(elapsed)
+            } else {
+                elapsed
+            },
             elapsed,
             &self.request_id,
             Some(AccessLogTokens {
@@ -2152,6 +2331,7 @@ impl RouteTelemetry {
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
             cached_prompt_tokens: usage.cached_prompt_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
             reasoning_tokens: usage.reasoning_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             cache_read_tokens: usage.cache_read_tokens,
@@ -2182,10 +2362,17 @@ impl RouteTelemetry {
             guardrail_blocked: self.guardrail_blocked,
             guardrail_monitor_hits: std::mem::take(&mut self.monitor_hits),
             guardrail_enforced_hits: crate::usage_attr::enforced_hits(&self.audit),
+            guardrail_scores: crate::usage_attr::guardrail_scores(&self.audit),
+            guardrail_bypassed_reason: crate::usage_attr::bypass_reason(&self.audit),
             ..Default::default()
         };
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
-        crate::usage_attr::apply_jwt_identity(&mut event, self.jwt.as_ref());
+        crate::usage_attr::apply_caller_identity(
+            &mut event,
+            self.jwt.as_ref(),
+            self.user_id.as_deref(),
+            self.user_name.as_deref(),
+        );
         if self.anonymous {
             event.auth_type = "anonymous".to_string();
         }
@@ -2210,7 +2397,7 @@ impl RouteTelemetry {
         crate::usage_attr::emit_usage(
             &self.state,
             &snapshot,
-            "passthrough_route",
+            crate::operation::PASSTHROUGH,
             event,
             crate::usage_attr::usage_event_labels(&usage_model, &pk),
             content.as_ref(),
@@ -2271,7 +2458,13 @@ fn emit_access_log(
     route: &str,
     api_key_id: &str,
     status: u16,
-    elapsed: Duration,
+    // What the caller waited for: the first relayed frame on a streamed
+    // relay, the whole response otherwise — the same figure the usage
+    // event reports as `downstream_latency_ms`.
+    latency: Duration,
+    // How long the relay held the gateway, arrival to last byte out. On a
+    // streamed relay the two differ by the length of the stream.
+    duration: Duration,
     request_id: &str,
     tokens: Option<AccessLogTokens>,
     error: Option<&ProxyError>,
@@ -2283,13 +2476,17 @@ fn emit_access_log(
         }
         None => (None, None),
     };
+    let target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method: method.as_str(),
         path,
         status,
-        latency: elapsed,
+        latency,
+        duration,
         provider: Some(route),
         model: None,
+        upstream_model: target.upstream_model(),
+        provider_key_id: target.provider_key_id(),
         api_key_id: Some(api_key_id),
         prompt_tokens: tokens.as_ref().map(|t| u64::from(t.prompt)),
         completion_tokens: tokens.as_ref().map(|t| u64::from(t.completion)),
@@ -2303,6 +2500,8 @@ fn emit_access_log(
         routing_fallback_count: None,
         error_kind,
         error: error.as_deref(),
+        mcp: None,
+        cache: None,
     }
     .emit();
 }
@@ -2329,6 +2528,7 @@ mod tests {
             request_id: Default::default(),
             url_rewrites: Vec::new(),
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }
@@ -2380,8 +2580,11 @@ mod tests {
         crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache())
     }
 
+    /// The `/passthrough/*` namespace carries no special case: with no
+    /// route claiming the path it is an ordinary router miss — a bare 404
+    /// with an empty body, like any other unmatched path.
     #[tokio::test]
-    async fn legacy_tunnel_answers_410_with_migration_pointer() {
+    async fn unclaimed_passthrough_path_takes_the_plain_404() {
         let app = build_app(AisixSnapshot::new());
         let req = Request::builder()
             .method("POST")
@@ -2390,14 +2593,13 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::GONE);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["code"], "endpoint_removed");
-        assert!(v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("passthrough_route"));
+        assert!(
+            bytes.is_empty(),
+            "the miss path carries no error envelope, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
     }
 
     #[tokio::test]
@@ -2587,8 +2789,8 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        // Disabled → no match → the tunnel namespace answers the 410.
-        assert_eq!(resp.status(), StatusCode::GONE);
+        // Disabled → no match → the ordinary router miss.
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2706,6 +2908,30 @@ mod tests {
         let frames = s.push(b"data: x\r\n\r\nrest");
         assert_eq!(frames.len(), 1);
         assert_eq!(s.take_rest(), b"rest");
+    }
+
+    #[test]
+    fn frame_in_band_error_reads_the_protocol_s_own_failure_events() {
+        let anthropic = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n";
+        let err = frame_in_band_error(PassthroughProtocol::OpenaiChat, anthropic).unwrap();
+        // Anthropic documents 529 for overloaded; not a 4xx, so it maps to 502.
+        assert_eq!(err.http_status(), 502);
+        let openai =
+            br#"data: {"error":{"message":"slow down","type":"rate_limit_error","code":429}}
+
+"#;
+        let err = frame_in_band_error(PassthroughProtocol::OpenaiCompletions, openai).unwrap();
+        assert_eq!(err.http_status(), 429);
+        let responses = br#"data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"x"}}}
+
+"#;
+        assert!(frame_in_band_error(PassthroughProtocol::OpenaiResponses, responses).is_some());
+        // An opaque stream is never read for one, and ordinary frames are not one.
+        assert!(frame_in_band_error(PassthroughProtocol::Raw, openai).is_none());
+        let delta = br#"data: {"choices":[{"delta":{"content":"hel"}}]}
+
+"#;
+        assert!(frame_in_band_error(PassthroughProtocol::OpenaiChat, delta).is_none());
     }
 
     #[test]
@@ -2864,6 +3090,135 @@ mod tests {
         assert_eq!(frame_delta(PassthroughProtocol::OpenaiChat, other).1, None);
     }
 
+    /// A frame's payload is ALL of its `data:` lines joined with `\n`
+    /// (WHATWG SSE). Parsing each line on its own turns one document into
+    /// N unparseable fragments, so the frame's usage went unread and — on
+    /// a `Raw` stream — its JSON source text was pushed into the guardrail
+    /// scan instead of its values.
+    #[test]
+    fn a_payload_spread_over_several_data_lines_is_read_as_one_document() {
+        let frame = b"event: message_delta\ndata: {\"type\":\"message_delta\",\ndata: \"usage\":{\"output_tokens\":7,\"input_tokens\":12}}\n\n";
+        let (_, usage) = frame_delta(PassthroughProtocol::OpenaiChat, frame);
+        assert_eq!(
+            usage,
+            Some(PassthroughUsage {
+                prompt_tokens: 12,
+                completion_tokens: 7,
+                ..Default::default()
+            }),
+        );
+
+        // The `Raw` scan text is the payload's VALUES for a document that
+        // parses — never the raw JSON source, which is what a per-line read
+        // fell back to for each fragment.
+        let (text, _) = frame_delta(PassthroughProtocol::Raw, frame);
+        assert_eq!(
+            text,
+            "{\"type\":\"message_delta\",\n\"usage\":{\"output_tokens\":7,\"input_tokens\":12}}",
+        );
+    }
+
+    /// Framing varies per ENDPOINT, not per vendor: on one host
+    /// `/v1/audio/transcriptions` streams pure CRLF with `\r\n\r\n`
+    /// separators and no `event:` lines while `/v1/responses` on the same
+    /// host is pure LF. The `\r` belongs to the framing and must reach
+    /// neither the parser nor the scan text.
+    #[test]
+    fn a_crlf_framed_frame_reads_the_same_as_its_lf_twin() {
+        let crlf = b"data: {\"usage\":{\"prompt_tokens\":26,\"completion_tokens\":4}}\r\n\r\n";
+        let lf = b"data: {\"usage\":{\"prompt_tokens\":26,\"completion_tokens\":4}}\n\n";
+        assert_eq!(
+            frame_delta(PassthroughProtocol::Raw, crlf),
+            frame_delta(PassthroughProtocol::Raw, lf),
+        );
+        assert_eq!(
+            frame_delta(PassthroughProtocol::Raw, crlf).1,
+            Some(usage_dims(26, 4)),
+        );
+        // …and the frame splitter agrees about where such a frame ends.
+        let mut splitter = SseFrameSplitter::new();
+        assert_eq!(splitter.push(crlf), vec![crlf.to_vec()]);
+    }
+
+    /// A comment-only frame — the keepalive some relays emit while the
+    /// upstream thinks — carries no `data:` line at all. It must contribute
+    /// no usage and no scan text on every protocol, rather than being read
+    /// as an empty or unparseable payload.
+    #[test]
+    fn a_comment_only_frame_contributes_nothing() {
+        for frame in [
+            &b": OPENROUTER PROCESSING\n\n"[..],
+            &b": OPENROUTER PROCESSING\r\n\r\n"[..],
+            &b": keep-alive\nevent: ping\n\n"[..],
+        ] {
+            for protocol in [
+                PassthroughProtocol::Raw,
+                PassthroughProtocol::OpenaiChat,
+                PassthroughProtocol::OpenaiCompletions,
+                PassthroughProtocol::OpenaiResponses,
+            ] {
+                assert_eq!(
+                    frame_delta(protocol, frame),
+                    (String::new(), None),
+                    "{protocol:?} on {:?}",
+                    String::from_utf8_lossy(frame),
+                );
+            }
+        }
+    }
+
+    /// A frame whose joined payload does not parse is still FORWARDED to
+    /// the client, so producing no scan text for it is a way past an output
+    /// block rule. Every protocol falls back to the raw payload text — the
+    /// worst case is a false positive, while the alternative is a bypass.
+    #[test]
+    fn an_unparseable_payload_still_yields_scan_text_on_every_protocol() {
+        // Two independent JSON documents on two `data:` lines: joined per
+        // the SSE spec this is one unparseable payload, and per-line parsing
+        // used to catch it only incidentally.
+        let frame = b"data: {\"choices\":[{\"delta\":{\"content\":\"BLOCKME\"}}]}\ndata: {\"choices\":[]}\n\n";
+        for protocol in [
+            PassthroughProtocol::Raw,
+            PassthroughProtocol::OpenaiChat,
+            PassthroughProtocol::OpenaiCompletions,
+            PassthroughProtocol::OpenaiResponses,
+        ] {
+            let (text, _) = frame_delta(protocol, frame);
+            assert!(
+                text.contains("BLOCKME"),
+                "{protocol:?} must still offer the forwarded bytes to the scan, got {text:?}",
+            );
+        }
+    }
+
+    /// The `[DONE]` sentinel is not content, on either framing. A stream
+    /// that omits it entirely — OpenAI's Responses API sends none — is the
+    /// ordinary case, so nothing may depend on having seen one.
+    #[test]
+    fn the_done_sentinel_contributes_nothing_on_either_framing() {
+        for frame in [&b"data: [DONE]\n\n"[..], &b"data: [DONE]\r\n\r\n"[..]] {
+            assert_eq!(
+                frame_delta(PassthroughProtocol::Raw, frame),
+                (String::new(), None),
+            );
+        }
+    }
+
+    /// Reasoning replayed by the caller is REQUEST text and is scanned; the
+    /// same field on a buffered RESPONSE is generated reasoning and is out
+    /// of the output-guardrail scope. One helper, two answers.
+    #[test]
+    fn replayed_reasoning_is_request_scan_text_and_not_response_scan_text() {
+        let msg = serde_json::json!({
+            "role": "assistant",
+            "content": "visible",
+            "reasoning_content": "hidden reasoning payload",
+        });
+        assert!(message_scan_text(&msg, true).contains("hidden reasoning payload"));
+        assert!(!message_scan_text(&msg, false).contains("hidden reasoning payload"));
+        assert!(message_scan_text(&msg, false).contains("visible"));
+    }
+
     #[test]
     fn opaque_stream_reads_flat_usage_only_from_a_labelled_frame() {
         // An agent backend reached through a forward-proxy route has no
@@ -2978,6 +3333,66 @@ mod tests {
         let name = body_model_name(PassthroughProtocol::OpenaiResponses, hostile.as_bytes());
         assert_eq!(name.chars().count(), REQUESTED_MODEL_CAP);
         assert!(!name.contains('\0'));
+    }
+
+    /// The passthrough route reads the SAME Responses shapes the typed
+    /// `/v1/responses` handler does, in the same directions. Request:
+    /// a replayed `reasoning` item's `content` AND `summary` are
+    /// caller-supplied text and are scanned. Response: a generated
+    /// `reasoning` item is out of the output scope and must not be —
+    /// the walk reads `content` off every item regardless of type, so
+    /// without an explicit skip a block rule matching only inside
+    /// reasoning refuses a response the typed route allows.
+    #[test]
+    fn responses_passthrough_scans_replayed_reasoning_but_not_generated_reasoning() {
+        let request = serde_json::json!({
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "VISIBLE"}]},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "SUMMARYSECRET"}],
+                    "content": [{"type": "reasoning_text", "text": "REASONINGSECRET"}]
+                },
+                {"type": "function_call_output", "call_id": "c1", "output": "TOOLRESULTSECRET"},
+                {"type": "mcp_approval_response", "approve": true, "reason": "APPROVALSECRET"}
+            ]
+        })
+        .to_string();
+        let scanned =
+            request_guardrail_text(PassthroughProtocol::OpenaiResponses, request.as_bytes());
+        assert!(scanned.contains("VISIBLE"), "got {scanned:?}");
+        assert!(scanned.contains("REASONINGSECRET"), "got {scanned:?}");
+        assert!(scanned.contains("SUMMARYSECRET"), "got {scanned:?}");
+        // The tool-result and approval slots too. These matter precisely
+        // because the items beside them yield text: the raw-body fallback
+        // fires only on a WHOLLY empty extraction, so a mixed body would
+        // otherwise carry them past the scan while `/v1/responses` blocks
+        // the same envelope.
+        assert!(scanned.contains("TOOLRESULTSECRET"), "got {scanned:?}");
+        assert!(scanned.contains("APPROVALSECRET"), "got {scanned:?}");
+
+        let response = serde_json::json!({
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "SUMMARYSECRET"}],
+                    "content": [{"type": "reasoning_text", "text": "REASONINGSECRET"}]
+                },
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "the visible answer"}]
+                }
+            ]
+        })
+        .to_string();
+        let scanned =
+            response_guardrail_text(PassthroughProtocol::OpenaiResponses, response.as_bytes());
+        assert!(scanned.contains("the visible answer"), "got {scanned:?}");
+        assert!(!scanned.contains("REASONINGSECRET"), "got {scanned:?}");
+        // Not a raw-body fallback: the message item yielded text, so a
+        // green above means the reasoning item was skipped rather than the
+        // whole walk having come back empty.
+        assert!(!scanned.contains("\"output\""), "got {scanned:?}");
     }
 
     #[test]
@@ -3188,6 +3603,246 @@ mod tests {
         assert_eq!(rid.len(), 1);
     }
 
+    /// A `header_key` route names the slot its gateway credential
+    /// arrives in, and the route schema forbids every name on the shared
+    /// credential list — so the shared list can never cover it. A glob
+    /// must not sweep it upstream, where the caller's AISIX key would be
+    /// replayable against this gateway.
+    #[tokio::test]
+    async fn a_glob_never_sweeps_the_route_s_own_auth_header() {
+        let (upstream, snap) = slot_route_fixture(serde_json::json!({
+            "auth_mode": "header_key",
+            "auth_header_name": "x-gw-key",
+            "forward_client_headers": ["x-*"]
+        }))
+        .await;
+
+        let resp = build_app(snap)
+            .oneshot(slot_request(&[("x-gw-key", "sk-caller")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        assert!(
+            received.headers.get("x-gw-key").is_none(),
+            "`x-*` must not relay the slot this route authenticated the caller with"
+        );
+        // The SAME `x-*` recovers a stripped header that is not a slot,
+        // so the assertion above is the rule firing rather than a pattern
+        // that was never asked.
+        assert_eq!(
+            received.headers.get("x-stripped-control").unwrap(),
+            "recovered"
+        );
+    }
+
+    /// Naming it in full is still consent — the rule narrows how a slot
+    /// is reached, never whether it can be.
+    #[tokio::test]
+    async fn the_route_s_own_auth_header_forwards_when_named_in_full() {
+        let (upstream, snap) = slot_route_fixture(serde_json::json!({
+            "auth_mode": "header_key",
+            "auth_header_name": "x-gw-key",
+            "forward_client_headers": ["x-gw-key"]
+        }))
+        .await;
+
+        let resp = build_app(snap)
+            .oneshot(slot_request(&[("x-gw-key", "sk-caller")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        assert_eq!(received.headers.get("x-gw-key").unwrap(), "sk-caller");
+    }
+
+    /// `identity_header`'s whole contract is that its value is recorded
+    /// on the usage event and stripped before forwarding — a glob that
+    /// put it back would make the promise false.
+    #[tokio::test]
+    async fn a_glob_never_sweeps_the_route_s_identity_header() {
+        let (upstream, snap) = slot_route_fixture(serde_json::json!({
+            "identity_header": "x-end-user",
+            "forward_client_headers": ["x-*"]
+        }))
+        .await;
+
+        let resp = build_app(snap)
+            .oneshot(slot_request(&[
+                ("authorization", "Bearer sk-caller"),
+                ("x-end-user", "alice@example.com"),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        assert!(received.headers.get("x-end-user").is_none());
+        assert_eq!(
+            received.headers.get("x-stripped-control").unwrap(),
+            "recovered"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_route_s_identity_header_forwards_when_named_in_full() {
+        let (upstream, snap) = slot_route_fixture(serde_json::json!({
+            "identity_header": "x-end-user",
+            "forward_client_headers": ["x-end-user"]
+        }))
+        .await;
+
+        let resp = build_app(snap)
+            .oneshot(slot_request(&[
+                ("authorization", "Bearer sk-caller"),
+                ("x-end-user", "alice@example.com"),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        assert_eq!(
+            received.headers.get("x-end-user").unwrap(),
+            "alice@example.com"
+        );
+    }
+
+    /// `gateway_key` names no slot of its own — the schema forbids
+    /// `auth_header_name` outside `header_key` — so nothing joins the
+    /// exact-name set and a glob keeps meaning exactly what it did.
+    /// (`anonymous` is the same shape and is covered end-to-end, where a
+    /// real peer address can satisfy its `source_cidrs` gate.)
+    #[tokio::test]
+    async fn a_gateway_key_route_keeps_the_shared_rule_and_nothing_more() {
+        let (upstream, snap) = slot_route_fixture(serde_json::json!({
+            "auth_mode": "gateway_key",
+            "forward_client_headers": ["x-*"]
+        }))
+        .await;
+
+        let resp = build_app(snap)
+            .oneshot(slot_request(&[
+                ("authorization", "Bearer sk-caller"),
+                ("x-gw-key", "not-a-slot-here"),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        assert_eq!(
+            received.headers.get("x-stripped-control").unwrap(),
+            "recovered"
+        );
+        // `x-gw-key` is in this ProviderKey's strip set, so `forwards()`
+        // IS asked about it here — and answers yes, because THIS route
+        // declared no slot. That is what makes the narrowing per route
+        // rather than a name added to the shared list: widen it to a
+        // global and this assertion fails.
+        assert_eq!(received.headers.get("x-gw-key").unwrap(), "not-a-slot-here");
+        // And the shared rule is untouched: `x-*` never reached
+        // `authorization`, so the ProviderKey's credential still rides
+        // alone.
+        let auths: Vec<_> = received.headers.get_all("authorization").iter().collect();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0], "Bearer sk-upstream");
+    }
+
+    /// `passthrough_route` is the one surface that relays EVERY value of
+    /// a repeated header — the other three collapse to the first — and
+    /// its field description now promises that to users. The only thing
+    /// keeping the promise is that this path walks the inbound map per
+    /// value instead of per name, so collapsing it must go red here.
+    #[tokio::test]
+    async fn a_repeated_header_forwards_every_value() {
+        let (upstream, snap) = slot_route_fixture(serde_json::json!({
+            "forward_client_headers": ["x-*"]
+        }))
+        .await;
+
+        // `x-stripped-control` is in the ProviderKey's strip set and
+        // [`slot_request`] always sends one, so the second copy makes
+        // this the STRIP-OVERRIDE path rather than the default-forward
+        // one — the branch where a per-name decision would be easiest to
+        // write and would silently drop a value.
+        let resp = build_app(snap)
+            .oneshot(slot_request(&[
+                ("authorization", "Bearer sk-caller"),
+                ("x-stripped-control", "second"),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        let got: Vec<_> = received
+            .headers
+            .get_all("x-stripped-control")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(got, vec!["recovered", "second"]);
+    }
+
+    /// An `inject` route with the given overrides merged onto it. The
+    /// upstream always answers `/v1/models`, and every request through
+    /// [`slot_request`] carries an ordinary `x-other`, so each test above
+    /// can tell "the rule fired" from "the pattern never matched".
+    async fn slot_route_fixture(overrides: serde_json::Value) -> (MockServer, AisixSnapshot) {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&upstream)
+            .await;
+
+        let mut json = serde_json::json!({
+            "name": "slot-route",
+            "path_prefix": "/passthrough/openai",
+            "target_url": upstream.uri(),
+            "provider_key_id": PK_ID
+        });
+        let map = json.as_object_mut().unwrap();
+        for (k, v) in overrides.as_object().unwrap() {
+            map.insert(k.clone(), v.clone());
+        }
+
+        // `strip_headers` names three `x-` headers, so `x-*` is asked
+        // about all three and the CONTROL below is a real observation of
+        // the glob firing. Without one in the strip set, a passthrough
+        // route forwards it by default whatever the patterns say — an
+        // assertion that proves nothing about this rule.
+        let pk_json = r#"{"display_name":"openai-up","secret":"sk-upstream",
+             "api_base":"http://unused","provider":"openai","adapter":"openai",
+             "strip_headers":["authorization","x-api-key","x-gw-key","x-end-user",
+                              "x-stripped-control"]}"#;
+        let pk: ProviderKey = serde_json::from_str(pk_json).unwrap();
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+        snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+        snap.passthrough_routes
+            .insert(route_entry("route-slot", json));
+        (upstream, snap)
+    }
+
+    /// A caller request carrying `headers` plus the control header — an
+    /// `x-` name the ProviderKey strips, so only a live `x-*` pattern
+    /// puts it back on the wire.
+    fn slot_request(headers: &[(&str, &str)]) -> Request<axum::body::Body> {
+        let mut b = Request::builder()
+            .method("GET")
+            .uri("/passthrough/openai/v1/models")
+            .header("x-stripped-control", "recovered");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(axum::body::Body::empty()).unwrap()
+    }
+
     #[test]
     fn copy_safe_headers_preserves_repeated_values() {
         let mut src = HeaderMap::new();
@@ -3254,7 +3909,7 @@ mod tests {
             r#"{"name":"test-block","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
         )
         .unwrap();
-        snap.guardrails.insert(ResourceEntry::new("g-1", g, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", g, 1));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());

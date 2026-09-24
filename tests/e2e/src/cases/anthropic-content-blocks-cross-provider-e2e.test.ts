@@ -194,6 +194,57 @@ describe("anthropic content blocks → OpenAI upstream (#722)", () => {
     expect(sent.messages[3].content).toContain("summarize please");
   });
 
+  test("the client's billing-attribution line does not reach a foreign upstream", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    const upstream = await modelBackedBy("blocks-billing-header-model");
+
+    // Anthropic-native clients prepend this line to the system prompt as
+    // attribution metadata for Anthropic's own API. It carries a segment
+    // that varies per request, and it sits at the very front of the
+    // prompt — so forwarding it to a provider that cannot read it anyway
+    // changes the prompt prefix on every turn and costs that provider's
+    // prompt cache every hit it would have had.
+    const resp = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": CALLER_PLAINTEXT,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "blocks-billing-header-model",
+        max_tokens: 64,
+        system: [
+          {
+            type: "text",
+            text: "x-anthropic-billing-header: cc_version=2.1.0; cc_entrypoint=cli; cch=7f3a91;",
+          },
+          { type: "text", text: "You are a terse assistant." },
+        ],
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    expect(resp.status).toBe(200);
+
+    const seen = upstream.receivedRequests.find((r) =>
+      r.path.includes("/chat/completions"),
+    );
+    expect(seen).toBeDefined();
+    expect(seen!.body).not.toContain("x-anthropic-billing-header");
+
+    const sent = JSON.parse(seen!.body) as {
+      messages: { role: string; content: unknown }[];
+    };
+    // The operator's actual system prompt still arrives — the strip must
+    // not take the whole field with it.
+    expect(sent.messages[0].role).toBe("system");
+    expect(sent.messages[0].content).toBe("You are a terse assistant.");
+    expect(sent.messages[1].content).toContain("hi");
+  });
+
   test("vision: base64 image block reaches the upstream as an image_url data URL", async (ctx) => {
     if (!etcdReachable || !app || !seed) {
       ctx.skip();

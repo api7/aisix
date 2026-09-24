@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::mcp_ref::McpToolRef;
 use crate::resource::Resource;
 
 /// Which API keys an MCP access policy applies to.
@@ -55,15 +56,52 @@ pub struct McpPolicy {
     /// a document written before the layered shape would otherwise fail
     /// to deserialize, and a skipped `api_key` row stops authenticating
     /// altogether rather than merely losing MCP access.
+    ///
+    /// Read only when `allow_ids` is absent; ignored entirely when it is
+    /// present.
     #[serde(default)]
     pub allow: Vec<String>,
+
+    /// This layer's allow side written by MCP server resource id instead of
+    /// by server name, so renaming a server does not change what the layer
+    /// allows. Each entry names one MCP server by the id it is registered
+    /// under and one tool by name, the tool matched as a single-`*` glob
+    /// against the bare tool name.
+    ///
+    /// Present — including as an empty array — it is authoritative and
+    /// `allow` is ignored; an empty array therefore allows nothing. Set to
+    /// `null` it means the same as omitted: the layer falls back to `allow`.
+    ///
+    /// It cannot express "every server": each entry names one server
+    /// exactly and `server_id` is never a glob, so an enumeration of the
+    /// servers registered today silently fails to cover one registered
+    /// tomorrow. To allow (or deny) every server, present and future,
+    /// leave this absent and use the name form's `"*"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_ids: Option<Vec<McpToolRef>>,
 
     /// Namespaced `<server>__<tool>` patterns subtracted from the effective
     /// grant of every key the policy applies to, using the same single-`*`
     /// glob matching as `allow`. Deny always wins: a tool matched here stays
     /// unavailable however the other layers allow it.
+    ///
+    /// Read only when `deny_ids` is absent; ignored entirely when it is
+    /// present.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+
+    /// This layer's deny side written by MCP server resource id instead of
+    /// by server name. Present — including as an empty array — it is
+    /// authoritative and `deny` is ignored; an empty array subtracts
+    /// nothing. Absent or `null`, the layer falls back to `deny`.
+    ///
+    /// It cannot express "every server": each entry names one server
+    /// exactly and `server_id` is never a glob, so an enumeration of the
+    /// servers registered today silently fails to cover one registered
+    /// tomorrow. To allow (or deny) every server, present and future,
+    /// leave this absent and use the name form's `"*"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_ids: Option<Vec<McpToolRef>>,
 
     /// Whether the policy is applied. A disabled policy is kept but
     /// contributes neither its allow nor its deny side. Treated as `true`
@@ -93,38 +131,43 @@ pub struct McpAccess {
     /// and `["*"]` narrows nothing (useful with `deny` alone).
     ///
     /// Required on the write path and defaulted by the runtime loader,
-    /// for the reason given on [`McpPolicy::allow`].
+    /// for the reason given on [`McpPolicy::allow`]. Read only when
+    /// `allow_ids` is absent; ignored entirely when it is present.
     #[serde(default)]
     pub allow: Vec<String>,
 
+    /// This key's allow side written by MCP server resource id instead of by
+    /// server name, so renaming a server does not change what the key may
+    /// reach. Present — including as an empty array — it is authoritative
+    /// and `allow` is ignored; an empty array therefore allows nothing.
+    /// Absent or `null`, the key falls back to `allow`.
+    ///
+    /// It cannot express "every server": each entry names one server
+    /// exactly and `server_id` is never a glob, so an enumeration of the
+    /// servers registered today silently fails to cover one registered
+    /// tomorrow. To allow (or deny) every server, present and future,
+    /// leave this absent and use the name form's `"*"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_ids: Option<Vec<McpToolRef>>,
+
     /// Namespaced `<server>__<tool>` patterns subtracted from this key's
     /// effective grant, using the same single-`*` glob matching as `allow`.
+    /// Read only when `deny_ids` is absent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
 
-    /// Compatibility tombstone for the pre-0.10.0 `mode` selector. The
-    /// control plane projected `"mode": "deny"` alongside the layered
-    /// shape so a 0.9.x data plane — where `mode` is required and `deny`
-    /// means "no MCP tool access" — still loaded the whole api_key row,
-    /// fail-closed, instead of skipping it (a skipped row stops the key
-    /// authenticating for EVERY kind of traffic). This generation
-    /// consumes and ignores the value; the field exists only so the
-    /// loader does not report the tombstone as partial compat on every
-    /// row. Any JSON shape is accepted so a malformed tombstone can
-    /// never kill the row. Hidden from the schemas — the strict write
-    /// path closes unknown fields, so resource authors cannot set it —
-    /// and never re-serialized.
+    /// This key's deny side written by MCP server resource id instead of by
+    /// server name. Present — including as an empty array — it is
+    /// authoritative and `deny` is ignored; an empty array subtracts
+    /// nothing. Absent or `null`, the key falls back to `deny`.
     ///
-    /// COMPAT-SINCE: 0.10.0 #1009 — the control plane stopped emitting this
-    /// tombstone at the 0.10.0 compat floor, but documents written before the
-    /// run-once reprojection still carry `mode`, so this generation reads and
-    /// drops it rather than reporting partial compat on every row.
-    ///
-    /// Retiring it removes the field, the `#[schemars(skip)]` exclusion, and
-    /// the loader test that pins the tolerance.
-    #[serde(default, rename = "mode", skip_serializing)]
-    #[schemars(skip)]
-    pub legacy_mode: Option<serde_json::Value>,
+    /// It cannot express "every server": each entry names one server
+    /// exactly and `server_id` is never a glob, so an enumeration of the
+    /// servers registered today silently fails to cover one registered
+    /// tomorrow. To allow (or deny) every server, present and future,
+    /// leave this absent and use the name form's `"*"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_ids: Option<Vec<McpToolRef>>,
 }
 
 impl Resource for McpPolicy {
@@ -247,25 +290,6 @@ mod tests {
         let blocked: McpAccess = serde_json::from_str(r#"{"allow":[]}"#).unwrap();
         assert!(blocked.allow.is_empty());
         assert!(blocked.deny.is_empty());
-    }
-
-    #[test]
-    fn mcp_access_consumes_the_legacy_mode_tombstone() {
-        // The CP projects `"mode": "deny"` next to the layered shape so a
-        // 0.9.x DP loads the row fail-closed. This generation reads its
-        // own half, tolerates any tombstone shape, and never re-emits it.
-        let a: McpAccess =
-            serde_json::from_str(r#"{"mode":"deny","allow":["github__*"],"deny":["x__y"]}"#)
-                .unwrap();
-        assert_eq!(a.allow, vec!["github__*"]);
-        assert_eq!(a.deny, vec!["x__y"]);
-        assert_eq!(a.legacy_mode, Some(serde_json::json!("deny")));
-
-        let malformed: McpAccess = serde_json::from_str(r#"{"allow":[],"mode":5}"#).unwrap();
-        assert_eq!(malformed.legacy_mode, Some(serde_json::json!(5)));
-
-        let v = serde_json::to_value(&a).unwrap();
-        assert!(v.get("mode").is_none());
     }
 
     #[test]

@@ -337,6 +337,21 @@ impl Guardrail for OpenaiModerationGuardrail {
         )
     }
 
+    fn runs_on_input(&self) -> bool {
+        matches!(
+            self.hook_point,
+            GuardrailHookPoint::Input | GuardrailHookPoint::Both
+        )
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        !self.fail_open
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        !self.output_fail_open
+    }
+
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
         if !self.hook_enabled(GuardrailHookPoint::Input) {
             return GuardrailVerdict::Allow;

@@ -67,22 +67,12 @@ const OPENAPI_JSON_BASE: &str = r##"{
                 }
               }
             }
-          },
-          "503": {
-            "description": "Process is shutting down (graceful drain)",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
           }
         },
         "tags": [
           "Health"
         ],
-        "description": "Process liveness: 200 while the process is alive, 503 once graceful shutdown has begun (an expected drain, not a crash). Use /readyz for traffic eligibility (readiness)."
+        "description": "Process liveness: should this instance be restarted? Answers 200 whenever it answers at all, including throughout a graceful drain \u2014 draining is deliberate work, and restarting an instance that is finishing the requests it accepted would kill exactly those. Use /readyz for traffic eligibility (readiness), which is what reports the drain."
       }
     },
     "/readyz": {
@@ -1522,6 +1512,28 @@ const OPENAPI_JSON_BASE: &str = r##"{
         },
         "description": "Admin API error response envelope."
       },
+      "McpToolRef": {
+        "type": "object",
+        "required": [
+          "server_id",
+          "tool"
+        ],
+        "properties": {
+          "server_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Resource id of the registered MCP server this entry refers to. An id matching no registered server refers to nothing: the entry never matches, and the other entries are unaffected.",
+            "example": "9b1b6d9c-1f5e-4c1e-9f8f-2f5f5b9d1c11"
+          },
+          "tool": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Tool on that server, matched as a single-`*` glob against the bare tool name \u2014 the part after the `<server>__` namespace prefix. `\"*\"` covers every tool the server exposes.",
+            "example": "create_issue"
+          }
+        },
+        "description": "One tool on one MCP server, the server named by its resource id and the tool by name. The server half is compared as an exact id, never glob-matched."
+      },
       "PublicApiKey": {
         "type": "object",
         "required": [
@@ -1538,9 +1550,22 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "Model aliases this caller API key may use.",
+            "description": "Model names this caller API key may use, matched as single-`*` globs. Read only when `allowed_model_ids` is omitted or null; an array there, `[]` included, takes over entirely.",
             "example": [
               "gpt-4o"
+            ]
+          },
+          "allowed_model_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Models this caller API key may use, named by resource id. An array here, `[]` included, is authoritative and `allowed_models` is ignored: each id resolves against the models currently in the configuration and the resolved name is glob-matched, and an id resolving to no model grants nothing. Omitted or null falls back to `allowed_models`, so `[]` and not null is how access is removed.",
+            "example": [
+              "9b1b6d9c-1f5e-4c1e-9f8f-2f5f5b9d1c11"
             ]
           },
           "rate_limit": {
@@ -1558,20 +1583,40 @@ const OPENAPI_JSON_BASE: &str = r##"{
                 "items": {
                   "type": "string"
                 },
-                "description": "Namespaced `<server>__<tool>` glob patterns this key allows, intersected with the environment and team layers."
+                "description": "Namespaced `<server>__<tool>` glob patterns this key allows, intersected with the environment and team layers. Read only when `allow_ids` is omitted or null; an array there, `[]` included, takes over entirely."
+              },
+              "allow_ids": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "$ref": "#/components/schemas/McpToolRef"
+                },
+                "description": "The same allow side written by MCP server resource id instead of by server name, so renaming a server does not change what the key may reach. An array here, `[]` included, is authoritative and `allow` is ignored. Omitted or null falls back to `allow`. Cannot express \"every server\": each entry names one server exactly and `server_id` is never a glob, so an enumeration of the servers registered today silently fails to cover one registered tomorrow — to cover every server, present and future, omit this and use the name form's `\"*\"`."
               },
               "deny": {
                 "type": "array",
                 "items": {
                   "type": "string"
                 },
-                "description": "Namespaced `<server>__<tool>` glob patterns subtracted from this key's effective grant. Deny always wins."
+                "description": "Namespaced `<server>__<tool>` glob patterns subtracted from this key's effective grant. Deny always wins. Read only when `deny_ids` is omitted or null."
+              },
+              "deny_ids": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "$ref": "#/components/schemas/McpToolRef"
+                },
+                "description": "The same deny side written by MCP server resource id instead of by server name. An array here, `[]` included, is authoritative and `deny` is ignored. Omitted or null falls back to `deny`. Writing it requires `deny` beside it, so a gateway one release behind the control plane still reads the denial. Cannot express \"every server\": each entry names one server exactly and `server_id` is never a glob, so an enumeration of the servers registered today silently fails to cover one registered tomorrow — to cover every server, present and future, omit this and use the name form's `\"*\"`."
               }
             },
             "required": [
               "allow"
             ],
-            "description": "This key's own layer of the MCP tool ACL, as namespaced `<server>__<tool>` glob patterns. Intersected with the environment and team MCP access policies: every present layer must allow a tool and no layer may deny it. When omitted the key adds no constraint of its own; with no layer present anywhere the grant is empty."
+            "description": "This key's own layer of the MCP tool ACL, as namespaced `<server>__<tool>` glob patterns or as `allow_ids` / `deny_ids` entries naming the server by resource id. Intersected with the environment and team MCP access policies: every present layer must allow a tool and no layer may deny it. When omitted the key adds no constraint of its own; with no layer present anywhere the grant is empty."
           },
           "allowed_agents": {
             "type": [
@@ -2178,11 +2223,16 @@ fn add_variant_titles(doc: &mut Value) {
                 "OpenAI Moderation",
                 "Presidio",
                 "Semantic Screening",
+                "Custom Script",
             ],
         ),
         (
             "/components/schemas/GuardrailHookPoint/oneOf",
             &["Input", "Output", "Both"],
+        ),
+        (
+            "/components/schemas/GuardrailInputMessages/oneOf",
+            &["All messages", "Latest turn only"],
         ),
         (
             "/components/schemas/KeywordPattern/oneOf",
@@ -2353,7 +2403,7 @@ fn add_schema_defaults(doc: &mut Value) {
         ),
         (
             "/components/schemas/CooldownConfig/properties/enabled",
-            serde_json::json!(true),
+            serde_json::json!(false),
         ),
         (
             "/components/schemas/CooldownConfig/properties/honor_retry_after",
@@ -2988,6 +3038,13 @@ mod tests {
             serde_json::json!([401, 408, 429, 500, 502, 503, 504]),
             "runtime default cooldown trigger statuses should be visible in OpenAPI"
         );
+        // Cooldown is opt-in (AISIX-Cloud#1499): the reference must not
+        // advertise a feature the gateway does not switch on by itself.
+        assert_eq!(
+            schemas["CooldownConfig"]["properties"]["enabled"]["default"],
+            serde_json::json!(false),
+            "cooldown must be documented as off unless the operator enables it"
+        );
         assert_eq!(
             schemas["Routing"]["properties"]["when_all_unavailable"]["default"],
             serde_json::json!("fail"),
@@ -3100,6 +3157,7 @@ mod tests {
             ("openai_moderation", "OpenAI Moderation"),
             ("presidio", "Presidio"),
             ("semantic", "Semantic Screening"),
+            ("custom", "Custom Script"),
         ];
 
         let parsed: serde_json::Value =
@@ -3115,7 +3173,7 @@ mod tests {
 
         // The kind descriptions have exactly one source, beside the type in
         // `aisix_core`. Assembly here must not become a second one.
-        let source = aisix_core::models::schema::guardrail_root_schema();
+        let source = aisix_core::models::schema::guardrail_root_schema(true);
         let source_branches = source["oneOf"]
             .as_array()
             .expect("the guardrail root schema is a `oneOf` over the kinds");
@@ -3224,11 +3282,44 @@ mod tests {
         );
     }
 
+    /// A subschema that states a cross-field REQUIREMENT and nothing
+    /// else: `required`, optionally with a bare type pin on each field it
+    /// names. The "name or id" alternative every model reference carries
+    /// is written this way — the type pin is there because `required` in
+    /// JSON Schema is satisfied by a key whose value is `null`, and the
+    /// id fields accept `null`.
+    ///
+    /// ReDoc renders no tab for such a branch and it defines no property
+    /// of its own, so the title and description guards below skip it —
+    /// exactly as they already skip `if`/`then`/`else`.
+    fn is_requiredness_constraint(node: &serde_json::Value) -> bool {
+        let Some(map) = node.as_object() else {
+            return false;
+        };
+        if !map.contains_key("required")
+            || !map
+                .keys()
+                .all(|k| matches!(k.as_str(), "required" | "properties"))
+        {
+            return false;
+        }
+        let Some(serde_json::Value::Object(properties)) = map.get("properties") else {
+            return true;
+        };
+        properties.values().all(|p| {
+            p.as_object()
+                .is_some_and(|o| o.len() == 1 && o.contains_key("type"))
+        })
+    }
+
     fn collect_missing_property_descriptions(
         value: &serde_json::Value,
         path: String,
         missing: &mut Vec<String>,
     ) {
+        if is_requiredness_constraint(value) {
+            return;
+        }
         match value {
             serde_json::Value::Object(map) => {
                 if map.get("type").is_some_and(|kind| kind == "object")
@@ -3356,6 +3447,14 @@ mod tests {
                 for key in ["oneOf", "anyOf"] {
                     if let Some(serde_json::Value::Array(variants)) = map.get(key) {
                         for (index, variant) in variants.iter().enumerate() {
+                            // A cross-field requirement is not a shape a
+                            // reader picks between, so ReDoc gives it no
+                            // tab and a title on it would name something
+                            // nobody sees. Same exemption the `not`
+                            // subschemas get below.
+                            if is_requiredness_constraint(variant) {
+                                continue;
+                            }
                             if variant["title"].as_str().is_none_or(str::is_empty) {
                                 missing.push(format!("{path}/{key}/{index}"));
                             }
@@ -3472,8 +3571,12 @@ mod tests {
             "verbose"
         );
         // Graceful shutdown is documented as 503 (drain), not 500 (#591).
-        assert!(parsed["paths"]["/livez"]["get"]["responses"]["503"].is_object());
+        // Liveness has no failure response to document: a draining
+        // instance answers 200 like any other, and an instance that
+        // cannot answer does not reply at all.
+        assert!(parsed["paths"]["/livez"]["get"]["responses"]["503"].is_null());
         assert!(parsed["paths"]["/livez"]["get"]["responses"]["500"].is_null());
+        assert!(parsed["paths"]["/readyz"]["get"]["responses"]["503"].is_object());
         // /readyz is documented with 200 + 503 (readiness).
         assert!(parsed["paths"]["/readyz"]["get"]["responses"]["200"].is_object());
         assert!(parsed["paths"]["/readyz"]["get"]["responses"]["503"].is_object());

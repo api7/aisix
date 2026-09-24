@@ -12,6 +12,8 @@
 //!
 //! etcd path: `{prefix}/models/{uuid}`. Secondary index on `display_name`.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -37,6 +39,34 @@ pub enum Adapter {
     Bedrock,
     Vertex,
     AzureOpenai,
+}
+
+impl Adapter {
+    /// Every variant, for the exhaustive sweeps that cannot express
+    /// themselves as a `match` — the `upstream_protocol` metric label's
+    /// agreement test walks this against the registered bridges. Kept
+    /// next to [`Adapter::wire_protocol`] so a new variant, which the
+    /// match below refuses to compile without, is added to both.
+    pub const ALL: [Adapter; 5] = [
+        Self::Openai,
+        Self::Anthropic,
+        Self::Bedrock,
+        Self::Vertex,
+        Self::AzureOpenai,
+    ];
+
+    /// The adapter's wire value — the serde representation, spelled out
+    /// so it can be used where a `&'static str` is needed (Prometheus
+    /// label values) without a serialization round-trip.
+    pub fn wire_protocol(self) -> &'static str {
+        match self {
+            Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Bedrock => "bedrock",
+            Self::Vertex => "vertex",
+            Self::AzureOpenai => "azure-openai",
+        }
+    }
 }
 
 /// Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.
@@ -84,10 +114,10 @@ pub struct BackgroundModelCheck {
     pub stale_after_seconds: u64,
 }
 
-/// Request-path cooldown settings for a direct model after retryable upstream failures.
+/// Request-path cooldown settings for a direct model after retryable upstream failures. Cooldown is opt-in: it runs only when `enabled` is `true`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Default)]
 pub struct CooldownConfig {
-    /// Whether cooldown is active for this model. Set to `false` to keep the model in rotation regardless of upstream failures.
+    /// Whether cooldown is active for this model. Cooldown is off unless this is set to `true`, so a model that omits it stays in rotation regardless of upstream failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     /// Cooldown TTL in seconds when the upstream did not supply a `Retry-After` header or `honor_retry_after` is `false`.
@@ -120,8 +150,13 @@ const DEFAULT_COOLDOWN_SECONDS: u64 = 30;
 const DEFAULT_COOLDOWN_MAX_SECONDS: u64 = 600;
 
 impl CooldownConfig {
-    pub fn enabled_or_default(&self) -> bool {
-        self.enabled.unwrap_or(true)
+    /// Cooldown is opt-in, so an absent `enabled` reads as `false` — the
+    /// same answer a model with no `cooldown` block at all gets. Taking a
+    /// direct model out of rotation is a user-visible availability
+    /// decision, and the gateway does not make it for an operator who
+    /// never asked (AISIX-Cloud#1499).
+    pub fn is_enabled(&self) -> bool {
+        self.enabled == Some(true)
     }
 
     pub fn default_seconds_or_default(&self) -> u64 {
@@ -270,11 +305,16 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<ModelCost>,
 
+    /// Name of a shared `pricing` document to take the per-token cost from, instead of setting `cost` on this model. The environment's own pricing documents are searched first and the shared catalog second; when the key matches neither, `cost` applies. Editing the pricing document repricies every model naming it, with no change to the models themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 255))]
+    pub pricing_key: Option<String>,
+
     /// Direct-model-only background health-check configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_model_check: Option<BackgroundModelCheck>,
 
-    /// Direct-model-only request-path cooldown configuration. Omit this field to use the built-in cooldown behavior.
+    /// Direct-model-only request-path cooldown configuration. Cooldown is opt-in: omit this field, or leave `enabled` unset, and the model is never taken out of rotation by request-path failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown: Option<CooldownConfig>,
 
@@ -282,11 +322,49 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_prompt_caching: Option<AutoPromptCaching>,
 
+    /// Direct-model-only mapping from a client-requested reasoning effort to the value sent upstream. After resolving the final target the gateway looks the requested effort up once — the exact entry first, then the `*` entry — and never looks the result up again. A requested value that matches neither is sent unchanged.
+    ///
+    /// Three entries are reserved. The empty-string key matches a request that sets no effort at all, meaning the effort field is absent, `null`, or empty, and its value is added to the outbound request. The `*` key matches any other present value that has no entry of its own, and never matches a request that sets no effort. A `null` value removes the effort field from the outbound request so the provider's own default applies; mapping `*` to `null` therefore strips the effort from every request whose value has no entry of its own. The empty-string key may not be mapped to `null`, because a request that sets no effort has nothing to remove, and no entry may be mapped to an empty value.
+    ///
+    /// On the Anthropic messages and token-counting endpoints only `output_config.effort` is read and rewritten. A `thinking` block is not an effort setting for this mapping, so a request that carries `thinking` but no `output_config.effort` sets no effort and the empty-string entry applies to it. When such a request is dispatched to a provider that does not accept the Anthropic protocol, the upstream reasoning effort is derived from the mapped `output_config.effort` when one is present and from `thinking` otherwise, except that an entry that removed the effort sends no effort at all. A request that sets `thinking.type: disabled` is never given an effort by this mapping: on the Anthropic protocol no entry writes a tier to it, though an entry that removes the effort still removes it, and on any other protocol it always sends the `none` effort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_mapping: Option<BTreeMap<String, Option<String>>>,
+
     /// Non-schema runtime id. Not part of the JSON payload — filled in by
     /// the snapshot loader from the etcd key path. Kept here so `Resource`
     /// can return a `&str` id.
     #[serde(skip)]
     pub(crate) runtime_id: String,
+}
+
+/// What a model's `effort_mapping` does to one request's reasoning effort,
+/// as resolved by [`Model::mapped_effort`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortAction<'a> {
+    /// No entry applies: the request's effort field goes upstream exactly
+    /// as it arrived, whether it was set or not.
+    Keep,
+    /// Send this effort upstream, adding the field when the request set
+    /// none.
+    Set(&'a str),
+    /// Drop the effort field from the outbound request so the provider's
+    /// own default applies.
+    Remove,
+}
+
+/// What a model's `effort_mapping` did to one request, carried alongside
+/// the rewritten request so a translation to another wire protocol can
+/// tell a request whose effort an entry deliberately removed from one
+/// that simply never stated an effort of its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MappedEffort {
+    /// The outbound request states whatever effort it carries, be that
+    /// the caller's own, one an entry wrote in, or none at all.
+    #[default]
+    AsWritten,
+    /// An entry removed the effort field: the outbound request states no
+    /// effort on purpose, and nothing may put one back.
+    Removed,
 }
 
 impl Model {
@@ -328,6 +406,9 @@ impl Model {
     /// never resolved.
     pub fn strip_kind_inapplicable(&mut self) -> Vec<&'static str> {
         let mut stripped = Vec::new();
+        if self.is_embedding() && self.effort_mapping.take().is_some() {
+            stripped.push("effort_mapping");
+        }
         if !(self.is_routing() || self.is_ensemble() || self.is_semantic()) {
             return stripped;
         }
@@ -336,6 +417,12 @@ impl Model {
         }
         if self.cost.take().is_some() {
             stripped.push("cost");
+        }
+        if self.effort_mapping.take().is_some() {
+            stripped.push("effort_mapping");
+        }
+        if self.pricing_key.take().is_some() {
+            stripped.push("pricing_key");
         }
         if (self.is_routing() || self.is_ensemble()) && self.retries.take().is_some() {
             stripped.push("retries");
@@ -352,6 +439,32 @@ impl Model {
             }
         }
         stripped
+    }
+
+    /// Resolve one request's reasoning effort against `effort_mapping`.
+    ///
+    /// `requested` is `None` when the request sets no effort — its carrier
+    /// field is absent, `null`, or an empty string — and `Some` for a
+    /// present, non-empty value. The two are distinct lookups: `""` is the
+    /// only key that matches the former, and `"*"` only ever matches the
+    /// latter.
+    ///
+    /// A present value resolves by exact key first and `"*"` second. The
+    /// result is never looked up again, so a map such as
+    /// `low -> high, high -> max` rewrites `low` to `high`, never `max`.
+    pub fn mapped_effort(&self, requested: Option<&str>) -> EffortAction<'_> {
+        let Some(mapping) = self.effort_mapping.as_ref() else {
+            return EffortAction::Keep;
+        };
+        let rule = match requested {
+            None => mapping.get(""),
+            Some(effort) => mapping.get(effort).or_else(|| mapping.get("*")),
+        };
+        match rule {
+            None => EffortAction::Keep,
+            Some(None) => EffortAction::Remove,
+            Some(Some(mapped)) => EffortAction::Set(mapped),
+        }
     }
 
     /// This resource's own non-streaming deadline, as one level of the
@@ -420,7 +533,8 @@ pub fn model_one_of() -> Value {
 /// [`Model::strip_kind_inapplicable`]). Kind policy (project decision):
 /// generic call knobs (`timeout`/`stream_timeout`/`retries`) resolve
 /// member → group → deployment default wherever a group slot exists;
-/// model-specific knobs (`auto_prompt_caching`, `cost`) are direct-only.
+/// model-specific knobs (`auto_prompt_caching`, `cost`, `pricing_key`) are
+/// direct-only.
 pub fn model_one_of_strict() -> Value {
     model_one_of_variant(true)
 }
@@ -438,8 +552,23 @@ fn model_one_of_variant(strict: bool) -> Value {
         // routing: the group slot for timeouts is the top-level pair
         // (api7/aisix#844); retries' group slot is `routing.retries`, so a
         // top-level value is dead — as are the model-specific knobs.
-        extend(&mut arr[0], &["retries", "auto_prompt_caching", "cost"]);
-        // direct (arr[1]): every knob is live.
+        extend(
+            &mut arr[0],
+            &[
+                "retries",
+                "auto_prompt_caching",
+                "cost",
+                "pricing_key",
+                "effort_mapping",
+            ],
+        );
+        // The direct-shaped branch also carries embedding models. They do
+        // not accept generation effort, so forbid the mapping only when the
+        // embedding marker is present; ordinary direct models keep it.
+        arr[1]["not"]["anyOf"]
+            .as_array_mut()
+            .expect("direct not.anyOf array")
+            .push(json!({ "required": ["embedding", "effort_mapping"] }));
         // ensemble: sub-calls resolve member-level knobs only; the
         // parent-level deadline is `ensemble.timeout_ms`.
         extend(
@@ -450,12 +579,22 @@ fn model_one_of_variant(strict: bool) -> Value {
                 "retries",
                 "auto_prompt_caching",
                 "cost",
+                "pricing_key",
+                "effort_mapping",
             ],
         );
         // semantic: top-level timeout/stream_timeout/retries ARE the group
         // slots (no routing block to carry them); the model-specific knobs
         // stay direct-only.
-        extend(&mut arr[3], &["auto_prompt_caching", "cost"]);
+        extend(
+            &mut arr[3],
+            &[
+                "auto_prompt_caching",
+                "cost",
+                "pricing_key",
+                "effort_mapping",
+            ],
+        );
     }
     variants
 }
@@ -736,6 +875,61 @@ mod tests {
     }
 
     #[test]
+    fn effort_mapping_is_a_single_exact_lookup() {
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "glm",
+            "provider": "openai",
+            "model_name": "glm-5.3",
+            "provider_key_id": "pk-1",
+            "effort_mapping": {
+                "medium": "high",
+                "high": "max"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            model.mapped_effort(Some("medium")),
+            EffortAction::Set("high")
+        );
+        assert_eq!(model.mapped_effort(Some("high")), EffortAction::Set("max"));
+        assert_eq!(model.mapped_effort(Some("low")), EffortAction::Keep);
+        assert_eq!(model.mapped_effort(None), EffortAction::Keep);
+    }
+
+    #[test]
+    fn effort_mapping_reserved_tokens_resolve_by_precedence() {
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "glm",
+            "provider": "openai",
+            "model_name": "glm-5.3",
+            "provider_key_id": "pk-1",
+            "effort_mapping": {
+                "": "high",
+                "*": "low",
+                "medium": serde_json::Value::Null
+            }
+        }))
+        .unwrap();
+
+        // A request that sets no effort takes the `""` entry, never `*`.
+        assert_eq!(model.mapped_effort(None), EffortAction::Set("high"));
+        // An exact entry wins over `*`, removal included.
+        assert_eq!(model.mapped_effort(Some("medium")), EffortAction::Remove);
+        assert_eq!(model.mapped_effort(Some("xl")), EffortAction::Set("low"));
+
+        let star_only: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "glm",
+            "provider": "openai",
+            "model_name": "glm-5.3",
+            "provider_key_id": "pk-1",
+            "effort_mapping": {"*": "low"}
+        }))
+        .unwrap();
+        assert_eq!(star_only.mapped_effort(None), EffortAction::Keep);
+    }
+
+    #[test]
     fn routing_form_has_no_provider_or_provider_key_id() {
         let m: Model = serde_json::from_str(
             r#"{
@@ -784,7 +978,10 @@ mod tests {
     #[test]
     fn cooldown_config_defaults_via_helpers() {
         let cfg = CooldownConfig::default();
-        assert!(cfg.enabled_or_default());
+        // Cooldown itself is opt-in; the knobs inside it keep their
+        // defaults, because those are parameters of a feature the
+        // operator turned on.
+        assert!(!cfg.is_enabled());
         assert_eq!(cfg.default_seconds_or_default(), 30);
         assert_eq!(cfg.max_seconds_or_default(), 600);
         assert!(cfg.honor_retry_after_or_default());
@@ -811,15 +1008,22 @@ mod tests {
         let cfg: CooldownConfig = serde_json::from_str(r#"{"default_seconds": 90}"#).unwrap();
         assert_eq!(cfg.default_seconds_or_default(), 90);
         // Other fields fall back to defaults.
-        assert!(cfg.enabled_or_default());
         assert_eq!(cfg.max_seconds_or_default(), 600);
         assert!(cfg.honor_retry_after_or_default());
+        // …but tuning a knob is not enabling the feature: a block that
+        // never says `enabled: true` leaves cooldown off.
+        assert!(!cfg.is_enabled());
     }
 
     #[test]
-    fn cooldown_config_disable_via_enabled_false() {
-        let cfg: CooldownConfig = serde_json::from_str(r#"{"enabled": false}"#).unwrap();
-        assert!(!cfg.enabled_or_default());
+    fn cooldown_runs_only_when_the_operator_enables_it() {
+        // AISIX-Cloud#1499. Three ways to say "not asked for", one answer.
+        let absent: CooldownConfig = serde_json::from_str("{}").unwrap();
+        assert!(!absent.is_enabled());
+        let off: CooldownConfig = serde_json::from_str(r#"{"enabled": false}"#).unwrap();
+        assert!(!off.is_enabled());
+        let on: CooldownConfig = serde_json::from_str(r#"{"enabled": true}"#).unwrap();
+        assert!(on.is_enabled());
     }
 
     #[test]
@@ -845,9 +1049,31 @@ mod tests {
         )
         .unwrap();
         let cooldown = m.cooldown.unwrap();
-        assert!(cooldown.enabled_or_default());
+        assert!(cooldown.is_enabled());
         assert_eq!(cooldown.default_seconds_or_default(), 45);
         assert_eq!(cooldown.effective_trigger_statuses().as_ref(), &[429, 503]);
+    }
+
+    #[test]
+    fn partial_cooldown_block_still_loads_the_row() {
+        // AISIX-Cloud#1499 turned an absent `enabled` from ON into OFF.
+        // That is a semantic change only: a stored row carrying a
+        // cooldown block written before the change must still
+        // deserialize, because a model row the loader cannot parse is
+        // skipped whole.
+        let m: Model = serde_json::from_str(
+            r#"{
+              "display_name": "my-gpt4",
+              "provider": "openai",
+              "model_name": "gpt-4o",
+              "provider_key_id": "11111111-1111-1111-1111-111111111111",
+              "cooldown": {"default_seconds": 60}
+            }"#,
+        )
+        .expect("a cooldown block without `enabled` must still load");
+        let cooldown = m.cooldown.expect("cooldown block preserved");
+        assert_eq!(cooldown.default_seconds_or_default(), 60);
+        assert!(!cooldown.is_enabled());
     }
 
     #[test]
@@ -905,6 +1131,23 @@ mod tests {
             serde_json::to_string(&Adapter::AzureOpenai).unwrap(),
             "\"azure-openai\""
         );
+    }
+
+    /// `wire_protocol()` is the serde wire value handed out as a
+    /// `&'static str`. The two must not drift: the `upstream_protocol`
+    /// metric label is documented as "the ProviderKey adapter's wire
+    /// value", so a divergence would make the label a third spelling
+    /// that matches neither the API nor the stored document.
+    #[test]
+    fn adapter_wire_protocol_matches_serde_wire_value() {
+        for adapter in Adapter::ALL {
+            let serialized = serde_json::to_string(&adapter).unwrap();
+            assert_eq!(
+                format!("\"{}\"", adapter.wire_protocol()),
+                serialized,
+                "{adapter:?}"
+            );
+        }
     }
 
     #[test]

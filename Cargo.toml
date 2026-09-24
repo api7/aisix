@@ -22,7 +22,7 @@ members = [
 ]
 # Build-time tool for the PGO release pipeline (#967): own manifest + lockfile,
 # never part of the product build graph.
-exclude = ["bench/pgo-training/trainer"]
+exclude = ["bench/pgo-training/trainer", "bench/metrics-scale"]
 
 [workspace.package]
 version = "0.3.0"
@@ -41,10 +41,24 @@ async-trait = "0.1"
 
 # HTTP server
 axum = { version = "0.7", features = ["macros", "ws", "tracing", "multipart"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+# The gateway serves its own accept loop on hyper directly; see
+# `serve_http` in aisix-server for why neither `axum::serve` nor
+# `axum_server` can express what the listener has to do.
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+# Declared only to hold a floor: hyper asks for `h2 = "0.4.6"`, and
+# anything below 0.4.14 resets every in-flight request on a
+# connection whose peer answers our GOAWAY with one of its own —
+# see the HTTP/2 branch of `serve_connection`. No code names it.
+h2 = "0.4.19"
+tokio-rustls = "0.26"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "limit", "compression-gzip", "set-header"] }
 http = "1.2"
+# Direct because the proxy implements `Body` itself: the response body
+# carries the request's telemetry guards, and only a real implementation
+# can observe the first poll (AISIX-Cloud#1571). Already in the tree via
+# axum/hyper; this adds an edge, not a crate.
+http-body = "1"
 http-body-util = "0.1"
 # Trusted-proxy CIDR matching for real-ip resolution (#492)
 ipnet = "2"
@@ -72,6 +86,12 @@ lz4_flex = "0.11"
 # stopped the gateway trusting anything the operating system trusts
 # (api7/aisix#860).
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "gzip", "multipart"] }
+
+# kind=custom guardrail: the sandboxed engine that runs operator-supplied
+# screening scripts. Vendors quickjs-ng; `futures` makes Rust futures
+# awaitable from the script (that is how `fetch` works) and `parallel`
+# makes the runtime Send so a hook can run on any worker thread.
+rquickjs = { version = "0.12", features = ["futures", "parallel"] }
 
 # TLS. The root-store crates are direct dependencies because the
 # outbound paths that are not reqwest — the Realtime WebSocket — have to
@@ -118,12 +138,19 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 uuid = { version = "1.11", features = ["v4", "v5", "serde"] }
 hostname = "0.4"
+# `setpriority`/`gettid` for the background-priority threads in
+# `aisix_core::sched`. rustix rather than raw `libc` because that crate
+# forbids unsafe code and these are its only two syscalls.
+rustix = { version = "1", features = ["process", "thread"] }
 
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "registry"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
+metrics-util = { version = "0.19", default-features = false, features = ["registry"] }
+crossbeam-queue = "0.3"
+quanta = "0.12"
 
 # Errors / utilities
 anyhow = "1"
@@ -137,6 +164,7 @@ percent-encoding = "2"
 
 # Crypto (M6 v3 CP register flow + ApiKey hash auth)
 sha2 = "0.10"
+ring = "0.17"
 sha1 = "0.10"
 hmac = "0.12"
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
@@ -187,6 +215,41 @@ aws-smithy-http-client = { version = "1", default-features = false, features = [
 wiremock = "0.6"
 testcontainers = "0.28"
 tempfile = "3.13"
+
+# Full DWARF is the largest single thing in `target/` here: it is 83% of
+# every test binary, and `cargo test --workspace` links 44 of them. Line
+# tables keep what a failing test needs while costing much less to emit.
+# Measured on one worktree replaying four real commits off main, same
+# commands, only this setting varied:
+#
+#   debug = 2                 42.1 GiB target, 22.0 GiB of test bins
+#   debug = line-tables-only  19.8 GiB target,  8.3 GiB of test bins
+#
+# Timing was measured separately, since a single build run is noisy: a
+# clean `cargo test --workspace --no-run`, three runs per setting,
+# alternating so machine drift hits both equally, came out at a 92s
+# median (90-111s spread) against 70s (70s on every run). So 53% off the
+# tree and about a quarter off the wall clock -- emitting debuginfo
+# costs both, which is why the two move together rather than trading off.
+#
+# Panic backtraces keep file and line. On rustc 1.97.1 the frames came
+# out identical to `debug = 2`, column included, but treat only file and
+# line as durable -- the column is not something to rely on across a
+# toolchain bump.
+#
+# What line tables drop is variable inspection under gdb/lldb: a
+# breakpoint still stops and still reports its line, but `print x` finds
+# no symbol. Recover it for one build with the same escape hatch
+# [profile.release] documents below:
+#   CARGO_PROFILE_DEV_DEBUG=2 cargo test -p aisix-proxy
+#
+# Coverage survives this, but not for the reason [profile.coverage]
+# suggests: nothing passes `--profile coverage`, so `cargo llvm-cov`
+# builds under this profile too. It reads the `__llvm_covmap` section
+# that `-C instrument-coverage` emits, not DWARF, so line-level coverage
+# is unaffected -- the coverage gate passes on this commit.
+[profile.dev]
+debug = "line-tables-only"
 
 # Shipped binaries must stay profileable in the field (perf / cargo
 # flamegraph against the very build a user runs), so keep the symbol

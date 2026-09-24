@@ -5,22 +5,34 @@ name: docker-image
 # Tag strategy. Every push always carries a :sha-<shortsha> tag for
 # traceability; the other tags layer on top based on the trigger:
 #   - push to main              → :dev + :sha-<shortsha>
-#   - push to poc               → :poc + :sha-<shortsha>
-#   - push tag vX.Y.Z           → :X.Y.Z + :X.Y + :X + :latest
-#                                 + :sha-<shortsha>
-#   - push tag vX.Y.Z-rc.N      → :X.Y.Z-rc.N + :sha-<shortsha>  (NO rolling tags)
+#   - push tag vX.Y.Z           → :X.Y.Z + :latest + :sha-<shortsha>
+#   - push tag vX.Y.Z-rc.N      → :X.Y.Z-rc.N + :sha-<shortsha>  (NO :latest)
 #   - pull request              → build-only (no push), sanity check
 #   - workflow_dispatch         → :sha-<shortsha> + optional tag input
 #
-# Pre-release tags exist so a release candidate can be QA'd on the exact
-# artifacts customers receive before anything points at it. They must move
-# no rolling pointer: docker/metadata-action already skips :X.Y and :X for
-# pre-release semver, and the guards below keep :latest and the published
+# A version tag is published in full only — there is no :X.Y or :X
+# abbreviation. An abbreviation freezes the moment the next release ships:
+# whoever pinned it keeps the old image while the tag reads like the line.
+# :latest and :dev are the only moving pointers.
+#
+# Pre-release tags exist so a release candidate can be QA'd on the artifacts
+# customers receive before anything points at it — bar the PGO difference
+# noted at "Decide PGO build mode" below. They must move no rolling
+# pointer: the guards below keep :latest and the published
 # `openapi-latest.json` on the last stable release.
+#
+# Architectures. Every tag above is a manifest list covering linux/amd64 and
+# linux/arm64 (AISIX-Cloud#903). Both legs build NATIVELY — amd64 on
+# ubuntu-latest, arm64 on the GitHub-hosted ubuntu-24.04-arm runner — because
+# PGO's training phase runs the instrumented binary, which cannot self-train
+# under emulation. Each leg pushes an untagged, arch-specific image addressed
+# by digest; the `merge` job assembles the tag set from those digests, one
+# manifest list per registry, and is also where signing and the OpenAPI
+# publishing happen. Nothing is tagged until both legs succeed.
 
 on:
   push:
-    branches: [main, poc]
+    branches: [main]
     tags: ["v*.*.*"]
   pull_request:
     branches: [main]
@@ -39,6 +51,10 @@ on:
       tag:
         description: "Optional extra tag to publish (e.g. aisix-e2e)"
         required: false
+      pgo:
+        description: "Run the full PGO build (pre-flight the release build path)"
+        type: boolean
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -55,28 +71,70 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    # PGO builds (#967) compile the workspace twice (instrumented + optimized)
-    # with a training run in between — roughly 2.5x the plain fat-LTO build
-    # that used to fit in 45 minutes.
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # Both architectures are reported independently: an arm64-only failure
+      # must not hide whether amd64 still builds.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            # GitHub-hosted arm64, free for this public repository. Native,
+            # not QEMU — see the architecture note at the top.
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    # A PGO build (#967) compiles the workspace twice (instrumented +
+    # optimized) with a training run in between — ~30 min against ~11 min
+    # for the single-compile build. Only stable release tags take that path
+    # (see "Decide PGO build mode"), but the timeout has to cover them.
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
 
-      # PGO build mode (#967). Push builds (dev/poc/tags/dispatch) are always
-      # PGO=on: shipped artifacts are PGO'd, fail-closed, no fallback. PR
-      # builds default to PGO=off so review latency stays at one compile —
-      # EXCEPT when the PR touches the build pipeline or the training assets,
-      # in which case the full three-phase build must prove itself pre-merge.
+      # PGO build mode (#967). PGO is reserved for the artifact customers
+      # actually run: a STABLE release tag (vX.Y.Z). Everything else — PR,
+      # main/:dev, `-rc.N` candidates, plain dispatch — builds in one compile,
+      # because PGO cost ~20 min on every one of the ~40 main pushes per
+      # release cycle and bought nothing those images are used for.
+      #
+      # Two consequences are load-bearing and documented in RELEASING.md:
+      #   - the QA'd `-rc.N` image is NOT PGO'd while the released image is.
+      #     PGO changes code layout, never semantics (the workspace has no
+      #     `unsafe`), so the QA result still describes the shipped build —
+      #     but the two binaries are not bit-identical.
+      #   - the release tag is therefore the FIRST build to exercise the
+      #     three-phase pipeline on that commit. A training-shape regression
+      #     surfaces there, after QA. Pre-flight it on the release commit
+      #     with `workflow_dispatch` + pgo=true before tagging.
+      #
+      # The PR escape hatch survives and matters more now: it is the only
+      # pre-tag exercise of the PGO path that happens automatically.
       - name: Decide PGO build mode
         id: pgomode
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
         run: |
           set -eu
-          mode=on
+          mode=off
+          case "$GITHUB_REF" in
+            # Stable release tag only: `-rc.N` (and any other pre-release
+            # suffix) keeps the fast path. Same predicate the :latest tag
+            # guard uses, so the PGO'd image and :latest never disagree.
+            refs/tags/v*)
+              case "$GITHUB_REF_NAME" in
+                *-*) ;;
+                *) mode=on ;;
+              esac
+              ;;
+          esac
+          if [ "${{ github.event.inputs.pgo }}" = "true" ]; then
+            mode=on
+          fi
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            mode=off
             git fetch --no-tags --depth=1 origin "$BASE_SHA"
             # Capture the diff as a CHECKED command before matching: inside
             # an `if` condition a git failure is exempt from `set -e` and
@@ -107,8 +165,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Release tags (vX.Y.Z) are additionally mirrored to the api7
-      # Docker Hub org for private/offline deployments (#789). dev / poc
-      # / sha builds stay GHCR-only.
+      # Docker Hub org for private/offline deployments (#789). dev / sha
+      # builds stay GHCR-only.
       - name: Log in to Docker Hub
         if: startsWith(github.ref, 'refs/tags/v')
         uses: docker/login-action@v4
@@ -126,17 +184,15 @@ jobs:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
             ${{ startsWith(github.ref, 'refs/tags/v') && format('{0}/{1}', secrets.DOCKER_REGISTRY, env.IMAGE_NAME) || '' }}
-          # `latest` is guarded on `!contains(ref_name, '-')` so a `-rc.N` tag
-          # cannot move it; metadata-action already skips {{major}}.{{minor}}
-          # and {{major}} for pre-release semver.
+          # A version tag publishes the full version only — no
+          # {{major}}.{{minor}} / {{major}} abbreviations, see the tag strategy
+          # at the top. `latest` is guarded on `!contains(ref_name, '-')` so a
+          # `-rc.N` tag cannot move it.
           tags: |
             type=raw,value=dev,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-            type=raw,value=poc,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/poc' }}
             type=ref,event=pr
             type=sha,prefix=sha-,format=short
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
           labels: |
@@ -167,23 +223,46 @@ jobs:
           esac
           echo "value=$v" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      # Every registry this event publishes to, as the image name each leg
+      # pushes its digest under. Both legs must reach every registry the
+      # merge job will tag, because `imagetools create` assembles a manifest
+      # list from sources in the repository it is creating the tag in.
+      - name: Compute image repositories
+        id: repos
+        env:
+          DOCKER_REGISTRY: ${{ secrets.DOCKER_REGISTRY }}
+        run: |
+          set -eu
+          repos="${REGISTRY}/${IMAGE_NAME}"
+          case "$GITHUB_REF" in
+            refs/tags/v*) repos="${repos},${DOCKER_REGISTRY}/${IMAGE_NAME}" ;;
+          esac
+          echo "value=$repos" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
+          platforms: ${{ matrix.platform }}
+          # Pushed untagged and addressed by digest: the tags belong to the
+          # manifest list `merge` builds out of both legs. A tag written here
+          # would point at a single architecture for as long as the other leg
+          # runs, which is exactly the state this workflow exists to prevent.
+          outputs: ${{ github.event_name != 'pull_request' && format('type=image,"name={0}",push-by-digest=true,name-canonical=true,push=true', steps.repos.outputs.value) || '' }}
           # PR builds aren't pushed; load them into the local daemon so
           # the smoke test below can run the image.
           load: ${{ github.event_name == 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ github.event_name == 'pull_request' && steps.meta.outputs.tags || '' }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BUILD_SHA=${{ steps.shortsha.outputs.value }}
             BUILD_VERSION=${{ steps.relver.outputs.value }}
             PGO=${{ steps.pgomode.outputs.value }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Per-architecture cache scope: a shared one has the two legs
+          # evict each other's layers on every single build.
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
           provenance: false   # keep manifest format compatible with older clients
 
       # Fail the release if the published image does not self-report the
@@ -205,12 +284,16 @@ jobs:
       # profile-optimized build succeeds. An absent marker, a short shape
       # list, or an undersized merged profile fails the workflow here —
       # before signing, and before any human treats the artifact as good.
-      # The `if` is deliberately NOT just `pgomode == 'on'`: every push build
-      # asserts unconditionally, so a future bug in the pgomode step itself
-      # (empty output, renamed id) cannot skip both the PGO build AND its
-      # guard in the same breath.
+      #
+      # The second clause is deliberately NOT derived from `pgomode`: it
+      # re-derives "stable release tag" from github.ref, so a future bug in
+      # the pgomode step (empty output, renamed id, a broken case pattern)
+      # cannot skip the PGO build AND its guard in the same breath. That
+      # independence is what keeps the now-default-off mode logic safe —
+      # a release tag that somehow built without PGO fails here instead of
+      # shipping silently un-optimized.
       - name: Assert PGO proof marker (#967)
-        if: github.event_name != 'pull_request' || steps.pgomode.outputs.value == 'on'
+        if: steps.pgomode.outputs.value == 'on' || (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-'))
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -268,6 +351,64 @@ jobs:
           docker logs smoke-aisix
           test -n "$ok"
 
+      # The image contract a restricted Kubernetes deployment relies on.
+      # Two halves, and each one alone reports green while the other is
+      # broken:
+      #
+      #   - `USER` must be NUMERIC. kubelet resolves `runAsNonRoot: true`
+      #     against the image's configured user and cannot prove a name is
+      #     non-root, so a named user fails the pod at admission with
+      #     CreateContainerConfigError. Nothing in a `docker run` notices.
+      #   - Nothing in the image may depend on the uid it was built for.
+      #     `docker inspect` cannot see that, so the image is run under an
+      #     unrelated uid with gid 0 and no passwd entry and has to serve
+      #     /livez. The file resource source keeps this to one container:
+      #     the subject is the boot, and no resource is needed to answer
+      #     /livez.
+      #
+      # What this does NOT cover, so that nobody reads it as more than it
+      # is: managed mode writes its mTLS bundle, gateway id and snapshot
+      # cache under /var/lib/aisix, which the image creates owned by uid
+      # 10001 and not group-writable. A managed gateway running as some
+      # other uid needs that directory supplied writable from outside —
+      # which is what the chart's state volume is for — and this step
+      # deliberately does not stand in for a deployment that arranges it.
+      - name: Smoke test — numeric USER, and boot under an arbitrary uid
+        if: github.event_name == 'pull_request'
+        run: |
+          set -eux
+          IMAGE="$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -n1)"
+          test "$(docker inspect --format '{{.Config.User}}' "$IMAGE")" = "10001"
+          mkdir -p /tmp/uid-smoke
+          printf '_format_version: "1"\n' > /tmp/uid-smoke/resources.yaml
+          cat > /tmp/uid-smoke/config.yaml <<'EOF'
+          resources_file: /etc/aisix/resources.yaml
+          proxy:
+            addr: "0.0.0.0:3000"
+          admin:
+            addr: "127.0.0.1:3001"
+            admin_keys: ["smoke-only"]
+          observability:
+            service_name: "aisix-uid-smoke"
+            log_level: "info"
+            metrics:
+              prometheus:
+                enabled: false
+          EOF
+          chmod 0644 /tmp/uid-smoke/config.yaml /tmp/uid-smoke/resources.yaml
+          docker run -d --name uid-smoke-aisix \
+            --user 1000760000:0 -p 13000:3000 \
+            -v /tmp/uid-smoke/config.yaml:/etc/aisix/config.yaml:ro \
+            -v /tmp/uid-smoke/resources.yaml:/etc/aisix/resources.yaml:ro \
+            "$IMAGE"
+          ok=""
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:13000/livez > /dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          docker logs uid-smoke-aisix
+          test -n "$ok"
+
       # The profiling contract from #847: the shipped binary must stay
       # profileable in the field, meaning the symbol table survives into
       # the image (function-level flame graphs). A future strip step,
@@ -301,8 +442,171 @@ jobs:
           nm /tmp/aisix-shipped | grep -q ' [tT] _rjem_' \
             || { echo "::error::jemalloc symbols missing from shipped binary"; exit 1; }
 
-      - name: Install cosign
+      # Hand this leg's digest to the merge job, which turns the set of
+      # them into one manifest list per registry. File name is the bare
+      # digest, content is this leg's architecture — the merge job checks
+      # it received one of each before it moves a tag.
+      - name: Export digest
         if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          mkdir -p "${{ runner.temp }}/digests"
+          printf '%s\n' "$ARCH" > "${{ runner.temp }}/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+      # The tag set the merge job publishes, carried as an artifact rather
+      # than a job output. GitHub drops a job output whose value contains a
+      # masked secret, and these refs embed the org name, which is one — the
+      # first multi-arch run on main logged `Skip output 'tags' since it may
+      # contain secret.` here, handed `merge` an empty tag set, and published
+      # nothing. The artifact path is not redacted.
+      #
+      # Both legs compute the identical string (it derives from the ref, not
+      # the architecture), so one leg uploads it; the choice of leg is
+      # arbitrary and `merge` fails by name if the file never arrives.
+      - name: Export the tag set
+        if: github.event_name != 'pull_request' && matrix.arch == 'amd64'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -eu
+          mkdir -p "${{ runner.temp }}/tagset"
+          printf '%s\n' "$TAGS" > "${{ runner.temp }}/tagset/tags.txt"
+
+      - name: Upload the tag set
+        if: github.event_name != 'pull_request' && matrix.arch == 'amd64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tagset
+          path: ${{ runner.temp }}/tagset/tags.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  # Tagging happens here and nowhere else: one manifest list per registry,
+  # carrying the full tag set, assembled from the per-architecture digests
+  # both legs pushed. Signing and the OpenAPI publishing moved here with it —
+  # they are per-image, not per-architecture, and must sign/describe the
+  # manifest list customers actually pull.
+  merge:
+    name: merge manifests
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Download the tag set
+        uses: actions/download-artifact@v8
+        with:
+          name: tagset
+          path: ${{ runner.temp }}/tagset
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ secrets.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # Both legs must be accounted for BEFORE any tag moves. `Verify every
+      # published tag is multi-arch` below is the authoritative check but can
+      # only report after `:latest` already points at the bad index, and a
+      # single digest reaching this job produces a perfectly valid
+      # single-platform image that nothing else would reject. Note
+      # `download-artifact` with a `pattern` succeeds on zero matches.
+      - name: Verify both architectures reported a digest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -eu
+          archs="$(cat -- * | sort -u | paste -sd,)"
+          echo "digests: $(ls | tr '\n' ' ')-> ${archs}"
+          test "$archs" = "amd64,arm64"
+
+      # Group the tag set by repository and create one manifest list per
+      # repository from every digest the build job exported.
+      - name: Create manifest lists
+        id: manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -eu
+          TAGS="$(cat "$RUNNER_TEMP/tagset/tags.txt")"
+          test -n "$TAGS" \
+            || { echo "::error::empty tag set — nothing would be published"; exit 1; }
+          repos=""
+          for ref in $TAGS; do
+            repo="${ref%:*}"
+            case " $repos " in
+              *" $repo "*) ;;
+              *) repos="$repos $repo" ;;
+            esac
+          done
+          for repo in $repos; do
+            targets=""
+            for ref in $TAGS; do
+              if [ "${ref%:*}" = "$repo" ]; then targets="$targets -t $ref"; fi
+            done
+            sources=""
+            for d in *; do sources="$sources ${repo}@sha256:${d}"; done
+            docker buildx imagetools create $targets $sources
+          done
+          # cosign signs the manifest-list digest, which is content-derived
+          # and therefore identical in every registry.
+          primary=""
+          for ref in $TAGS; do
+            case "$ref" in
+              "${REGISTRY}/${IMAGE_NAME}:"*) primary="$ref"; break ;;
+            esac
+          done
+          test -n "$primary"
+          digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$primary" | jq -r .digest)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      # The gate this workflow exists for (AISIX-Cloud#903): a tag that lost
+      # an architecture is a broken release and is invisible in an otherwise
+      # green run, because the surviving leg publishes a perfectly valid
+      # single-platform image.
+      - name: Verify every published tag is multi-arch
+        run: |
+          set -eu
+          TAGS="$(cat "$RUNNER_TEMP/tagset/tags.txt")"
+          for ref in $TAGS; do
+            platforms="$(docker buildx imagetools inspect --raw "$ref" \
+              | jq -r '[.manifests[].platform | .os + "/" + .architecture] | unique | join(",")')"
+            echo "${ref} -> ${platforms}"
+            test "$platforms" = "linux/amd64,linux/arm64"
+          done
+
+      - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
       # Keyless (GitHub OIDC) signature over the pushed image digest, same
@@ -310,11 +614,10 @@ jobs:
       # signature; signatures land in a sibling <registry>/api7/notary repo,
       # so `cosign verify` must set COSIGN_REPOSITORY to the same value.
       - name: Sign images with cosign
-        if: github.event_name != 'pull_request'
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
         run: |
+          TAGS="$(cat "$RUNNER_TEMP/tagset/tags.txt")"
           signed=""
           for ref in ${TAGS}; do
             repo="${ref%:*}"
@@ -328,7 +631,7 @@ jobs:
 
       - name: Check OpenAPI publishing secrets
         id: openapi-secrets
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}

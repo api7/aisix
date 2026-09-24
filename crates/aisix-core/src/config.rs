@@ -23,6 +23,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -124,10 +125,59 @@ pub struct EtcdConfig {
     /// read at connect time — never stored in the config struct.
     #[serde(default)]
     pub password_env: Option<String>,
-    #[serde(default = "EtcdConfig::default_dial_timeout")]
-    pub dial_timeout_ms: u64,
-    #[serde(default = "EtcdConfig::default_request_timeout")]
-    pub request_timeout_ms: u64,
+    /// Bound on dialling etcd, in milliseconds. Unset, it is
+    /// [`DEFAULT_ETCD_DIAL_TIMEOUT_MS`]; an explicit `0` means unbounded
+    /// (see the note on `0` under [`EtcdConfig::request_timeout`]),
+    /// leaving it to the OS TCP stack.
+    ///
+    /// The whole dial gets this budget once per configured endpoint —
+    /// `dial_timeout_ms × max(1, endpoints)`, see
+    /// [`EtcdConfig::dial_budget`] — and the value also reaches the
+    /// connector as its per-TCP-connect bound. The TLS handshake and the
+    /// `Authenticate` exchange sit outside that connector option, which
+    /// is why the whole-dial bound exists at all.
+    ///
+    /// The default is finite, unlike `request_timeout_ms`, because the
+    /// two bound different things. A range read's cost scales with the
+    /// size of the configuration set, so a default bound on it would
+    /// abort the one call whose expiry leaves the instance with nothing
+    /// to serve. A dial has no such cost, and boot awaits it before it
+    /// binds ANY listener — so an endpoint that accepts the TCP
+    /// connection and then answers nothing held `:3000` and `:9090`
+    /// closed for as long as it stayed quiet, with the snapshot cache
+    /// that exists for exactly that outage sitting unread behind it.
+    ///
+    /// When set it covers the whole dial: it reaches hyper's connector
+    /// via `Endpoint::connect_timeout` for the TCP handshake, and the
+    /// gateway wraps `Client::connect` in it as well, so the TLS
+    /// handshake layered above the connector and the `Authenticate` call
+    /// etcd-client issues when `user` / `password_env` are set are
+    /// bounded too. An expired dial reports an etcd that could not be
+    /// reached, which the gateway retries rather than exits on.
+    #[serde(default = "default_etcd_dial_timeout_ms")]
+    pub dial_timeout_ms: Option<u64>,
+    /// Bound on a single request/response etcd call, in milliseconds.
+    /// Unset — the default — and `0` both mean unbounded (see the note on
+    /// `0` below).
+    ///
+    /// When set it covers the configuration range read (`load_all`), the
+    /// watch-create handshake, and the admin surface's reads — including
+    /// the dial each of those has to make when the connection is not up
+    /// yet, `Authenticate` included. It deliberately does NOT cover the
+    /// established watch
+    /// stream either: that stream is long-lived by construction, so a
+    /// bound on it would expire on every interval quiet enough to produce
+    /// no event and leave the gateway reconnecting instead of watching.
+    /// Creating the watch is request/response shaped and is bounded;
+    /// consuming it is not.
+    ///
+    /// The default is unset rather than a finite value because the range
+    /// read scales with the size of the configuration set: a bound short
+    /// enough to be useful on a small deployment aborts the read on a
+    /// large one, and the supervisor then re-issues the identical read
+    /// forever without the instance ever serving traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
     /// Optional TLS / mTLS bundle used to authenticate to the etcd
     /// endpoint. Required when talking to an aisix.cloud DP Manager
     /// (see prd-09 §9.3.3 — the CP issues a 10-year client cert via
@@ -175,6 +225,12 @@ pub struct ManagedConfig {
 
     /// aisix.cloud CP base URL, e.g. "https://api.us.aisix.cloud".
     /// Required for heartbeat when managed mode is enabled.
+    ///
+    /// Normalised once by [`normalise_cp_base_url`] at load, so every
+    /// consumer — heartbeat, telemetry, budget check, the etcd dial —
+    /// reads the same scheme-qualified value. A scheme-less
+    /// `host:port` is accepted and defaults to `https://`; anything
+    /// that is not an http(s) URL fails the boot.
     #[serde(default)]
     pub cp_base_url: Option<String>,
 
@@ -183,6 +239,13 @@ pub struct ManagedConfig {
     /// (prd-09a §9A.7.2) no longer ships it back, so the DP must
     /// know its etcd endpoint at boot. Bare `host:port` without
     /// scheme — the DP attaches `https://` for the gRPC dial.
+    ///
+    /// Reduced to that bare form once by
+    /// [`normalise_cp_etcd_endpoint`] at load: a leading `http://` or
+    /// `https://` and one trailing `/` are stripped, and anything that
+    /// is still not a bare `host[:port]` fails the boot. Note the
+    /// convention is the mirror image of `cp_base_url`'s, which keeps
+    /// its scheme.
     #[serde(default)]
     pub cp_etcd_endpoint: Option<String>,
 
@@ -255,21 +318,16 @@ pub struct ManagedConfig {
     #[serde(default = "ManagedConfig::default_dp_id_file")]
     pub dp_id_file: String,
 
-    /// Optional path to the on-disk snapshot cache the DP keeps as a
-    /// fallback when etcd is unreachable (prd-09 §9.7.2). When set, the
-    /// supervisor flushes every applied resync / put / delete to this
-    /// file and re-loads it at boot before opening the etcd connection,
-    /// so the proxy can serve traffic from cached config across CP
-    /// outages and full container restarts.
-    ///
-    /// When the field is omitted, managed mode uses
-    /// `/var/lib/aisix/config_cache.json` and self-hosted etcd mode
-    /// leaves persistence off (unchanged defaults). Setting a path
-    /// enables the cache in either mode — self-hosted etcd deployments
-    /// gain the same offline resilience by opting in. Empty string
-    /// disables persistence everywhere — useful for ephemeral test runs
-    /// where you don't want a stale cache to mask a real failure. A
-    /// bare `snapshot_cache_path:` (YAML null) is treated as omitted.
+    /// Enable on-disk configuration snapshots for recovery across restarts
+    /// when etcd is unavailable. Disabled by default in both managed and
+    /// self-hosted etcd modes; in-memory last-known-good serving is unaffected.
+    /// Snapshots include unencrypted credentials; restrict cache directory access.
+    #[serde(default)]
+    pub snapshot_cache_enabled: bool,
+
+    /// Cache location when `snapshot_cache_enabled` is true. Omitted or
+    /// null uses `/var/lib/aisix/config_cache.json`; an empty string also
+    /// disables persistence. A path alone does not enable the cache.
     #[serde(default)]
     pub snapshot_cache_path: Option<String>,
 
@@ -306,20 +364,18 @@ impl ManagedConfig {
         has_pem || has_file
     }
 
-    /// Resolve the snapshot-cache path per the field docs: an explicit
-    /// path wins in any mode, an explicit empty string disables, and an
-    /// omitted field means "the default path in managed mode, disabled
-    /// in self-hosted etcd mode".
+    /// Resolve the optional cache only after the operator enables it.
     pub fn effective_snapshot_cache_path(&self) -> Option<&str> {
+        if !self.snapshot_cache_enabled {
+            return None;
+        }
         match self.snapshot_cache_path.as_deref() {
             Some("") => None,
             Some(path) => Some(path),
-            None if self.is_managed() => Some(Self::DEFAULT_SNAPSHOT_CACHE_PATH),
-            None => None,
+            None => Some(Self::DEFAULT_SNAPSHOT_CACHE_PATH),
         }
     }
 
-    /// Default on-disk snapshot cache location for managed mode.
     pub const DEFAULT_SNAPSHOT_CACHE_PATH: &'static str = "/var/lib/aisix/config_cache.json";
 
     fn default_mtls_dir() -> String {
@@ -331,6 +387,187 @@ impl ManagedConfig {
     const fn default_heartbeat_interval_secs() -> u64 {
         15
     }
+}
+
+/// Environment variable that sets `managed.cp_base_url`. Named in the
+/// rejection so an operator who set it through the environment (the
+/// only way a container deployment can) is told which variable to fix.
+const CP_BASE_URL_ENV: &str = "AISIX_MANAGED__CP_BASE_URL";
+
+/// Give `managed.cp_base_url` a scheme once, at load, so every
+/// consumer agrees on it.
+///
+/// The etcd dial strips whatever scheme is there and re-attaches
+/// `https://`, so a scheme-less `host:port` reached etcd and the
+/// console reported the gateway healthy — while the three REST
+/// consumers (heartbeat, telemetry, budget check) concatenated a path
+/// onto a value reqwest cannot parse as a URL, failed at request
+/// build, and logged one WARN per tick. The budget gate's no-cache
+/// fallback is a sticky deny, so every proxied request answered
+/// `429 budget_exceeded` (AISIX-Cloud#1643).
+///
+/// The control plane normalises its own copy of this value by the same
+/// rule; keep the two in step.
+fn normalise_cp_base_url(raw: &str) -> Result<String, BootstrapError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(trimmed.to_string());
+    }
+    // A value that already attempts a scheme keeps it, so a misspelt
+    // one is reported as the typo it is rather than prefixed into
+    // `https://htts://host`. The probe is a colon followed by either
+    // slash, not `://`: `https:/host` would otherwise become
+    // `https://https:/host` and `https:\\host` would become
+    // `https://https:\\host` — both parse to the host "https" and
+    // would have sailed through. A URL parser reads `\\` as `/`, so a
+    // Windows-style separator is an attempt at a scheme just the same.
+    let qualified = if trimmed.contains(":/") || trimmed.contains(":\\") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    // The scheme check is a byte comparison, not `Url::scheme()`: the
+    // url crate normalises `HTTPS://host` and accepts `https:/host`,
+    // while `derive_cp_etcd_url` strips the scheme case-sensitively —
+    // so an uppercase scheme would serve the REST calls and silently
+    // break the etcd dial, the mirror image of the bug this function
+    // exists to prevent.
+    let scheme_ok = qualified.starts_with("http://") || qualified.starts_with("https://");
+    // The authority has to start immediately after `://`. A URL parser
+    // skips extra leading slashes and backslashes, so `//host` and
+    // `\\host` are prefixed into `https:////host` / `https://\\host`
+    // and still resolve to the right host for the REST calls — but
+    // `derive_cp_etcd_url` strips the scheme by byte prefix and hands
+    // the leftovers straight to the gRPC dial, which rejects them. That
+    // is this bug wearing the other mask: REST fine, etcd dead.
+    let authority_ok = qualified
+        .split_once("://")
+        .is_some_and(|(_, rest)| !rest.starts_with(['/', '\\']));
+    // The authority must be a host, with no credentials in front of it.
+    // dp-manager authenticates a gateway by its mTLS client certificate
+    // and nothing else, so userinfo here is never meaningful — it is
+    // either a secret about to be written to the log (the heartbeat
+    // worker reports its URL at INFO and repeats it in every failed
+    // beat's WARN) or a pasted-wrong value silently pointing the
+    // gateway elsewhere, as `mailto:user@example.com` does once it is
+    // prefixed. The sibling `cp_etcd_endpoint` rejects `@` for the same
+    // reason.
+    let parsed = url::Url::parse(&qualified).ok();
+    let host_ok = parsed
+        .as_ref()
+        .and_then(|u| u.host_str().map(|h| !h.is_empty()))
+        .unwrap_or(false);
+    let has_userinfo = parsed
+        .as_ref()
+        .is_some_and(|u| !u.username().is_empty() || u.password().is_some());
+    if !scheme_ok || !authority_ok || !host_ok || has_userinfo {
+        // What to quote is decided from the INPUT, never from the parse
+        // result: `https://user:secret@dpm.example.com:abc` fails on its
+        // port, so a parse-derived answer says "no userinfo here" and
+        // echoes the secret — from the branch that exists to keep it out
+        // of the log. `redact_userinfo` hands back its input untouched
+        // when the authority carries no `@`, so comparing the two covers
+        // every rejection branch at once. A value without credentials is
+        // still quoted byte for byte: the operator has to see what they
+        // wrote to fix it.
+        let redacted = redact_userinfo(&qualified);
+        let shown = if redacted == qualified {
+            raw.to_string()
+        } else {
+            redacted
+        };
+        return Err(BootstrapError::Config(format!(
+            "managed.cp_base_url ({CP_BASE_URL_ENV}) must be an http(s) URL such as \
+             https://dpm.example.com:7944, got {shown:?}"
+        )));
+    }
+    // Return the qualified *input* byte for byte, never
+    // `Url::to_string()`: the latter appends a root path to an origin
+    // and re-encodes, and the control plane must derive the same bytes
+    // from the same input. Trailing slash, path, query and case stay as
+    // typed; the call sites own their own trailing-slash handling.
+    Ok(qualified)
+}
+
+/// Replace the userinfo in `value` with `***`, keeping the scheme, the
+/// host and everything after the authority. A value with no scheme is
+/// treated as a bare authority, which is the shape `cp_etcd_endpoint`
+/// arrives in.
+///
+/// Used only by the two userinfo rejections, so the operator is told
+/// which host they pointed at without the rejection logging the
+/// credential it is rejecting them for.
+fn redact_userinfo(value: &str) -> String {
+    let (prefix, rest) = match value.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => (String::new(), value),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rfind('@') {
+        Some(at) => format!("{prefix}***{}{tail}", &authority[at..]),
+        None => value.to_string(),
+    }
+}
+
+/// Environment variable that sets `managed.cp_etcd_endpoint`.
+const CP_ETCD_ENDPOINT_ENV: &str = "AISIX_MANAGED__CP_ETCD_ENDPOINT";
+
+/// Reduce `managed.cp_etcd_endpoint` to the bare `host[:port]` that
+/// `derive_cp_etcd_url` expects.
+///
+/// This field's convention is the mirror image of `cp_base_url`'s: the
+/// etcd dial prepends `https://` itself, so a value that already names
+/// one produced `https://https://etcd.example.com:7943`. The gRPC dial
+/// rejects that, the supervisor retries it forever, and the proxy
+/// listener never binds — with nothing in the error pointing at the
+/// variable to fix. Now that the neighbouring field accepts a scheme,
+/// writing one here too is the natural next mistake, so a leading
+/// scheme is stripped rather than left to fail at dial time.
+///
+/// Anything that is still not a bare `host[:port]` afterwards fails the
+/// boot, for the same reason `cp_base_url` does: a path or a query the
+/// dial would silently drop is a value whose author expected something
+/// this field cannot do.
+fn normalise_cp_etcd_endpoint(raw: &str) -> Result<String, BootstrapError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(trimmed.to_string());
+    }
+    // Exact lower case, matching what `derive_cp_etcd_url` strips off
+    // `cp_base_url` — an uppercase scheme here is a typo, not a value.
+    let bare = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let bare = bare.strip_suffix('/').unwrap_or(bare);
+    // `@` would smuggle userinfo into a field the dial reads as an
+    // authority, and the rest are the separators that begin a component
+    // `host[:port]` has no room for.
+    let is_bare_authority = !bare.is_empty()
+        && !bare.contains(['/', '?', '#', '@', '\\'])
+        && url::Url::parse(&format!("https://{bare}"))
+            .ok()
+            .and_then(|u| u.host_str().map(|h| !h.is_empty()))
+            .unwrap_or(false);
+    if !is_bare_authority {
+        // Same reasoning, and the same input-derived test, as the
+        // `cp_base_url` branch above: an endpoint pasted from a URL that
+        // carried credentials must not have them read back into the
+        // startup log, in any rejection branch. Everything without
+        // credentials is still quoted byte for byte.
+        let redacted = redact_userinfo(trimmed);
+        let shown = if redacted == trimmed {
+            raw.to_string()
+        } else {
+            redacted
+        };
+        return Err(BootstrapError::Config(format!(
+            "managed.cp_etcd_endpoint ({CP_ETCD_ENDPOINT_ENV}) must be a bare host:port \
+             such as etcd.example.com:7943, got {shown:?}"
+        )));
+    }
+    Ok(bare.to_string())
 }
 
 /// Default is the "unconfigured" shape (no endpoints) so a
@@ -345,30 +582,99 @@ impl Default for EtcdConfig {
             env_id: String::new(),
             user: None,
             password_env: None,
-            dial_timeout_ms: Self::default_dial_timeout(),
-            request_timeout_ms: Self::default_request_timeout(),
+            dial_timeout_ms: Some(DEFAULT_ETCD_DIAL_TIMEOUT_MS),
+            request_timeout_ms: None,
             tls: None,
         }
     }
 }
 
+fn default_etcd_dial_timeout_ms() -> Option<u64> {
+    Some(DEFAULT_ETCD_DIAL_TIMEOUT_MS)
+}
+
+/// Default bound on one etcd dial. Generous enough that a healthy dial
+/// — including its TLS handshake and the `Authenticate` round trip when
+/// `user` is set — never trips it, short enough that a gateway scheduled
+/// ahead of its control plane binds its listeners and serves from the
+/// snapshot cache instead of waiting silently.
+pub const DEFAULT_ETCD_DIAL_TIMEOUT_MS: u64 = 5000;
+
 impl EtcdConfig {
     fn default_prefix() -> String {
         "/aisix".into()
     }
-    const fn default_dial_timeout() -> u64 {
-        5_000
-    }
-    const fn default_request_timeout() -> u64 {
-        5_000
+    /// What a whole dial may spend, as opposed to one attempt of it.
+    ///
+    /// `None` only when `dial_timeout_ms` is an explicit `0` — omitting
+    /// the key gets [`DEFAULT_ETCD_DIAL_TIMEOUT_MS`]. See
+    /// [`EtcdConfig::request_timeout`] for why `0` means unbounded here
+    /// and "fall back to the next level" elsewhere in this repo.
+    ///
+    /// One budget per configured endpoint, as headroom rather than as a
+    /// claim about the client's internals. `Client::connect` opens one
+    /// balanced channel over the whole set and the driver exposes no
+    /// per-endpoint bound to set instead, so the only lever is the total
+    /// — and a total sized for one endpoint would cut a dial that has to
+    /// get past unreachable members, which is the deployment a multi-
+    /// endpoint cluster exists to survive.
+    ///
+    /// `× max(1, endpoints)`, with no `+1`: unlike the Redis side, where
+    /// a sentinel or cluster walk ends in a connection to a node the walk
+    /// merely pointed at, the channel here IS the endpoints and there is
+    /// no extra hop to pay for.
+    ///
+    /// What an operator actually sees is the window in which no listener
+    /// is bound, and boot dials TWO providers (the environment prefix and
+    /// the shared pricing catalog) one after the other — so against a
+    /// wholly unreachable cluster that window is
+    /// `dial_timeout_ms × endpoints × 2`.
+    ///
+    /// Blank entries are excluded from the count because they are not
+    /// endpoints anything can dial: `Client::connect` rejects the whole
+    /// set at URI parsing if one is present, which ends the boot. Paying
+    /// a budget for them would be paying for a dial that cannot happen.
+    pub fn dial_budget(&self) -> Option<Duration> {
+        let endpoints = self
+            .endpoints
+            .iter()
+            .filter(|e| !e.trim().is_empty())
+            .count()
+            .max(1);
+        self.dial_timeout()
+            .map(|per_attempt| per_attempt.saturating_mul(endpoints.try_into().unwrap_or(u32::MAX)))
     }
 
-    pub const fn dial_timeout(&self) -> Duration {
-        Duration::from_millis(self.dial_timeout_ms)
+    /// What ONE connection attempt inside a dial may spend — the value
+    /// the operator wrote. [`Self::dial_budget`] is what the whole dial
+    /// gets.
+    pub const fn dial_timeout(&self) -> Option<Duration> {
+        Self::bound(self.dial_timeout_ms)
     }
 
-    pub const fn request_timeout(&self) -> Duration {
-        Duration::from_millis(self.request_timeout_ms)
+    /// `None` when unset or `0`: request/response calls are unbounded.
+    ///
+    /// `0` is the same as unset, not an instant abort — the same reading
+    /// `Model::timeout: 0` gets ("no deadline, stop resolving"). The one
+    /// key in this repo where `0` means "fall back to the next level" is
+    /// `Model::stream_timeout`, and only because it sits on a model →
+    /// group → `upstream.*` resolution chain where deferring is an
+    /// expressible meaning. These two keys are flat, single-level startup
+    /// configuration with nothing to defer to, so the only other reading
+    /// `0` could carry is an instant abort, and that is unreachable:
+    /// every connect and every read would expire, so the proxy listener
+    /// would never bind.
+    pub const fn request_timeout(&self) -> Option<Duration> {
+        Self::bound(self.request_timeout_ms)
+    }
+
+    /// Shared reading of both etcd timeout keys, so the two cannot drift
+    /// apart on what `0` means.
+    const fn bound(ms: Option<u64>) -> Option<Duration> {
+        match ms {
+            None | Some(0) => None,
+            Some(ms) => Some(Duration::from_millis(ms)),
+        }
     }
 
     /// The full env-scoped key prefix the DP watches and parses.
@@ -392,11 +698,31 @@ impl EtcdConfig {
             format!("{trimmed}/{}/", self.env_id)
         }
     }
+
+    /// The cross-environment key prefix: `<prefix>/global/`.
+    ///
+    /// Holds the shared pricing catalog and nothing else. Not derived
+    /// from `env_id` — every gateway reads the same one — and not
+    /// configurable, since it is one half of a contract with the control
+    /// plane rather than a deployment choice.
+    ///
+    /// Trailing slash for the same reason as [`Self::effective_prefix`]:
+    /// it is what the kine auth interceptor matches the Range key
+    /// against.
+    pub fn global_prefix(&self) -> String {
+        let trimmed = self.prefix.trim_end_matches('/');
+        format!("{trimmed}/global/")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
+    /// The single proxy listener's address — the shorthand form, and the
+    /// only one until `listeners` was added. Required either way: the
+    /// shipped chart injects `AISIX_PROXY__ADDR` unconditionally, so a
+    /// deployment that lists its listeners explicitly still carries it.
+    /// It is then ignored, and nothing binds it.
     pub addr: String,
     /// Cap on inbound request bodies across the whole proxy surface
     /// (JSON, multipart, passthrough, MCP, A2A). `0` — the default —
@@ -408,8 +734,28 @@ pub struct ProxyConfig {
     /// the caller's error envelope.
     #[serde(default = "ProxyConfig::default_body_limit")]
     pub request_body_limit_bytes: usize,
+    /// TLS for the listener `addr` binds. Part of the shorthand form, so
+    /// it cannot be combined with a non-empty `listeners` — a certificate
+    /// that would apply to nothing is a configuration error rather than
+    /// something to drop silently.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// The complete set of proxy listeners, for a deployment that needs
+    /// more than one — serving HTTPS and plaintext HTTP side by side, say
+    /// (AISIX-Cloud#1662). Empty, the default, means the single listener
+    /// described by `addr` + `tls`.
+    ///
+    /// Non-empty, it replaces that listener entirely: `addr` is not bound
+    /// and `tls` must be absent. Every listener serves the same router and
+    /// the same application state; TLS, ALPN and the drain are per
+    /// listener.
+    ///
+    /// Env-only deployments (the chart injects config purely through
+    /// `AISIX_*` vars, which cannot express a structured list) set the
+    /// whole set as one JSON array:
+    /// `AISIX_PROXY__LISTENERS='[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/c.pem","key_file":"/k.pem"}},{"addr":"0.0.0.0:3000"}]'`.
+    #[serde(default, deserialize_with = "deserialize_proxy_listeners")]
+    pub listeners: Vec<ProxyListener>,
     /// Real-client-IP resolution from forwarded headers (#492). Default
     /// trusts nothing, so the logged source IP is always the immediate
     /// TCP peer. Configure `trusted_proxies` when the gateway sits behind
@@ -450,9 +796,10 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub workers: Option<usize>,
     /// Entry-level URL rewrite rules, applied to every proxy-listener
-    /// request **before** routing (the admin and metrics listeners are
-    /// unaffected). The first rule whose `match` regex matches the request
-    /// path rewrites it — once, no cascading — and the request then flows
+    /// request **before** all routing, including host-based passthrough
+    /// (the admin and metrics listeners are unaffected). The first rule
+    /// whose optional `hosts` and path `match` both match rewrites it —
+    /// once, no cascading — and the request then flows
     /// through the normal endpoint (auth, ACL, quota, …) as if the client
     /// had sent the rewritten path. Lets operators map legacy URL shapes
     /// onto AISIX endpoints, e.g. per-server MCP paths onto
@@ -469,6 +816,20 @@ pub struct ProxyConfig {
 impl ProxyConfig {
     const fn default_body_limit() -> usize {
         0
+    }
+
+    /// The listeners the proxy actually binds, resolving the shorthand
+    /// form. One function so the bind path, the validation and the tests
+    /// cannot disagree about which listeners a configuration describes.
+    pub fn resolved_listeners(&self) -> Vec<ProxyListener> {
+        if self.listeners.is_empty() {
+            vec![ProxyListener {
+                addr: self.addr.clone(),
+                tls: self.tls.clone(),
+            }]
+        } else {
+            self.listeners.clone()
+        }
     }
 
     /// Whether the proxy serves from thread-per-core workers, resolving
@@ -496,6 +857,11 @@ pub struct UrlRewriteRule {
     /// Optional name, used in logs when the rule fires.
     #[serde(default)]
     pub name: Option<String>,
+    /// Optional inbound hosts. Omitted means all hosts; an explicit list
+    /// must be non-empty. Host and path must both match. Matching ignores
+    /// case and the request's port; `*.` matches one additional label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosts: Option<Vec<String>>,
     /// Regex matched against the **raw, percent-encoded** request path
     /// (never the query string) — no decoding, no normalization. Anchor
     /// with `^`/`$` to match the whole path; an unanchored pattern matches
@@ -555,6 +921,13 @@ where
     D: serde::Deserializer<'de>,
 {
     deserialize_seq_or_json_string(deserializer, "url_rewrites")
+}
+
+fn deserialize_proxy_listeners<'de, D>(deserializer: D) -> Result<Vec<ProxyListener>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_seq_or_json_string(deserializer, "listeners")
 }
 
 fn deserialize_client_type_rules<'de, D>(deserializer: D) -> Result<Vec<ClientTypeRule>, D::Error>
@@ -676,28 +1049,20 @@ impl RealIpConfig {
     }
 }
 
-/// Headers an operator's `default_headers` block may never set, that are
-/// never forwarded from a client, and that a caller-supplied request id may
+/// Headers that carry a credential, which a caller-supplied request id may
 /// never be read out of.
 ///
-/// The auth entries are the credentials each bridge mints for itself: letting
-/// config override them would swap the gateway's upstream identity for an
-/// attacker-supplied one. The last three are host-routing / session /
-/// proxy-auth headers that no provider auth scheme uses but that are still
-/// dangerous to hand to config.
+/// The id a caller sends becomes THE id for the request: it is echoed in
+/// the `x-aisix-request-id` response header, written to the logs and
+/// telemetry, and sent upstream. Reading it out of `authorization` would
+/// disclose the caller's secret through all three.
 ///
-/// cp-api rejects these at write time
-/// (`internal/cpapi/resources/provider_key_overrides.go`); this list is the
-/// runtime half of that pair, and the two must stay in sync.
-///
-/// Lives here rather than in `aisix-gateway` (which re-exports it as
-/// `upstream_headers::RESERVED_UPSTREAM_HEADERS`) so that [`Config::validate`]
-/// can enforce it too: naming one of these in
-/// `proxy.request_id.accept_headers` would turn the caller's credential into
-/// the request id, which the gateway then writes to its logs and telemetry,
-/// returns in `x-aisix-request-id`, and sends upstream — routing around this
-/// very guard by a different door.
-pub const RESERVED_UPSTREAM_HEADERS: &[&str] = &[
+/// This is NOT the upstream-forwarding guard — that lives in
+/// [`crate::forwarded_headers`], and is deliberately much narrower:
+/// handing an internal upstream the caller's own credential is a
+/// supported, operator-declared capability, while turning that credential
+/// into a logged identifier is never useful.
+pub const CREDENTIAL_HEADERS: &[&str] = &[
     "authorization",        // OpenAI / Anthropic / Vertex Bearer
     "x-api-key",            // Anthropic raw, also OpenAI legacy proxies
     "x-goog-api-key",       // Gemini API key
@@ -745,7 +1110,7 @@ impl Default for RequestIdConfig {
 
 impl RequestIdConfig {
     /// Parse `accept_headers` into header names, rejecting malformed entries
-    /// and any name in [`RESERVED_UPSTREAM_HEADERS`]. Header names are
+    /// and any name in [`CREDENTIAL_HEADERS`]. Header names are
     /// case-insensitive on the wire, so the parse also lowercases and gives
     /// the proxy ready-to-use keys.
     ///
@@ -761,7 +1126,7 @@ impl RequestIdConfig {
                     .trim()
                     .parse::<http::HeaderName>()
                     .map_err(|_| s.clone())?;
-                if RESERVED_UPSTREAM_HEADERS.contains(&name.as_str()) {
+                if CREDENTIAL_HEADERS.contains(&name.as_str()) {
                     return Err(s.clone());
                 }
                 // W3C trace-context headers can't be request-id sources
@@ -832,6 +1197,18 @@ pub struct TlsConfig {
     pub key_file: String,
 }
 
+/// One entry of [`ProxyConfig::listeners`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyListener {
+    /// Socket address this listener binds, e.g. `0.0.0.0:3000`.
+    pub addr: String,
+    /// Serve TLS on this listener. Absent, it serves plaintext HTTP —
+    /// which is what lets one gateway answer both schemes.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ObservabilityConfig {
@@ -891,6 +1268,13 @@ impl ObservabilityConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct MetricsConfig {
     pub prometheus: PrometheusConfig,
+    /// Complete label selections by metric family name. An omitted family
+    /// keeps its default labels; an empty list selects no business labels.
+    /// Histogram buckets and summary quantiles keep their generated labels.
+    /// Validated at startup; changing a selection requires a restart.
+    /// Environment variables accept the whole map as one JSON object.
+    #[serde(default, deserialize_with = "deserialize_metric_labels")]
+    pub labels: std::collections::BTreeMap<String, Vec<String>>,
     /// Retired; see [`OtlpConfig`]. `Option` for the same reason as
     /// [`ObservabilityConfig::tracing`].
     pub otlp: Option<OtlpConfig>,
@@ -912,6 +1296,24 @@ pub struct MetricsConfig {
     /// own Prometheus scrape surface. Validated at boot (fail-fast),
     /// never hot-reloaded.
     pub buckets: HistogramBucketsConfig,
+}
+
+fn deserialize_metric_labels<'de, D>(
+    deserializer: D,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Labels {
+        Map(std::collections::BTreeMap<String, Vec<String>>),
+        Json(String),
+    }
+    match Labels::deserialize(deserializer)? {
+        Labels::Map(labels) => Ok(labels),
+        Labels::Json(raw) => serde_json::from_str(&raw).map_err(serde::de::Error::custom),
+    }
 }
 
 /// Per-metric bucket-edge overrides, in seconds. An unset field keeps that
@@ -1083,18 +1485,20 @@ pub enum RedisMode {
 /// - `cluster`  → `nodes` (one or more seed node URLs)
 /// - `sentinel` → `sentinels` (sentinel node URLs) + `master_name`
 ///
-/// In `single` mode all credentials and TLS (`rediss://`) travel inside
-/// `url`. In `cluster`/`sentinel` mode they can travel in the node /
-/// sentinel URLs the same way, but the **data node** (cluster nodes, or
-/// the Sentinel-discovered master) can also be authenticated explicitly
-/// with `username` + `password` (Redis ACL) and, for sentinel, a
-/// `database` — useful because the Sentinel-discovered master has no URL
-/// of its own. Sentinel-node auth still travels in the `sentinels` URLs,
-/// so Sentinel and master credentials may differ.
+/// Credentials and TLS (`rediss://`) can travel inside the URLs, and the
+/// **data node** — the `single` endpoint, the cluster nodes, or the
+/// Sentinel-discovered master — can also be authenticated explicitly
+/// with `username` + `password` (Redis ACL) and `database`. The explicit
+/// fields apply in every mode and **override** whatever the URL carries.
+/// Sentinel-node auth still travels in the `sentinels` URLs, so Sentinel
+/// and master credentials may differ.
 ///
 /// To keep secrets out of the config file, supply `password` via the
 /// matching env var instead, e.g. `AISIX_RATELIMIT__REDIS__PASSWORD`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// That is the shape the precedence rule exists for: a value injected
+/// through the environment is no use if a stale credential left in `url`
+/// quietly outranks it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RedisConnConfig {
     pub mode: RedisMode,
@@ -1106,12 +1510,18 @@ pub struct RedisConnConfig {
     pub sentinels: Vec<String>,
     /// Monitored master group name. Required when `mode = sentinel`.
     pub master_name: Option<String>,
-    /// ACL username for the data node (cluster nodes / sentinel master).
+    /// ACL username for the data node. Applied in every mode, and it
+    /// overrides any username the URL carries.
     pub username: Option<String>,
-    /// Password for the data node (cluster nodes / sentinel master).
+    /// Password for the data node. Applied in every mode, and it
+    /// overrides any password the URL carries.
     pub password: Option<String>,
-    /// Database index for the Sentinel-discovered master (default 0).
-    /// Not applicable to `cluster` (Redis Cluster only has DB 0).
+    /// Database index for the data node (default 0). Overrides the one
+    /// the URL's path carries. Not applicable to `cluster` (Redis
+    /// Cluster only has DB 0), where it is not sent at all. A value the
+    /// server does not have is reported as a refusal rather than as an
+    /// outage — the server answered — and the backend serves degraded
+    /// until it is corrected.
     pub database: Option<i64>,
     /// Trust settings for a `rediss://` connection. Independent of
     /// `upstream.tls` because the cache/rate-limit backend sits inside
@@ -1121,6 +1531,43 @@ pub struct RedisConnConfig {
     /// Only consulted for `rediss://` URLs; a plaintext `redis://`
     /// connection never negotiates TLS regardless of what is set here.
     pub tls: OutboundTlsConfig,
+    /// Seconds a single Redis round trip may take before it is
+    /// abandoned, and the budget the startup connection is given — once
+    /// per endpoint a `cluster`/`sentinel` discovery may have to walk,
+    /// plus one. Default [`DEFAULT_REDIS_TIMEOUT_SECS`].
+    ///
+    /// Every consumer of this connection fails **open** on a Redis error
+    /// (the rate limiter falls back to per-replica counters, the caches
+    /// to a miss), but that only helps if the error actually arrives.
+    /// A peer that stops answering without closing the socket — host
+    /// down, network partition, a stopped container — leaves the command
+    /// blocked on TCP retransmission for minutes, so without a bound the
+    /// request hangs instead of degrading.
+    ///
+    /// Must be at least 1; there is deliberately no "unbounded" setting.
+    pub timeout_secs: u64,
+}
+
+/// Default bound on one Redis round trip / connection attempt.
+/// Generous enough that a healthy in-cluster Redis never trips it, short
+/// enough that an unreachable one degrades a request instead of hanging it.
+pub const DEFAULT_REDIS_TIMEOUT_SECS: u64 = 5;
+
+impl Default for RedisConnConfig {
+    fn default() -> Self {
+        Self {
+            mode: RedisMode::default(),
+            url: None,
+            nodes: Vec::new(),
+            sentinels: Vec::new(),
+            master_name: None,
+            username: None,
+            password: None,
+            database: None,
+            tls: OutboundTlsConfig::default(),
+            timeout_secs: DEFAULT_REDIS_TIMEOUT_SECS,
+        }
+    }
 }
 
 impl RedisConnConfig {
@@ -1153,6 +1600,12 @@ impl RedisConnConfig {
                     ));
                 }
             }
+        }
+        if self.timeout_secs == 0 {
+            return Err(format!(
+                "{ctx}.timeout_secs must be at least 1 second (an unbounded Redis \
+                 command blocks the request instead of failing open)"
+            ));
         }
         match (&self.tls.client_cert_file, &self.tls.client_key_file) {
             (Some(_), None) => {
@@ -1247,6 +1700,9 @@ pub struct UpstreamConfig {
     pub stream_timeout_ms: u64,
     /// Max time for DNS + TCP + TLS before an attempt fails. Without it a
     /// black-holed upstream is bounded only by the model's overall timeout.
+    /// On `/v1/realtime` it also covers the WebSocket handshake exchange,
+    /// which has no other deadline — the session idle limit only starts
+    /// once the socket is up.
     pub connect_timeout_ms: u64,
     /// Idle seconds before the kernel sends its first TCP keepalive probe.
     /// Keeps a long wait for a slow first token from being reaped by a NAT
@@ -1461,11 +1917,147 @@ impl Default for ShutdownConfig {
     }
 }
 
+/// Every top-level setting of [`Config`], spelled as the environment
+/// source sees it — `AISIX_` stripped and lowercased.
+///
+/// A variable outside this set, and without the `__` that marks a nested
+/// key, is not a setting at all and is dropped by [`EnvOverrides`] rather
+/// than handed to a root struct that rejects unknown fields.
+/// `config_top_level_keys_match_the_struct` fails the build when a field
+/// is added or renamed without this list following.
+const TOP_LEVEL_ENV_KEYS: [&str; 12] = [
+    "admin",
+    "bedrock_endpoint_url",
+    "cache",
+    "downstream",
+    "etcd",
+    "managed",
+    "observability",
+    "proxy",
+    "ratelimit",
+    "resources_file",
+    "shutdown",
+    "upstream",
+];
+
+/// `AISIX_*` variables the gateway reads by name somewhere other than the
+/// configuration loader. They are deliberate, so they are dropped without
+/// a warning.
+///
+/// Spelled as the environment source sees them, as in
+/// [`TOP_LEVEL_ENV_KEYS`]: `AISIX_CONFIG` → `config`.
+const NON_CONFIG_ENV_KEYS: [&str; 3] = [
+    // `--config`'s env fallback (clap, `aisix-server`).
+    "config",
+    // Selects which baked config the container entrypoint execs with.
+    "config_path",
+    // Upper bound on a cached budget decision's age (`aisix-proxy`).
+    "dp_budget_stale_max_seconds",
+];
+
+/// The `AISIX_*` variables the configuration loader consumes, split from
+/// the ones it must leave alone.
+struct EnvOverrides {
+    /// Handed to the `Environment` source in place of the real
+    /// environment.
+    source: HashMap<String, String>,
+    /// Warnings for variables that name no setting, one per variable.
+    /// Rendered here and emitted by the binary once the tracing
+    /// subscriber exists — config loading runs before it.
+    warnings: Vec<String>,
+}
+
+impl EnvOverrides {
+    fn from_env() -> Self {
+        Self::partition(std::env::vars())
+    }
+
+    fn partition(vars: impl Iterator<Item = (String, String)>) -> Self {
+        // config-rs lowercases before it matches the prefix, so the
+        // environment's own casing never decides whether a variable is an
+        // override. Match it.
+        const PREFIX: &str = "aisix_";
+        let mut source = HashMap::new();
+        let mut warnings = Vec::new();
+
+        for (name, value) in vars {
+            let lowered = name.to_lowercase();
+            let Some(key) = lowered.strip_prefix(PREFIX) else {
+                // Not ours; the environment source would skip it anyway.
+                continue;
+            };
+            if NON_CONFIG_ENV_KEYS.contains(&key) {
+                continue;
+            }
+            // Judged on the FIRST segment, not on whether the key is
+            // nested at all. A key whose head names a real section was
+            // meant as a setting, so it keeps reaching the deserializer
+            // typo and all (`AISIX_PROXY__BOGUS` still fails the boot);
+            // a key whose head names nothing cannot be one however deeply
+            // it is spelled. Nesting is `__`, but config-rs also treats a
+            // literal `.` as a path separator, so both split the head.
+            //
+            // Service names may contain consecutive hyphens, and kubelet
+            // folds each to `_` — so `aisix-oss--x` injects
+            // `AISIX_OSS__X_SERVICE_HOST`, which reads as nested and is
+            // exactly what a contains-`__` test would wave through into a
+            // failed boot. The residue is a Service named for a section
+            // (`aisix-proxy--x`), which is indistinguishable from an
+            // operator's typo and is treated as one.
+            let head = key
+                .split("__")
+                .next()
+                .unwrap_or(key)
+                .split('.')
+                .next()
+                .unwrap_or(key);
+            if TOP_LEVEL_ENV_KEYS.contains(&head) {
+                source.insert(name, value);
+                continue;
+            }
+            // Leads with what is certain. Whether anything reads the
+            // variable is NOT knowable here: the configuration that would
+            // name it (etcd.password_env, a credential reference, a
+            // resources-file `${…}`) has not been parsed yet, and calling
+            // such a variable "ignored" is false on a deployment that
+            // followed the shipped example.
+            warnings.push(format!(
+                "{name} was not applied as a configuration override: it names no \
+                 gateway setting, and a nested setting is spelled \
+                 AISIX_<SECTION>__<KEY>. If the configuration reads it by name \
+                 (etcd.password_env, a resources-file interpolation) it still \
+                 applies; otherwise nothing reads it — Kubernetes injects \
+                 variables of this shape for every Service named aisix or \
+                 aisix-*, which enableServiceLinks: false on the pod spec turns \
+                 off."
+            ));
+        }
+
+        Self { source, warnings }
+    }
+}
+
 impl Config {
+    /// Warnings about `AISIX_*` environment variables that name no
+    /// setting and were left out of the load.
+    ///
+    /// Returned rather than logged because the configuration is read
+    /// before the tracing subscriber is installed — the binary emits these
+    /// at WARN once it exists, the same way it reports retired settings.
+    pub fn ignored_env_overrides() -> Vec<String> {
+        EnvOverrides::from_env().warnings
+    }
+
     /// Load + merge + validate.
     ///
     /// - If `path` is Some, the file is loaded (format inferred from extension).
-    /// - Env vars prefixed `AISIX_` override anything in the file.
+    /// - Env vars prefixed `AISIX_` override anything in the file:
+    ///   `AISIX_<SECTION>__<KEY>` for a nested setting, `AISIX_<KEY>` for a
+    ///   top-level one. A variable matching neither is not a setting — it is
+    ///   ignored and reported by [`Config::ignored_env_overrides`], because
+    ///   an environment the gateway does not control injects them (a
+    ///   Kubernetes Service named `aisix-*` contributes seven per pod) and
+    ///   the root struct rejects unknown fields.
     /// - Basic invariants are checked (non-empty etcd endpoints, at least one
     ///   admin key, bind addresses parse).
     pub fn load_from_path(path: Option<&Path>) -> Result<Self, BootstrapError> {
@@ -1487,10 +2079,16 @@ impl Config {
         // first key segment, double underscore for nested keys).
         // Pin prefix_separator explicitly so the two shapes are
         // distinct: `AISIX_` strips the prefix, `__` splits keys.
+        let overrides = EnvOverrides::from_env();
         builder = builder.add_source(
             Environment::with_prefix("AISIX")
                 .prefix_separator("_")
                 .separator("__")
+                // Only the variables `EnvOverrides` kept. Handing the
+                // source an explicit map is what lets a variable this
+                // process did not name be dropped before config-rs turns
+                // it into a key the root struct has to recognise.
+                .source(Some(overrides.source))
                 // Per-key list parsing. Setting `list_separator`
                 // without explicit `with_list_parse_key` would force
                 // EVERY string env override through comma-splitting,
@@ -1526,9 +2124,16 @@ impl Config {
             .build()
             .map_err(|e| BootstrapError::Config(format!("build: {e}")))?;
 
-        let cfg: Self = raw
+        let mut cfg: Self = raw
             .try_deserialize()
             .map_err(|e| BootstrapError::Config(format!("deserialize: {e}")))?;
+
+        if let Some(raw_base) = cfg.managed.cp_base_url.as_deref() {
+            cfg.managed.cp_base_url = Some(normalise_cp_base_url(raw_base)?);
+        }
+        if let Some(raw_endpoint) = cfg.managed.cp_etcd_endpoint.as_deref() {
+            cfg.managed.cp_etcd_endpoint = Some(normalise_cp_etcd_endpoint(raw_endpoint)?);
+        }
 
         cfg.validate()?;
         Ok(cfg)
@@ -1539,12 +2144,23 @@ impl Config {
         // otherwise surface at runtime as silently mis-routed or 404ing
         // legacy traffic, which is much harder to trace back to a typo in
         // one line of config.
+        let host_pattern =
+            regex::Regex::new(crate::host::HOST_PATTERN).expect("host pattern is valid");
         for (i, rule) in self.proxy.url_rewrites.iter().enumerate() {
             let ctx = || {
                 rule.name
                     .clone()
                     .unwrap_or_else(|| format!("proxy.url_rewrites[{i}]"))
             };
+            if let Some(hosts) = &rule.hosts {
+                if hosts.is_empty() || hosts.iter().any(|host| !host_pattern.is_match(host)) {
+                    return Err(BootstrapError::Config(format!(
+                        "{}: hosts must be a non-empty list of hostnames or single-label \
+                         wildcards such as *.example.com (no scheme, port, or path)",
+                        ctx()
+                    )));
+                }
+            }
             let regex = match regex::Regex::new(&rule.pattern) {
                 Ok(regex) => regex,
                 Err(e) => {
@@ -1639,6 +2255,46 @@ impl Config {
                 self.proxy.addr
             )));
         }
+        // `proxy.tls` belongs to the listener `proxy.addr` describes, and
+        // that listener is not bound once `proxy.listeners` names the set.
+        // Accepting both would leave a configured certificate serving
+        // nothing, with no way to tell from the outside that TLS had been
+        // asked for.
+        if !self.proxy.listeners.is_empty() && self.proxy.tls.is_some() {
+            return Err(BootstrapError::Config(
+                "proxy.tls cannot be combined with proxy.listeners: proxy.tls \
+                 configures the single listener proxy.addr describes, which \
+                 proxy.listeners replaces — move the certificate into the \
+                 proxy.listeners entry that should serve it"
+                    .into(),
+            ));
+        }
+        let mut bound: Vec<std::net::SocketAddr> = Vec::new();
+        for (i, listener) in self.proxy.listeners.iter().enumerate() {
+            let Ok(addr) = listener.addr.parse::<std::net::SocketAddr>() else {
+                return Err(BootstrapError::Config(format!(
+                    "proxy.listeners[{i}].addr invalid socket address: {}",
+                    listener.addr
+                )));
+            };
+            // A repeated address does NOT report itself at the bind. The
+            // thread-per-core listeners set `SO_REUSEPORT`, so two entries
+            // on one address co-bind happily and the kernel then hands
+            // each connection to whichever entry's accept loop it picks —
+            // a port that answers TLS or plaintext at random when the two
+            // entries differ in `tls`. On the shared runtime it is an
+            // `EADDRINUSE` raised after the first-configuration gate,
+            // which is exactly the arbitrarily-late failure the boot probe
+            // exists to prevent (and the probe cannot see it either: it
+            // drops each socket before binding the next).
+            if let Some(first) = bound.iter().position(|seen| *seen == addr) {
+                return Err(BootstrapError::Config(format!(
+                    "proxy.listeners[{i}].addr {addr} is already bound by \
+                     proxy.listeners[{first}] — each listener needs its own address"
+                )));
+            }
+            bound.push(addr);
+        }
         if let Err(bad) = self.proxy.real_ip.parse_trusted() {
             return Err(BootstrapError::Config(format!(
                 "proxy.real_ip.trusted_proxies invalid CIDR/IP: {bad}"
@@ -1654,7 +2310,7 @@ impl Config {
                 "proxy.request_id.accept_headers rejects {bad:?}: not a valid HTTP \
                  header name, or a reserved header a request id must never be read \
                  from ({})",
-                RESERVED_UPSTREAM_HEADERS.join(", ")
+                CREDENTIAL_HEADERS.join(", ")
             )));
         }
         // Zero workers would bind no listener at all: the proxy would
@@ -1734,6 +2390,279 @@ mod tests {
         f
     }
 
+    /// The seven variables Kubernetes injects into every pod for a Service
+    /// named `aisix-oss` exposing port 9090 — the shape that made a
+    /// gateway exit at boot instead of starting.
+    const SERVICE_LINK_ENV: [(&str, &str); 7] = [
+        ("AISIX_OSS_SERVICE_HOST", "10.96.0.12"),
+        ("AISIX_OSS_SERVICE_PORT", "9090"),
+        ("AISIX_OSS_PORT", "tcp://10.96.0.12:9090"),
+        ("AISIX_OSS_PORT_9090_TCP", "tcp://10.96.0.12:9090"),
+        ("AISIX_OSS_PORT_9090_TCP_PROTO", "tcp"),
+        ("AISIX_OSS_PORT_9090_TCP_PORT", "9090"),
+        ("AISIX_OSS_PORT_9090_TCP_ADDR", "10.96.0.12"),
+    ];
+
+    /// A Service name may carry consecutive hyphens, and kubelet folds
+    /// each one to `_` — so `aisix-oss--x` injects variables that read as
+    /// nested keys. They are still not settings.
+    const HYPHENATED_SERVICE_LINK_ENV: [(&str, &str); 2] = [
+        ("AISIX_OSS__X_SERVICE_HOST", "10.96.0.13"),
+        ("AISIX_OSS__X_PORT_9090_TCP_PROTO", "tcp"),
+    ];
+
+    const ENV_TEST_CONFIG: &str = r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#;
+
+    /// Re-run this test's body in a child process carrying `vars` as the
+    /// only `AISIX_*` variables in its environment; returns `false` in the
+    /// parent, `true` once running as the child.
+    ///
+    /// Env-backed loading cannot be isolated any other way: the loader
+    /// reads the real process environment, and the rest of the suite runs
+    /// concurrently in the same one.
+    fn in_child_with_env(test: &str, marker: &str, vars: &[(&str, &str)]) -> bool {
+        if std::env::var_os(marker).is_some() {
+            return true;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.arg(test).arg("--test-threads=1").env(marker, "1");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("AISIX_") {
+                child.env_remove(key);
+            }
+        }
+        for (k, v) in vars {
+            child.env(k, v);
+        }
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "child config test failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "child test did not run: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        false
+    }
+
+    #[test]
+    fn service_link_env_vars_are_ignored_instead_of_aborting_startup() {
+        // Kubernetes injects a variable per Service per port into every
+        // pod in the namespace, and a Service whose name starts with
+        // `aisix` produces `AISIX_*` names. None of them is a setting, and
+        // the root struct rejects unknown fields — so before this filter
+        // existed, deploying the gateway beside an `aisix-oss` Service
+        // made it exit at boot with `unknown field`.
+        let injected: Vec<(&str, &str)> = SERVICE_LINK_ENV
+            .iter()
+            .chain(HYPHENATED_SERVICE_LINK_ENV.iter())
+            .copied()
+            .collect();
+        if !in_child_with_env(
+            "service_link_env_vars_are_ignored_instead_of_aborting_startup",
+            "TEST_ENV_SERVICE_LINKS_CHILD",
+            &injected,
+        ) {
+            return;
+        }
+
+        let f = write_yaml(ENV_TEST_CONFIG);
+        let cfg = Config::load_from_path(Some(f.path())).expect("service links must not abort");
+        assert_eq!(cfg.proxy.addr, "0.0.0.0:3000");
+
+        let warnings = Config::ignored_env_overrides();
+        assert_eq!(warnings.len(), injected.len());
+        for (name, _) in injected {
+            assert!(
+                warnings.iter().any(|w| w.starts_with(&format!("{name} "))),
+                "no warning names {name}: {warnings:?}",
+            );
+        }
+        // The remedy has to be in the line itself: the operator reading it
+        // owns the pod spec, not this process's environment.
+        assert!(warnings[0].contains("enableServiceLinks: false"));
+    }
+
+    #[test]
+    fn a_nested_unknown_env_var_still_aborts_startup() {
+        // The filter drops only names that cannot be settings. An operator
+        // who spelled out a section meant a setting, so their typo still
+        // fails the boot rather than being silently ignored — the same
+        // strictness the config file gets.
+        if !in_child_with_env(
+            "a_nested_unknown_env_var_still_aborts_startup",
+            "TEST_ENV_NESTED_UNKNOWN_CHILD",
+            &[("AISIX_PROXY__BOGUS", "1")],
+        ) {
+            return;
+        }
+
+        let f = write_yaml(ENV_TEST_CONFIG);
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(
+            err.to_string().contains("bogus"),
+            "error should name the field: {err}",
+        );
+        assert!(Config::ignored_env_overrides().is_empty());
+    }
+
+    #[test]
+    fn the_gateways_own_non_config_env_vars_load_silently() {
+        // These three are read by name elsewhere — clap's `--config`
+        // fallback, the container entrypoint, the budget client — so they
+        // are set deliberately and a warning about them would be noise.
+        // `AISIX_CONFIG` is the one that used to stop `aisix` from
+        // starting from its own documented environment variable at all.
+        const OWN: [(&str, &str); 3] = [
+            ("AISIX_CONFIG", "/etc/aisix/config.yaml"),
+            ("AISIX_CONFIG_PATH", "/etc/aisix/config.managed.yaml"),
+            ("AISIX_DP_BUDGET_STALE_MAX_SECONDS", "30"),
+        ];
+        if !in_child_with_env(
+            "the_gateways_own_non_config_env_vars_load_silently",
+            "TEST_ENV_OWN_VARS_CHILD",
+            &OWN,
+        ) {
+            return;
+        }
+
+        let f = write_yaml(ENV_TEST_CONFIG);
+        Config::load_from_path(Some(f.path())).expect("the gateway's own variables must load");
+        assert!(
+            Config::ignored_env_overrides().is_empty(),
+            "deliberate variables must not warn: {:?}",
+            Config::ignored_env_overrides(),
+        );
+    }
+
+    #[test]
+    fn a_flat_top_level_env_var_still_overrides_the_file() {
+        // The two scalar top-level settings have no `AISIX_<SECTION>__<KEY>`
+        // spelling, so the filter is the only thing standing between them
+        // and the deserializer. Nothing else in the suite drives one
+        // through `load_from_path`: the guards above stop at the partition,
+        // and a filter that handed config-rs a shape its collector does not
+        // expect would leave them all green.
+        if !in_child_with_env(
+            "a_flat_top_level_env_var_still_overrides_the_file",
+            "TEST_ENV_FLAT_TOP_LEVEL_CHILD",
+            &[("AISIX_BEDROCK_ENDPOINT_URL", "http://localstack:4566")],
+        ) {
+            return;
+        }
+
+        let f = write_yaml(ENV_TEST_CONFIG);
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(
+            cfg.bedrock_endpoint_url.as_deref(),
+            Some("http://localstack:4566"),
+        );
+        assert!(Config::ignored_env_overrides().is_empty());
+    }
+
+    #[test]
+    fn a_dot_spelled_nested_env_var_still_overrides_the_file() {
+        // config-rs reads the key as a path expression, in which `.` is a
+        // separator of its own — so this spelling reaches `etcd.endpoints`
+        // and has always worked. Undocumented, but dropping a working
+        // override is not something this filter may do silently.
+        if !in_child_with_env(
+            "a_dot_spelled_nested_env_var_still_overrides_the_file",
+            "TEST_ENV_DOT_SPELLED_CHILD",
+            &[("AISIX_ETCD.ENDPOINTS", "http://dotted:2379")],
+        ) {
+            return;
+        }
+
+        let f = write_yaml(ENV_TEST_CONFIG);
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.etcd.endpoints, vec!["http://dotted:2379".to_string()]);
+        assert!(Config::ignored_env_overrides().is_empty());
+    }
+
+    #[test]
+    fn a_reserved_name_never_shadows_a_real_setting() {
+        // The reserved names are matched first, so one that also named a
+        // top-level field would drop that setting's overrides — and the
+        // field-set guard above would stay green, because it only compares
+        // TOP_LEVEL_ENV_KEYS against the struct.
+        assert!(
+            NON_CONFIG_ENV_KEYS
+                .iter()
+                .all(|reserved| !TOP_LEVEL_ENV_KEYS.contains(reserved)),
+            "a reserved variable name shadows a configuration setting",
+        );
+    }
+
+    #[test]
+    fn config_top_level_keys_match_the_struct() {
+        // TOP_LEVEL_ENV_KEYS decides which flat `AISIX_<KEY>` variables
+        // reach the deserializer. Left to drift, a newly added setting
+        // would be unreachable from the environment — silently, and only
+        // in the env-only deployments (the chart) that have no other way
+        // to set it.
+        //
+        // The expected set is taken from serde rather than restated here:
+        // `deny_unknown_fields` reports every field it would have
+        // accepted, so adding or renaming one moves this list.
+        let err = serde_json::from_str::<Config>(r#"{"not-a-config-field":0}"#)
+            .expect_err("the root struct rejects unknown fields");
+        let message = err.to_string();
+        let listed = message
+            .split_once("expected one of ")
+            .unwrap_or_else(|| panic!("unexpected serde error shape: {message}"))
+            .1;
+        // Backtick-delimited, so the trailing " at line 1 column N" the
+        // error carries is outside every pair and never read as a field.
+        let mut expected: Vec<&str> = listed.split('`').skip(1).step_by(2).collect();
+        expected.sort_unstable();
+        assert!(
+            expected.contains(&"proxy"),
+            "field list did not parse out of: {message}",
+        );
+
+        let mut have = TOP_LEVEL_ENV_KEYS.to_vec();
+        have.sort_unstable();
+        assert_eq!(
+            have, expected,
+            "TOP_LEVEL_ENV_KEYS must list exactly the root struct's fields",
+        );
+    }
+
+    #[test]
+    fn env_partition_matches_on_lowercased_names() {
+        // config-rs lowercases a variable's name before matching the
+        // prefix, so `aisix_proxy__addr` is an override to it. A filter
+        // that recognised only the upper-case spelling would drop an
+        // override that works and warn about it.
+        let overrides = EnvOverrides::partition(
+            [
+                ("aisix_proxy__addr", "127.0.0.1:1"),
+                ("Aisix_Bedrock_Endpoint_Url", "http://localhost:4566"),
+                ("PATH", "/usr/bin"),
+                ("AISIX_OSS_SERVICE_HOST", "10.96.0.12"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string())),
+        );
+        let mut kept: Vec<&str> = overrides.source.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["Aisix_Bedrock_Endpoint_Url", "aisix_proxy__addr"]);
+        assert_eq!(overrides.warnings.len(), 1);
+        assert!(overrides.warnings[0].starts_with("AISIX_OSS_SERVICE_HOST "));
+    }
+
     #[test]
     fn loads_minimal_config() {
         let f = write_yaml(
@@ -1763,6 +2692,181 @@ admin:
         assert!(!cfg.proxy.real_ip.recursive);
         assert_eq!(cfg.proxy.real_ip.header, "x-forwarded-for");
         assert!(cfg.proxy.real_ip.parse_trusted().unwrap().is_empty());
+    }
+
+    #[test]
+    fn loads_metric_labels_from_yaml_and_json() {
+        for labels in [
+            "{aisix_request_ttft_seconds: [model, provider_key_name], aisix_requests_total: []}",
+            r#"'{"aisix_request_ttft_seconds":["model","provider_key_name"],"aisix_requests_total":[]}'"#,
+        ] {
+            let file = write_yaml(&format!(
+                "etcd:\n  endpoints: [\"http://127.0.0.1:2379\"]\nproxy:\n  addr: \"127.0.0.1:3000\"\nadmin:\n  admin_keys: [\"test\"]\nobservability:\n  metrics:\n    labels: {labels}\n"
+            ));
+            let cfg = Config::load_from_path(Some(file.path())).unwrap();
+            assert_eq!(
+                cfg.observability.metrics.labels["aisix_request_ttft_seconds"],
+                ["model", "provider_key_name"]
+            );
+            assert!(cfg.observability.metrics.labels["aisix_requests_total"].is_empty());
+            assert!(!cfg
+                .observability
+                .metrics
+                .labels
+                .contains_key("aisix_llm_requests_total"));
+        }
+    }
+
+    #[test]
+    fn an_unset_dial_timeout_is_bounded_while_an_unset_read_timeout_is_not() {
+        // The two keys default differently, on purpose. A finite default
+        // on the range read would bound a call whose cost scales with the
+        // size of the configuration set — the one call whose expiry
+        // leaves the instance with nothing to serve. A dial has no such
+        // cost and boot awaits it before binding any listener, so it does
+        // get a default.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.etcd.dial_timeout_ms, Some(DEFAULT_ETCD_DIAL_TIMEOUT_MS));
+        assert_eq!(cfg.etcd.request_timeout_ms, None);
+        assert_eq!(
+            cfg.etcd.dial_timeout(),
+            Some(Duration::from_millis(DEFAULT_ETCD_DIAL_TIMEOUT_MS))
+        );
+        assert_eq!(cfg.etcd.request_timeout(), None);
+    }
+
+    // The whole dial gets a budget per endpoint, because the client
+    // opens ONE balanced channel over all of them and a single
+    // authentication call may fail over across the set. A flat bound
+    // would cut a dial working exactly as designed on the one topology
+    // built to survive a dead member.
+    #[test]
+    fn the_dial_budget_pays_for_every_configured_endpoint() {
+        // `ms` is written out on every case: a struct literal cannot
+        // express "the key was omitted" — that is serde's job, and the
+        // load test above pins it. What is pinned here is the arithmetic
+        // built on top of whatever value arrives.
+        let cfg = |endpoints: Vec<&str>, ms: Option<u64>| EtcdConfig {
+            endpoints: endpoints.into_iter().map(String::from).collect(),
+            dial_timeout_ms: ms,
+            ..Default::default()
+        };
+        let per = DEFAULT_ETCD_DIAL_TIMEOUT_MS;
+        let dflt = Some(per);
+
+        assert_eq!(
+            cfg(vec!["http://a:2379"], dflt).dial_budget(),
+            Some(Duration::from_millis(per))
+        );
+        assert_eq!(
+            cfg(
+                vec!["http://a:2379", "http://b:2379", "http://c:2379"],
+                dflt
+            )
+            .dial_budget(),
+            Some(Duration::from_millis(per * 3))
+        );
+        // Blank entries are dropped before anything is dialled, so they
+        // must not buy a budget the dial will never spend.
+        assert_eq!(
+            cfg(vec!["http://a:2379", "  ", ""], dflt).dial_budget(),
+            Some(Duration::from_millis(per))
+        );
+        // No endpoints at all is a config `validate` rejects; the floor
+        // keeps the arithmetic from reading as "no budget".
+        assert_eq!(
+            cfg(vec![], dflt).dial_budget(),
+            Some(Duration::from_millis(per))
+        );
+        // Unbounded scales to unbounded, not to zero.
+        assert_eq!(
+            cfg(vec!["http://a:2379", "http://b:2379"], Some(0)).dial_budget(),
+            None
+        );
+        // And the per-attempt value is untouched by the count — it is
+        // what reaches the connector for one TCP connect.
+        assert_eq!(
+            cfg(vec!["http://a:2379", "http://b:2379"], Some(1500)).dial_timeout(),
+            Some(Duration::from_millis(1500))
+        );
+    }
+
+    #[test]
+    fn etcd_timeouts_when_set_are_read_as_milliseconds() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+  dial_timeout_ms: 2500
+  request_timeout_ms: 7000
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.etcd.dial_timeout(), Some(Duration::from_millis(2500)));
+        assert_eq!(
+            cfg.etcd.request_timeout(),
+            Some(Duration::from_millis(7000))
+        );
+    }
+
+    #[test]
+    fn etcd_timeouts_read_zero_as_unbounded_not_as_an_instant_abort() {
+        // `0` means unbounded on both keys, matching what
+        // `Model::timeout: 0` already means. On `request_timeout_ms` that
+        // is also what unset gives; on `dial_timeout_ms` it is now the
+        // only way to ask for it, and asking is the point — an operator
+        // who wants the dial left alone says `0` rather than omitting the
+        // key. The alternative reading of `0` — abort immediately —
+        // bricks the gateway silently: every connect and every read
+        // expires, so the proxy listener never binds and nothing says
+        // why. The one `0` in this repo that means "fall
+        // back to the next level" is `Model::stream_timeout`, which needs
+        // a resolution chain these two flat startup keys do not have.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+  dial_timeout_ms: 0
+  request_timeout_ms: 0
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.etcd.dial_timeout_ms, Some(0), "the key still parses");
+        assert_eq!(cfg.etcd.request_timeout_ms, Some(0));
+        assert_eq!(
+            cfg.etcd.dial_timeout(),
+            None,
+            "dial_timeout_ms: 0 must read as unbounded",
+        );
+        assert_eq!(
+            cfg.etcd.request_timeout(),
+            None,
+            "request_timeout_ms: 0 must read as unbounded",
+        );
     }
 
     #[test]
@@ -1853,11 +2957,10 @@ admin:
     // A request id read out of a credential header would be echoed to the
     // caller, written to the logs and telemetry, and sent upstream as
     // `x-aisix-request-id` — disclosing the caller's secret through all
-    // three, and walking around the RESERVED_UPSTREAM_HEADERS guard by a
-    // different door. Every reserved name must fail the boot.
+    // three. Every credential-bearing name must fail the boot.
     #[test]
     fn request_id_accept_headers_rejects_credential_headers() {
-        for reserved in RESERVED_UPSTREAM_HEADERS {
+        for reserved in CREDENTIAL_HEADERS {
             for spelling in [reserved.to_string(), reserved.to_uppercase()] {
                 let f = write_yaml(&format!(
                     r#"
@@ -1884,6 +2987,372 @@ admin:
                 );
             }
         }
+    }
+
+    /// `managed.cp_base_url` reaches four consumers with two different
+    /// appetites: the etcd dial strips whatever scheme is there and
+    /// re-attaches `https://`, while heartbeat / telemetry / budget
+    /// concatenate a path onto the value verbatim. A scheme-less
+    /// `host:port` therefore used to dial etcd happily — so the console
+    /// showed the gateway connected — while every REST call failed at
+    /// request build and the budget gate's no-cache fallback turned
+    /// every proxied request into `429 budget_exceeded`
+    /// (AISIX-Cloud#1643). Normalising once at load is what keeps the
+    /// four readings identical.
+    fn load_with_cp_base_url(value: &str) -> Result<Config, BootstrapError> {
+        let f = write_yaml(&format!(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+  cp_base_url: "{value}"
+"#
+        ));
+        Config::load_from_path(Some(f.path()))
+    }
+
+    #[test]
+    fn cp_base_url_without_a_scheme_defaults_to_https() {
+        let cfg = load_with_cp_base_url("dpm.example.com:7944").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://dpm.example.com:7944")
+        );
+        // A host with no port is just as valid a bare value.
+        let cfg = load_with_cp_base_url("dpm.example.com").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://dpm.example.com")
+        );
+        // ...as is a bare IPv4 host:port, the shape a private
+        // deployment points `controlPlane.baseURL` at.
+        let cfg = load_with_cp_base_url("127.0.0.1:7944").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://127.0.0.1:7944")
+        );
+        // A bracketed IPv6 literal survives the prefixing; an
+        // unbracketed one is ambiguous with the port separator and is
+        // rejected, the same way the etcd endpoint parser reads it.
+        let cfg = load_with_cp_base_url("[::1]:7944").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://[::1]:7944")
+        );
+        assert!(load_with_cp_base_url("::1:7944").is_err());
+        // An ordinary host:port is unaffected by the userinfo rule.
+        let cfg = load_with_cp_base_url("https://cp.example.com:7944").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://cp.example.com:7944")
+        );
+        // A path on a scheme-less value is still scheme-less: the `:/`
+        // probe must not mistake the port separator for a scheme.
+        let cfg = load_with_cp_base_url("dpm.example.com:7944/path").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://dpm.example.com:7944/path")
+        );
+    }
+
+    #[test]
+    fn cp_base_url_keeps_an_explicit_scheme_path_and_trailing_slash() {
+        for value in [
+            "https://dpm.example.com:7944",
+            "http://localhost:7944",
+            "https://cp.example.com/api",
+            "https://dpm.example.com:7944/",
+        ] {
+            let cfg = load_with_cp_base_url(value).unwrap();
+            assert_eq!(
+                cfg.managed.cp_base_url.as_deref(),
+                Some(value),
+                "{value} must survive the load unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn cp_base_url_is_trimmed_before_the_scheme_is_applied() {
+        let cfg = load_with_cp_base_url("  dpm.example.com:7944  ").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://dpm.example.com:7944")
+        );
+        let cfg = load_with_cp_base_url("  https://dpm.example.com:7944 ").unwrap();
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://dpm.example.com:7944")
+        );
+    }
+
+    #[test]
+    fn cp_base_url_rejects_a_value_that_is_not_an_http_url() {
+        // Each of these used to boot fine and then deny every request
+        // at runtime. Grouped by what they get wrong:
+        //
+        // - a misspelt or non-http scheme, which must be reported as
+        //   the typo it is rather than prefixed into `https://htts://…`;
+        // - a slash count that is off, where the naive `://` probe
+        //   would have produced `https://https:/host` — a URL whose
+        //   host is "https" — and let it through;
+        // - an uppercase scheme, which the REST calls tolerate but
+        //   `derive_cp_etcd_url` strips case-sensitively, so it would
+        //   break the etcd dial instead;
+        // - the shipped placeholder left unreplaced, which can never
+        //   reach a control plane whichever way it is read;
+        // - a value that is no URL at all.
+        for value in [
+            "htts://dpm.example.com",
+            "ftp://dpm.example.com",
+            "https:/dpm.example.com:7944",
+            "https:dpm.example.com:7944",
+            "HTTPS://dpm.example.com:7944",
+            "https://<your-dp-manager>:7944",
+            "not a url",
+            // Extra leading separators: a URL parser skips them and
+            // resolves the right host, so the REST calls would work
+            // while the etcd dial — which strips the scheme by byte
+            // prefix — gets handed `https:////host` and dies.
+            "//dpm.example.com:7944",
+            r"\\dpm.example.com",
+            // A Windows-style separator is a `://` typo, and must not
+            // be prefixed into a URL whose host is the literal "https".
+            r"https:\\dpm.example.com",
+        ] {
+            let err = match load_with_cp_base_url(value) {
+                Ok(cfg) => panic!(
+                    "{value:?} must not load, got cp_base_url = {:?}",
+                    cfg.managed.cp_base_url
+                ),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("AISIX_MANAGED__CP_BASE_URL"),
+                "rejection for {value:?} must name the variable to fix, got: {err}"
+            );
+            assert!(
+                err.contains(value),
+                "rejection for {value:?} must quote the offending value, got: {err}"
+            );
+        }
+    }
+
+    /// `cp_etcd_endpoint` carries the opposite convention to
+    /// `cp_base_url`: the etcd dial prepends `https://` itself, so a
+    /// value naming a scheme produced `https://https://etcd…:7943`.
+    /// The gRPC dial rejects it, the supervisor retries forever and the
+    /// proxy listener never binds — with nothing in the error naming
+    /// the variable. Now that the neighbouring field takes a scheme,
+    /// writing one here is the natural next mistake.
+    fn load_with_cp_etcd_endpoint(value: &str) -> Result<Config, BootstrapError> {
+        let f = write_yaml(&format!(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+  cp_base_url: "https://dpm.example.com:7944"
+  cp_etcd_endpoint: "{value}"
+"#
+        ));
+        Config::load_from_path(Some(f.path()))
+    }
+
+    /// Credentials in the authority are rejected — dp-manager
+    /// authenticates a gateway by its mTLS client certificate alone, so
+    /// userinfo is never meaningful, and the heartbeat worker reports
+    /// its URL at INFO and repeats it in every failed beat's WARN.
+    ///
+    /// The rejection therefore has to break the rule every other
+    /// rejection follows: it quotes the host but not the credential,
+    /// because echoing the value verbatim would write the secret into
+    /// the log this branch exists to keep it out of.
+    #[test]
+    fn cp_base_url_rejects_credentials_without_echoing_them() {
+        let err = match load_with_cp_base_url("https://user:secret@dpm.example.com:7944") {
+            Ok(cfg) => panic!(
+                "a URL carrying credentials must not load, got cp_base_url = {:?}",
+                cfg.managed.cp_base_url
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("AISIX_MANAGED__CP_BASE_URL"),
+            "the rejection must name the variable to fix, got: {err}"
+        );
+        assert!(
+            err.contains("***@dpm.example.com:7944"),
+            "the rejection must still show which host was named, got: {err}"
+        );
+        assert!(
+            !err.contains("secret"),
+            "the rejection must not echo the credential, got: {err}"
+        );
+
+        // The credential must not survive a rejection that fires
+        // BEFORE the userinfo check: this one fails on its port, so a
+        // parse-derived answer would report no userinfo and echo the
+        // value whole.
+        let err = load_with_cp_base_url("https://user:secret@dpm.example.com:abc")
+            .expect_err("a URL with an invalid port must not load")
+            .to_string();
+        assert!(err.contains("***@dpm.example.com:abc"), "got: {err}");
+        assert!(!err.contains("secret"), "got: {err}");
+
+        // A username with no password is the same class of value.
+        let err = load_with_cp_base_url("https://user@dpm.example.com:7944")
+            .expect_err("a URL carrying a username must not load")
+            .to_string();
+        assert!(err.contains("***@dpm.example.com:7944"), "got: {err}");
+        assert!(!err.contains("user@"), "got: {err}");
+
+        // Pasted from the wrong field: no `:/`, so the prefixed form
+        // parses to userinfo `mailto:user` with host `example.com` —
+        // a gateway quietly talking to somewhere nobody chose.
+        let err = load_with_cp_base_url("mailto:user@example.com")
+            .expect_err("a mailto: address must not load")
+            .to_string();
+        assert!(err.contains("***@example.com"), "got: {err}");
+    }
+
+    #[test]
+    fn cp_etcd_endpoint_strips_a_scheme_and_trailing_slash() {
+        for (input, expected) in [
+            ("https://etcd.example.com:7943", "etcd.example.com:7943"),
+            ("http://etcd.example.com:7943/", "etcd.example.com:7943"),
+            ("  https://etcd.example.com:7943  ", "etcd.example.com:7943"),
+        ] {
+            let cfg = load_with_cp_etcd_endpoint(input).unwrap();
+            assert_eq!(
+                cfg.managed.cp_etcd_endpoint.as_deref(),
+                Some(expected),
+                "{input} must reduce to the bare authority"
+            );
+        }
+    }
+
+    /// An etcd endpoint pasted from a URL that carried credentials is
+    /// rejected — and, like its `cp_base_url` counterpart, the
+    /// rejection must not read the credential back into the startup
+    /// log it is being written to.
+    #[test]
+    fn cp_etcd_endpoint_rejects_credentials_without_echoing_them() {
+        let err = match load_with_cp_etcd_endpoint("https://user:secret@etcd.example.com:7943") {
+            Ok(cfg) => panic!(
+                "an endpoint carrying credentials must not load, got cp_etcd_endpoint = {:?}",
+                cfg.managed.cp_etcd_endpoint
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("AISIX_MANAGED__CP_ETCD_ENDPOINT"),
+            "the rejection must name the variable to fix, got: {err}"
+        );
+        assert!(
+            err.contains("***@etcd.example.com:7943"),
+            "the rejection must still show which host was named, got: {err}"
+        );
+        assert!(
+            !err.contains("secret"),
+            "the rejection must not echo the credential, got: {err}"
+        );
+
+        // The scheme-less form is the same value with the prefix the
+        // operator happened not to paste.
+        let err = load_with_cp_etcd_endpoint("user:secret@etcd.example.com:7943")
+            .expect_err("a bare authority carrying credentials must not load")
+            .to_string();
+        assert!(err.contains("***@etcd.example.com:7943"), "got: {err}");
+        assert!(!err.contains("secret"), "got: {err}");
+
+        // And it must survive a rejection reached on a different
+        // ground — here the port, which fails the parse first.
+        let err = load_with_cp_etcd_endpoint("https://user:secret@etcd.example.com:abc")
+            .expect_err("an endpoint with an invalid port must not load")
+            .to_string();
+        assert!(err.contains("***@etcd.example.com:abc"), "got: {err}");
+        assert!(!err.contains("secret"), "got: {err}");
+    }
+
+    #[test]
+    fn cp_etcd_endpoint_leaves_a_bare_authority_alone() {
+        for value in ["etcd.example.com:7943", "[::1]:7943", "etcd.example.com"] {
+            let cfg = load_with_cp_etcd_endpoint(value).unwrap();
+            assert_eq!(
+                cfg.managed.cp_etcd_endpoint.as_deref(),
+                Some(value),
+                "{value} is already bare and must survive byte for byte"
+            );
+        }
+    }
+
+    #[test]
+    fn cp_etcd_endpoint_rejects_anything_that_is_not_a_bare_authority() {
+        // A path or a query the gRPC dial would silently drop, a port
+        // that is not a port, and a scheme with nothing behind it.
+        for value in [
+            "https://etcd.example.com:7943/path",
+            "etcd.example.com:7943?x=1",
+            "etcd.example.com:abc",
+            "https://",
+        ] {
+            let err = match load_with_cp_etcd_endpoint(value) {
+                Ok(cfg) => panic!(
+                    "{value:?} must not load, got cp_etcd_endpoint = {:?}",
+                    cfg.managed.cp_etcd_endpoint
+                ),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("AISIX_MANAGED__CP_ETCD_ENDPOINT"),
+                "rejection for {value:?} must name the variable to fix, got: {err}"
+            );
+            assert!(
+                err.contains(value),
+                "rejection for {value:?} must quote the offending value, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cp_base_url_unset_or_empty_stays_that_way() {
+        // Unset means "not managed by a control plane"; an empty string
+        // is the same absence expressed by an environment that always
+        // sets the variable. Neither is a URL to validate, and the
+        // consumers already fail with their own message.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(cfg.managed.cp_base_url.is_none());
+
+        let cfg = load_with_cp_base_url("").unwrap();
+        assert_eq!(cfg.managed.cp_base_url.as_deref(), Some(""));
     }
 
     #[test]
@@ -1939,6 +3408,47 @@ admin:
     }
 
     #[test]
+    fn url_rewrites_validate_optional_hosts() {
+        let load = |hosts: serde_json::Value| {
+            let f = write_yaml(
+                &serde_json::json!({
+                    "etcd": {"endpoints": ["http://127.0.0.1:2379"]},
+                    "admin": {"addr": "127.0.0.1:3001", "admin_keys": ["test"]},
+                    "proxy": {"addr": "127.0.0.1:3000", "url_rewrites": [{
+                        "name": "host-scoped-chat", "hosts": hosts,
+                        "match": "^/chat$", "rewrite": "/v1/chat/completions"
+                    }]}
+                })
+                .to_string(),
+            );
+            Config::load_from_path(Some(f.path()))
+        };
+        for hosts in [
+            serde_json::json!(["GW.Example.com", "*.example.com"]),
+            serde_json::json!(["localhost", "127.0.0.1"]),
+        ] {
+            let cfg = load(hosts.clone()).unwrap();
+            assert_eq!(serde_json::json!(cfg.proxy.url_rewrites[0].hosts), hosts);
+        }
+        for hosts in [
+            serde_json::json!([]),
+            serde_json::json!([""]),
+            serde_json::json!(["*"]),
+            serde_json::json!(["*.com"]),
+            serde_json::json!(["https://gw.example.com"]),
+            serde_json::json!(["gw.example.com:8080"]),
+            serde_json::json!(["gw.example.com/chat"]),
+            serde_json::json!(["gw.example.com", "bad host"]),
+        ] {
+            let err = load(hosts.clone()).unwrap_err().to_string();
+            assert!(
+                err.contains("host-scoped-chat") && err.contains("hosts"),
+                "{hosts}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn loads_url_rewrites_and_rejects_an_invalid_regex() {
         let f = write_yaml(
             r#"
@@ -1959,6 +3469,7 @@ admin:
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
         assert_eq!(cfg.proxy.url_rewrites.len(), 1);
         assert_eq!(cfg.proxy.url_rewrites[0].replacement, "/mcp/$1");
+        assert!(cfg.proxy.url_rewrites[0].hosts.is_none());
 
         let f = write_yaml(
             r#"
@@ -2137,7 +3648,7 @@ admin:
         // registration. `proxy.real_ip.trusted_proxies` was registered
         // nowhere and shipped unreachable behind exactly that gap.
         const CHILD_MARKER: &str = "TEST_ENV_SEQUENCE_FIELDS_CHILD";
-        const ENV: [(&str, &str); 9] = [
+        const ENV: [(&str, &str); 10] = [
             ("AISIX_ETCD__ENDPOINTS", "http://127.0.0.1:2379"),
             ("AISIX_ADMIN__ADMIN_KEYS", "k1,k2"),
             ("AISIX_PROXY__ADDR", "0.0.0.0:3000"),
@@ -2152,7 +3663,11 @@ admin:
             ),
             (
                 "AISIX_PROXY__URL_REWRITES",
-                r#"[{"name":"c","match":"^/a$","rewrite":"/b"}]"#,
+                r#"[{"name":"c","hosts":["gw.example.com"],"match":"^/a$","rewrite":"/b"}]"#,
+            ),
+            (
+                "AISIX_PROXY__LISTENERS",
+                r#"[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/c.pem","key_file":"/k.pem"}},{"addr":"0.0.0.0:3000"}]"#,
             ),
             (
                 "AISIX_OBSERVABILITY__METRICS__CLIENT_TYPE_RULES",
@@ -2191,6 +3706,10 @@ admin:
 
         let cfg = Config::load_from_path(None).unwrap();
         assert_eq!(
+            cfg.proxy.url_rewrites[0].hosts.as_deref(),
+            Some(["gw.example.com".to_string()].as_slice())
+        );
+        assert_eq!(
             cfg.proxy.real_ip.trusted_proxies,
             vec!["10.0.0.0/8".to_string(), "127.0.0.1/32".to_string()],
         );
@@ -2199,6 +3718,17 @@ admin:
             vec!["x-aisix-request-id".to_string(), "x-request-id".to_string()],
         );
         assert_eq!(cfg.proxy.url_rewrites.len(), 1);
+        assert_eq!(cfg.proxy.listeners.len(), 2);
+        assert_eq!(cfg.proxy.listeners[0].addr, "0.0.0.0:3443");
+        assert_eq!(
+            cfg.proxy.listeners[0]
+                .tls
+                .as_ref()
+                .map(|tls| tls.cert_file.as_str()),
+            Some("/c.pem"),
+        );
+        assert_eq!(cfg.proxy.listeners[1].addr, "0.0.0.0:3000");
+        assert!(cfg.proxy.listeners[1].tls.is_none());
         assert_eq!(cfg.observability.metrics.client_type_rules.len(), 1);
         assert_eq!(
             cfg.observability.metrics.client_type_rules[0].client,
@@ -2216,6 +3746,138 @@ admin:
             cfg.admin.admin_keys,
             vec!["k1".to_string(), "k2".to_string()]
         );
+    }
+
+    /// `proxy.listeners` and the `addr` + `tls` shorthand describe the
+    /// same thing, so exactly one of them is in force.
+    mod proxy_listeners {
+        use super::*;
+
+        fn config_with(proxy_body: &str) -> Result<Config, BootstrapError> {
+            let f = write_yaml(&format!(
+                r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+{proxy_body}
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#
+            ));
+            Config::load_from_path(Some(f.path()))
+        }
+
+        #[test]
+        fn shorthand_resolves_to_one_listener_carrying_proxy_tls() {
+            let cfg = config_with(
+                r#"  addr: "0.0.0.0:3000"
+  tls:
+    cert_file: "/c.pem"
+    key_file: "/k.pem""#,
+            )
+            .expect("shorthand config loads");
+            assert!(cfg.proxy.listeners.is_empty());
+            let resolved = cfg.proxy.resolved_listeners();
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].addr, "0.0.0.0:3000");
+            assert_eq!(
+                resolved[0].tls.as_ref().map(|tls| tls.cert_file.as_str()),
+                Some("/c.pem"),
+            );
+        }
+
+        #[test]
+        fn listeners_replace_the_shorthand_listener_entirely() {
+            let cfg = config_with(
+                r#"  addr: "0.0.0.0:3000"
+  listeners:
+    - addr: "0.0.0.0:3443"
+      tls:
+        cert_file: "/c.pem"
+        key_file: "/k.pem"
+    - addr: "0.0.0.0:3080""#,
+            )
+            .expect("listener set loads");
+            let resolved = cfg.proxy.resolved_listeners();
+            assert_eq!(resolved.len(), 2);
+            // `proxy.addr` is not among them: it is not bound.
+            assert!(resolved.iter().all(|l| l.addr != "0.0.0.0:3000"));
+            assert_eq!(resolved[0].addr, "0.0.0.0:3443");
+            assert!(resolved[0].tls.is_some());
+            assert_eq!(resolved[1].addr, "0.0.0.0:3080");
+            assert!(resolved[1].tls.is_none());
+        }
+
+        #[test]
+        fn proxy_tls_with_a_listener_set_is_a_config_error() {
+            // Silently dropping it would serve plaintext on every port
+            // while the operator believes a certificate is in force.
+            let err = config_with(
+                r#"  addr: "0.0.0.0:3000"
+  tls:
+    cert_file: "/c.pem"
+    key_file: "/k.pem"
+  listeners:
+    - addr: "0.0.0.0:3443""#,
+            )
+            .expect_err("proxy.tls + proxy.listeners must be rejected");
+            let msg = format!("{err}");
+            assert!(msg.contains("proxy.tls"), "{msg}");
+            assert!(msg.contains("proxy.listeners"), "{msg}");
+        }
+
+        #[test]
+        fn an_entry_address_is_validated_and_the_message_names_its_index() {
+            let err = config_with(
+                r#"  addr: "0.0.0.0:3000"
+  listeners:
+    - addr: "0.0.0.0:3443"
+    - addr: "not-an-address""#,
+            )
+            .expect_err("an unparseable listener address must be rejected");
+            assert!(
+                format!("{err}").contains("proxy.listeners[1].addr invalid socket address"),
+                "{err}",
+            );
+        }
+
+        #[test]
+        fn a_repeated_address_is_rejected_naming_both_entries() {
+            // SO_REUSEPORT lets the thread-per-core listeners co-bind a
+            // repeated address, so nothing downstream of here would fail:
+            // the port would just answer whichever entry's accept loop the
+            // kernel picked, TLS or plaintext, per connection.
+            let err = config_with(
+                r#"  addr: "0.0.0.0:3000"
+  listeners:
+    - addr: "0.0.0.0:3443"
+      tls:
+        cert_file: "/c.pem"
+        key_file: "/k.pem"
+    - addr: "0.0.0.0:3443""#,
+            )
+            .expect_err("a repeated listener address must be rejected");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("proxy.listeners[1].addr 0.0.0.0:3443"),
+                "{msg}"
+            );
+            assert!(msg.contains("proxy.listeners[0]"), "{msg}");
+        }
+
+        #[test]
+        fn an_empty_listener_set_keeps_the_shorthand() {
+            let cfg = config_with(
+                r#"  addr: "0.0.0.0:3000"
+  listeners: []"#,
+            )
+            .expect("an empty list is the shorthand");
+            let resolved = cfg.proxy.resolved_listeners();
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].addr, "0.0.0.0:3000");
+        }
     }
 
     #[test]
@@ -2691,6 +4353,36 @@ ratelimit:
         assert_eq!(redis.url.as_deref(), Some("redis://127.0.0.1:6379"));
     }
 
+    /// The bound exists because every consumer of the Redis connection
+    /// fails open on an *error*, and a peer that stops answering without
+    /// closing the socket never produces one — the request hangs instead
+    /// of degrading. So it has to be on by default, not opt-in.
+    #[test]
+    fn redis_timeout_defaults_to_five_seconds() {
+        let f = redis_backend_yaml("    url: \"redis://127.0.0.1:6379\"");
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.ratelimit.redis.unwrap().timeout_secs, 5);
+        assert_eq!(RedisConnConfig::default().timeout_secs, 5);
+    }
+
+    #[test]
+    fn redis_timeout_is_configurable_per_block() {
+        let f = redis_backend_yaml("    url: \"redis://127.0.0.1:6379\"\n    timeout_secs: 2");
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.ratelimit.redis.unwrap().timeout_secs, 2);
+    }
+
+    /// `0` would mean "wait forever", which is the defect this field was
+    /// added to remove — so it is rejected rather than silently accepted.
+    #[test]
+    fn redis_timeout_of_zero_is_rejected() {
+        let f = redis_backend_yaml("    url: \"redis://127.0.0.1:6379\"\n    timeout_secs: 0");
+        let err = Config::load_from_path(Some(f.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ratelimit.redis.timeout_secs"), "{err}");
+    }
+
     #[test]
     fn redis_single_mode_requires_url() {
         let f = redis_backend_yaml("    mode: \"single\"");
@@ -3145,50 +4837,53 @@ managed:
         assert!(cfg.managed.is_managed());
         assert_eq!(cfg.managed.mtls_dir, "/var/lib/aisix/mtls");
         assert_eq!(cfg.managed.dp_id_file, "/var/lib/aisix/dp_id");
-        // Default snapshot cache path keeps offline-resilience on by
-        // default in managed mode; operators opt out by setting the
-        // field to "".
-        assert_eq!(
-            cfg.managed.effective_snapshot_cache_path(),
-            Some("/var/lib/aisix/config_cache.json"),
-        );
+        assert_eq!(cfg.managed.effective_snapshot_cache_path(), None);
         // CP URL comes from env at runtime — empty here is fine.
         assert!(cfg.managed.cp_base_url.is_none());
     }
 
-    /// #871: the snapshot cache resolves per mode — managed defaults on,
-    /// self-hosted etcd defaults off, an explicit path enables either,
-    /// an explicit "" disables either.
     #[test]
     fn snapshot_cache_path_resolution_per_mode() {
-        let mut managed = ManagedConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            managed.effective_snapshot_cache_path(),
-            Some(ManagedConfig::DEFAULT_SNAPSHOT_CACHE_PATH),
-        );
-        managed.snapshot_cache_path = Some(String::new());
-        assert_eq!(managed.effective_snapshot_cache_path(), None);
-        managed.snapshot_cache_path = Some("/tmp/cache.json".into());
-        assert_eq!(
-            managed.effective_snapshot_cache_path(),
-            Some("/tmp/cache.json"),
-        );
-
-        let mut self_hosted = ManagedConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        assert_eq!(self_hosted.effective_snapshot_cache_path(), None);
-        self_hosted.snapshot_cache_path = Some("/tmp/cache.json".into());
-        assert_eq!(
-            self_hosted.effective_snapshot_cache_path(),
-            Some("/tmp/cache.json"),
-        );
-        self_hosted.snapshot_cache_path = Some(String::new());
-        assert_eq!(self_hosted.effective_snapshot_cache_path(), None);
+        for enabled in [false, true] {
+            for toggle in [
+                "",
+                "snapshot_cache_enabled: false",
+                "snapshot_cache_enabled: true",
+            ] {
+                for (setting, when_enabled) in [
+                    ("", Some(ManagedConfig::DEFAULT_SNAPSHOT_CACHE_PATH)),
+                    (
+                        "snapshot_cache_path: null",
+                        Some(ManagedConfig::DEFAULT_SNAPSHOT_CACHE_PATH),
+                    ),
+                    ("snapshot_cache_path: \"\"", None),
+                    (
+                        "snapshot_cache_path: /tmp/cache.json",
+                        Some("/tmp/cache.json"),
+                    ),
+                ] {
+                    let managed: ManagedConfig = config::Config::builder()
+                        .add_source(config::File::from_str(
+                            &format!("enabled: {enabled}\n{toggle}\n{setting}\n"),
+                            config::FileFormat::Yaml,
+                        ))
+                        .build()
+                        .unwrap()
+                        .try_deserialize()
+                        .unwrap();
+                    let expected = if toggle.ends_with("true") {
+                        when_enabled
+                    } else {
+                        None
+                    };
+                    assert_eq!(
+                        managed.effective_snapshot_cache_path(),
+                        expected,
+                        "{enabled}: {toggle}: {setting}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

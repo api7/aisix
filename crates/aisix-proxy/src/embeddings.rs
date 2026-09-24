@@ -15,7 +15,7 @@
 //! `"type": "not_implemented"`.
 
 use aisix_core::AppliedGuardrail;
-use aisix_gateway::{BridgeError, ChatFormat, ChatMessage, EmbeddingRequest};
+use aisix_gateway::{BridgeCapability, BridgeError, ChatFormat, ChatMessage, EmbeddingRequest};
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -176,16 +176,15 @@ pub async fn embeddings(
             // spend. Pre-#226 the embedding handler dropped the
             // event entirely, so any /v1/embeddings traffic was
             // invisible to budget enforcement and billing
-            // reconciliation. Skip when `upstream_called == false`
-            // — the dispatch's 501-NotImplemented path returns the
-            // false flag because no upstream call happened, and
-            // attributing a zero-everything event to the api_key
-            // would bloat /logs with noise. Distinguished from
+            // reconciliation. A 501 normally remains suppressed because no
+            // upstream call happened; if screening recorded a guardrail
+            // decision, preserve it in a zero-token event. Distinguished from
             // `prompt_tokens == 0` so a 200 with legitimately zero
             // tokens (empty input, provider-specific billing
-            // convention) still emits. Same emit-on-success-only
-            // convention as chat.rs.
-            if success.upstream_called {
+            // convention) still emits.
+            if success.upstream_called
+                || crate::usage_attr::has_guardrail_attribution(&audit, &success.monitor_hits)
+            {
                 emit_usage_event(
                     &state,
                     &snapshot,
@@ -206,6 +205,7 @@ pub async fn embeddings(
                     success.monitor_hits.clone(),
                     success.captured_content.as_ref(),
                     &audit,
+                    success.upstream_called,
                 );
             }
             success.response
@@ -242,15 +242,18 @@ pub async fn embeddings(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
-                "embeddings",
+                crate::operation::EMBEDDINGS,
                 "openai",
                 &request_id,
                 &model_name,
                 &api_key_id,
                 status,
                 err.kind(),
+                err.is_guardrail_block(),
                 &client,
                 crate::usage_attr::enforced_hits(&audit),
+                crate::usage_attr::guardrail_scores(&audit),
+                crate::usage_attr::bypass_reason(&audit),
             );
             err.into_response()
         }
@@ -313,7 +316,7 @@ async fn dispatch(
     let model_entry = crate::model_resolve::resolve_model(snapshot, &body.model)
         .ok_or_else(|| ProxyError::ModelNotFound(body.model.clone()))?;
 
-    if !auth.key().can_access(&body.model) {
+    if !auth.key().can_access(snapshot, &body.model) {
         return Err(ProxyError::ModelForbidden(body.model.clone()));
     }
 
@@ -362,7 +365,7 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-            ..
+            unavailable,
         } = verdict
         {
             // Per #153 keep the matched-pattern detail in ops logs only; the
@@ -373,8 +376,10 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/embeddings request",
             );
-            return Err(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
             ));
         }
     }
@@ -418,6 +423,10 @@ async fn dispatch(
     );
     let captured_prompt = content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
 
+    // The name the caller addressed, kept before `body` is consumed below —
+    // the response echoes it rather than the id the provider reports (the
+    // `model_echo` contract).
+    let client_facing_model = body.model.clone();
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
@@ -466,7 +475,11 @@ async fn dispatch(
     })
     .await
     {
-        Ok(embed_resp) => {
+        Ok(mut embed_resp) => {
+            // The provider bridge fills `model` from the upstream's own
+            // document (or echoes the upstream id it was sent); the client
+            // asked for an alias and gets the alias back.
+            embed_resp.model = client_facing_model;
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
             state.health.record_success(&model_entry.value.display_name);
@@ -528,15 +541,13 @@ async fn dispatch(
                 captured_content,
             })
         }
-        Err(BridgeError::Config(msg)) if msg.contains("does not support embeddings") => {
+        Err(e @ BridgeError::UnsupportedCapability(BridgeCapability::Embeddings)) => {
             // Provider doesn't implement embed → 501 Not Implemented.
             // Drop the reservation without committing — the request
-            // didn't hit the upstream. No UsageEvent emission either
-            // (`upstream_called: false` → handler skips emit per the
-            // chat.rs convention that we only attribute usage on a
-            // real upstream completion).
+            // didn't hit the upstream. The handler emits no usage unless a
+            // guardrail decision was already recorded before this branch.
             reservation.commit_tokens(0).await;
-            let env = ErrorEnvelope::new(msg, "not_implemented");
+            let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(EmbedDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
                 provider: provider.to_ascii_lowercase(),
@@ -549,8 +560,9 @@ async fn dispatch(
                 prompt_tokens: 0,
                 usage_estimated: false,
                 captured_content: None,
-                // No upstream call happened — the handler reads this
-                // and skips UsageEvent emission. Distinguished from
+                // No upstream call happened. The handler normally skips the
+                // event, except when guardrail attribution must survive.
+                // Distinguished from
                 // `prompt_tokens == 0` so a 200 that legitimately
                 // reports zero tokens still emits.
                 upstream_called: false,
@@ -585,13 +597,17 @@ fn emit_access_log(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let _ = now_ts; // only used for context; access log uses elapsed
+    let target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method: "POST",
         path: "/v1/embeddings",
         status,
         latency,
+        duration: latency,
         provider: Some(provider),
         model: Some(model),
+        upstream_model: target.upstream_model(),
+        provider_key_id: target.provider_key_id(),
         api_key_id: Some(api_key_id),
         prompt_tokens: None,
         completion_tokens: None,
@@ -605,6 +621,8 @@ fn emit_access_log(
         routing_fallback_count: None,
         error_kind,
         error: error.as_deref(),
+        mcp: None,
+        cache: None,
     }
     .emit();
 }
@@ -661,6 +679,7 @@ fn emit_usage_event(
     content: Option<&CapturedContent>,
     // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
     audit: &crate::usage_attr::GuardrailAudit,
+    dispatched: bool,
 ) {
     // Only populate fields meaningful to /v1/embeddings; rely on
     // UsageEvent's `#[derive(Default)]` for everything else. Wire-level
@@ -675,9 +694,6 @@ fn emit_usage_event(
     //   - cost_usd — cp-api computes server-side from pricing catalog
     //   - guardrail_blocked — a blocked input short-circuits before this
     //     emit (success-only path), so it is never set here
-    //   - guardrail_bypassed_reason — embeddings now run input guardrails
-    //     (#719); fail-open bypass telemetry is not yet plumbed for the
-    //     non-chat handlers (follow-up, same as the per-PK fields below)
     //   - cache_status / cache_hit_saved_* — no caching on embeddings
     //   - ttft_ms — embeddings are not streamed
     //   - served_by_model / routing_* — embeddings don't run routing
@@ -706,25 +722,32 @@ fn emit_usage_event(
         redacted_entity_counts,
         guardrail_monitor_hits,
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
+        guardrail_scores: crate::usage_attr::guardrail_scores(audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
     // Handler label "embeddings" — bucketed prometheus counter (#408).
-    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
+    crate::usage_attr::apply_caller_identity(
+        &mut event,
+        client.jwt.as_ref(),
+        client.caller.user_id.as_deref(),
+        client.caller.user_name.as_deref(),
+    );
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
     crate::usage_attr::emit_usage(
         state,
         snap,
-        "embeddings",
+        crate::operation::EMBEDDINGS,
         event,
         crate::usage_attr::usage_event_labels(&usage_model, pk),
         content,
         client.trace.as_ref(),
         /* terminal */ true,
-        /* dispatched */ true,
+        dispatched,
     );
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     crate::request_metrics::record_usage(
@@ -742,6 +765,10 @@ fn emit_usage_event(
             input: prompt_tokens,
             output: 0,
             total: prompt_tokens,
+            // No upstream on this surface reports prompt-cache detail.
+            cached: 0,
+            cache_read: 0,
+            cache_creation: 0,
             spend_usd: 0.0,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
@@ -769,6 +796,7 @@ mod tests {
             request_id: Default::default(),
             url_rewrites: Vec::new(),
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }
@@ -860,8 +888,8 @@ mod tests {
         })
     }
 
-    /// An env-scoped keyword input guardrail (no attachment row → applies
-    /// to every request via the backward-compat fallback) that blocks on a
+    /// A keyword input guardrail, attached env-wide by
+    /// `seed_env_scoped_guardrail` so it applies to every request. Blocks on a
     /// literal. `fail_open:false` is irrelevant for keyword (local, never
     /// errors) but keeps the row explicit.
     fn keyword_input_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
@@ -895,7 +923,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("my-embed"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -1039,7 +1067,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("my-embed"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let app = build_app(snap);
         let body = serde_json::json!({"model": "my-embed", "input": "please BLOCKME now"});
@@ -1071,7 +1099,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("my-embed"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let app = build_app(snap);
         let body =
@@ -1102,7 +1130,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("my-embed"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let app = build_app(snap);
         let body = serde_json::json!({"model": "my-embed", "input": "a perfectly fine request"});
@@ -1612,10 +1640,9 @@ mod tests {
         // The `.expect(1)` on both mocks asserts exactly two upstream calls.
     }
 
-    /// Issue #456 (#226 family): the 501 NotImplemented path (provider
-    /// doesn't support embeddings) must NOT emit a UsageEvent — no
-    /// upstream call happened, so there's nothing to attribute. Mirrors
-    /// the canonical `completions.rs::provider_lacking_complete_returns_501_without_emit`.
+    /// A 501 without a guardrail decision stays out of usage, while a 501
+    /// reached after a mask must preserve that attribution in a zero-token
+    /// event (#1083).
     /// Triggers the path by routing /v1/embeddings at an Anthropic-backed
     /// model; `AnthropicBridge` doesn't override `Bridge::embed()` so the
     /// trait default returns `BridgeError::Config(...)` → 501. Without this
@@ -1623,7 +1650,7 @@ mod tests {
     /// `usage: None` → `Some(zero)`) on the 501 branch would silently emit
     /// a bogus zero event.
     #[tokio::test]
-    async fn provider_lacking_embed_returns_501_without_emit_issue_456() {
+    async fn provider_lacking_embed_emits_only_for_guardrail_attribution() {
         use aisix_obs::UsageSink;
         use aisix_provider_anthropic::AnthropicBridge;
 
@@ -1644,6 +1671,7 @@ mod tests {
         snap.provider_keys.insert(anthropic_pk_entry);
         snap.models.insert(anthropic_model_entry);
         snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -1655,7 +1683,7 @@ mod tests {
         let app = crate::build_router(state);
 
         let body = serde_json::json!({"model": "claude-embed", "input": "hello"});
-        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+        let resp = tower::ServiceExt::oneshot(app.clone(), make_req(body))
             .await
             .unwrap();
         assert_eq!(
@@ -1673,6 +1701,23 @@ mod tests {
                 ev.prompt_tokens, ev.status_code,
             );
         }
+
+        let body = serde_json::json!({
+            "model": "claude-embed",
+            "input": "build version: 9.9.9"
+        });
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the masked 501 must emit its guardrail attribution")
+            .expect("usage sink remains open");
+        assert_eq!(ev.status_code, 501);
+        assert_eq!(ev.prompt_tokens, 0);
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
     }
 
     /// Issue #226 audit M1: a 200 response with upstream-reported
@@ -1901,7 +1946,15 @@ mod tests {
             .await;
 
         let snap = new_snap(&upstream.uri());
-        snap.models.insert(model_entry("embed-model"));
+        // Cooldown is opt-in (AISIX-Cloud#1499). The subject here is that
+        // this handler routes its failures through the cooldown
+        // chokepoint at all, so the model has to ask for cooldown.
+        let mut entry = model_entry("embed-model");
+        entry.value.cooldown = Some(aisix_core::CooldownConfig {
+            enabled: Some(true),
+            ..Default::default()
+        });
+        snap.models.insert(entry);
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let hub = Arc::new(Hub::new());
@@ -1936,7 +1989,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("my-embed"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -2007,7 +2060,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("my-embed"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(masking_input_guardrail());
+        crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());

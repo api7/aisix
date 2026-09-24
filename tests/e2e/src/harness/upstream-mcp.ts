@@ -21,6 +21,12 @@ export interface McpUpstream {
    * byte-diff what reached the upstream.
    */
   received: string[];
+  /**
+   * Request headers this upstream received, lowercased, in the same
+   * arrival order as `received` — what a header-forwarding suite asserts
+   * on.
+   */
+  receivedHeaders: Record<string, string>[];
   close(): Promise<void>;
 }
 
@@ -60,8 +66,9 @@ export async function startMcpUpstream(
   options: McpUpstreamOptions = {},
 ): Promise<McpUpstream> {
   const received: string[] = [];
+  const receivedHeaders: Record<string, string>[] = [];
   const httpServer: HttpServer = createServer((req, res) => {
-    void handle(label, req, res, options, received);
+    void handle(label, req, res, options, received, receivedHeaders);
   });
   await new Promise<void>((resolve) =>
     httpServer.listen(0, "127.0.0.1", resolve),
@@ -73,6 +80,7 @@ export async function startMcpUpstream(
   return {
     url: `http://127.0.0.1:${address.port}/mcp`,
     received,
+    receivedHeaders,
     close: () =>
       new Promise((resolve) => httpServer.close(() => resolve())),
   };
@@ -84,6 +92,7 @@ async function handle(
   res: ServerResponse,
   options: McpUpstreamOptions,
   received: string[],
+  receivedHeaders: Record<string, string>[],
 ): Promise<void> {
   try {
     if (req.method !== "POST") {
@@ -94,6 +103,14 @@ async function handle(
     for await (const chunk of req) chunks.push(chunk as Buffer);
     const raw = Buffer.concat(chunks).toString("utf8");
     received.push(raw);
+    receivedHeaders.push(
+      Object.fromEntries(
+        Object.entries(req.headers).map(([k, v]) => [
+          k.toLowerCase(),
+          Array.isArray(v) ? v.join(", ") : (v ?? ""),
+        ]),
+      ),
+    );
     const body: unknown = JSON.parse(raw);
 
     const server = new Server(

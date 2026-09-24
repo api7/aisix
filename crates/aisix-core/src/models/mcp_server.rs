@@ -15,6 +15,30 @@ use serde_json::{json, Value};
 
 use crate::resource::Resource;
 
+/// The WRITE-path pattern for [`McpServer::name`]: the read pattern
+/// (`^(?:[^_]|_[^_])*$`, on the field itself) with `*` additionally
+/// excluded from both alternatives.
+///
+/// A name is pasted into the `<server>__<tool>` glob patterns that every
+/// name-form MCP grant, deny and anonymous ceiling is written as, and a
+/// `*` in it breaks those patterns in BOTH directions — which is why the
+/// name, rather than any one call site, is what gets fixed:
+///
+/// - **wider than written**, wherever the tool half is a literal. A deny
+///   of `gh*__read` on a server called `gh*` also matches `ghost__read`:
+///   `crate::wildcard` anchors the one `*` between the prefix `gh` and
+///   the suffix `__read`, and `ghost__read` satisfies both.
+/// - **empty**, wherever the tool half is itself `*` — the shape the
+///   anonymous ceiling always builds. `gh*__*` carries TWO `*`, and
+///   `wildcard_matches` refuses any pattern with more than one, so such a
+///   ceiling admits nothing at all, not even that server's own tools.
+///
+/// New names may not carry one; stored rows that already do keep loading,
+/// because the lenient read schema is left on the looser pattern
+/// (`aisix-etcd`'s loader skips a row it cannot validate, and skipping the
+/// row is a strictly worse outcome than a name that globs).
+pub const NAME_PATTERN_STRICT: &str = r"^(?:[^_*]|_[^_*])*$";
+
 // `Eq` is deliberately absent: `spec` holds a `serde_json::Value`, which is
 // only `PartialEq` (JSON numbers are floats).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
@@ -32,7 +56,10 @@ pub struct McpServer {
     // (see `aisix_mcp::gateway`). So the name must contain no `__` AND must not
     // end in `_`: `gh_` + `x` and `gh` + `_x` both serialize to `gh___x`, and the
     // split resolves the former to the non-existent server `gh`. The pattern
-    // below rejects both shapes on every configuration path.
+    // below rejects both shapes on every configuration path; the WRITE path
+    // additionally rejects a `*` (`NAME_PATTERN_STRICT`, whose doc has the two
+    // ways such a name breaks the patterns built from it), which stays out of
+    // the read pattern so a row that already carries one keeps loading.
     #[schemars(regex(pattern = "^(?:[^_]|_[^_])*$"), length(min = 1))]
     pub name: String,
 
@@ -117,6 +144,45 @@ pub struct McpServer {
     /// `type: openapi`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<McpProtocolVersion>,
+
+    /// Inbound client headers forwarded to this server, as single-`*`
+    /// glob patterns matched case-insensitively against the header name
+    /// (`"x-trace-*"`, `"authorization"`). Empty — the default — forwards
+    /// nothing. Applies to both `type: mcp` and `type: openapi`, so a REST
+    /// API exposed here as tools receives them on every tool call.
+    ///
+    /// A header the caller sends more than once is forwarded with its
+    /// first value only; the upstream receives one well-formed header
+    /// rather than a list this gateway never interpreted. An HTTP/2
+    /// caller may split `cookie` across several header fields, and only
+    /// the first of them is forwarded.
+    ///
+    /// A header named here reaches the server whatever the gateway would
+    /// otherwise do with it. Naming the credential slot `auth_type` would
+    /// fill — `authorization` for `bearer` and `oauth2`, `api_key_header`
+    /// for `api_key` — hands the server the caller's own credential in
+    /// place of the gateway's, never both. That is what lets an internal
+    /// server that already authorizes on the end user's `Authorization`
+    /// keep doing so unchanged. A server that validates the `aud` claim
+    /// will reject a token minted for the gateway.
+    ///
+    /// A credential slot, and `traceparent` / `tracestate`, are forwarded
+    /// only when a pattern names them exactly — a glob such as `"*"` or
+    /// `"x-*"` is a statement about the operator's own headers, not
+    /// consent to hand a third party the caller's credential or to graft
+    /// the caller's trace onto that party's telemetry.
+    ///
+    /// Headers whose forwarding would break the exchange rather than
+    /// change who it comes from are never forwarded whatever the patterns
+    /// say: `host`, the hop-by-hop headers that describe the caller's own
+    /// connection, the gateway's `x-aisix-*` namespace, the headers
+    /// describing a body this gateway re-serializes (`content-type`,
+    /// `content-length`, `accept`), and the MCP session slots
+    /// (`mcp-session-id`, `mcp-protocol-version`, `last-event-id`), which
+    /// name the caller's session with this gateway and which an upstream
+    /// MCP server refuses outright when they carry a foreign value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forward_client_headers: Vec<String>,
 
     /// Maximum time, in milliseconds, to wait for a single upstream operation
     /// (establishing the session, listing tools, or calling a tool). Must be at
@@ -318,6 +384,26 @@ pub fn mcp_server_credential_coupling() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_client_header_forward_is_a_free_list_of_patterns() {
+        use crate::models::schema::{validate_mcp_server, validate_mcp_server_lenient};
+
+        let with = |patterns: Value| {
+            let mut v = json!({"name": "erp", "url": "https://erp.internal/mcp"});
+            v["forward_client_headers"] = patterns;
+            v
+        };
+
+        // Credential slots are the point of the field, not an oversight:
+        // the runtime decides what is deliverable, so the schema does not
+        // second-guess an operator naming one.
+        validate_mcp_server(&with(json!(["authorization", "x-trace-*", "*"])))
+            .expect("credential slots and globs are both accepted");
+        validate_mcp_server(&with(json!([]))).expect("an empty list is the default, spelled out");
+        validate_mcp_server_lenient(&with(json!(["authorization"])))
+            .expect("the read path must not cost the row over a pattern");
+    }
 
     #[test]
     fn schema_pins_each_mcp_obligation_individually() {
@@ -646,6 +732,7 @@ mod tests {
             token_url: None,
             scopes: None,
             protocol_version: None,
+            forward_client_headers: Vec::new(),
             timeout_ms: None,
             enabled: true,
             runtime_id: String::new(),
