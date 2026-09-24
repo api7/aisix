@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -427,8 +427,21 @@ async fn deliver(
     loop {
         attempts += 1;
         let failure = match send(client, cfg, batch_id, events).await {
-            Attempt::Delivered { dedup } => {
+            Attempt::Delivered { dedup, rejected } => {
                 state.dedup_seen = dedup;
+                // Delivered and final: the control plane judged these events
+                // and would refuse them again, so there is nothing to re-send.
+                // What there is, is a hole in the usage record that nothing
+                // else reports.
+                if rejected > 0 {
+                    metrics.record_usage_events_rejected(rejected);
+                    tracing::warn!(
+                        %batch_id,
+                        count,
+                        rejected,
+                        "control plane rejected usage events in an accepted telemetry batch (events dropped)",
+                    );
+                }
                 if resending {
                     tracing::warn!(
                         %batch_id,
@@ -593,6 +606,14 @@ struct TelemetryBody<'a> {
     events: &'a [UsageEvent],
 }
 
+/// The control plane's `2xx` answer to a batch. Decoded loosely — a newer
+/// control plane may add fields or drop this one.
+#[derive(Debug, Deserialize)]
+struct TelemetryAnswer {
+    #[serde(default)]
+    rejected: u64,
+}
+
 /// What one POST of a batch came back as.
 #[derive(Debug)]
 enum Attempt {
@@ -602,6 +623,9 @@ enum Attempt {
     /// [`USAGE_BATCH_DEDUP_HEADER`].
     Delivered {
         dedup: bool,
+        /// Events the control plane refused inside the accepted batch —
+        /// the `rejected` count of its `{accepted, rejected}` answer.
+        rejected: u64,
     },
     Failed(SendFailure),
 }
@@ -668,7 +692,15 @@ async fn send(
         .is_some_and(|value| value.as_bytes() == USAGE_BATCH_DEDUP_ENABLED.as_bytes());
     let status = resp.status();
     if status.is_success() {
-        return Attempt::Delivered { dedup };
+        // A body that is not the expected answer reads as nothing rejected:
+        // the batch was accepted, and there is no count to report.
+        let rejected = resp
+            .text()
+            .await
+            .ok()
+            .and_then(|body| serde_json::from_str::<TelemetryAnswer>(&body).ok())
+            .map_or(0, |answer| answer.rejected);
+        return Attempt::Delivered { dedup, rejected };
     }
     let body = resp.text().await.unwrap_or_default();
     Attempt::Failed(SendFailure::Response {
@@ -834,7 +866,7 @@ mod tests {
         // A control plane that does not set the header still delivers; it
         // is re-sending that its absence rules out.
         assert!(
-            matches!(attempt, Attempt::Delivered { dedup: false }),
+            matches!(attempt, Attempt::Delivered { dedup: false, .. }),
             "{attempt:?}"
         );
 
@@ -1037,6 +1069,8 @@ mod tests {
         /// a mock server is not: a dropped listener keeps answering for an
         /// unspecified while.
         stalled: bool,
+        /// JSON body of a `2xx` answer; `None` sends an empty body.
+        body: Option<&'static str>,
     }
 
     /// Answers with the de-duplication header — a control plane whose
@@ -1046,6 +1080,7 @@ mod tests {
             status,
             dedup: Some(USAGE_BATCH_DEDUP_ENABLED),
             stalled: false,
+            body: None,
         }
     }
 
@@ -1056,6 +1091,7 @@ mod tests {
             status,
             dedup: Some(value),
             stalled: false,
+            body: None,
         }
     }
 
@@ -1066,6 +1102,7 @@ mod tests {
             status,
             dedup: None,
             stalled: false,
+            body: None,
         }
     }
 
@@ -1075,6 +1112,7 @@ mod tests {
             status: 200,
             dedup: Some(USAGE_BATCH_DEDUP_ENABLED),
             stalled: true,
+            body: None,
         }
     }
 
@@ -1114,6 +1152,10 @@ mod tests {
                     Some(value) => ResponseTemplate::new(answer.status)
                         .insert_header(USAGE_BATCH_DEDUP_HEADER, value),
                     None => ResponseTemplate::new(answer.status),
+                };
+                let response = match answer.body {
+                    Some(body) => response.set_body_raw(body, "application/json"),
+                    None => response,
                 };
                 if answer.stalled {
                     response.set_delay(BEYOND_THE_REQUEST_TIMEOUT)
@@ -1531,6 +1573,119 @@ mod tests {
                 (&posts[0].0, &posts[0].1),
                 "a re-send repeats the SAME batch id and the SAME events",
             );
+        }
+    }
+
+    /// A `2xx` that names events the control plane refused is delivered and
+    /// final — re-sending would be refused the same way — but it is a hole
+    /// in the usage record, so it is counted and logged instead of passing
+    /// silently.
+    #[tokio::test]
+    async fn rejected_events_in_an_accepted_batch_are_counted_and_not_resent() {
+        let (server, posts) = scripted_server(vec![Answer {
+            body: Some(r#"{"accepted":1,"rejected":1}"#),
+            ..dedups(200)
+        }])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let logs = CapturedLogs::default();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let (mut sender, tx) = staged_sender(cfg, metrics.clone(), &mut cancel_rx, 2).await;
+
+        let rejected_recorded = || {
+            metrics
+                .render()
+                .lines()
+                .any(|line| line == "aisix_usage_events_rejected_total 1")
+        };
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            rejected_recorded,
+            "the rejection was never recorded",
+        )
+        .await;
+        // Long past every re-send backoff: a retry would have happened.
+        for _ in 0..20 {
+            assert!(poll_sender(sender.as_mut()).await.is_pending());
+            tokio::time::advance(RETRY_MAX_BACKOFF).await;
+            tokio::task::yield_now().await;
+        }
+        drop(tx);
+        finish_sender(sender.as_mut()).await;
+
+        assert_eq!(
+            posts.lock().unwrap().len(),
+            1,
+            "a rejection is never re-sent"
+        );
+        assert!(rejected_recorded(), "{}", metrics.render());
+        let logs = logs.text();
+        let warn = logs
+            .lines()
+            .find(|line| line.contains("control plane rejected usage events"))
+            .unwrap_or_else(|| panic!("no rejection WARN in: {logs}"));
+        assert!(warn.contains("WARN"), "{warn}");
+        assert!(
+            warn.contains("rejected=1") && warn.contains("count=2"),
+            "{warn}"
+        );
+        assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 0);
+    }
+
+    /// An answer with nothing rejected — or no answer body at all, as an
+    /// older control plane may send — records no rejection.
+    #[tokio::test]
+    async fn an_answer_without_rejections_records_none() {
+        for body in [Some(r#"{"accepted":2,"rejected":0}"#), None] {
+            let (server, _posts) = scripted_server(vec![Answer {
+                body,
+                ..dedups(200)
+            }])
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+            let attempt = send(&plain_client(), &cfg, Uuid::new_v4(), &[sample_event("r")]).await;
+            assert!(
+                matches!(attempt, Attempt::Delivered { rejected: 0, .. }),
+                "{attempt:?}"
+            );
+        }
+    }
+
+    /// `tracing` writer that keeps what was logged for assertions.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
         }
     }
 

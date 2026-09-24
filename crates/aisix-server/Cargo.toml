@@ -84,3 +84,4 @@ hyper = { workspace = true, features = ["client"] }
 http-body-util.workspace = true
 wiremock = "0.6"
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true

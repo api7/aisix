@@ -2276,18 +2276,28 @@ impl GeminiUsageMetadata {
         let candidates_inclusive = self.total_token_count > 0
             && prompt_tokens.saturating_add(self.candidates_token_count) == self.total_token_count
             && self.thoughts_token_count <= self.candidates_token_count;
-        let completion_tokens = if candidates_inclusive {
-            self.candidates_token_count
+        //
+        // The fold is client-facing accounting only. The UsageEvent records
+        // Gemini's own counters — `candidatesTokenCount` as the completion
+        // and `totalTokenCount` as the total — by subtracting
+        // `reasoning_folded_into_completion` back out; cp-api reads the
+        // total identity itself.
+        let reasoning_folded_into_completion = if candidates_inclusive {
+            0
         } else {
-            self.candidates_token_count
-                .saturating_add(self.thoughts_token_count)
+            self.thoughts_token_count
         };
+        let completion_tokens = self
+            .candidates_token_count
+            .saturating_add(reasoning_folded_into_completion);
         UsageStats {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens.saturating_add(completion_tokens),
             cached_prompt_tokens: self.cached_content_token_count,
             reasoning_tokens: self.thoughts_token_count,
+            upstream_total_tokens: self.total_token_count,
+            reasoning_folded_into_completion,
             ..Default::default()
         }
     }
@@ -3369,6 +3379,31 @@ mod tests {
         assert_eq!(u.reasoning_tokens, 30);
         assert_eq!(u.total_tokens, 150, "matches Gemini's own totalTokenCount");
         assert_eq!(u.openai_total_tokens(), 150);
+        // The recorded event keeps Gemini's own counters.
+        assert_eq!(u.upstream_total_tokens, 150);
+        assert_eq!(u.reasoning_folded_into_completion, 30);
+        assert_eq!(
+            aisix_gateway::chat::recorded_completion_tokens(
+                u.completion_tokens,
+                u.reasoning_folded_into_completion
+            ),
+            20
+        );
+    }
+
+    /// Without `totalTokenCount` there is nothing to say the candidates
+    /// already hold the thoughts, so the client-facing fold stays as it
+    /// was — and the recorded total stays unreported rather than becoming
+    /// a sum computed here.
+    #[test]
+    fn gemini_missing_total_folds_for_clients_and_records_no_total() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":20,"thoughtsTokenCount":30}"#,
+        );
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.total_tokens, 150);
+        assert_eq!(u.upstream_total_tokens, 0);
+        assert_eq!(u.reasoning_folded_into_completion, 30);
     }
 
     /// Other Gemini versions already count thoughts INSIDE
@@ -3384,6 +3419,8 @@ mod tests {
         assert_eq!(u.completion_tokens, 50);
         assert_eq!(u.reasoning_tokens, 30);
         assert_eq!(u.total_tokens, 150);
+        assert_eq!(u.reasoning_folded_into_completion, 0);
+        assert_eq!(u.upstream_total_tokens, 150);
     }
 
     /// Tool-result tokens are INPUT that `promptTokenCount` excludes, so

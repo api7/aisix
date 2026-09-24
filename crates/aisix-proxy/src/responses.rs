@@ -155,6 +155,12 @@ struct ResponseUsage {
     /// verbatim OpenAI path (OpenAI surfaces cache hits via
     /// `cached_prompt_tokens` instead).
     cache_read_tokens: u32,
+    /// The upstream's own `usage.total_tokens` (0 = not reported); see
+    /// `UsageStats::upstream_total_tokens`.
+    upstream_total_tokens: u32,
+    /// See `UsageStats::reasoning_folded_into_completion`. Always 0 on the
+    /// verbatim path.
+    reasoning_folded_into_completion: u32,
     /// Attempt-scoped time to the upstream's first streamed frame, whatever
     /// its type (`response.created` included) — see
     /// `UsageEvent::upstream_ttft_ms`. 0 on the non-streaming paths. Before
@@ -2458,6 +2464,8 @@ async fn responses_cross_provider_to_target(
                     cache_write_tokens: comp.cache_write_tokens,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
+                    upstream_total_tokens: comp.upstream_total_tokens.unwrap_or(0),
+                    reasoning_folded_into_completion: comp.reasoning_folded_into_completion,
                     usage_estimated: comp.usage_estimated,
                     upstream_ttft_ms: comp.upstream_ttft_ms,
                     downstream_latency_ms: comp.downstream_latency_ms,
@@ -2603,6 +2611,8 @@ async fn responses_cross_provider_to_target(
             cache_write_tokens: resp.usage.cache_write_tokens,
             cache_creation_tokens: resp.usage.cache_creation_tokens,
             cache_read_tokens: resp.usage.cache_read_tokens,
+            upstream_total_tokens: resp.usage.upstream_total_tokens,
+            reasoning_folded_into_completion: resp.usage.reasoning_folded_into_completion,
             usage_estimated: false,
             upstream_ttft_ms: 0,
             downstream_latency_ms: 0,
@@ -2794,6 +2804,10 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         .pointer("/input_tokens_details/cache_write_tokens")
         .and_then(Value::as_u64)
         .map(|n| n.min(u32::MAX as u64) as u32);
+    let upstream_total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .map_or(0, |n| n.min(u32::MAX as u64) as u32);
     Some(ResponseUsage {
         // Parsed from a fully buffered response body, so by definition the
         // response was delivered in full.
@@ -2807,6 +2821,8 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         // OpenAI verbatim path: no Anthropic-style cache counters.
         cache_creation_tokens: 0,
         cache_read_tokens: 0,
+        upstream_total_tokens,
+        reasoning_folded_into_completion: 0,
         // Carried across by the caller (`drain_responses_sse_frames`), which
         // measured these before this terminal frame arrived.
         upstream_ttft_ms: 0,
@@ -3603,7 +3619,11 @@ fn emit_usage_event(
         api_key_id: caller.api_key_id.to_string(),
         requested_model: requested_model.to_string(),
         prompt_tokens: usage.prompt_tokens,
-        completion_tokens: usage.completion_tokens,
+        completion_tokens: aisix_gateway::chat::recorded_completion_tokens(
+            usage.completion_tokens,
+            usage.reasoning_folded_into_completion,
+        ),
+        total_tokens: usage.upstream_total_tokens,
         cached_prompt_tokens: usage.cached_prompt_tokens,
         cache_write_tokens: usage.cache_write_tokens,
         reasoning_tokens: usage.reasoning_tokens,

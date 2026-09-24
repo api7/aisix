@@ -123,9 +123,19 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u32>,
 
-    /// OpenAI o1/o3 reasoning tokens. Subset of `completion_tokens`.
+    /// Reasoning tokens as the upstream reported them. A subset of
+    /// `completion_tokens` for OpenAI-shape upstreams; Gemini may report
+    /// them BESIDE its completion count, which `total_tokens` tells apart.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub reasoning_tokens: u32,
+
+    /// The upstream's own total token count, verbatim (Gemini
+    /// `totalTokenCount`, OpenAI / Responses `usage.total_tokens`, Bedrock
+    /// `totalTokens`); omitted when the upstream reported none. Never a sum
+    /// the gateway computed: cp-api reads `prompt + completion + reasoning
+    /// == total_tokens` as reasoning counted beside the completion.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub total_tokens: u32,
 
     /// Anthropic cache_creation_input_tokens. Separate counter on top
     /// of input_tokens; bills at ~1.25× prompt rate (per-model rate
