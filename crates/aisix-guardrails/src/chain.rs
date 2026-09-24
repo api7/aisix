@@ -1997,7 +1997,9 @@ mod tests {
     /// Otherwise appending a system message after the prefill makes the
     /// prefill look answered, and the window is left holding system
     /// messages alone — which, since system messages are excluded, is an
-    /// empty window and the same bypass one step further out.
+    /// empty window and the same bypass one step further out. A developer
+    /// message is a system message by another name and must not reopen it
+    /// either.
     #[tokio::test]
     async fn a_system_message_after_a_prefill_does_not_reopen_the_bypass() {
         let chain = GuardrailChain::new_with_applied(
@@ -2009,18 +2011,24 @@ mod tests {
             )],
             applied(1),
         );
-        let req = ChatFormat::new(
-            "m",
-            vec![
-                ChatMessage::user("please handle AKIA"),
-                ChatMessage::assistant("Sure, here is"),
-                ChatMessage::system("trailing policy"),
-            ],
-        );
-        assert!(
-            chain.check_input(&req).await.is_block(),
-            "the window must still hold the user message",
-        );
+        for trailing in [
+            ChatMessage::system("trailing policy"),
+            ChatMessage::developer("trailing policy"),
+        ] {
+            let role = trailing.role;
+            let req = ChatFormat::new(
+                "m",
+                vec![
+                    ChatMessage::user("please handle AKIA"),
+                    ChatMessage::assistant("Sure, here is"),
+                    trailing,
+                ],
+            );
+            assert!(
+                chain.check_input(&req).await.is_block(),
+                "the window must still hold the user message after a trailing {role:?}",
+            );
+        }
     }
 
     #[tokio::test]

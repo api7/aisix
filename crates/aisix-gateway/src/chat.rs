@@ -27,6 +27,16 @@ pub enum Role {
     Tool,
 }
 
+impl Role {
+    /// Whether the message is an instruction from the application rather
+    /// than a conversation turn. `developer` is OpenAI's newer spelling of
+    /// `system`, so anything that treats system messages specially must
+    /// treat developer messages the same way.
+    pub fn is_instruction(self) -> bool {
+        matches!(self, Role::System | Role::Developer)
+    }
+}
+
 /// One element of the OpenAI-shape `messages` array.
 ///
 /// `deny_unknown_fields` is intentionally NOT applied here — OpenAI ships
