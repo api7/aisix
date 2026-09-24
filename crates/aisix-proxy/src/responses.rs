@@ -3660,6 +3660,9 @@ fn emit_usage_event(
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
         ..Default::default()
     };
+    event.reasoning_unfolded_from_completion = usage
+        .completion_tokens
+        .saturating_sub(event.completion_tokens);
     crate::usage_attr::apply_caller_identity(
         &mut event,
         client.jwt.as_ref(),

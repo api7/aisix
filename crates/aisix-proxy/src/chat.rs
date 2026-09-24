@@ -4996,6 +4996,8 @@ fn emit_usage_event(
         // MCP attribution does not apply to the chat path.
         ..Default::default()
     };
+    event.reasoning_unfolded_from_completion =
+        completion_tokens.saturating_sub(event.completion_tokens);
     crate::usage_attr::apply_caller_identity(
         &mut event,
         client.jwt.as_ref(),

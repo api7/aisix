@@ -474,8 +474,8 @@ mod tests {
     }
 
     /// Datadog's GenAI output count includes reasoning counted beside the
-    /// completion, as the OTLP span's does; the raw counters ride along
-    /// under their `aisix.` keys.
+    /// completion, as the OTLP span's does; the reasoning and total counters
+    /// ride along under their `aisix.` keys.
     #[tokio::test]
     async fn output_tokens_include_reasoning_counted_beside_the_completion() {
         let server = MockServer::start().await;

@@ -8,6 +8,7 @@ import {
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   waitForSlsLog,
   type MockSls,
   type OpenAiUpstream,
@@ -151,6 +152,13 @@ interface Called {
   text: string;
 }
 
+/** A `key=value` field of a log line. */
+function field(line: string, name: string): string | undefined {
+  const m = line.match(new RegExp(`\\b${name}=(?:"([^"]*)"|([^\\s]+))`));
+  if (!m) return undefined;
+  return m[1] ?? m[2];
+}
+
 /** The last usage object a stream carried, located by `pick`. */
 function usageFromSse(text: string, pick: (frame: Record<string, unknown>) => unknown): Record<string, any> {
   let found: Record<string, any> | undefined;
@@ -204,6 +212,20 @@ describe("the usage record carries upstream usage as reported", () => {
     );
   }
 
+  /**
+   * The access-log line keeps the gateway's own (folded) numbers, streamed
+   * or not — only the usage record is raw.
+   */
+  async function expectFoldedAccessLog(requestId: string): Promise<void> {
+    const line = await waitForLogLine(
+      app!,
+      (l) => l.includes("proxy request completed") && field(l, "request_id") === requestId,
+      `the access-log line of ${requestId}`,
+    );
+    expect(field(line, "completion_tokens")).toBe(String(CANDIDATES + THOUGHTS));
+    expect(field(line, "total_tokens")).toBe(String(TOTAL));
+  }
+
   /** Gemini's own counters, whichever protocol addressed the call. */
   async function expectRawGeminiRecord(requestId: string): Promise<void> {
     const log = await recorded(requestId);
@@ -226,8 +248,10 @@ describe("the usage record carries upstream usage as reported", () => {
     const geminiNoTotal = await startOpenAiUpstream({ nonStreamBody: GEMINI_NO_TOTAL_BODY });
     upstreams.push(gemini, geminiStream, openai, openaiNoTotal, geminiNoTotal);
 
+    // The access log is an `info` event; the harness defaults to `warn`.
     app = await spawnApp({
       extraEnv: {
+        RUST_LOG: "info",
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-ak-id",
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-ak-secret",
       },
@@ -316,6 +340,7 @@ describe("the usage record carries upstream usage as reported", () => {
     expect(usage.total_tokens).toBe(TOTAL);
 
     await expectRawGeminiRecord(res.requestId);
+    await expectFoldedAccessLog(res.requestId);
   });
 
   test("chat/completions streaming over Gemini records the same raw row", async (ctx) => {
@@ -333,6 +358,7 @@ describe("the usage record carries upstream usage as reported", () => {
     expect(usage.total_tokens).toBe(TOTAL);
 
     await expectRawGeminiRecord(res.requestId);
+    await expectFoldedAccessLog(res.requestId);
   });
 
   test("messages over Gemini: Anthropic output folds the thoughts, the record keeps them apart", async (ctx) => {
@@ -363,6 +389,7 @@ describe("the usage record carries upstream usage as reported", () => {
     expect(usage.output_tokens).toBe(CANDIDATES + THOUGHTS);
 
     await expectRawGeminiRecord(res.requestId);
+    await expectFoldedAccessLog(res.requestId);
   });
 
   test("responses over Gemini: output_tokens folds the thoughts, the record keeps them apart", async (ctx) => {
@@ -385,6 +412,7 @@ describe("the usage record carries upstream usage as reported", () => {
     expect(usage.output_tokens).toBe(CANDIDATES + THOUGHTS);
 
     await expectRawGeminiRecord(res.requestId);
+    await expectFoldedAccessLog(res.requestId);
   });
 
   test("Gemini without a total: the record keeps the folded completion and names no total", async (ctx) => {

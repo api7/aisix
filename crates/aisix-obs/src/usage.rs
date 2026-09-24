@@ -137,6 +137,13 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub total_tokens: u32,
 
+    /// In-process only, never on the wire: the reasoning the record took
+    /// back out of the gateway's folded completion count. Consumers that
+    /// must keep reporting the gateway's own numbers (the access log) read
+    /// [`Self::folded_completion_tokens`].
+    #[serde(skip)]
+    pub reasoning_unfolded_from_completion: u32,
+
     /// Anthropic cache_creation_input_tokens. Separate counter on top
     /// of input_tokens; bills at ~1.25× prompt rate (per-model rate
     /// resolved by cp-api from model_pricing).
@@ -776,6 +783,13 @@ fn is_zero_u32(n: &u32) -> bool {
 }
 
 impl UsageEvent {
+    /// The completion count every in-gateway consumer reports — the
+    /// record's raw count with any reasoning the record unfolded put back.
+    pub fn folded_completion_tokens(&self) -> u32 {
+        self.completion_tokens
+            .saturating_add(self.reasoning_unfolded_from_completion)
+    }
+
     /// Whether this record counts its reasoning BESIDE its completion rather
     /// than inside it — the control plane's additive-billing rule, stated
     /// once here so every exporter reads the record the way billing does:

@@ -3321,6 +3321,9 @@ fn emit_anthropic_usage_event(
         guardrail_blocked: terminal && guardrail_blocked,
         ..Default::default()
     };
+    event.reasoning_unfolded_from_completion = metrics
+        .completion_tokens
+        .saturating_sub(event.completion_tokens);
     // Handler label "messages" — Anthropic /v1/messages inbound
     // path. Bucketed prometheus counter (#408).
     crate::usage_attr::apply_caller_identity(
