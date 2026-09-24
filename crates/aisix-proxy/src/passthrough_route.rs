@@ -1730,9 +1730,6 @@ fn strip_redundant_version_segment<'a>(base: &str, rest: &'a str) -> &'a str {
 // Streaming relay
 // ---------------------------------------------------------------------------
 
-/// Incremental splitter of an SSE byte stream into complete frames
-/// (terminated by a blank line). Bytes after the last complete frame stay
-/// buffered until more arrive; `take_rest` drains them at end-of-stream.
 /// Cap on bytes buffered while waiting for one SSE frame terminator, and on
 /// bytes held back by the `Window` policy while its char threshold has not
 /// been reached. Both accumulators would otherwise grow without bound on an
@@ -1743,80 +1740,55 @@ fn strip_redundant_version_segment<'a>(base: &str, rest: &'a str) -> &'a str {
 /// bounded while the policy semantics degrade gracefully.
 const MAX_HELD_STREAM_BYTES: usize = 1024 * 1024;
 
-struct SseFrameSplitter {
-    buf: Vec<u8>,
-    /// Resume offset for the boundary scan: everything before it was
-    /// already checked in an earlier `push`, so an unterminated frame
-    /// costs O(n), not O(n²).
-    scanned: usize,
-}
+/// The gateway's shared frame splitter, with this relay's overflow policy:
+/// an oversized unterminated run is handed on as a frame. Bytes after the
+/// last complete frame stay buffered until more arrive; `take_rest` drains
+/// them at end-of-stream.
+struct SseFrameSplitter(aisix_gateway::sse::SseFrameSplitter);
 
 impl SseFrameSplitter {
     fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            scanned: 0,
-        }
+        Self(aisix_gateway::sse::SseFrameSplitter::new(
+            MAX_HELD_STREAM_BYTES,
+        ))
     }
 
     fn push(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
-        self.buf.extend_from_slice(chunk);
+        self.0.push(chunk);
         let mut frames = Vec::new();
         loop {
-            // Rescan the last 3 already-checked bytes: a boundary can
-            // straddle the previous chunk edge.
-            let from = self.scanned.saturating_sub(3);
-            let lf = find_subsequence(&self.buf[from..], b"\n\n").map(|i| (from + i, 2));
-            let crlf = find_subsequence(&self.buf[from..], b"\r\n\r\n").map(|i| (from + i, 4));
-            let boundary = match (lf, crlf) {
-                (Some((li, ll)), Some((ci, cl))) => {
-                    if ci < li {
-                        (ci, cl)
-                    } else {
-                        (li, ll)
-                    }
-                }
-                (Some(x), None) | (None, Some(x)) => x,
-                (None, None) => {
-                    self.scanned = self.buf.len();
-                    // Frame-terminator starvation: hand the oversized run on
-                    // as-is rather than buffering without bound.
-                    if self.buf.len() > MAX_HELD_STREAM_BYTES {
-                        frames.push(std::mem::take(&mut self.buf));
-                        self.scanned = 0;
-                    }
+            match self.0.next_frame() {
+                Ok(Some(frame)) => frames.push(frame),
+                Ok(None) => break,
+                // Frame-terminator starvation: hand the oversized run on as-is
+                // rather than buffering without bound.
+                Err(_) => {
+                    frames.push(self.0.take_rest());
                     break;
                 }
-            };
-            let end = boundary.0 + boundary.1;
-            let frame: Vec<u8> = self.buf.drain(..end).collect();
-            self.scanned = 0;
-            frames.push(frame);
+            }
         }
         frames
     }
 
     fn take_rest(&mut self) -> Vec<u8> {
-        self.scanned = 0;
-        std::mem::take(&mut self.buf)
+        self.0.take_rest()
     }
-}
-
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 /// `true` when the frame carries an `event:` line the server itself names
 /// a usage report. The only evidence an opaque stream offers that a
 /// token-shaped payload IS usage — see [`frame_delta`].
-fn is_usage_labelled_frame(frame_text: &str) -> bool {
-    frame_text.lines().any(|line| {
-        line.strip_prefix("event:").is_some_and(|name| {
-            let name = name.trim();
-            name.eq_ignore_ascii_case("token_usage") || name.eq_ignore_ascii_case("usage")
-        })
+fn is_usage_labelled_frame(frame: &[u8]) -> bool {
+    aisix_gateway::sse::lines(frame).any(|line| {
+        aisix_gateway::sse::parse_field(&frame[line.start..line.end]).is_some_and(
+            |(name, value)| {
+                let value = value.trim_ascii();
+                name == b"event"
+                    && (value.eq_ignore_ascii_case(b"token_usage")
+                        || value.eq_ignore_ascii_case(b"usage"))
+            },
+        )
     })
 }
 
@@ -1890,9 +1862,8 @@ fn frame_parts(
     protocol: PassthroughProtocol,
     frame: &[u8],
 ) -> (crate::held_content::Parts, Option<PassthroughUsage>) {
-    let frame_text = String::from_utf8_lossy(frame);
-    let usage_labelled = matches!(protocol, PassthroughProtocol::Raw)
-        && is_usage_labelled_frame(frame_text.as_ref());
+    let usage_labelled =
+        matches!(protocol, PassthroughProtocol::Raw) && is_usage_labelled_frame(frame);
     let mut parts = crate::held_content::Parts::default();
     let mut usage: Option<PassthroughUsage> = None;
     let mut merge = |found: PassthroughUsage| {
@@ -3072,6 +3043,20 @@ mod tests {
         let frames = s.push(b"data: x\r\n\r\nrest");
         assert_eq!(frames.len(), 1);
         assert_eq!(s.take_rest(), b"rest");
+    }
+
+    #[test]
+    fn sse_splitter_and_usage_label_read_cr_framing() {
+        let frame = b"event: token_usage\rdata: {\"input_tokens\":3,\"output_tokens\":4}\r\r";
+        let mut s = SseFrameSplitter::new();
+        assert_eq!(
+            s.push(&[&frame[..], b"data: next"].concat()),
+            vec![frame.to_vec()]
+        );
+        assert_eq!(s.take_rest(), b"data: next");
+        assert!(is_usage_labelled_frame(frame));
+        let (_, usage) = frame_delta(PassthroughProtocol::Raw, frame);
+        assert!(usage.is_some(), "a CR-framed usage report is read");
     }
 
     #[test]

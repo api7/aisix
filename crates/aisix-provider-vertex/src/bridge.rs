@@ -1144,7 +1144,7 @@ impl VertexBridge {
 
             while let Some(item) = byte_stream.next().await {
                 let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-                for event in decoder.feed(bytes.as_ref()) {
+                for event in decoder.feed(bytes.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
                     let SseEvent::Data(data) = event else { continue };
                     let parsed: AnthropicStreamEvent =
                         serde_json::from_str(&data).map_err(|e| {
@@ -1318,7 +1318,7 @@ impl VertexBridge {
 
             while let Some(item) = byte_stream.next().await {
                 let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-                for event in decoder.feed(bytes.as_ref()) {
+                for event in decoder.feed(bytes.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
                     match event {
                         SseEvent::Data(data) => {
                             let parsed = parse_vertex_openai_stream_payload(
@@ -1539,7 +1539,7 @@ impl VertexBridge {
 
             while let Some(item) = byte_stream.next().await {
                 let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-                for event in decoder.feed(bytes.as_ref()) {
+                for event in decoder.feed(bytes.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
                     match event {
                         SseEvent::Data(data) => {
                             let parsed = parse_vertex_openai_stream_payload(
@@ -1666,7 +1666,7 @@ impl VertexBridge {
 
             while let Some(item) = byte_stream.next().await {
                 let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-                for event in decoder.feed(bytes.as_ref()) {
+                for event in decoder.feed(bytes.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
                     if let SseEvent::Data(data) = event {
                         let parsed = parse_vertex_gemini_stream_payload(
                             &data,

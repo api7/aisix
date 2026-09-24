@@ -1439,68 +1439,76 @@ impl SseFrame {
         let Some(data) = self.data.as_ref() else {
             return self.raw.clone();
         };
-        let text = String::from_utf8_lossy(&self.raw);
-        let mut out = String::new();
+        let raw = &self.raw;
+        let mut out = Vec::with_capacity(raw.len());
+        // `raw[cursor..]` has not been copied yet.
+        let mut cursor = 0usize;
         let mut data_written = false;
-        for line in text.split('\n') {
-            if line.starts_with("data:") {
-                if !data_written {
-                    out.push_str("data: ");
-                    out.push_str(&serde_json::to_string(data).unwrap_or_default());
-                    // Keep the line's own ending: the rest of the frame
-                    // passes through verbatim, so dropping the `\r` here
-                    // alone would leave one LF line in a CRLF frame.
-                    if line.ends_with('\r') {
-                        out.push('\r');
-                    }
-                    out.push('\n');
-                    data_written = true;
-                }
-            } else {
-                out.push_str(line);
-                out.push('\n');
+        // Where the previous line's content ended — its terminator follows.
+        let mut prev_end = 0usize;
+        for line in aisix_gateway::sse::lines(raw) {
+            let is_data = aisix_gateway::sse::parse_field(&raw[line.start..line.end])
+                .is_some_and(|(name, _)| name == b"data");
+            if is_data && !data_written {
+                // Keep the line's own terminator: the rest of the frame
+                // passes through verbatim, so a CRLF (or CR) frame stays one.
+                out.extend_from_slice(&raw[cursor..line.start]);
+                out.extend_from_slice(b"data: ");
+                out.extend_from_slice(serde_json::to_string(data).unwrap_or_default().as_bytes());
+                cursor = line.end;
+                data_written = true;
+            } else if is_data {
+                // Drop the line together with the terminator BEFORE it, so
+                // its own terminator ends whatever preceded it — and a
+                // dropped last line leaves no stray line ending ahead of the
+                // separator the caller re-adds.
+                out.extend_from_slice(&raw[cursor..prev_end]);
+                cursor = line.end;
             }
+            prev_end = line.end;
         }
-        // Drop the final artificial newline added by the loop; the caller
-        // re-adds the frame separator.
-        if out.ends_with('\n') {
-            out.pop();
-        }
-        // ...and, on a CRLF frame whose LAST line was a dropped `data:`
-        // line, the CR that line ending left behind. The frame's own
-        // terminator CR was split off with the frame, so anything trailing
-        // here belongs to a line that is no longer followed by one — it
-        // would reach the client as a lone CR before the separator.
-        if out.ends_with('\r') {
-            out.pop();
-        }
-        out.into_bytes()
+        out.extend_from_slice(&raw[cursor..]);
+        out
     }
 }
 
-/// Offset and length of the first frame terminator (a blank line) in `raw`.
+/// Offset and length of the first frame's separator in `raw`: the last
+/// line's terminator plus the blank line after it, as the upstream wrote
+/// them.
 ///
 /// The ONE place this crate decides where an SSE frame ends. Everything
 /// below derives from it, so the frame-based redaction pass and the
 /// line-based scan passes cannot end up with two notions of framing —
 /// which is exactly how an unterminated final frame slipped past one pass
-/// while the other read it (#1091).
-///
-/// It is the relay's own `messages::find_frame_end`, deliberately called
-/// rather than reimplemented: two functions that agree today are how the
-/// disagreement this fixes got in. That one is CRLF-aware, and it has to
-/// be — the scan passes read lines and trim, so a CRLF-framed upstream is
-/// ordinary text to them, while a splitter that knew only `\n\n` would hand
-/// the whole body back as one unframed blob and the redactor would render
-/// it down to its first `data:` line. Same disagreement, second costume.
+/// while the other read it (#1091). It is the gateway's shared splitter,
+/// the same one every streaming relay drains with, so a frame the relay
+/// forwarded is a frame the scans read.
 fn frame_terminator(raw: &[u8]) -> Option<(usize, usize)> {
-    let end = crate::messages::find_frame_end(raw)?;
-    let term: &'static [u8] = if raw[..end].ends_with(b"\r\n\r\n") {
-        b"\r\n\r\n"
-    } else {
-        b"\n\n"
-    };
-    Some((end - term.len(), term.len()))
+    let (content_end, frame_end) = aisix_gateway::sse::split_frame_end(raw)?;
+    Some((content_end, frame_end - content_end))
+}
+
+/// The separator `frame_terminator` found, as a `'static` slice: a frame
+/// keeps the separator its upstream wrote, so a masked CRLF (or CR)
+/// document does not come back LF-framed.
+fn separator(bytes: &[u8]) -> &'static [u8] {
+    const SEPARATORS: [&[u8]; 11] = [
+        b"\n\n",
+        b"\r\n\r\n",
+        b"\r\r",
+        b"\n\r\n",
+        b"\r\n\n",
+        b"\n\r",
+        b"\r\r\n",
+        b"\r\n\r",
+        b"\n",
+        b"\r",
+        b"\r\n",
+    ];
+    SEPARATORS
+        .into_iter()
+        .find(|s| *s == bytes)
+        .unwrap_or(b"\n\n")
 }
 
 /// Byte offset just past the LAST complete frame terminator in `raw`
@@ -1547,22 +1555,7 @@ pub(crate) fn frame_payload(frame_raw: &[u8]) -> Option<String> {
 /// the restamp came to see only the first line of a multi-line frame
 /// (#1105) while every other consumer saw all of it (#1100).
 pub(crate) fn data_line_ranges(frame_raw: &[u8]) -> Vec<Range<usize>> {
-    let mut out = Vec::new();
-    let mut offset = 0usize;
-    for line in frame_raw.split(|&b| b == b'\n') {
-        let start = offset;
-        offset += line.len() + 1; // the split consumed one `\n`
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let Some(after_colon) = line.strip_prefix(b"data:") else {
-            continue;
-        };
-        let mut from = start + b"data:".len();
-        if after_colon.first() == Some(&b' ') {
-            from += 1;
-        }
-        out.push(from..start + line.len());
-    }
-    out
+    aisix_gateway::sse::data_ranges(frame_raw)
 }
 
 /// The `data:` payload of every frame in a buffered SSE body, in order,
@@ -1610,7 +1603,7 @@ fn split_sse_frames(raw: &[u8]) -> (Vec<SseFrame>, &[u8]) {
             raw: frame_raw.to_vec(),
             data: frame_payload(frame_raw)
                 .and_then(|l| serde_json::from_str::<Value>(l.trim()).ok()),
-            term: if len == 4 { b"\r\n\r\n" } else { b"\n\n" },
+            term: separator(&rest[pos..pos + len]),
             dirty: false,
         });
         rest = &rest[pos + len..];
@@ -1722,10 +1715,17 @@ pub fn seal_buffered_sse(buf: &mut Vec<u8>) -> BufferedSseSeal {
 /// Pads by what is MISSING, not a fixed `\n\n`: a fragment that already
 /// ends in half its terminator needs only the other half, and a full pad
 /// would leave a stray blank line in the released bytes. The upstream's own
-/// line ending is matched, so a CRLF stream stays a CRLF stream.
+/// line ending is matched, so a CRLF (or CR) stream stays one.
 fn seal_sse_tail(buf: &mut Vec<u8>) -> SseTailSeal {
     let end = last_frame_end(buf);
     if end == buf.len() {
+        // A CRLF stream cut between the `\r` and the `\n` of its last blank
+        // line: that `\r` already ends the frame, but a client that frames on
+        // `\r\n\r\n` alone would never see it end.
+        if buf.ends_with(b"\r\n\r") {
+            buf.push(b'\n');
+            return SseTailSeal::Completed { padded: 1 };
+        }
         return SseTailSeal::Terminated;
     }
     // An empty payload and the `[DONE]` sentinel carry no text (the scan
@@ -1745,16 +1745,19 @@ fn seal_sse_tail(buf: &mut Vec<u8>) -> SseTailSeal {
     // says nothing, so the frames before it are the only evidence.
     let frag = &buf[end..];
     let crlf_stream = buf[..end].ends_with(b"\r\n\r\n");
-    let pad: &[u8] = if frag.ends_with(b"\r\n\r") {
-        b"\n"
-    } else if frag.ends_with(b"\r\n") {
+    let cr_stream = buf[..end].ends_with(b"\r\r");
+    let pad: &[u8] = if frag.ends_with(b"\r\n") {
         b"\r\n"
     } else if frag.ends_with(b"\r") && crlf_stream {
         b"\n\r\n"
+    } else if frag.ends_with(b"\r") {
+        b"\r"
     } else if frag.ends_with(b"\n") {
         b"\n"
     } else if crlf_stream {
         b"\r\n\r\n"
+    } else if cr_stream {
+        b"\r\r"
     } else {
         b"\n\n"
     };
@@ -3806,6 +3809,65 @@ mod tests {
         // ends at `}`, not at a stray CR.
         assert!(out.ends_with("}\r\n\r\n"), "stray CR: {out:?}");
         assert!(!out.contains("\r\r"), "stray CR: {out:?}");
+    }
+
+    /// The event-stream spec lets a line end in a bare `\r` too. A body
+    /// framed that way is framed, scanned and masked like any other, and
+    /// comes back framed the way it arrived.
+    #[test]
+    fn a_cr_framed_body_is_read_masked_and_left_cr_framed() {
+        let chain = both();
+        let raw = concat!(
+            "event: response.output_text.delta\rdata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"mail a@x.com\"}\r\r",
+            "event: response.completed\rdata: {\"type\":\"response.completed\",\"response\":{}}\r\r",
+        )
+        .as_bytes()
+        .to_vec();
+        assert_eq!(sse_frame_payloads(&raw).len(), 2);
+        let mut sealed = raw.clone();
+        assert_eq!(seal_buffered_sse(&mut sealed).tail, SseTailSeal::Terminated);
+        assert_eq!(sealed, raw);
+        let (out, counts) = redact_responses_sse(chain.as_ref(), &sealed).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "out: {out:?}");
+        assert_eq!(counts.get("email"), Some(&1));
+        assert!(!out.contains('\n'), "re-framed with LF: {out:?}");
+        assert_eq!(out.matches("\r\r").count(), 2, "out: {out:?}");
+    }
+
+    #[test]
+    fn a_masked_cr_frame_spanning_several_data_lines_keeps_one_line_and_its_framing() {
+        let chain = both();
+        let raw = concat!(
+            "event: content_block_delta\rdata: {\"type\":\"content_block_delta\",\"index\":0,\r",
+            "data: \"delta\":{\"type\":\"text_delta\",\"text\":\"mail a@x.com\"}}\r\r",
+        );
+        let (out, _) = redact_anthropic_sse(chain.as_ref(), raw.as_bytes())
+            .expect("the whole payload must reach the redactor");
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "left unmasked: {out:?}");
+        assert!(
+            out.starts_with("event: content_block_delta\rdata: {"),
+            "out: {out:?}"
+        );
+        assert_eq!(out.matches("data:").count(), 1, "out: {out:?}");
+        assert!(out.ends_with("}\r\r"), "out: {out:?}");
+    }
+
+    #[test]
+    fn seal_pads_a_cr_stream_with_cr() {
+        let mut raw = b"data: {\"a\":1}\r\rdata: {\"b\":2}".to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut raw).tail,
+            SseTailSeal::Completed { padded: 2 }
+        );
+        assert_eq!(raw, b"data: {\"a\":1}\r\rdata: {\"b\":2}\r\r");
+        let mut raw = b"data: {\"a\":1}\r".to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut raw).tail,
+            SseTailSeal::Completed { padded: 1 }
+        );
+        assert_eq!(raw, b"data: {\"a\":1}\r\r");
     }
 
     #[test]

@@ -881,7 +881,7 @@ where
             };
             let Some(next) = next else { break 'outer; };
             let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-            for event in decoder.feed(chunk.as_ref()) {
+            for event in decoder.feed(chunk.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
                 match event {
                     SseEvent::Done => {
                         done_marker_seen = true;

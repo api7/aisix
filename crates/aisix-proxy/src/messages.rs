@@ -3730,7 +3730,7 @@ fn update_anthropic_usage(
 
 /// Drain every complete SSE frame from `buf`, updating `acc` and
 /// appending the frame to `out` with the client-facing `model` restamped
-/// onto `message_start`. A frame ends at the first blank line (`\n\n`);
+/// onto `message_start`. A frame ends at the first blank line;
 /// incomplete trailing bytes are left in `buf` for the next chunk. The
 /// `data:` payload is parsed as JSON for the usage side; non-JSON or
 /// non-`data` frames are skipped there and forwarded untouched.
@@ -3749,9 +3749,7 @@ fn drain_anthropic_sse_frames(
     client_facing_model: &str,
     out: &mut Vec<u8>,
 ) {
-    // SSE event delimiter is a blank line. Anthropic emits `\n\n`;
-    // tolerate `\r\n\r\n` defensively by normalising the search.
-    while let Some(end) = find_frame_end(buf) {
+    while let Some(end) = aisix_gateway::sse::find_frame_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
         // The frame's WHOLE payload, not just its first `data:` line: this
         // is what feeds `response_text`, the text the end-of-stream output
@@ -3771,29 +3769,6 @@ fn drain_anthropic_sse_frames(
             None => out.extend_from_slice(&frame),
         }
     }
-}
-
-/// Find the byte index just past the first SSE frame terminator
-/// (`\n\n` or `\r\n\r\n`). Returns the number of bytes to drain
-/// (frame + terminator), or `None` if no complete frame is buffered.
-/// Shared with the `/v1/responses` streaming usage parser (#808).
-pub(crate) fn find_frame_end(buf: &[u8]) -> Option<usize> {
-    let mut i = 0;
-    while i + 1 < buf.len() {
-        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
-            return Some(i + 2);
-        }
-        if i + 3 < buf.len()
-            && buf[i] == b'\r'
-            && buf[i + 1] == b'\n'
-            && buf[i + 2] == b'\r'
-            && buf[i + 3] == b'\n'
-        {
-            return Some(i + 4);
-        }
-        i += 1;
-    }
-    None
 }
 
 /// Drop guard that fires `on_complete` exactly once with the
@@ -6065,6 +6040,37 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
                 String::from_utf8_lossy(frame),
             );
         }
+    }
+
+    /// A bare `\r` ends a line too. A CR-framed upstream is framed as it
+    /// arrives, read for usage, and restamped, and its bytes reach the
+    /// client in their own framing.
+    #[test]
+    fn sse_frame_parser_reads_a_cr_framed_stream() {
+        use super::{drain_anthropic_sse_frames, AnthropicStreamUsage};
+
+        let mut acc = AnthropicStreamUsage::default();
+        let mut first_token_seen = false;
+        let mut buf: Vec<u8> = b"event: message_start\rdata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":11}}}\r\r\
+event: message_delta\rdata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":23}}\r\r".to_vec();
+        let mut out: Vec<u8> = Vec::new();
+        drain_anthropic_sse_frames(
+            &mut buf,
+            &mut acc,
+            std::time::Instant::now(),
+            &mut first_token_seen,
+            "gw-alias",
+            &mut out,
+        );
+        assert!(buf.is_empty(), "both frames drained: {buf:?}");
+        assert_eq!(acc.prompt_tokens, 11);
+        assert_eq!(acc.completion_tokens, 23);
+        let emitted = String::from_utf8(out).unwrap();
+        assert!(
+            emitted.contains("\"model\":\"gw-alias\"") && !emitted.contains("claude-x"),
+            "{emitted:?}"
+        );
+        assert!(!emitted.contains('\n'), "{emitted:?}");
     }
 
     /// Issue #245: the SSE frame parser must reassemble events that

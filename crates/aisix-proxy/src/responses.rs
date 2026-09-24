@@ -2905,7 +2905,7 @@ fn parse_responses_terminal_usage(json: &Value) -> Option<ResponseUsage> {
 /// do not stop the TTFT clock.
 fn has_complete_responses_sse_event(bytes: &[u8]) -> bool {
     let mut offset = 0;
-    while let Some(end) = crate::messages::find_frame_end(&bytes[offset..]) {
+    while let Some(end) = aisix_gateway::sse::find_frame_end(&bytes[offset..]) {
         let frame = &bytes[offset..offset + end];
         // Whole payload, not the first `data:` line (#1100). Only COMPLETE
         // frames count, so this walks them rather than taking the whole
@@ -3003,7 +3003,7 @@ fn drain_responses_sse_frames(
     client_facing_model: &str,
     out: &mut Vec<u8>,
 ) {
-    while let Some(end) = crate::messages::find_frame_end(buf) {
+    while let Some(end) = aisix_gateway::sse::find_frame_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
         match crate::model_echo::restamp_sse_frame(
             &frame,

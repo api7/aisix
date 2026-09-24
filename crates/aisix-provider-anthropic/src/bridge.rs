@@ -499,7 +499,7 @@ where
 
         while let Some(next) = stream.next().await {
             let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-            for event in decoder.feed(chunk.as_ref()) {
+            for event in decoder.feed(chunk.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
                 let SseEvent::Data(payload) = event else { continue };
                 let parsed: AnthropicStreamEvent = serde_json::from_str(&payload)
                     .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;

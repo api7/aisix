@@ -51,7 +51,7 @@ pub use chat::{
 };
 pub use credential::credential_fingerprint;
 pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};
-pub use sse::{SseDecoder, SseEvent};
+pub use sse::{SseDecoder, SseEvent, SseFrameTooLarge};
 pub use structured_output::{
     apply_schema_limits, close_object_schemas, json_schema_from_response_format,
     response_into_fake_stream_chunks, seal_object_schemas, unwrap_json_tool_call, SchemaLimits,

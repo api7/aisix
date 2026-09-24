@@ -166,7 +166,7 @@ pub(crate) fn restamp_sse_buffer(
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(buf.len());
     let mut rest = buf;
-    while let Some(end) = crate::messages::find_frame_end(rest) {
+    while let Some(end) = aisix_gateway::sse::find_frame_end(rest) {
         let (frame, tail) = rest.split_at(end);
         match restamp_sse_frame(frame, client_facing_model, selects_model) {
             Some(rewritten) => out.extend_from_slice(&rewritten),
@@ -522,5 +522,17 @@ mod tests {
         assert!(restamp_sse_frame(nested, "gpt4o-mini", responses_snapshot_model).is_none());
         let deep = b"data: {\"type\":\"response.completed\",\"response\":{\"tools\":[{\"model\":\"aux\"}]}}\n\n";
         assert!(restamp_sse_frame(deep, "gpt4o-mini", responses_snapshot_model).is_none());
+    }
+
+    /// A bare `\r` ends a line too: a CR-framed document is framed and
+    /// restamped, and its bytes around the spliced value survive.
+    #[test]
+    fn restamp_sse_buffer_reads_a_cr_framed_document() {
+        let buf = b"event: response.created\rdata: {\"type\":\"response.created\",\"response\":{\"model\":\"up-1\"}}\r\rdata: [DONE]\r\r";
+        let out = restamp_sse_buffer(buf, "alias", responses_snapshot_model);
+        assert_eq!(
+            out,
+            b"event: response.created\rdata: {\"type\":\"response.created\",\"response\":{\"model\":\"alias\"}}\r\rdata: [DONE]\r\r"
+        );
     }
 }
