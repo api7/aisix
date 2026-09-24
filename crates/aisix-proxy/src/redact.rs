@@ -245,9 +245,15 @@ impl Guardrail for SegmentApplier {
 /// Masked replacements are written back through `walk`; the provider's
 /// entity counts merge into `counts_out` (they feed
 /// `redacted_entity_counts`, names only — #932 no-leak).
+///
+/// `model` is the model the request addressed, exactly as the check pass
+/// saw it in `ChatFormat::model`, so a segment member that exposes it (a
+/// `custom` script's `ctx.model`) reads the same value on either pass.
+/// Input only: the output hook passes `None`.
 pub async fn moderate_body(
     chain: &dyn Guardrail,
     dir: Direction,
+    model: Option<&str>,
     non_segment_verdict: aisix_guardrails::GuardrailVerdict,
     counts_out: &mut RedactionCounts,
     monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
@@ -256,6 +262,7 @@ pub async fn moderate_body(
     moderate_body_scanning(
         chain,
         dir,
+        model,
         non_segment_verdict,
         counts_out,
         monitor_hits_out,
@@ -281,9 +288,11 @@ pub async fn moderate_body(
 /// `/v1/messages`: they answer `Allow` from `check_input_non_segment` by
 /// design and take their real verdict from this pass, so a block policy on
 /// any of them was bypassable by moving the text into a thinking block.
+#[allow(clippy::too_many_arguments)]
 pub async fn moderate_body_scanning(
     chain: &dyn Guardrail,
     dir: Direction,
+    model: Option<&str>,
     non_segment_verdict: aisix_guardrails::GuardrailVerdict,
     counts_out: &mut RedactionCounts,
     monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
@@ -314,7 +323,7 @@ pub async fn moderate_body_scanning(
     let mut outcome = match dir {
         Direction::Input | Direction::InputHistory => {
             chain
-                .moderate_input_segments_in_turn(&texts, &in_latest_turn)
+                .moderate_input_segments_in_turn(&texts, &in_latest_turn, model)
                 .await
         }
         Direction::Output => chain.moderate_output_segments(&texts).await,
@@ -2418,6 +2427,7 @@ mod tests {
         let verdict = moderate_body_scanning(
             chain.as_ref(),
             Direction::Input,
+            None,
             GuardrailVerdict::Allow,
             &mut counts,
             &mut hits,
@@ -2481,6 +2491,7 @@ mod tests {
         moderate_body_scanning(
             chain.as_ref(),
             Direction::Input,
+            None,
             GuardrailVerdict::Allow,
             &mut counts,
             &mut hits,
@@ -3626,6 +3637,7 @@ mod tests {
         let verdict = moderate_body(
             &chain,
             Direction::Input,
+            None,
             GuardrailVerdict::Allow,
             &mut counts,
             &mut Vec::new(),
@@ -3676,6 +3688,7 @@ mod tests {
         let verdict = moderate_body(
             &chain,
             Direction::Input,
+            None,
             GuardrailVerdict::Allow,
             &mut counts,
             &mut Vec::new(),
@@ -3706,6 +3719,7 @@ mod tests {
         let verdict = moderate_body(
             &chain,
             Direction::Input,
+            None,
             GuardrailVerdict::block("already blocked"),
             &mut counts,
             &mut Vec::new(),
@@ -3719,6 +3733,7 @@ mod tests {
         let verdict = moderate_body(
             sync_only.as_ref(),
             Direction::Input,
+            None,
             GuardrailVerdict::Allow,
             &mut counts,
             &mut Vec::new(),
@@ -3747,6 +3762,7 @@ mod tests {
         let verdict = moderate_body(
             &chain,
             Direction::Output,
+            None,
             GuardrailVerdict::Allow,
             &mut counts,
             &mut Vec::new(),

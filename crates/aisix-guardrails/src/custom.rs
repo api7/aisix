@@ -707,10 +707,18 @@ impl Guardrail for CustomGuardrail {
     }
 
     async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+        self.moderate_input_segments_for_model(texts, None).await
+    }
+
+    async fn moderate_input_segments_for_model(
+        &self,
+        texts: &[String],
+        model: Option<&str>,
+    ) -> SegmentsOutcome {
         if !self.hook_enabled(GuardrailHookPoint::Input) {
             return SegmentsOutcome::allow();
         }
-        self.run_segment_hook("checkInput", texts, "input", None, self.fail_open)
+        self.run_segment_hook("checkInput", texts, "input", model, self.fail_open)
             .await
     }
 
@@ -1389,6 +1397,32 @@ mod tests {
             matches!(outcome.verdict, GuardrailVerdict::Block { .. }),
             "{:?}",
             outcome.verdict,
+        );
+    }
+
+    /// `ctx.model` means the same thing on both input passes: the model the
+    /// request addressed. The segment pass is the only one the chat,
+    /// responses and messages endpoints run a script through.
+    #[tokio::test]
+    async fn both_input_passes_expose_the_addressed_model() {
+        let cfg = config(
+            "export function checkInput(ctx) {
+               return ctx.model === 'gpt-4o' ? { action: 'block' } : { action: 'none' };
+             }",
+        );
+        let g = guardrail(&cfg, false);
+        let checked = g.check_input(&request("hi")).await;
+        assert!(
+            matches!(checked, GuardrailVerdict::Block { .. }),
+            "{checked:?}"
+        );
+        let segmented = g
+            .moderate_input_segments_for_model(&["hi".to_owned()], Some("gpt-4o"))
+            .await;
+        assert!(
+            matches!(segmented.verdict, GuardrailVerdict::Block { .. }),
+            "{:?}",
+            segmented.verdict,
         );
     }
 

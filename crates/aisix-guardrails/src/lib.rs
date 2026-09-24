@@ -903,6 +903,19 @@ pub trait Guardrail: Send + Sync + 'static {
         SegmentsOutcome::allow()
     }
 
+    /// [`Self::moderate_input_segments`] told which model the request
+    /// addressed — the name the caller put in the request, the same value
+    /// the check pass sees as `ChatFormat::model`. Only a kind that exposes
+    /// the model to its policy (`custom`, as `ctx.model`) overrides it.
+    async fn moderate_input_segments_for_model(
+        &self,
+        texts: &[String],
+        model: Option<&str>,
+    ) -> SegmentsOutcome {
+        let _ = model;
+        self.moderate_input_segments(texts).await
+    }
+
     /// Moderate the response's text segments in one remote call.
     async fn moderate_output_segments(&self, _texts: &[String]) -> SegmentsOutcome {
         SegmentsOutcome::allow()
@@ -920,9 +933,10 @@ pub trait Guardrail: Send + Sync + 'static {
         &self,
         texts: &[String],
         in_latest_turn: &[bool],
+        model: Option<&str>,
     ) -> SegmentsOutcome {
         let _ = in_latest_turn;
-        self.moderate_input_segments(texts).await
+        self.moderate_input_segments_for_model(texts, model).await
     }
 
     /// `check_input` minus segment-moderating members — used by call

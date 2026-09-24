@@ -893,13 +893,22 @@ impl Guardrail for GuardrailChain {
     /// member moderates the previous member's masked output, mirroring
     /// `fold_redactions`; the first Bypass reason sticks. Counts merge.
     async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
-        fold_segments(&self.members, self.recorders(), texts, true, None).await
+        fold_segments(&self.members, self.recorders(), texts, true, None, None).await
+    }
+
+    async fn moderate_input_segments_for_model(
+        &self,
+        texts: &[String],
+        model: Option<&str>,
+    ) -> SegmentsOutcome {
+        fold_segments(&self.members, self.recorders(), texts, true, None, model).await
     }
 
     async fn moderate_input_segments_in_turn(
         &self,
         texts: &[String],
         in_latest_turn: &[bool],
+        model: Option<&str>,
     ) -> SegmentsOutcome {
         fold_segments(
             &self.members,
@@ -907,12 +916,13 @@ impl Guardrail for GuardrailChain {
             texts,
             true,
             Some(in_latest_turn),
+            model,
         )
         .await
     }
 
     async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
-        fold_segments(&self.members, self.recorders(), texts, false, None).await
+        fold_segments(&self.members, self.recorders(), texts, false, None, None).await
     }
 
     /// The check fold minus segment-moderating members — the pass those
@@ -1052,6 +1062,7 @@ async fn fold_segments(
     texts: &[String],
     input: bool,
     in_latest_turn: Option<&[bool]>,
+    model: Option<&str>,
 ) -> SegmentsOutcome {
     let phase = if input { "input" } else { "output" };
     let mut masked: Option<Vec<String>> = None;
@@ -1083,7 +1094,9 @@ async fn fold_segments(
         let src: &[String] = narrowed.as_deref().unwrap_or(full);
         let started = Instant::now();
         let mut outcome = if input {
-            m.guardrail.moderate_input_segments(src).await
+            m.guardrail
+                .moderate_input_segments_for_model(src, model)
+                .await
         } else {
             m.guardrail.moderate_output_segments(src).await
         };
@@ -2152,7 +2165,7 @@ mod tests {
         );
         let texts = vec!["history".to_owned(), "current".to_owned()];
         let out = chain
-            .moderate_input_segments_in_turn(&texts, &[false, true])
+            .moderate_input_segments_in_turn(&texts, &[false, true], None)
             .await;
         assert_eq!(
             out.masked.expect("mask applied"),
@@ -2205,7 +2218,7 @@ mod tests {
         );
         let texts = vec!["history".to_owned(), "current".to_owned()];
         let out = chain
-            .moderate_input_segments_in_turn(&texts, &[false, true])
+            .moderate_input_segments_in_turn(&texts, &[false, true], None)
             .await;
         assert_eq!(
             out.masked.expect("mask applied"),
@@ -2230,7 +2243,7 @@ mod tests {
         );
         let texts = vec!["history".to_owned(), "current".to_owned()];
         let out = chain
-            .moderate_input_segments_in_turn(&texts, &[false, true])
+            .moderate_input_segments_in_turn(&texts, &[false, true], None)
             .await;
         assert_eq!(
             out.masked.expect("mask applied"),

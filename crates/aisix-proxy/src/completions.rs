@@ -387,6 +387,7 @@ async fn dispatch(
         let verdict = crate::redact::moderate_body(
             &resolved_chain,
             crate::redact::Direction::Input,
+            Some(model_name),
             verdict,
             &mut input_seg_counts,
             &mut monitor_hits,
@@ -558,6 +559,7 @@ async fn dispatch(
                 let verdict = crate::redact::moderate_body(
                     &resolved_chain,
                     crate::redact::Direction::Output,
+                    None,
                     verdict,
                     &mut redactions,
                     &mut monitor_hits,

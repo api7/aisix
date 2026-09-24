@@ -2713,6 +2713,7 @@ pub fn build_responses_bridge_stream(
             let verdict = crate::redact::moderate_body(
                 chain.as_ref(),
                 crate::redact::Direction::Output,
+                None,
                 verdict,
                 &mut seg_counts,
                 &mut seg_hits,
