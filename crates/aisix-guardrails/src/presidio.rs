@@ -242,7 +242,7 @@ impl PresidioGuardrail {
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
-                url = %url,
+                url = %aisix_core::redact_url_userinfo(url),
                 response_body = %response_body,
                 "presidio returned 4xx — check analyzer_url/anonymizer_url, language, and entities configuration",
             );

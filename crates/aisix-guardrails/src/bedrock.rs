@@ -143,7 +143,7 @@ impl BedrockGuardrail {
             // env. Prints once per BedrockGuardrail materialised from
             // the snapshot, which is rare (snapshot rebuild only).
             tracing::info!(
-                endpoint = %url,
+                endpoint = %aisix_core::redact_url_userinfo(url),
                 guardrail_id = %cfg.guardrail_id,
                 "BedrockGuardrail using endpoint URL override (Config.bedrock_endpoint_url)",
             );

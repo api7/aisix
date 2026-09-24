@@ -470,7 +470,7 @@ fn normalise_cp_base_url(raw: &str) -> Result<String, BootstrapError> {
         // every rejection branch at once. A value without credentials is
         // still quoted byte for byte: the operator has to see what they
         // wrote to fix it.
-        let redacted = redact_userinfo(&qualified);
+        let redacted = crate::redact_url_userinfo(&qualified).into_owned();
         let shown = if redacted == qualified {
             raw.to_string()
         } else {
@@ -487,27 +487,6 @@ fn normalise_cp_base_url(raw: &str) -> Result<String, BootstrapError> {
     // from the same input. Trailing slash, path, query and case stay as
     // typed; the call sites own their own trailing-slash handling.
     Ok(qualified)
-}
-
-/// Replace the userinfo in `value` with `***`, keeping the scheme, the
-/// host and everything after the authority. A value with no scheme is
-/// treated as a bare authority, which is the shape `cp_etcd_endpoint`
-/// arrives in.
-///
-/// Used only by the two userinfo rejections, so the operator is told
-/// which host they pointed at without the rejection logging the
-/// credential it is rejecting them for.
-fn redact_userinfo(value: &str) -> String {
-    let (prefix, rest) = match value.split_once("://") {
-        Some((scheme, rest)) => (format!("{scheme}://"), rest),
-        None => (String::new(), value),
-    };
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(authority_end);
-    match authority.rfind('@') {
-        Some(at) => format!("{prefix}***{}{tail}", &authority[at..]),
-        None => value.to_string(),
-    }
 }
 
 /// Environment variable that sets `managed.cp_etcd_endpoint`.
@@ -556,7 +535,7 @@ fn normalise_cp_etcd_endpoint(raw: &str) -> Result<String, BootstrapError> {
         // carried credentials must not have them read back into the
         // startup log, in any rejection branch. Everything without
         // credentials is still quoted byte for byte.
-        let redacted = redact_userinfo(trimmed);
+        let redacted = crate::redact_url_userinfo(trimmed).into_owned();
         let shown = if redacted == trimmed {
             raw.to_string()
         } else {
