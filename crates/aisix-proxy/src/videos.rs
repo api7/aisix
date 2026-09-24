@@ -2021,6 +2021,17 @@ fn resolve_get_target(
     }
 }
 
+/// Whether `group` names a Model Group with `target` among its targets.
+fn group_routes_to(snapshot: &aisix_core::AisixSnapshot, group: &str, target: &str) -> bool {
+    snapshot.models.get_by_name(group).is_some_and(|entry| {
+        entry
+            .value
+            .routing
+            .as_ref()
+            .is_some_and(|r| r.targets.iter().any(|t| t.model_ref(snapshot) == target))
+    })
+}
+
 pub async fn get_video(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
@@ -2056,9 +2067,13 @@ pub async fn get_video(
         // CLIENT-SUPPLIED id, so echo it only when this row would actually
         // serve it: a forged id, or one left behind by a row renamed since
         // submit, falls back to the row's own name rather than being handed
-        // back as though the gateway had attested it.
+        // back as though the gateway had attested it. A task submitted
+        // through a Model Group is held by one of its targets, and the name
+        // the caller submitted under is the group's.
         let echoed =
-            if crate::model_resolve::row_serves_name(&target.model_entry.value, &requested_alias) {
+            if crate::model_resolve::row_serves_name(&target.model_entry.value, &requested_alias)
+                || group_routes_to(&snapshot, &requested_alias, target.display_name())
+            {
                 requested_alias.as_str()
             } else {
                 target.display_name()

@@ -441,6 +441,17 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
       expect(field(line, "served_by_model"), line).toBe(`${group}-ok`);
       expect(field(line, "routing_attempt_count"), line).toBe("2");
       expect(field(line, "routing_fallback_count"), line).toBe("1");
+
+      // A video task is polled back under the group name it was submitted
+      // under, not the name of the target that holds it.
+      if (upstreamPath === "/v1/videos") {
+        const submitted = JSON.parse(text) as { id: string; model: string };
+        expect(submitted.model).toBe(group);
+        const poll = await fetch(`${app.proxyUrl}/v1/videos/${submitted.id}`, { headers: auth });
+        const polled = await poll.text();
+        expect(poll.status, polled).toBe(200);
+        expect((JSON.parse(polled) as { model: string }).model).toBe(group);
+      }
     },
   );
 
