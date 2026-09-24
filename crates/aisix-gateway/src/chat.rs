@@ -432,13 +432,26 @@ fn is_zero(n: &u32) -> bool {
 /// The completion count a UsageEvent records: the upstream's own, before
 /// the gateway folded its separately-reported reasoning in.
 ///
+/// Only when the record also carries the upstream's total. The total is
+/// how cp-api tells reasoning counted BESIDE the completion from reasoning
+/// counted inside it; without one it reads reasoning as a subset, so an
+/// unfolded completion would bill the candidates as nothing. With no total
+/// the record keeps the folded count, which that reading bills correctly.
+///
 /// Takes the completion the caller is about to record rather than reading
 /// `UsageStats`, because that value may have been estimated (#1074) or
 /// zeroed (#419) since the upstream reported it. Both only ever touch a
 /// count that is `0` or zero it outright, and the folded amount never
 /// exceeds the folded completion, so subtracting with saturation is exact
 /// in every case.
-pub fn recorded_completion_tokens(completion_tokens: u32, reasoning_folded: u32) -> u32 {
+pub fn recorded_completion_tokens(
+    completion_tokens: u32,
+    reasoning_folded: u32,
+    upstream_total_tokens: u32,
+) -> u32 {
+    if upstream_total_tokens == 0 {
+        return completion_tokens;
+    }
     completion_tokens.saturating_sub(reasoning_folded)
 }
 
@@ -1287,10 +1300,13 @@ mod tests {
 
     #[test]
     fn recorded_completion_removes_only_the_folded_reasoning() {
-        assert_eq!(recorded_completion_tokens(50, 30), 20);
-        assert_eq!(recorded_completion_tokens(50, 0), 50);
+        assert_eq!(recorded_completion_tokens(50, 30, 150), 20);
+        assert_eq!(recorded_completion_tokens(50, 0, 150), 50);
         // #419 zeroes the completion of a stream nobody received.
-        assert_eq!(recorded_completion_tokens(0, 30), 0);
+        assert_eq!(recorded_completion_tokens(0, 30, 150), 0);
+        // Without the upstream's total nothing marks the reasoning as
+        // beside the completion, so the folded count stands.
+        assert_eq!(recorded_completion_tokens(50, 30, 0), 50);
     }
 
     /// PR #442 audit MEDIUM-4 (forward-compat): an *old-shape*

@@ -4934,6 +4934,7 @@ fn emit_usage_event(
         completion_tokens: aisix_gateway::chat::recorded_completion_tokens(
             completion_tokens,
             extras.reasoning_folded_into_completion,
+            extras.upstream_total_tokens,
         ),
         total_tokens: extras.upstream_total_tokens,
         cached_prompt_tokens: extras.cached_prompt_tokens,
@@ -5522,6 +5523,9 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
             if delivered == 0 {
                 c.completion_tokens = 0;
                 c.reasoning_tokens = 0;
+                // The upstream's total describes counters no longer being
+                // recorded.
+                c.upstream_total_tokens = None;
                 c.cache_creation_tokens = 0;
                 c.cache_read_tokens = 0;
                 c.total_tokens = c.prompt_tokens as u64;

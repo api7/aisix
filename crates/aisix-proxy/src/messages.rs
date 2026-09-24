@@ -3279,6 +3279,7 @@ fn emit_anthropic_usage_event(
         completion_tokens: aisix_gateway::chat::recorded_completion_tokens(
             metrics.completion_tokens,
             metrics.reasoning_folded_into_completion,
+            metrics.upstream_total_tokens,
         ),
         reasoning_tokens: metrics.reasoning_tokens,
         total_tokens: metrics.upstream_total_tokens,

@@ -56,7 +56,14 @@ const GEMINI_MODEL = "raw-usage-gemini";
 const GEMINI_STREAM_MODEL = "raw-usage-gemini-stream";
 const OPENAI_MODEL = "raw-usage-openai";
 const OPENAI_NO_TOTAL_MODEL = "raw-usage-openai-no-total";
-const ALL_MODELS = [GEMINI_MODEL, GEMINI_STREAM_MODEL, OPENAI_MODEL, OPENAI_NO_TOTAL_MODEL];
+const GEMINI_NO_TOTAL_MODEL = "raw-usage-gemini-no-total";
+const ALL_MODELS = [
+  GEMINI_MODEL,
+  GEMINI_STREAM_MODEL,
+  OPENAI_MODEL,
+  OPENAI_NO_TOTAL_MODEL,
+  GEMINI_NO_TOTAL_MODEL,
+];
 
 const GEMINI_BODY = {
   candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }],
@@ -67,6 +74,17 @@ const GEMINI_BODY = {
     totalTokenCount: TOTAL,
   },
   modelVersion: "gemini-2.5-flash",
+};
+
+// The same call from an upstream that omits `totalTokenCount`: nothing
+// says the thoughts sit beside the candidates.
+const GEMINI_NO_TOTAL_BODY = {
+  ...GEMINI_BODY,
+  usageMetadata: {
+    promptTokenCount: PROMPT,
+    candidatesTokenCount: CANDIDATES,
+    thoughtsTokenCount: THOUGHTS,
+  },
 };
 
 // Gemini stamps cumulative usage on every streamed frame.
@@ -205,7 +223,8 @@ describe("the usage record carries upstream usage as reported", () => {
     const geminiStream = await startOpenAiUpstream({ rawStreamFrames: GEMINI_STREAM_FRAMES });
     const openai = await startOpenAiUpstream({ nonStreamBody: openAiChatBody(true) });
     const openaiNoTotal = await startOpenAiUpstream({ nonStreamBody: openAiChatBody(false) });
-    upstreams.push(gemini, geminiStream, openai, openaiNoTotal);
+    const geminiNoTotal = await startOpenAiUpstream({ nonStreamBody: GEMINI_NO_TOTAL_BODY });
+    upstreams.push(gemini, geminiStream, openai, openaiNoTotal, geminiNoTotal);
 
     app = await spawnApp({
       extraEnv: {
@@ -227,6 +246,7 @@ describe("the usage record carries upstream usage as reported", () => {
     for (const [model, upstream] of [
       [GEMINI_MODEL, gemini],
       [GEMINI_STREAM_MODEL, geminiStream],
+      [GEMINI_NO_TOTAL_MODEL, geminiNoTotal],
     ] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${model}-pk`,
@@ -365,6 +385,23 @@ describe("the usage record carries upstream usage as reported", () => {
     expect(usage.output_tokens).toBe(CANDIDATES + THOUGHTS);
 
     await expectRawGeminiRecord(res.requestId);
+  });
+
+  test("Gemini without a total: the record keeps the folded completion and names no total", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const res = await call("/v1/chat/completions", {
+      model: GEMINI_NO_TOTAL_MODEL,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(res.status, res.text).toBe(200);
+    expect(JSON.parse(res.text).usage.completion_tokens).toBe(CANDIDATES + THOUGHTS);
+    // Without the upstream's total the reasoning reads as a subset of the
+    // completion, so an unfolded completion would bill the candidates as
+    // nothing.
+    const log = await recorded(res.requestId);
+    expect(log.get("completion_tokens")).toBe(String(CANDIDATES + THOUGHTS));
+    expect(log.get("reasoning_tokens")).toBe(String(THOUGHTS));
+    expect(log.has("total_tokens")).toBe(false);
   });
 
   test("an OpenAI-compatible upstream's total is recorded verbatim", async (ctx) => {

@@ -3622,6 +3622,7 @@ fn emit_usage_event(
         completion_tokens: aisix_gateway::chat::recorded_completion_tokens(
             usage.completion_tokens,
             usage.reasoning_folded_into_completion,
+            usage.upstream_total_tokens,
         ),
         total_tokens: usage.upstream_total_tokens,
         cached_prompt_tokens: usage.cached_prompt_tokens,
