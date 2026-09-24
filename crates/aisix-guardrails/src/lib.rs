@@ -758,6 +758,15 @@ pub trait Guardrail: Send + Sync + 'static {
         }
     }
 
+    /// Record that a held-back stream outgrew the effective
+    /// [`StreamOutputPolicy::BufferFull`] cap under a fail-closed policy and
+    /// was refused (#1029). The refusal happens in the proxy's relay loop,
+    /// where no member returns a verdict, so without this the usage event
+    /// says a guardrail blocked and names none. Only [`GuardrailChain`]
+    /// knows which row set the cap and holds the request's audit log, so
+    /// the default is a no-op.
+    fn record_output_buffer_exceeded(&self) {}
+
     /// Whether this guardrail actually inspects the OUTPUT hook. Drives
     /// whether its `stream_output_policy` participates in the streamed-output
     /// hold-back fold (#466): an input-only guardrail must NOT force output

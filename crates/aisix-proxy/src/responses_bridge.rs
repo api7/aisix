@@ -2641,6 +2641,7 @@ pub fn build_responses_bridge_stream(
                 "streaming /v1/responses (cross-provider) output exceeded buffer cap; failing closed",
             );
             guard.comp().guardrail_blocked = true;
+            aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
             yield Ok(guardrail_failure_frames(
                 &mut encoder,
                 sent_downstream,

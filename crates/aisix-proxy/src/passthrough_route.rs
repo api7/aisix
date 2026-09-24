@@ -2129,6 +2129,7 @@ fn stream_response(
                                     "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
                                 );
                                 blocked = true;
+                                chain.record_output_buffer_exceeded();
                                 yield Ok(guardrail_error_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
                                 break 'outer;
                             }

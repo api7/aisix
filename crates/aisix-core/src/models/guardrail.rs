@@ -1196,12 +1196,6 @@ pub struct GuardrailMonitorHit {
 /// One entry per `(guardrail_name, hook, action, error_type)`: a guardrail
 /// that masks forty string leaves of one tool result reports a single entry
 /// whose `counts` and `duration_us` are summed across those leaves.
-///
-/// An empty array alongside `guardrail_blocked: true` is a legitimate
-/// state, not a contradiction: a streamed response aborted by the
-/// guardrail buffer cap is refused without any member returning a verdict,
-/// so there is no policy to name. Read the array as "which policies acted,
-/// when one did", never as an inverse of the boolean.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuardrailEnforcedHit {
     /// The configured (row) name of the guardrail that fired.
@@ -1217,6 +1211,12 @@ pub struct GuardrailEnforcedHit {
     ///   (`fail_open: false`). The request was
     ///   refused because the check was unavailable, not because the
     ///   content matched a policy.
+    /// - `blocked_buffer_exceeded` — a streamed response outgrew the
+    ///   hold-back cap (`max_buffer_bytes`) while an output row's
+    ///   `on_buffer_exceeded` was `fail_closed`, so it was refused without
+    ///   being scanned. `guardrail_name` is the row whose cap was the
+    ///   effective one; raising that cap, not tuning the policy, is the
+    ///   remedy.
     pub action: String,
     /// Why the check was unavailable, on `blocked_unavailable` only: a
     /// short, bounded cause such as `lakera_timeout` or
@@ -1224,7 +1224,7 @@ pub struct GuardrailEnforcedHit {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error_type: String,
     /// detector/rule name → number of spans masked (`masked` only; empty
-    /// for the two refusal actions). Same key space as
+    /// for every refusal action). Same key space as
     /// `redacted_entity_counts`.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub counts: std::collections::BTreeMap<String, u32>,

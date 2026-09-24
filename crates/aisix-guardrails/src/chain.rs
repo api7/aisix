@@ -393,6 +393,11 @@ fn classify_execution<'v>(
     }
 }
 
+/// `action` of the enforced hit a fail-closed buffer-cap refusal records
+/// (#1029): the check never ran, so it is neither `blocked` nor
+/// `blocked_unavailable`.
+const ACTION_BLOCKED_BUFFER_EXCEEDED: &str = "blocked_buffer_exceeded";
+
 /// The two receivers a fold reports each member execution to: the
 /// process-global metrics sink (AISIX-Cloud#1076) and the request's
 /// enforced-hit log (AISIX-Cloud#1330). Either may be absent — a
@@ -547,6 +552,37 @@ impl Guardrail for GuardrailChain {
 
     fn runs_on_output(&self) -> bool {
         self.members.iter().any(|m| m.guardrail.runs_on_output())
+    }
+
+    /// Names the member whose cap is the one [`Self::stream_output_policy`]
+    /// folded to: the smallest `max_buffer_bytes` among output members that
+    /// hold the whole response, the first in chain order on a tie — the row
+    /// an operator raises, not the chain.
+    fn record_output_buffer_exceeded(&self) {
+        let Some(audit) = self.audit.as_deref() else {
+            return;
+        };
+        let mut owner: Option<(&str, usize)> = None;
+        for m in self.members.iter().filter(|m| m.guardrail.runs_on_output()) {
+            if let StreamOutputPolicy::BufferFull {
+                max_buffer_bytes, ..
+            } = m.guardrail.stream_output_policy()
+            {
+                if owner.is_none_or(|(_, cap)| max_buffer_bytes < cap) {
+                    owner = Some((&m.name, max_buffer_bytes));
+                }
+            }
+        }
+        if let Some((name, _)) = owner {
+            audit.record(
+                name,
+                "output",
+                ACTION_BLOCKED_BUFFER_EXCEEDED,
+                None,
+                std::time::Duration::ZERO,
+                &std::collections::BTreeMap::new(),
+            );
+        }
     }
 
     /// `true` when at least one member inspects the request. An empty
@@ -1234,6 +1270,59 @@ mod tests {
     use super::*;
     use crate::{KeywordBlocklist, KeywordRule};
     use aisix_gateway::{ChatMessage, FinishReason, Role, UsageStats};
+
+    /// #1029: on an equal cap the entry names the member that runs first,
+    /// and a windowed member never set the cap, so it is never named.
+    #[test]
+    fn a_buffer_cap_refusal_names_the_first_member_on_a_tied_cap() {
+        struct Policy(StreamOutputPolicy);
+        #[async_trait]
+        impl Guardrail for Policy {
+            fn name(&self) -> &'static str {
+                "policy"
+            }
+            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+                GuardrailVerdict::Allow
+            }
+            fn stream_output_policy(&self) -> StreamOutputPolicy {
+                self.0.clone()
+            }
+        }
+        let full = || StreamOutputPolicy::BufferFull {
+            max_buffer_bytes: 4_096,
+            on_exceeded_fail_open: false,
+        };
+        let member = |name: &str, policy| {
+            (
+                name.to_owned(),
+                Arc::new(Policy(policy)) as Arc<dyn Guardrail>,
+            )
+        };
+        let audit = Arc::new(GuardrailAuditLog::new());
+        let chain = GuardrailChain::new_with_applied_all(
+            vec![
+                member(
+                    "windowed",
+                    StreamOutputPolicy::Window {
+                        size_chars: 10,
+                        overlap_chars: 2,
+                    },
+                ),
+                member("tied-first", full()),
+                member("tied-second", full()),
+            ],
+            Vec::new(),
+        )
+        .with_audit_log(Some(Arc::clone(&audit)));
+
+        chain.record_output_buffer_exceeded();
+
+        let hits = chain.enforced_hits();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].guardrail_name, "tied-first");
+        assert_eq!(hits[0].hook, "output");
+        assert_eq!(hits[0].action, "blocked_buffer_exceeded");
+    }
 
     /// AISIX-Cloud#1330: the audit log and the metrics sink are gated
     /// independently. `record_execution` used to bail the moment the sink

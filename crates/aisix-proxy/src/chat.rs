@@ -5972,6 +5972,9 @@ where
                                 );
                                 errored = true;
                                 guard.comp().guardrail_blocked = true;
+                                if let Some(ctx) = output_guardrail.as_ref() {
+                                    ctx.chain.record_output_buffer_exceeded();
+                                }
                                 yield Ok::<_, Infallible>(
                                     Event::default().event("error").data(error_frame_payload(
                                         "content_filter",

@@ -2773,6 +2773,9 @@ fn build_anthropic_sse_stream(
                 "streaming /v1/messages response exceeded hold-back cap; failing closed",
             );
             guard.comp().guardrail_blocked = true;
+            if let Some(chain) = output_guardrail.as_ref() {
+                aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
+            }
             yield Ok(bytes::Bytes::from(guardrail_block_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED))));
             return;
         }
@@ -4134,6 +4137,9 @@ where
                 "streaming /v1/messages passthrough exceeded hold-back cap; failing closed",
             );
             guard.usage().guardrail_blocked = true;
+            if let Some(chain) = output_guardrail.as_ref() {
+                aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
+            }
             yield Ok(Bytes::from(guardrail_block_frame(
                 None,
                 Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),

@@ -1526,6 +1526,7 @@ async fn responses_to_target(
                     max_buffer_bytes,
                     "streaming /v1/responses output exceeded buffer cap; failing closed",
                 );
+                aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain);
                 // At least one upstream frame may already have arrived.
                 // Return the refusal as a terminal dispatch envelope so
                 // that measured TTFT is emitted exactly once even though
