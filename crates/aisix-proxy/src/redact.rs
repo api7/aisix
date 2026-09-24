@@ -464,7 +464,7 @@ pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> Redact
     }
     let window_from = chat_latest_turn_start(&req.messages);
     for (i, msg) in req.messages.iter_mut().enumerate() {
-        let dir = Direction::input_window(i >= window_from && msg.role != Role::System);
+        let dir = Direction::input_window(i >= window_from && !msg.role.is_instruction());
         if let Some(content) = msg.content.as_mut() {
             apply_to_string(chain, dir, content, &mut counts);
         }
@@ -504,7 +504,7 @@ pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> Redact
 fn chat_latest_turn_start(messages: &[aisix_gateway::ChatMessage]) -> usize {
     let answered = messages
         .iter()
-        .rposition(|m| m.role != Role::System)
+        .rposition(|m| !m.role.is_instruction())
         .unwrap_or(0);
     messages[..answered]
         .iter()
@@ -2066,6 +2066,17 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(chat_latest_turn_start(&chat.messages), 0);
+
+        let chat_developer: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "secret"},
+                {"role": "assistant", "content": "Sure, here is"},
+                {"role": "developer", "content": "trailing policy"},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(chat_latest_turn_start(&chat_developer.messages), 0);
 
         // The non-spec `role: "system"` entry Claude Code sends (#597).
         let anthropic = json!([

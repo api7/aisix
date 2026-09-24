@@ -165,7 +165,8 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
 }
 
 /// The messages a `input_messages: latest_turn` guardrail may read: every
-/// message after the last assistant one, with system messages dropped.
+/// message after the last assistant one, with system and developer
+/// messages dropped.
 ///
 /// IDE and agent clients replay the whole conversation on every call, so a
 /// rule that matched one message keeps matching for the rest of the
@@ -199,7 +200,7 @@ pub fn latest_turn_view(req: &ChatFormat) -> ChatFormat {
     let answered = req
         .messages
         .iter()
-        .rposition(|m| m.role != Role::System)
+        .rposition(|m| !m.role.is_instruction())
         .unwrap_or(0);
     let start = req.messages[..answered]
         .iter()
@@ -208,7 +209,7 @@ pub fn latest_turn_view(req: &ChatFormat) -> ChatFormat {
     let mut view = req.clone();
     view.messages = req.messages[start..]
         .iter()
-        .filter(|m| m.role != Role::System)
+        .filter(|m| !m.role.is_instruction())
         .cloned()
         .collect();
     view

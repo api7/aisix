@@ -455,6 +455,7 @@ fn label_candidates(candidates: &[ChatResponse]) -> String {
 fn role_label(role: Role) -> &'static str {
     match role {
         Role::System => "System",
+        Role::Developer => "Developer",
         Role::User => "User",
         Role::Assistant => "Assistant",
         Role::Tool => "Tool",
