@@ -9,8 +9,9 @@
 //! time. Builds without a stamp fall back to the workspace crate
 //! version — and so do builds where the stamp is set but empty, which is
 //! what every non-tag image gets: the Dockerfile always exports
-//! `AISIX_BUILD_VERSION`, and CI fills it only for release tags. (QA v0.3.0 finding: the 0.3.0 image self-reported 0.1.0
-//! because the crate version was the only source and was never bumped.)
+//! `AISIX_BUILD_VERSION`, and CI fills it only for release tags.
+//! (QA v0.3.0 finding: the 0.3.0 image self-reported 0.1.0 because the
+//! crate version was the only source and was never bumped.)
 
 /// Version the binary reports about itself.
 pub const BUILD_VERSION: &str = resolve_build_version(
