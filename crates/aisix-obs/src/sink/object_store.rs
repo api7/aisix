@@ -390,7 +390,8 @@ pub fn build_object_store(
 /// is rejected for S3, since ambient credentials require the provider's
 /// metadata service. **GCS** uses
 /// Application Default Credentials (GKE Workload Identity / GCE metadata) by
-/// constructing the builder with no service-account key. **Azure** is not
+/// constructing the builder with no service-account key; a custom `endpoint`
+/// is rejected for GCS too, as the control plane does. **Azure** is not
 /// supported here — its managed identity still needs a non-secret account name
 /// the keyless config does not carry; cp-api rejects that combination at create
 /// time, and this arm returns a clear permanent error as a backstop.
@@ -429,6 +430,16 @@ pub fn build_object_store_ambient(
             Ok(Arc::new(store))
         }
         ObjectStoreProvider::Gcs => {
+            // Refused like S3, and as the control plane refuses it for every
+            // provider: a custom base URL is only reachable with a
+            // credential_ref service account.
+            if endpoint.is_some() {
+                return Err(SinkError::Permanent(
+                    "object_store: cloud_identity for gcs does not support a custom \
+                     endpoint; use credential_ref"
+                        .to_string(),
+                ));
+            }
             // No service-account key set → `object_store` sources Application
             // Default Credentials (GKE Workload Identity / GCE metadata).
             let store = object_store::gcp::GoogleCloudStorageBuilder::new()
@@ -1071,6 +1082,25 @@ mod tests {
             }
             other => {
                 panic!("expected Permanent error for s3 cloud_identity + endpoint, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn build_object_store_ambient_gcs_rejects_endpoint() {
+        let r = build_object_store_ambient(
+            ObjectStoreProvider::Gcs,
+            "bucket",
+            None,
+            Some("https://storage-private.example.com"),
+        );
+        match r {
+            Err(SinkError::Permanent(msg)) => {
+                assert!(msg.contains("endpoint"), "msg: {msg}");
+                assert!(msg.contains("credential_ref"), "msg: {msg}");
+            }
+            other => {
+                panic!("expected Permanent error for gcs cloud_identity + endpoint, got {other:?}")
             }
         }
     }
