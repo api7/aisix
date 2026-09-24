@@ -54,6 +54,7 @@ describe("a2a gateway e2e: /a2a/{agent}", () => {
   let app: SpawnedApp | undefined;
   let rootHosted: A2aUpstream | undefined;
   let pathHosted: A2aUpstream | undefined;
+  let multiLine: A2aUpstream | undefined;
   let etcdReachable = false;
   let seed: SeedClient;
 
@@ -100,6 +101,7 @@ describe("a2a gateway e2e: /a2a/{agent}", () => {
       token: "upstream-secret-tok",
     });
     pathHosted = await startA2aUpstream({ cardMount: "path" });
+    multiLine = await startA2aUpstream({ multiLineData: true });
     app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
 
@@ -122,6 +124,13 @@ describe("a2a gateway e2e: /a2a/{agent}", () => {
     await seed.update("a2a_agents", randomUUID(), {
       name: "tenant",
       url: pathHosted.url,
+      protocol_version: "1.0",
+      auth_type: "none",
+      enabled: true,
+    });
+    await seed.update("a2a_agents", randomUUID(), {
+      name: "multiline",
+      url: multiLine.url,
       protocol_version: "1.0",
       auth_type: "none",
       enabled: true,
@@ -160,6 +169,7 @@ describe("a2a gateway e2e: /a2a/{agent}", () => {
     await app?.exit();
     await rootHosted?.close();
     await pathHosted?.close();
+    await multiLine?.close();
   });
 
   test("announces the pinned wire version on every upstream call", async (ctx) => {
@@ -312,6 +322,46 @@ describe("a2a gateway e2e: /a2a/{agent}", () => {
     // and far below the 240ms the stub spends, with room for the client not
     // beginning to read the instant the headers land.
     expect(events[2].at - events[0].at).toBeGreaterThan(60);
+  });
+
+  test("relays an event the agent split across CRLF data lines as one single-line frame", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    const res = await fetch(`${app.proxyUrl}/a2a/multiline`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${KEY_ALLOWED}`,
+        "content-type": "application/json",
+        accept: "text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "stream-ml",
+        method: "message/stream",
+        params: {
+          message: {
+            role: "user",
+            parts: [{ kind: "text", text: "invoice 42" }],
+            messageId: "m-ml",
+          },
+        },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const raw = await res.text();
+
+    // Every event the agent sent arrives, each re-framed so a client reading
+    // one `data:` line per event gets the whole envelope from that one line.
+    const frames = raw
+      .split(/\r\n\r\n|\n\n|\r\r/)
+      .map((frame) => frame.split(/\r\n|\n|\r/).filter((line) => line.startsWith("data:")))
+      .filter((dataLines) => dataLines.length > 0);
+    for (const dataLines of frames) expect(dataLines).toHaveLength(1);
+    const events = frames.map(([line]) => JSON.parse(line.slice(5)) as Record<string, any>);
+
+    expect(events.map((e) => e.result.seq)).toEqual([1, 2, 3]);
+    expect(events.every((e) => e.id === "stream-ml")).toBe(true);
+    expect(events[2].result.status.state).toBe("completed");
   });
 
   test("gates on the per-agent ACL and on agent existence", async (ctx) => {

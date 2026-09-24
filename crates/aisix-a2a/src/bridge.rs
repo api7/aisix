@@ -62,9 +62,12 @@ const SSE_CONTENT_TYPE: &str = "text/event-stream";
 
 /// Hard cap on a SINGLE buffered SSE event. A stream has no total size — a task
 /// may push updates for hours — so the cap is per event: it bounds how much an
-/// upstream can accumulate without ever emitting a newline, which is the only
-/// way a streaming reader can be made to grow without limit.
+/// upstream can accumulate without ever emitting the blank line that ends an
+/// event, which is the only way a streaming reader can be made to grow without
+/// limit.
 const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
+
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
 /// Hard cap on an upstream response body the gateway will buffer. A registered
 /// agent is semi-trusted, but a compromised or misbehaving one must not be able
@@ -601,6 +604,11 @@ fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> 
         let mut bytes = resp.bytes_stream();
         let mut pending: Vec<u8> = Vec::new();
         let mut line_start = 0;
+        // Set while the last byte was a `\r`, so the `\n` of a CRLF pair split
+        // across two chunks is swallowed instead of read as a blank line.
+        let mut after_cr = false;
+        // The stream's first bytes may be a UTF-8 BOM, which the spec strips.
+        let mut at_stream_start = true;
         loop {
             let chunk = match bytes.next().await {
                 Some(Ok(chunk)) => chunk,
@@ -611,7 +619,20 @@ fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> 
                 None => break,
             };
             for byte in chunk {
+                if after_cr && byte == b'\n' {
+                    after_cr = false;
+                    continue;
+                }
+                after_cr = byte == b'\r';
                 pending.push(byte);
+                if at_stream_start {
+                    if pending == UTF8_BOM {
+                        pending.clear();
+                        at_stream_start = false;
+                        continue;
+                    }
+                    at_stream_start = UTF8_BOM.starts_with(&pending);
+                }
                 // Bound the whole event, including multiple data lines, rather
                 // than a network chunk that may contain many small events.
                 if pending.len() > MAX_SSE_EVENT_BYTES {
@@ -620,9 +641,9 @@ fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> 
                     ));
                     return;
                 }
-                if byte == b'\n' {
-                    let line = &pending[line_start..];
-                    if line == b"\n" || line == b"\r\n" {
+                // `\r`, `\n` and `\r\n` each end a line; an empty line ends the event.
+                if byte == b'\n' || byte == b'\r' {
+                    if pending.len() - 1 == line_start {
                         match parse_sse_frame(&pending) {
                             Ok(Some(event)) => yield Ok(event),
                             Ok(None) => {}
@@ -652,8 +673,11 @@ fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> 
 fn parse_sse_frame(frame: &[u8]) -> Result<Option<serde_json::Value>, A2aError> {
     let text = std::str::from_utf8(frame)
         .map_err(|_| A2aError::Request("upstream SSE event was not valid UTF-8".to_string()))?;
+    // Split on either terminator rather than `lines()`, which misses a bare
+    // `\r`; empty pieces are blank lines and the second half of a `\r\n`.
     let payload = text
-        .lines()
+        .split(['\n', '\r'])
+        .filter(|line| !line.is_empty())
         .filter_map(|line| {
             let data = if line == "data" {
                 ""
@@ -816,7 +840,7 @@ mod tests {
 
     #[test]
     fn sse_frame_joins_data_fields_before_parsing() {
-        for newline in ["\n", "\r\n"] {
+        for newline in ["\n", "\r\n", "\r"] {
             let frame = [
                 "data: {\"jsonrpc\":\"2.0\",",
                 ": keep-alive",

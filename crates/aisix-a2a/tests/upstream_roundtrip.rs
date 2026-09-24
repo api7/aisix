@@ -565,6 +565,50 @@ async fn a_malformed_final_line_fails_the_stream() {
 }
 
 #[tokio::test]
+async fn a_leading_bom_and_bare_cr_line_endings_are_read_as_framing() {
+    use futures::StreamExt;
+
+    // The event-stream grammar allows a bare `\r` as a line terminator and a
+    // UTF-8 BOM at the start of the stream. The BOM is split across writes, and
+    // a lone `\r` ends one write so the next byte cannot be read as its `\n`.
+    async fn cr_framed() -> impl IntoResponse {
+        let chunks: Vec<Result<Vec<u8>, std::convert::Infallible>> = vec![
+            Ok(b"\xEF\xBB".to_vec()),
+            Ok(b"\xBFdata: {\"jsonrpc\":\"2.0\",\"result\":{\"seq\":1}}\r\r".to_vec()),
+            Ok(b"data: {\"jsonrpc\":\"2.0\",\rdata: \"result\":{\"seq\":2}}\r".to_vec()),
+            Ok(b"\rdata: {\"jsonrpc\":\"2.0\",\"result\":{\"seq\":3}}\r\r".to_vec()),
+        ];
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            axum::body::Body::from_stream(futures::stream::iter(chunks)),
+        )
+    }
+    let app = Router::new().route("/a2a", post(cr_framed));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let bridge = HttpBridge::new(upstream(format!("http://{addr}/a2a"), A2aAuth::None));
+    let events: Vec<Result<Value, A2aError>> = bridge
+        .send_stream(&json!({"jsonrpc":"2.0","id":"s","method":"message/stream"}))
+        .await
+        .expect("stream opens")
+        .collect()
+        .await;
+    server.abort();
+
+    let seqs: Vec<_> = events
+        .iter()
+        .map(|event| event.as_ref().expect("every event parses")["result"]["seq"].clone())
+        .collect();
+    assert_eq!(seqs, [json!(1), json!(2), json!(3)], "got {events:#?}");
+}
+
+#[tokio::test]
 async fn an_oversized_multiline_event_fails_the_stream() {
     use futures::StreamExt;
 
