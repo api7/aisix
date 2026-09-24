@@ -1129,7 +1129,7 @@ pub(crate) fn responses_item_role(item: &Value) -> Role {
 /// so the caller maps them to a user message (scanned by every guardrail
 /// kind). Reading a key absent on other item types is a harmless no-op.
 /// <https://platform.openai.com/docs/api-reference/responses/create>
-fn responses_item_text(item: &Value) -> String {
+pub(crate) fn responses_item_text(item: &Value) -> String {
     [
         item.get("content"),
         item.get("output"),
@@ -3448,7 +3448,7 @@ where
 /// type, so generated reasoning was reaching the output scan. The skip is
 /// explicit now.
 /// <https://platform.openai.com/docs/api-reference/responses/object>
-fn responses_output_text(resp: &Value) -> String {
+pub(crate) fn responses_output_text(resp: &Value) -> String {
     let Some(items) = resp.get("output").and_then(|v| v.as_array()) else {
         return String::new();
     };

@@ -38,48 +38,139 @@ pub(crate) fn chat_delta(delta: &ChatDelta) -> usize {
     text + reasoning + tool_args
 }
 
-/// Held content in one Anthropic Messages stream event: `text`, `thinking`
-/// and `partial_json` deltas, plus any text, thinking or tool input a
-/// `content_block_start` already carries.
-pub(crate) fn anthropic_event(v: &Value) -> usize {
-    let str_len = |o: Option<&Value>, key: &str| {
-        o.and_then(|o| o.get(key))
-            .and_then(Value::as_str)
-            .map_or(0, str::len)
-    };
-    match v.get("type").and_then(Value::as_str) {
-        Some("content_block_delta") => {
-            let d = v.get("delta");
-            str_len(d, "text") + str_len(d, "thinking") + str_len(d, "partial_json")
+/// One stream event split the way the output guardrails read it: `scan`
+/// is the generated text they inspect (assistant text and tool-call
+/// arguments), `reasoning` the generated reasoning they do not inspect.
+/// Both count toward the hold-back cap, so [`Parts::held`] is the cap's
+/// measure and `scan` the scanner's input — one extraction for both.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Parts {
+    pub(crate) scan: String,
+    pub(crate) reasoning: usize,
+}
+
+impl Parts {
+    pub(crate) fn held(&self) -> usize {
+        self.scan.len() + self.reasoning
+    }
+
+    fn scan_str(&mut self, v: Option<&Value>) {
+        if let Some(s) = v.and_then(Value::as_str) {
+            self.scan.push_str(s);
         }
-        Some("content_block_start") => {
-            let cb = v.get("content_block");
-            let input = cb
-                .and_then(|c| c.get("input"))
-                .filter(|i| !i.is_null() && i.as_object().is_none_or(|o| !o.is_empty()))
-                .map_or(0, |i| i.to_string().len());
-            str_len(cb, "text") + str_len(cb, "thinking") + input
-        }
-        _ => 0,
+    }
+
+    fn reasoning_str(&mut self, v: Option<&Value>) {
+        self.reasoning += v.and_then(Value::as_str).map_or(0, str::len);
     }
 }
 
-/// Held content in one OpenAI Responses stream event. Only the delta
-/// events count: the `.done` events and the terminal `response.*` snapshot
-/// repeat content already counted from its deltas.
-pub(crate) fn responses_event(v: &Value) -> usize {
+/// An Anthropic Messages stream event: `text` and `partial_json` deltas and
+/// the text or tool input a `content_block_start` already carries are
+/// scanned; `thinking` is reasoning.
+pub(crate) fn anthropic_event_parts(v: &Value) -> Parts {
+    let mut p = Parts::default();
+    match v.get("type").and_then(Value::as_str) {
+        Some("content_block_delta") => {
+            let d = v.get("delta");
+            p.scan_str(d.and_then(|d| d.get("text")));
+            p.scan_str(d.and_then(|d| d.get("partial_json")));
+            p.reasoning_str(d.and_then(|d| d.get("thinking")));
+        }
+        Some("content_block_start") => {
+            let cb = v.get("content_block");
+            p.scan_str(cb.and_then(|c| c.get("text")));
+            if let Some(input) = cb
+                .and_then(|c| c.get("input"))
+                .filter(|i| !i.is_null() && i.as_object().is_none_or(|o| !o.is_empty()))
+            {
+                p.scan.push_str(&input.to_string());
+            }
+            p.reasoning_str(cb.and_then(|c| c.get("thinking")));
+        }
+        _ => {}
+    }
+    p
+}
+
+/// An OpenAI Responses stream event. Only delta events count: the `.done`
+/// events and the terminal `response.*` snapshot repeat content already
+/// counted from its deltas.
+pub(crate) fn responses_event_parts(v: &Value) -> Parts {
+    let mut p = Parts::default();
     match v.get("type").and_then(Value::as_str) {
         Some(
             "response.output_text.delta"
-            | "response.refusal.delta"
-            | "response.reasoning_text.delta"
-            | "response.reasoning_summary_text.delta"
             | "response.function_call_arguments.delta"
             | "response.mcp_call_arguments.delta"
             | "response.custom_tool_call_input.delta",
-        ) => v.get("delta").and_then(Value::as_str).map_or(0, str::len),
-        _ => 0,
+        ) => p.scan_str(v.get("delta")),
+        Some("response.reasoning_text.delta" | "response.reasoning_summary_text.delta") => {
+            p.reasoning_str(v.get("delta"))
+        }
+        _ => {}
     }
+    p
+}
+
+/// An OpenAI chat-completions stream chunk: every choice's `delta.content`
+/// and tool-call arguments are scanned; `reasoning_content` (or the
+/// `reasoning` spelling some relays use) is reasoning.
+pub(crate) fn chat_chunk_parts(v: &Value) -> Parts {
+    let mut p = Parts::default();
+    for delta in v
+        .get("choices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.get("delta"))
+    {
+        match delta.get("content") {
+            Some(Value::String(s)) => p.scan.push_str(s),
+            Some(Value::Array(parts)) => {
+                for part in parts {
+                    p.scan_str(part.get("text"));
+                }
+            }
+            _ => {}
+        }
+        for tc in delta
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            p.scan_str(tc.get("function").and_then(|f| f.get("arguments")));
+            p.scan_str(tc.get("custom").and_then(|c| c.get("input")));
+        }
+        p.reasoning_str(delta.get("reasoning_content"));
+        p.reasoning_str(delta.get("reasoning"));
+    }
+    p
+}
+
+/// A legacy completions stream chunk: every choice's `text` is scanned.
+pub(crate) fn completions_chunk_parts(v: &Value) -> Parts {
+    let mut p = Parts::default();
+    for c in v
+        .get("choices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        p.scan_str(c.get("text"));
+    }
+    p
+}
+
+/// Held content in one Anthropic Messages stream event.
+pub(crate) fn anthropic_event(v: &Value) -> usize {
+    anthropic_event_parts(v).held()
+}
+
+/// Held content in one OpenAI Responses stream event.
+pub(crate) fn responses_event(v: &Value) -> usize {
+    responses_event_parts(v).held()
 }
 
 /// Held content across every SSE frame in `frames` (complete frames; an

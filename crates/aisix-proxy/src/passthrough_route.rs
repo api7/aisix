@@ -1135,7 +1135,16 @@ fn content_text(v: &serde_json::Value) -> String {
 /// the model generated is out of the output-guardrail scope.
 fn message_scan_text(msg: &serde_json::Value, reasoning: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
-    let content = msg.get("content").map(content_text).unwrap_or_default();
+    let content = msg
+        .get("content")
+        .map(|c| {
+            if reasoning {
+                request_content_text(c)
+            } else {
+                content_text(c)
+            }
+        })
+        .unwrap_or_default();
     if !content.is_empty() {
         parts.push(content);
     }
@@ -1152,6 +1161,50 @@ fn message_scan_text(msg: &serde_json::Value, reasoning: bool) -> String {
         }
     }
     parts.join("\n")
+}
+
+/// Request text of one chat-envelope `content` value, which on this
+/// envelope may also be an Anthropic Messages block array: `text` blocks,
+/// a `tool_result`'s own content, a replayed `tool_use`'s input, and a
+/// replayed `thinking` block — the same slots the typed `/v1/messages`
+/// route scans once it has parsed the body. Caller-replayed reasoning is
+/// request text, as it is for `reasoning_content` above.
+fn request_content_text(v: &serde_json::Value) -> String {
+    let serde_json::Value::Array(blocks) = v else {
+        return content_text(v);
+    };
+    blocks
+        .iter()
+        .filter_map(|b| match b.get("type").and_then(|t| t.as_str()) {
+            Some("tool_result") => b.get("content").map(request_content_text),
+            Some("tool_use") => b.get("input").map(|i| i.to_string()),
+            Some("thinking") => b
+                .get("thinking")
+                .and_then(|t| t.as_str())
+                .map(str::to_string),
+            _ => b.get("text").and_then(|t| t.as_str()).map(str::to_string),
+        })
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The generated text of a buffered Anthropic Messages response carried on
+/// the chat envelope: its `text` blocks and each `tool_use` input.
+/// `thinking` is generated reasoning and stays out of the output scan.
+fn anthropic_message_output_text(v: &serde_json::Value) -> String {
+    v.get("content")
+        .and_then(|c| c.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|b| match b.get("type").and_then(|t| t.as_str()) {
+            Some("text") => b.get("text").and_then(|t| t.as_str()).map(str::to_string),
+            Some("tool_use") => b.get("input").map(|i| i.to_string()),
+            _ => None,
+        })
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The body envelope detected for one exchange. Not configuration:
@@ -1298,45 +1351,34 @@ fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String 
     };
     let extracted = match protocol {
         PassthroughProtocol::Raw => return raw(),
+        // An Anthropic Messages body carries its system prompt top-level.
         PassthroughProtocol::OpenaiChat => v
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .map(|msgs| {
-                msgs.iter()
-                    .map(|m| message_scan_text(m, true))
-                    .filter(|t| !t.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default(),
+            .get("system")
+            .map(request_content_text)
+            .into_iter()
+            .chain(
+                v.get("messages")
+                    .and_then(|m| m.as_array())
+                    .into_iter()
+                    .flatten()
+                    .map(|m| message_scan_text(m, true)),
+            )
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
         // Responses API: `input` is either a bare string or an array of
-        // items, and the text can sit in any of FOUR slots — the same four
-        // the typed route reads (`responses::responses_item_text`):
-        // `content` on a message, `output` on a tool result fed back,
-        // `reason` on an `mcp_approval_response`, and `summary` on a
-        // replayed `reasoning` item.
-        //
-        // All four, not just the common one: the raw-body fallback below
-        // fires only when the WHOLE extraction came back empty, so a body
-        // mixing a benign message item with a `function_call_output`
-        // produces non-empty text and the tool result is never scanned —
-        // while `/v1/responses` blocks that same body. A passthrough route
-        // must not enforce less than the typed route in front of the same
-        // envelope.
+        // items, read exactly as the typed route reads them
+        // (`responses::responses_item_text`) — message content, tool
+        // results, approval reasons, replayed reasoning summaries, and a
+        // replayed tool call's name, arguments and input. Every item, not
+        // only the common one: the raw-body fallback below fires only when
+        // the WHOLE extraction came back empty, so a slot left out here is
+        // never scanned while `/v1/responses` blocks the same body.
         PassthroughProtocol::OpenaiResponses => match v.get("input") {
             Some(serde_json::Value::String(t)) => t.clone(),
             Some(serde_json::Value::Array(items)) => items
                 .iter()
-                .flat_map(|i| {
-                    [
-                        i.get("content"),
-                        i.get("output"),
-                        i.get("reason"),
-                        i.get("summary"),
-                    ]
-                })
-                .flatten()
-                .map(content_text)
+                .map(crate::responses::responses_item_text)
                 .filter(|t| !t.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -1376,30 +1418,21 @@ fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
         return raw();
     };
-    // Responses answers with `output` items, not `choices`.
+    // Responses answers with `output` items, not `choices`: read them as
+    // the typed route does (`responses::responses_output_text`) — message
+    // text plus each tool call's name, arguments and input, with generated
+    // reasoning items left out of the output scope.
     if matches!(protocol, PassthroughProtocol::OpenaiResponses) {
-        let joined = v
-            .get("output")
-            .and_then(|o| o.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    // Generated reasoning is out of the output-guardrail
-                    // scope, and a `reasoning` item DOES carry `content[]`
-                    // with `text` parts — so reading `content` off every
-                    // item regardless of type sweeps it in. The typed
-                    // `/v1/responses` handler skips it for the same reason
-                    // (`responses::responses_output_text`); without this a
-                    // block rule matching only inside reasoning would refuse
-                    // a response here that the typed route allows.
-                    .filter(|i| i.get("type").and_then(|t| t.as_str()) != Some("reasoning"))
-                    .filter_map(|i| i.get("content").map(content_text))
-                    .filter(|t| !t.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
+        let joined = crate::responses::responses_output_text(&v);
         return if joined.is_empty() { raw() } else { joined };
+    }
+    // An Anthropic Messages response on the chat envelope carries
+    // `content` blocks rather than `choices`.
+    if matches!(protocol, PassthroughProtocol::OpenaiChat) && v.get("choices").is_none() {
+        let text = anthropic_message_output_text(&v);
+        if !text.is_empty() {
+            return text;
+        }
     }
     let choices = match protocol {
         PassthroughProtocol::Raw => return raw(),
@@ -1820,11 +1853,24 @@ fn frame_in_band_error(
     }
 }
 
+#[cfg(test)]
 fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<PassthroughUsage>) {
+    let (parts, usage) = frame_parts(protocol, frame);
+    (parts.scan, usage)
+}
+
+/// One frame's generated content, split by [`crate::held_content::Parts`]
+/// into what the output guardrails scan and what only counts toward the
+/// hold-back cap, plus any usage it reports. The scan and the cap read the
+/// same extraction, so they cannot disagree about a frame (#513).
+fn frame_parts(
+    protocol: PassthroughProtocol,
+    frame: &[u8],
+) -> (crate::held_content::Parts, Option<PassthroughUsage>) {
     let frame_text = String::from_utf8_lossy(frame);
     let usage_labelled = matches!(protocol, PassthroughProtocol::Raw)
         && is_usage_labelled_frame(frame_text.as_ref());
-    let mut text = String::new();
+    let mut parts = crate::held_content::Parts::default();
     let mut usage: Option<PassthroughUsage> = None;
     let mut merge = |found: PassthroughUsage| {
         usage
@@ -1856,7 +1902,7 @@ fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<P
             // client receives is the bypass. (Per-line parsing used to catch
             // the two-document case incidentally; this covers it and every
             // other shape that does not parse.)
-            text.push_str(payload);
+            parts.scan.push_str(payload);
             break 'payload;
         };
         if let Some(u) = v.get("usage").and_then(usage_of) {
@@ -1894,47 +1940,27 @@ fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<P
                 merge(u);
             }
         }
-        match protocol {
-            PassthroughProtocol::Raw => text.push_str(payload),
+        parts = match protocol {
+            PassthroughProtocol::Raw => crate::held_content::Parts {
+                scan: payload.to_string(),
+                reasoning: 0,
+            },
+            // The chat envelope also carries Anthropic Messages streams; the
+            // two event shapes are disjoint, so reading both is exact.
             PassthroughProtocol::OpenaiChat => {
-                if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
-                    for c in choices {
-                        if let Some(t) = c
-                            .get("delta")
-                            .and_then(|d| d.get("content"))
-                            .map(content_text)
-                        {
-                            text.push_str(&t);
-                        }
-                    }
-                }
+                let mut p = crate::held_content::chat_chunk_parts(&v);
+                let a = crate::held_content::anthropic_event_parts(&v);
+                p.scan.push_str(&a.scan);
+                p.reasoning += a.reasoning;
+                p
             }
             PassthroughProtocol::OpenaiCompletions => {
-                if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
-                    for c in choices {
-                        if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
-                            text.push_str(t);
-                        }
-                    }
-                }
+                crate::held_content::completions_chunk_parts(&v)
             }
-            PassthroughProtocol::OpenaiResponses => {
-                // Text arrives as `response.output_text.delta` events; the
-                // terminal `response.completed` repeats the whole output,
-                // which would double the captured text, so take deltas only.
-                let is_delta = v
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .is_some_and(|t| t.ends_with("output_text.delta"));
-                if is_delta {
-                    if let Some(t) = v.get("delta").and_then(|d| d.as_str()) {
-                        text.push_str(t);
-                    }
-                }
-            }
-        }
+            PassthroughProtocol::OpenaiResponses => crate::held_content::responses_event_parts(&v),
+        };
     }
-    (text, usage)
+    (parts, usage)
 }
 
 /// The SSE error frame appended when an output guardrail blocks mid-relay.
@@ -1980,7 +2006,11 @@ fn stream_response(
         let mut splitter = SseFrameSplitter::new();
         // Held-back frames (Window / BufferFull) not yet released.
         let mut pending: Vec<Bytes> = Vec::new();
+        // Frame bytes held under Window (a memory bound for delta-free runs).
         let mut held_bytes: usize = 0;
+        // Generated content held under BufferFull (#513) — what
+        // `max_buffer_bytes` caps; the SSE framing around it is not counted.
+        let mut held_content: usize = 0;
         // Unscanned delta text for the CURRENT window / buffer.
         let mut scan_buf = String::new();
         // Overlap carried between Window scans.
@@ -2020,7 +2050,9 @@ fn stream_response(
                 if let Some(err) = frame_in_band_error(protocol, &frame) {
                     telemetry.record_failure(&err);
                 }
-                let (delta, usage) = frame_delta(protocol, &frame);
+                let (parts, usage) = frame_parts(protocol, &frame);
+                let held = parts.held();
+                let delta = parts.scan;
                 if let Some(u) = usage {
                     telemetry.usage.merge(u);
                 }
@@ -2082,15 +2114,14 @@ fn stream_response(
                     }
                     StreamOutputPolicy::BufferFull { max_buffer_bytes, on_exceeded_fail_open } => {
                         scan_buf.push_str(&delta);
-                        held_bytes += frame.len();
+                        held_content += held;
                         pending.push(frame);
-                        if held_bytes > *max_buffer_bytes {
+                        if held_content > *max_buffer_bytes {
                             if *on_exceeded_fail_open {
                                 for f in pending.drain(..) {
                                     telemetry.mark_first_delivery();
                                     yield Ok(f);
                                 }
-                                held_bytes = 0;
                                 fail_opened = true;
                             } else {
                                 tracing::warn!(
@@ -2112,7 +2143,8 @@ fn stream_response(
             // of whatever the policy has not cleared yet.
             let rest = splitter.take_rest();
             if !rest.is_empty() {
-                let (delta, usage) = frame_delta(protocol, &rest);
+                let (parts, usage) = frame_parts(protocol, &rest);
+                let delta = parts.scan;
                 if let Some(u) = usage {
                     telemetry.usage.merge(u);
                 }
@@ -4119,5 +4151,100 @@ mod tests {
         assert_eq!(ev.guardrail_enforced_hits[0].action, "blocked");
         let wire = serde_json::to_string(&ev).unwrap();
         assert!(!wire.contains("BLOCKME"), "{wire}");
+    }
+
+    /// Every protocol's stream frame yields its text and tool-call
+    /// arguments for the scan, and its reasoning only for the cap (#513).
+    #[test]
+    fn frame_parts_split_scan_text_from_reasoning_per_protocol() {
+        let parts = |p, f: &str| frame_parts(p, f.as_bytes()).0;
+        let a = parts(
+            PassthroughProtocol::OpenaiChat,
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        );
+        assert_eq!((a.scan.as_str(), a.reasoning), ("hi", 0));
+        let a = parts(
+            PassthroughProtocol::OpenaiChat,
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\"\"}}\n\n",
+        );
+        assert_eq!(a.scan, "{\"q\"");
+        let a = parts(
+            PassthroughProtocol::OpenaiChat,
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\n",
+        );
+        assert_eq!((a.scan.as_str(), a.reasoning), ("", 3));
+        let c = parts(
+            PassthroughProtocol::OpenaiChat,
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"why\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n",
+        );
+        assert_eq!((c.scan.as_str(), c.reasoning), ("{}", 3));
+        let r = parts(
+            PassthroughProtocol::OpenaiResponses,
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"a\\\":1}\"}\n\n",
+        );
+        assert_eq!(r.scan, "{\"a\":1}");
+        let r = parts(
+            PassthroughProtocol::OpenaiResponses,
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"plan\"}\n\n",
+        );
+        assert_eq!((r.scan.as_str(), r.reasoning), ("", 4));
+        // Raw counts and scans the whole payload, envelope included.
+        let raw = parts(PassthroughProtocol::Raw, "data: {\"x\":1}\n\n");
+        assert_eq!((raw.scan.as_str(), raw.held()), ("{\"x\":1}", 7));
+    }
+
+    /// An Anthropic Messages body on the chat envelope is scanned in every
+    /// slot the typed `/v1/messages` route scans.
+    #[test]
+    fn anthropic_request_blocks_and_system_are_request_scan_text() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "system": [{"type": "text", "text": "SYS"}],
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "THINK", "signature": "s"},
+                    {"type": "tool_use", "id": "t", "name": "f", "input": {"q": "ARGS"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t", "content": [{"type": "text", "text": "RESULT"}]}
+                ]}
+            ]
+        })
+        .to_string();
+        let text = request_guardrail_text(PassthroughProtocol::OpenaiChat, body.as_bytes());
+        for slot in ["SYS", "THINK", "ARGS", "RESULT"] {
+            assert!(text.contains(slot), "{slot} missing from {text}");
+        }
+    }
+
+    /// Buffered Anthropic and Responses replies are read slot by slot:
+    /// text and tool input in, generated reasoning out.
+    #[test]
+    fn buffered_tool_calls_are_response_scan_text_and_reasoning_is_not() {
+        let anthropic = serde_json::json!({
+            "type": "message", "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "THINK"},
+                {"type": "text", "text": "TEXT"},
+                {"type": "tool_use", "id": "t", "name": "f", "input": {"q": "ARGS"}}
+            ]
+        })
+        .to_string();
+        let text = response_guardrail_text(PassthroughProtocol::OpenaiChat, anthropic.as_bytes());
+        assert!(text.contains("TEXT") && text.contains("ARGS"));
+        assert!(!text.contains("THINK"));
+        let responses = serde_json::json!({
+            "output": [{"type": "function_call", "name": "f", "arguments": "{\"q\":\"ARGS\"}"}]
+        })
+        .to_string();
+        let text =
+            response_guardrail_text(PassthroughProtocol::OpenaiResponses, responses.as_bytes());
+        assert!(text.contains("ARGS"));
+        let request = serde_json::json!({
+            "input": [{"type": "function_call", "name": "f", "arguments": "{\"q\":\"ARGS\"}"}]
+        })
+        .to_string();
+        let text = request_guardrail_text(PassthroughProtocol::OpenaiResponses, request.as_bytes());
+        assert!(text.contains("ARGS"));
     }
 }
