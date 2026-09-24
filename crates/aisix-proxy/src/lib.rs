@@ -1913,7 +1913,7 @@ mod tests {
 
     /// Every response — including success bodies, error envelopes, and
     /// short-circuited middleware rejections — must carry the gateway's
-    /// `Server` product token (`AISIX/<semver>`) so clients can identify
+    /// `Server` product token (`AISIX/<version>`) so clients can identify
     /// the data plane without round-tripping to a status endpoint.
     #[tokio::test]
     async fn server_header_identifies_the_data_plane() {
