@@ -103,13 +103,11 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
         // get anyway. Spelled as `Config` before #1093, which made it
         // retryable and burned the whole budget before the 501 surfaced.
         //
-        // There is no failover to preserve underneath this `false`. The
-        // three routes that can raise it — `/v1/completions`,
-        // `/v1/embeddings`, `/v1/images/generations` — dispatch through
-        // `retrying_dispatch`, which walks no candidates, and they refuse a
-        // routing model outright in `dispatch::require_provider`. The one
-        // loop that does fail over (chat's) only ever calls `chat` /
-        // `chat_stream`, which have no default impl to raise this.
+        // The three routes that can raise it — `/v1/completions`,
+        // `/v1/embeddings`, `/v1/images/generations` — answer it with a
+        // 501 naming the unsupported capability, so a Model Group stops on
+        // it rather than failing over (`dispatch_with_failover`), the same
+        // as on any other non-retryable refusal.
         BridgeError::UnsupportedCapability(_) => false,
         BridgeError::Timeout { .. }
         | BridgeError::Transport(_)
@@ -134,7 +132,13 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
 /// to fail over and leaves exactly the trace a group with one reachable
 /// candidate leaves — one attempt, error class `upstream_status`
 /// (AISIX-Cloud#1499).
+///
+/// `request_id` is a field of the line itself, not only of the enclosing
+/// `request` span: that span is INFO-level, so at `log_level=warn` it is
+/// disabled and this line would otherwise carry no way back to the request
+/// (AISIX-Cloud#1136).
 pub(crate) fn log_attempt_failure(
+    request_id: &str,
     target_model: &str,
     attempt_number: usize,
     err: &dyn std::fmt::Display,
@@ -142,6 +146,7 @@ pub(crate) fn log_attempt_failure(
     fallback_on_statuses: &[u16],
 ) {
     tracing::warn!(
+        request_id = %request_id,
         target_model = %target_model,
         target_attempt = attempt_number,
         error = %err,
@@ -409,12 +414,9 @@ pub fn effective_timeouts(
 
 /// Drive one single-model upstream call under that model's retry budget.
 ///
-/// The group-capable endpoints (chat, messages, responses, count_tokens)
-/// keep their own loops: they also walk fall-over targets and emit
-/// per-attempt telemetry, neither of which applies here. Every other
-/// endpoint — embeddings, rerank, completions, audio, images, videos,
-/// passthrough — dispatches to exactly one model, and this is their whole
-/// retry story.
+/// For a caller-addressed Model use [`dispatch_with_failover`] instead —
+/// it walks a Model Group's targets. This is for the callers that already
+/// hold ONE concrete model: an ensemble member, a passthrough route.
 ///
 /// `retry_on_429` / `fallback_on_statuses` are group-level knobs, so the
 /// default classification applies: 5xx, timeout, transport, decode and
@@ -497,6 +499,285 @@ where
     // Unreachable with `last_err == None`: the loop body either returns or
     // stores an error, and it runs at least once.
     Err(last_err.unwrap_or_else(|| BridgeError::Config("retry loop produced no error".into())))
+}
+
+/// What [`dispatch_with_failover`] hands back on success: the call's own
+/// value, the concrete target that produced it, when that attempt began,
+/// and that target's model-layer rate-limit reservation (`None` for a
+/// direct model), which the caller merges into its request reservation
+/// before committing tokens so the member's TPM/TPD is billed too
+/// (AISIX-Cloud#1087).
+pub(crate) struct Dispatched<T> {
+    pub value: T,
+    pub target: AttemptModel,
+    /// Start of the attempt that produced `value` — what a relayed
+    /// response's end-of-stream usage event measures its latency from, so
+    /// the failed attempts before it are not counted twice.
+    pub attempt_started: std::time::Instant,
+    pub member_reservation: Option<aisix_ratelimit::MultiReservation>,
+    /// The target's `least_busy` in-flight count, raised for the winning
+    /// attempt. A buffered response is complete once `value` exists, so
+    /// dropping it with the rest is right; a relayed stream moves it into
+    /// its body so the target counts as busy until the relay ends.
+    pub in_flight: crate::health::InFlightGuard,
+}
+
+/// The caller-addressed model as a refusal names it, with the dispatched
+/// row added whenever its name differs (a Model Group member, or the
+/// wildcard row serving an alias), so a group holding a target the endpoint
+/// cannot serve says which one.
+pub(crate) fn refused_model_label(addressed: &str, target: &aisix_core::Model) -> String {
+    if target.display_name == addressed {
+        format!("model `{addressed}`")
+    } else {
+        format!("model `{addressed}` (target `{}`)", target.display_name)
+    }
+}
+
+/// Dispatch a single-shot (non-streaming-relay) request to the Model the
+/// caller addressed: a direct model is its own only target, a Model Group
+/// walks its `routing.targets` exactly as `/v1/chat/completions` does
+/// (strategy order, health/cooldown filter, per-target client-IP allowlist,
+/// per-target model rate-limit layers), with same-target retries before
+/// failing over.
+///
+/// `call` performs ONE attempt against the target it is handed, with that
+/// target's resolved deadlines. It must build all the per-target state it
+/// needs (provider key, upstream model id, request body rewrite) from
+/// the target, never from the caller-addressed entry — a group has no
+/// provider. Only a retryable `ProxyError::Bridge` moves on; any other error
+/// (a config gap, a 4xx) is returned as-is. `permit` can veto spending the
+/// retry/fail-over budget on a failure after which a replay would duplicate
+/// a non-idempotent upstream write (see [`retrying_dispatch_gated`]).
+///
+/// Every attempt is recorded on `telemetry` — the same
+/// [`crate::attempt::RoutingTelemetry`] chat, messages and responses use —
+/// so the per-attempt usage events and the `aisix_deployment_*` /
+/// `aisix_routing_*_fallbacks_total` metrics come out of the one
+/// chokepoint (#655). `unsupported` names an `Ok` value that is really the
+/// route's own 501 for a provider that lacks the capability: that attempt
+/// ends the dispatch like any non-retryable refusal and is recorded as a
+/// failed, never-dispatched one rather than as a success.
+///
+/// A successful attempt also feeds the target's latency to the
+/// `least_latency` strategy, exactly as chat does, so a group on that
+/// strategy learns its targets on every endpoint of the family. Every
+/// attempt is counted in flight for `least_busy` while it runs, and the
+/// winner's count is handed back in [`Dispatched::in_flight`].
+///
+/// The one chokepoint for the single-shot endpoint family — completions,
+/// embeddings, rerank, images, audio, videos — so they dispatch Model
+/// Groups identically (AISIX-Cloud#1111).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch_with_failover<T, P, U, F, Fut>(
+    state: &crate::ProxyState,
+    snapshot: &AisixSnapshot,
+    auth: &crate::auth::AuthenticatedKey,
+    client: &crate::client_ip::ClientContext,
+    requested_name: &str,
+    entry: &aisix_core::ResourceEntry<Model>,
+    telemetry: &mut crate::attempt::RoutingTelemetry,
+    permit: P,
+    unsupported: U,
+    mut call: F,
+) -> Result<Dispatched<T>, ProxyError>
+where
+    P: Fn(&BridgeError) -> bool,
+    U: Fn(&T) -> Option<String>,
+    F: FnMut(AttemptModel, TimeoutBudget) -> Fut,
+    Fut: std::future::Future<Output = Result<T, ProxyError>>,
+{
+    use crate::attempt::{AttemptRecord, AttemptTarget};
+
+    let attempt_models = resolve_attempt_models(
+        &state.routing,
+        &state.runtime_status,
+        &state.pricing,
+        snapshot,
+        requested_name,
+        &entry.id,
+        &entry.value,
+        RoutingRequest {
+            tags: &client.routing_tags,
+            headers: Some(&client.headers),
+            api_key_id: auth.entry.id.as_str(),
+            source_ip: &client.source_ip,
+        },
+    )?;
+    let routing = entry.value.routing.as_ref();
+    let retry_on_429 = routing.is_some_and(|r| r.retry_on_429_or_default());
+    let fallback_statuses: &[u16] = routing
+        .map(|r| r.fallback_on_statuses_or_default())
+        .unwrap_or(&[]);
+    let n = attempt_models.len();
+    let mut last_err: Option<ProxyError> = None;
+    for (i, target) in attempt_models.into_iter().enumerate() {
+        let pk_id = crate::dispatch::resolve_provider_key(snapshot, &target.model)
+            .map(|e| e.id.clone())
+            .unwrap_or_default();
+        // The routing target's name on the attempt record; empty for a
+        // direct model, whose `model_id` already identifies it.
+        let target_model = if routing.is_some() {
+            target.model.display_name.clone()
+        } else {
+            String::new()
+        };
+        let begin = |telemetry: &mut crate::attempt::RoutingTelemetry| {
+            telemetry.begin_attempt(AttemptTarget {
+                display_name: &target.model.display_name,
+                target_model: &target_model,
+                model_id: &target.id,
+            })
+        };
+        let member_reservation = match crate::quota::reserve_routing_target(
+            state,
+            snapshot,
+            auth,
+            routing.is_some().then_some(crate::quota::RoutingParent {
+                name: &entry.value.display_name,
+                entry_id: &entry.id,
+            }),
+            &target.model.display_name,
+            &target.id,
+            &target.model,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // A target over its own limits is an attempt that never
+                // reached an upstream — recorded, as chat records it, so the
+                // failover it forced is visible.
+                let (index, kind) = begin(telemetry);
+                telemetry.record(
+                    state,
+                    AttemptRecord {
+                        index,
+                        kind,
+                        target_model: target_model.clone(),
+                        target_model_id: target.id.clone(),
+                        provider_key_id: pk_id.clone(),
+                        status: 429,
+                        success: false,
+                        error_class: "rate_limit_exceeded".to_string(),
+                        error_message: e.to_string(),
+                        latency_ms: 0,
+                        dispatched: false,
+                    },
+                );
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let budget = effective_retries(
+            &target.model,
+            group_retries_of(&entry.value),
+            state.default_retries,
+            i + 1 < n,
+        );
+        let timeouts =
+            effective_timeouts(&target.model, Some(&entry.value), state.default_timeouts);
+        for attempt_idx in 0..=budget.attempts {
+            if attempt_idx > 0 {
+                let hint = last_err.as_ref().and_then(|e| match e {
+                    ProxyError::Bridge(be) => retry_after_hint(be),
+                    _ => None,
+                });
+                tokio::time::sleep(retry_backoff(attempt_idx as u32, hint)).await;
+            }
+            let (index, kind) = begin(telemetry);
+            let attempt_started = std::time::Instant::now();
+            let in_flight = state.runtime_status.count_in_flight(&target.id);
+            match call(target.clone(), timeouts).await {
+                Ok(value) => {
+                    let refusal = unsupported(&value);
+                    // The route answered its own 501 without contacting the
+                    // provider, so it is no evidence of upstream health.
+                    let dispatched = refusal.is_none();
+                    let latency_ms = crate::attempt::ms_since(attempt_started);
+                    // Feed the least_latency EWMA, as chat does: the round
+                    // trip for a buffered answer, time to the upstream's
+                    // response head for a relayed stream.
+                    if dispatched {
+                        state.runtime_status.record_latency(&target.id, latency_ms);
+                    }
+                    telemetry.record(
+                        state,
+                        AttemptRecord {
+                            index,
+                            kind,
+                            target_model: target_model.clone(),
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: if refusal.is_some() { 501 } else { 200 },
+                            success: refusal.is_none(),
+                            // The class `BridgeError::UnsupportedCapability`
+                            // reports (`attempt::routing_error_class`).
+                            error_class: if refusal.is_some() {
+                                "config".to_string()
+                            } else {
+                                String::new()
+                            },
+                            error_message: refusal.unwrap_or_default(),
+                            latency_ms,
+                            dispatched,
+                        },
+                    );
+                    return Ok(Dispatched {
+                        value,
+                        target,
+                        attempt_started,
+                        member_reservation,
+                        in_flight,
+                    });
+                }
+                Err(e) => {
+                    let (retryable, budget_covers) = match &e {
+                        ProxyError::Bridge(be) => (
+                            is_retryable(be, retry_on_429, fallback_statuses) && permit(be),
+                            budget.covers(be),
+                        ),
+                        _ => (false, true),
+                    };
+                    if routing.is_some() || retryable {
+                        log_attempt_failure(
+                            &client.request_id,
+                            &target.model.display_name,
+                            attempt_idx + 1,
+                            &e,
+                            retryable,
+                            fallback_statuses,
+                        );
+                    }
+                    let (error_class, error_message) = crate::attempt::attempt_error_from_proxy(&e);
+                    telemetry.record(
+                        state,
+                        AttemptRecord {
+                            index,
+                            kind,
+                            target_model: target_model.clone(),
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: e.status().as_u16(),
+                            success: false,
+                            error_class,
+                            error_message,
+                            latency_ms: crate::attempt::ms_since(attempt_started),
+                            dispatched: crate::attempt::attempt_reached_upstream(&e),
+                        },
+                    );
+                    if !retryable {
+                        return Err(e);
+                    }
+                    last_err = Some(e);
+                    if !budget_covers {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))
 }
 
 /// Balancing state is keyed per (virtual model, tier priority). Priority is

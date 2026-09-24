@@ -31,8 +31,8 @@ import {
 //      forwards verbatim to upstream's /v1/rerank with only the
 //      `model` field rewritten.
 //   2. Cohere provider (#213 Phase 1) — caller POSTs against a
-//      Cohere-provider Model. Gateway dispatches to Cohere's
-//      `/v1/rerank` with Bearer auth + the rewritten model.
+//      Cohere-provider Model. Gateway dispatches to Cohere's native
+//      `/v2/rerank` with Bearer auth + the rewritten model.
 //   3. Jina provider (#213 Phase 2) — caller POSTs against a
 //      Jina-provider Model. Gateway dispatches to Jina's
 //      `/v1/rerank` (https://api.jina.ai/v1/rerank). Jina's wire
@@ -215,17 +215,15 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
     // Per #213 Phase 1: a Model with `provider: "cohere"` is now a
     // valid configuration on /v1/rerank (parallel to OpenAI). Cohere
     // natively implements the same body shape (`{model, query,
-    // documents, top_n}`) at `…/v1/rerank` with `Authorization:
+    // documents, top_n}`) at `<host>/v2/rerank` with `Authorization:
     // Bearer <key>` auth, so the gateway forwards verbatim with the
     // `model` field rewritten — no transform required.
     const cohereSecret = "sk-cohere-mock-e2e";
     const coherePk = await seed.createProviderKey({
       display_name: "rerank-cohere-pk",
       secret: cohereSecret,
-      // Operator can also set this to `https://api.cohere.com`; the
-      // gateway's `build_v1_url` produces `…/v1/rerank` from either
-      // form.
-      api_base: `${upstream.baseUrl}/v1`,
+      // The bare host, as Cohere's own default base is written.
+      api_base: upstream.baseUrl,
     });
     await seed.createModel({
       display_name: "rerank-cohere",
@@ -289,7 +287,7 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
     await res.json();
 
     // Upstream wire-shape contract:
-    //   - path is `/v1/rerank`
+    //   - path is `/v2/rerank`
     //   - `Authorization: Bearer <Cohere secret>` (NOT the caller's
     //     plaintext bearer — that would leak the gateway's caller
     //     credential to the upstream provider)
@@ -297,7 +295,7 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
     //     else byte-for-byte
     const testCalls = upstream.receivedRequests
       .slice(baseline)
-      .filter((r) => r.path === "/v1/rerank");
+      .filter((r) => r.path === "/v2/rerank");
     expect(testCalls).toHaveLength(1);
     expect(testCalls[0]?.method).toBe("POST");
     expect(testCalls[0]?.headers["authorization"]).toBe(`Bearer ${cohereSecret}`);
@@ -315,8 +313,8 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
     expect(sentBody.top_n).toBe(requestPayload.top_n);
 
     // Per #213 audit MEDIUM-2: pin the EXACT field set sent to
-    // Cohere. Cohere's `/v1/rerank` documents
-    // `{model, query, documents, top_n, return_documents, ...}`
+    // Cohere. Cohere's `/v2/rerank` documents
+    // `{model, query, documents, top_n, max_tokens_per_doc}`
     // — https://docs.cohere.com/reference/rerank. The gateway
     // forwards verbatim, so the upstream body MUST contain ONLY
     // the keys the caller sent — no gateway-injected extras.

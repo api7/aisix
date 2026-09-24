@@ -421,6 +421,21 @@ pub(crate) fn guardrail_block_error(
     }
 }
 
+/// The `data:` payload of the OpenAI-shape SSE `event: error` frame that
+/// ends a streamed response an output guardrail refused. It is the buffered
+/// 422 body for the same refusal, so the two halves of an endpoint carry the
+/// same `error.type` and the same `error.code` (`guardrail_unavailable` for
+/// a fail-closed refusal, none for a policy block).
+pub(crate) fn guardrail_block_frame_payload(
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> String {
+    serde_json::to_string(
+        &guardrail_block_error("response", guardrail_name, unavailable).envelope(),
+    )
+    .expect("an error envelope serializes")
+}
+
 impl ProxyError {
     pub fn status(&self) -> StatusCode {
         match self {
@@ -866,6 +881,28 @@ struct AnthropicErrorBody {
     #[serde(rename = "type")]
     kind: String,
     message: String,
+    /// Set only on a guardrail refusal ([`anthropic_guardrail_code`]):
+    /// `type` is pinned to the SDK's closed literal, so without it a
+    /// policy block and a malformed request are the same 422.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
+}
+
+/// The Anthropic envelope's `error.code` for a guardrail refusal, shared by
+/// the HTTP 422 body and the streaming `event: error` frame of
+/// `/v1/messages` and `/v1/messages/count_tokens`.
+///
+/// `error.type` cannot carry the signal there: it stays
+/// `invalid_request_error`, because the Anthropic SDK types it as a closed
+/// literal and a `content_filter` type once failed its typed parse. The
+/// code does: `content_filter` for a policy block, and for a fail-closed
+/// refusal the same `guardrail_unavailable` the OpenAI envelope carries.
+pub(crate) fn anthropic_guardrail_code(unavailable: Option<&str>) -> &'static str {
+    if unavailable.is_some() {
+        "guardrail_unavailable"
+    } else {
+        "content_filter"
+    }
 }
 
 /// Map an HTTP status code to the Anthropic-canonical `error.type`
@@ -907,7 +944,8 @@ pub(crate) fn anthropic_kind_from_status(status: StatusCode) -> &'static str {
 
 impl ProxyError {
     /// Render this error as an Anthropic-shape `{type:"error", error:
-    /// {type, message}}` HTTP response. Used by `/v1/messages` so the
+    /// {type, message}}` HTTP response, plus `error.code` on a guardrail
+    /// refusal ([`anthropic_guardrail_code`]). Used by `/v1/messages` so the
     /// Anthropic SDK's envelope parser sees a shape the official
     /// SDK and the broader ecosystem both treat as canonical.
     ///
@@ -929,6 +967,12 @@ impl ProxyError {
         let retry_after = self.retry_after_secs();
         let rate_limit_detail = self.rate_limit_detail();
         let kind = anthropic_kind_from_status(status).to_string();
+        let code = match &self {
+            ProxyError::ContentFiltered { unavailable, .. } => {
+                Some(anthropic_guardrail_code(unavailable.as_deref()))
+            }
+            _ => None,
+        };
         // Reuse OpenAI envelope only for the SAFE-MESSAGE logic
         // (5xx body redaction, 4xx upstream-message pass-through).
         // The inner type is overwritten to the Anthropic-canonical
@@ -939,6 +983,7 @@ impl ProxyError {
             error: AnthropicErrorBody {
                 kind,
                 message: openai_env.error.message,
+                code,
             },
         };
         let mut response = (status, Json(anth_body)).into_response();
@@ -1396,19 +1441,41 @@ mod tests {
         assert_anthropic_envelope(resp, StatusCode::PAYLOAD_TOO_LARGE, "request_too_large").await;
     }
 
+    /// Content-filter rejections share 422 with the OpenAI side, and the
+    /// Anthropic-canonical 422 is `invalid_request_error` (the SDK literal
+    /// has no content-filter type). AISIX-Cloud#726: so `error.code` is the
+    /// only field that tells a guardrail refusal from a malformed request —
+    /// and a broken fail-closed row from a policy hit.
     #[tokio::test]
-    async fn anthropic_envelope_422_content_filter_maps_to_invalid_request_error() {
-        // Content-filter rejections share 422 with the OpenAI side;
-        // Anthropic-canonical 422 maps to `invalid_request_error`
-        // (no dedicated content-filter type in the SDK literal).
-        let err = guardrail_block_error("request", None, None);
-        let resp = err.into_anthropic_response();
-        assert_anthropic_envelope(
-            resp,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_request_error",
-        )
+    async fn anthropic_envelope_422_content_filter_maps_to_invalid_request_error_with_a_code() {
+        async fn body(err: ProxyError) -> serde_json::Value {
+            let resp = err.into_anthropic_response();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            body_to_json(resp).await
+        }
+        let policy = body(guardrail_block_error("request", Some("gr"), None)).await;
+        assert_eq!(policy["error"]["type"], "invalid_request_error");
+        assert_eq!(policy["error"]["code"], "content_filter");
+
+        let broken = body(guardrail_block_error(
+            "request",
+            Some("gr"),
+            Some(TAG_UNSCANNABLE_BODY),
+        ))
         .await;
+        assert_eq!(broken["error"]["type"], "invalid_request_error");
+        assert_eq!(broken["error"]["code"], "guardrail_unavailable");
+        // The same code the OpenAI envelope carries for a fail-closed row.
+        assert_eq!(
+            guardrail_block_error("request", None, Some(TAG_UNSCANNABLE_BODY))
+                .envelope()
+                .error
+                .code
+                .as_deref(),
+            Some("guardrail_unavailable"),
+        );
+
+        assert!(policy["error"].get("param").is_none());
     }
 
     #[tokio::test]

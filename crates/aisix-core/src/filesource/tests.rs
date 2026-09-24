@@ -1683,3 +1683,37 @@ fn two_issuerless_providers_are_not_a_duplicate_issuer() {
     let snap = load(&file, &env).expect("file must load");
     assert_eq!(snap.oidc_providers.len(), 2);
 }
+
+#[test]
+fn an_openapi_mcp_server_serving_no_tools_is_a_load_error_and_collisions_load() {
+    // AISIX-Cloud#1272: the file source runs the same tool generation the
+    // runtime serves from, so a document it can turn into no tool fails the
+    // load instead of registering a server with nothing on it.
+    let env = env_of(&[]);
+    let file_with = |spec: &str| {
+        format!(
+            "_format_version: \"1\"\n\nmcp_servers:\n  - name: erp\n    type: openapi\n    \
+             url: https://erp.test\n    spec: {spec}\n"
+        )
+    };
+    for (spec, expected) in [
+        (r#"{"openapi": "3.0.0"}"#, "no `paths` object"),
+        (
+            r#"{"paths": {"/upload": {"post": {"requestBody": {"content": {"multipart/form-data": {}}}}}}}"#,
+            "no operations that can become tools",
+        ),
+    ] {
+        let errors = errors_of(load(&file_with(spec), &env));
+        assert!(
+            errors.iter().any(|e| e.contains(expected)),
+            "expected {expected:?} in {errors:?}"
+        );
+    }
+
+    let snap = load(
+        &file_with(r#"{"paths": {"/a": {"get": {"operationId": "foo/list"}}, "/b": {"get": {"operationId": "foo.list"}}}}"#),
+        &env,
+    )
+    .expect("colliding operationIds load");
+    assert_eq!(snap.mcp_servers.len(), 1);
+}

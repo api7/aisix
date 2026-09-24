@@ -4163,6 +4163,58 @@ data: [DONE]\n\n"
         );
     }
 
+    /// The `data:` payload of the refusal frame on a streamed chat wire.
+    fn refusal_frame(wire: &str) -> serde_json::Value {
+        let frame = wire
+            .split("\n\n")
+            .find_map(|f| f.strip_prefix("event: error\ndata: "))
+            .unwrap_or_else(|| panic!("no refusal frame on the wire: {wire}"));
+        serde_json::from_str(frame).unwrap()
+    }
+
+    /// The streamed refusal carries the same `error.code` the buffered 422
+    /// body carries for it: `guardrail_unavailable` whenever the guardrail
+    /// could not evaluate the response — a held stream outgrowing its cap, a
+    /// screening service down in window or whole-response mode — and no
+    /// code for a policy block.
+    #[tokio::test]
+    async fn streamed_guardrail_refusals_carry_the_buffered_error_code() {
+        let acs_down = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/contentsafety/text:analyze"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&acs_down)
+            .await;
+        let acs_hit = acs_mock(6).await;
+        let row = |endpoint: &str, mode: &str| {
+            format!(
+                r#"{{"name":"tm","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{endpoint}","api_key":"k","stream_processing_mode":"{mode}","window_size":5,"window_overlap_size":1}}"#
+            )
+        };
+        let cap = format!(
+            r#"{{"name":"tm","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k","stream_processing_mode":"buffer_full","max_buffer_bytes":4,"on_buffer_exceeded":"fail_closed"}}"#,
+            acs_hit.uri()
+        );
+        let chunks = two_content_chunks("hello ", "world!");
+        for (cfg, code) in [
+            (cap, Some("guardrail_unavailable")),
+            (
+                row(&acs_down.uri(), "window"),
+                Some("guardrail_unavailable"),
+            ),
+            (
+                row(&acs_down.uri(), "buffer_full"),
+                Some("guardrail_unavailable"),
+            ),
+            (row(&acs_hit.uri(), "window"), None),
+            (row(&acs_hit.uri(), "buffer_full"), None),
+        ] {
+            let v = refusal_frame(&run_textmod_stream(&cfg, &chunks).await);
+            assert_eq!(v["error"]["type"], "content_filter", "{cfg}: {v}");
+            assert_eq!(v["error"]["code"].as_str(), code, "{cfg}: {v}");
+        }
+    }
+
     // ---- regression coverage for issue #107 -------------------------
     // Pre-fix only /v1/chat/completions enforced rate-limit / budget;
     // every other LLM endpoint silently bypassed both. The test below
@@ -10288,7 +10340,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
 
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/compatibility/v1/chat/completions"))
             .and(header("authorization", "Bearer cohere-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "cmpl-cohere",

@@ -296,4 +296,76 @@ describe("mcp openapi e2e: REST API exposed as MCP tools", () => {
     expect(allowed.isError).not.toBe(true);
     expect(JSON.parse(allowed.text ?? "{}").id).toBe("7");
   });
+
+  // A document the gateway can turn into no tool would register a server
+  // that serves nothing; it is rejected at load and reported like any other
+  // rejected row. Operation ids that collide after sanitization are not a
+  // rejection: both operations are served, one under a `_2` suffix.
+  test("an openapi server yielding no tools is rejected; colliding operationIds load", async () => {
+    if (!etcdReachable) return;
+    const etcd = new EtcdClient();
+    const badId = randomUUID();
+    const dupId = randomUUID();
+    const server = (name: string, spec: unknown) =>
+      JSON.stringify({
+        name,
+        type: "openapi",
+        url: erp!.baseUrl,
+        auth_type: "bearer",
+        secret: erp!.token,
+        spec,
+      });
+    await etcd.put(
+      `${app!.etcdPrefix}/mcp_servers/${badId}`,
+      server("empty", {
+        openapi: "3.0.0",
+        paths: {
+          "/upload": {
+            post: {
+              operationId: "upload",
+              requestBody: { content: { "multipart/form-data": {} } },
+            },
+          },
+        },
+      }),
+    );
+    await etcd.put(
+      `${app!.etcdPrefix}/mcp_servers/${dupId}`,
+      server("dup", {
+        openapi: "3.0.0",
+        paths: {
+          "/items/{id}": { get: { operationId: "items/get" } },
+          "/items": { get: { operationId: "items.get" } },
+        },
+      }),
+    );
+    try {
+      let rejected: Array<{ resource_kind: string; resource_id: string }> = [];
+      let names: string[] = [];
+      await waitConfigPropagation(async () => {
+        const res = await fetch(`${app!.metricsUrl}/status/config`);
+        rejected = ((await res.json()) as { rejected: typeof rejected }).rejected;
+        names = (await listTools(KEY_FULL)).map((t) => t.name);
+        return (
+          rejected.some((r) => r.resource_id === badId) &&
+          names.some((n) => n.startsWith("dup__"))
+        );
+      });
+      expect(rejected.find((r) => r.resource_id === badId)!.resource_kind).toBe(
+        "mcp_servers",
+      );
+      expect(rejected.some((r) => r.resource_id === dupId)).toBe(false);
+      expect(names.filter((n) => n.startsWith("dup__")).sort()).toEqual([
+        "dup__items_get",
+        "dup__items_get_2",
+      ]);
+      expect(names.some((n) => n.startsWith("empty__"))).toBe(false);
+
+      const metrics = await (await fetch(`${app!.metricsUrl}/metrics`)).text();
+      expect(metrics).toMatch(/aisix_config_rejected_resources\{kind="mcp_servers"\} 1\b/);
+    } finally {
+      await etcd.delete(`${app!.etcdPrefix}/mcp_servers/${badId}`);
+      await etcd.delete(`${app!.etcdPrefix}/mcp_servers/${dupId}`);
+    }
+  });
 });

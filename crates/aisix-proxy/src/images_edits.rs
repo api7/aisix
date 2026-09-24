@@ -110,6 +110,8 @@ pub async fn image_edits(
     // where a guardrail block lands — stamps the enforced hits too
     // (AISIX-Cloud#1330 / #1024).
     let mut audit = crate::usage_attr::GuardrailAudit::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::attempt::RoutingTelemetry::default();
 
     match dispatch(
         &state,
@@ -119,6 +121,7 @@ pub async fn image_edits(
         &request_id,
         &client,
         &mut audit,
+        &mut routing,
     )
     .await
     {
@@ -134,6 +137,7 @@ pub async fn image_edits(
                 status,
                 elapsed,
                 &request_id,
+                &routing,
                 None,
             );
             // One ProviderKey lookup for both terminal emits (#941).
@@ -147,10 +151,29 @@ pub async fn image_edits(
                     model: &success.model_name,
                     upstream_model: &success.upstream_model,
                     pk: pk.labels(),
+                    is_fallback: routing.fallback_count() > 0,
                     ..Default::default()
                 },
                 status,
                 elapsed,
+            );
+            // One zero-token event per attempt that failed before the
+            // winner (#655).
+            crate::usage_attr::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::operation::IMAGE_EDIT,
+                &request_id,
+                &success.model_name,
+                &api_key_id,
+                &client,
+                &success.applied_guardrails,
+                &routing.attempts,
+                /* terminal_last */ false,
+                false,
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
             let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
             crate::images::emit_usage_event(
@@ -176,6 +199,7 @@ pub async fn image_edits(
                 success.captured_content.as_ref(),
                 &audit,
                 true,
+                routing.winner(),
             );
             success.response
         }
@@ -193,6 +217,7 @@ pub async fn image_edits(
                 status,
                 elapsed,
                 &request_id,
+                &routing,
                 Some(&err),
             );
             // AISIX-Cloud#1325: the form is parsed inside the dispatch that
@@ -206,7 +231,7 @@ pub async fn image_edits(
                 &state,
                 ENDPOINT,
                 crate::request_metrics::Caller::new(&auth),
-                last_target.upstream(metric_model.as_ref(), false, false),
+                last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
                 elapsed,
             );
@@ -215,23 +240,46 @@ pub async fn image_edits(
             // failure past model resolution (a guardrail 422, a provider
             // 400); earlier failures leave it empty — status + error
             // class still identify those.
-            crate::usage_attr::emit_error_usage_event(
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
+            crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
                 crate::operation::IMAGE_EDIT,
-                "openai",
                 &request_id,
                 &attributed.requested_model,
                 &api_key_id,
-                status,
-                err.kind(),
-                err.is_guardrail_block(),
                 &client,
-                crate::usage_attr::applied_guardrails(&audit),
-                crate::usage_attr::enforced_hits(&audit),
-                crate::usage_attr::guardrail_scores(&audit),
-                crate::usage_attr::bypass_reason(&audit),
+                &crate::usage_attr::applied_guardrails(&audit),
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
+            // A failure no attempt answers for — pre-dispatch, or after the
+            // winner — is one zero-token terminal event.
+            if !failed_terminal {
+                crate::usage_attr::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::operation::IMAGE_EDIT,
+                    "openai",
+                    &request_id,
+                    &attributed.requested_model,
+                    &api_key_id,
+                    status,
+                    err.kind(),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::usage_attr::applied_guardrails(&audit),
+                    crate::usage_attr::enforced_hits(&audit),
+                    crate::usage_attr::guardrail_scores(&audit),
+                    crate::usage_attr::bypass_reason(&audit),
+                );
+            }
             err.into_response()
         }
     }
@@ -240,6 +288,7 @@ pub async fn image_edits(
 /// Collect all multipart fields, resolve the model, swap in the upstream
 /// model id, then rebuild and forward the multipart form. See audio's
 /// `multipart_dispatch` for the pattern this follows (minus streaming).
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,
     // Out-param: the snapshot is loaded HERE, once the upload has been
@@ -251,6 +300,7 @@ async fn dispatch(
     request_id: &str,
     client_ctx: &ClientContext,
     audit_out: &mut crate::usage_attr::GuardrailAudit,
+    routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<EditsDispatchSuccess, ProxyError> {
     // Collect all fields first so we can find `model` before building the
     // outgoing reqwest multipart.
@@ -444,185 +494,234 @@ async fn dispatch(
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
-    let model = &model_entry.value;
+    // A Model Group walks its targets (AISIX-Cloud#1111); every per-target
+    // input — provider gate, key, URL, upstream id, deadline — comes from
+    // the target.
+    *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client_ctx.trace.clone());
+    let dispatched = crate::routing::dispatch_with_failover(
+        state,
+        snapshot,
+        auth,
+        client_ctx,
+        &model_name,
+        &model_entry,
+        routing_out,
+        |_| true,
+        |_| None,
+        |target, timeouts| {
+            let (model_name, fields) = (&model_name, &fields);
+            async move {
+                let model = &target.model;
 
-    // Per #168's reasoning on generations: only OpenAI's API documents
-    // the `/v1/images/edits` route + form shape. Routing another provider
-    // here would dispatch to an upstream that 404s — reject explicitly at
-    // the gateway boundary instead. Cross-provider editing wires
-    // (Gemini / Vertex / BFL) are the AISIX-Cloud#1360 Phase 2 follow-up.
-    if model.provider.as_deref() != Some("openai") {
-        reservation.commit_tokens(0).await;
-        return Err(ProxyError::InvalidRequest(format!(
-            "model `{model_name}` is not an OpenAI provider; \
-             /v1/images/edits requires OpenAI"
-        )));
+                // Per #168's reasoning on generations: only OpenAI's API documents
+                // the `/v1/images/edits` route + form shape. Routing another provider
+                // here would dispatch to an upstream that 404s — reject explicitly at
+                // the gateway boundary instead. Cross-provider editing wires
+                // (Gemini / Vertex / BFL) are the AISIX-Cloud#1360 Phase 2 follow-up.
+                if model.provider.as_deref() != Some("openai") {
+                    return Err(ProxyError::InvalidRequest(format!(
+                        "{} is not an OpenAI provider; \
+                         /v1/images/edits requires OpenAI",
+                        crate::routing::refused_model_label(model_name, model)
+                    )));
+                }
+
+                let provider = crate::dispatch::require_provider(model)?.to_string();
+                let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
+                let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
+
+                let url = aisix_gateway::url_cache::cached_endpoint_url(
+                    &pk_entry.id,
+                    "proxy/images/edits",
+                    // Every resolve_base_url input, via the shared constructor
+                    // (#1017), plus the endpoint path.
+                    &{
+                        let [base, vendor, adapter] =
+                            crate::dispatch::pk_url_fingerprint(&pk_entry.value);
+                        [base, vendor, adapter, "/images/edits"]
+                    },
+                    || {
+                        let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+                        Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
+                            &base,
+                            "/images/edits",
+                        ))
+                    },
+                )?;
+                let provider_label = provider.to_ascii_lowercase();
+
+                // Rebuild the multipart form with `model` rewritten. A `multipart::Form`
+                // is single-use (sending consumes it), so this is a closure: each retry
+                // attempt below builds a fresh one. That is only possible because every
+                // part is `Part::bytes` over an in-memory `Bytes`.
+                let build_form = || {
+                    let mut form = multipart::Form::new();
+                    for (name, file_name, content_type, data) in fields {
+                        let field_data = if name == "model" {
+                            Bytes::copy_from_slice(upstream_model.as_bytes())
+                        } else {
+                            data.clone()
+                        };
+
+                        let data_vec = field_data.to_vec();
+                        let mut part = if let Some(ct) = content_type {
+                            multipart::Part::bytes(data_vec.clone())
+                                .mime_str(ct)
+                                .unwrap_or_else(|_| multipart::Part::bytes(data_vec))
+                        } else {
+                            multipart::Part::bytes(data_vec)
+                        };
+                        if let Some(fname) = file_name {
+                            part = part.file_name(fname.clone());
+                        }
+                        form = form.part(name.clone(), part);
+                    }
+                    form
+                };
+
+                // Headers built explicitly so the PK's `request.default_headers` and
+                // `request.forward_client_headers` apply (AISIX-Cloud#867). The body is
+                // a multipart form, so JSON body-field overrides don't apply — only
+                // headers do. Content-Type is left to `.multipart()` (it sets the
+                // boundary). Reserved auth headers are protected by
+                // `apply_request_headers`.
+                let mut headers = axum::http::HeaderMap::new();
+                let auth_hv =
+                    header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
+                        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                            "api key contains invalid header chars: {e}"
+                        )))
+                    })?;
+                headers.insert(header::AUTHORIZATION, auth_hv);
+                let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
+                    ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                        "request_id contains invalid header chars: {e}"
+                    )))
+                })?;
+                headers.insert(
+                    header::HeaderName::from_static("x-aisix-request-id"),
+                    rid_hv,
+                );
+                aisix_gateway::apply_request_headers(
+                    &mut headers,
+                    &crate::dispatch::upstream_header_ctx(
+                        &pk_entry.value,
+                        &pk_entry.id,
+                        model,
+                        &target.id,
+                        client_ctx,
+                    ),
+                );
+
+                let client =
+                    crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
+                let tracker = &state.runtime_status;
+                let model_id: &str = &target.id;
+                let cooldown_cfg = model.cooldown.as_ref();
+                // #554/#911: the per-model E2E request timeout bounds the whole
+                // buffered exchange, like the other direct-upstream paths.
+                let request_budget = timeouts.request;
+                let resp_json = match {
+                    let mut req = url
+                        .clone()
+                        .post_on(&client)
+                        .headers(headers.clone())
+                        .multipart(build_form());
+                    if let Some(d) = request_budget {
+                        req = req.timeout(d);
+                    }
+                    async move {
+                        // `reqwest_error_to_bridge`: an elapsed `timeout` must surface
+                        // as `BridgeError::Timeout`, not transport — the distinction
+                        // decides whether the default retry budget covers it.
+                        let send_started = Instant::now();
+                        let resp = req.send().await.map_err(|e| {
+                            crate::cooldown::note_failure(
+                                tracker,
+                                model_id,
+                                cooldown_cfg,
+                                crate::dispatch::reqwest_error_to_bridge(&e, send_started),
+                            )
+                        })?;
+                        let status = resp.status();
+                        if !status.is_success() {
+                            let s = status.as_u16();
+                            let retry_after = aisix_gateway::parse_retry_after(resp.headers());
+                            let msg = resp.text().await.unwrap_or_default();
+                            return Err(crate::cooldown::note_failure(
+                                tracker,
+                                model_id,
+                                cooldown_cfg,
+                                aisix_gateway::BridgeError::upstream_status_with_retry_after(
+                                    s,
+                                    msg.chars().take(1024).collect::<String>(),
+                                    retry_after,
+                                ),
+                            ));
+                        }
+                        let body_bytes = resp.bytes().await.map_err(|e| {
+                            crate::cooldown::note_failure(
+                                tracker,
+                                model_id,
+                                cooldown_cfg,
+                                aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+                            )
+                        })?;
+                        // The edits response is a JSON object (`{created,
+                        // data, usage?}`) on every documented success; a
+                        // body that doesn't parse is a failed attempt, so
+                        // it neither marks the target healthy nor ends a
+                        // group's failover.
+                        serde_json::from_slice::<Value>(&body_bytes).map_err(|e| {
+                            crate::cooldown::note_failure(
+                                tracker,
+                                model_id,
+                                cooldown_cfg,
+                                aisix_gateway::BridgeError::UpstreamDecode(format!(
+                                    "image edits response is not JSON: {e}"
+                                )),
+                            )
+                        })
+                    }
+                }
+                .await
+                {
+                    Ok(v) => v,
+                    Err(err) => return Err(ProxyError::Bridge(err)),
+                };
+                Ok((
+                    resp_json,
+                    provider_label,
+                    pk_entry.id.to_string(),
+                    upstream_model,
+                ))
+            }
+        },
+    )
+    .await;
+    let crate::routing::Dispatched {
+        value: (resp_json, provider_label, pk_id, upstream_model),
+        target,
+        member_reservation,
+        ..
+    } = match dispatched {
+        Ok(d) => d,
+        Err(e) => {
+            reservation.commit_tokens(0).await;
+            return Err(e);
+        }
+    };
+    // Fold the target's model-layer reservation in (AISIX-Cloud#1087) so
+    // one commit bills the member's TPM/TPD too.
+    let mut reservation = reservation;
+    if let Some(member) = member_reservation {
+        reservation.merge(member);
     }
 
-    let provider = crate::dispatch::require_provider(model)?.to_string();
-    let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
-    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-    let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
-
-    let url = aisix_gateway::url_cache::cached_endpoint_url(
-        &pk_entry.id,
-        "proxy/images/edits",
-        // Every resolve_base_url input, via the shared constructor
-        // (#1017), plus the endpoint path.
-        &{
-            let [base, vendor, adapter] = crate::dispatch::pk_url_fingerprint(&pk_entry.value);
-            [base, vendor, adapter, "/images/edits"]
-        },
-        || {
-            let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
-                &base,
-                "/images/edits",
-            ))
-        },
-    )?;
-    let provider_label = provider.to_ascii_lowercase();
-
-    // Rebuild the multipart form with `model` rewritten. A `multipart::Form`
-    // is single-use (sending consumes it), so this is a closure: each retry
-    // attempt below builds a fresh one. That is only possible because every
-    // part is `Part::bytes` over an in-memory `Bytes`.
-    let build_form = || {
-        let mut form = multipart::Form::new();
-        for (name, file_name, content_type, data) in &fields {
-            let field_data = if name == "model" {
-                Bytes::copy_from_slice(upstream_model.as_bytes())
-            } else {
-                data.clone()
-            };
-
-            let data_vec = field_data.to_vec();
-            let mut part = if let Some(ct) = content_type {
-                multipart::Part::bytes(data_vec.clone())
-                    .mime_str(ct)
-                    .unwrap_or_else(|_| multipart::Part::bytes(data_vec))
-            } else {
-                multipart::Part::bytes(data_vec)
-            };
-            if let Some(fname) = file_name {
-                part = part.file_name(fname.clone());
-            }
-            form = form.part(name.clone(), part);
-        }
-        form
-    };
-
-    // Headers built explicitly so the PK's `request.default_headers` and
-    // `request.forward_client_headers` apply (AISIX-Cloud#867). The body is
-    // a multipart form, so JSON body-field overrides don't apply — only
-    // headers do. Content-Type is left to `.multipart()` (it sets the
-    // boundary). Reserved auth headers are protected by
-    // `apply_request_headers`.
-    let mut headers = axum::http::HeaderMap::new();
-    let auth_hv = header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-            "api key contains invalid header chars: {e}"
-        )))
-    })?;
-    headers.insert(header::AUTHORIZATION, auth_hv);
-    let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
-        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-            "request_id contains invalid header chars: {e}"
-        )))
-    })?;
-    headers.insert(
-        header::HeaderName::from_static("x-aisix-request-id"),
-        rid_hv,
-    );
-    aisix_gateway::apply_request_headers(
-        &mut headers,
-        &crate::dispatch::upstream_header_ctx(
-            &pk_entry.value,
-            &pk_entry.id,
-            model,
-            &model_entry.id,
-            client_ctx,
-        ),
-    );
-
-    let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
-    let tracker = &state.runtime_status;
-    let model_id: &str = &model_entry.id;
-    let cooldown_cfg = model.cooldown.as_ref();
-    // #554/#911: the per-model E2E request timeout bounds the whole
-    // buffered exchange, like the other direct-upstream paths.
-    let request_budget =
-        crate::routing::effective_timeouts(model, None, state.default_timeouts).request;
-    let body_bytes = match crate::routing::retrying_dispatch(state, model, ENDPOINT, || {
-        let mut req = url
-            .clone()
-            .post_on(&client)
-            .headers(headers.clone())
-            .multipart(build_form());
-        if let Some(d) = request_budget {
-            req = req.timeout(d);
-        }
-        async move {
-            // `reqwest_error_to_bridge`: an elapsed `timeout` must surface
-            // as `BridgeError::Timeout`, not transport — the distinction
-            // decides whether the default retry budget covers it.
-            let send_started = Instant::now();
-            let resp = req.send().await.map_err(|e| {
-                crate::cooldown::note_failure(
-                    tracker,
-                    model_id,
-                    cooldown_cfg,
-                    crate::dispatch::reqwest_error_to_bridge(&e, send_started),
-                )
-            })?;
-            let status = resp.status();
-            if !status.is_success() {
-                let s = status.as_u16();
-                let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-                let msg = resp.text().await.unwrap_or_default();
-                return Err(crate::cooldown::note_failure(
-                    tracker,
-                    model_id,
-                    cooldown_cfg,
-                    aisix_gateway::BridgeError::upstream_status_with_retry_after(
-                        s,
-                        msg.chars().take(1024).collect::<String>(),
-                        retry_after,
-                    ),
-                ));
-            }
-            resp.bytes().await.map_err(|e| {
-                crate::cooldown::note_failure(
-                    tracker,
-                    model_id,
-                    cooldown_cfg,
-                    aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
-                )
-            })
-        }
-    })
-    .await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            reservation.commit_tokens(0).await;
-            return Err(ProxyError::Bridge(err));
-        }
-    };
-
-    // The edits response is a JSON object (`{created, data, usage?}`) on
-    // every documented success; a body that doesn't parse is an upstream
-    // defect surfaced as 502 rather than relayed as ambiguous bytes.
-    // Parsed BEFORE the health marks below, so a 2xx-with-garbage answer
-    // doesn't record the model healthy on a request the caller sees fail.
-    let resp_json: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
-        ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(format!(
-            "image edits response is not JSON: {e}"
-        )))
-    })?;
-
-    state.health.record_success(&model.display_name);
-    state.runtime_status.mark_healthy(&model_entry.id);
+    state.health.record_success(&target.model.display_name);
+    state.runtime_status.mark_healthy(&target.id);
 
     // #911 [21]: commit the actual token cost so TPM/TPD is enforced.
     let usage = crate::images::extract_token_usage(&resp_json);
@@ -644,8 +743,8 @@ async fn dispatch(
         response: Json(resp_json).into_response(),
         model_name,
         provider: provider_label,
-        model_id: model_entry.id.to_string(),
-        provider_key_id: pk_entry.id.to_string(),
+        model_id: target.id.clone(),
+        provider_key_id: pk_id,
         upstream_model,
         applied_guardrails,
         usage,
@@ -878,6 +977,53 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// A 2xx whose body is not JSON is a failed attempt: a Model Group
+    /// fails over to its next target instead of answering 502.
+    #[tokio::test]
+    async fn a_non_json_2xx_fails_over_to_the_next_group_target() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .and(wiremock::matchers::body_string_contains("garbage-upstream"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>not json</html>"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .and(wiremock::matchers::body_string_contains("gpt-image-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        let garbage: Model = serde_json::from_str(&format!(
+            r#"{{"display_name":"edit-garbage","provider":"openai","model_name":"garbage-upstream","provider_key_id":"{PK_ID}"}}"#
+        ))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("m-garbage", garbage, 1));
+        let mut ok = model_entry("edit-ok");
+        ok.id = "m-ok".into();
+        snap.models.insert(ok);
+        let group: Model = serde_json::from_str(
+            r#"{"display_name":"edit-group","routing":{"strategy":"failover","targets":[{"model":"edit-garbage"},{"model":"edit-ok"}],"retries":0,"max_fallbacks":1}}"#,
+        )
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-group", group, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, make_req("edit-group", "add a hat"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["data"][0]["b64_json"].is_string());
+    }
+
     /// The alias must NOT reach the upstream — the form's `model` field
     /// is rewritten to the Model row's upstream name.
     #[tokio::test]
@@ -1068,6 +1214,37 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("requires OpenAI"));
+    }
+
+    /// A Model Group whose first target is not OpenAI ends the request with
+    /// the same 400, naming the group and the target, without trying the
+    /// next one: every target of a group must serve the endpoint.
+    #[tokio::test]
+    async fn a_group_with_a_non_openai_target_names_it_in_the_400() {
+        let snap = new_snap("http://unused");
+        snap.models.insert(anthropic_model_entry("claude-img"));
+        let mut ok = model_entry("edit-ok");
+        ok.id = "m-ok".into();
+        snap.models.insert(ok);
+        let group: Model = serde_json::from_str(
+            r#"{"display_name":"mixed-group","routing":{"strategy":"failover","targets":[{"model":"claude-img"},{"model":"edit-ok"}]}}"#,
+        )
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-group", group, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, make_req("mixed-group", "add a hat"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["error"]["message"],
+            "request payload is invalid: model `mixed-group` (target `claude-img`) \
+             is not an OpenAI provider; /v1/images/edits requires OpenAI"
+        );
     }
 
     /// `stream=true` (partial-image SSE) is not relayed yet — explicit

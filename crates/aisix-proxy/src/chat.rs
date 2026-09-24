@@ -2055,6 +2055,7 @@ async fn dispatch(
                         );
                         let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
                         crate::routing::log_attempt_failure(
+                            request_id,
                             &model.display_name,
                             attempt_idx + 1,
                             &err,
@@ -3247,6 +3248,7 @@ async fn dispatch(
                     );
                     let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
                     crate::routing::log_attempt_failure(
+                        request_id,
                         &model.display_name,
                         attempt_idx + 1,
                         &err,
@@ -4892,9 +4894,7 @@ fn emit_usage_event(
     let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
-        // RFC 3339 UTC. cp-api parses with time.Parse(time.RFC3339, ...);
-        // chrono's `to_rfc3339_opts(Secs, true)` emits the trailing Z.
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
@@ -5232,7 +5232,7 @@ fn emit_access_log(
     // Per #655 the access log stays ONE line per request (the transport
     // plane), carrying user-perceived `latency` + the final status plus a
     // routing summary. The per-attempt detail lives in telemetry only.
-    let served_by = routing.winner().map(|w| w.target_model.as_str());
+    let summary = routing.access_log_summary();
     let target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method,
@@ -5250,15 +5250,9 @@ fn emit_access_log(
         total_tokens,
         request_id,
         provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
-        served_by_model: served_by.filter(|s| !s.is_empty()),
-        routing_attempt_count: match routing.attempt_count() {
-            0 => None,
-            n => Some(n),
-        },
-        routing_fallback_count: match routing.fallback_count() {
-            0 => None,
-            n => Some(n),
-        },
+        served_by_model: summary.served_by_model,
+        routing_attempt_count: summary.attempt_count,
+        routing_fallback_count: summary.fallback_count,
         error_kind,
         error: error.as_deref(),
         mcp: None,
@@ -5618,8 +5612,10 @@ where
         // `delta.content` — a blocked literal in tool-call `arguments` leaked.
         // Under BufferFull the held-content budget below bounds it (a stream
         // that overflows is refused, or released unscanned and no longer
-        // collected); every other policy bounds it at the default cap.
-        // Allocated only with a guardrail.
+        // collected). Under Window every window re-scans the whole buffer, so
+        // the chain's folded hold cap bounds it, and outgrowing that cap is a
+        // buffer trip like any other (#513, #1029). The live-forward monitor
+        // path bounds it at the default cap. Allocated only with a guardrail.
         let mut tool_calls_buf = if output_guardrail.is_some() {
             Some(String::new())
         } else {
@@ -5642,9 +5638,18 @@ where
             .unwrap_or_default();
         let hold_back = stream_policy.holds_back();
         let tool_calls_cap = match stream_policy {
-            aisix_guardrails::StreamOutputPolicy::BufferFull { .. } => usize::MAX,
-            _ => aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+            aisix_guardrails::StreamOutputPolicy::EndOfStreamCheck => {
+                aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES
+            }
+            _ => usize::MAX,
         };
+        let mut window_tool_calls_cap = match stream_policy {
+            aisix_guardrails::StreamOutputPolicy::Window { .. } => stream_policy.hold_cap(),
+            _ => None,
+        };
+        // Set once the tool-call text outgrows `window_tool_calls_cap`; the
+        // text past it is no longer collected for the window scans.
+        let mut tool_calls_overflowed = false;
         // What is held under BufferFull (#513): content, which
         // `max_buffer_bytes` caps, and the raw bytes it bounds too.
         let mut held = crate::held_content::HeldBuffer::default();
@@ -5790,12 +5795,30 @@ where
                     // for the output guardrail. `delta.tool_calls` streams as
                     // partial JSON objects; concatenate their text WITHOUT a
                     // separator so a literal split across deltas reassembles.
-                    if let (Some(tcs), Some(buf), false) =
-                        (chunk.delta.tool_calls.as_ref(), tool_calls_buf.as_mut(), cap_released)
-                    {
+                    if let (Some(tcs), Some(buf), false, false) = (
+                        chunk.delta.tool_calls.as_ref(),
+                        tool_calls_buf.as_mut(),
+                        cap_released,
+                        tool_calls_overflowed,
+                    ) {
                         for tc in tcs {
                             if buf.len() >= tool_calls_cap {
                                 break;
+                            }
+                            let function = tc.get("function");
+                            let name = function
+                                .and_then(|f| f.get("name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let args = function
+                                .and_then(|f| f.get("arguments"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if let Some((cap, _)) = window_tool_calls_cap {
+                                if buf.len() + name.len() + args.len() > cap {
+                                    tool_calls_overflowed = true;
+                                    break;
+                                }
                             }
                             if !hold_back {
                                 // Serialized deltas carry their envelope, so
@@ -5807,14 +5830,8 @@ where
                                         .saturating_mul(crate::held_content::RAW_HOLD_FACTOR),
                                 );
                             }
-                            if let Some(f) = tc.get("function") {
-                                if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
-                                    buf.push_str(n);
-                                }
-                                if let Some(a) = f.get("arguments").and_then(|v| v.as_str()) {
-                                    buf.push_str(a);
-                                }
-                            }
+                            buf.push_str(name);
+                            buf.push_str(args);
                         }
                     }
                     if let Some(u) = chunk.usage.as_ref() {
@@ -5890,6 +5907,39 @@ where
             let Some(chunk) = maybe_chunk else {
                 continue;
             };
+            // The tool-call text just outgrew the Window hold cap. This chunk
+            // is not on the wire yet, so fail-closed can still refuse it.
+            if let (Some((max_buffer_bytes, fail_open)), true, Some(ctx)) =
+                (window_tool_calls_cap, tool_calls_overflowed, output_guardrail.as_ref())
+            {
+                if fail_open {
+                    let comp = guard.comp();
+                    if comp.bypass_reason.is_empty() {
+                        comp.bypass_reason = crate::error::TAG_OUTPUT_BUFFER_EXCEEDED.to_owned();
+                    }
+                    ctx.chain.record_output_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                    // Recorded once; the remainder is released by window unscanned.
+                    window_tool_calls_cap = None;
+                } else {
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        max_buffer_bytes,
+                        "streamed tool-call arguments exceeded max_buffer_bytes; failing closed",
+                    );
+                    errored = true;
+                    guard.comp().guardrail_blocked = true;
+                    ctx.chain.record_output_buffer_exceeded();
+                    yield Ok::<_, Infallible>(
+                        Event::default().event("error").data(
+                            crate::error::guardrail_block_frame_payload(
+                                None,
+                                Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+                            ),
+                        ),
+                    );
+                    break;
+                }
+            }
             if !hold_back || cap_released {
                 // The EndOfStreamCheck path and a released BufferFull cap
                 // forward straight to the wire. (Error frames yielded in
@@ -5908,6 +5958,7 @@ where
                     aisix_guardrails::StreamOutputPolicy::Window {
                         size_chars,
                         overlap_chars,
+                        ..
                     } => {
                         if window_buf.chars().count() >= *size_chars {
                             if let Some(ctx) = output_guardrail.as_ref() {
@@ -5960,12 +6011,9 @@ where
                                         guard.comp().guardrail_blocked = true;
                                         yield Ok::<_, Infallible>(
                                             Event::default().event("error").data(
-                                                error_frame_payload(
-                                                    "content_filter",
-                                                    &crate::error::guardrail_block_message(
-                                                        "response",
-                                                        guardrail_name.as_deref(),
-                                                     unavailable.as_deref()),
+                                                crate::error::guardrail_block_frame_payload(
+                                                    guardrail_name.as_deref(),
+                                                    unavailable.as_deref(),
                                                 ),
                                             ),
                                         );
@@ -6045,14 +6093,12 @@ where
                                     ctx.chain.record_output_buffer_exceeded();
                                 }
                                 yield Ok::<_, Infallible>(
-                                    Event::default().event("error").data(error_frame_payload(
-                                        "content_filter",
-                                        &crate::error::guardrail_block_message(
-                                            "response",
+                                    Event::default().event("error").data(
+                                        crate::error::guardrail_block_frame_payload(
                                             None,
                                             Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
                                         ),
-                                    )),
+                                    ),
                                 );
                                 break;
                             }
@@ -6207,12 +6253,9 @@ where
                                 errored = true;
                                 guard.comp().guardrail_blocked = true;
                                 yield Ok::<_, Infallible>(
-                                    Event::default().event("error").data(error_frame_payload(
-                                        "content_filter",
-                                        &crate::error::guardrail_block_message(
-                                            "response",
-                                            guardrail_name.as_deref(),
-                                         unavailable.as_deref()),
+                                    Event::default().event("error").data(crate::error::guardrail_block_frame_payload(
+                                        guardrail_name.as_deref(),
+                                        unavailable.as_deref(),
                                     )),
                                 );
                                 true
@@ -6330,12 +6373,9 @@ where
                         yield Ok::<_, Infallible>(
                             Event::default()
                                 .event("error")
-                                .data(error_frame_payload(
-                                    "content_filter",
-                                    &crate::error::guardrail_block_message(
-                                        "response",
-                                        guardrail_name.as_deref(),
-                                     unavailable.as_deref()),
+                                .data(crate::error::guardrail_block_frame_payload(
+                                    guardrail_name.as_deref(),
+                                    unavailable.as_deref(),
                                 )),
                         );
                     }

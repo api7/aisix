@@ -732,6 +732,8 @@ impl Guardrail for AliyunTextModerationGuardrail {
             _ => StreamOutputPolicy::Window {
                 size_chars: self.window_size as usize,
                 overlap_chars: self.window_overlap_size as usize,
+                max_buffer_bytes: self.max_buffer_bytes as usize,
+                on_exceeded_fail_open: self.on_buffer_exceeded == "fail_open",
             },
         }
     }
@@ -1612,7 +1614,9 @@ mod tests {
             g.stream_output_policy(),
             StreamOutputPolicy::Window {
                 size_chars: 2_000,
-                overlap_chars: 128
+                overlap_chars: 128,
+                max_buffer_bytes: 262_144,
+                on_exceeded_fail_open: false,
             }
         );
         let mut g2 = build("http://unused", "high", true);

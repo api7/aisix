@@ -1061,7 +1061,7 @@ async fn run_session(
     );
     let mut event = UsageEvent {
         request_id: request_id.clone(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: model_entry.id.clone(),
         api_key_id: auth.entry.id.clone(),
         requested_model: requested_model.clone(),

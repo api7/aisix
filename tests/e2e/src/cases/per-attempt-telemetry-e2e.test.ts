@@ -40,7 +40,7 @@ interface OtlpReceiver {
   /**
    * Same spans, plus the emitted `latency_ms`. The sink derives a span's
    * start from `occurred_at - latency_ms`, so `end - start` recovers the
-   * UsageEvent's `latency_ms` exactly (`occurred_at`'s second-level
+   * UsageEvent's `latency_ms` exactly (`occurred_at`'s own
    * precision cancels out in the subtraction).
    */
   spans: Array<{ attrs: Record<string, string>; latencyMs: number }>;

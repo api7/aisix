@@ -3266,6 +3266,29 @@ mod tests {
         assert_eq!(counts.get("email"), Some(&1));
     }
 
+    /// AISIX-Cloud#1621: an `mcp_call`'s arguments stream on their own
+    /// event pair, and `redact_responses_item` masks the same string on the
+    /// terminal item — so the pair must be masked too, or one stream
+    /// carries the raw value beside its masked copy.
+    #[test]
+    fn responses_sse_masks_the_mcp_call_arguments_channel() {
+        let chain = both();
+        let raw = concat!(
+            "event: response.mcp_call_arguments.delta\ndata: {\"type\":\"response.mcp_call_arguments.delta\",\"item_id\":\"mcp_1\",\"output_index\":0,\"delta\":\"{\\\"to\\\":\\\"a@\"}\n\n",
+            "event: response.mcp_call_arguments.delta\ndata: {\"type\":\"response.mcp_call_arguments.delta\",\"item_id\":\"mcp_1\",\"output_index\":0,\"delta\":\"x.com\\\"}\"}\n\n",
+            "event: response.mcp_call_arguments.done\ndata: {\"type\":\"response.mcp_call_arguments.done\",\"item_id\":\"mcp_1\",\"output_index\":0,\"arguments\":\"{\\\"to\\\":\\\"a@x.com\\\"}\"}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"mcp_call\",\"id\":\"mcp_1\",\"server_label\":\"s\",\"name\":\"send\",\"arguments\":\"{\\\"to\\\":\\\"a@x.com\\\"}\"}}\n\n",
+        );
+        let (out, counts) = redact_responses_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            !out.contains("a@"),
+            "an mcp_call argument fragment reached the client unmasked: {out}"
+        );
+        assert_eq!(out.matches("[EMAIL_REDACTED]").count(), 3, "out: {out}");
+        assert_eq!(counts.get("email"), Some(&1));
+    }
+
     /// A custom tool's input streams on its own event pair, and the same
     /// string is masked on the terminal item by `redact_responses_item`.
     /// Leave the pair out of this walk and the caller reads the masked

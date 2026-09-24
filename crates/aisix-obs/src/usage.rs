@@ -63,7 +63,9 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub trace_id: String,
 
-    /// Wall-clock time the upstream call completed, RFC 3339 (UTC).
+    /// Wall-clock time the upstream call completed: RFC 3339, UTC, with
+    /// exactly three fractional digits. Stamp it with
+    /// [`UsageEvent::occurred_at_now`], never by hand.
     pub occurred_at: String,
 
     /// UUID of the v3 Model row this request resolved to. Empty when
@@ -788,6 +790,14 @@ fn is_zero_u32(n: &u32) -> bool {
 }
 
 impl UsageEvent {
+    /// The current time in the one `occurred_at` format every emitter
+    /// writes. Millisecond precision because the control plane orders a
+    /// request's attempts and its usage rows by this value, and whole
+    /// seconds tie for everything a request emits.
+    pub fn occurred_at_now() -> String {
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
     /// The completion count every in-gateway consumer reports — the
     /// record's raw count with any reasoning the record unfolded put back.
     pub fn folded_completion_tokens(&self) -> u32 {
@@ -1091,6 +1101,21 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn occurred_at_is_utc_rfc3339_with_exactly_three_fractional_digits() {
+        let stamp = UsageEvent::occurred_at_now();
+        let (whole, frac) = stamp
+            .strip_suffix('Z')
+            .and_then(|s| s.split_once('.'))
+            .unwrap_or_else(|| panic!("{stamp}: want <seconds>.<millis>Z"));
+        assert_eq!(whole.len(), "2026-01-02T03:04:05".len(), "{stamp}");
+        assert!(
+            frac.len() == 3 && frac.bytes().all(|b| b.is_ascii_digit()),
+            "{stamp}"
+        );
+        chrono::DateTime::parse_from_rfc3339(&stamp).expect("must parse as RFC 3339");
+    }
 
     #[test]
     fn disabled_sink_is_a_noop() {

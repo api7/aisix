@@ -343,8 +343,10 @@ Two shapes, both already implemented — copy the nearest one:
   `when_all_unavailable: try_anyway` policy hands back the unfiltered list, which
   would defeat an allowlist. See `routing::targets_allowed_for_ip`.
 - **Check per attempt** (dynamic/stateful gates like a rate-limit reservation):
-  resolve from the attempt model *inside* the dispatch loop, in all four
-  group-capable endpoints (chat, messages, count_tokens, responses) and in both the
+  resolve from the attempt model *inside* the dispatch loop, in each loop that
+  walks targets — chat, messages, count_tokens and responses keep their own, and
+  `routing::dispatch_with_failover` serves the single-shot family (completions,
+  embeddings, rerank, images, audio, video submits) — and in both the
   streaming and non-streaming branches; skip the target and continue rather than
   failing the whole request. See `quota::reserve_routing_target`, which also shows
   the non-double-charge rule: it returns `None` for non-routing dispatch, whose

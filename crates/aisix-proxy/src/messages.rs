@@ -1015,6 +1015,7 @@ async fn dispatch(
                         ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
                     );
                     crate::routing::log_attempt_failure(
+                        request_id,
                         &target.model.display_name,
                         attempt_idx + 1,
                         &e,
@@ -1974,8 +1975,6 @@ fn anthropic_estimation_output_text(body: &Value) -> String {
     out
 }
 
-/// Concatenate the text from an Anthropic response's `content` blocks — the
-/// assistant's assembled output text, for content-capturing exporters.
 /// Extend the live-forward frame copy with `frames`, dropping the copy once
 /// it would outgrow the end-of-stream scan bound.
 fn keep_live_copy(copy: &mut Option<Vec<u8>>, frames: &[u8]) {
@@ -1988,6 +1987,24 @@ fn keep_live_copy(copy: &mut Option<Vec<u8>>, frames: &[u8]) {
     *copy = None;
 }
 
+/// Whether a streamed `/v1/messages` relay holds the whole response back
+/// for the output chain, as `(max_buffer_bytes, on_exceeded_fail_open)`;
+/// `None` relays live.
+///
+/// A block- or mask-capable output chain holds, `Window` as well as
+/// `BufferFull`: a verdict reached after the content went out cannot take it
+/// back. The relay has no window-by-window release, so a `Window` chain is
+/// held whole, under the folded `max_buffer_bytes` / `on_buffer_exceeded` of
+/// its members. A monitor-only chain (`EndOfStreamCheck`) relays live and is
+/// scanned once at end-of-stream.
+fn anthropic_stream_hold_policy(
+    chain: Option<&aisix_guardrails::GuardrailChain>,
+) -> Option<(usize, bool)> {
+    aisix_guardrails::Guardrail::stream_output_policy(chain?).hold_cap()
+}
+
+/// Concatenate the text from an Anthropic response's `content` blocks — the
+/// assistant's assembled output text, for content-capturing exporters.
 fn anthropic_response_text(body: &Value) -> String {
     body.get("content")
         .and_then(Value::as_array)
@@ -2619,22 +2636,12 @@ fn build_anthropic_sse_stream(
             bytes::Bytes::from($ev.to_sse_string())
         }};
     }
-    // #932 / #466-class: when the chain's streamed-output policy is the
-    // whole-response hold-back (BufferFull — keyword/pii/bedrock output
-    // guardrails), chunks are withheld from the encoder until the
-    // end-of-stream scan clears (and masks) them: a block keeps matched
-    // content off the wire entirely, and a mask can't rewrite bytes that
-    // already left. Window-policy guardrails (Azure/Aliyun) keep the
-    // pre-existing live-forward + end-of-stream check on this surface.
-    let hold_policy = output_guardrail.as_ref().and_then(|c| {
-        match aisix_guardrails::Guardrail::stream_output_policy(c.as_ref()) {
-            aisix_guardrails::StreamOutputPolicy::BufferFull {
-                max_buffer_bytes,
-                on_exceeded_fail_open,
-            } => Some((max_buffer_bytes, on_exceeded_fail_open)),
-            _ => None,
-        }
-    });
+    // #932 / #466-class: under a hold-back policy chunks are withheld from
+    // the encoder until the end-of-stream scan clears (and masks) them: a
+    // block keeps matched content off the wire entirely, and a mask can't
+    // rewrite bytes that already left. See `anthropic_stream_hold_policy`
+    // for which chains hold.
+    let hold_policy = anthropic_stream_hold_policy(output_guardrail.as_deref());
     let stream = async_stream::stream! {
         let mut guard = CompleteAnthropicStreamOnDrop {
             slot: Some((on_complete, AnthropicStreamCompletion::default())),
@@ -2849,6 +2856,9 @@ fn build_anthropic_sse_stream(
                     )
                     .await;
                 guard.comp().monitor_hits.extend(hits);
+                // Segment pass: over the held chunks under a hold-back policy
+                // (a mask rewrites them), otherwise over the assembled
+                // message the live relay already sent — read-only.
                 let mut seg_counts = crate::redact::RedactionCounts::new();
                 let mut seg_hits = Vec::new();
                 let verdict = crate::redact::moderate_body(
@@ -2858,11 +2868,18 @@ fn build_anthropic_sse_stream(
                     verdict,
                     &mut seg_counts,
                     &mut seg_hits,
-                    |g| crate::redact::redact_chat_chunks(g, &mut held_chunks),
+                    |g| {
+                        if hold_policy.is_some() {
+                            crate::redact::redact_chat_chunks(g, &mut held_chunks)
+                        } else {
+                            let _ = crate::redact::redact_chat_response(g, &mut synth.clone());
+                            crate::redact::RedactionCounts::new()
+                        }
+                    },
                 )
                 .await;
                 guard.comp().monitor_hits.extend(seg_hits);
-                if !seg_counts.is_empty() {
+                if hold_policy.is_some() && !seg_counts.is_empty() {
                     // Bedrock masked the held chunks — rebuild the content-
                     // capture accumulator from the masked content channel
                     // (the sync redactor below can't reproduce a provider-
@@ -2985,15 +3002,20 @@ fn build_anthropic_sse_stream(
 /// be: Anthropic's `error.type` is a closed enum in its SDK and carries no
 /// `content_filter` member, so emitting one made the streaming half of
 /// this endpoint disagree with the buffered half AND fail the SDK's typed
-/// parse. No `code` field either — the Anthropic envelope has none, and
-/// the caller reads WHICH guardrail fired from the message.
-fn guardrail_block_frame(guardrail_name: Option<&str>, unavailable: Option<&str>) -> String {
+/// parse. What tells a refusal apart is `error.code`, the same value the
+/// 422 body carries (`anthropic_guardrail_code`); the caller reads WHICH
+/// guardrail fired from the message.
+pub(crate) fn guardrail_block_frame(
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> String {
     format!(
         "event: error\ndata: {}\n\n",
         serde_json::json!({
             "type": "error",
             "error": {
                 "type": "invalid_request_error",
+                "code": crate::error::anthropic_guardrail_code(unavailable),
                 "message": crate::error::guardrail_block_message("response", guardrail_name, unavailable),
             }
         })
@@ -3321,7 +3343,7 @@ fn emit_anthropic_usage_event(
     let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
         // `model` is the client-sent alias on every call path
@@ -3903,22 +3925,12 @@ where
 {
     let delivered = Arc::new(AtomicU32::new(0));
     let delivered_for_drop = Arc::clone(&delivered);
-    // #932 / #466-class: when the chain's streamed-output policy is the
-    // whole-response hold-back (BufferFull — keyword/pii/bedrock output
-    // guardrails), the passthrough must buffer the raw SSE bytes rather
-    // than forward them live: a block must keep matched content off the
-    // wire entirely, and a mask can't be applied to bytes already sent.
-    // Window-policy guardrails (Azure/Aliyun incremental release) keep the
-    // pre-existing live-forward + end-of-stream check on this surface.
-    let hold_policy = output_guardrail.as_ref().and_then(|c| {
-        match aisix_guardrails::Guardrail::stream_output_policy(c.as_ref()) {
-            aisix_guardrails::StreamOutputPolicy::BufferFull {
-                max_buffer_bytes,
-                on_exceeded_fail_open,
-            } => Some((max_buffer_bytes, on_exceeded_fail_open)),
-            _ => None,
-        }
-    });
+    // #932 / #466-class: under a hold-back policy the passthrough buffers
+    // the raw SSE bytes rather than forward them live: a block must keep
+    // matched content off the wire entirely, and a mask can't be applied to
+    // bytes already sent. See `anthropic_stream_hold_policy` for which
+    // chains hold.
+    let hold_policy = anthropic_stream_hold_policy(output_guardrail.as_deref());
     let inner = async_stream::stream! {
         let mut guard = AnthropicStreamGuard {
             slot: Some((on_complete, AnthropicStreamUsage::default())),
@@ -4231,11 +4243,11 @@ where
         guard.usage().reached_end = true;
         // End-of-stream output guardrail (#448): scan the accumulated
         // assistant text. On a block, emit a terminal Anthropic `error`
-        // event. On the hold-back path (BufferFull) nothing has been
-        // forwarded yet, so a block keeps the matched content off the
-        // wire entirely; on the live-forward path (Window /
-        // EndOfStreamCheck) the bytes were already forwarded verbatim
-        // and the error frame is the trailing signal.
+        // event. On the hold-back path (Window / BufferFull) nothing has
+        // been forwarded yet, so a block keeps the matched content off the
+        // wire entirely; on the live-forward path (EndOfStreamCheck) the
+        // bytes were already forwarded verbatim and the error frame is the
+        // trailing signal.
         let mut blocked = false;
         if let (Some(chain), false) = (output_guardrail.as_ref(), released) {
             // Clone (not take) when content capture is on, so the assembled
@@ -4246,26 +4258,17 @@ where
             } else {
                 std::mem::take(&mut guard.usage().response_text)
             };
+            // Live-forward (no hold) has no held frames to walk, so the
+            // segment passes read what went out: the forwarded frames (#1027),
+            // or the accumulated text once the copy outgrew its bound — the
+            // one slot there is. Read-only: those bytes are already gone.
+            let live_frames = if hold.is_some() { None } else { live_copy.take() };
+            let live_text = (hold.is_none() && live_frames.is_none()).then(|| text.clone());
             // #1100: an excised frame is not released, but a forbidden
             // literal inside it must still block the response — the block
             // pass reads raw text, so it can scan a payload nothing could
             // parse. Appended to the scanned copy only: it never reached
             // the client, so it must not reach the captured content either.
-            // Live-forward (no hold) has no held frames to walk: the
-            // accumulated text is the one slot there is.
-            let live_segments: Vec<aisix_guardrails::ScanSegment> = if hold.is_some() {
-                Vec::new()
-            } else if let Some(frames) = live_copy.take() {
-                crate::redact::collect_segments(|g| {
-                    let _ = crate::redact::redact_anthropic_sse(g, &frames);
-                })
-            } else {
-                vec![aisix_guardrails::ScanSegment {
-                    text: text.clone(),
-                    role: aisix_guardrails::SegmentRole::Rewritable,
-                    in_latest_turn: true,
-                }]
-            };
             for payload in &unscanned {
                 if !text.is_empty() {
                     text.push('\n');
@@ -4287,19 +4290,20 @@ where
                     )
                     .await;
                 guard.usage().monitor_hits.extend(hits);
-                // Segment pass over the held SSE bytes. Only meaningful in
-                // hold-back mode (`held` is empty otherwise — and a chain
-                // with a segment member always folds to BufferFull, so a
-                // live-forward stream never carries one).
+                // Segment pass: over the held SSE bytes under a hold-back
+                // policy (a mask rewrites them), otherwise over what the
+                // live relay forwarded. Every holding chain is held
+                // (`anthropic_stream_hold_policy`), so the live copy serves
+                // monitor-mode members and the local kinds (#1027).
                 let mut seg_counts = crate::redact::RedactionCounts::new();
                 let mut seg_hits = Vec::new();
-                let local_extra = live_segments
-                    .into_iter()
-                    .chain(unscanned.iter().map(|t| aisix_guardrails::ScanSegment {
+                let local_extra = unscanned
+                    .iter()
+                    .map(|t| aisix_guardrails::ScanSegment {
                         text: t.clone(),
                         role: aisix_guardrails::SegmentRole::ScanOnly,
                         in_latest_turn: true,
-                    }))
+                    })
                     .collect();
                 let verdict = crate::redact::moderate_body_local_extra(
                     chain.as_ref(),
@@ -4309,17 +4313,27 @@ where
                     &mut seg_counts,
                     &mut seg_hits,
                     local_extra,
-                    |g| match crate::redact::redact_anthropic_sse(g, &held) {
-                        Some((rewritten, counts)) => {
-                            held = rewritten;
-                            counts
+                    |g| {
+                        if hold.is_some() {
+                            return match crate::redact::redact_anthropic_sse(g, &held) {
+                                Some((rewritten, counts)) => {
+                                    held = rewritten;
+                                    counts
+                                }
+                                None => crate::redact::RedactionCounts::new(),
+                            };
                         }
-                        None => crate::redact::RedactionCounts::new(),
+                        if let Some(frames) = live_frames.as_deref() {
+                            let _ = crate::redact::redact_anthropic_sse(g, frames);
+                        } else if let Some(t) = live_text.as_deref() {
+                            let _ = g.redact_output_text(t);
+                        }
+                        crate::redact::RedactionCounts::new()
                     },
                 )
                 .await;
                 guard.usage().monitor_hits.extend(seg_hits);
-                if !seg_counts.is_empty() {
+                if hold.is_some() && !seg_counts.is_empty() {
                     // Bedrock masked the held bytes — rebuild the content-
                     // capture accumulator from the masked text channels
                     // (the sync redactor can't reproduce a provider-side
@@ -4429,10 +4443,7 @@ fn emit_access_log(
     // Per #655 the access log stays ONE line per request, carrying the
     // user-perceived `latency` + final status plus a routing summary; the
     // per-attempt detail lives in telemetry.
-    let served_by = routing
-        .winner()
-        .map(|w| w.target_model.as_str())
-        .filter(|s| !s.is_empty());
+    let summary = routing.access_log_summary();
     let target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method: "POST",
@@ -4450,15 +4461,9 @@ fn emit_access_log(
         total_tokens: None,
         request_id,
         provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
-        served_by_model: served_by,
-        routing_attempt_count: match routing.attempt_count() {
-            0 => None,
-            n => Some(n),
-        },
-        routing_fallback_count: match routing.fallback_count() {
-            0 => None,
-            n => Some(n),
-        },
+        served_by_model: summary.served_by_model,
+        routing_attempt_count: summary.attempt_count,
+        routing_fallback_count: summary.fallback_count,
         error_kind,
         error: error.as_deref(),
         mcp: None,
@@ -7303,21 +7308,31 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
     /// Anthropic's `error.type` is a closed enum with no `content_filter`
     /// member — so the streaming terminal frame emitting `content_filter`
     /// both disagreed with its own sibling and failed the SDK's typed
-    /// parse. The envelope carries no `code` either; Anthropic's shape has
-    /// none.
+    /// parse. The refusal signal rides on `error.code` instead, on both
+    /// halves (AISIX-Cloud#726).
     #[test]
     fn streaming_block_frame_uses_a_legal_anthropic_error_type() {
-        let frame = super::guardrail_block_frame(Some("gr-block"), None);
-        let payload = frame
-            .strip_prefix("event: error\ndata: ")
-            .and_then(|r| r.strip_suffix("\n\n"))
-            .expect("an SSE error frame labelled `error`");
-        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let parse = |frame: String| -> serde_json::Value {
+            let payload = frame
+                .strip_prefix("event: error\ndata: ")
+                .and_then(|r| r.strip_suffix("\n\n"))
+                .expect("an SSE error frame labelled `error`")
+                .to_owned();
+            serde_json::from_str(&payload).unwrap()
+        };
+        let v = parse(super::guardrail_block_frame(Some("gr-block"), None));
         assert_eq!(v["type"], "error");
         assert_eq!(v["error"]["type"], "invalid_request_error");
         assert!(v["error"]["message"].as_str().unwrap().contains("gr-block"));
-        assert!(v["error"].get("code").is_none());
-        assert_eq!(v["error"].as_object().unwrap().len(), 2);
+        assert_eq!(v["error"]["code"], "content_filter");
+        assert_eq!(v["error"].as_object().unwrap().len(), 3);
+
+        let v = parse(super::guardrail_block_frame(
+            None,
+            Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+        ));
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], "guardrail_unavailable");
 
         // The same value the buffered half renders for this refusal.
         assert_eq!(

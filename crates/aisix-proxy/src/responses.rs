@@ -950,6 +950,7 @@ async fn dispatch(
                         ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
                     );
                     crate::routing::log_attempt_failure(
+                        request_id,
                         &target.model.display_name,
                         attempt_idx + 1,
                         &e,
@@ -1431,15 +1432,12 @@ async fn responses_to_target(
             // gateway. Mirror the chat surface's BufferFull policy (#466):
             // count the model-generated content as it arrives (#513) and,
             // past the cap, fail closed — or, under fail-open, release it
-            // unscanned. The cap is taken from the chain's resolved
-            // streaming policy.
-            let (max_buffer_bytes, on_exceeded_fail_open) = match output_policy {
-                aisix_guardrails::StreamOutputPolicy::BufferFull {
-                    max_buffer_bytes,
-                    on_exceeded_fail_open,
-                } => (max_buffer_bytes, on_exceeded_fail_open),
-                _ => (aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false),
-            };
+            // unscanned. The cap and the overflow policy are the chain's
+            // folded `max_buffer_bytes` / `on_buffer_exceeded`, whether it
+            // resolved to a window or a whole-response hold.
+            let (max_buffer_bytes, on_exceeded_fail_open) = output_policy
+                .hold_cap()
+                .unwrap_or((aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false));
             let stream = &mut upstream_body;
             // Effective streaming budget — applied to every buffered read,
             // consistent with the verbatim branch and the connect deadline.
@@ -2424,13 +2422,9 @@ async fn responses_cross_provider_to_target(
         .then(|| chain.clone());
         let output_policy = aisix_guardrails::Guardrail::stream_output_policy(chain.as_ref());
         let hold_back = output_policy.holds_back();
-        let (max_buffer_bytes, on_exceeded_fail_open) = match output_policy {
-            aisix_guardrails::StreamOutputPolicy::BufferFull {
-                max_buffer_bytes,
-                on_exceeded_fail_open,
-            } => (max_buffer_bytes, on_exceeded_fail_open),
-            _ => (aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false),
-        };
+        let (max_buffer_bytes, on_exceeded_fail_open) = output_policy
+            .hold_cap()
+            .unwrap_or((aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false));
 
         let state_c = state.clone();
         // The chain does not survive into the end-of-stream closure, so
@@ -3689,7 +3683,7 @@ fn emit_usage_event(
     let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: model_id.to_string(),
         api_key_id: caller.api_key_id.to_string(),
         requested_model: requested_model.to_string(),
@@ -3871,7 +3865,7 @@ fn emit_zero_token_event(
     let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
@@ -4015,10 +4009,7 @@ fn emit_access_log(
     };
     // Per #655 the access log stays ONE line per request, carrying the
     // user-perceived `latency` + final status plus a routing summary.
-    let served_by = routing
-        .winner()
-        .map(|w| w.target_model.as_str())
-        .filter(|s| !s.is_empty());
+    let summary = routing.access_log_summary();
     let target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method: "POST",
@@ -4036,15 +4027,9 @@ fn emit_access_log(
         total_tokens: None,
         request_id,
         provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
-        served_by_model: served_by,
-        routing_attempt_count: match routing.attempt_count() {
-            0 => None,
-            n => Some(n),
-        },
-        routing_fallback_count: match routing.fallback_count() {
-            0 => None,
-            n => Some(n),
-        },
+        served_by_model: summary.served_by_model,
+        routing_attempt_count: summary.attempt_count,
+        routing_fallback_count: summary.fallback_count,
         error_kind,
         error: error.as_deref(),
         mcp: None,

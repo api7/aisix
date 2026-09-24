@@ -128,6 +128,8 @@ pub async fn transcriptions(
     // branch — where a guardrail block lands — stamps the enforced hits
     // too (AISIX-Cloud#1330 / #1024).
     let mut audit = crate::usage_attr::GuardrailAudit::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::attempt::RoutingTelemetry::default();
 
     match multipart_dispatch(
         &state,
@@ -140,6 +142,7 @@ pub async fn transcriptions(
         &request_id,
         &client,
         &mut audit,
+        &mut routing,
     )
     .await
     {
@@ -170,7 +173,8 @@ pub async fn transcriptions(
                         &api_key_id,
                         started,
                     )
-                    .with_model(&success.provider, &success.model_name),
+                    .with_model(&success.provider, &success.model_name)
+                    .with_routing(&routing),
                 );
             } else {
                 emit_access_log(
@@ -182,6 +186,7 @@ pub async fn transcriptions(
                     status,
                     elapsed,
                     &request_id,
+                    &routing,
                     None,
                 );
             }
@@ -195,6 +200,25 @@ pub async fn transcriptions(
                 &success,
                 status,
                 elapsed,
+                routing.fallback_count() > 0,
+            );
+            // One zero-token event per attempt that failed before the
+            // winner (#655); a live relay's own event is the winner's.
+            crate::usage_attr::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::operation::TRANSCRIPTION,
+                &request_id,
+                &success.model_name,
+                &api_key_id,
+                &client,
+                &success.applied_guardrails,
+                &routing.attempts,
+                /* terminal_last */ false,
+                false,
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
             // #998: the streamed relay's Drop guard emits the event once
             // the terminal `transcript.text.done` has been parsed off the
@@ -214,6 +238,7 @@ pub async fn transcriptions(
                     elapsed,
                     &client,
                     &audit,
+                    routing.winner(),
                 );
             }
             success.response
@@ -233,6 +258,7 @@ pub async fn transcriptions(
                 status,
                 elapsed,
                 &request_id,
+                &routing,
                 Some(&err),
             );
             // AISIX-Cloud#1325: the multipart form is parsed inside the
@@ -249,30 +275,53 @@ pub async fn transcriptions(
                 &state,
                 "/v1/audio/transcriptions",
                 crate::request_metrics::Caller::new(&auth),
-                last_target.upstream(metric_model.as_ref(), false, false),
+                last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs. The model
             // isn't extracted from the multipart form on this error path, so
             // requested_model is empty; status + error class still identify it.
-            crate::usage_attr::emit_error_usage_event(
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
+            crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
                 crate::operation::TRANSCRIPTION,
-                "openai",
                 &request_id,
-                "",
+                &attributed.requested_model,
                 &api_key_id,
-                status,
-                err.kind(),
-                err.is_guardrail_block(),
                 &client,
-                crate::usage_attr::applied_guardrails(&audit),
-                crate::usage_attr::enforced_hits(&audit),
-                crate::usage_attr::guardrail_scores(&audit),
-                crate::usage_attr::bypass_reason(&audit),
+                &crate::usage_attr::applied_guardrails(&audit),
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
+            // A failure no attempt answers for — pre-dispatch, or after the
+            // winner — is one zero-token terminal event.
+            if !failed_terminal {
+                crate::usage_attr::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::operation::TRANSCRIPTION,
+                    "openai",
+                    &request_id,
+                    "",
+                    &api_key_id,
+                    status,
+                    err.kind(),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::usage_attr::applied_guardrails(&audit),
+                    crate::usage_attr::enforced_hits(&audit),
+                    crate::usage_attr::guardrail_scores(&audit),
+                    crate::usage_attr::bypass_reason(&audit),
+                );
+            }
             err.into_response()
         }
     }
@@ -317,6 +366,8 @@ pub async fn translations(
     // branch — where a guardrail block lands — stamps the enforced hits
     // too (AISIX-Cloud#1330 / #1024).
     let mut audit = crate::usage_attr::GuardrailAudit::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::attempt::RoutingTelemetry::default();
 
     match multipart_dispatch(
         &state,
@@ -329,6 +380,7 @@ pub async fn translations(
         &request_id,
         &client,
         &mut audit,
+        &mut routing,
     )
     .await
     {
@@ -352,7 +404,8 @@ pub async fn translations(
                         &api_key_id,
                         started,
                     )
-                    .with_model(&success.provider, &success.model_name),
+                    .with_model(&success.provider, &success.model_name)
+                    .with_routing(&routing),
                 );
             } else {
                 emit_access_log(
@@ -364,6 +417,7 @@ pub async fn translations(
                     status,
                     elapsed,
                     &request_id,
+                    &routing,
                     None,
                 );
             }
@@ -377,6 +431,25 @@ pub async fn translations(
                 &success,
                 status,
                 elapsed,
+                routing.fallback_count() > 0,
+            );
+            // One zero-token event per attempt that failed before the
+            // winner (#655); a live relay's own event is the winner's.
+            crate::usage_attr::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::operation::TRANSLATION,
+                &request_id,
+                &success.model_name,
+                &api_key_id,
+                &client,
+                &success.applied_guardrails,
+                &routing.attempts,
+                /* terminal_last */ false,
+                false,
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
             // #998: the streamed relay's Drop guard emits the event once
             // the terminal `transcript.text.done` has been parsed off the
@@ -396,6 +469,7 @@ pub async fn translations(
                     elapsed,
                     &client,
                     &audit,
+                    routing.winner(),
                 );
             }
             success.response
@@ -415,6 +489,7 @@ pub async fn translations(
                 status,
                 elapsed,
                 &request_id,
+                &routing,
                 Some(&err),
             );
             // AISIX-Cloud#1325: the multipart form is parsed inside the
@@ -431,29 +506,52 @@ pub async fn translations(
                 &state,
                 "/v1/audio/translations",
                 crate::request_metrics::Caller::new(&auth),
-                last_target.upstream(metric_model.as_ref(), false, false),
+                last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs (model not
             // extracted on the multipart error path → empty requested_model).
-            crate::usage_attr::emit_error_usage_event(
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
+            crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
                 crate::operation::TRANSLATION,
-                "openai",
                 &request_id,
-                "",
+                &attributed.requested_model,
                 &api_key_id,
-                status,
-                err.kind(),
-                err.is_guardrail_block(),
                 &client,
-                crate::usage_attr::applied_guardrails(&audit),
-                crate::usage_attr::enforced_hits(&audit),
-                crate::usage_attr::guardrail_scores(&audit),
-                crate::usage_attr::bypass_reason(&audit),
+                &crate::usage_attr::applied_guardrails(&audit),
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
+            // A failure no attempt answers for — pre-dispatch, or after the
+            // winner — is one zero-token terminal event.
+            if !failed_terminal {
+                crate::usage_attr::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::operation::TRANSLATION,
+                    "openai",
+                    &request_id,
+                    "",
+                    &api_key_id,
+                    status,
+                    err.kind(),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::usage_attr::applied_guardrails(&audit),
+                    crate::usage_attr::enforced_hits(&audit),
+                    crate::usage_attr::guardrail_scores(&audit),
+                    crate::usage_attr::bypass_reason(&audit),
+                );
+            }
             err.into_response()
         }
     }
@@ -503,6 +601,8 @@ pub async fn speech(
     // branch — where a guardrail block lands — stamps the enforced hits
     // too (AISIX-Cloud#1330 / #1024).
     let mut audit = crate::usage_attr::GuardrailAudit::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::attempt::RoutingTelemetry::default();
     match speech_dispatch(
         &state,
         &snapshot,
@@ -511,6 +611,7 @@ pub async fn speech(
         &request_id,
         &client,
         &mut audit,
+        &mut routing,
     )
     .await
     {
@@ -529,7 +630,8 @@ pub async fn speech(
                     &api_key_id,
                     started,
                 )
-                .with_model(&success.provider, &model_name),
+                .with_model(&success.provider, &model_name)
+                .with_routing(&routing),
             );
             // One ProviderKey lookup for the metric emit + the usage event
             // below (#941).
@@ -543,10 +645,29 @@ pub async fn speech(
                     model: &model_name,
                     upstream_model: &success.upstream_model,
                     pk: pk.labels(),
+                    is_fallback: routing.fallback_count() > 0,
                     ..Default::default()
                 },
                 status,
                 elapsed,
+            );
+            // One zero-token event per attempt that failed before the
+            // winner (#655); the relay's own event is the winner's.
+            crate::usage_attr::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::operation::SPEECH,
+                &request_id,
+                &model_name,
+                &api_key_id,
+                &client,
+                &success.applied_guardrails,
+                &routing.attempts,
+                /* terminal_last */ false,
+                false,
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
             // Issue #406: /v1/audio/speech (TTS) returns binary audio
             // with no usage block — emit a zero-token UsageEvent so the
@@ -567,7 +688,11 @@ pub async fn speech(
                 redactions,
                 monitor_hits,
                 captured_content,
+                attempt_started,
             } = success;
+            // The winner's event measures its own attempt, to the end of
+            // the audio — not the attempts that failed before it.
+            let winner = routing.winner().cloned();
             let state_c = state.clone();
             let client_c = client.clone();
             let request_id_c = request_id.clone();
@@ -583,6 +708,10 @@ pub async fn speech(
                 // emit reads a FRESH snapshot (#941).
                 let snap = state_c.snapshot.load();
                 let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &provider_key_id);
+                let winner = winner.map(|mut w| {
+                    w.latency_ms = crate::attempt::ms_since(attempt_started);
+                    w
+                });
                 emit_usage_event(
                     &state_c,
                     &snap,
@@ -610,6 +739,7 @@ pub async fn speech(
                     captured_content.as_ref(),
                     &audit,
                     outcome.failure.as_ref(),
+                    winner.as_ref(),
                 );
             });
             *response.body_mut() = axum::body::Body::from_stream(relayed);
@@ -627,6 +757,7 @@ pub async fn speech(
                 status,
                 elapsed,
                 &request_id,
+                &routing,
                 Some(&err),
             );
             let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
@@ -640,29 +771,52 @@ pub async fn speech(
                 &state,
                 "/v1/audio/speech",
                 crate::request_metrics::Caller::new(&auth),
-                last_target.upstream(metric_model.as_ref(), false, false),
+                last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
             // zero-token event (status + error class).
-            crate::usage_attr::emit_error_usage_event(
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
+            crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
                 crate::operation::SPEECH,
-                "openai",
                 &request_id,
                 &model_name,
                 &api_key_id,
-                status,
-                err.kind(),
-                err.is_guardrail_block(),
                 &client,
-                crate::usage_attr::applied_guardrails(&audit),
-                crate::usage_attr::enforced_hits(&audit),
-                crate::usage_attr::guardrail_scores(&audit),
-                crate::usage_attr::bypass_reason(&audit),
+                &crate::usage_attr::applied_guardrails(&audit),
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
+            // A failure no attempt answers for — pre-dispatch, or after the
+            // winner — is one zero-token terminal event.
+            if !failed_terminal {
+                crate::usage_attr::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::operation::SPEECH,
+                    "openai",
+                    &request_id,
+                    &model_name,
+                    &api_key_id,
+                    status,
+                    err.kind(),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::usage_attr::applied_guardrails(&audit),
+                    crate::usage_attr::enforced_hits(&audit),
+                    crate::usage_attr::guardrail_scores(&audit),
+                    crate::usage_attr::bypass_reason(&audit),
+                );
+            }
             err.into_response()
         }
     }
@@ -982,6 +1136,7 @@ async fn multipart_dispatch(
     request_id: &str,
     client_ctx: &ClientContext,
     audit_out: &mut crate::usage_attr::GuardrailAudit,
+    routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<AudioDispatchSuccess, ProxyError> {
     // The request clock for the streamed relay's end-of-stream emit
     // (#998): the handler has long returned by the time it fires, so it
@@ -1185,40 +1340,9 @@ async fn multipart_dispatch(
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
-    let model = &model_entry.value;
-    let provider = crate::dispatch::require_provider(model)?;
-    let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
-    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-    let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
-
-    // Cache key must be `'static`; both callers pass fixed literals.
-    let url_cache_key: &'static str = if upstream_path == "/audio/translations" {
-        "proxy/audio/translations"
-    } else {
-        "proxy/audio/transcriptions"
-    };
-    let url = aisix_gateway::url_cache::cached_endpoint_url(
-        &pk_entry.id,
-        url_cache_key,
-        // Every resolve_base_url input, via the shared constructor
-        // (#1017: the resolved URL depends on the vendor too), plus the
-        // per-call path.
-        &{
-            let [base, vendor, adapter] = crate::dispatch::pk_url_fingerprint(&pk_entry.value);
-            [base, vendor, adapter, upstream_path]
-        },
-        || {
-            let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
-                &base,
-                upstream_path,
-            ))
-        },
-    )?;
-    let provider_label = provider.to_ascii_lowercase();
-    // Static labels for retry tracing and telemetry — this dispatch serves
+    // Static labels for telemetry — this dispatch serves
     // both audio sub-routes, and logging translations under the
-    // transcription label would mislead an operator reading retry output.
+    // transcription label would mislead an operator.
     // Chosen in ONE branch so the endpoint series and the usage event's
     // operation cannot name different routes on the streaming path, which
     // is the only emit inside this function.
@@ -1229,178 +1353,265 @@ async fn multipart_dispatch(
             ("/v1/audio/transcriptions", crate::operation::TRANSCRIPTION)
         };
 
-    // Rebuild the multipart form with `model` rewritten. A `multipart::Form`
-    // is single-use (sending consumes it), so this is a closure rather than a
-    // value: each retry attempt below builds a fresh one. That is only
-    // possible because every part is `Part::bytes` over an in-memory `Bytes`
-    // — a streamed part could not be replayed.
-    let build_form = || {
-        let mut form = multipart::Form::new();
-        for (name, file_name, content_type, data) in &fields {
-            let field_data = if name == "model" {
-                Bytes::copy_from_slice(upstream_model.as_bytes())
-            } else {
-                data.clone()
-            };
-
-            let data_vec = field_data.to_vec();
-            let mut part = if let Some(ct) = content_type {
-                multipart::Part::bytes(data_vec.clone())
-                    .mime_str(ct)
-                    .unwrap_or_else(|_| multipart::Part::bytes(data_vec))
-            } else {
-                multipart::Part::bytes(data_vec)
-            };
-            if let Some(fname) = file_name {
-                part = part.file_name(fname.clone());
-            }
-            form = form.part(name.clone(), part);
-        }
-        form
-    };
-
-    // Build headers explicitly so the PK's `request.default_headers` and
-    // `request.forward_client_headers` can inject operator/client headers
-    // (AISIX-Cloud#867 follow-up). The body is a multipart form, so the JSON
-    // body-field overrides don't apply here — only headers do. Content-Type
-    // is left to `.multipart()` (it sets the boundary). Reserved auth
-    // headers are protected by `apply_request_headers`.
-    let mut headers = axum::http::HeaderMap::new();
-    let auth_hv = header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-            "api key contains invalid header chars: {e}"
-        )))
-    })?;
-    headers.insert(header::AUTHORIZATION, auth_hv);
-    let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
-        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-            "request_id contains invalid header chars: {e}"
-        )))
-    })?;
-    headers.insert(
-        header::HeaderName::from_static("x-aisix-request-id"),
-        rid_hv,
-    );
-    aisix_gateway::apply_request_headers(
-        &mut headers,
-        &crate::dispatch::upstream_header_ctx(
-            &pk_entry.value,
-            &pk_entry.id,
-            model,
-            &model_entry.id,
-            client_ctx,
-        ),
-    );
-
-    let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
-    let tracker = &state.runtime_status;
-    let model_id: &str = &model_entry.id;
-    let cooldown_cfg = model.cooldown.as_ref();
-    // Send, check the status, and — unless the answer is a stream being
-    // relayed — read the body as one retryable unit. See the same shape in
-    // rerank.rs for why `note_failure` stays per attempt. A relayed stream
-    // leaves the retryable unit at the status check: once its first frame
-    // is on the wire there is no failing over left to do.
-    let timeouts = crate::routing::effective_timeouts(model, None, state.default_timeouts);
-    let request_budget = timeouts.request;
-    let stream_budget = timeouts.stream;
-    let (upstream_headers, upstream_body) =
-        match crate::routing::retrying_dispatch(state, model, retry_endpoint_label, || {
-            let mut req = url
-                .clone()
-                .post_on(&client)
-                .headers(headers.clone())
-                .multipart(build_form());
-            // #554/#911: a buffered audio call takes the per-model E2E
-            // request timeout like the other direct-upstream paths
-            // (count_tokens/rerank/responses), so a slow/blackholed audio
-            // provider fails over and the model's timeout cooldown can
-            // engage. A relayed stream must NOT carry it: reqwest's
-            // request-level timeout bounds the body read too, so it would
-            // cut the transcript off mid-stream (#998). That path bounds the
-            // connect phase and each chunk by the stream budget instead —
-            // the same split `/v1/responses` uses.
-            if !live_relay {
-                if let Some(d) = request_budget {
-                    req = req.timeout(d);
-                }
-            }
-            let connect_deadline = if live_relay { stream_budget } else { None };
+    // A Model Group walks its targets (AISIX-Cloud#1111); every per-target
+    // input — provider, key, URL, upstream id, deadlines — comes from the
+    // target.
+    *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client_ctx.trace.clone());
+    let dispatched = crate::routing::dispatch_with_failover(
+        state,
+        snapshot,
+        auth,
+        client_ctx,
+        &model_name,
+        &model_entry,
+        routing_out,
+        |_| true,
+        |_| None,
+        |target, timeouts| {
+            let fields = &fields;
             async move {
-                // `reqwest_error_to_bridge`, not a bare `Transport`: an
-                // elapsed `timeout` has to surface as `BridgeError::Timeout`
-                // or it is indistinguishable from a connection fault. That
-                // distinction now decides whether the default retry budget
-                // is spent on it (`RetryBudget::covers`) — classifying a
-                // timeout as transport made the model's own timeout get
-                // retried, turning a 400ms budget into ~2s.
-                let send_started = Instant::now();
-                let resp =
-                    crate::stream_timeout::send_with_deadline(req, connect_deadline, send_started)
+                let model = &target.model;
+                let provider = crate::dispatch::require_provider(model)?;
+                let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
+                let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
+
+                // Cache key must be `'static`; both callers pass fixed literals.
+                let url_cache_key: &'static str = if upstream_path == "/audio/translations" {
+                    "proxy/audio/translations"
+                } else {
+                    "proxy/audio/transcriptions"
+                };
+                let url = aisix_gateway::url_cache::cached_endpoint_url(
+                    &pk_entry.id,
+                    url_cache_key,
+                    // Every resolve_base_url input, via the shared constructor
+                    // (#1017: the resolved URL depends on the vendor too), plus the
+                    // per-call path.
+                    &{
+                        let [base, vendor, adapter] =
+                            crate::dispatch::pk_url_fingerprint(&pk_entry.value);
+                        [base, vendor, adapter, upstream_path]
+                    },
+                    || {
+                        let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+                        Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
+                            &base,
+                            upstream_path,
+                        ))
+                    },
+                )?;
+                let provider_label = provider.to_ascii_lowercase();
+
+                // Rebuild the multipart form with `model` rewritten. A `multipart::Form`
+                // is single-use (sending consumes it), so this is a closure rather than a
+                // value: each retry attempt below builds a fresh one. That is only
+                // possible because every part is `Part::bytes` over an in-memory `Bytes`
+                // — a streamed part could not be replayed.
+                let build_form = || {
+                    let mut form = multipart::Form::new();
+                    for (name, file_name, content_type, data) in fields {
+                        let field_data = if name == "model" {
+                            Bytes::copy_from_slice(upstream_model.as_bytes())
+                        } else {
+                            data.clone()
+                        };
+
+                        let data_vec = field_data.to_vec();
+                        let mut part = if let Some(ct) = content_type {
+                            multipart::Part::bytes(data_vec.clone())
+                                .mime_str(ct)
+                                .unwrap_or_else(|_| multipart::Part::bytes(data_vec))
+                        } else {
+                            multipart::Part::bytes(data_vec)
+                        };
+                        if let Some(fname) = file_name {
+                            part = part.file_name(fname.clone());
+                        }
+                        form = form.part(name.clone(), part);
+                    }
+                    form
+                };
+
+                // Build headers explicitly so the PK's `request.default_headers` and
+                // `request.forward_client_headers` can inject operator/client headers
+                // (AISIX-Cloud#867 follow-up). The body is a multipart form, so the JSON
+                // body-field overrides don't apply here — only headers do. Content-Type
+                // is left to `.multipart()` (it sets the boundary). Reserved auth
+                // headers are protected by `apply_request_headers`.
+                let mut headers = axum::http::HeaderMap::new();
+                let auth_hv =
+                    header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
+                        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                            "api key contains invalid header chars: {e}"
+                        )))
+                    })?;
+                headers.insert(header::AUTHORIZATION, auth_hv);
+                let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
+                    ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                        "request_id contains invalid header chars: {e}"
+                    )))
+                })?;
+                headers.insert(
+                    header::HeaderName::from_static("x-aisix-request-id"),
+                    rid_hv,
+                );
+                aisix_gateway::apply_request_headers(
+                    &mut headers,
+                    &crate::dispatch::upstream_header_ctx(
+                        &pk_entry.value,
+                        &pk_entry.id,
+                        model,
+                        &target.id,
+                        client_ctx,
+                    ),
+                );
+
+                let client =
+                    crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
+                let tracker = &state.runtime_status;
+                let model_id: &str = &target.id;
+                let cooldown_cfg = model.cooldown.as_ref();
+                // Send, check the status, and — unless the answer is a stream being
+                // relayed — read the body as one retryable unit. See the same shape in
+                // rerank.rs for why `note_failure` stays per attempt. A relayed stream
+                // leaves the retryable unit at the status check: once its first frame
+                // is on the wire there is no failing over left to do.
+                let request_budget = timeouts.request;
+                let stream_budget = timeouts.stream;
+                let (upstream_headers, upstream_body) = match {
+                    let mut req = url
+                        .clone()
+                        .post_on(&client)
+                        .headers(headers.clone())
+                        .multipart(build_form());
+                    // #554/#911: a buffered audio call takes the per-model E2E
+                    // request timeout like the other direct-upstream paths
+                    // (count_tokens/rerank/responses), so a slow/blackholed audio
+                    // provider fails over and the model's timeout cooldown can
+                    // engage. A relayed stream must NOT carry it: reqwest's
+                    // request-level timeout bounds the body read too, so it would
+                    // cut the transcript off mid-stream (#998). That path bounds the
+                    // connect phase and each chunk by the stream budget instead —
+                    // the same split `/v1/responses` uses.
+                    if !live_relay {
+                        if let Some(d) = request_budget {
+                            req = req.timeout(d);
+                        }
+                    }
+                    let connect_deadline = if live_relay { stream_budget } else { None };
+                    async move {
+                        // `reqwest_error_to_bridge`, not a bare `Transport`: an
+                        // elapsed `timeout` has to surface as `BridgeError::Timeout`
+                        // or it is indistinguishable from a connection fault. That
+                        // distinction now decides whether the default retry budget
+                        // is spent on it (`RetryBudget::covers`) — classifying a
+                        // timeout as transport made the model's own timeout get
+                        // retried, turning a 400ms budget into ~2s.
+                        let send_started = Instant::now();
+                        let resp = crate::stream_timeout::send_with_deadline(
+                            req,
+                            connect_deadline,
+                            send_started,
+                        )
                         .await
                         .map_err(|be| {
                             crate::cooldown::note_failure(tracker, model_id, cooldown_cfg, be)
                         })?;
 
-                let status = resp.status();
-                if !status.is_success() {
-                    let s = status.as_u16();
-                    let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-                    let msg = resp.text().await.unwrap_or_default();
-                    return Err(crate::cooldown::note_failure(
-                        tracker,
-                        model_id,
-                        cooldown_cfg,
-                        aisix_gateway::BridgeError::upstream_status_with_retry_after(
-                            s,
-                            msg.chars().take(1024).collect::<String>(),
-                            retry_after,
-                        ),
-                    ));
-                }
+                        let status = resp.status();
+                        if !status.is_success() {
+                            let s = status.as_u16();
+                            let retry_after = aisix_gateway::parse_retry_after(resp.headers());
+                            let msg = resp.text().await.unwrap_or_default();
+                            return Err(crate::cooldown::note_failure(
+                                tracker,
+                                model_id,
+                                cooldown_cfg,
+                                aisix_gateway::BridgeError::upstream_status_with_retry_after(
+                                    s,
+                                    msg.chars().take(1024).collect::<String>(),
+                                    retry_after,
+                                ),
+                            ));
+                        }
 
-                // Relay response headers that matter for the client.
-                let upstream_headers = resp.headers().clone();
-                // The caller asked to stream and the upstream answered one:
-                // hand the live response on so its frames reach the caller
-                // as they arrive (#998). Everything else — including a
-                // provider that ignored `stream=true` and replied with a
-                // JSON transcript — is read whole, so the usage, duration
-                // and output-guardrail passes below still see a body.
-                if live_relay && is_event_stream(&upstream_headers) {
-                    return Ok((upstream_headers, AudioUpstreamBody::Live(resp)));
-                }
-                let read = async {
-                    match stream_budget.filter(|_| live_relay) {
-                        // No request-level timeout was set on the live path,
-                        // so bound this read rather than leaving it open.
-                        Some(d) => tokio::time::timeout(d, resp.bytes())
-                            .await
-                            .map_err(|_| aisix_gateway::BridgeError::Timeout {
-                                elapsed_ms: d.as_millis() as u64,
-                                cause: String::new(),
-                            })?
-                            .map_err(|e| aisix_gateway::BridgeError::UpstreamDecode(e.to_string())),
-                        None => resp
-                            .bytes()
-                            .await
-                            .map_err(|e| aisix_gateway::BridgeError::UpstreamDecode(e.to_string())),
+                        // Relay response headers that matter for the client.
+                        let upstream_headers = resp.headers().clone();
+                        // The caller asked to stream and the upstream answered one:
+                        // hand the live response on so its frames reach the caller
+                        // as they arrive (#998). Everything else — including a
+                        // provider that ignored `stream=true` and replied with a
+                        // JSON transcript — is read whole, so the usage, duration
+                        // and output-guardrail passes below still see a body.
+                        if live_relay && is_event_stream(&upstream_headers) {
+                            return Ok((upstream_headers, AudioUpstreamBody::Live(resp)));
+                        }
+                        let read = async {
+                            match stream_budget.filter(|_| live_relay) {
+                                // No request-level timeout was set on the live path,
+                                // so bound this read rather than leaving it open.
+                                Some(d) => tokio::time::timeout(d, resp.bytes())
+                                    .await
+                                    .map_err(|_| aisix_gateway::BridgeError::Timeout {
+                                        elapsed_ms: d.as_millis() as u64,
+                                        cause: String::new(),
+                                    })?
+                                    .map_err(|e| {
+                                        aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
+                                    }),
+                                None => resp.bytes().await.map_err(|e| {
+                                    aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
+                                }),
+                            }
+                        };
+                        let body_bytes = read.await.map_err(|be| {
+                            crate::cooldown::note_failure(tracker, model_id, cooldown_cfg, be)
+                        })?;
+                        Ok((upstream_headers, AudioUpstreamBody::Buffered(body_bytes)))
                     }
+                }
+                .await
+                {
+                    Ok(v) => v,
+                    Err(err) => return Err(ProxyError::Bridge(err)),
                 };
-                let body_bytes = read.await.map_err(|be| {
-                    crate::cooldown::note_failure(tracker, model_id, cooldown_cfg, be)
-                })?;
-                Ok((upstream_headers, AudioUpstreamBody::Buffered(body_bytes)))
+                Ok((
+                    upstream_headers,
+                    upstream_body,
+                    provider_label,
+                    pk_entry.id.to_string(),
+                    upstream_model,
+                    stream_budget,
+                ))
             }
-        })
-        .await
-        {
-            Ok(v) => v,
-            Err(err) => return Err(ProxyError::Bridge(err)),
-        };
+        },
+    )
+    .await;
+    let crate::routing::Dispatched {
+        value:
+            (upstream_headers, upstream_body, provider_label, pk_id, upstream_model, stream_budget),
+        target,
+        attempt_started,
+        member_reservation,
+        in_flight,
+    } = match dispatched {
+        Ok(d) => d,
+        Err(e) => {
+            reservation.commit_tokens(0).await;
+            return Err(e);
+        }
+    };
+    // Fold the target's model-layer reservation in (AISIX-Cloud#1087) so
+    // one commit — or the stream guard — bills the member's TPM/TPD too.
+    let mut reservation = reservation;
+    if let Some(member) = member_reservation {
+        reservation.merge(member);
+    }
 
-    state.health.record_success(&model_entry.value.display_name);
-    state.runtime_status.mark_healthy(&model_entry.id);
+    state.health.record_success(&target.model.display_name);
+    state.runtime_status.mark_healthy(&target.id);
 
     let body_bytes = match upstream_body {
         AudioUpstreamBody::Buffered(bytes) => bytes,
@@ -1427,6 +1638,8 @@ async fn multipart_dispatch(
             let post_stream_keys = reservation.keys();
             let stream_hold = reservation.into_stream_hold();
             let limiter = std::sync::Arc::clone(&state.limiter);
+            // least_busy: the target stays busy until the relay ends.
+            let in_flight_hold = in_flight;
 
             // Monitor-only output chains still get their end-of-stream
             // observation (AISIX-Cloud#1010); a block-capable chain never
@@ -1441,11 +1654,11 @@ async fn multipart_dispatch(
 
             let state_c = state.clone();
             let request_id_c = request_id.to_string();
-            let model_id_c = model_entry.id.to_string();
+            let model_id_c = target.id.clone();
             let model_name_c = model_name.clone();
             let provider_c = provider_label.clone();
             let upstream_model_c = upstream_model.clone();
-            let pk_id_c = pk_entry.id.to_string();
+            let pk_id_c = pk_id.clone();
             let api_key_id_c = auth.entry.id.clone();
             let applied_c = applied_guardrails.clone();
             // The chain itself does not survive into the relay closure, so
@@ -1461,6 +1674,9 @@ async fn multipart_dispatch(
             let input_monitor_hits = monitor_hits.clone();
             let client_c = client_ctx.clone();
             let captured_prompt_c = captured_prompt.clone();
+            // The winner's event measures its own attempt, to the end of the
+            // stream — not the attempts that failed before it (#655).
+            let winner_c = routing_out.winner().cloned();
 
             let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
             let relayed = transcription_relay(
@@ -1479,6 +1695,7 @@ async fn multipart_dispatch(
                         limiter.add_tokens_post_stream(key, total);
                     }
                     drop(stream_hold);
+                    drop(in_flight_hold);
                     // A stream can outlive several config generations, so
                     // the end-of-stream emit reads a FRESH snapshot rather
                     // than the one the request started on (#941).
@@ -1492,6 +1709,10 @@ async fn multipart_dispatch(
                     };
                     let mut monitor_hits = input_monitor_hits;
                     monitor_hits.extend(outcome.output_hits);
+                    let winner = winner_c.map(|mut w| {
+                        w.latency_ms = crate::attempt::ms_since(attempt_started);
+                        w
+                    });
                     emit_usage_event(
                         &state_c,
                         &snap,
@@ -1525,6 +1746,7 @@ async fn multipart_dispatch(
                         captured_content.as_ref(),
                         &audit_c,
                         outcome.failure.as_ref(),
+                        winner.as_ref(),
                     );
                 },
             );
@@ -1540,8 +1762,8 @@ async fn multipart_dispatch(
                 response: out,
                 model_name,
                 provider: provider_label,
-                model_id: model_entry.id.to_string(),
-                provider_key_id: pk_entry.id.to_string(),
+                model_id: target.id.clone(),
+                provider_key_id: pk_id.clone(),
                 upstream_model,
                 // The Drop guard owns the emit; the handler must not
                 // double-emit with the counts it cannot see yet.
@@ -1664,8 +1886,8 @@ async fn multipart_dispatch(
                 .into_response(),
                 model_name,
                 provider: provider_label,
-                model_id: model_entry.id.to_string(),
-                provider_key_id: pk_entry.id.to_string(),
+                model_id: target.id.clone(),
+                provider_key_id: pk_id.clone(),
                 upstream_model: upstream_model.clone(),
                 usage,
                 duration_seconds,
@@ -1710,8 +1932,8 @@ async fn multipart_dispatch(
         response: out,
         model_name,
         provider: provider_label,
-        model_id: model_entry.id.to_string(),
-        provider_key_id: pk_entry.id.to_string(),
+        model_id: target.id.clone(),
+        provider_key_id: pk_id.clone(),
         upstream_model,
         usage,
         duration_seconds,
@@ -1815,8 +2037,11 @@ struct SpeechDispatchSuccess {
     redactions: crate::redact::RedactionCounts,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     captured_content: Option<CapturedContent>,
+    /// When the attempt that answered began (#655).
+    attempt_started: Instant,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn speech_dispatch(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
@@ -1825,6 +2050,7 @@ async fn speech_dispatch(
     request_id: &str,
     client_ctx: &ClientContext,
     audit_out: &mut crate::usage_attr::GuardrailAudit,
+    routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<SpeechDispatchSuccess, ProxyError> {
     let model_name = body
         .get("model")
@@ -1914,147 +2140,195 @@ async fn speech_dispatch(
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
-    let model = &model_entry.value;
-    let provider = crate::dispatch::require_provider(model)?;
-    let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
-    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-    let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
+    // A Model Group walks its targets (AISIX-Cloud#1111). Each attempt
+    // rewrites its own copy of the body — the `model` field and the PK's
+    // `request.*` overrides belong to the target it is sent to.
+    let base_body = &body;
+    *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client_ctx.trace.clone());
+    let dispatched = crate::routing::dispatch_with_failover(
+        state,
+        snapshot,
+        auth,
+        client_ctx,
+        &model_name,
+        &model_entry,
+        routing_out,
+        |_| true,
+        |_| None,
+        |target, timeouts| async move {
+            let model = &target.model;
+            let mut attempt_body = base_body.clone();
+            let body = &mut attempt_body;
+            let provider = crate::dispatch::require_provider(model)?;
+            let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+            let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
+            let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
 
-    let provider_label = provider.to_ascii_lowercase();
+            let provider_label = provider.to_ascii_lowercase();
 
-    // Rewrite model field.
-    if let Some(m) = body.get_mut("model") {
-        *m = Value::String(upstream_model.clone());
-    }
+            // Rewrite model field.
+            if let Some(m) = body.get_mut("model") {
+                *m = Value::String(upstream_model.clone());
+            }
 
-    // Apply the PK's `request.*` overrides (body + headers) like the OpenAI
-    // bridge's chat() path — /v1/audio/speech is a JSON passthrough that builds
-    // the request directly (AISIX-Cloud#867 follow-up). No-op when none set.
-    if let Some(r) = pk_entry.value.request.as_ref() {
-        aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
-        if let Some(constraints) = &r.param_constraints {
-            aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
-        }
-        aisix_provider_openai::overrides::apply_default_body_fields(
-            &mut body,
-            &r.default_body_fields,
-        );
-    }
+            // Apply the PK's `request.*` overrides (body + headers) like the OpenAI
+            // bridge's chat() path — /v1/audio/speech is a JSON passthrough that builds
+            // the request directly (AISIX-Cloud#867 follow-up). No-op when none set.
+            if let Some(r) = pk_entry.value.request.as_ref() {
+                aisix_provider_openai::overrides::apply_param_renames(body, &r.param_renames);
+                if let Some(constraints) = &r.param_constraints {
+                    aisix_provider_openai::overrides::apply_param_constraints(body, constraints);
+                }
+                aisix_provider_openai::overrides::apply_default_body_fields(
+                    body,
+                    &r.default_body_fields,
+                );
+            }
 
-    let mut headers = axum::http::HeaderMap::new();
-    let auth_hv = header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-            "api key contains invalid header chars: {e}"
-        )))
-    })?;
-    headers.insert(header::AUTHORIZATION, auth_hv);
-    headers.insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("application/json"),
-    );
-    let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
-        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-            "request_id contains invalid header chars: {e}"
-        )))
-    })?;
-    headers.insert(
-        header::HeaderName::from_static("x-aisix-request-id"),
-        rid_hv,
-    );
-    aisix_gateway::apply_request_headers(
-        &mut headers,
-        &crate::dispatch::upstream_header_ctx(
-            &pk_entry.value,
-            &pk_entry.id,
-            model,
-            &model_entry.id,
-            client_ctx,
-        ),
-    );
+            let mut headers = axum::http::HeaderMap::new();
+            let auth_hv =
+                header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
+                    ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                        "api key contains invalid header chars: {e}"
+                    )))
+                })?;
+            headers.insert(header::AUTHORIZATION, auth_hv);
+            headers.insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/json"),
+            );
+            let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
+                ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                    "request_id contains invalid header chars: {e}"
+                )))
+            })?;
+            headers.insert(
+                header::HeaderName::from_static("x-aisix-request-id"),
+                rid_hv,
+            );
+            aisix_gateway::apply_request_headers(
+                &mut headers,
+                &crate::dispatch::upstream_header_ctx(
+                    &pk_entry.value,
+                    &pk_entry.id,
+                    model,
+                    &target.id,
+                    client_ctx,
+                ),
+            );
 
-    let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
-    let speech_url = aisix_gateway::url_cache::cached_endpoint_url(
-        &pk_entry.id,
-        "proxy/audio/speech",
-        // Every resolve_base_url input (#1017) via the shared constructor.
-        &crate::dispatch::pk_url_fingerprint(&pk_entry.value),
-        || {
-            let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
-                &base,
-                "/audio/speech",
+            let client =
+                crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
+            let speech_url = aisix_gateway::url_cache::cached_endpoint_url(
+                &pk_entry.id,
+                "proxy/audio/speech",
+                // Every resolve_base_url input (#1017) via the shared constructor.
+                &crate::dispatch::pk_url_fingerprint(&pk_entry.value),
+                || {
+                    let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+                    Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
+                        &base,
+                        "/audio/speech",
+                    ))
+                },
+            )?;
+            let tracker = &state.runtime_status;
+            let model_id: &str = &target.id;
+            let cooldown_cfg = model.cooldown.as_ref();
+            // Send and check the status as one retryable unit; the audio bytes are
+            // relayed, not read here. See the same shape in rerank.rs for why
+            // `note_failure` stays per attempt.
+            //
+            // #998: the synthesized audio is forwarded chunk by chunk (LiteLLM's
+            // `/v1/audio/speech` does the same, explicitly for latency) — a player
+            // can start on the first bytes instead of waiting for the whole file.
+            // That moves the read out of the retryable unit: once the 200 is on the
+            // wire a failed read truncates the download rather than failing over,
+            // the same trade `/v1/videos`' content proxy makes.
+            let stream_budget = timeouts.stream;
+            let upstream_resp = match {
+                let req = speech_url
+                    .clone()
+                    .post_on(&client)
+                    .headers(headers.clone())
+                    .json(&*body);
+                // #554/#911: reqwest's request-level timeout would bound the
+                // body read too and cut a long synthesis off mid-file, so the
+                // stream budget bounds the connect phase and each chunk
+                // instead — the split every relayed path uses.
+                async move {
+                    // `reqwest_error_to_bridge`, not a bare `Transport`: an
+                    // elapsed `timeout` has to surface as `BridgeError::Timeout`
+                    // or it is indistinguishable from a connection fault. That
+                    // distinction now decides whether the default retry budget
+                    // is spent on it (`RetryBudget::covers`) — classifying a
+                    // timeout as transport made the model's own timeout get
+                    // retried, turning a 400ms budget into ~2s.
+                    let send_started = Instant::now();
+                    let resp =
+                        crate::stream_timeout::send_with_deadline(req, stream_budget, send_started)
+                            .await
+                            .map_err(|be| {
+                                crate::cooldown::note_failure(tracker, model_id, cooldown_cfg, be)
+                            })?;
+
+                    let status = resp.status();
+                    if !status.is_success() {
+                        let s = status.as_u16();
+                        let retry_after = aisix_gateway::parse_retry_after(resp.headers());
+                        let msg = resp.text().await.unwrap_or_default();
+                        return Err(crate::cooldown::note_failure(
+                            tracker,
+                            model_id,
+                            cooldown_cfg,
+                            aisix_gateway::BridgeError::upstream_status_with_retry_after(
+                                s,
+                                msg.chars().take(1024).collect::<String>(),
+                                retry_after,
+                            ),
+                        ));
+                    }
+                    Ok(resp)
+                }
+            }
+            .await
+            {
+                Ok(v) => v,
+                Err(err) => return Err(ProxyError::Bridge(err)),
+            };
+            Ok((
+                upstream_resp,
+                provider_label,
+                pk_entry.id.to_string(),
+                upstream_model,
+                stream_budget,
             ))
         },
-    )?;
-    let tracker = &state.runtime_status;
-    let model_id: &str = &model_entry.id;
-    let cooldown_cfg = model.cooldown.as_ref();
-    // Send and check the status as one retryable unit; the audio bytes are
-    // relayed, not read here. See the same shape in rerank.rs for why
-    // `note_failure` stays per attempt.
-    //
-    // #998: the synthesized audio is forwarded chunk by chunk (LiteLLM's
-    // `/v1/audio/speech` does the same, explicitly for latency) — a player
-    // can start on the first bytes instead of waiting for the whole file.
-    // That moves the read out of the retryable unit: once the 200 is on the
-    // wire a failed read truncates the download rather than failing over,
-    // the same trade `/v1/videos`' content proxy makes.
-    let stream_budget =
-        crate::routing::effective_timeouts(model, None, state.default_timeouts).stream;
-    let upstream_resp =
-        match crate::routing::retrying_dispatch(state, model, "/v1/audio/speech", || {
-            let req = speech_url
-                .clone()
-                .post_on(&client)
-                .headers(headers.clone())
-                .json(&body);
-            // #554/#911: reqwest's request-level timeout would bound the
-            // body read too and cut a long synthesis off mid-file, so the
-            // stream budget bounds the connect phase and each chunk
-            // instead — the split every relayed path uses.
-            async move {
-                // `reqwest_error_to_bridge`, not a bare `Transport`: an
-                // elapsed `timeout` has to surface as `BridgeError::Timeout`
-                // or it is indistinguishable from a connection fault. That
-                // distinction now decides whether the default retry budget
-                // is spent on it (`RetryBudget::covers`) — classifying a
-                // timeout as transport made the model's own timeout get
-                // retried, turning a 400ms budget into ~2s.
-                let send_started = Instant::now();
-                let resp =
-                    crate::stream_timeout::send_with_deadline(req, stream_budget, send_started)
-                        .await
-                        .map_err(|be| {
-                            crate::cooldown::note_failure(tracker, model_id, cooldown_cfg, be)
-                        })?;
+    )
+    .await;
+    let crate::routing::Dispatched {
+        value: (upstream_resp, provider_label, pk_id, upstream_model, stream_budget),
+        target,
+        attempt_started,
+        member_reservation,
+        in_flight,
+    } = match dispatched {
+        Ok(d) => d,
+        Err(e) => {
+            reservation.commit_tokens(0).await;
+            return Err(e);
+        }
+    };
+    // Fold the target's model-layer reservation into the hold below
+    // (AISIX-Cloud#1087), so the member's concurrency slot spans the relay too.
+    let mut reservation = reservation;
+    if let Some(member) = member_reservation {
+        reservation.merge(member);
+    }
 
-                let status = resp.status();
-                if !status.is_success() {
-                    let s = status.as_u16();
-                    let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-                    let msg = resp.text().await.unwrap_or_default();
-                    return Err(crate::cooldown::note_failure(
-                        tracker,
-                        model_id,
-                        cooldown_cfg,
-                        aisix_gateway::BridgeError::upstream_status_with_retry_after(
-                            s,
-                            msg.chars().take(1024).collect::<String>(),
-                            retry_after,
-                        ),
-                    ));
-                }
-                Ok(resp)
-            }
-        })
-        .await
-        {
-            Ok(v) => v,
-            Err(err) => return Err(ProxyError::Bridge(err)),
-        };
-
-    state.health.record_success(&model_entry.value.display_name);
-    state.runtime_status.mark_healthy(&model_entry.id);
+    state.health.record_success(&target.model.display_name);
+    state.runtime_status.mark_healthy(&target.id);
 
     // #911 [21]: speech synthesis (TTS) reports no token usage — it is billed
     // per input character — so there are no tokens to add to TPM/TPD. The
@@ -2068,7 +2342,9 @@ async fn speech_dispatch(
     let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
     let signal = read_timeout.clone();
     let body = Box::pin(async_stream::stream! {
-        let _hold = stream_hold;
+        // least_busy: the target stays busy until the relay ends, with
+        // the concurrency slot.
+        let _hold = (stream_hold, in_flight);
         let inner = crate::stream_timeout::with_read_timeout_bytes_signalled(
             upstream_resp.bytes_stream(),
             stream_budget,
@@ -2092,13 +2368,14 @@ async fn speech_dispatch(
         body,
         read_timeout,
         provider: provider_label,
-        model_id: model_entry.id.to_string(),
-        provider_key_id: pk_entry.id.to_string(),
+        model_id: target.id.clone(),
+        provider_key_id: pk_id.clone(),
         upstream_model,
         applied_guardrails,
         redactions,
         monitor_hits,
         captured_content,
+        attempt_started,
     })
 }
 
@@ -2201,6 +2478,7 @@ fn probe_audio_duration_seconds(audio: &[u8]) -> Option<f64> {
 /// Terminal request-metric emit for the two transcription-shaped routes,
 /// which share `AudioDispatchSuccess` and would otherwise repeat the same
 /// label set twice.
+#[allow(clippy::too_many_arguments)]
 fn record_audio_metrics(
     state: &ProxyState,
     pk: &crate::usage_attr::ResolvedPk<'_>,
@@ -2209,6 +2487,7 @@ fn record_audio_metrics(
     success: &AudioDispatchSuccess,
     status: u16,
     elapsed: Duration,
+    is_fallback: bool,
 ) {
     crate::request_metrics::record(
         state,
@@ -2223,7 +2502,7 @@ fn record_audio_metrics(
             // moves the usage emit into the stream is the same condition
             // that makes this a streamed response.
             stream: success.usage_handled_by_stream,
-            ..Default::default()
+            is_fallback,
         },
         status,
         elapsed,
@@ -2247,6 +2526,7 @@ fn emit_audio_usage(
     elapsed: Duration,
     client: &ClientContext,
     audit: &crate::usage_attr::GuardrailAudit,
+    winner: Option<&crate::attempt::AttemptRecord>,
 ) {
     let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
     emit_usage_event(
@@ -2274,6 +2554,7 @@ fn emit_audio_usage(
         success.captured_content.as_ref(),
         audit,
         /* failure */ None,
+        winner,
     );
 }
 
@@ -2329,18 +2610,21 @@ fn emit_usage_event(
     // The upstream failure that ended a streamed transcript after its
     // `200`; its class and message are the event's error fields.
     failure: Option<&crate::attempt::StreamFailure>,
+    // The attempt that answered (#655).
+    winner: Option<&crate::attempt::AttemptRecord>,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
         prompt_tokens,
         completion_tokens,
         audio_duration_seconds,
-        // Single-attempt endpoint: the attempt spans the whole request, so
-        // the upstream figure and what the caller waited for coincide.
+        // Narrowed to the winning attempt's own latency below
+        // (`apply_winning_attempt`) once a failover put earlier attempts
+        // in front of it; they emitted their own events.
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
@@ -2363,6 +2647,7 @@ fn emit_usage_event(
     // Per-PK telemetry attribution, same lookup as chat / messages /
     // responses (AISIX-Cloud#867 parity).
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
+    crate::usage_attr::apply_winning_attempt(&mut event, winner);
     // Handler label "audio" — bucketed prometheus counter (#408).
     crate::usage_attr::apply_caller_identity(
         &mut event,
@@ -2427,6 +2712,7 @@ fn emit_access_log(
     status: u16,
     latency: Duration,
     request_id: &str,
+    routing: &crate::attempt::RoutingTelemetry,
     error: Option<&ProxyError>,
 ) {
     let (error_kind, error) = match error {
@@ -2437,6 +2723,7 @@ fn emit_access_log(
         None => (None, None),
     };
     let target = crate::attribution::AccessLogTarget::current();
+    let summary = routing.access_log_summary();
     AccessLog {
         method,
         path,
@@ -2456,9 +2743,9 @@ fn emit_access_log(
         // `{text, usage}` and speech returns audio bytes — neither carries
         // one (AISIX-Cloud#1289).
         provider_request_id: None,
-        served_by_model: None,
-        routing_attempt_count: None,
-        routing_fallback_count: None,
+        served_by_model: summary.served_by_model,
+        routing_attempt_count: summary.attempt_count,
+        routing_fallback_count: summary.fallback_count,
         error_kind,
         error: error.as_deref(),
         mcp: None,
@@ -3698,10 +3985,26 @@ mod tests {
             !ev.error_class.is_empty(),
             "error_class must classify the failure"
         );
+        // One event per upstream attempt (#655): each of the direct
+        // model's own retries fails the same way and leaves its own row,
+        // none of them billed.
+        let mut events = vec![ev];
+        while let Ok(more) = rx.try_recv() {
+            events.push(more);
+        }
+        let hits = upstream.received_requests().await.unwrap_or_default().len();
         assert!(
-            rx.try_recv().is_err(),
-            "exactly one event per failed request"
+            hits > 1,
+            "the direct model's retry budget should replay a 5xx"
         );
+        assert_eq!(events.len(), hits, "exactly one event per upstream attempt");
+        for (i, ev) in events.iter().enumerate() {
+            assert_eq!(ev.attempt_index, i as u32);
+            assert_eq!(ev.attempt_kind, if i == 0 { "initial" } else { "retry" });
+            assert_eq!(ev.status_code, events[0].status_code);
+            assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
+            assert_eq!(ev.cost_usd, 0.0);
+        }
     }
 
     /// AISIX-Cloud#867: `/v1/audio/speech` (JSON body) must apply the PK's

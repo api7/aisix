@@ -735,19 +735,22 @@ impl Guardrail for GuardrailChain {
     }
 
     /// Names the member whose cap is the one [`Self::stream_output_policy`]
-    /// folded to: the smallest `max_buffer_bytes` among output members that
-    /// hold the whole response, the first in chain order on a tie — the row
-    /// an operator raises, not the chain.
+    /// folded to: the smallest `max_buffer_bytes` among output members of
+    /// the chain policy's own rank (a `window` member does not set a chain
+    /// that has a `buffer_full` member), the first in chain order on a tie —
+    /// the row an operator raises, not the chain.
     fn record_output_buffer_exceeded(&self) {
         let Some(audit) = self.audit.as_deref() else {
             return;
         };
+        let chain_policy = std::mem::discriminant(&self.stream_output_policy());
         let mut owner: Option<(&str, usize)> = None;
         for m in self.members.iter().filter(|m| m.guardrail.runs_on_output()) {
-            if let StreamOutputPolicy::BufferFull {
-                max_buffer_bytes, ..
-            } = m.guardrail.stream_output_policy()
-            {
+            let policy = m.guardrail.stream_output_policy();
+            if std::mem::discriminant(&policy) != chain_policy {
+                continue;
+            }
+            if let Some((max_buffer_bytes, _)) = policy.hold_cap() {
                 if owner.is_none_or(|(_, cap)| max_buffer_bytes < cap) {
                     owner = Some((&m.name, max_buffer_bytes));
                 }
@@ -1542,6 +1545,8 @@ mod tests {
                     StreamOutputPolicy::Window {
                         size_chars: 10,
                         overlap_chars: 2,
+                        max_buffer_bytes: 8_192,
+                        on_exceeded_fail_open: false,
                     },
                 ),
                 member("tied-first", full()),

@@ -320,12 +320,42 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
             );
         }
     }
+    // Operations whose ids collide after tool-name sanitization load and
+    // stay callable under a `_2` / `_3` … suffix, so this is not an error —
+    // but the suffixed names are not the ones the spec's author wrote.
+    for (name, duplicates) in openapi_tool_name_collisions(&snapshot.mcp_servers) {
+        eprintln!(
+            "resources file {}: warning: mcp_servers ({name:?}): operations share a tool name \
+             after sanitization and are served with a _2, _3 … suffix: {}",
+            resources.display(),
+            duplicates.join(", "),
+        );
+    }
     println!(
         "OK: {} loaded {} resource(s)",
         resources.display(),
         snapshot.total_entries(),
     );
     Ok(())
+}
+
+/// `(server name, colliding base tool names)` for each `type: openapi`
+/// server whose operations collide after tool-name sanitization.
+fn openapi_tool_name_collisions(
+    servers: &aisix_core::ResourceTable<aisix_core::McpServer>,
+) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = servers
+        .entries()
+        .into_iter()
+        .filter(|e| e.value.server_type == aisix_core::McpServerType::Openapi)
+        .filter_map(|e| {
+            let spec = e.value.spec.as_ref()?;
+            let duplicates = aisix_core::mcp_openapi::generate(spec).ok()?.duplicates;
+            (!duplicates.is_empty()).then(|| (e.value.name.clone(), duplicates))
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// Is this gauge label set still describing something the configuration
@@ -3507,6 +3537,33 @@ models:
         // Success path returns Ok; the failure path exits the process,
         // which is covered end-to-end by the e2e fail-fast case.
         run_validate(f.path()).unwrap();
+    }
+
+    #[test]
+    fn validate_reports_colliding_openapi_tool_names_without_failing() {
+        use std::io::Write as _;
+        let mut f = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        f.write_all(
+            br#"
+_format_version: "1"
+mcp_servers:
+  - name: erp
+    type: openapi
+    url: https://erp.test
+    spec: {"paths": {"/a": {"get": {"operationId": "foo/list"}}, "/b": {"get": {"operationId": "foo.list"}}}}
+  - name: clean
+    type: openapi
+    url: https://clean.test
+    spec: {"paths": {"/a": {"get": {"operationId": "one"}}, "/b": {"get": {"operationId": "two"}}}}
+"#,
+        )
+        .unwrap();
+        run_validate(f.path()).unwrap();
+        let snapshot = aisix_core::filesource::load_resources_file(f.path(), 1).unwrap();
+        assert_eq!(
+            openapi_tool_name_collisions(&snapshot.mcp_servers),
+            vec![("erp".to_string(), vec!["foo_list".to_string()])]
+        );
     }
 
     #[test]

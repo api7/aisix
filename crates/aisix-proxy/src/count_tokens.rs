@@ -124,6 +124,8 @@ pub async fn count_tokens(
     // Filled inside `dispatch`, so the failure branch — where a guardrail
     // block lands — stamps the enforced hits too (AISIX-Cloud#1330 / #1024).
     let mut screening = InputScreening::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::attempt::RoutingTelemetry::default();
     match dispatch(
         &state,
         &snapshot,
@@ -132,6 +134,7 @@ pub async fn count_tokens(
         &request_id,
         &client,
         &mut screening,
+        &mut routing,
     )
     .await
     {
@@ -146,6 +149,7 @@ pub async fn count_tokens(
                 elapsed,
                 &request_id,
                 None,
+                &routing,
             );
             // One ProviderKey lookup per completion (#941).
             let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
@@ -158,10 +162,30 @@ pub async fn count_tokens(
                     model: &model_name,
                     upstream_model: &success.upstream_model,
                     pk: pk.labels(),
+                    is_fallback: routing.fallback_count() > 0,
                     ..Default::default()
                 },
                 status,
                 elapsed,
+            );
+            // One zero-token event per attempt that failed first (#655);
+            // the winner's is the terminal one below.
+            crate::usage_attr::emit_failed_attempts_as(
+                &state,
+                &snapshot,
+                crate::operation::COUNT_TOKENS,
+                "anthropic",
+                &request_id,
+                &model_name,
+                &api_key_id,
+                &client,
+                &screening.applied,
+                &routing.attempts,
+                false,
+                false,
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &screening.audit,
             );
             emit_usage_event(
                 &state,
@@ -176,6 +200,7 @@ pub async fn count_tokens(
                 elapsed,
                 &client,
                 &screening,
+                routing.winner(),
             );
             success.response
         }
@@ -190,6 +215,7 @@ pub async fn count_tokens(
                 elapsed,
                 &request_id,
                 Some(&err),
+                &routing,
             );
             let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
             // AISIX-Cloud#1325: name the target the request died on. This
@@ -202,14 +228,14 @@ pub async fn count_tokens(
                 &state,
                 "/v1/messages/count_tokens",
                 crate::request_metrics::Caller::new(&auth),
-                last_target.upstream(metric_model.as_ref(), false, false),
+                last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
                 elapsed,
             );
-            // A failed count_tokens is a request the operator has to be
-            // able to find, and a guardrail refusal is the one that must
-            // carry the flag the "Guardrail blocks" view filters on.
-            crate::usage_attr::emit_error_usage_event(
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
+            crate::usage_attr::emit_failed_attempts_as(
                 &state,
                 &snapshot,
                 crate::operation::COUNT_TOKENS,
@@ -217,15 +243,39 @@ pub async fn count_tokens(
                 &request_id,
                 &model_name,
                 &api_key_id,
-                status,
-                err.kind(),
-                err.is_guardrail_block(),
                 &client,
-                crate::usage_attr::applied_guardrails(&screening.audit),
-                crate::usage_attr::enforced_hits(&screening.audit),
-                crate::usage_attr::guardrail_scores(&screening.audit),
-                crate::usage_attr::bypass_reason(&screening.audit),
+                &screening.applied,
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                screening.monitor_hits.clone(),
+                screening.redactions.clone(),
+                &screening.audit,
             );
+            // A failed count_tokens is a request the operator has to be
+            // able to find, and a guardrail refusal is the one that must
+            // carry the flag the "Guardrail blocks" view filters on. A
+            // failure no attempt answers for — pre-dispatch — is this one
+            // zero-token terminal event.
+            if !failed_terminal {
+                crate::usage_attr::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::operation::COUNT_TOKENS,
+                    "anthropic",
+                    &request_id,
+                    &model_name,
+                    &api_key_id,
+                    status,
+                    err.kind(),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::usage_attr::applied_guardrails(&screening.audit),
+                    crate::usage_attr::enforced_hits(&screening.audit),
+                    crate::usage_attr::guardrail_scores(&screening.audit),
+                    crate::usage_attr::bypass_reason(&screening.audit),
+                );
+            }
             // Anthropic-shape envelope (#336) — count_tokens callers are
             // the Anthropic SDK, not OpenAI-compatible clients.
             err.into_anthropic_response()
@@ -395,6 +445,7 @@ async fn dispatch(
     request_id: &str,
     client: &ClientContext,
     screening: &mut InputScreening,
+    routing: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<CountTokensSuccess, ProxyError> {
     let model_name = body
         .get("model")
@@ -462,6 +513,8 @@ async fn dispatch(
     // pre-dispatch 4xx); if this endpoint ever grows semantic support,
     // widen this flag or the deferred policies are silently skipped.
     let is_routing_request = model_entry.value.routing.is_some();
+    *routing = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client.trace.clone());
     let mut last_err: Option<ProxyError> = None;
     let mut any_anthropic = false;
     for (target_idx, target) in attempt_models.iter().enumerate() {
@@ -472,6 +525,21 @@ async fn dispatch(
             continue;
         }
         any_anthropic = true;
+        let pk_id = crate::dispatch::resolve_provider_key(snapshot, &target.model)
+            .map(|e| e.id.clone())
+            .unwrap_or_default();
+        // The routing target's name on the attempt record; empty for a
+        // direct model, whose `model_id` already identifies it.
+        let target_model = if is_routing_request {
+            target.model.display_name.clone()
+        } else {
+            String::new()
+        };
+        let attempt_target = crate::attempt::AttemptTarget {
+            display_name: &target.model.display_name,
+            target_model: &target_model,
+            model_id: &target.id,
+        };
         // Reserve THIS target's own model rate-limit layers before
         // dispatching to it (AISIX-Cloud#1087); over-limit → skip it and
         // try the remaining targets. Like the handler-level `_reservation` it is
@@ -493,6 +561,25 @@ async fn dispatch(
         {
             Ok(r) => r,
             Err(e) => {
+                // An attempt that never reached an upstream, recorded so
+                // the failover it forced is visible.
+                let (index, kind) = routing.begin_attempt(attempt_target);
+                routing.record(
+                    state,
+                    crate::attempt::AttemptRecord {
+                        index,
+                        kind,
+                        target_model: target_model.clone(),
+                        target_model_id: target.id.clone(),
+                        provider_key_id: pk_id.clone(),
+                        status: 429,
+                        success: false,
+                        error_class: "rate_limit_exceeded".to_string(),
+                        error_message: e.to_string(),
+                        latency_ms: 0,
+                        dispatched: false,
+                    },
+                );
                 last_err = Some(e);
                 continue;
             }
@@ -524,6 +611,8 @@ async fn dispatch(
                 });
                 tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32, hint)).await;
             }
+            let (index, kind) = routing.begin_attempt(attempt_target);
+            let attempt_started = Instant::now();
             match count_tokens_to_target(
                 state,
                 snapshot,
@@ -540,13 +629,49 @@ async fn dispatch(
             )
             .await
             {
-                Ok(success) => return Ok(success),
+                Ok(success) => {
+                    routing.record(
+                        state,
+                        crate::attempt::AttemptRecord {
+                            index,
+                            kind,
+                            target_model: target_model.clone(),
+                            target_model_id: target.id.clone(),
+                            provider_key_id: success.provider_key_id.clone(),
+                            status: success.response.status().as_u16(),
+                            success: true,
+                            error_class: String::new(),
+                            error_message: String::new(),
+                            latency_ms: crate::attempt::ms_since(attempt_started),
+                            dispatched: true,
+                        },
+                    );
+                    return Ok(success);
+                }
                 Err(e) => {
+                    let (error_class, error_message) = crate::attempt::attempt_error_from_proxy(&e);
+                    routing.record(
+                        state,
+                        crate::attempt::AttemptRecord {
+                            index,
+                            kind,
+                            target_model: target_model.clone(),
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: e.status().as_u16(),
+                            success: false,
+                            error_class,
+                            error_message,
+                            latency_ms: crate::attempt::ms_since(attempt_started),
+                            dispatched: crate::attempt::attempt_reached_upstream(&e),
+                        },
+                    );
                     let retryable = matches!(
                         &e,
                         ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
                     );
                     crate::routing::log_attempt_failure(
+                        request_id,
                         &target.model.display_name,
                         attempt_idx + 1,
                         &e,
@@ -835,10 +960,12 @@ fn emit_usage_event(
     elapsed: Duration,
     client: &ClientContext,
     screening: &InputScreening,
+    // The attempt that answered, which this event describes (#655).
+    winner: Option<&crate::attempt::AttemptRecord>,
 ) {
     let mut event = aisix_obs::UsageEvent {
         request_id: request_id.to_string(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
@@ -856,6 +983,11 @@ fn emit_usage_event(
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(&screening.audit),
         ..Default::default()
     };
+    if let Some(w) = winner {
+        event.attempt_index = w.index;
+        event.attempt_kind = w.kind.to_string();
+        event.attempt_model = w.target_model.clone();
+    }
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
     crate::usage_attr::apply_caller_identity(
         &mut event,
@@ -881,6 +1013,7 @@ fn emit_usage_event(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -889,7 +1022,9 @@ fn emit_access_log(
     elapsed: Duration,
     request_id: &str,
     error: Option<&ProxyError>,
+    routing: &crate::attempt::RoutingTelemetry,
 ) {
+    let summary = routing.access_log_summary();
     let (error_kind, error) = match error {
         Some(e) => {
             let (kind, msg) = crate::attempt::access_log_error(e);
@@ -916,9 +1051,9 @@ fn emit_access_log(
         // No provider response id: count_tokens returns only the token
         // estimate, and no upstream response object (AISIX-Cloud#1289).
         provider_request_id: None,
-        served_by_model: None,
-        routing_attempt_count: None,
-        routing_fallback_count: None,
+        served_by_model: summary.served_by_model,
+        routing_attempt_count: summary.attempt_count,
+        routing_fallback_count: summary.fallback_count,
         error_kind,
         error: error.as_deref(),
         mcp: None,

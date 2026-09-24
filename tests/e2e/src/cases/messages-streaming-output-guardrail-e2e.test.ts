@@ -106,14 +106,15 @@ describe("streaming /v1/messages output guardrail (#448)", () => {
     // the same value the HTTP 422 half of this endpoint renders. Anthropic's
     // `error.type` is a closed enum with no `content_filter` member, so the
     // two halves had been disagreeing and the SDK's typed parse rejected the
-    // streaming one.
+    // streaming one. The refusal is named by `error.code` instead
+    // (AISIX-Cloud#726).
     expect(body, "stream must end with an SSE error event").toContain("event: error");
     const frame = body.slice(body.lastIndexOf("event: error"));
     const payload = JSON.parse(
       frame.slice(frame.indexOf("data: ") + "data: ".length, frame.indexOf("\n\n")),
-    ) as { type: string; error: { type: string; message: string } };
+    ) as { type: string; error: { type: string; code?: string; message: string } };
     expect(payload.type).toBe("error");
     expect(payload.error.type).toBe("invalid_request_error");
-    expect(payload.error).not.toHaveProperty("code");
+    expect(payload.error.code).toBe("content_filter");
   });
 });

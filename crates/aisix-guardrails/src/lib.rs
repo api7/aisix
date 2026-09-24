@@ -569,10 +569,14 @@ pub enum StreamOutputPolicy {
     EndOfStreamCheck,
     /// Sliding window: release a window of content only after it scans
     /// clean; `overlap_chars` is carried between windows so a span split
-    /// across a boundary is still caught.
+    /// across a boundary is still caught. A relay that cannot release by
+    /// window holds the whole response instead, under `max_buffer_bytes`
+    /// and `on_exceeded_fail_open` exactly as [`Self::BufferFull`] does.
     Window {
         size_chars: usize,
         overlap_chars: usize,
+        max_buffer_bytes: usize,
+        on_exceeded_fail_open: bool,
     },
     /// Hold the whole response; scan once; release all or block.
     /// `max_buffer_bytes` caps the model-generated content held (assistant
@@ -593,6 +597,45 @@ impl StreamOutputPolicy {
         !matches!(self, StreamOutputPolicy::EndOfStreamCheck)
     }
 
+    /// The cap on held content and the overflow policy past it, for a relay
+    /// that holds the whole response; `None` when the policy holds nothing.
+    pub fn hold_cap(&self) -> Option<(usize, bool)> {
+        match *self {
+            StreamOutputPolicy::EndOfStreamCheck => None,
+            StreamOutputPolicy::Window {
+                max_buffer_bytes,
+                on_exceeded_fail_open,
+                ..
+            }
+            | StreamOutputPolicy::BufferFull {
+                max_buffer_bytes,
+                on_exceeded_fail_open,
+            } => Some((max_buffer_bytes, on_exceeded_fail_open)),
+        }
+    }
+
+    /// Fold `other`'s hold cap into `self`: the smaller cap, and fail-closed
+    /// unless both fail open.
+    fn with_cap_of(mut self, other: &Self) -> Self {
+        let Some((cap_b, open_b)) = other.hold_cap() else {
+            return self;
+        };
+        if let StreamOutputPolicy::Window {
+            max_buffer_bytes,
+            on_exceeded_fail_open,
+            ..
+        }
+        | StreamOutputPolicy::BufferFull {
+            max_buffer_bytes,
+            on_exceeded_fail_open,
+        } = &mut self
+        {
+            *max_buffer_bytes = (*max_buffer_bytes).min(cap_b);
+            *on_exceeded_fail_open = *on_exceeded_fail_open && open_b;
+        }
+        self
+    }
+
     /// Coarse strictness rank: more hold-back = higher.
     fn rank(&self) -> u8 {
         match self {
@@ -604,43 +647,38 @@ impl StreamOutputPolicy {
 
     /// Pick the stricter of two policies (used to fold a chain into one).
     /// Higher rank wins; ties break toward the tighter parameters
-    /// (smaller window, smaller buffer cap).
+    /// (smaller window). The hold cap folds within the winning rank only:
+    /// the smaller cap, and fail-closed unless every member of that rank
+    /// fails open. A `buffer_full` member therefore sets the chain's cap on
+    /// its own, and a `window` member's cap binds only a chain whose holding
+    /// members are all `window`.
     pub fn stricter(self, other: Self) -> Self {
         use StreamOutputPolicy::*;
-        match self.rank().cmp(&other.rank()) {
-            std::cmp::Ordering::Less => other,
-            std::cmp::Ordering::Greater => self,
-            std::cmp::Ordering::Equal => match (self, other) {
+        let winner = match self.rank().cmp(&other.rank()) {
+            std::cmp::Ordering::Less => return other,
+            std::cmp::Ordering::Greater => return self,
+            std::cmp::Ordering::Equal => match (&self, &other) {
                 (
                     Window {
                         size_chars: a,
                         overlap_chars: oa,
+                        ..
                     },
                     Window {
                         size_chars: b,
                         overlap_chars: ob,
+                        ..
                     },
                 ) => Window {
-                    size_chars: a.min(b),
-                    overlap_chars: oa.max(ob),
+                    size_chars: (*a).min(*b),
+                    overlap_chars: (*oa).max(*ob),
+                    max_buffer_bytes: usize::MAX,
+                    on_exceeded_fail_open: true,
                 },
-                (
-                    BufferFull {
-                        max_buffer_bytes: a,
-                        on_exceeded_fail_open: fa,
-                    },
-                    BufferFull {
-                        max_buffer_bytes: b,
-                        on_exceeded_fail_open: fb,
-                    },
-                ) => BufferFull {
-                    max_buffer_bytes: a.min(b),
-                    // fail-closed is stricter than fail-open.
-                    on_exceeded_fail_open: fa && fb,
-                },
-                (s, _) => s,
+                _ => self.clone(),
             },
-        }
+        };
+        winner.with_cap_of(&self).with_cap_of(&other)
     }
 }
 
@@ -1360,6 +1398,49 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn hold_cap_folds_within_the_winning_rank() {
+        let window = |cap, open| StreamOutputPolicy::Window {
+            size_chars: 100,
+            overlap_chars: 10,
+            max_buffer_bytes: cap,
+            on_exceeded_fail_open: open,
+        };
+        let full = |cap, open| StreamOutputPolicy::BufferFull {
+            max_buffer_bytes: cap,
+            on_exceeded_fail_open: open,
+        };
+        assert_eq!(window(500, true).hold_cap(), Some((500, true)));
+        assert_eq!(StreamOutputPolicy::EndOfStreamCheck.hold_cap(), None);
+        // An all-window chain folds its rows' caps.
+        assert_eq!(
+            window(500, true).stricter(window(900, true)).hold_cap(),
+            Some((500, true)),
+        );
+        assert_eq!(
+            window(900, false).stricter(window(500, true)).hold_cap(),
+            Some((500, false)),
+        );
+        // A buffer_full member sets the cap alone: a window row's tighter
+        // cap or fail-closed policy does not bind it, in either order.
+        let mixed = full(900, true).stricter(window(500, false));
+        assert_eq!(mixed, full(900, true));
+        assert_eq!(
+            window(500, false).stricter(full(900, true)),
+            full(900, true)
+        );
+        assert_eq!(
+            window(100, false)
+                .stricter(window(200, false))
+                .stricter(full(900, true))
+                .stricter(full(700, true))
+                .stricter(window(50, false))
+                .stricter(StreamOutputPolicy::EndOfStreamCheck)
+                .hold_cap(),
+            Some((700, true)),
+        );
     }
 
     /// Every top-level guardrail `kind` in the resource vocabulary, read out

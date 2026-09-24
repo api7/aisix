@@ -126,6 +126,8 @@ pub async fn embeddings(
     // failure branch most of all, since a guardrail block arrives here as
     // an error (AISIX-Cloud#1330 / #1024).
     let mut audit = crate::usage_attr::GuardrailAudit::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::attempt::RoutingTelemetry::default();
     match dispatch(
         &state,
         &snapshot,
@@ -134,6 +136,7 @@ pub async fn embeddings(
         &request_id,
         &client,
         &mut audit,
+        &mut routing,
     )
     .await
     {
@@ -152,6 +155,7 @@ pub async fn embeddings(
                 status,
                 elapsed,
                 &request_id,
+                &routing,
                 None,
             );
             // One ProviderKey lookup for the metric emit + the usage event
@@ -166,10 +170,33 @@ pub async fn embeddings(
                     model: &model_name,
                     upstream_model: &success.upstream_model,
                     pk: pk.labels(),
+                    is_fallback: routing.fallback_count() > 0,
                     ..Default::default()
                 },
                 status,
                 elapsed,
+            );
+            // One zero-token event per attempt that failed first (#655).
+            // The route's own 501 keeps its gated event below; when that
+            // stays silent the last failed attempt is the terminal one.
+            let (superseded, refused) = crate::usage_attr::split_route_refusal(&routing);
+            let answered = success.upstream_called
+                || crate::usage_attr::has_guardrail_attribution(&audit, &success.monitor_hits);
+            crate::usage_attr::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::operation::EMBEDDINGS,
+                &request_id,
+                &model_name,
+                &api_key_id,
+                &client,
+                &success.applied_guardrails,
+                superseded,
+                refused && !answered,
+                false,
+                success.monitor_hits.clone(),
+                success.redactions.clone(),
+                &audit,
             );
             // Issue #226: emit UsageEvent so cp-api's budget ledger
             // and customer-facing /logs analytics see embeddings
@@ -182,9 +209,7 @@ pub async fn embeddings(
             // `prompt_tokens == 0` so a 200 with legitimately zero
             // tokens (empty input, provider-specific billing
             // convention) still emits.
-            if success.upstream_called
-                || crate::usage_attr::has_guardrail_attribution(&audit, &success.monitor_hits)
-            {
+            if answered {
                 emit_usage_event(
                     &state,
                     &snapshot,
@@ -206,6 +231,7 @@ pub async fn embeddings(
                     success.captured_content.as_ref(),
                     &audit,
                     success.upstream_called,
+                    routing.attempts.last(),
                 );
             }
             success.response
@@ -220,6 +246,7 @@ pub async fn embeddings(
                 status,
                 elapsed,
                 &request_id,
+                &routing,
                 Some(&err),
             );
             let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
@@ -233,29 +260,52 @@ pub async fn embeddings(
                 &state,
                 "/v1/embeddings",
                 crate::request_metrics::Caller::new(&auth),
-                last_target.upstream(metric_model.as_ref(), false, false),
+                last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
             // zero-token event (status + error class), instead of dropping it.
-            crate::usage_attr::emit_error_usage_event(
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
+            crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
                 crate::operation::EMBEDDINGS,
-                "openai",
                 &request_id,
                 &model_name,
                 &api_key_id,
-                status,
-                err.kind(),
-                err.is_guardrail_block(),
                 &client,
-                crate::usage_attr::applied_guardrails(&audit),
-                crate::usage_attr::enforced_hits(&audit),
-                crate::usage_attr::guardrail_scores(&audit),
-                crate::usage_attr::bypass_reason(&audit),
+                &crate::usage_attr::applied_guardrails(&audit),
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
+            // A failure no attempt answers for — pre-dispatch, or after the
+            // winner — is one zero-token terminal event.
+            if !failed_terminal {
+                crate::usage_attr::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::operation::EMBEDDINGS,
+                    "openai",
+                    &request_id,
+                    &model_name,
+                    &api_key_id,
+                    status,
+                    err.kind(),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::usage_attr::applied_guardrails(&audit),
+                    crate::usage_attr::enforced_hits(&audit),
+                    crate::usage_attr::guardrail_scores(&audit),
+                    crate::usage_attr::bypass_reason(&audit),
+                );
+            }
             err.into_response()
         }
     }
@@ -305,6 +355,7 @@ struct EmbedDispatchSuccess {
     upstream_called: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
@@ -313,6 +364,7 @@ async fn dispatch(
     request_id: &str,
     client_ctx: &ClientContext,
     audit_out: &mut crate::usage_attr::GuardrailAudit,
+    routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<EmbedDispatchSuccess, ProxyError> {
     let model_entry = crate::model_resolve::resolve_model(snapshot, &body.model)
         .ok_or_else(|| ProxyError::ModelNotFound(body.model.clone()))?;
@@ -323,13 +375,6 @@ async fn dispatch(
 
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
-
-    let model = &model_entry.value;
-    let provider = crate::dispatch::require_provider(model)?;
-    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-
-    let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
-        .ok_or(ProxyError::ProviderUnavailable)?;
 
     // #719: /v1/embeddings must run input guardrails. Before this the
     // handler explicitly bypassed all guardrails, so a content block
@@ -432,8 +477,6 @@ async fn dispatch(
         crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
-    let upstream_model_id = crate::dispatch::require_upstream_model(model)?.to_string();
-
     // Preserve the caller's original `input` shape per #162 /
     // `docs/api-proxy.md` §4.4 "both pass through". The bridge will
     // use this flag to serialise the upstream wire body as either a
@@ -442,40 +485,97 @@ async fn dispatch(
     // which contradicts the docs and confuses operator-side packet
     // captures during billing reconciliation / debugging.
     let input_was_single = matches!(body.input, InputField::Single(_));
-    let req = EmbeddingRequest {
-        model: upstream_model_id,
+    let base_req = EmbeddingRequest {
+        // Rewritten to each target's upstream id at dispatch.
+        model: String::new(),
         input: body.input.into_vec(),
         input_was_single,
         encoding_format: body.encoding_format,
         dimensions: body.dimensions,
     };
 
-    // #554: apply the configured request `timeout` as the upstream deadline.
-    let mut ctx = crate::dispatch::bridge_ctx(
-        request_id,
-        &model_entry.id,
-        Arc::new(model.clone()),
-        &pk_entry.id,
-        Arc::new(pk_entry.value.clone()),
-        Some(client_ctx),
-    );
-    if let Some(d) = crate::routing::effective_timeouts(model, None, state.default_timeouts).request
-    {
-        ctx = ctx.with_deadline(d);
+    // A Model Group walks its targets (AISIX-Cloud#1111); every per-target
+    // input — provider, key, bridge, upstream id, deadline — comes from the
+    // target.
+    *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client_ctx.trace.clone());
+    let dispatched = crate::routing::dispatch_with_failover(
+        state,
+        snapshot,
+        auth,
+        client_ctx,
+        &client_facing_model,
+        &model_entry,
+        routing_out,
+        |_| true,
+        |(answered, ..): &(Result<_, BridgeError>, String, String)| {
+            answered.as_ref().err().map(ToString::to_string)
+        },
+        |target, timeouts| {
+            let base_req = &base_req;
+            async move {
+                let provider =
+                    crate::dispatch::require_provider(&target.model)?.to_ascii_lowercase();
+                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &target.model)?;
+                let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
+                    .ok_or(ProxyError::ProviderUnavailable)?;
+                let req = EmbeddingRequest {
+                    model: crate::dispatch::require_upstream_model(&target.model)?.to_string(),
+                    ..base_req.clone()
+                };
+                // #554: apply the configured request `timeout` as the upstream deadline.
+                let mut ctx = crate::dispatch::bridge_ctx(
+                    request_id,
+                    &target.id,
+                    Arc::new(target.model.clone()),
+                    &pk_entry.id,
+                    Arc::new(pk_entry.value.clone()),
+                    Some(client_ctx),
+                );
+                if let Some(d) = timeouts.request {
+                    ctx = ctx.with_deadline(d);
+                }
+                // #701: per-attempt cooldown accounting — see completions.rs.
+                let answered = match bridge.embed(&req, &ctx).await {
+                    Ok(v) => Ok(v),
+                    Err(e @ BridgeError::UnsupportedCapability(BridgeCapability::Embeddings)) => {
+                        Err(e)
+                    }
+                    Err(e) => {
+                        return Err(ProxyError::Bridge(crate::cooldown::note_failure(
+                            &state.runtime_status,
+                            &target.id,
+                            target.model.cooldown.as_ref(),
+                            e,
+                        )))
+                    }
+                };
+                Ok((answered, provider, pk_entry.id.to_string()))
+            }
+        },
+    )
+    .await;
+    let crate::routing::Dispatched {
+        value: (answered, provider, pk_id),
+        target,
+        member_reservation,
+        ..
+    } = match dispatched {
+        Ok(d) => d,
+        Err(e) => {
+            reservation.commit_tokens(0).await;
+            return Err(e);
+        }
+    };
+    // Fold the target's model-layer reservation in (AISIX-Cloud#1087) so
+    // one commit bills the member's TPM/TPD too.
+    let mut reservation = reservation;
+    if let Some(member) = member_reservation {
+        reservation.merge(member);
     }
+    let model = &target.model;
 
-    // #701: per-attempt cooldown accounting — see completions.rs.
-    let tracker = &state.runtime_status;
-    let cooldown_model_id: &str = &model_entry.id;
-    let cooldown_cfg = model.cooldown.as_ref();
-    match crate::routing::retrying_dispatch(state, model, "/v1/embeddings", || async {
-        bridge
-            .embed(&req, &ctx)
-            .await
-            .map_err(|e| crate::cooldown::note_failure(tracker, cooldown_model_id, cooldown_cfg, e))
-    })
-    .await
-    {
+    match answered {
         Ok(mut embed_resp) => {
             // The provider bridge fills `model` from the upstream's own
             // document (or echoes the upstream id it was sent); the client
@@ -483,8 +583,8 @@ async fn dispatch(
             embed_resp.model = client_facing_model;
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
-            state.health.record_success(&model_entry.value.display_name);
-            state.runtime_status.mark_healthy(&model_entry.id);
+            state.health.record_success(&model.display_name);
+            state.runtime_status.mark_healthy(&target.id);
             // Token accounting (#226 / AISIX-Cloud#1074). Embeddings are
             // input-only, so `prompt_tokens == total_tokens` on the OpenAI
             // shape. Providers that report only `total_tokens` (e.g. some
@@ -499,7 +599,7 @@ async fn dispatch(
                 (embed_resp.usage.total_tokens, false)
             } else {
                 let upstream_model = model.upstream_model().unwrap_or("unknown");
-                let estimated = req.input.iter().fold(0u32, |acc, s| {
+                let estimated = base_req.input.iter().fold(0u32, |acc, s| {
                     acc.saturating_add(crate::token_estimate::count_text(upstream_model, s))
                 });
                 (estimated, estimated > 0)
@@ -515,7 +615,7 @@ async fn dispatch(
                     (embed_resp.usage.total_tokens).max(prompt_tokens),
                 ))
                 .await;
-            let provider_label = provider.to_ascii_lowercase();
+            let provider_label = provider.clone();
             // Content capture (#700): the full response JSON, vectors
             // included (LiteLLM parity); CapturedContent::new truncates to
             // the cap.
@@ -530,8 +630,8 @@ async fn dispatch(
             Ok(EmbedDispatchSuccess {
                 response: Json(embed_resp).into_response(),
                 provider: provider_label,
-                model_id: model_entry.id.to_string(),
-                provider_key_id: pk_entry.id.to_string(),
+                model_id: target.id.clone(),
+                provider_key_id: pk_id.clone(),
                 upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 redactions: redactions.clone(),
@@ -542,7 +642,9 @@ async fn dispatch(
                 captured_content,
             })
         }
-        Err(e @ BridgeError::UnsupportedCapability(BridgeCapability::Embeddings)) => {
+        // `Err` carries only the unsupported-capability refusal — every
+        // other failure left through the dispatch.
+        Err(e) => {
             // Provider doesn't implement embed → 501 Not Implemented.
             // Drop the reservation without committing — the request
             // didn't hit the upstream. The handler emits no usage unless a
@@ -551,9 +653,9 @@ async fn dispatch(
             let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(EmbedDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
-                provider: provider.to_ascii_lowercase(),
-                model_id: model_entry.id.to_string(),
-                provider_key_id: pk_entry.id.to_string(),
+                provider,
+                model_id: target.id.clone(),
+                provider_key_id: pk_id.clone(),
                 upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 redactions: redactions.clone(),
@@ -569,14 +671,10 @@ async fn dispatch(
                 upstream_called: false,
             })
         }
-        Err(e) => {
-            reservation.commit_tokens(0).await;
-            // Cooldown was already noted per attempt inside the retry loop.
-            Err(ProxyError::Bridge(e))
-        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -584,6 +682,7 @@ fn emit_access_log(
     status: u16,
     latency: Duration,
     request_id: &str,
+    routing: &crate::attempt::RoutingTelemetry,
     error: Option<&ProxyError>,
 ) {
     let (error_kind, error) = match error {
@@ -599,6 +698,7 @@ fn emit_access_log(
         .unwrap_or(0);
     let _ = now_ts; // only used for context; access log uses elapsed
     let target = crate::attribution::AccessLogTarget::current();
+    let summary = routing.access_log_summary();
     AccessLog {
         method: "POST",
         path: "/v1/embeddings",
@@ -617,9 +717,9 @@ fn emit_access_log(
         // No provider response id: the OpenAI embeddings response shape
         // carries none (AISIX-Cloud#1289).
         provider_request_id: None,
-        served_by_model: None,
-        routing_attempt_count: None,
-        routing_fallback_count: None,
+        served_by_model: summary.served_by_model,
+        routing_attempt_count: summary.attempt_count,
+        routing_fallback_count: summary.fallback_count,
         error_kind,
         error: error.as_deref(),
         mcp: None,
@@ -681,6 +781,8 @@ fn emit_usage_event(
     // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
     audit: &crate::usage_attr::GuardrailAudit,
     dispatched: bool,
+    // The attempt that answered (#655); `None` when none was dispatched.
+    winner: Option<&crate::attempt::AttemptRecord>,
 ) {
     // Only populate fields meaningful to /v1/embeddings; rely on
     // UsageEvent's `#[derive(Default)]` for everything else. Wire-level
@@ -705,16 +807,15 @@ fn emit_usage_event(
     // `usage_attr::apply_pk_telemetry` below.
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
-        // RFC 3339 UTC. cp-api parses with time.Parse(time.RFC3339, ...);
-        // chrono's `to_rfc3339_opts(Secs, true)` emits the trailing Z.
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
         prompt_tokens,
         usage_estimated,
-        // Single-attempt endpoint: the attempt spans the whole request, so
-        // the upstream figure and what the caller waited for coincide.
+        // Narrowed to the winning attempt's own latency below
+        // (`apply_winning_attempt`) once a failover put earlier attempts
+        // in front of it; they emitted their own events.
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
@@ -730,6 +831,7 @@ fn emit_usage_event(
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
+    crate::usage_attr::apply_winning_attempt(&mut event, winner);
     // Handler label "embeddings" — bucketed prometheus counter (#408).
     crate::usage_attr::apply_caller_identity(
         &mut event,
@@ -1898,10 +2000,26 @@ mod tests {
             !ev.error_class.is_empty(),
             "error_class must classify the failure"
         );
+        // One event per upstream attempt (#655): each of the direct
+        // model's own retries fails the same way and leaves its own row,
+        // none of them billed.
+        let mut events = vec![ev];
+        while let Ok(more) = rx.try_recv() {
+            events.push(more);
+        }
+        let hits = upstream.received_requests().await.unwrap_or_default().len();
         assert!(
-            rx.try_recv().is_err(),
-            "exactly one event per failed request"
+            hits > 1,
+            "the direct model's retry budget should replay a 5xx"
         );
+        assert_eq!(events.len(), hits, "exactly one event per upstream attempt");
+        for (i, ev) in events.iter().enumerate() {
+            assert_eq!(ev.attempt_index, i as u32);
+            assert_eq!(ev.attempt_kind, if i == 0 { "initial" } else { "retry" });
+            assert_eq!(ev.status_code, events[0].status_code);
+            assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
+            assert_eq!(ev.cost_usd, 0.0);
+        }
     }
 
     /// Malformed JSON (syntax error) on /v1/embeddings must also

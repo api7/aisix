@@ -374,6 +374,8 @@ impl Guardrail for TextModerationGuardrail {
             _ => StreamOutputPolicy::Window {
                 size_chars: self.window_size as usize,
                 overlap_chars: self.window_overlap_size as usize,
+                max_buffer_bytes: self.max_buffer_bytes as usize,
+                on_exceeded_fail_open: self.on_buffer_exceeded == "fail_open",
             },
         }
     }
@@ -521,9 +523,17 @@ mod tests {
             g.stream_output_policy(),
             StreamOutputPolicy::Window {
                 size_chars: 10_000,
-                overlap_chars: 256
+                overlap_chars: 256,
+                max_buffer_bytes: 262_144,
+                on_exceeded_fail_open: false,
             }
         );
+        // Window mode carries the row's cap + on_exceeded policy too, for a
+        // relay that holds the whole response.
+        let mut gw = build("http://unused", true);
+        gw.max_buffer_bytes = 1000;
+        gw.on_buffer_exceeded = "fail_open".to_owned();
+        assert_eq!(gw.stream_output_policy().hold_cap(), Some((1000, true)),);
         // buffer_full mode surfaces the cap + on_exceeded policy.
         let mut g2 = build("http://unused", true);
         g2.stream_processing_mode = "buffer_full".to_owned();
