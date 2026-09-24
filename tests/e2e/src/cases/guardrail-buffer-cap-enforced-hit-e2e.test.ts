@@ -48,6 +48,8 @@ const DEFAULT_CAP_ROW = "cap-default-keyword";
 const ROUTE = "cap-passthrough";
 const OPEN_ROW = "cap-fail-open";
 const OPEN_ROUTE = "cap-open-passthrough";
+const TAIL_ROUTE = "cap-tail-passthrough";
+const OPEN_TAIL_ROUTE = "cap-open-tail-passthrough";
 
 // 30 pieces of 100 bytes: three times the tight cap, far under the loose one.
 const TIGHT_CAP = 1_000;
@@ -117,6 +119,16 @@ const RESPONSES_STREAM = [
       usage: { input_tokens: 5, output_tokens: 40, total_tokens: 45 },
     },
   }),
+];
+
+// A passthrough stream whose last frame never ends: a short answer, then a
+// keep-alive the upstream leaves unterminated, carrying no content but past
+// the raw bound (64 × the tight cap) the hold-back also keeps.
+const TAIL_MARKER = "tail-marker";
+const UNTERMINATED_TAIL_STREAM = [
+  `data: ${chatChunk({ role: "assistant" })}\n\n`,
+  `data: ${chatChunk({ content: PIECES[0] })}\n\n`,
+  `data: ${JSON.stringify({ id: `${TAIL_MARKER}-${"k".repeat(100_000)}`, object: "chat.completion.chunk", choices: [] })}`,
 ];
 
 interface EnforcedHit {
@@ -248,6 +260,33 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
       provider_key_id: routeUp.pk.id,
     });
     await attachBoth("passthrough_route", route.id);
+
+    const tailUp = await startOpenAiUpstream({ rawStreamFrames: UNTERMINATED_TAIL_STREAM });
+    upstreams.push(tailUp);
+    const tailPk = await seed.createProviderKey({
+      display_name: "cap-tail-backing-pk",
+      secret: "sk-mock",
+      api_base: `${tailUp.baseUrl}/v1`,
+    });
+    const tailRoute = await seed.createPassthroughRoute({
+      name: TAIL_ROUTE,
+      path_prefix: "/passthrough/cap-tail",
+      target_url: `${tailUp.baseUrl}/v1`,
+      provider_key_id: tailPk.id,
+    });
+    await attachBoth("passthrough_route", tailRoute.id);
+    const openTailRoute = await seed.createPassthroughRoute({
+      name: OPEN_TAIL_ROUTE,
+      path_prefix: "/passthrough/cap-open-tail",
+      target_url: `${tailUp.baseUrl}/v1`,
+      provider_key_id: tailPk.id,
+    });
+    await seed.update("guardrail_attachments", randomUUID(), {
+      guardrail_id: open.id,
+      scope_type: "passthrough_route",
+      scope_id: openTailRoute.id,
+      priority: 100,
+    });
     const openRoute = await seed.createPassthroughRoute({
       name: OPEN_ROUTE,
       path_prefix: "/passthrough/cap-open",
@@ -359,6 +398,27 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
     expect(body).toContain("output_buffer_exceeded");
     expect(body).not.toContain(PIECES[29]);
     await expectCapHit("passthrough", (l) => l.get("passthrough_route_name") === ROUTE, TIGHT);
+  });
+
+  test("passthrough route: an unterminated last frame past the raw bound fails closed", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const body = await post("/passthrough/cap-tail/chat/completions", {
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: "go" }],
+    });
+    expect(body).toContain("output_buffer_exceeded");
+    expect(body).not.toContain(TAIL_MARKER);
+    await expectCapHit("passthrough tail", (l) => l.get("passthrough_route_name") === TAIL_ROUTE, TIGHT);
+  });
+
+  test("passthrough route: an unterminated last frame past the raw bound fails open as a bypass", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const body = await post("/passthrough/cap-open-tail/chat/completions", {
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: "go" }],
+    });
+    expect(body, "fail_open releases the tail").toContain(TAIL_MARKER);
+    await expectBypass("passthrough tail", (l) => l.get("passthrough_route_name") === OPEN_TAIL_ROUTE);
   });
 
   test("a kind with no max_buffer_bytes of its own is named when the default cap trips", async (ctx) => {

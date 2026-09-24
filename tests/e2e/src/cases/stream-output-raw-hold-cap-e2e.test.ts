@@ -70,6 +70,14 @@ const CHAT_EMPTY_TOOL_CALLS = [
   "[DONE]",
 ];
 
+// Bridged `/v1/responses` whose upstream ends without a finish or usage
+// chunk: the bridge closes the response itself. `response.created` and
+// `response.in_progress` echo the request's `instructions`, together under the
+// raw bound; the terminal event the bridge adds echoes them a third time and
+// carries the stream past it.
+const CHAT_NO_FINISH = [chatChunk({ role: "assistant" }), chatChunk({ content: TAIL })];
+const LONG_INSTRUCTIONS = `Be brief. ${"i".repeat(25 * CAP)}`;
+
 // Token-by-token text whose content totals `bytes`, ending with TAIL.
 const tokens = (bytes: number) => {
   const filler = bytes - TAIL.length;
@@ -233,6 +241,7 @@ describe("held-back stream raw-byte bound", () => {
       // `apis: {}`: no `/v1/responses` on this endpoint, so the route reaches
       // it through the chat bridge.
       await model(`raw-resp-bridge-${policy}`, "openai", CHAT_EMPTY_TOOL_CALLS, guard, { pk: { apis: {} } });
+      await model(`raw-resp-bridge-eof-${policy}`, "openai", CHAT_NO_FINISH, guard, { pk: { apis: {} } });
       const backing = await model(`raw-route-backing-${policy}`, "openai", PASSTHROUGH_KEEPALIVES, guard);
       const route = await seed.createPassthroughRoute({
         name: `raw-route-${policy}`,
@@ -302,6 +311,10 @@ describe("held-back stream raw-byte bound", () => {
     ["/v1/messages (bridged)", (p) => messages(`raw-msg-bridge-${p}`)],
     ["/v1/responses (native)", (p) => responses(`raw-resp-native-${p}`)],
     ["/v1/responses (bridged)", (p) => responses(`raw-resp-bridge-${p}`)],
+    [
+      "/v1/responses (bridged, closed by the gateway)",
+      (p) => post("/v1/responses", { model: `raw-resp-bridge-eof-${p}`, input: "go", instructions: LONG_INSTRUCTIONS }),
+    ],
     ["passthrough route", (p) => route(p)],
   ];
 

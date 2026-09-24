@@ -49,9 +49,30 @@ impl HeldBuffer {
     }
 }
 
-/// Raw size of a held chat chunk: its serialized length, which is what the
-/// chunk occupies once rendered at release.
-pub(crate) fn chat_chunk_raw(chunk: &aisix_gateway::ChatChunk) -> usize {
+/// JSON values kept up to `cap` serialized bytes; the rest are dropped.
+#[derive(Debug, Default)]
+pub(crate) struct BoundedValues {
+    values: Vec<Value>,
+    bytes: usize,
+}
+
+impl BoundedValues {
+    pub(crate) fn push(&mut self, v: &Value, cap: usize) {
+        let len = json_len(v);
+        if self.bytes.saturating_add(len) <= cap {
+            self.bytes += len;
+            self.values.push(v.clone());
+        }
+    }
+
+    /// The kept values, or `None` when there are none.
+    pub(crate) fn take(&mut self) -> Option<Vec<Value>> {
+        self.bytes = 0;
+        (!self.values.is_empty()).then(|| std::mem::take(&mut self.values))
+    }
+}
+
+fn json_len(v: &impl serde::Serialize) -> usize {
     struct Count(usize);
     impl std::io::Write for Count {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -63,8 +84,14 @@ pub(crate) fn chat_chunk_raw(chunk: &aisix_gateway::ChatChunk) -> usize {
         }
     }
     let mut c = Count(0);
-    let _ = serde_json::to_writer(&mut c, chunk);
+    let _ = serde_json::to_writer(&mut c, v);
     c.0
+}
+
+/// Raw size of a held chat chunk: its serialized length, which is what the
+/// chunk occupies once rendered at release.
+pub(crate) fn chat_chunk_raw(chunk: &aisix_gateway::ChatChunk) -> usize {
+    json_len(chunk)
 }
 
 /// Held content in one normalised chat delta.
@@ -297,6 +324,18 @@ mod tests {
         let mut b = HeldBuffer::default();
         b.hold(0, 10 * RAW_HOLD_FACTOR + 1);
         assert!(b.exceeds(10), "content-free bytes past the raw guard");
+    }
+
+    #[test]
+    fn bounded_values_stop_at_their_own_size() {
+        let empty_delta = json!({"index": 0});
+        let len = serde_json::to_string(&empty_delta).unwrap().len();
+        let mut kept = BoundedValues::default();
+        for _ in 0..1_000 {
+            kept.push(&empty_delta, 10 * len);
+        }
+        assert_eq!(kept.take().map(|v| v.len()), Some(10));
+        assert_eq!(kept.take(), None);
     }
 
     #[test]

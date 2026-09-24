@@ -2139,6 +2139,7 @@ fn stream_response(
             let rest = splitter.take_rest();
             if !rest.is_empty() {
                 let (parts, usage) = frame_parts(protocol, &rest);
+                let held = parts.held();
                 let delta = parts.scan;
                 if let Some(u) = usage {
                     merge_usage(&mut telemetry.usage, u);
@@ -2148,11 +2149,46 @@ fn stream_response(
                 }
                 scan_buf.push_str(&delta);
                 let rest = Bytes::from(rest);
-                if policy.holds_back() && !fail_opened {
-                    pending.push(rest);
-                } else {
-                    telemetry.mark_first_delivery();
-                    yield Ok(rest);
+                // The tail is held like any frame, under the same cap.
+                let tripped = match &policy {
+                    StreamOutputPolicy::BufferFull { max_buffer_bytes, on_exceeded_fail_open }
+                        if !fail_opened =>
+                    {
+                        held_content.hold(held, rest.len());
+                        held_content
+                            .exceeds(*max_buffer_bytes)
+                            .then_some(*on_exceeded_fail_open)
+                    }
+                    _ => None,
+                };
+                match tripped {
+                    Some(false) => {
+                        tracing::warn!(
+                            route = %route_name,
+                            "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
+                        );
+                        chain.record_output_buffer_exceeded();
+                        pending.clear();
+                        yield Ok(guardrail_error_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
+                        telemetry.guardrail_blocked = true;
+                        telemetry.stream_reached_end = true;
+                        telemetry.emit();
+                        return;
+                    }
+                    Some(true) => {
+                        for f in pending.drain(..) {
+                            telemetry.mark_first_delivery();
+                            yield Ok(f);
+                        }
+                        chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                        telemetry.mark_first_delivery();
+                        yield Ok(rest);
+                    }
+                    None if policy.holds_back() && !fail_opened => pending.push(rest),
+                    None => {
+                        telemetry.mark_first_delivery();
+                        yield Ok(rest);
+                    }
                 }
             }
             let text = format!("{overlap_tail}{scan_buf}");

@@ -5627,9 +5627,10 @@ where
         };
         // The raw tool-call deltas, for the end-of-stream check to rebuild
         // the channels the buffered branch's mask walker reads (#1027).
-        // Only the live-forward branch reads them; bounded like the buffer
+        // Only the live-forward branch reads them; bounded by their own size,
+        // since a delta with no name or arguments adds nothing to the buffer
         // above.
-        let mut eos_tool_calls: Vec<serde_json::Value> = Vec::new();
+        let mut eos_tool_calls = crate::held_content::BoundedValues::default();
         // P2 (#379) / #466: streamed-output policy folded over the output-hook
         // guardrails. EndOfStreamCheck (reached only when no output-hook
         // guardrail is present) leaves the live-forward path below byte-for-byte
@@ -5797,7 +5798,7 @@ where
                                 break;
                             }
                             if !hold_back {
-                                eos_tool_calls.push(tc.clone());
+                                eos_tool_calls.push(tc, tool_calls_cap);
                             }
                             if let Some(f) = tc.get("function") {
                                 if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
@@ -6286,8 +6287,7 @@ where
                         model: String::new(),
                         delta: aisix_gateway::ChatDelta {
                             content: Some(content.clone()),
-                            tool_calls: (!eos_tool_calls.is_empty())
-                                .then(|| std::mem::take(&mut eos_tool_calls)),
+                            tool_calls: eos_tool_calls.take(),
                             ..Default::default()
                         },
                         finish_reason: None,

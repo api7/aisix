@@ -2624,10 +2624,28 @@ pub fn build_responses_bridge_stream(
             for ev in encoder.force_finish() {
                 let b = bytes::Bytes::from(ev.to_sse_string());
                 if buffering {
+                    held_content.hold(0, b.len());
                     held.push(b);
                 } else {
                     downstream_mark!();
                     yield Ok(b);
+                }
+            }
+            // The closing events are held like any others, under the same
+            // cap: the terminal response repeats the request echo and the
+            // whole output.
+            if buffering && held_content.exceeds(max_buffer_bytes) {
+                if on_exceeded_fail_open {
+                    released = true;
+                    if let Some(chain) = output_guardrail.as_ref() {
+                        chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                    }
+                    for b in held.drain(..) {
+                        downstream_mark!();
+                        yield Ok(b);
+                    }
+                } else {
+                    overflowed = true;
                 }
             }
         }
