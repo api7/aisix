@@ -116,7 +116,7 @@ impl OtlpHttpFanOut {
     fn build(metrics: Option<Metrics>) -> Self {
         let client = aisix_gateway::client_builder()
             .timeout(REQUEST_TIMEOUT)
-            .user_agent(format!("aisix-dp/{}", aisix_core::BUILD_VERSION))
+            .user_agent(format!("aisix-dp/{}", &*aisix_core::BUILD_VERSION))
             .build()
             // The client builder only fails on illegal TLS roots; the
             // default config is always valid.
@@ -2188,7 +2188,7 @@ mod tests {
         assert_eq!(reqs.len(), 1, "one batched request, not three spawns");
         assert_eq!(
             reqs[0].headers["user-agent"],
-            format!("aisix-dp/{}", aisix_core::BUILD_VERSION)
+            format!("aisix-dp/{}", &*aisix_core::BUILD_VERSION)
         );
         let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
         let spans = body["resourceSpans"][0]["scopeSpans"][0]["spans"]

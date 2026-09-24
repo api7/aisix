@@ -1,56 +1,105 @@
 //! Build-time version identity.
 //!
-//! Release builds are stamped by CI: the `docker-image` workflow derives
-//! `AISIX_BUILD_VERSION` from the release tag (`v0.4.0` → `0.4.0`) and
-//! passes it as a Docker build-arg, so a released binary always
-//! self-reports the version it was tagged with — the `Server` response
-//! header, `aisix --version`, and the heartbeat `dp_version` all come
-//! from here, and no manual `Cargo.toml` bump is required at release
-//! time. Builds without a stamp fall back to the workspace crate
-//! version — and so do builds where the stamp is set but empty, which is
-//! what every non-tag image gets: the Dockerfile always exports
-//! `AISIX_BUILD_VERSION`, and CI fills it only for release tags.
-//! (QA v0.3.0 finding: the 0.3.0 image self-reported 0.1.0 because the
-//! crate version was the only source and was never bumped.)
+//! The version comes only from two compile-time stamps, and an empty stamp
+//! counts as unset (the Dockerfile always exports both, possibly empty):
+//!
+//! - `AISIX_BUILD_VERSION` — set by the `docker-image` workflow on release
+//!   tags only (`v1.4.0` → `1.4.0`). Reported unchanged.
+//! - `AISIX_BUILD_SHA` — the short commit sha every CI image build passes.
+//!   Without a release version the binary reports `dev+sha-<sha>`.
+//! - Neither → `dev` (plain `cargo build`, `docker build` without args).
+//!
+//! The workspace crate version is a placeholder and is never reported.
+//! [`BUILD_VERSION`] is what `aisix --version`, the `Server` header and the
+//! outbound User-Agents carry; [`HEARTBEAT_VERSION`] is what the heartbeat
+//! reports to the control plane.
+
+use std::sync::LazyLock;
+
+const BUILD_VERSION_STAMP: Option<&str> = option_env!("AISIX_BUILD_VERSION");
+const BUILD_SHA_STAMP: Option<&str> = option_env!("AISIX_BUILD_SHA");
 
 /// Version the binary reports about itself.
-pub const BUILD_VERSION: &str = resolve_build_version(
-    option_env!("AISIX_BUILD_VERSION"),
-    env!("CARGO_PKG_VERSION"),
-);
+pub static BUILD_VERSION: LazyLock<String> =
+    LazyLock::new(|| resolve_version(BUILD_VERSION_STAMP, BUILD_SHA_STAMP));
 
-const fn resolve_build_version(
-    stamp: Option<&'static str>,
-    fallback: &'static str,
-) -> &'static str {
-    match stamp {
-        Some(v) if !v.is_empty() => v,
-        _ => fallback,
+/// Version reported in the heartbeat. Release builds append the image sha
+/// (`1.4.0+sha-103d3ec`) so a node can be matched to its image; every other
+/// build reports [`BUILD_VERSION`] as is, which already carries the sha.
+pub static HEARTBEAT_VERSION: LazyLock<String> =
+    LazyLock::new(|| heartbeat_version(BUILD_VERSION_STAMP, BUILD_SHA_STAMP));
+
+fn stamped(value: Option<&str>) -> Option<&str> {
+    value.filter(|v| !v.is_empty())
+}
+
+fn resolve_version(version: Option<&str>, sha: Option<&str>) -> String {
+    match (stamped(version), stamped(sha)) {
+        (Some(v), _) => v.to_string(),
+        (None, Some(sha)) => format!("dev+sha-{sha}"),
+        (None, None) => "dev".to_string(),
+    }
+}
+
+fn heartbeat_version(version: Option<&str>, sha: Option<&str>) -> String {
+    match (stamped(version), stamped(sha)) {
+        (Some(v), Some(sha)) => format!("{v}+sha-{sha}"),
+        _ => resolve_version(version, sha),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_build_version, BUILD_VERSION};
+    use super::*;
 
     #[test]
-    fn empty_stamp_falls_back_to_crate_version() {
-        assert_eq!(resolve_build_version(Some(""), "0.3.0"), "0.3.0");
-        assert_eq!(resolve_build_version(None, "0.3.0"), "0.3.0");
+    fn release_stamp_wins_and_heartbeat_appends_sha() {
+        assert_eq!(resolve_version(Some("1.4.0"), Some("103d3ec")), "1.4.0");
         assert_eq!(
-            resolve_build_version(Some("1.4.0-rc.2"), "0.3.0"),
-            "1.4.0-rc.2"
+            heartbeat_version(Some("1.5.0-rc.1"), Some("103d3ec")),
+            "1.5.0-rc.1+sha-103d3ec"
         );
     }
 
     #[test]
-    fn build_version_is_nonempty_semverish() {
-        assert!(!BUILD_VERSION.is_empty());
-        // Both sources (stamp or crate version) must look like a
-        // dotted version, not a placeholder.
-        assert!(
-            BUILD_VERSION.chars().next().unwrap().is_ascii_digit(),
-            "BUILD_VERSION must start with a digit, got {BUILD_VERSION:?}"
+    fn sha_only_reports_dev_with_a_single_sha_suffix() {
+        assert_eq!(resolve_version(None, Some("103d3ec")), "dev+sha-103d3ec");
+        assert_eq!(heartbeat_version(None, Some("103d3ec")), "dev+sha-103d3ec");
+    }
+
+    #[test]
+    fn unstamped_reports_dev() {
+        assert_eq!(resolve_version(None, None), "dev");
+        assert_eq!(heartbeat_version(None, None), "dev");
+    }
+
+    #[test]
+    fn empty_stamps_count_as_unset() {
+        // What every non-tag image gets: BUILD_VERSION="" plus a real sha.
+        assert_eq!(
+            resolve_version(Some(""), Some("103d3ec")),
+            "dev+sha-103d3ec"
+        );
+        assert_eq!(
+            heartbeat_version(Some(""), Some("103d3ec")),
+            "dev+sha-103d3ec"
+        );
+        // `docker build` without args exports both, empty.
+        assert_eq!(resolve_version(Some(""), Some("")), "dev");
+        assert_eq!(heartbeat_version(Some(""), Some("")), "dev");
+        assert_eq!(resolve_version(Some("1.4.0"), Some("")), "1.4.0");
+        assert_eq!(heartbeat_version(Some("1.4.0"), Some("")), "1.4.0");
+    }
+
+    #[test]
+    fn statics_follow_the_compile_time_stamps() {
+        assert_eq!(
+            *BUILD_VERSION,
+            resolve_version(BUILD_VERSION_STAMP, BUILD_SHA_STAMP)
+        );
+        assert_eq!(
+            *HEARTBEAT_VERSION,
+            heartbeat_version(BUILD_VERSION_STAMP, BUILD_SHA_STAMP)
         );
     }
 }

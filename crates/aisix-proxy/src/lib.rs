@@ -116,10 +116,10 @@ use tower_http::set_header::SetResponseHeaderLayer;
 /// Product token emitted in the `Server` response header. Format follows
 /// RFC 9110 §10.2.4 (`product/version`) and matches the convention used
 /// by adjacent gateways (APISIX, nginx, kong). Version is
-/// [`aisix_core::BUILD_VERSION`]: CI-stamped from the release tag, crate
-/// version for local builds.
+/// [`aisix_core::BUILD_VERSION`]: the release tag on release builds,
+/// `dev+sha-<sha>` or `dev` otherwise.
 static SERVER_HEADER_VALUE: std::sync::LazyLock<HeaderValue> = std::sync::LazyLock::new(|| {
-    HeaderValue::from_str(&format!("AISIX/{}", aisix_core::BUILD_VERSION))
+    HeaderValue::from_str(&format!("AISIX/{}", &*aisix_core::BUILD_VERSION))
         .expect("build version must be a valid ASCII header value")
 });
 

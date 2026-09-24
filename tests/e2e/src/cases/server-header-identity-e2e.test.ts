@@ -50,13 +50,12 @@ const VALID_KEY_HASH = createHash("sha256")
   .digest("hex");
 const UNKNOWN_PLAINTEXT = "sk-server-header-e2e-unregistered";
 
-// Semver-anchored: `AISIX/` + `<major>.<minor>.<patch>` with optional
-// pre-release / build metadata. The version segment comes from
-// `CARGO_PKG_VERSION`, which the workspace pins to semver — a regression
-// that swaps in e.g. `CARGO_PKG_NAME` (yielding `AISIX/aisix-proxy`)
-// would slip past a looser `.+` pattern. Tightening to semver locks the
-// documented contract.
-const SERVER_HEADER_PATTERN = /^AISIX\/\d+\.\d+\.\d+([-+][\w.-]+)?$/;
+// Anchored to the two shapes the build stamps produce: a release version
+// (`<major>.<minor>.<patch>` with optional pre-release / build metadata) or
+// `dev` / `dev+sha-<sha>` for non-release builds — a regression that swaps
+// in e.g. `CARGO_PKG_NAME` (yielding `AISIX/aisix-proxy`) would slip past a
+// looser `.+` pattern.
+const SERVER_HEADER_PATTERN = /^AISIX\/(\d+\.\d+\.\d+([-+][\w.-]+)?|dev(\+sha-[0-9a-f]+)?)$/;
 
 describe("data plane identifies itself via Server header on every response", () => {
   let app: SpawnedApp | undefined;

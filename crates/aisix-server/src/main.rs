@@ -94,7 +94,7 @@ use tokio::sync::watch;
 #[derive(Debug, Parser)]
 #[command(
     name = "aisix",
-    version = aisix_core::BUILD_VERSION,
+    version = aisix_core::BUILD_VERSION.as_str(),
     about = "aisix AI Gateway",
     subcommand_negates_reqs = true
 )]

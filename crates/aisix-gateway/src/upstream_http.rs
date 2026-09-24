@@ -138,7 +138,7 @@ pub fn config() -> &'static UpstreamHttpConfig {
 pub fn client_builder() -> reqwest::ClientBuilder {
     let cfg = config();
     let mut b = reqwest::Client::builder()
-        .user_agent(format!("aisix/{}", aisix_core::BUILD_VERSION))
+        .user_agent(format!("aisix/{}", &*aisix_core::BUILD_VERSION))
         // Every client in the process resolves through the one cache, so
         // a burst of new connections to a host costs one lookup however
         // many clients it is spread over — including the per-ProviderKey
