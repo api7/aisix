@@ -330,7 +330,11 @@ impl PendingAccessLog {
         // `duration` is (AISIX-Cloud#1394).
         let latency = Duration::from_millis(u64::from(event.downstream_latency_ms));
         let prompt = u64::from(event.prompt_tokens);
-        let completion = u64::from(event.completion_tokens);
+        // The gateway's own completion count, as the non-streamed line and
+        // Prometheus report it — not the record's raw one, which may keep
+        // an upstream's separately-counted reasoning apart.
+        let completion_tokens = event.folded_completion_tokens();
+        let completion = u64::from(completion_tokens);
         // Cache-inclusive, the way every emitter in this crate computes a
         // request's total: `prompt_tokens` excludes the cache dimensions on
         // the Anthropic-shaped paths, so summing the two visible columns
@@ -338,7 +342,7 @@ impl PendingAccessLog {
         // row it was emitted beside.
         let total = crate::usage_attr::total_tokens_with_cache(
             event.prompt_tokens,
-            event.completion_tokens,
+            completion_tokens,
             event.cache_creation_tokens,
             event.cache_read_tokens,
         );

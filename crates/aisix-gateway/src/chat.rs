@@ -404,6 +404,82 @@ pub struct UsageStats {
     /// (#542). See `prompt_cache_hit_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_miss_tokens: Option<u32>,
+    /// The upstream's own total, verbatim (Gemini `totalTokenCount`, an
+    /// OpenAI-shape `usage.total_tokens`, Bedrock `totalTokens`). `0` means
+    /// the upstream reported none. Unlike `total_tokens`, which the gateway
+    /// may compute, this is never a sum built here: it is what the
+    /// UsageEvent records, and cp-api reads `prompt + completion + reasoning
+    /// == total` as "reasoning is billed beside completion", so a
+    /// synthesised total that happens to match would bill the reasoning
+    /// twice.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub upstream_total_tokens: u32,
+    /// Reasoning tokens the upstream reported BESIDE its completion count
+    /// that `completion_tokens` has folded in, because OpenAI accounting has
+    /// no third output bucket (Gemini `thoughtsTokenCount` outside
+    /// `candidatesTokenCount`). Every consumer reads the folded
+    /// `completion_tokens`; only the UsageEvent subtracts this back out to
+    /// record the upstream's own count — see
+    /// [`recorded_completion_tokens`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reasoning_folded_into_completion: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// The completion count a UsageEvent records: the upstream's own, before
+/// the gateway folded its separately-reported reasoning in.
+///
+/// Only when the unfolded row states that itself: cp-api reads reasoning
+/// as counted BESIDE the completion exactly when
+/// `prompt + completion + reasoning` equals the upstream's total, and as a
+/// subset of the completion otherwise. An unfolded row that misses that
+/// identity — no total reported, or a total built from terms this gateway
+/// does not map — would bill the candidates as nothing under the subset
+/// reading, so the record keeps the folded count, which that reading bills
+/// correctly.
+///
+/// Takes the completion the caller is about to record rather than reading
+/// `UsageStats`, because that value may have been estimated (#1074) or
+/// zeroed (#419) since the upstream reported it. Both only ever touch a
+/// count that is `0` or zero it outright, and the folded amount never
+/// exceeds the folded completion, so subtracting with saturation is exact
+/// in every case.
+pub fn recorded_completion_tokens(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    reasoning_tokens: u32,
+    reasoning_folded: u32,
+    upstream_total_tokens: u32,
+) -> u32 {
+    if reasoning_folded == 0 || upstream_total_tokens == 0 {
+        return completion_tokens;
+    }
+    let unfolded = completion_tokens.saturating_sub(reasoning_folded);
+    let additive = u64::from(prompt_tokens) + u64::from(unfolded) + u64::from(reasoning_tokens)
+        == u64::from(upstream_total_tokens);
+    if additive {
+        unfolded
+    } else {
+        completion_tokens
+    }
+}
+
+/// Fold one streamed usage frame's [`UsageStats::upstream_total_tokens`]
+/// into a stream's running value. `acc` is `None` until the first
+/// usage-bearing frame. The counters are cumulative, so the latest (max)
+/// value stands — but only while every frame reported a total: one frame
+/// without it means the stream's total is not the upstream's own, and it
+/// records `0`.
+pub fn merge_stream_upstream_total(acc: &mut Option<u32>, frame_total: u32) {
+    *acc = Some(match *acc {
+        None => frame_total,
+        Some(0) => 0,
+        Some(_) if frame_total == 0 => 0,
+        Some(prev) => prev.max(frame_total),
+    });
 }
 
 impl UsageStats {
@@ -478,6 +554,20 @@ impl UsageStats {
                 self.prompt_cache_miss_tokens,
                 other.prompt_cache_miss_tokens,
             ),
+            // A sum of totals is the upstreams' own only when every
+            // addend reported one; otherwise it is not a total any
+            // upstream stated, and recording it would mislead billing.
+            upstream_total_tokens: if self.upstream_total_tokens > 0
+                && other.upstream_total_tokens > 0
+            {
+                self.upstream_total_tokens
+                    .saturating_add(other.upstream_total_tokens)
+            } else {
+                0
+            },
+            reasoning_folded_into_completion: self
+                .reasoning_folded_into_completion
+                .saturating_add(other.reasoning_folded_into_completion),
         }
     }
 
@@ -1130,6 +1220,8 @@ mod tests {
             cache_read_tokens: 4,
             prompt_cache_hit_tokens: Some(2),
             prompt_cache_miss_tokens: None,
+            upstream_total_tokens: 15,
+            reasoning_folded_into_completion: 3,
         };
         let b = UsageStats {
             prompt_tokens: 20,
@@ -1142,6 +1234,8 @@ mod tests {
             cache_read_tokens: 6,
             prompt_cache_hit_tokens: None,
             prompt_cache_miss_tokens: Some(8),
+            upstream_total_tokens: 27,
+            reasoning_folded_into_completion: 0,
         };
         let sum = a.saturating_add(&b);
         assert_eq!(sum.prompt_tokens, 30);
@@ -1155,6 +1249,8 @@ mod tests {
         // None + Some(8) = Some(8); Some(2) + None = Some(2). None + None stays None.
         assert_eq!(sum.prompt_cache_hit_tokens, Some(2));
         assert_eq!(sum.prompt_cache_miss_tokens, Some(8));
+        assert_eq!(sum.upstream_total_tokens, 42);
+        assert_eq!(sum.reasoning_folded_into_completion, 3);
         assert_eq!(
             UsageStats::default()
                 .saturating_add(&UsageStats::default())
@@ -1168,6 +1264,69 @@ mod tests {
                 .prompt_tokens,
             u32::MAX,
         );
+    }
+
+    /// An aggregate's upstream total is the upstreams' own only when every
+    /// contributor reported one. An ensemble member that reported none
+    /// (Anthropic) must zero the sum: a partial sum is a number no upstream
+    /// stated, and cp-api would read it as a billing identity.
+    #[test]
+    fn upstream_total_sums_only_when_every_contributor_reported_one() {
+        let reported = UsageStats {
+            upstream_total_tokens: 150,
+            ..UsageStats::new(100, 50)
+        };
+        let unreported = UsageStats::with_cache(10, 5, 0, 0);
+        assert_eq!(unreported.upstream_total_tokens, 0);
+        assert_eq!(
+            reported.saturating_add(&unreported).upstream_total_tokens,
+            0
+        );
+        assert_eq!(
+            unreported.saturating_add(&reported).upstream_total_tokens,
+            0
+        );
+        assert_eq!(
+            reported.saturating_add(&reported).upstream_total_tokens,
+            300
+        );
+    }
+
+    /// The streamed counterpart: cumulative frames keep the latest total,
+    /// but one usage frame without a total makes the stream's total
+    /// unreported, wherever it falls.
+    #[test]
+    fn stream_upstream_total_keeps_the_latest_only_while_every_frame_reports_one() {
+        let run = |frames: &[u32]| {
+            let mut acc = None;
+            for f in frames {
+                merge_stream_upstream_total(&mut acc, *f);
+            }
+            acc.unwrap_or(0)
+        };
+        assert_eq!(run(&[]), 0);
+        assert_eq!(run(&[120, 150]), 150);
+        assert_eq!(run(&[0, 150]), 0);
+        assert_eq!(run(&[120, 0]), 0);
+    }
+
+    #[test]
+    fn recorded_completion_removes_only_the_folded_reasoning() {
+        // prompt 100, candidates 20, thoughts 30, total 150: additive.
+        assert_eq!(recorded_completion_tokens(100, 50, 30, 30, 150), 20);
+        assert_eq!(recorded_completion_tokens(100, 50, 30, 0, 150), 50);
+        // #419 zeroes the completion (and reasoning) of a stream nobody
+        // received.
+        assert_eq!(recorded_completion_tokens(100, 0, 0, 30, 150), 0);
+        // Without the upstream's total nothing marks the reasoning as
+        // beside the completion, so the folded count stands.
+        assert_eq!(recorded_completion_tokens(100, 50, 30, 30, 0), 50);
+        // A total the unfolded row does not add up to reads as the subset
+        // shape too.
+        assert_eq!(recorded_completion_tokens(100, 50, 30, 30, 160), 50);
+        // A thinking-only frame whose total has not caught up (candidates
+        // 0, thoughts 30, total == prompt).
+        assert_eq!(recorded_completion_tokens(100, 30, 30, 30, 100), 30);
     }
 
     /// PR #442 audit MEDIUM-4 (forward-compat): an *old-shape*

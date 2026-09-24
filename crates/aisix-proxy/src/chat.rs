@@ -285,6 +285,8 @@ pub async fn chat_completions(
                         cached_prompt_tokens: success.cached_prompt_tokens,
                         cache_write_tokens: success.cache_write_tokens,
                         reasoning_tokens: success.reasoning_tokens,
+                        upstream_total_tokens: success.upstream_total_tokens,
+                        reasoning_folded_into_completion: success.reasoning_folded_into_completion,
                         cache_creation_tokens: success.cache_creation_tokens,
                         cache_read_tokens: success.cache_read_tokens,
                         usage_estimated: success.usage_estimated,
@@ -600,6 +602,8 @@ pub async fn chat_completions(
                             cached_prompt_tokens: c.cached_prompt_tokens,
                             cache_write_tokens: c.cache_write_tokens,
                             reasoning_tokens: c.reasoning_tokens,
+                            upstream_total_tokens: c.upstream_total_tokens,
+                            reasoning_folded_into_completion: c.reasoning_folded_into_completion,
                             cache_creation_tokens: c.cache_creation_tokens,
                             cache_read_tokens: c.cache_read_tokens,
                             usage_estimated: c.usage_estimated,
@@ -723,6 +727,10 @@ struct Success {
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// Recorded-usage counterparts of the folded fields above; see
+    /// `UsageStats::upstream_total_tokens` / `reasoning_folded_into_completion`.
+    upstream_total_tokens: u32,
+    reasoning_folded_into_completion: u32,
     /// Provider response `id` (OpenAI chat.completion.id or Anthropic
     /// message id) — empty when the cached path served the request
     /// (re-using a stored response's id would mislead reconciliation).
@@ -1425,6 +1433,8 @@ struct UpstreamCharge {
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    upstream_total_tokens: u32,
+    reasoning_folded_into_completion: u32,
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
@@ -2306,6 +2316,8 @@ async fn dispatch(
                         cached_prompt_tokens: comp.cached_prompt_tokens,
                         cache_write_tokens: comp.cache_write_tokens,
                         reasoning_tokens: comp.reasoning_tokens,
+                        upstream_total_tokens: comp.upstream_total_tokens.unwrap_or(0),
+                        reasoning_folded_into_completion: comp.reasoning_folded_into_completion,
                         cache_creation_tokens: comp.cache_creation_tokens,
                         cache_read_tokens: comp.cache_read_tokens,
                         usage_estimated: comp.usage_estimated,
@@ -2495,6 +2507,8 @@ async fn dispatch(
             cached_prompt_tokens: 0,
             cache_write_tokens: None,
             reasoning_tokens: 0,
+            upstream_total_tokens: 0,
+            reasoning_folded_into_completion: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             provider_request_id: String::new(),
@@ -2786,6 +2800,9 @@ async fn dispatch(
                 let cached_prompt_tokens = cached.usage.cached_prompt_tokens;
                 let cache_write_tokens = cached.usage.cache_write_tokens;
                 let reasoning_tokens = cached.usage.reasoning_tokens;
+                let upstream_total_tokens = cached.usage.upstream_total_tokens;
+                let reasoning_folded_into_completion =
+                    cached.usage.reasoning_folded_into_completion;
                 let cache_creation_tokens = cached.usage.cache_creation_tokens;
                 let cache_read_tokens = cached.usage.cache_read_tokens;
                 // The model the ORIGINAL upstream reported for this body —
@@ -2928,6 +2945,8 @@ async fn dispatch(
                     cached_prompt_tokens,
                     cache_write_tokens,
                     reasoning_tokens,
+                    upstream_total_tokens,
+                    reasoning_folded_into_completion,
                     cache_creation_tokens,
                     cache_read_tokens,
                     // The stored response's `id` stays out: re-using a
@@ -3330,6 +3349,8 @@ async fn dispatch(
     let cached_prompt_tokens = upstream.usage.cached_prompt_tokens;
     let cache_write_tokens = upstream.usage.cache_write_tokens;
     let reasoning_tokens = upstream.usage.reasoning_tokens;
+    let upstream_total_tokens = upstream.usage.upstream_total_tokens;
+    let reasoning_folded_into_completion = upstream.usage.reasoning_folded_into_completion;
     let cache_creation_tokens = upstream.usage.cache_creation_tokens;
     let cache_read_tokens = upstream.usage.cache_read_tokens;
     let provider_request_id = crate::usage_attr::sanitize_provider_response_id(&upstream.id);
@@ -3389,6 +3410,8 @@ async fn dispatch(
                 cached_prompt_tokens,
                 cache_write_tokens,
                 reasoning_tokens,
+                upstream_total_tokens,
+                reasoning_folded_into_completion,
                 cache_creation_tokens,
                 cache_read_tokens,
                 provider_request_id: provider_request_id.clone(),
@@ -3582,6 +3605,8 @@ async fn dispatch(
         cached_prompt_tokens,
         cache_write_tokens,
         reasoning_tokens,
+        upstream_total_tokens,
+        reasoning_folded_into_completion,
         cache_creation_tokens,
         cache_read_tokens,
         provider_request_id,
@@ -3757,6 +3782,8 @@ async fn dispatch_ensemble(
                 cached_prompt_tokens: effective.usage.cached_prompt_tokens,
                 cache_write_tokens: effective.usage.cache_write_tokens,
                 reasoning_tokens: effective.usage.reasoning_tokens,
+                upstream_total_tokens: effective.usage.upstream_total_tokens,
+                reasoning_folded_into_completion: effective.usage.reasoning_folded_into_completion,
                 cache_creation_tokens: effective.usage.cache_creation_tokens,
                 cache_read_tokens: effective.usage.cache_read_tokens,
                 usage_estimated: effective.estimated,
@@ -4159,6 +4186,10 @@ async fn dispatch_ensemble(
                             cached_prompt_tokens: member.usage.cached_prompt_tokens,
                             cache_write_tokens: member.usage.cache_write_tokens,
                             reasoning_tokens: member.usage.reasoning_tokens,
+                            upstream_total_tokens: member.usage.upstream_total_tokens,
+                            reasoning_folded_into_completion: member
+                                .usage
+                                .reasoning_folded_into_completion,
                             cache_creation_tokens: member.usage.cache_creation_tokens,
                             cache_read_tokens: member.usage.cache_read_tokens,
                             usage_estimated: member.usage_estimated,
@@ -4199,6 +4230,8 @@ async fn dispatch_ensemble(
                         cached_prompt_tokens: comp.cached_prompt_tokens,
                         cache_write_tokens: comp.cache_write_tokens,
                         reasoning_tokens: comp.reasoning_tokens,
+                        upstream_total_tokens: comp.upstream_total_tokens.unwrap_or(0),
+                        reasoning_folded_into_completion: comp.reasoning_folded_into_completion,
                         cache_creation_tokens: comp.cache_creation_tokens,
                         cache_read_tokens: comp.cache_read_tokens,
                         usage_estimated: comp.usage_estimated,
@@ -4367,6 +4400,8 @@ async fn dispatch_ensemble(
             cached_prompt_tokens: 0,
             cache_write_tokens: None,
             reasoning_tokens: 0,
+            upstream_total_tokens: 0,
+            reasoning_folded_into_completion: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             provider_request_id: String::new(),
@@ -4503,6 +4538,10 @@ async fn dispatch_ensemble(
                 cached_prompt_tokens: effective_judge.usage.cached_prompt_tokens,
                 cache_write_tokens: effective_judge.usage.cache_write_tokens,
                 reasoning_tokens: effective_judge.usage.reasoning_tokens,
+                upstream_total_tokens: effective_judge.usage.upstream_total_tokens,
+                reasoning_folded_into_completion: effective_judge
+                    .usage
+                    .reasoning_folded_into_completion,
                 cache_creation_tokens: effective_judge.usage.cache_creation_tokens,
                 cache_read_tokens: effective_judge.usage.cache_read_tokens,
                 usage_estimated: effective_judge.estimated,
@@ -4654,6 +4693,10 @@ async fn dispatch_ensemble(
         cached_prompt_tokens: metric_usage.cached_prompt_tokens,
         cache_write_tokens: metric_usage.cache_write_tokens,
         reasoning_tokens: metric_usage.reasoning_tokens,
+        // Request-level aggregate for Prometheus; the per-sub-call
+        // UsageEvents above carry each upstream's own totals.
+        upstream_total_tokens: 0,
+        reasoning_folded_into_completion: 0,
         cache_creation_tokens: metric_usage.cache_creation_tokens,
         cache_read_tokens: metric_usage.cache_read_tokens,
         provider_request_id: String::new(),
@@ -4856,7 +4899,14 @@ fn emit_usage_event(
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
         prompt_tokens,
-        completion_tokens,
+        completion_tokens: aisix_gateway::chat::recorded_completion_tokens(
+            prompt_tokens,
+            completion_tokens,
+            extras.reasoning_tokens,
+            extras.reasoning_folded_into_completion,
+            extras.upstream_total_tokens,
+        ),
+        total_tokens: extras.upstream_total_tokens,
         cached_prompt_tokens: extras.cached_prompt_tokens,
         cache_write_tokens: extras.cache_write_tokens,
         reasoning_tokens: extras.reasoning_tokens,
@@ -4916,6 +4966,8 @@ fn emit_usage_event(
         // MCP attribution does not apply to the chat path.
         ..Default::default()
     };
+    event.reasoning_unfolded_from_completion =
+        completion_tokens.saturating_sub(event.completion_tokens);
     crate::usage_attr::apply_caller_identity(
         &mut event,
         client.jwt.as_ref(),
@@ -4990,6 +5042,11 @@ struct UsageExtras {
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
     reasoning_tokens: u32,
+    /// `UsageStats::upstream_total_tokens` — the event's `total_tokens`.
+    upstream_total_tokens: u32,
+    /// `UsageStats::reasoning_folded_into_completion`, subtracted back out
+    /// of the recorded completion.
+    reasoning_folded_into_completion: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
     /// True when any token counter was filled by the local estimator
@@ -5254,6 +5311,13 @@ struct StreamCompletion {
     /// uses u64; cp-api's wire-shape `prompt_tokens` is u32 but
     /// cumulative-tokens accounting can overflow u32 over a long key.
     total_tokens: u64,
+    /// See `aisix_gateway::chat::merge_stream_upstream_total`; `None`
+    /// until a usage frame arrives.
+    upstream_total_tokens: Option<u32>,
+    /// The latest usage frame's value, not the max: Gemini decides the
+    /// fold per frame, and only the final frame's decision matches the
+    /// max-merged completion.
+    reasoning_folded_into_completion: u32,
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
     reasoning_tokens: u32,
@@ -5431,6 +5495,9 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
             if delivered == 0 {
                 c.completion_tokens = 0;
                 c.reasoning_tokens = 0;
+                // The upstream's total describes counters no longer being
+                // recorded.
+                c.upstream_total_tokens = None;
                 c.cache_creation_tokens = 0;
                 c.cache_read_tokens = 0;
                 c.total_tokens = c.prompt_tokens as u64;
@@ -5733,6 +5800,11 @@ where
                         if u.reasoning_tokens > comp.reasoning_tokens {
                             comp.reasoning_tokens = u.reasoning_tokens;
                         }
+                        aisix_gateway::chat::merge_stream_upstream_total(
+                            &mut comp.upstream_total_tokens,
+                            u.upstream_total_tokens,
+                        );
+                        comp.reasoning_folded_into_completion = u.reasoning_folded_into_completion;
                         if u.cache_creation_tokens > comp.cache_creation_tokens {
                             comp.cache_creation_tokens = u.cache_creation_tokens;
                         }

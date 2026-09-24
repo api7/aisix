@@ -1385,6 +1385,7 @@ fn converse_output_into_chat_response(
             prompt_tokens: u.input_tokens().max(0) as u32,
             completion_tokens: u.output_tokens().max(0) as u32,
             total_tokens: u.total_tokens().max(0) as u32,
+            upstream_total_tokens: u.total_tokens().max(0) as u32,
             cache_read_tokens: u.cache_read_input_tokens().unwrap_or(0).max(0) as u32,
             cache_creation_tokens: u.cache_write_input_tokens().unwrap_or(0).max(0) as u32,
             ..Default::default()
@@ -1560,6 +1561,7 @@ fn emit_converse_chunk(
                         prompt_tokens: u.input_tokens.max(0) as u32,
                         completion_tokens: u.output_tokens.max(0) as u32,
                         total_tokens: u.total_tokens.max(0) as u32,
+                        upstream_total_tokens: u.total_tokens.max(0) as u32,
                         // Same mapping as the non-streaming branch — the
                         // metadata event carries the identical shape.
                         cache_read_tokens: u.cache_read_input_tokens.unwrap_or(0).max(0) as u32,

@@ -296,6 +296,7 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
             "upstream_protocol"
         ]
     ),
+    metric!(M_USAGE_EVENTS_REJECTED_TOTAL, &[]),
     metric!(M_GUARDRAIL_BLOCKS_TOTAL, &[]),
     metric!(M_GUARDRAIL_BYPASSES_TOTAL, &["reason"]),
     metric!(M_AUTH_DECISIONS_TOTAL, &["method", "result", "reason"]),
