@@ -1518,6 +1518,7 @@ async fn responses_to_target(
                 exceeded = held_content > max_buffer_bytes;
             }
             if exceeded && on_exceeded_fail_open {
+                chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
                 fail_open_prefix = Some(std::mem::take(&mut buf));
             } else if exceeded {
                 tracing::warn!(

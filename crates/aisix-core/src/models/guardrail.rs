@@ -1214,9 +1214,11 @@ pub struct GuardrailEnforcedHit {
     /// - `blocked_buffer_exceeded` — a streamed response outgrew the
     ///   hold-back cap (`max_buffer_bytes`) while an output row's
     ///   `on_buffer_exceeded` was `fail_closed`, so it was refused without
-    ///   being scanned. `guardrail_name` is the row whose cap was the
-    ///   effective one; raising that cap, not tuning the policy, is the
-    ///   remedy.
+    ///   being scanned. `guardrail_name` is the row whose cap was hit —
+    ///   the smallest among the output rows — and the refusal policy is
+    ///   the chain's folded one (fail-closed when any output row is), so
+    ///   the named row may itself be `fail_open`. Raising that cap, not
+    ///   tuning the policy, is the remedy.
     pub action: String,
     /// Why the check was unavailable, on `blocked_unavailable` only: a
     /// short, bounded cause such as `lakera_timeout` or

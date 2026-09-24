@@ -2730,6 +2730,9 @@ fn build_anthropic_sse_stream(
                         // `on_buffer_exceeded: fail_open`: release what is
                         // held unscanned and unmasked, then stream the rest.
                         released = true;
+                        if let Some(chain) = output_guardrail.as_ref() {
+                            chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                        }
                         for chunk in held_chunks.drain(..) {
                             for ev in encoder.next_events(&chunk) {
                                 yield Ok::<_, std::io::Error>(downstream_bytes!(guard, ev));
@@ -4001,6 +4004,9 @@ where
                     // unscanned and unmasked, then stream the rest live.
                     hold = None;
                     released = true;
+                    if let Some(chain) = output_guardrail.as_ref() {
+                        chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                    }
                     forward = std::mem::take(&mut held);
                 }
                 // Nothing completed yet — keep reading rather than yielding
@@ -4087,6 +4093,9 @@ where
                     if fail_open {
                         hold = None;
                         released = true;
+                        if let Some(chain) = output_guardrail.as_ref() {
+                            chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                        }
                         if guard.usage().downstream_latency_ms == 0 {
                             guard.usage().downstream_latency_ms =
                                 started.elapsed().as_millis().min(u32::MAX as u128) as u32;

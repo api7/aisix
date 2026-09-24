@@ -5960,6 +5960,18 @@ where
                                 // operator opted into that trade-off via
                                 // `on_buffer_exceeded: fail_open`.
                                 cap_released = true;
+                                {
+                                    let comp = guard.comp();
+                                    if comp.bypass_reason.is_empty() {
+                                        comp.bypass_reason =
+                                            crate::error::TAG_OUTPUT_BUFFER_EXCEEDED.to_owned();
+                                    }
+                                }
+                                if let Some(ctx) = output_guardrail.as_ref() {
+                                    ctx.chain.record_output_bypass(
+                                        crate::error::TAG_OUTPUT_BUFFER_EXCEEDED,
+                                    );
+                                }
                                 for chunk in pending.drain(..) {
                                     let ev = chunk_event!(chunk);
                                     yield Ok::<_, Infallible>(ev);

@@ -767,6 +767,13 @@ pub trait Guardrail: Send + Sync + 'static {
     /// the default is a no-op.
     fn record_output_buffer_exceeded(&self) {}
 
+    /// Record that the proxy let held-back output through WITHOUT an output
+    /// scan, as a fail-open bypass under `reason` — a stream that outgrew
+    /// the cap under `on_buffer_exceeded: fail_open`. No member ran, so no
+    /// fold can report it. Only [`GuardrailChain`] carries the receivers
+    /// ([`GuardrailChain::record_bypass`]), so the default is a no-op.
+    fn record_output_bypass(&self, _reason: &str) {}
+
     /// Whether this guardrail actually inspects the OUTPUT hook. Drives
     /// whether its `stream_output_policy` participates in the streamed-output
     /// hold-back fold (#466): an input-only guardrail must NOT force output

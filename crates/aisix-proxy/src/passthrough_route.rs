@@ -2123,6 +2123,7 @@ fn stream_response(
                                     yield Ok(f);
                                 }
                                 fail_opened = true;
+                                chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
                             } else {
                                 tracing::warn!(
                                     route = %route_name,

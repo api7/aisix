@@ -356,7 +356,9 @@ pub enum ProxyError {
 /// did not happen.
 ///
 /// `output_buffer_exceeded` — a streamed response outgrew the hold-back
-/// cap and the row is fail-closed, so it is refused unscanned.
+/// cap and the row is fail-closed, so it is refused unscanned. Under
+/// `on_buffer_exceeded: fail_open` the same tag is the request's
+/// `guardrail_bypassed_reason`: there it means the output scan was skipped.
 /// `unscannable_body` — the body could not be walked, so the guardrail was
 /// never offered the content to scan.
 /// `mask_writeback_failed` — a mask verdict could not be spliced back into

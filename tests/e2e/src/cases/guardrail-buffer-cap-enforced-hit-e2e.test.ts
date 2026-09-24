@@ -30,6 +30,11 @@ import {
 // first in chain order — so naming the chain's first member, or the larger
 // cap, names the wrong row. A third case covers a kind that has no
 // `max_buffer_bytes` of its own and holds back under the default cap.
+//
+// The same trip under `on_buffer_exceeded: fail_open` refuses nothing: what
+// was held goes out unscanned. That is a bypass, and each path records it as
+// `guardrail_bypassed_reason: "output_buffer_exceeded"` — without it the row
+// looks exactly like a response the guardrail screened.
 
 const KEY = "sk-buffer-cap-enforced-hit-e2e";
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -41,6 +46,8 @@ const LOOSE = "cap-loose-runs-first";
 const TIGHT = "cap-tight-runs-second";
 const DEFAULT_CAP_ROW = "cap-default-keyword";
 const ROUTE = "cap-passthrough";
+const OPEN_ROW = "cap-fail-open";
+const OPEN_ROUTE = "cap-open-passthrough";
 
 // 30 pieces of 100 bytes: three times the tight cap, far under the loose one.
 const TIGHT_CAP = 1_000;
@@ -150,7 +157,7 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
       content_mode: "metadata_only",
     });
 
-    const pii = (name: string, cap: number) =>
+    const pii = (name: string, cap: number, onExceeded = "fail_closed") =>
       seed.createGuardrail(
         {
           name,
@@ -159,12 +166,13 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
           kind: "pii",
           detectors: [{ type: "email", action: "mask" }],
           max_buffer_bytes: cap,
-          on_buffer_exceeded: "fail_closed",
+          on_buffer_exceeded: onExceeded,
         },
         { attach: false },
       );
     const loose = await pii(LOOSE, LOOSE_CAP);
     const tight = await pii(TIGHT, TIGHT_CAP);
+    const open = await pii(OPEN_ROW, TIGHT_CAP, "fail_open");
     const keyword = await seed.createGuardrail(
       {
         name: DEFAULT_CAP_ROW,
@@ -226,6 +234,8 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
     ] as const) {
       const { model: m } = await model(display, provider, [...events], extra);
       await attachBoth("model", m.id);
+      const { model: o } = await model(`${display}-open`, provider, [...events], extra);
+      await seed.attachGuardrailToModel(open.id, o.id);
     }
     const big = await model("cap-default", "openai", chatStream(BIG_PIECES));
     await seed.attachGuardrailToModel(keyword.id, big.model.id);
@@ -238,6 +248,18 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
       provider_key_id: routeUp.pk.id,
     });
     await attachBoth("passthrough_route", route.id);
+    const openRoute = await seed.createPassthroughRoute({
+      name: OPEN_ROUTE,
+      path_prefix: "/passthrough/cap-open",
+      target_url: `${routeUp.upstream.baseUrl}/v1`,
+      provider_key_id: routeUp.pk.id,
+    });
+    await seed.update("guardrail_attachments", randomUUID(), {
+      guardrail_id: open.id,
+      scope_type: "passthrough_route",
+      scope_id: openRoute.id,
+      priority: 100,
+    });
 
     // Caller key LAST: it authenticating implies every row above is live.
     await seed.createApiKey({
@@ -277,41 +299,56 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
       { guardrail_name: row, hook: "output", action: "blocked_buffer_exceeded" },
     ]);
   };
+  // Gated on the route's own row, not on the field under test, so a missing
+  // tag fails the assertion rather than the poll.
+  const expectBypass = async (what: string, pred: (log: Map<string, string>) => boolean) => {
+    const log = await waitForSlsLog(sls!, LOGSTORE, pred, what);
+    expect(log.get("guardrail_blocked") ?? "false", `${what}: fail_open refused nothing`).not.toBe("true");
+    expect(log.get("guardrail_bypassed_reason"), `${what}: the unscanned release is not recorded`).toBe(
+      "output_buffer_exceeded",
+    );
+    expect(JSON.parse(log.get("guardrail_enforced_hits") ?? "[]")).toEqual([]);
+  };
   const byModel = (model: string) => (l: Map<string, string>) => l.get("requested_model") === model;
 
-  const cases: Array<{ route: string; model: string; send: () => Promise<string> }> = [
-    { route: "/v1/chat/completions", model: "cap-chat", send: () => chat("cap-chat") },
-    {
-      route: "/v1/messages (native)",
-      model: "cap-msg-native",
-      send: () => post("/v1/messages", { model: "cap-msg-native", max_tokens: 256, messages: [{ role: "user", content: "go" }] }),
-    },
-    {
-      route: "/v1/messages (bridged)",
-      model: "cap-msg-bridge",
-      send: () => post("/v1/messages", { model: "cap-msg-bridge", max_tokens: 256, messages: [{ role: "user", content: "go" }] }),
-    },
-    {
-      route: "/v1/responses (native)",
-      model: "cap-resp-native",
-      send: () => post("/v1/responses", { model: "cap-resp-native", input: "go" }),
-    },
-    {
-      route: "/v1/responses (bridged)",
-      model: "cap-resp-bridge",
-      send: () => post("/v1/responses", { model: "cap-resp-bridge", input: "go" }),
-    },
+  const msg = (model: string) =>
+    post("/v1/messages", { model, max_tokens: 256, messages: [{ role: "user", content: "go" }] });
+  const resp = (model: string) => post("/v1/responses", { model, input: "go" });
+  const cases: Array<{ route: string; model: string; send: (model: string) => Promise<string> }> = [
+    { route: "/v1/chat/completions", model: "cap-chat", send: chat },
+    { route: "/v1/messages (native)", model: "cap-msg-native", send: msg },
+    { route: "/v1/messages (bridged)", model: "cap-msg-bridge", send: msg },
+    { route: "/v1/responses (native)", model: "cap-resp-native", send: resp },
+    { route: "/v1/responses (bridged)", model: "cap-resp-bridge", send: resp },
   ];
 
   for (const c of cases) {
     test(`${c.route}: names the row with the stricter cap, not the chain's first`, async (ctx) => {
       if (!etcdReachable || !app || !sls) return ctx.skip();
-      const body = await c.send();
+      const body = await c.send(c.model);
       expect(body).toContain("output_buffer_exceeded");
       expect(body).not.toContain(PIECES[29]);
       await expectCapHit(c.route, byModel(c.model), TIGHT);
     });
+
+    test(`${c.route}: a fail_open trip records the skipped output scan as a bypass`, async (ctx) => {
+      if (!etcdReachable || !app || !sls) return ctx.skip();
+      const model = `${c.model}-open`;
+      const body = await c.send(model);
+      expect(body, "fail_open releases what was held").toContain(PIECES[29]);
+      await expectBypass(c.route, byModel(model));
+    });
   }
+
+  test("passthrough route: a fail_open trip records the skipped output scan as a bypass", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const body = await post("/passthrough/cap-open/chat/completions", {
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: "go" }],
+    });
+    expect(body, "fail_open releases what was held").toContain(PIECES[29]);
+    await expectBypass("passthrough", (l) => l.get("passthrough_route_name") === OPEN_ROUTE);
+  });
 
   test("passthrough route: names the row with the stricter cap, not the chain's first", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();

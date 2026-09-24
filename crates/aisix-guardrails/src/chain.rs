@@ -225,10 +225,12 @@ impl GuardrailChain {
     /// Record a bypass the PROXY performed on the chain's behalf, rather
     /// than one a member returned.
     ///
-    /// One caller shape: a body the scanner cannot read, which the
+    /// Two caller shapes: a body the scanner cannot read, which the
     /// handler passes through when nothing attached both reads that side
-    /// and refuses when it cannot evaluate (#1115). No member ran, so no
-    /// member can report it, yet the request was screened by nothing —
+    /// and refuses when it cannot evaluate (#1115); and a held-back stream
+    /// that outgrew its cap under `on_buffer_exceeded: fail_open`, released
+    /// without an output scan (`output_buffer_exceeded`). No member ran, so
+    /// no member can report it, yet the content was screened by nothing —
     /// exactly what the field is read to rule out.
     ///
     /// Reported to BOTH receivers, and they answer different questions.
@@ -552,6 +554,10 @@ impl Guardrail for GuardrailChain {
 
     fn runs_on_output(&self) -> bool {
         self.members.iter().any(|m| m.guardrail.runs_on_output())
+    }
+
+    fn record_output_bypass(&self, reason: &str) {
+        self.record_bypass(reason);
     }
 
     /// Names the member whose cap is the one [`Self::stream_output_policy`]

@@ -182,7 +182,7 @@ impl GuardrailAuditLog {
 
     /// Record that a guardrail was bypassed instead of enforced, under
     /// the kind's bounded failure tag (`lakera_timeout`,
-    /// `unscannable_body`, …).
+    /// `unscannable_body`, `output_buffer_exceeded`, …).
     ///
     /// First one sticks, matching the chain folds and `chat.rs`: the
     /// policy that failed FIRST is the one that explains the request, and

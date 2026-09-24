@@ -302,9 +302,11 @@ pub struct UsageEvent {
     /// configured failure policy let the request past it: a remote kind
     /// whose upstream was unreachable on a `fail_open: true` row, or a
     /// body the scanner could not read on a chain where nothing that
-    /// reads that side fails closed. The value is the kind's bounded
-    /// failure tag (`bedrock_5xx`, `lakera_timeout`,
-    /// `custom_script_error`, …) or `unscannable_body`, clamped to 64
+    /// reads that side fails closed, or a held-back stream that outgrew
+    /// its cap under `on_buffer_exceeded: fail_open` and was released
+    /// without an output scan. The value is the kind's bounded failure tag
+    /// (`bedrock_5xx`, `lakera_timeout`, `custom_script_error`, …),
+    /// `unscannable_body` or `output_buffer_exceeded`, clamped to 64
     /// bytes; the first bypass of the request wins.
     ///
     /// NOT mutually exclusive with `guardrail_blocked`. A chain can fail

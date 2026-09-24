@@ -2516,6 +2516,9 @@ pub fn build_responses_bridge_stream(
                         // held unscanned and unmasked, then stream the rest.
                         buffering = false;
                         released = true;
+                        if let Some(chain) = output_guardrail.as_ref() {
+                            chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                        }
                         for b in held.drain(..) {
                             downstream_mark!();
                             yield Ok(b);
