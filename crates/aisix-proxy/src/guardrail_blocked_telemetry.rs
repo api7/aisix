@@ -385,6 +385,18 @@ async fn a_guardrail_refusal_is_marked_on_every_surface() {
             ));
             continue;
         }
+        // The refused row must also name the guardrail that governed it,
+        // or it contradicts its own flag (api7/aisix#1030, #543).
+        if let Some(event) = events
+            .iter()
+            .find(|e| e.guardrail_blocked && e.applied_guardrails.is_empty())
+        {
+            wrong.push(format!(
+                "{surface}: {} marked guardrail_blocked with an empty applied_guardrails",
+                event.error_class,
+            ));
+            continue;
+        }
         // A refusal costs the caller nothing: no upstream ran. `/a2a` is
         // exempt because its counters are the gateway's own reading of the
         // words, flagged `usage_estimated` and never charged — they are

@@ -327,8 +327,9 @@ pub(crate) async fn realtime(
                 err.is_guardrail_block(),
                 &client,
                 // Refused before the handshake, so no chain was ever
-                // resolved and no guardrail can have enforced anything —
-                // nor scored anything, nor been bypassed.
+                // resolved: none applied, and none can have enforced
+                // anything — nor scored anything, nor been bypassed.
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 String::new(),
@@ -836,6 +837,7 @@ async fn run_session(
                 /* guardrail_blocked */
                 false,
                 &client,
+                crate::usage_attr::applied_guardrails(&audit),
                 crate::usage_attr::enforced_hits(&audit),
                 crate::usage_attr::guardrail_scores(&audit),
                 crate::usage_attr::bypass_reason(&audit),
@@ -1085,6 +1087,7 @@ async fn run_session(
             .as_ref()
             .is_some_and(ProxyError::is_guardrail_block),
         guardrail_monitor_hits: monitor_hits,
+        applied_guardrails: crate::usage_attr::applied_guardrails(&audit),
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(&audit),
         guardrail_scores: crate::usage_attr::guardrail_scores(&audit),
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(&audit),

@@ -136,9 +136,11 @@ construction.
 
 Two rules follow, and both are enforced mechanically rather than by review:
 
-- A new `UsageEvent` literal in this crate sets the field, or carries a
+- A new `UsageEvent` literal in this crate sets the field — and
+  `applied_guardrails`, which rides the same log
+  (`usage_attr::applied_guardrails(audit)`) — or carries a
   `NO-GUARDRAIL-CHAIN: <why>` comment saying no chain was ever resolved
-  (`usage_attr`'s `every_usage_event_this_crate_builds_answers_the_bypass_question`
+  (`usage_attr`'s `every_usage_event_this_crate_builds_answers_the_guardrail_questions`
   parses the crate's own source for both).
 - A pass-through the PROXY performs on a body it could not scan is recorded
   with `GuardrailChain::record_unevaluable_{input,output}_bypass`, never

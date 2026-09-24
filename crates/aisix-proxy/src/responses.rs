@@ -3634,6 +3634,7 @@ fn emit_usage_event(
         redacted_entity_counts,
         guardrail_monitor_hits,
         // See `emit_zero_token_event`: request-scoped, so terminal only.
+        applied_guardrails: crate::usage_attr::applied_guardrails(audit),
         guardrail_enforced_hits: crate::usage_attr::terminal_enforced_hits(terminal, audit),
         guardrail_scores: crate::usage_attr::terminal_guardrail_scores(terminal, audit),
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
@@ -3809,6 +3810,7 @@ fn emit_zero_token_event(
         // Guardrails run once per REQUEST, not once per attempt, so a
         // superseded attempt's event would repeat the same hit per retry.
         // Only the terminal event carries them.
+        applied_guardrails: crate::usage_attr::applied_guardrails(audit),
         guardrail_enforced_hits: crate::usage_attr::terminal_enforced_hits(terminal, audit),
         guardrail_scores: crate::usage_attr::terminal_guardrail_scores(terminal, audit),
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),

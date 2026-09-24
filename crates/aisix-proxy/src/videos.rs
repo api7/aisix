@@ -1618,6 +1618,7 @@ pub async fn create_video(
                 err.kind(),
                 err.is_guardrail_block(),
                 &client,
+                crate::usage_attr::applied_guardrails(&audit),
                 crate::usage_attr::enforced_hits(&audit),
                 crate::usage_attr::guardrail_scores(&audit),
                 crate::usage_attr::bypass_reason(&audit),

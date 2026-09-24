@@ -1821,7 +1821,8 @@ impl LiveGuardrailIndex {
         if chain.is_empty() {
             return chain;
         }
-        chain.with_audit_log(Some(Arc::new(crate::GuardrailAuditLog::new())))
+        let log = crate::GuardrailAuditLog::for_applied(chain.applied().to_vec());
+        chain.with_audit_log(Some(Arc::new(log)))
     }
 
     /// `true` when the index has no entries — no enabled attachment names a
