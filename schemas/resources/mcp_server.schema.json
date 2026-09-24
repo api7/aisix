@@ -348,7 +348,7 @@
       ]
     },
     "spec": {
-      "description": "The OpenAPI 3.x document (as a JSON object) whose operations become this server's tools. Required when `type` is `openapi`; ignored otherwise."
+      "description": "The OpenAPI 3.x document (as a JSON object) whose operations become this server's tools. Required when `type` is `openapi`; ignored otherwise. A document with no operation that can become a tool is rejected."
     },
     "timeout_ms": {
       "description": "Maximum time, in milliseconds, to wait for a single upstream operation (establishing the session, listing tools, or calling a tool). Must be at least `1` when set. When omitted, the gateway applies a built-in default.",

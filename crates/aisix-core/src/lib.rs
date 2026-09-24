@@ -23,6 +23,7 @@ pub mod filesource;
 pub mod forwarded_headers;
 pub mod header_template;
 pub mod host;
+pub mod mcp_openapi;
 pub mod models;
 pub mod resource;
 pub mod sched;

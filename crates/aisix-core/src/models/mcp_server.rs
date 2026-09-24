@@ -78,7 +78,8 @@ pub struct McpServer {
 
     /// The OpenAPI 3.x document (as a JSON object) whose operations become
     /// this server's tools. Required when `type` is `openapi`; ignored
-    /// otherwise.
+    /// otherwise. A document with no operation that can become a tool is
+    /// rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<serde_json::Value>,
 
@@ -278,6 +279,22 @@ impl Resource for McpServer {
 
     fn kind() -> &'static str {
         "mcp_servers"
+    }
+}
+
+impl McpServer {
+    /// Requirements the JSON Schema cannot express, run by every load path
+    /// after deserialization: a `type: openapi` document must yield at least
+    /// one tool. A row that fails is rejected exactly like a schema failure,
+    /// because the gateway would register the server and serve nothing
+    /// from it.
+    pub fn validate_semantics(&self) -> Result<(), String> {
+        match (&self.server_type, &self.spec) {
+            (McpServerType::Openapi, Some(spec)) => {
+                crate::mcp_openapi::check_spec_yields_tools(spec)
+            }
+            _ => Ok(()),
+        }
     }
 }
 

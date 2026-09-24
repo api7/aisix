@@ -729,8 +729,16 @@ pub fn load_from_str(
                 }
             }
             "mcp_servers" => {
-                if let Some(t) = finish(&scope, &entry.doc, validate_mcp_server, &mut errors) {
-                    mcp_servers.push((id, scope, t));
+                if let Some(t) =
+                    finish::<McpServer>(&scope, &entry.doc, validate_mcp_server, &mut errors)
+                {
+                    // An OpenAPI document that yields no tool is beyond the
+                    // schema — a load error like any schema failure.
+                    if let Err(message) = t.validate_semantics() {
+                        errors.push(LoadError { scope, message });
+                    } else {
+                        mcp_servers.push((id, scope, t));
+                    }
                 }
             }
             "a2a_agents" => {
