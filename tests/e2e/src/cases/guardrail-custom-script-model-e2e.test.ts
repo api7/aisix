@@ -164,12 +164,15 @@ describe("custom guardrail script: ctx.model on the segment pass", () => {
       post("/v1/completions", { model, prompt: "hello", max_tokens: 16 }),
   };
 
-  // The caller key is seeded after the guardrail and both models, so the
-  // key authenticating means the policy is loaded too. Gated on the open
-  // model so the wait never depends on the behaviour under test.
+  // The caller key is seeded after the guardrail and every model, so the
+  // key authenticating means the policy is loaded too. Gated on
+  // `GET /v1/models` so the wait never depends on the guardrail under test:
+  // a guardrail failure shows up as a failed assertion, not a timeout.
   async function waitForPolicy(): Promise<void> {
     await waitConfigPropagation(async () => {
-      const res = await send.chat(ALLOWED);
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER}` },
+      });
       await res.text();
       return res.status === 200;
     });

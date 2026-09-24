@@ -87,9 +87,14 @@ pub enum GuardrailInputMessages {
     #[default]
     All,
     /// The window is only the messages after the last assistant message,
-    /// with system and developer messages excluded: the current user
-    /// message together with any tool results answering it. Messages the
-    /// model has already replied to are neither screened nor rewritten.
+    /// with system and developer messages excluded — this turn's user
+    /// messages together with the tool results answering them. That
+    /// assistant message is looked for only before the request's final
+    /// message other than a system or developer one, so a trailing
+    /// assistant prefill stays inside the current turn. For a request
+    /// carrying no assistant message, the window is the whole request
+    /// apart from its system and developer messages. Messages the model has
+    /// already replied to are neither screened nor rewritten.
     LatestTurn,
 }
 
