@@ -2055,7 +2055,7 @@ async fn dispatch(
                         );
                         let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
                         crate::routing::log_attempt_failure(
-                            &request_id,
+                            request_id,
                             &model.display_name,
                             attempt_idx + 1,
                             &err,
@@ -3248,7 +3248,7 @@ async fn dispatch(
                     );
                     let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
                     crate::routing::log_attempt_failure(
-                        &request_id,
+                        request_id,
                         &model.display_name,
                         attempt_idx + 1,
                         &err,
