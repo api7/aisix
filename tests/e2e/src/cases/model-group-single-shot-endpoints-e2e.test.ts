@@ -8,6 +8,7 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -27,7 +28,13 @@ import { startMockOtlp, type CapturedSpan, type MockOtlp } from "../harness/otlp
 // target and a `fallback` on the second — plus the per-attempt deployment
 // and fallback counters, exactly as /v1/chat/completions reports a
 // failover. The usage events are observed through the per-env OTLP
-// fan-out, which exports one span per event.
+// fan-out, which exports one span per event. The request's one access-log
+// line carries the same failover as its routing summary.
+//
+// Last, each endpoint serves a `least_latency` group whose slower target is
+// declared first: once both targets have answered once, the faster one
+// must serve, which it can only do if the endpoint feeds the per-target
+// latency the strategy ranks by.
 
 const CALLER_PLAINTEXT = "sk-model-group-single-shot-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -59,6 +66,13 @@ const OK_BODY = {
 
 const OK_UPSTREAM_MODEL = "ok-target-upstream";
 
+/** One `key=value` field of an access-log line. */
+function field(line: string, name: string): string | undefined {
+  const m = line.match(new RegExp(`\\b${name}=(?:"([^"]*)"|([^\\s]+))`));
+  if (!m) return undefined;
+  return m[1] ?? m[2];
+}
+
 type Call = () => Promise<Response>;
 
 /** The spans carrying one request's usage events, in attempt order. */
@@ -87,6 +101,8 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
   let etcdReachable = false;
   let bad: OpenAiUpstream | undefined;
   let ok: OpenAiUpstream | undefined;
+  let slow: OpenAiUpstream | undefined;
+  let fast: OpenAiUpstream | undefined;
   let otlp: MockOtlp | undefined;
   const auth = { authorization: `Bearer ${CALLER_PLAINTEXT}` };
 
@@ -104,50 +120,70 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
     return fetch(`${app!.proxyUrl}${path}`, { method: "POST", headers: auth, body: form });
   };
 
-  // [label, group name, upstream path the gateway calls, the call]
-  const cases: Array<[string, string, string, Call]> = [
-    ["completions", "grp-completions", "/v1/completions", json("/v1/completions", { model: "grp-completions", prompt: "hi" })],
-    ["embeddings", "grp-embeddings", "/v1/embeddings", json("/v1/embeddings", { model: "grp-embeddings", input: "hi" })],
-    ["rerank", "grp-rerank", "/v1/rerank", json("/v1/rerank", { model: "grp-rerank", query: "q", documents: ["a", "b"] })],
+  // [label, group name, upstream path the gateway calls, the call]. The
+  // call takes the model to address, so the least-latency groups below
+  // drive the same requests.
+  const endpoints: Array<[string, string, string, (model: string) => Call]> = [
+    ["completions", "grp-completions", "/v1/completions", (m) => json("/v1/completions", { model: m, prompt: "hi" })],
+    ["embeddings", "grp-embeddings", "/v1/embeddings", (m) => json("/v1/embeddings", { model: m, input: "hi" })],
+    [
+      "rerank",
+      "grp-rerank",
+      "/v1/rerank",
+      (m) => json("/v1/rerank", { model: m, query: "q", documents: ["a", "b"] }),
+    ],
     [
       "images/generations",
       "grp-images",
       "/v1/images/generations",
-      json("/v1/images/generations", { model: "grp-images", prompt: "a cat" }),
+      (m) => json("/v1/images/generations", { model: m, prompt: "a cat" }),
     ],
     [
       "images/edits",
       "grp-images-edits",
       "/v1/images/edits",
-      multipart("/v1/images/edits", { model: "grp-images-edits", prompt: "a hat" }, "image"),
+      (m) => multipart("/v1/images/edits", { model: m, prompt: "a hat" }, "image"),
     ],
     [
       "audio/transcriptions",
       "grp-transcriptions",
       "/v1/audio/transcriptions",
-      multipart("/v1/audio/transcriptions", { model: "grp-transcriptions" }, "file"),
+      (m) => multipart("/v1/audio/transcriptions", { model: m }, "file"),
     ],
     [
       "audio/translations",
       "grp-translations",
       "/v1/audio/translations",
-      multipart("/v1/audio/translations", { model: "grp-translations" }, "file"),
+      (m) => multipart("/v1/audio/translations", { model: m }, "file"),
     ],
     [
       "audio/speech",
       "grp-speech",
       "/v1/audio/speech",
-      json("/v1/audio/speech", { model: "grp-speech", input: "hello", voice: "alloy" }),
+      (m) => json("/v1/audio/speech", { model: m, input: "hello", voice: "alloy" }),
     ],
-    ["videos", "grp-videos", "/v1/videos", json("/v1/videos", { model: "grp-videos", prompt: "a boat" })],
+    ["videos", "grp-videos", "/v1/videos", (m) => json("/v1/videos", { model: m, prompt: "a boat" })],
   ];
+  const cases: Array<[string, string, string, Call]> = endpoints.map(([label, group, path, call]) => [
+    label,
+    group,
+    path,
+    call(group),
+  ]);
+  const latencyCases: Array<[string, string, string, Call]> = endpoints.map(([label, group, path, call]) => [
+    label,
+    `lat-${group}`,
+    path,
+    call(`lat-${group}`),
+  ]);
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
-    app = await spawnApp();
+    // The access log is an `info` event; the harness defaults to `warn`.
+    app = await spawnApp({ logLevel: "info" });
     const seed = new SeedClient(etcd, app.etcdPrefix);
     otlp = await startMockOtlp();
     await seed.createObservabilityExporter({
@@ -162,6 +198,8 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
       errorBody: { error: { message: "first target is down" } },
     });
     ok = await startOpenAiUpstream({ nonStreamBody: OK_BODY });
+    slow = await startOpenAiUpstream({ nonStreamBody: OK_BODY, responseDelayMs: 400 });
+    fast = await startOpenAiUpstream({ nonStreamBody: OK_BODY });
 
     // The videos surface appends `/v1/videos` to the key's base itself;
     // every other endpoint takes a `/v1` base.
@@ -171,6 +209,10 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
     const okPk = await pk("grp-ok-pk", `${ok.baseUrl}/v1`);
     const badVideoPk = await pk("grp-bad-video-pk", bad.baseUrl);
     const okVideoPk = await pk("grp-ok-video-pk", ok.baseUrl);
+    const slowPk = await pk("lat-slow-pk", `${slow.baseUrl}/v1`);
+    const fastPk = await pk("lat-fast-pk", `${fast.baseUrl}/v1`);
+    const slowVideoPk = await pk("lat-slow-video-pk", slow.baseUrl);
+    const fastVideoPk = await pk("lat-fast-video-pk", fast.baseUrl);
 
     for (const [label, group] of cases) {
       const video = label === "videos";
@@ -200,6 +242,29 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
         },
       });
     }
+    for (const [label, group] of latencyCases) {
+      const video = label === "videos";
+      for (const [member, key] of [
+        ["slow", video ? slowVideoPk : slowPk],
+        ["fast", video ? fastVideoPk : fastPk],
+      ] as const) {
+        await seed.createModel({
+          display_name: `${group}-${member}`,
+          provider: "openai",
+          model_name: OK_UPSTREAM_MODEL,
+          provider_key_id: key,
+        });
+      }
+      await seed.createModel({
+        display_name: group,
+        routing: {
+          strategy: "least_latency",
+          // Slow first: the strategy must reorder by what it measured, not
+          // honour declaration order.
+          targets: [{ model: `${group}-slow` }, { model: `${group}-fast` }],
+        },
+      });
+    }
 
     // Seeded last: once it authenticates, every model above is in the
     // snapshot (tests/e2e/AGENTS.md).
@@ -215,6 +280,8 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
     await app?.exit();
     await bad?.close();
     await ok?.close();
+    await slow?.close();
+    await fast?.close();
     await otlp?.close();
   });
 
@@ -270,6 +337,38 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
         group,
       ).toBe(1);
       expect(delta("aisix_proxy_requests_total", { endpoint: upstreamPath, is_fallback: "true" }), group).toBe(1);
+
+      // The request's access-log line summarises the same failover.
+      const line = await waitForLogLine(
+        app,
+        (l) => l.includes("proxy request completed") && field(l, "request_id") === requestId,
+        `${group}: the access-log line of ${requestId}`,
+      );
+      expect(field(line, "served_by_model"), line).toBe(`${group}-ok`);
+      expect(field(line, "routing_attempt_count"), line).toBe("2");
+      expect(field(line, "routing_fallback_count"), line).toBe("1");
+    },
+  );
+
+  test.for(latencyCases)(
+    "%s: a least_latency Model Group routes to the faster target once both are measured",
+    { timeout: 60_000 },
+    async ([, group, upstreamPath, call], ctx) => {
+      if (!etcdReachable || !app || !slow || !fast) {
+        ctx.skip();
+        return;
+      }
+      // Unmeasured targets are probed first, in declaration order: the
+      // first request measures the slow target, the second the fast one.
+      // Every request after that goes to whichever answered faster.
+      for (let i = 0; i < 4; i++) {
+        const res = await call();
+        const text = await res.text();
+        expect(res.status, `${group} #${i}: ${text}`).toBe(200);
+      }
+      const hits = (u: OpenAiUpstream) => u.receivedRequests.filter((r) => r.path === upstreamPath).length;
+      expect(hits(slow), `${group}: requests the slow target served`).toBe(1);
+      expect(hits(fast), `${group}: requests the fast target served`).toBe(3);
     },
   );
 });

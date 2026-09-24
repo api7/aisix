@@ -301,18 +301,10 @@ impl PendingAccessLog {
     /// Same shape their own inline line carries: the winner's display name,
     /// and the two counts, each absent when zero.
     pub(crate) fn with_routing(mut self, routing: &crate::attempt::RoutingTelemetry) -> Self {
-        self.served_by_model = routing
-            .winner()
-            .map(|w| w.target_model.clone())
-            .unwrap_or_default();
-        self.routing_attempt_count = match routing.attempt_count() {
-            0 => None,
-            n => Some(n),
-        };
-        self.routing_fallback_count = match routing.fallback_count() {
-            0 => None,
-            n => Some(n),
-        };
+        let summary = routing.access_log_summary();
+        self.served_by_model = summary.served_by_model.unwrap_or_default().to_string();
+        self.routing_attempt_count = summary.attempt_count;
+        self.routing_fallback_count = summary.fallback_count;
         self
     }
 

@@ -535,6 +535,10 @@ pub(crate) struct Dispatched<T> {
 /// ends the dispatch like any non-retryable refusal and is recorded as a
 /// failed, never-dispatched one rather than as a success.
 ///
+/// A successful attempt also feeds the target's latency to the
+/// `least_latency` strategy, exactly as chat does, so a group on that
+/// strategy learns its targets on every endpoint of the family.
+///
 /// The one chokepoint for the single-shot endpoint family — completions,
 /// embeddings, rerank, images, audio, videos — so they dispatch Model
 /// Groups identically (AISIX-Cloud#1111).
@@ -663,6 +667,13 @@ where
                     // The route answered its own 501 without contacting the
                     // provider, so it is no evidence of upstream health.
                     let dispatched = refusal.is_none();
+                    let latency_ms = crate::attempt::ms_since(attempt_started);
+                    // Feed the least_latency EWMA, as chat does: the round
+                    // trip for a buffered answer, time to the upstream's
+                    // response head for a relayed stream.
+                    if dispatched {
+                        state.runtime_status.record_latency(&target.id, latency_ms);
+                    }
                     telemetry.record(
                         state,
                         AttemptRecord {
@@ -681,7 +692,7 @@ where
                                 String::new()
                             },
                             error_message: refusal.unwrap_or_default(),
-                            latency_ms: crate::attempt::ms_since(attempt_started),
+                            latency_ms,
                             dispatched,
                         },
                     );

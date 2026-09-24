@@ -187,6 +187,7 @@ pub async fn completions(
                 elapsed,
                 &request_id,
                 Some(success.provider_request_id.as_str()),
+                &routing,
                 None,
             );
             // One ProviderKey lookup for the metric emit + the usage event
@@ -284,6 +285,7 @@ pub async fn completions(
                 elapsed,
                 &request_id,
                 None,
+                &routing,
                 Some(&err),
             );
             let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
@@ -1003,6 +1005,7 @@ fn emit_access_log(
     request_id: &str,
     // Provider response id; `None`/empty when the call produced none.
     provider_request_id: Option<&str>,
+    routing: &crate::attempt::RoutingTelemetry,
     error: Option<&ProxyError>,
 ) {
     let (error_kind, error) = match error {
@@ -1017,6 +1020,7 @@ fn emit_access_log(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let target = crate::attribution::AccessLogTarget::current();
+    let summary = routing.access_log_summary();
     AccessLog {
         method: "POST",
         path: "/v1/completions",
@@ -1033,9 +1037,9 @@ fn emit_access_log(
         total_tokens: None,
         request_id,
         provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
-        served_by_model: None,
-        routing_attempt_count: None,
-        routing_fallback_count: None,
+        served_by_model: summary.served_by_model,
+        routing_attempt_count: summary.attempt_count,
+        routing_fallback_count: summary.fallback_count,
         error_kind,
         error: error.as_deref(),
         mcp: None,

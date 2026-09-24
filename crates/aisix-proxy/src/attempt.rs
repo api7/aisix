@@ -224,6 +224,28 @@ impl RoutingTelemetry {
     pub fn winner(&self) -> Option<&AttemptRecord> {
         self.attempts.iter().rfind(|a| a.success)
     }
+
+    /// The routing summary every family's access-log line carries (#655):
+    /// the winning routing target, and the attempt and fallback counts,
+    /// each absent when empty or zero.
+    pub fn access_log_summary(&self) -> AccessLogRouting<'_> {
+        AccessLogRouting {
+            served_by_model: self
+                .winner()
+                .map(|w| w.target_model.as_str())
+                .filter(|s| !s.is_empty()),
+            attempt_count: Some(self.attempt_count()).filter(|&n| n > 0),
+            fallback_count: Some(self.fallback_count()).filter(|&n| n > 0),
+        }
+    }
+}
+
+/// See [`RoutingTelemetry::access_log_summary`].
+#[derive(Clone, Copy, Default)]
+pub(crate) struct AccessLogRouting<'a> {
+    pub served_by_model: Option<&'a str>,
+    pub attempt_count: Option<u32>,
+    pub fallback_count: Option<u32>,
 }
 
 /// Winning-attempt / failed-attempt classification stamped onto an

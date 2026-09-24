@@ -5230,7 +5230,7 @@ fn emit_access_log(
     // Per #655 the access log stays ONE line per request (the transport
     // plane), carrying user-perceived `latency` + the final status plus a
     // routing summary. The per-attempt detail lives in telemetry only.
-    let served_by = routing.winner().map(|w| w.target_model.as_str());
+    let summary = routing.access_log_summary();
     let target = crate::attribution::AccessLogTarget::current();
     AccessLog {
         method,
@@ -5248,15 +5248,9 @@ fn emit_access_log(
         total_tokens,
         request_id,
         provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
-        served_by_model: served_by.filter(|s| !s.is_empty()),
-        routing_attempt_count: match routing.attempt_count() {
-            0 => None,
-            n => Some(n),
-        },
-        routing_fallback_count: match routing.fallback_count() {
-            0 => None,
-            n => Some(n),
-        },
+        served_by_model: summary.served_by_model,
+        routing_attempt_count: summary.attempt_count,
+        routing_fallback_count: summary.fallback_count,
         error_kind,
         error: error.as_deref(),
         mcp: None,

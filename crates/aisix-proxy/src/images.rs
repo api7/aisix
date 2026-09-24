@@ -134,6 +134,7 @@ pub async fn image_generations(
                 status,
                 elapsed,
                 &request_id,
+                &routing,
                 None,
             );
             // One ProviderKey lookup for the metric emit + the usage event
@@ -226,6 +227,7 @@ pub async fn image_generations(
                 status,
                 elapsed,
                 &request_id,
+                &routing,
                 Some(&err),
             );
             let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
@@ -729,6 +731,7 @@ pub(crate) fn emit_access_log(
     status: u16,
     latency: Duration,
     request_id: &str,
+    routing: &crate::attempt::RoutingTelemetry,
     error: Option<&ProxyError>,
 ) {
     let (error_kind, error) = match error {
@@ -739,6 +742,7 @@ pub(crate) fn emit_access_log(
         None => (None, None),
     };
     let target = crate::attribution::AccessLogTarget::current();
+    let summary = routing.access_log_summary();
     AccessLog {
         method: "POST",
         path: endpoint,
@@ -757,9 +761,9 @@ pub(crate) fn emit_access_log(
         // No provider response id: the images response is
         // `{created, data, usage}` — no id on the wire (AISIX-Cloud#1289).
         provider_request_id: None,
-        served_by_model: None,
-        routing_attempt_count: None,
-        routing_fallback_count: None,
+        served_by_model: summary.served_by_model,
+        routing_attempt_count: summary.attempt_count,
+        routing_fallback_count: summary.fallback_count,
         error_kind,
         error: error.as_deref(),
         mcp: None,

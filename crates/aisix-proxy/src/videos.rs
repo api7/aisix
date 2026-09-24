@@ -1472,18 +1472,25 @@ struct Telemetry<'a> {
 
 impl Telemetry<'_> {
     fn finish(&self, status: u16, provider: &str, model_label: &str, error: Option<&ProxyError>) {
-        self.finish_routed(status, provider, model_label, error, false);
+        self.finish_routed(
+            status,
+            provider,
+            model_label,
+            error,
+            &crate::attempt::RoutingTelemetry::default(),
+        );
     }
 
     /// [`Self::finish`] for the submit, whose dispatch can fail over to
-    /// another Model Group target (`is_fallback` on the request series).
+    /// another Model Group target: the access log carries its routing
+    /// summary, the request series its `is_fallback`.
     fn finish_routed(
         &self,
         status: u16,
         provider: &str,
         model_label: &str,
         error: Option<&ProxyError>,
-        is_fallback: bool,
+        routing: &crate::attempt::RoutingTelemetry,
     ) {
         let elapsed = self.started.elapsed();
         let (error_kind, error) = match error {
@@ -1494,6 +1501,7 @@ impl Telemetry<'_> {
             None => (None, None),
         };
         let log_target = crate::attribution::AccessLogTarget::current();
+        let summary = routing.access_log_summary();
         AccessLog {
             method: self.method,
             path: &self.path,
@@ -1515,9 +1523,9 @@ impl Telemetry<'_> {
             // same job (AISIX-Cloud#1289). It already reaches the caller as
             // the job's own `id`.
             provider_request_id: None,
-            served_by_model: None,
-            routing_attempt_count: None,
-            routing_fallback_count: None,
+            served_by_model: summary.served_by_model,
+            routing_attempt_count: summary.attempt_count,
+            routing_fallback_count: summary.fallback_count,
             error_kind,
             error: error.as_deref(),
             mcp: None,
@@ -1543,7 +1551,7 @@ impl Telemetry<'_> {
             crate::request_metrics::Caller::new(self.auth),
             crate::request_metrics::Upstream {
                 provider,
-                ..last_target.upstream(model_label, false, is_fallback)
+                ..last_target.upstream(model_label, false, routing.fallback_count() > 0)
             },
             status,
             elapsed,
@@ -1621,13 +1629,7 @@ pub async fn create_video(
                 .get_by_id(&success.model_id)
                 .map(|e| e.value.display_name.clone())
                 .unwrap_or_else(|| crate::usage_attr::UNRESOLVED_MODEL_LABEL.to_string());
-            telemetry.finish_routed(
-                status,
-                &success.provider,
-                &model_label,
-                None,
-                routing.fallback_count() > 0,
-            );
+            telemetry.finish_routed(status, &success.provider, &model_label, None, &routing);
             // One zero-token event per attempt that failed first (#655).
             // The route's own 501 keeps its gated event below; when that
             // stays silent the last failed attempt is the terminal one.
@@ -1682,7 +1684,7 @@ pub async fn create_video(
                 "unknown",
                 metric_model.as_ref(),
                 Some(&err),
-                routing.fallback_count() > 0,
+                &routing,
             );
             // #655 parity: failed submits surface in Logs as zero-token
             // events instead of vanishing.

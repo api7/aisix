@@ -155,6 +155,7 @@ pub async fn embeddings(
                 status,
                 elapsed,
                 &request_id,
+                &routing,
                 None,
             );
             // One ProviderKey lookup for the metric emit + the usage event
@@ -245,6 +246,7 @@ pub async fn embeddings(
                 status,
                 elapsed,
                 &request_id,
+                &routing,
                 Some(&err),
             );
             let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
@@ -678,6 +680,7 @@ fn emit_access_log(
     status: u16,
     latency: Duration,
     request_id: &str,
+    routing: &crate::attempt::RoutingTelemetry,
     error: Option<&ProxyError>,
 ) {
     let (error_kind, error) = match error {
@@ -693,6 +696,7 @@ fn emit_access_log(
         .unwrap_or(0);
     let _ = now_ts; // only used for context; access log uses elapsed
     let target = crate::attribution::AccessLogTarget::current();
+    let summary = routing.access_log_summary();
     AccessLog {
         method: "POST",
         path: "/v1/embeddings",
@@ -711,9 +715,9 @@ fn emit_access_log(
         // No provider response id: the OpenAI embeddings response shape
         // carries none (AISIX-Cloud#1289).
         provider_request_id: None,
-        served_by_model: None,
-        routing_attempt_count: None,
-        routing_fallback_count: None,
+        served_by_model: summary.served_by_model,
+        routing_attempt_count: summary.attempt_count,
+        routing_fallback_count: summary.fallback_count,
         error_kind,
         error: error.as_deref(),
         mcp: None,

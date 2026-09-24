@@ -137,6 +137,7 @@ pub async fn image_edits(
                 status,
                 elapsed,
                 &request_id,
+                &routing,
                 None,
             );
             // One ProviderKey lookup for both terminal emits (#941).
@@ -216,6 +217,7 @@ pub async fn image_edits(
                 status,
                 elapsed,
                 &request_id,
+                &routing,
                 Some(&err),
             );
             // AISIX-Cloud#1325: the form is parsed inside the dispatch that
