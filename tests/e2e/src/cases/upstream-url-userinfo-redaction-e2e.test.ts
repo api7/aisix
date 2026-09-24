@@ -61,10 +61,10 @@ describe("configured upstream URL userinfo is redacted e2e", () => {
     await app?.exit();
   });
 
-  test.each([
+  test.for([
     ["azure-override", "https://***@azure-proxy.invalid/openai"],
     ["azure-canonical", "https://***@acme.openai.azure.com"],
-  ])("%s answers 400 without echoing the credential", async (model, shown, ctx) => {
+  ] as const)("%s answers 400 without echoing the credential", async ([model, shown], ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;

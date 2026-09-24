@@ -148,14 +148,14 @@ describe("default upstream base on the direct-HTTP routes e2e", () => {
 
   const messages = [{ role: "user", content: "hi" }];
 
-  test.each([
+  test.for([
     ["/v1/messages", "anthropic-default", { max_tokens: 8, messages }],
     ["/v1/messages/count_tokens", "anthropic-default", { messages }],
     ["/v1/messages", "legacy-anthropic-default", { max_tokens: 8, messages }],
     ["/v1/messages/count_tokens", "legacy-anthropic-default", { messages }],
-  ])(
+  ] as const)(
     "%s on %s dials api.anthropic.com",
-    async (path, model, body, ctx) => {
+    async ([path, model, body], ctx) => {
       if (!etcdReachable || !app) {
         ctx.skip();
         return;

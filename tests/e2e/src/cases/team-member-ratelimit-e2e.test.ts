@@ -101,6 +101,7 @@ describe("rate limit e2e: team_member per-member default buckets", () => {
       ctx.skip();
       return;
     }
+    const { proxyUrl } = app;
 
     // listModels doesn't consume an rpm slot — safe readiness probe.
     // Probe EVERY key the assertions use, not just KEY_A1: the keys are
@@ -110,7 +111,7 @@ describe("rate limit e2e: team_member per-member default buckets", () => {
     const keysToProbe = [KEY_A1, KEY_A2, KEY_B];
     await waitConfigPropagation(async () => {
       for (const key of keysToProbe) {
-        const res = await new ProxyClient(app.proxyUrl, key).listModels();
+        const res = await new ProxyClient(proxyUrl, key).listModels();
         if (res.status !== 200) return false;
         const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
         if (!data.some((m) => m.id === "tm-e2e")) return false;
@@ -119,7 +120,7 @@ describe("rate limit e2e: team_member per-member default buckets", () => {
     });
 
     const chat = (apiKey: string) =>
-      new OpenAI({ apiKey, baseURL: `${app!.proxyUrl}/v1`, maxRetries: 0 });
+      new OpenAI({ apiKey, baseURL: `${proxyUrl}/v1`, maxRetries: 0 });
 
     const callStatus = async (apiKey: string): Promise<number> => {
       try {
