@@ -25,10 +25,21 @@ const HASH = createHash("sha256").update(CALLER).digest("hex");
 
 const BLOCKED = "csm-restricted";
 const ALLOWED = "csm-open";
+// Anthropic-backed pair: `/v1/messages/count_tokens` serves only those.
+const CT_BLOCKED = "csm-ct-restricted";
+const CT_ALLOWED = "csm-ct-open";
+// Routing parents. The script restricts ROUTER_BLOCKED, whose only target
+// is the open model, and does not restrict ROUTER_ALLOWED, whose only
+// target is the restricted one — so a script that saw the dispatched
+// target instead of the addressed name gets both backwards.
+const ROUTER_BLOCKED = "csm-router-restricted";
+const ROUTER_ALLOWED = "csm-router-open";
+
+const RESTRICTED = [BLOCKED, CT_BLOCKED, ROUTER_BLOCKED];
 
 const SCRIPT = `
 export async function checkInput(ctx) {
-  if (ctx.model === "${BLOCKED}") {
+  if (${JSON.stringify(RESTRICTED)}.indexOf(ctx.model) !== -1) {
     return { action: "block", reason_code: "MODEL-RESTRICTED" };
   }
   return { action: "none" };
@@ -76,11 +87,46 @@ describe("custom guardrail script: ctx.model on the segment pass", () => {
       await seed.attachGuardrailToModel(gr.id, model.id);
     }
 
+    const anthropicPk = await seed.createProviderKey({
+      display_name: "csm-anthropic-pk",
+      provider: "anthropic",
+      adapter: "anthropic",
+      secret: "sk-ant-mock",
+      api_base: upstream.baseUrl,
+    });
+    for (const alias of [CT_BLOCKED, CT_ALLOWED]) {
+      const model = await seed.createModel({
+        display_name: alias,
+        provider: "anthropic",
+        model_name: "claude-3-5-haiku-20241022",
+        provider_key_id: anthropicPk.id,
+      });
+      await seed.attachGuardrailToModel(gr.id, model.id);
+    }
+
+    for (const [alias, target] of [
+      [ROUTER_BLOCKED, ALLOWED],
+      [ROUTER_ALLOWED, BLOCKED],
+    ]) {
+      const model = await seed.createModel({
+        display_name: alias,
+        routing: { strategy: "failover", targets: [{ model: target }] },
+      });
+      await seed.attachGuardrailToModel(gr.id, model.id);
+    }
+
     // Seeded last: this key authenticating implies everything above it is
     // in the gateway's snapshot.
     await seed.createApiKey({
       key_hash: HASH,
-      allowed_models: [BLOCKED, ALLOWED],
+      allowed_models: [
+        BLOCKED,
+        ALLOWED,
+        CT_BLOCKED,
+        CT_ALLOWED,
+        ROUTER_BLOCKED,
+        ROUTER_ALLOWED,
+      ],
     });
   });
 
@@ -114,6 +160,8 @@ describe("custom guardrail script: ctx.model on the segment pass", () => {
         max_tokens: 16,
         messages: [{ role: "user", content: "hello" }],
       }),
+    completions: (model: string) =>
+      post("/v1/completions", { model, prompt: "hello", max_tokens: 16 }),
   };
 
   // The caller key is seeded after the guardrail and both models, so the
@@ -127,7 +175,7 @@ describe("custom guardrail script: ctx.model on the segment pass", () => {
     });
   }
 
-  for (const endpoint of ["chat", "responses", "messages"] as const) {
+  for (const endpoint of ["chat", "responses", "messages", "completions"] as const) {
     test(`${endpoint}: a script branching on ctx.model blocks only the addressed model`, async (ctx) => {
       if (!etcdReachable || !app || !upstream) {
         ctx.skip();
@@ -152,4 +200,53 @@ describe("custom guardrail script: ctx.model on the segment pass", () => {
       ).not.toBe(422);
     });
   }
+
+  test("count_tokens: a script branching on ctx.model blocks only the addressed model", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    await waitForPolicy();
+    const count = (model: string) =>
+      post("/v1/messages/count_tokens", {
+        model,
+        messages: [{ role: "user", content: "hello" }],
+      });
+
+    const before = upstream.receivedRequests.length;
+    const blocked = await count(CT_BLOCKED);
+    const blockedBody = await blocked.text();
+    expect(blocked.status, blockedBody).toBe(422);
+    expect(upstream.receivedRequests.length - before).toBe(0);
+
+    const allowed = await count(CT_ALLOWED);
+    const allowedBody = await allowed.text();
+    expect(allowed.status, allowedBody).not.toBe(422);
+    expect(
+      upstream.receivedRequests.length - before,
+      "the open model's count reached the upstream, so the 422 above was the policy",
+    ).toBe(1);
+  });
+
+  test("routing: the script sees the routing model the caller addressed, not the dispatched target", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    await waitForPolicy();
+
+    const blocked = await send.chat(ROUTER_BLOCKED);
+    const blockedBody = await blocked.text();
+    expect(
+      blocked.status,
+      `the restricted routing parent is refused although its target is open: ${blockedBody}`,
+    ).toBe(422);
+
+    const allowed = await send.chat(ROUTER_ALLOWED);
+    const allowedBody = await allowed.text();
+    expect(
+      allowed.status,
+      `the open routing parent is served although its target is restricted: ${allowedBody}`,
+    ).toBe(200);
+  });
 });
