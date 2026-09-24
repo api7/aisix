@@ -463,6 +463,16 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
       const hits = (u: OpenAiUpstream) => u.receivedRequests.filter((r) => r.path === upstreamPath).length;
       expect(hits(slow), `${group}: requests the slow target served`).toBe(1);
       expect(hits(fast), `${group}: requests the fast target served`).toBe(3);
+
+      // Measuring a target is not a health transition: a target these
+      // endpoints only ever saw succeed has no deployment state to report.
+      // (An absence check is sound here: no other test touches these models.)
+      const states = (await scrapeMetrics(app.metricsUrl)).filter(
+        (m) =>
+          m.name === "aisix_deployment_state" &&
+          (m.labels.model === `${group}-slow` || m.labels.model === `${group}-fast`),
+      );
+      expect(states, `${group}: deployment state series`).toEqual([]);
     },
   );
 

@@ -288,10 +288,6 @@ struct RuntimeEntry {
     last_checked_at: Option<SystemTime>,
     last_check_status: Option<u16>,
     status_reason: Option<String>,
-    /// Exponentially-weighted moving average of recent observed upstream
-    /// latency in milliseconds. `None` until the first sample. Drives the
-    /// `least_latency` routing strategy; independent of health/cooldown.
-    latency_ewma_ms: Option<f64>,
     /// Last value published to the `aisix_deployment_state` gauge for this
     /// target, so [`ModelRuntimeStatusTracker::sync_deployment_state`] can
     /// skip a write when nothing changed. `None` = never published.
@@ -583,6 +579,12 @@ pub struct ModelRuntimeStatusTracker {
     /// counting a request must not create one. See
     /// [`ModelRuntimeStatusTracker::count_in_flight`].
     in_flight: DashMap<String, Arc<AtomicUsize>>,
+    /// Exponentially-weighted moving average of each target's observed
+    /// upstream latency in milliseconds, driving the `least_latency`
+    /// strategy. Kept apart from `entries` for the same reason as
+    /// `in_flight`: measuring a target must not create the entry a first
+    /// success publishes `aisix_deployment_state` from.
+    latency_ewma_ms: DashMap<String, f64>,
 }
 
 /// RAII guard that decrements a target's in-flight counter when dropped.
@@ -697,6 +699,7 @@ impl ModelRuntimeStatusTracker {
             flags: Some(flags),
             exclusion_log: DashMap::new(),
             in_flight: DashMap::new(),
+            latency_ewma_ms: DashMap::new(),
         }
     }
 
@@ -967,23 +970,17 @@ impl ModelRuntimeStatusTracker {
             return;
         }
         let sample = f64::from(latency_ms);
-        self.entries
+        self.latency_ewma_ms
             .entry(model_id.to_string())
-            .and_modify(|entry| {
-                entry.latency_ewma_ms = Some(match entry.latency_ewma_ms {
-                    Some(prev) => LATENCY_EWMA_ALPHA * sample + (1.0 - LATENCY_EWMA_ALPHA) * prev,
-                    None => sample,
-                });
+            .and_modify(|prev| {
+                *prev = LATENCY_EWMA_ALPHA * sample + (1.0 - LATENCY_EWMA_ALPHA) * *prev;
             })
-            .or_insert_with(|| RuntimeEntry {
-                latency_ewma_ms: Some(sample),
-                ..RuntimeEntry::default()
-            });
+            .or_insert(sample);
     }
 
     /// Current latency EWMA (ms) for `model_id`, or `None` if never sampled.
     pub fn latency_ewma_ms(&self, model_id: &str) -> Option<f64> {
-        self.entries.get(model_id).and_then(|e| e.latency_ewma_ms)
+        self.latency_ewma_ms.get(model_id).map(|v| *v)
     }
 
     /// Mark one request as in flight to `model_id` and return a guard that
@@ -1304,6 +1301,18 @@ mod tests {
         drop(inactive.count_in_flight("single-shot-target"));
         inactive.mark_healthy("single-shot-target");
         assert!(inactive.entries.get("single-shot-target").is_none());
+    }
+
+    /// `dispatch_with_failover` feeds `least_latency` through
+    /// `record_latency`, which must not create the entry a first success
+    /// would publish `aisix_deployment_state` from either.
+    #[test]
+    fn record_latency_measures_without_creating_an_entry() {
+        let t = ModelRuntimeStatusTracker::new();
+        t.record_latency("single-shot-target", 50);
+        assert_eq!(t.latency_ewma_ms("single-shot-target"), Some(50.0));
+        t.mark_healthy("single-shot-target");
+        assert!(t.entries.get("single-shot-target").is_none());
     }
 
     #[test]
