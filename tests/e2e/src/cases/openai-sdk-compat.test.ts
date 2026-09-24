@@ -33,6 +33,7 @@ describe("openai SDK compat: drive gateway through real client", () => {
   let app: SpawnedApp | undefined;
   let nonStreamUpstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;
+  let compatUpstream: OpenAiUpstream | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -50,6 +51,8 @@ describe("openai SDK compat: drive gateway through real client", () => {
         "[DONE]",
       ],
     });
+
+    compatUpstream = await startOpenAiUpstream();
 
     app = await spawnApp({});
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -81,9 +84,29 @@ describe("openai SDK compat: drive gateway through real client", () => {
       provider_key_id: pkStream.id,
     });
 
+    // An OpenAI-compatible vendor other than OpenAI itself: its Chat
+    // Completions contract has no `developer` role.
+    const pkCompat = await seed.createProviderKey({
+      display_name: "sdk-compat-deepseek-pk",
+      secret: "sk-mock",
+      api_base: `${compatUpstream.baseUrl}/v1`,
+      provider: "deepseek",
+      adapter: "openai",
+    });
+    await seed.createModel({
+      display_name: "sdk-compat-deepseek",
+      provider: "deepseek",
+      model_name: "deepseek-chat",
+      provider_key_id: pkCompat.id,
+    });
+
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: ["sdk-compat-sync", "sdk-compat-stream"],
+      allowed_models: [
+        "sdk-compat-sync",
+        "sdk-compat-stream",
+        "sdk-compat-deepseek",
+      ],
     });
   });
 
@@ -91,6 +114,7 @@ describe("openai SDK compat: drive gateway through real client", () => {
     await app?.exit();
     await nonStreamUpstream?.close();
     await streamUpstream?.close();
+    await compatUpstream?.close();
   });
 
   /** Readiness gate per the harness rules: the caller key is seeded
@@ -175,6 +199,41 @@ describe("openai SDK compat: drive gateway through real client", () => {
     };
     expect(body.messages).toEqual([
       { role: "developer", content: "Follow application instructions" },
+      { role: "user", content: "hello" },
+    ]);
+  });
+
+  test("developer role reaches a non-OpenAI compatible vendor as system", async (ctx) => {
+    if (!etcdReachable || !app || !compatUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+    });
+
+    await waitConfigPropagation(seedsPropagated);
+    const baseline = compatUpstream.receivedRequests.length;
+
+    const completion = await client.chat.completions.create({
+      model: "sdk-compat-deepseek",
+      messages: [
+        { role: "developer", content: "Follow application instructions" },
+        { role: "user", content: "hello" },
+      ] as unknown as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+    });
+
+    expect(completion.object).toBe("chat.completion");
+    expect(compatUpstream.receivedRequests.length - baseline).toBe(1);
+    const request = compatUpstream.receivedRequests[baseline];
+    expect(request?.path).toBe("/v1/chat/completions");
+    const body = JSON.parse(request!.body) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(body.messages).toEqual([
+      { role: "system", content: "Follow application instructions" },
       { role: "user", content: "hello" },
     ]);
   });
