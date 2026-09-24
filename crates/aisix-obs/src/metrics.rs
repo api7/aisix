@@ -229,6 +229,10 @@ pub const M_BUDGET_RESET_SECONDS: &str = "aisix_budget_reset_seconds";
 pub const M_BUDGET_DETAILS_PRESENT: &str = "aisix_budget_details_present";
 pub const M_REDIS_FAILURES_TOTAL: &str = "aisix_redis_failures_total";
 pub const M_USAGE_EVENT_DROPS_TOTAL: &str = "aisix_usage_event_drops_total";
+/// Usage events the control plane answered as rejected inside an accepted
+/// (2xx) telemetry batch. Unlabelled: the control plane returns only a
+/// count, so there is no event to attribute a rejection to.
+pub const M_USAGE_EVENTS_REJECTED_TOTAL: &str = "aisix_usage_events_rejected_total";
 /// Guardrail outcomes (#379 observability). `aisix_guardrail_blocks_total`
 /// counts REQUESTS rejected by guardrail enforcement, including fail-closed
 /// paths such as a streaming buffer overflow that happen before a guardrail
@@ -1510,6 +1514,17 @@ impl Metrics {
                     "reason" => reason.to_string(),
                 )
             },
+        );
+    }
+
+    /// Add the `rejected` count a control plane reported for a batch it
+    /// otherwise accepted.
+    pub fn record_usage_events_rejected(&self, rejected: u64) {
+        self.cached_counter(
+            M_USAGE_EVENTS_REJECTED_TOTAL,
+            rejected,
+            |_| {},
+            || metrics::counter!(M_USAGE_EVENTS_REJECTED_TOTAL),
         );
     }
 

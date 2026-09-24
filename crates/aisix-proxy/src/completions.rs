@@ -102,6 +102,11 @@ struct CompletionUsage {
     /// inferred.
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    /// `completion_tokens_details.reasoning_tokens` and `total_tokens`,
+    /// recorded exactly as `/v1/chat/completions` records them; 0 when the
+    /// upstream omits them.
+    reasoning_tokens: u32,
+    upstream_total_tokens: u32,
     /// True when any counter was filled by the local estimator because
     /// the upstream reported no usage (AISIX-Cloud#1074).
     usage_estimated: bool,
@@ -212,6 +217,8 @@ pub async fn completions(
                     completion_tokens: 0,
                     cached_prompt_tokens: 0,
                     cache_write_tokens: None,
+                    reasoning_tokens: 0,
+                    upstream_total_tokens: 0,
                     usage_estimated: false,
                 });
                 emit_usage_event(
@@ -500,6 +507,8 @@ async fn dispatch(
                     completion_tokens: 0,
                     cached_prompt_tokens: 0,
                     cache_write_tokens: None,
+                    reasoning_tokens: 0,
+                    upstream_total_tokens: 0,
                     usage_estimated: false,
                 });
                 let est_model = model.upstream_model().unwrap_or("unknown");
@@ -716,11 +725,19 @@ fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
         .pointer("/prompt_tokens_details/cache_write_tokens")
         .and_then(Value::as_u64)
         .map(|n| n.min(u32::MAX as u64) as u32);
+    let counter = |pointer: &str| {
+        usage
+            .pointer(pointer)
+            .and_then(Value::as_u64)
+            .map_or(0, |n| n.min(u32::MAX as u64) as u32)
+    };
     Some(CompletionUsage {
         prompt_tokens,
         completion_tokens,
         cached_prompt_tokens,
         cache_write_tokens,
+        reasoning_tokens: counter("/completion_tokens_details/reasoning_tokens"),
+        upstream_total_tokens: counter("/total_tokens"),
         usage_estimated: false,
     })
 }
@@ -816,6 +833,8 @@ fn emit_usage_event(
         completion_tokens: usage.completion_tokens,
         cached_prompt_tokens: usage.cached_prompt_tokens,
         cache_write_tokens: usage.cache_write_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        total_tokens: usage.upstream_total_tokens,
         usage_estimated: usage.usage_estimated,
         // Single-attempt endpoint: the attempt spans the whole request, so
         // the upstream figure and what the caller waited for coincide.

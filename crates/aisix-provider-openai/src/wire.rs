@@ -405,6 +405,10 @@ fn into_usage(u: OpenAiUsage) -> UsageStats {
         // for non-DeepSeek upstreams → the renderer omits the fields.
         prompt_cache_hit_tokens: u.prompt_cache_hit_tokens,
         prompt_cache_miss_tokens: u.prompt_cache_miss_tokens,
+        // `total_tokens` decodes to 0 when the upstream omits it, which is
+        // exactly "not reported".
+        upstream_total_tokens: u.total_tokens,
+        reasoning_folded_into_completion: 0,
     }
 }
 

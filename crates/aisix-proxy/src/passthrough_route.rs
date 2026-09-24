@@ -887,7 +887,7 @@ async fn dispatch(
         started,
         attempt_started,
         status: status.as_u16(),
-        usage: PassthroughUsage::default(),
+        usage: None,
         requested_model,
         upstream_ttft_ms: 0,
         downstream_first_ms: None,
@@ -983,7 +983,7 @@ async fn dispatch(
     }
 
     if let Some(u) = response_usage(protocol, raw_shape, &resp_body) {
-        telemetry.usage.merge(u);
+        merge_usage(&mut telemetry.usage, u);
     }
     if telemetry.content_cap.is_some() {
         telemetry.response_text = response_guardrail_text(protocol, &resp_body);
@@ -1478,6 +1478,10 @@ struct PassthroughUsage {
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// The upstream's own `total_tokens`, verbatim; `None` when a report
+    /// carried none. Never a sum computed here — see
+    /// `UsageStats::upstream_total_tokens`.
+    upstream_total_tokens: Option<u32>,
 }
 
 impl PassthroughUsage {
@@ -1497,6 +1501,21 @@ impl PassthroughUsage {
         self.reasoning_tokens = self.reasoning_tokens.max(other.reasoning_tokens);
         self.cache_creation_tokens = self.cache_creation_tokens.max(other.cache_creation_tokens);
         self.cache_read_tokens = self.cache_read_tokens.max(other.cache_read_tokens);
+        // A total stands only while every merged report carried one.
+        self.upstream_total_tokens = self
+            .upstream_total_tokens
+            .zip(other.upstream_total_tokens)
+            .map(|(a, b)| a.max(b));
+    }
+}
+
+/// Merge one usage report into an exchange's accumulated usage. The first
+/// report is adopted whole rather than merged into zeros, so a total it
+/// carried survives until a report without one arrives.
+fn merge_usage(acc: &mut Option<PassthroughUsage>, report: PassthroughUsage) {
+    match acc {
+        Some(acc) => acc.merge(report),
+        None => *acc = Some(report),
     }
 }
 
@@ -1561,6 +1580,7 @@ fn dashscope_native_usage(usage: &serde_json::Value) -> Option<PassthroughUsage>
     Some(PassthroughUsage {
         prompt_tokens: prompt.unwrap_or(0),
         completion_tokens: completion.unwrap_or(0),
+        upstream_total_tokens: num("total_tokens"),
         ..generic.unwrap_or_default()
     })
 }
@@ -1629,6 +1649,7 @@ fn usage_of(usage: &serde_json::Value) -> Option<PassthroughUsage> {
         reasoning_tokens: reasoning.unwrap_or(0),
         cache_creation_tokens: cache_creation.unwrap_or(0),
         cache_read_tokens: cache_read.unwrap_or(0),
+        upstream_total_tokens: flat(&["total_tokens"]),
     })
 }
 
@@ -1873,9 +1894,7 @@ fn frame_parts(
     let mut parts = crate::held_content::Parts::default();
     let mut usage: Option<PassthroughUsage> = None;
     let mut merge = |found: PassthroughUsage| {
-        usage
-            .get_or_insert_with(PassthroughUsage::default)
-            .merge(found);
+        merge_usage(&mut usage, found);
     };
     // ONE read and ONE parse per frame: a payload spread over several
     // `data:` lines is one document joined with `\n`, so parsing each line
@@ -2054,7 +2073,7 @@ fn stream_response(
                 let held = parts.held();
                 let delta = parts.scan;
                 if let Some(u) = usage {
-                    telemetry.usage.merge(u);
+                    merge_usage(&mut telemetry.usage, u);
                 }
                 if capture_cap.is_some() {
                     push_capped(&mut telemetry.response_text, &delta, capture_cap);
@@ -2148,7 +2167,7 @@ fn stream_response(
                 let (parts, usage) = frame_parts(protocol, &rest);
                 let delta = parts.scan;
                 if let Some(u) = usage {
-                    telemetry.usage.merge(u);
+                    merge_usage(&mut telemetry.usage, u);
                 }
                 if capture_cap.is_some() {
                     push_capped(&mut telemetry.response_text, &delta, capture_cap);
@@ -2319,7 +2338,7 @@ struct RouteTelemetry {
     status: u16,
     /// Every token dimension the exchange reported, accumulated field-wise
     /// across the response (buffered) or its frames (streamed).
-    usage: PassthroughUsage,
+    usage: Option<PassthroughUsage>,
     /// The model alias the caller addressed, read from a DETECTED
     /// envelope's own `model` field — the same value the typed endpoint
     /// serving that envelope records. Empty for an opaque body, whose
@@ -2418,7 +2437,7 @@ impl RouteTelemetry {
         }
         let elapsed = self.started.elapsed();
         let snapshot = self.state.snapshot.load();
-        let usage = self.usage;
+        let usage = self.usage.unwrap_or_default();
 
         emit_access_log(
             &self.method,
@@ -2474,6 +2493,7 @@ impl RouteTelemetry {
             cached_prompt_tokens: usage.cached_prompt_tokens,
             cache_write_tokens: usage.cache_write_tokens,
             reasoning_tokens: usage.reasoning_tokens,
+            total_tokens: usage.upstream_total_tokens.unwrap_or(0),
             cache_creation_tokens: usage.cache_creation_tokens,
             cache_read_tokens: usage.cache_read_tokens,
             upstream_latency_ms: self
@@ -3097,6 +3117,29 @@ mod tests {
 "#;
         let (text, _) = frame_delta(PassthroughProtocol::OpenaiCompletions, fim);
         assert_eq!(text, "def ");
+    }
+
+    /// The recorded total is the upstream's own: adopted from the first
+    /// report, kept while every later report carries one, and dropped the
+    /// moment one does not — a surviving partial value would be a number
+    /// no upstream stated.
+    #[test]
+    fn merged_usage_keeps_a_total_only_while_every_report_carries_one() {
+        let with = usage_of(
+            &serde_json::json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}),
+        )
+        .unwrap();
+        let without = usage_of(&serde_json::json!({"output_tokens": 5})).unwrap();
+        assert_eq!(with.upstream_total_tokens, Some(10));
+        assert_eq!(without.upstream_total_tokens, None);
+
+        let mut acc = None;
+        merge_usage(&mut acc, with);
+        assert_eq!(acc.unwrap().upstream_total_tokens, Some(10));
+        merge_usage(&mut acc, with);
+        assert_eq!(acc.unwrap().upstream_total_tokens, Some(10));
+        merge_usage(&mut acc, without);
+        assert_eq!(acc.unwrap().upstream_total_tokens, None);
     }
 
     #[test]
@@ -3735,20 +3778,25 @@ mod tests {
                 b,
             )
         };
+        // A reported total is recorded verbatim beside the derived prompt.
+        let totalled = |prompt, completion, total| PassthroughUsage {
+            upstream_total_tokens: Some(total),
+            ..usage_dims(prompt, completion)
+        };
         // Embedding: flat image tokens beside the text count, total reported.
         let flat = br#"{"usage":{"input_tokens":44,"image_tokens":64,"total_tokens":108}}"#;
-        assert_eq!(usage(flat), Some(usage_dims(108, 0)));
+        assert_eq!(usage(flat), Some(totalled(108, 0, 108)));
         // Generation: flat image tokens already inside input_tokens.
         let generation = br#"{"usage":{"input_tokens":79,"image_tokens":66,"input_tokens_details":{"image_tokens":66,"text_tokens":13},"output_tokens":14,"total_tokens":93}}"#;
-        assert_eq!(usage(generation), Some(usage_dims(79, 14)));
+        assert_eq!(usage(generation), Some(totalled(79, 14, 93)));
         let nested = br#"{"usage":{"input_tokens":903,"input_tokens_details":{"image_tokens":896,"text_tokens":7},"output_tokens":3,"total_tokens":906}}"#;
-        assert_eq!(usage(nested), Some(usage_dims(903, 3)));
+        assert_eq!(usage(nested), Some(totalled(903, 3, 906)));
         // No total: images counted beside the text.
         let no_total =
             br#"{"usage":{"duration":0,"image_count":1,"image_tokens":128,"input_tokens":5}}"#;
         assert_eq!(usage(no_total), Some(usage_dims(133, 0)));
         let total_only = br#"{"output":{"results":[]},"usage":{"total_tokens":29}}"#;
-        assert_eq!(usage(total_only), Some(usage_dims(29, 0)));
+        assert_eq!(usage(total_only), Some(totalled(29, 0, 29)));
         // The generic dimensions ride along.
         let cached = br#"{"usage":{"input_tokens":120,"output_tokens":30,"total_tokens":150,"prompt_tokens_details":{"cached_tokens":100},"output_tokens_details":{"reasoning_tokens":20}}}"#;
         assert_eq!(
@@ -3756,7 +3804,7 @@ mod tests {
             Some(PassthroughUsage {
                 cached_prompt_tokens: 100,
                 reasoning_tokens: 20,
-                ..usage_dims(120, 30)
+                ..totalled(120, 30, 150)
             })
         );
         assert_eq!(usage(br#"{"code":"InvalidParameter","message":"x"}"#), None);

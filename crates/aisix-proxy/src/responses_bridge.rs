@@ -2259,6 +2259,10 @@ pub struct ResponsesStreamCompletion {
     pub cache_write_tokens: Option<u32>,
     pub cache_creation_tokens: u32,
     pub cache_read_tokens: u32,
+    /// See `aisix_gateway::chat::merge_stream_upstream_total`.
+    pub upstream_total_tokens: Option<u32>,
+    /// Latest usage frame's value, as in the chat stream.
+    pub reasoning_folded_into_completion: u32,
     pub finish_reason: String,
     /// Response object `id` reported by the **bridged upstream** — i.e. the
     /// chat-completion id the provider sent, not the `resp_…` this encoder
@@ -2493,6 +2497,11 @@ pub fn build_responses_bridge_stream(
                             comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);
                             comp.cache_creation_tokens = comp.cache_creation_tokens.max(u.cache_creation_tokens);
                             comp.cache_read_tokens = comp.cache_read_tokens.max(u.cache_read_tokens);
+                            aisix_gateway::chat::merge_stream_upstream_total(
+                                &mut comp.upstream_total_tokens,
+                                u.upstream_total_tokens,
+                            );
+                            comp.reasoning_folded_into_completion = u.reasoning_folded_into_completion;
                         }
                     }
                     if buffering {

@@ -1590,6 +1590,9 @@ async fn anthropic_passthrough_dispatch(
                     cache_write_tokens: None,
                     cache_creation_tokens: usage.cache_creation_tokens,
                     cache_read_tokens: usage.cache_read_tokens,
+                    reasoning_tokens: 0,
+                    upstream_total_tokens: 0,
+                    reasoning_folded_into_completion: 0,
                     usage_estimated: usage.usage_estimated,
                     provider_request_id: usage.provider_request_id,
                     provider_model_version: usage.provider_model_version,
@@ -2009,6 +2012,9 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
         // Anthropic upstream: see the streaming sibling — no OpenAI-shape subset.
         cached_prompt_tokens: 0,
         cache_write_tokens: None,
+        reasoning_tokens: 0,
+        upstream_total_tokens: 0,
+        reasoning_folded_into_completion: 0,
         prompt_tokens: usage
             .and_then(|u| u.get("input_tokens"))
             .and_then(Value::as_u64)
@@ -2323,6 +2329,9 @@ async fn cross_provider_dispatch(
                     cache_write_tokens: comp.cache_write_tokens,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
+                    reasoning_tokens: comp.reasoning_tokens,
+                    upstream_total_tokens: comp.upstream_total_tokens.unwrap_or(0),
+                    reasoning_folded_into_completion: comp.reasoning_folded_into_completion,
                     usage_estimated: comp.usage_estimated,
                     provider_request_id: comp.provider_request_id,
                     provider_model_version: comp.provider_model_version,
@@ -2510,6 +2519,9 @@ async fn cross_provider_dispatch(
         cache_write_tokens: resp.usage.cache_write_tokens,
         cache_creation_tokens: resp.usage.cache_creation_tokens,
         cache_read_tokens: resp.usage.cache_read_tokens,
+        reasoning_tokens: resp.usage.reasoning_tokens,
+        upstream_total_tokens: resp.usage.upstream_total_tokens,
+        reasoning_folded_into_completion: resp.usage.reasoning_folded_into_completion,
         usage_estimated: false,
         provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
         provider_model_version: resp.model.clone(),
@@ -2683,6 +2695,12 @@ fn build_anthropic_sse_stream(
                         comp.cache_creation_tokens =
                             comp.cache_creation_tokens.max(u.cache_creation_tokens);
                         comp.cache_read_tokens = comp.cache_read_tokens.max(u.cache_read_tokens);
+                        comp.reasoning_tokens = comp.reasoning_tokens.max(u.reasoning_tokens);
+                        aisix_gateway::chat::merge_stream_upstream_total(
+                            &mut comp.upstream_total_tokens,
+                            u.upstream_total_tokens,
+                        );
+                        comp.reasoning_folded_into_completion = u.reasoning_folded_into_completion;
                     }
                     if output_guardrail.is_some() && !released {
                         if let Some(t) = chunk.delta.content.as_deref() {
@@ -3032,6 +3050,11 @@ struct AnthropicStreamCompletion {
     cache_write_tokens: Option<u32>,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    reasoning_tokens: u32,
+    /// See `aisix_gateway::chat::merge_stream_upstream_total`.
+    upstream_total_tokens: Option<u32>,
+    /// Latest usage frame's value, as in the chat stream.
+    reasoning_folded_into_completion: u32,
     /// True when the Drop guard filled any token counter from the local
     /// estimator (AISIX-Cloud#1074).
     usage_estimated: bool,
@@ -3199,6 +3222,13 @@ struct AnthropicUsageMetrics {
     cache_write_tokens: Option<u32>,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// Recorded exactly as `/v1/chat/completions` records them, so one
+    /// upstream call produces the same UsageEvent whichever inbound
+    /// protocol addressed it. Always 0 from a native Anthropic upstream,
+    /// which reports neither a reasoning count nor a total.
+    reasoning_tokens: u32,
+    upstream_total_tokens: u32,
+    reasoning_folded_into_completion: u32,
     /// True when any token counter was filled by the local estimator
     /// because the upstream reported no usage (AISIX-Cloud#1074).
     usage_estimated: bool,
@@ -3294,7 +3324,15 @@ fn emit_anthropic_usage_event(
         // (AISIX-Cloud#790) — the group name for routed requests.
         requested_model: model.to_string(),
         prompt_tokens: metrics.prompt_tokens,
-        completion_tokens: metrics.completion_tokens,
+        completion_tokens: aisix_gateway::chat::recorded_completion_tokens(
+            metrics.prompt_tokens,
+            metrics.completion_tokens,
+            metrics.reasoning_tokens,
+            metrics.reasoning_folded_into_completion,
+            metrics.upstream_total_tokens,
+        ),
+        reasoning_tokens: metrics.reasoning_tokens,
+        total_tokens: metrics.upstream_total_tokens,
         cached_prompt_tokens: metrics.cached_prompt_tokens,
         cache_write_tokens: metrics.cache_write_tokens,
         cache_creation_tokens: metrics.cache_creation_tokens,
@@ -3333,6 +3371,9 @@ fn emit_anthropic_usage_event(
         guardrail_blocked: terminal && guardrail_blocked,
         ..Default::default()
     };
+    event.reasoning_unfolded_from_completion = metrics
+        .completion_tokens
+        .saturating_sub(event.completion_tokens);
     // Handler label "messages" — Anthropic /v1/messages inbound
     // path. Bucketed prometheus counter (#408).
     crate::usage_attr::apply_caller_identity(

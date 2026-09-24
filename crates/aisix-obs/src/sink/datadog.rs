@@ -235,6 +235,12 @@ impl DatadogSink {
                 obj.insert(map_field_name(&key), rendered);
             }
         }
+        // The GenAI output count includes reasoning; the record's own
+        // `completion_tokens` may not (see `UsageEvent::genai_output_tokens`).
+        obj.insert(
+            "gen_ai.usage.output_tokens".into(),
+            json!(record.usage.genai_output_tokens()),
+        );
 
         // Opt-in captured content as flat, queryable fields. Absent on the
         // default metadata-only path, so prompts never leak there.
@@ -465,6 +471,36 @@ mod tests {
 
     fn batch_of(records: Vec<SinkRecord>) -> EventBatch {
         EventBatch::new(records.into_iter().map(Arc::new).collect())
+    }
+
+    /// Datadog's GenAI output count includes reasoning counted beside the
+    /// completion, as the OTLP span's does; the reasoning and total counters
+    /// ride along under their `aisix.` keys.
+    #[tokio::test]
+    async fn output_tokens_include_reasoning_counted_beside_the_completion() {
+        let server = MockServer::start().await;
+        let sink = sink_for(&server, &[]);
+        let log = |event: UsageEvent| sink.to_log(&SinkRecord::metadata_only(event));
+
+        let gemini = log(UsageEvent {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            reasoning_tokens: 30,
+            total_tokens: 150,
+            ..UsageEvent::default()
+        });
+        assert_eq!(gemini["gen_ai.usage.output_tokens"], 50);
+        assert_eq!(gemini["aisix.reasoning_tokens"], 30);
+        assert_eq!(gemini["aisix.total_tokens"], 150);
+
+        let openai = log(UsageEvent {
+            prompt_tokens: 40,
+            completion_tokens: 25,
+            reasoning_tokens: 10,
+            total_tokens: 65,
+            ..UsageEvent::default()
+        });
+        assert_eq!(openai["gen_ai.usage.output_tokens"], 25);
     }
 
     #[tokio::test]
