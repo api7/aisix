@@ -165,8 +165,10 @@ describe("config last-known-good: rejected updates keep serving across resync an
       // The served row keeps counting.
       expect(cfg!.applied?.resource_counts.models).toBe(1);
 
-      // And the per-kind gauge on the metrics listener.
+      // And the per-kind gauges on the metrics listener: the row counts as
+      // rejected AND as served stale.
       const text = await scrape(app);
+      expect(text).toMatch(/aisix_config_rejected_resources\{kind="models"\} 1/);
       expect(text).toMatch(/aisix_config_stale_served_resources\{kind="models"\} 1/);
     }
 
@@ -215,6 +217,7 @@ describe("config last-known-good: rejected updates keep serving across resync an
       expect(cfg.applied?.resource_counts.models).toBe(1);
 
       const text = await scrape(app);
+      expect(text).toMatch(/aisix_config_rejected_resources\{kind="models"\} 1/);
       expect(text).toMatch(/aisix_config_stale_served_resources\{kind="models"\} 1/);
     }
 
