@@ -19,6 +19,7 @@
 //!
 //! **Stateless task addressing**: the gateway persists nothing. The
 //! caller-visible id is `base64url_nopad("<model_entry_id>:<upstream_task_id>")`
+//! (for a Model Group, the id of the target that accepted the task)
 //! — the GET routes decode it, re-resolve the Model row (and thus the
 //! ProviderKey credential) from the live snapshot, and call the
 //! provider's task endpoint. Same encode-routing-into-the-id approach as
@@ -1120,13 +1121,7 @@ fn resolve_video_target(
 
 // ─────────────────────── upstream plumbing ───────────────────────
 
-/// One provider HTTP round-trip: Bearer auth (all three vendors),
-/// provider-specific submit headers, the model's E2E timeout, cooldown
-/// accounting on transport failures (parity with jobs / passthrough,
-/// #701). Non-2xx responses map to `BridgeError::UpstreamStatus`
-/// carrying the upstream `message` (4xx pass through the standard
-/// envelope; 5xx bodies are redacted by the shared renderer in
-/// error.rs).
+/// [`provider_call_once`] under the target model's retry budget.
 async fn provider_call(
     state: &ProxyState,
     target: &VideoTarget,
@@ -1135,8 +1130,67 @@ async fn provider_call(
     body: Option<&serde_json::Value>,
     request_id: &str,
 ) -> Result<serde_json::Value, ProxyError> {
+    // Every /v1/videos JSON round-trip after the submit — poll, content-URL
+    // fetch — funnels through here, so wrapping this one function gives
+    // those routes a retry budget. The submit walks a Model Group's targets
+    // instead (`dispatch_create`), with the same permit.
+    let timeout =
+        crate::routing::effective_timeouts(&target.model_entry.value, None, state.default_timeouts)
+            .request;
+    crate::routing::retrying_dispatch_gated(
+        state,
+        &target.model_entry.value,
+        "/v1/videos",
+        |e| retry_permit(&method, e),
+        || {
+            provider_call_once(
+                state,
+                target,
+                method.clone(),
+                url,
+                body,
+                request_id,
+                timeout,
+            )
+        },
+    )
+    .await
+    .map_err(ProxyError::Bridge)
+}
+
+/// Whether a failed round-trip may be replayed (same target or, on the
+/// submit, the next target of a Model Group).
+///
+/// The submit POST creates a PAID generation task, so a failure after the
+/// upstream returned its status (a body-read or parse failure —
+/// `UpstreamDecode`) must not be replayed: the task exists upstream, its id
+/// was in the lost body, and a retry would start a second one the caller
+/// also can't see. Send-phase transport failures stay retryable for POST
+/// too — whether the request arrived is unknowable, and the provider SDKs
+/// make the same call for their own paid generation POSTs. GETs (poll /
+/// content URL) retry everything.
+fn retry_permit(method: &reqwest::Method, e: &aisix_gateway::BridgeError) -> bool {
+    method == reqwest::Method::GET || !matches!(e, aisix_gateway::BridgeError::UpstreamDecode(_))
+}
+
+/// One provider HTTP round-trip: Bearer auth (all three vendors),
+/// provider-specific submit headers, the given E2E timeout, cooldown
+/// accounting on transport failures (parity with jobs / passthrough,
+/// #701). Non-2xx responses map to `BridgeError::UpstreamStatus`
+/// carrying the upstream `message` (4xx pass through the standard
+/// envelope; 5xx bodies are redacted by the shared renderer in
+/// error.rs). `note` stays per attempt (see rerank.rs).
+fn provider_call_once<'a>(
+    state: &'a ProxyState,
+    target: &'a VideoTarget,
+    method: reqwest::Method,
+    url: &str,
+    body: Option<&serde_json::Value>,
+    request_id: &str,
+    timeout: Option<Duration>,
+) -> impl std::future::Future<Output = Result<serde_json::Value, aisix_gateway::BridgeError>> + 'a {
     let client = crate::http_client::client_for(target.conn.as_ref());
-    let note = |e: aisix_gateway::BridgeError| {
+    let note = move |e: aisix_gateway::BridgeError| {
         crate::cooldown::note_failure(
             &state.runtime_status,
             &target.model_entry.id,
@@ -1144,112 +1198,79 @@ async fn provider_call(
             e,
         )
     };
+    // Gateway-owned headers go into the map first; the operator /
+    // client set is merged on top and skips any name already there.
+    // `RequestBuilder::header` APPENDS on a repeat name, so building
+    // the map is what keeps a colliding operator header from putting
+    // two values of e.g. `x-aisix-request-id` on the wire.
+    let mut headers = axum::http::HeaderMap::new();
+    if let Ok(v) = header::HeaderValue::from_str(&format!("Bearer {}", target.secret)) {
+        headers.insert(header::AUTHORIZATION, v);
+    }
+    if let Ok(v) = header::HeaderValue::from_str(request_id) {
+        headers.insert(header::HeaderName::from_static("x-aisix-request-id"), v);
+    }
+    // A provider header required on every call (submit and poll) — e.g.
+    // Runway's mandatory `X-Runway-Version`. Applied unconditionally,
+    // before the submit-only body/header block below.
+    if let Some((name, value)) = target.provider.all_request_header() {
+        if let (Ok(n), Ok(v)) = (
+            name.parse::<header::HeaderName>(),
+            header::HeaderValue::from_str(value),
+        ) {
+            headers.insert(n, v);
+        }
+    }
+    if target.provider.submit_headers_async() && body.is_some() {
+        // DashScope requires the async-mode header — it rejects
+        // synchronous video-synthesis calls outright.
+        headers.insert(
+            header::HeaderName::from_static("x-dashscope-async"),
+            header::HeaderValue::from_static("enable"),
+        );
+    }
+    for (name, value) in &target.extra_headers {
+        if !headers.contains_key(name) {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+    // Last, and overwriting — see the field's doc comment.
+    target.forwarded_client.apply(&mut headers);
 
-    // Every /v1/videos JSON round-trip — submit, poll, content-URL fetch —
-    // funnels through here, so wrapping this one function gives the whole
-    // surface a retry budget. `note` stays per attempt (see rerank.rs).
-    //
-    // The submit POST creates a PAID generation task, so a failure after
-    // the upstream returned its status (a body-read or parse failure —
-    // `UpstreamDecode`) must not be replayed: the task exists upstream,
-    // its id was in the lost body, and a retry would start a second one
-    // the caller also can't see. Send-phase transport failures stay
-    // retryable for POST too — whether the request arrived is unknowable,
-    // and the provider SDKs make the same call for their own paid
-    // generation POSTs. GETs (poll / content URL) retry everything.
-    let retry_permit = |e: &aisix_gateway::BridgeError| {
-        method == reqwest::Method::GET
-            || !matches!(e, aisix_gateway::BridgeError::UpstreamDecode(_))
-    };
-    crate::routing::retrying_dispatch_gated(
-        state,
-        &target.model_entry.value,
-        "/v1/videos",
-        retry_permit,
-        || {
-            // Gateway-owned headers go into the map first; the operator /
-            // client set is merged on top and skips any name already there.
-            // `RequestBuilder::header` APPENDS on a repeat name, so building
-            // the map is what keeps a colliding operator header from putting
-            // two values of e.g. `x-aisix-request-id` on the wire.
-            let mut headers = axum::http::HeaderMap::new();
-            if let Ok(v) = header::HeaderValue::from_str(&format!("Bearer {}", target.secret)) {
-                headers.insert(header::AUTHORIZATION, v);
-            }
-            if let Ok(v) = header::HeaderValue::from_str(request_id) {
-                headers.insert(header::HeaderName::from_static("x-aisix-request-id"), v);
-            }
-            // A provider header required on every call (submit and poll) — e.g.
-            // Runway's mandatory `X-Runway-Version`. Applied unconditionally,
-            // before the submit-only body/header block below.
-            if let Some((name, value)) = target.provider.all_request_header() {
-                if let (Ok(n), Ok(v)) = (
-                    name.parse::<header::HeaderName>(),
-                    header::HeaderValue::from_str(value),
-                ) {
-                    headers.insert(n, v);
-                }
-            }
-            if target.provider.submit_headers_async() && body.is_some() {
-                // DashScope requires the async-mode header — it rejects
-                // synchronous video-synthesis calls outright.
-                headers.insert(
-                    header::HeaderName::from_static("x-dashscope-async"),
-                    header::HeaderValue::from_static("enable"),
-                );
-            }
-            for (name, value) in &target.extra_headers {
-                if !headers.contains_key(name) {
-                    headers.insert(name.clone(), value.clone());
-                }
-            }
-            // Last, and overwriting — see the field's doc comment.
-            target.forwarded_client.apply(&mut headers);
+    let mut builder = client.request(method, url).headers(headers);
+    if let Some(b) = body {
+        builder = builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .json(b);
+    }
+    if let Some(d) = timeout {
+        builder = builder.timeout(d);
+    }
+    async move {
+        let started = Instant::now();
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))?;
+        let status = resp.status().as_u16();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| note(aisix_gateway::BridgeError::UpstreamDecode(e.to_string())))?;
 
-            let mut builder = client.request(method.clone(), url).headers(headers);
-            if let Some(b) = body {
-                builder = builder
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .json(b);
-            }
-            if let Some(d) = crate::routing::effective_timeouts(
-                &target.model_entry.value,
-                None,
-                state.default_timeouts,
-            )
-            .request
-            {
-                builder = builder.timeout(d);
-            }
-            async move {
-                let started = Instant::now();
-                let resp = builder
-                    .send()
-                    .await
-                    .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))?;
-                let status = resp.status().as_u16();
-                let bytes = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| note(aisix_gateway::BridgeError::UpstreamDecode(e.to_string())))?;
+        if !(200..300).contains(&status) {
+            let message = parse_provider_error_message(&bytes);
+            return Err(note(aisix_gateway::BridgeError::upstream_status(
+                status, message,
+            )));
+        }
 
-                if !(200..300).contains(&status) {
-                    let message = parse_provider_error_message(&bytes);
-                    return Err(note(aisix_gateway::BridgeError::upstream_status(
-                        status, message,
-                    )));
-                }
-
-                serde_json::from_slice(&bytes).map_err(|e| {
-                    aisix_gateway::BridgeError::UpstreamDecode(format!(
-                        "invalid task response from upstream: {e}"
-                    ))
-                })
-            }
-        },
-    )
-    .await
-    .map_err(ProxyError::Bridge)
+        serde_json::from_slice(&bytes).map_err(|e| {
+            aisix_gateway::BridgeError::UpstreamDecode(format!(
+                "invalid task response from upstream: {e}"
+            ))
+        })
+    }
 }
 
 /// Poll the provider task for a decoded video id and reduce it to the
@@ -1663,9 +1684,15 @@ async fn dispatch_create(
         ));
     }
 
-    let target = match resolve_video_target(snapshot, auth, model_entry, &body.model, client)? {
-        Ok(t) => t,
-        Err(resp) => {
+    // The caller-addressed entry's own gates run once, before guardrails.
+    // A direct model is also its own only target, so its provider gate
+    // (the 501 for an unmapped vendor) answers here too, before the request
+    // is screened or burns a rate-limit slot; a Model Group's targets are
+    // gated one by one in the dispatch below.
+    if model_entry.value.routing.is_none() {
+        if let Err(resp) =
+            resolve_video_target(snapshot, auth, model_entry.clone(), &body.model, client)?
+        {
             return Ok(CreateSuccess {
                 response: resp,
                 provider: "unknown".into(),
@@ -1674,16 +1701,21 @@ async fn dispatch_create(
                 applied_guardrails: Vec::new(),
                 monitor_hits: Vec::new(),
                 upstream_called: false,
-            })
+            });
         }
-    };
+    } else {
+        if !auth.key().can_access(snapshot, &body.model) {
+            return Err(ProxyError::ModelForbidden(body.model.clone()));
+        }
+        crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
+    }
 
     // Input guardrail chain over the prompt — same resolution as chat /
     // embeddings, run BEFORE the rate-limit reservation so a policy
     // block doesn't burn an RPM slot (#542).
     let guardrail_ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
-        model_id: &target.model_entry.id,
+        model_id: &model_entry.id,
         mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
@@ -1723,36 +1755,94 @@ async fn dispatch_create(
 
     // Model-level rate limiting — the submit is a full typed endpoint
     // (AISIX-Cloud#1118 decision 3; the #1116 shape).
-    let model_rl = crate::quota::ModelRateLimit::from_model(
-        &body.model,
-        &target.model_entry.id,
-        &target.model_entry.value,
-    );
+    let model_rl =
+        crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
-    let upstream_model =
-        crate::dispatch::require_upstream_model(&target.model_entry.value)?.to_string();
-    let submit_body = target.provider.submit_body(
-        &upstream_model,
-        &body.prompt,
-        seconds,
-        body.size.as_deref(),
-    )?;
-    let url = target.provider.submit_url(&target.base_url);
-
-    let result = provider_call(
+    // A Model Group walks its targets (AISIX-Cloud#1111). The video id then
+    // names the target that accepted the task, so the GET routes poll the
+    // provider that holds it; the ACL they re-run is against the name the
+    // caller addressed (the group), exactly as here.
+    enum Submitted {
+        Accepted(Box<VideoTarget>, serde_json::Value),
+        Unsupported(Response),
+    }
+    let dispatched = crate::routing::dispatch_with_failover(
         state,
-        &target,
-        reqwest::Method::POST,
-        &url,
-        Some(&submit_body),
-        &client.request_id,
+        snapshot,
+        auth,
+        client,
+        &body.model,
+        &model_entry,
+        |e| retry_permit(&reqwest::Method::POST, e),
+        |attempt, timeouts| {
+            let (body, revision) = (&body, model_entry.revision);
+            async move {
+                let entry = std::sync::Arc::new(aisix_core::ResourceEntry::new(
+                    attempt.id,
+                    attempt.model,
+                    revision,
+                ));
+                let target = match resolve_video_target(snapshot, auth, entry, &body.model, client)?
+                {
+                    Ok(t) => t,
+                    Err(resp) => return Ok(Submitted::Unsupported(resp)),
+                };
+                let upstream_model =
+                    crate::dispatch::require_upstream_model(&target.model_entry.value)?.to_string();
+                let submit_body = target.provider.submit_body(
+                    &upstream_model,
+                    &body.prompt,
+                    seconds,
+                    body.size.as_deref(),
+                )?;
+                let url = target.provider.submit_url(&target.base_url);
+                let resp = provider_call_once(
+                    state,
+                    &target,
+                    reqwest::Method::POST,
+                    &url,
+                    Some(&submit_body),
+                    &client.request_id,
+                    timeouts.request,
+                )
+                .await
+                .map_err(ProxyError::Bridge)?;
+                Ok(Submitted::Accepted(Box::new(target), resp))
+            }
+        },
     )
     .await;
+    let mut reservation = reservation;
+    let submitted = match dispatched {
+        Ok(d) => {
+            if let Some(member) = d.member_reservation {
+                reservation.merge(member);
+            }
+            d.value
+        }
+        Err(e) => {
+            reservation.commit_tokens(0).await;
+            return Err(e);
+        }
+    };
     // Zero tokens on the videos surface — commit releases the
     // concurrency permit and finalises RPM.
     reservation.commit_tokens(0).await;
-    let resp = result?;
+    let (target, resp) = match submitted {
+        Submitted::Accepted(target, resp) => (*target, resp),
+        Submitted::Unsupported(resp) => {
+            return Ok(CreateSuccess {
+                response: resp,
+                provider: "unknown".into(),
+                model_id,
+                provider_key_id: String::new(),
+                applied_guardrails,
+                monitor_hits,
+                upstream_called: false,
+            })
+        }
+    };
 
     state
         .health
@@ -1782,7 +1872,9 @@ async fn dispatch_create(
     Ok(CreateSuccess {
         response: Json(video).into_response(),
         provider: target.provider_label.clone(),
-        model_id,
+        // The target that accepted the task — the one pricing resolves
+        // against, which for a Model Group is not the group itself.
+        model_id: target.model_entry.id.to_string(),
         provider_key_id: target.pk_id.clone(),
         applied_guardrails,
         monitor_hits,

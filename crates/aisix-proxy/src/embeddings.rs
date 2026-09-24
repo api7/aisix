@@ -323,13 +323,6 @@ async fn dispatch(
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
 
-    let model = &model_entry.value;
-    let provider = crate::dispatch::require_provider(model)?;
-    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-
-    let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
-        .ok_or(ProxyError::ProviderUnavailable)?;
-
     // #719: /v1/embeddings must run input guardrails. Before this the
     // handler explicitly bypassed all guardrails, so a content block
     // enforced on /v1/chat/completions was bypassable by sending the same
@@ -431,8 +424,6 @@ async fn dispatch(
         crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
-    let upstream_model_id = crate::dispatch::require_upstream_model(model)?.to_string();
-
     // Preserve the caller's original `input` shape per #162 /
     // `docs/api-proxy.md` §4.4 "both pass through". The bridge will
     // use this flag to serialise the upstream wire body as either a
@@ -441,40 +432,90 @@ async fn dispatch(
     // which contradicts the docs and confuses operator-side packet
     // captures during billing reconciliation / debugging.
     let input_was_single = matches!(body.input, InputField::Single(_));
-    let req = EmbeddingRequest {
-        model: upstream_model_id,
+    let base_req = EmbeddingRequest {
+        // Rewritten to each target's upstream id at dispatch.
+        model: String::new(),
         input: body.input.into_vec(),
         input_was_single,
         encoding_format: body.encoding_format,
         dimensions: body.dimensions,
     };
 
-    // #554: apply the configured request `timeout` as the upstream deadline.
-    let mut ctx = crate::dispatch::bridge_ctx(
-        request_id,
-        &model_entry.id,
-        Arc::new(model.clone()),
-        &pk_entry.id,
-        Arc::new(pk_entry.value.clone()),
-        Some(client_ctx),
-    );
-    if let Some(d) = crate::routing::effective_timeouts(model, None, state.default_timeouts).request
-    {
-        ctx = ctx.with_deadline(d);
+    // A Model Group walks its targets (AISIX-Cloud#1111); every per-target
+    // input — provider, key, bridge, upstream id, deadline — comes from the
+    // target.
+    let dispatched = crate::routing::dispatch_with_failover(
+        state,
+        snapshot,
+        auth,
+        client_ctx,
+        &client_facing_model,
+        &model_entry,
+        |_| true,
+        |target, timeouts| {
+            let base_req = &base_req;
+            async move {
+                let provider =
+                    crate::dispatch::require_provider(&target.model)?.to_ascii_lowercase();
+                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &target.model)?;
+                let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
+                    .ok_or(ProxyError::ProviderUnavailable)?;
+                let req = EmbeddingRequest {
+                    model: crate::dispatch::require_upstream_model(&target.model)?.to_string(),
+                    ..base_req.clone()
+                };
+                // #554: apply the configured request `timeout` as the upstream deadline.
+                let mut ctx = crate::dispatch::bridge_ctx(
+                    request_id,
+                    &target.id,
+                    Arc::new(target.model.clone()),
+                    &pk_entry.id,
+                    Arc::new(pk_entry.value.clone()),
+                    Some(client_ctx),
+                );
+                if let Some(d) = timeouts.request {
+                    ctx = ctx.with_deadline(d);
+                }
+                // #701: per-attempt cooldown accounting — see completions.rs.
+                let answered = match bridge.embed(&req, &ctx).await {
+                    Ok(v) => Ok(v),
+                    Err(e @ BridgeError::UnsupportedCapability(BridgeCapability::Embeddings)) => {
+                        Err(e)
+                    }
+                    Err(e) => {
+                        return Err(ProxyError::Bridge(crate::cooldown::note_failure(
+                            &state.runtime_status,
+                            &target.id,
+                            target.model.cooldown.as_ref(),
+                            e,
+                        )))
+                    }
+                };
+                Ok((answered, provider, pk_entry.id.to_string()))
+            }
+        },
+    )
+    .await;
+    let crate::routing::Dispatched {
+        value: (answered, provider, pk_id),
+        target,
+        member_reservation,
+    } = match dispatched {
+        Ok(d) => d,
+        Err(e) => {
+            reservation.commit_tokens(0).await;
+            return Err(e);
+        }
+    };
+    // Fold the target's model-layer reservation in (AISIX-Cloud#1087) so
+    // one commit bills the member's TPM/TPD too.
+    let mut reservation = reservation;
+    if let Some(member) = member_reservation {
+        reservation.merge(member);
     }
+    let model = &target.model;
 
-    // #701: per-attempt cooldown accounting — see completions.rs.
-    let tracker = &state.runtime_status;
-    let cooldown_model_id: &str = &model_entry.id;
-    let cooldown_cfg = model.cooldown.as_ref();
-    match crate::routing::retrying_dispatch(state, model, "/v1/embeddings", || async {
-        bridge
-            .embed(&req, &ctx)
-            .await
-            .map_err(|e| crate::cooldown::note_failure(tracker, cooldown_model_id, cooldown_cfg, e))
-    })
-    .await
-    {
+    match answered {
         Ok(mut embed_resp) => {
             // The provider bridge fills `model` from the upstream's own
             // document (or echoes the upstream id it was sent); the client
@@ -482,8 +523,8 @@ async fn dispatch(
             embed_resp.model = client_facing_model;
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
-            state.health.record_success(&model_entry.value.display_name);
-            state.runtime_status.mark_healthy(&model_entry.id);
+            state.health.record_success(&model.display_name);
+            state.runtime_status.mark_healthy(&target.id);
             // Token accounting (#226 / AISIX-Cloud#1074). Embeddings are
             // input-only, so `prompt_tokens == total_tokens` on the OpenAI
             // shape. Providers that report only `total_tokens` (e.g. some
@@ -498,7 +539,7 @@ async fn dispatch(
                 (embed_resp.usage.total_tokens, false)
             } else {
                 let upstream_model = model.upstream_model().unwrap_or("unknown");
-                let estimated = req.input.iter().fold(0u32, |acc, s| {
+                let estimated = base_req.input.iter().fold(0u32, |acc, s| {
                     acc.saturating_add(crate::token_estimate::count_text(upstream_model, s))
                 });
                 (estimated, estimated > 0)
@@ -514,7 +555,7 @@ async fn dispatch(
                     (embed_resp.usage.total_tokens).max(prompt_tokens),
                 ))
                 .await;
-            let provider_label = provider.to_ascii_lowercase();
+            let provider_label = provider.clone();
             // Content capture (#700): the full response JSON, vectors
             // included (LiteLLM parity); CapturedContent::new truncates to
             // the cap.
@@ -529,8 +570,8 @@ async fn dispatch(
             Ok(EmbedDispatchSuccess {
                 response: Json(embed_resp).into_response(),
                 provider: provider_label,
-                model_id: model_entry.id.to_string(),
-                provider_key_id: pk_entry.id.to_string(),
+                model_id: target.id.clone(),
+                provider_key_id: pk_id.clone(),
                 upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 redactions: redactions.clone(),
@@ -541,7 +582,9 @@ async fn dispatch(
                 captured_content,
             })
         }
-        Err(e @ BridgeError::UnsupportedCapability(BridgeCapability::Embeddings)) => {
+        // `Err` carries only the unsupported-capability refusal — every
+        // other failure left through the dispatch.
+        Err(e) => {
             // Provider doesn't implement embed → 501 Not Implemented.
             // Drop the reservation without committing — the request
             // didn't hit the upstream. The handler emits no usage unless a
@@ -550,9 +593,9 @@ async fn dispatch(
             let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(EmbedDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
-                provider: provider.to_ascii_lowercase(),
-                model_id: model_entry.id.to_string(),
-                provider_key_id: pk_entry.id.to_string(),
+                provider,
+                model_id: target.id.clone(),
+                provider_key_id: pk_id.clone(),
                 upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 redactions: redactions.clone(),
@@ -567,11 +610,6 @@ async fn dispatch(
                 // reports zero tokens still emits.
                 upstream_called: false,
             })
-        }
-        Err(e) => {
-            reservation.commit_tokens(0).await;
-            // Cooldown was already noted per attempt inside the retry loop.
-            Err(ProxyError::Bridge(e))
         }
     }
 }

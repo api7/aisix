@@ -443,50 +443,84 @@ async fn dispatch(
         crate::quota::ModelRateLimit::from_model(model_name, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
-    let model = &model_entry.value;
-    let provider = crate::dispatch::require_provider(model)?;
-    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-
-    let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
-        .ok_or(ProxyError::ProviderUnavailable)?;
-
-    // #554: apply the configured request `timeout` as the upstream deadline.
-    let mut ctx = crate::dispatch::bridge_ctx(
-        request_id,
-        &model_entry.id,
-        Arc::new(model.clone()),
-        &pk_entry.id,
-        Arc::new(pk_entry.value.clone()),
-        Some(client_ctx),
-    );
-    if let Some(d) = crate::routing::effective_timeouts(model, None, state.default_timeouts).request
-    {
-        ctx = ctx.with_deadline(d);
+    // A Model Group walks its targets (AISIX-Cloud#1111); every per-target
+    // input — provider, key, bridge, deadline — comes from the target.
+    let dispatched = crate::routing::dispatch_with_failover(
+        state,
+        snapshot,
+        auth,
+        client_ctx,
+        model_name,
+        &model_entry,
+        |_| true,
+        |target, timeouts| {
+            let body = &body;
+            async move {
+                let provider =
+                    crate::dispatch::require_provider(&target.model)?.to_ascii_lowercase();
+                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &target.model)?;
+                let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
+                    .ok_or(ProxyError::ProviderUnavailable)?;
+                // #554: apply the configured request `timeout` as the upstream deadline.
+                let mut ctx = crate::dispatch::bridge_ctx(
+                    request_id,
+                    &target.id,
+                    Arc::new(target.model.clone()),
+                    &pk_entry.id,
+                    Arc::new(pk_entry.value.clone()),
+                    Some(client_ctx),
+                );
+                if let Some(d) = timeouts.request {
+                    ctx = ctx.with_deadline(d);
+                }
+                // #701: mark each failed attempt on the runtime status, so the
+                // cooldown / circuit-breaker sees flapping upstreams even when
+                // a later retry recovers the request. `note_failure` is a
+                // no-op for non-triggering categories.
+                let answered = match bridge.complete(body, &ctx).await {
+                    Ok(v) => Ok(v),
+                    Err(
+                        e @ BridgeError::UnsupportedCapability(BridgeCapability::TextCompletions),
+                    ) => Err(e),
+                    Err(e) => {
+                        return Err(ProxyError::Bridge(crate::cooldown::note_failure(
+                            &state.runtime_status,
+                            &target.id,
+                            target.model.cooldown.as_ref(),
+                            e,
+                        )))
+                    }
+                };
+                Ok((answered, provider, pk_entry.id.to_string()))
+            }
+        },
+    )
+    .await;
+    let crate::routing::Dispatched {
+        value: (answered, provider_label, pk_id),
+        target,
+        member_reservation,
+    } = match dispatched {
+        Ok(d) => d,
+        Err(e) => {
+            reservation.commit_tokens(0).await;
+            return Err(e);
+        }
+    };
+    // Fold the target's model-layer reservation in (AISIX-Cloud#1087) so
+    // one commit bills the member's TPM/TPD too.
+    let mut reservation = reservation;
+    if let Some(member) = member_reservation {
+        reservation.merge(member);
     }
+    let model = &target.model;
 
-    let provider_label = provider.to_ascii_lowercase();
-
-    // #701: mark each failed attempt on the runtime status INSIDE the retry
-    // loop, so the cooldown / circuit-breaker sees flapping upstreams even
-    // when a later retry recovers the request — same per-attempt semantics
-    // as chat.rs, where the cooldown decision is independent of the retry
-    // decision. `note_failure` is a no-op for non-triggering categories.
-    let tracker = &state.runtime_status;
-    let cooldown_model_id: &str = &model_entry.id;
-    let cooldown_cfg = model.cooldown.as_ref();
-    match crate::routing::retrying_dispatch(state, model, "/v1/completions", || async {
-        bridge
-            .complete(&body, &ctx)
-            .await
-            .map_err(|e| crate::cooldown::note_failure(tracker, cooldown_model_id, cooldown_cfg, e))
-    })
-    .await
-    {
+    match answered {
         Ok(resp_json) => {
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
-            state.health.record_success(&model_entry.value.display_name);
-            state.runtime_status.mark_healthy(&model_entry.id);
+            state.health.record_success(&model.display_name);
+            state.runtime_status.mark_healthy(&target.id);
             // Extract usage BEFORE moving resp_json into the Response
             // so the success struct carries typed counters rather
             // than re-parsing JSON downstream.
@@ -602,8 +636,8 @@ async fn dispatch(
                         )
                         .into_response(),
                         provider: provider_label,
-                        model_id: model_entry.id.to_string(),
-                        provider_key_id: pk_entry.id.to_string(),
+                        model_id: target.id.clone(),
+                        provider_key_id: pk_id.clone(),
                         upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                         applied_guardrails: applied_guardrails.clone(),
                         usage,
@@ -647,8 +681,8 @@ async fn dispatch(
             Ok(CompletionDispatchSuccess {
                 response: Json(resp_json).into_response(),
                 provider: provider_label,
-                model_id: model_entry.id.to_string(),
-                provider_key_id: pk_entry.id.to_string(),
+                model_id: target.id.clone(),
+                provider_key_id: pk_id.clone(),
                 upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 usage,
@@ -660,15 +694,17 @@ async fn dispatch(
                 captured_content,
             })
         }
-        Err(e @ BridgeError::UnsupportedCapability(BridgeCapability::TextCompletions)) => {
+        // The provider does not implement completions (`Err` carries only
+        // that refusal — every other failure left through the dispatch).
+        Err(e) => {
             // No upstream call → no tokens to count; release the reservation.
             reservation.commit_tokens(0).await;
             let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(CompletionDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
                 provider: provider_label,
-                model_id: model_entry.id.to_string(),
-                provider_key_id: pk_entry.id.to_string(),
+                model_id: target.id.clone(),
+                provider_key_id: pk_id.clone(),
                 upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails,
                 // No upstream call → no token usage. The handler emits only
@@ -681,11 +717,6 @@ async fn dispatch(
                 guardrail_blocked: false,
                 captured_content: None,
             })
-        }
-        Err(e) => {
-            reservation.commit_tokens(0).await;
-            // Cooldown was already noted per attempt inside the retry loop.
-            Err(ProxyError::Bridge(e))
         }
     }
 }

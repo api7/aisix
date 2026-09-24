@@ -284,8 +284,8 @@ async fn dispatch(
     // route, and the dispatch below reads the upstream answer as a single
     // JSON document. Forwarding `stream` had the provider generate — and
     // charge for — a stream the gateway then failed to decode; that decode
-    // failure is retryable, and this route dispatches through
-    // `retrying_dispatch`, so ONE caller request re-ran the generation for
+    // failure is retryable, and this route retries it, so ONE caller
+    // request re-ran the generation for
     // the whole retry budget and still answered 502.
     //
     // Refuse it here, before the provider is contacted, and in the same
@@ -371,65 +371,98 @@ async fn dispatch(
         crate::quota::ModelRateLimit::from_model(model_name, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
-    let model = &model_entry.value;
-
-    // Per #168: only OpenAI's API has the documented
-    // `/v1/images/generations` route + body shape. Anthropic has no
-    // image-generation API at all; Gemini's image generation lives
-    // at a different URL (`/v1beta/models/...:generateContent`) with
-    // a different body shape; DeepSeek doesn't expose image
-    // generation. Routing a non-OpenAI Model here would silently
-    // dispatch to an upstream that 404s — a confusing failure for
-    // callers who follow `docs/api-proxy.md` §4.9 configuration
-    // verbatim. Reject explicitly with 400 (parallel to
-    // /v1/responses §4.6) so the configuration error is visible
-    // at the gateway boundary.
-    if model.provider.as_deref() != Some("openai") {
-        return Err(ProxyError::InvalidRequest(format!(
-            "model `{model_name}` is not an OpenAI provider; \
-             /v1/images/generations requires OpenAI"
-        )));
+    // A Model Group walks its targets (AISIX-Cloud#1111); every per-target
+    // input — provider gate, key, bridge, deadline — comes from the target.
+    let dispatched = crate::routing::dispatch_with_failover(
+        state,
+        snapshot,
+        auth,
+        client_ctx,
+        model_name,
+        &model_entry,
+        |_| true,
+        |target, timeouts| {
+            let body = &body;
+            async move {
+                // Per #168: only OpenAI's API has the documented
+                // `/v1/images/generations` route + body shape. Anthropic has no
+                // image-generation API at all; Gemini's image generation lives
+                // at a different URL (`/v1beta/models/...:generateContent`) with
+                // a different body shape; DeepSeek doesn't expose image
+                // generation. Routing a non-OpenAI Model here would silently
+                // dispatch to an upstream that 404s — a confusing failure for
+                // callers who follow `docs/api-proxy.md` §4.9 configuration
+                // verbatim. Reject explicitly with 400 (parallel to
+                // /v1/responses §4.6) so the configuration error is visible
+                // at the gateway boundary.
+                if target.model.provider.as_deref() != Some("openai") {
+                    return Err(ProxyError::InvalidRequest(format!(
+                        "model `{model_name}` is not an OpenAI provider; \
+                         /v1/images/generations requires OpenAI"
+                    )));
+                }
+                let provider =
+                    crate::dispatch::require_provider(&target.model)?.to_ascii_lowercase();
+                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &target.model)?;
+                let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
+                    .ok_or(ProxyError::ProviderUnavailable)?;
+                // #554: apply the configured request `timeout` as the upstream deadline.
+                let mut ctx = crate::dispatch::bridge_ctx(
+                    request_id,
+                    &target.id,
+                    Arc::new(target.model.clone()),
+                    &pk_entry.id,
+                    Arc::new(pk_entry.value.clone()),
+                    Some(client_ctx),
+                );
+                if let Some(d) = timeouts.request {
+                    ctx = ctx.with_deadline(d);
+                }
+                // #701: per-attempt cooldown accounting — see completions.rs.
+                let answered = match bridge.generate_image(body, &ctx).await {
+                    Ok(v) => Ok(v),
+                    Err(
+                        e @ BridgeError::UnsupportedCapability(BridgeCapability::ImageGeneration),
+                    ) => Err(e),
+                    Err(e) => {
+                        return Err(ProxyError::Bridge(crate::cooldown::note_failure(
+                            &state.runtime_status,
+                            &target.id,
+                            target.model.cooldown.as_ref(),
+                            e,
+                        )))
+                    }
+                };
+                Ok((answered, provider, pk_entry.id.to_string()))
+            }
+        },
+    )
+    .await;
+    let crate::routing::Dispatched {
+        value: (answered, provider_label, pk_id),
+        target,
+        member_reservation,
+    } = match dispatched {
+        Ok(d) => d,
+        Err(e) => {
+            reservation.commit_tokens(0).await;
+            return Err(e);
+        }
+    };
+    // Fold the target's model-layer reservation in (AISIX-Cloud#1087) so
+    // one commit bills the member's TPM/TPD too.
+    let mut reservation = reservation;
+    if let Some(member) = member_reservation {
+        reservation.merge(member);
     }
+    let model = &target.model;
 
-    let provider = crate::dispatch::require_provider(model)?.to_string();
-    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-
-    let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
-        .ok_or(ProxyError::ProviderUnavailable)?;
-
-    // #554: apply the configured request `timeout` as the upstream deadline.
-    let mut ctx = crate::dispatch::bridge_ctx(
-        request_id,
-        &model_entry.id,
-        Arc::new(model.clone()),
-        &pk_entry.id,
-        Arc::new(pk_entry.value.clone()),
-        Some(client_ctx),
-    );
-    if let Some(d) = crate::routing::effective_timeouts(model, None, state.default_timeouts).request
-    {
-        ctx = ctx.with_deadline(d);
-    }
-
-    let provider_label = provider.to_ascii_lowercase();
-
-    // #701: per-attempt cooldown accounting — see completions.rs.
-    let tracker = &state.runtime_status;
-    let cooldown_model_id: &str = &model_entry.id;
-    let cooldown_cfg = model.cooldown.as_ref();
-    match crate::routing::retrying_dispatch(state, model, "/v1/images/generations", || async {
-        bridge
-            .generate_image(&body, &ctx)
-            .await
-            .map_err(|e| crate::cooldown::note_failure(tracker, cooldown_model_id, cooldown_cfg, e))
-    })
-    .await
-    {
+    match answered {
         Ok(resp_json) => {
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
-            state.health.record_success(&model_entry.value.display_name);
-            state.runtime_status.mark_healthy(&model_entry.id);
+            state.health.record_success(&model.display_name);
+            state.runtime_status.mark_healthy(&target.id);
             // Extract usage tokens (gpt-image-1 returns a `usage` block;
             // dall-e-3 doesn't) BEFORE moving resp_json into the
             // Response, so the success struct carries typed counters.
@@ -454,8 +487,8 @@ async fn dispatch(
             Ok(ImageDispatchSuccess {
                 response: Json(resp_json).into_response(),
                 provider: provider_label,
-                model_id: model_entry.id.to_string(),
-                provider_key_id: pk_entry.id.to_string(),
+                model_id: target.id.clone(),
+                provider_key_id: pk_id.clone(),
                 upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 usage,
@@ -465,15 +498,17 @@ async fn dispatch(
                 captured_content,
             })
         }
-        Err(e @ BridgeError::UnsupportedCapability(BridgeCapability::ImageGeneration)) => {
+        // `Err` carries only the unsupported-capability refusal — every
+        // other failure left through the dispatch.
+        Err(e) => {
             // No upstream call → no tokens to count; release the reservation.
             reservation.commit_tokens(0).await;
             let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(ImageDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
                 provider: provider_label,
-                model_id: model_entry.id.to_string(),
-                provider_key_id: pk_entry.id.to_string(),
+                model_id: target.id.clone(),
+                provider_key_id: pk_id.clone(),
                 upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 usage: None,
@@ -484,11 +519,6 @@ async fn dispatch(
                 monitor_hits: monitor_hits.clone(),
                 captured_content: None,
             })
-        }
-        Err(e) => {
-            reservation.commit_tokens(0).await;
-            // Cooldown was already noted per attempt inside the retry loop.
-            Err(ProxyError::Bridge(e))
         }
     }
 }
