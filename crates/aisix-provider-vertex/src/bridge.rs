@@ -1142,9 +1142,21 @@ impl VertexBridge {
             let mut state = StreamState::default();
             let mut byte_stream = Box::pin(byte_stream);
 
-            while let Some(item) = byte_stream.next().await {
-                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-                for event in decoder.feed(bytes.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
+            loop {
+                // At EOF, `finish` flushes a last frame the upstream never
+                // terminated, and reports a frame that outgrew the bound
+                // after the last events were returned.
+                let (events, eof) = match byte_stream.next().await {
+                    Some(item) => {
+                        let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                        (decoder.feed(bytes.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?, false)
+                    }
+                    None => (
+                        decoder.finish().map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?.into_iter().collect(),
+                        true,
+                    ),
+                };
+                for event in events {
                     let SseEvent::Data(data) = event else { continue };
                     let parsed: AnthropicStreamEvent =
                         serde_json::from_str(&data).map_err(|e| {
@@ -1162,6 +1174,9 @@ impl VertexBridge {
                     if StreamState::is_terminal(&parsed) {
                         return;
                     }
+                }
+                if eof {
+                    break;
                 }
             }
         };
@@ -5473,6 +5488,47 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             }
         }
         assert!(saw_in_band, "expected typed in-band error");
+    }
+
+    /// A last frame the upstream never terminated is still read, as on the
+    /// native Anthropic bridge.
+    #[tokio::test]
+    async fn chat_anthropic_stream_reads_an_unterminated_last_frame() {
+        let body = "event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}"
+            .to_string();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-3-5-sonnet-v2@20241022"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        let chunks: Vec<_> = bridge
+            .chat_stream(&req, &ctx)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            chunks.last().and_then(|c| c.finish_reason.clone()),
+            Some(aisix_gateway::FinishReason::Stop)
+        );
     }
 
     /// The OpenAI-shim rail probes the same envelope shape.
