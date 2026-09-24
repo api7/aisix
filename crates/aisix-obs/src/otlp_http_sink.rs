@@ -45,9 +45,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_core::models::{
-    AliyunSlsConfig, DatadogConfig, ExporterKind, ObjectStoreConfig, ObservabilityExporter,
-    OtlpHttpConfig, SlsContentMode,
+    AisixSnapshot, AliyunSlsConfig, DatadogConfig, ExporterKind, ObjectStoreConfig,
+    ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
 };
+use aisix_core::snapshot::SnapshotHandle;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -71,8 +72,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`crate::sink::SinkPipeline`] (batched, retried, backpressured). Cheap
 /// clonable handle; the per-exporter pipelines and the shared `reqwest::Client`
 /// live behind an `Arc`. Pipelines start lazily on first sighting of an
-/// exporter (immediately consistent with the snapshot) and are GC'd by
-/// [`OtlpHttpFanOut::gc`] when an exporter leaves it.
+/// exporter (immediately consistent with the snapshot) and are stopped by
+/// [`OtlpHttpFanOut::reap_on_config_change`] when an exporter leaves it or
+/// is disabled.
 ///
 /// NOTE: the type name is historical — it drove only `otlp_http` originally
 /// and now fans out all kinds. A rename to `ExporterFanOut` (plus the
@@ -280,11 +282,52 @@ impl OtlpHttpFanOut {
     }
 
     /// Stop pipelines for exporters no longer present in `live` (the current
-    /// snapshot's enabled exporter names, across all kinds). Called
-    /// periodically by the server to GC pipelines for deleted / disabled
-    /// exporters.
+    /// snapshot's enabled exporter names, across all kinds).
     pub fn gc(&self, live: &std::collections::HashSet<String>) {
         self.inner.exporters.retain(live);
+    }
+
+    /// Stop the pipeline of every exporter that was deleted or disabled,
+    /// each time a snapshot is published, until `cancel` fires. Without it
+    /// the pipeline — task, client, queue — outlives its exporter for the
+    /// life of the process (#954).
+    ///
+    /// Driven by the publish rather than by traffic or a timer: a deleted
+    /// exporter is by definition one no request will touch again. It keys
+    /// on the exporter table's generation, so a write to any other
+    /// collection costs one comparison. Stopping only signals the worker,
+    /// wherever it runs — under `proxy.thread_per_core` a pipeline lives on
+    /// the worker runtime whose request first saw the exporter, not on the
+    /// runtime running this loop.
+    pub async fn reap_on_config_change(
+        self,
+        snapshot: SnapshotHandle<AisixSnapshot>,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mut published = snapshot.subscribe();
+        let mut reaped = None;
+        loop {
+            if *cancel.borrow() {
+                return;
+            }
+            let snap = snapshot.load();
+            let generation = snap.observability_exporters.generation();
+            if reaped != Some(generation) {
+                let live = snap
+                    .observability_exporters
+                    .entries()
+                    .iter()
+                    .filter(|e| e.value.enabled)
+                    .map(|e| e.value.name.clone())
+                    .collect();
+                self.gc(&live);
+                reaped = Some(generation);
+            }
+            tokio::select! {
+                changed = published.changed() => if changed.is_err() { return },
+                changed = cancel.changed() => if changed.is_err() { return },
+            }
+        }
     }
 
     /// Per-exporter delivery counters, keyed by exporter name. Read by the
@@ -2388,6 +2431,72 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+        f.shutdown().await;
+    }
+
+    /// #954: publishing a snapshot that deletes one exporter and disables
+    /// another drops both from the delivery-health report — the view the
+    /// managed-mode heartbeat sends the control plane — with no traffic in
+    /// between, while the exporter that is still configured keeps its
+    /// pipeline.
+    #[tokio::test]
+    async fn config_publish_reaps_deleted_and_disabled_exporters() {
+        let receiver = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&receiver)
+            .await;
+        let endpoint = format!("{}/v1/traces", receiver.uri());
+        let exporter = |name: &str, enabled: bool| -> ObservabilityExporter {
+            serde_json::from_value(serde_json::json!({
+                "name": name,
+                "enabled": enabled,
+                "kind": "otlp_http",
+                "endpoint": endpoint,
+            }))
+            .unwrap()
+        };
+        let snapshot_with = |rows: &[(&str, bool)]| {
+            let snap = AisixSnapshot::new();
+            for (name, enabled) in rows {
+                snap.observability_exporters
+                    .insert(aisix_core::ResourceEntry::new(
+                        format!("id-{name}"),
+                        exporter(name, *enabled),
+                        1,
+                    ));
+            }
+            snap
+        };
+        let handle = SnapshotHandle::new(snapshot_with(&[
+            ("keep", true),
+            ("gone", true),
+            ("off", true),
+        ]));
+        let f = OtlpHttpFanOut::new();
+        let live = handle.load().observability_exporters.entries();
+        f.fan_out(&sample_event(), None, None, live.iter().map(|e| &e.value));
+        let mut names: Vec<_> = f.exporter_stats().into_keys().collect();
+        names.sort();
+        assert_eq!(names, ["gone", "keep", "off"]);
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let reaper = tokio::spawn(f.clone().reap_on_config_change(handle.clone(), cancel_rx));
+        handle.store(snapshot_with(&[("keep", true), ("off", false)]));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while f.exporter_stats().len() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "deleted/disabled exporters still reported: {:?}",
+                f.exporter_stats().keys().collect::<Vec<_>>()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(f.exporter_stats().contains_key("keep"));
+
+        cancel_tx.send(true).unwrap();
+        reaper.await.unwrap();
         f.shutdown().await;
     }
 }
