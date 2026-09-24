@@ -145,12 +145,7 @@ describe("streaming ensemble folds the panel usage once with a multi-usage-frame
     // the snapshot.
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: [ENSEMBLE] });
     const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
-    await waitConfigPropagation(async () => {
-      const res = await probe.listModels();
-      if (res.status !== 200) return false;
-      const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
-      return data.some((row) => row.id === ENSEMBLE);
-    });
+    await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
   });
 
   afterAll(async () => {

@@ -39,9 +39,29 @@ describe("upstream error with no message → caller sees the upstream status (#9
     if (!etcdReachable) return;
     app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
+    await modelFailingWith("empty-err-chat-404", { status: 404, rawErrorBody: "" });
+    await modelFailingWith("empty-err-chat-blank", {
+      status: 400,
+      errorBody: { error: { message: "", type: "invalid_request_error" } },
+    });
+    // No Location header: a redirect the HTTP client cannot follow comes
+    // back to the gateway as the upstream's answer.
+    await modelFailingWith("empty-err-chat-301", { status: 301, rawErrorBody: "" });
+    await modelFailingWith("empty-err-responses-403", { status: 403, rawErrorBody: "" });
+    await modelFailingWith("empty-err-messages-404", { status: 404, rawErrorBody: "" });
+
+    // Caller key last: the moment it authenticates, every model above is in
+    // the snapshot, so an asserted error cannot be a snapshot-lag "model not
+    // found".
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
+    });
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      return res.status === 200;
     });
   });
 
@@ -50,9 +70,7 @@ describe("upstream error with no message → caller sees the upstream status (#9
     await Promise.all(closers.map((c) => c()));
   });
 
-  // A model whose upstream answers every request with `failure`. The
-  // readiness gate waits for the model to be listed, so the asserted error
-  // cannot be a snapshot-lag "model not found".
+  // A model whose upstream answers every request with `failure`.
   async function modelFailingWith(
     name: string,
     failure: { status: number; rawErrorBody?: string; errorBody?: unknown },
@@ -69,14 +87,6 @@ describe("upstream error with no message → caller sees the upstream status (#9
       provider: "openai",
       model_name: "gpt-4o",
       provider_key_id: pk.id,
-    });
-    await waitConfigPropagation(async () => {
-      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
-        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
-      });
-      if (res.status !== 200) return false;
-      const body = (await res.json()) as { data?: Array<{ id?: string }> };
-      return (body.data ?? []).some((m) => m.id === name);
     });
   }
 
@@ -109,10 +119,6 @@ describe("upstream error with no message → caller sees the upstream status (#9
 
   test("chat completions: bodyless 404 names the status", async (ctx) => {
     if (skip(ctx)) return;
-    await modelFailingWith("empty-err-chat-404", {
-      status: 404,
-      rawErrorBody: "",
-    });
     const res = await post("/v1/chat/completions", {
       model: "empty-err-chat-404",
       messages: [{ role: "user", content: "hi" }],
@@ -123,10 +129,6 @@ describe("upstream error with no message → caller sees the upstream status (#9
 
   test("chat completions: an error envelope with a blank message names the status", async (ctx) => {
     if (skip(ctx)) return;
-    await modelFailingWith("empty-err-chat-blank", {
-      status: 400,
-      errorBody: { error: { message: "", type: "invalid_request_error" } },
-    });
     const res = await post("/v1/chat/completions", {
       model: "empty-err-chat-blank",
       messages: [{ role: "user", content: "hi" }],
@@ -137,12 +139,6 @@ describe("upstream error with no message → caller sees the upstream status (#9
 
   test("chat completions: a bodyless redirect names the status and nothing else", async (ctx) => {
     if (skip(ctx)) return;
-    // No Location header: a redirect the HTTP client cannot follow comes
-    // back to the gateway as the upstream's answer.
-    await modelFailingWith("empty-err-chat-301", {
-      status: 301,
-      rawErrorBody: "",
-    });
     const res = await post("/v1/chat/completions", {
       model: "empty-err-chat-301",
       messages: [{ role: "user", content: "hi" }],
@@ -155,10 +151,6 @@ describe("upstream error with no message → caller sees the upstream status (#9
 
   test("responses (verbatim forward): bodyless 403 names the status", async (ctx) => {
     if (skip(ctx)) return;
-    await modelFailingWith("empty-err-responses-403", {
-      status: 403,
-      rawErrorBody: "",
-    });
     const res = await post("/v1/responses", {
       model: "empty-err-responses-403",
       input: "hi",
@@ -169,10 +161,6 @@ describe("upstream error with no message → caller sees the upstream status (#9
 
   test("messages (cross-provider to an OpenAI upstream): bodyless 404 names the status", async (ctx) => {
     if (skip(ctx)) return;
-    await modelFailingWith("empty-err-messages-404", {
-      status: 404,
-      rawErrorBody: "",
-    });
     const res = await post("/v1/messages", {
       model: "empty-err-messages-404",
       max_tokens: 16,
