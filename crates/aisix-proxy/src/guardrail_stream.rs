@@ -82,6 +82,7 @@ impl EosOutputScan {
         let verdict = crate::redact::moderate_body(
             self.chain.as_ref(),
             crate::redact::Direction::Output,
+            None,
             verdict,
             &mut seg_counts,
             &mut hits,

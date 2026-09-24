@@ -727,6 +727,7 @@ async fn dispatch(
         let verdict = crate::redact::moderate_body_scanning(
             resolved_chain.as_ref(),
             crate::redact::Direction::Input,
+            Some(chat.model.as_str()),
             verdict,
             redactions_out,
             monitor_hits_out,
@@ -1825,6 +1826,7 @@ async fn anthropic_passthrough_dispatch(
                 let verdict = crate::redact::moderate_body(
                     resolved_chain.as_ref(),
                     crate::redact::Direction::Output,
+                    None,
                     verdict,
                     &mut output_seg_counts,
                     &mut output_monitor_hits,
@@ -2456,6 +2458,7 @@ async fn cross_provider_dispatch(
         let verdict = crate::redact::moderate_body(
             resolved_chain.as_ref(),
             crate::redact::Direction::Output,
+            None,
             verdict,
             &mut output_seg_counts,
             &mut output_monitor_hits,
@@ -2781,6 +2784,7 @@ fn build_anthropic_sse_stream(
                 let verdict = crate::redact::moderate_body(
                     chain.as_ref(),
                     crate::redact::Direction::Output,
+                    None,
                     verdict,
                     &mut seg_counts,
                     &mut seg_hits,
@@ -4172,6 +4176,7 @@ where
                 let verdict = crate::redact::moderate_body(
                     chain.as_ref(),
                     crate::redact::Direction::Output,
+                    None,
                     verdict,
                     &mut seg_counts,
                     &mut seg_hits,

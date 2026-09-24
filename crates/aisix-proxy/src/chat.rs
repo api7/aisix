@@ -1558,9 +1558,13 @@ async fn dispatch(
     // ANONYMIZE masks back into `req` (#932 bedrock follow-up).
     let (input_verdict, hits) = resolved_chain.check_input_non_segment_observed(req).await;
     monitor_hits_out.extend(hits);
+    // The segment walker below borrows `req` mutably, so the addressed
+    // model the check pass just read from `req.model` is taken first.
+    let addressed_model = req.model.clone();
     let input_verdict = crate::redact::moderate_body(
         resolved_chain.as_ref(),
         crate::redact::Direction::Input,
+        Some(addressed_model.as_str()),
         input_verdict,
         redactions_out,
         monitor_hits_out,
@@ -2746,6 +2750,7 @@ async fn dispatch(
                 let cached_verdict = crate::redact::moderate_body(
                     resolved_chain.as_ref(),
                     crate::redact::Direction::Output,
+                    None,
                     cached_verdict,
                     redactions_out,
                     monitor_hits_out,
@@ -3365,6 +3370,7 @@ async fn dispatch(
     let output_verdict = crate::redact::moderate_body(
         resolved_chain.as_ref(),
         crate::redact::Direction::Output,
+        None,
         output_verdict,
         redactions_out,
         monitor_hits_out,
@@ -4579,6 +4585,7 @@ async fn dispatch_ensemble(
     let ensemble_verdict = crate::redact::moderate_body(
         resolved_chain.as_ref(),
         crate::redact::Direction::Output,
+        None,
         ensemble_verdict,
         &mut ensemble_redactions,
         &mut ensemble_monitor_hits,
@@ -6046,6 +6053,7 @@ where
                         let verdict = crate::redact::moderate_body(
                             ctx.chain.as_ref(),
                             crate::redact::Direction::Output,
+                            None,
                             verdict,
                             &mut seg_counts,
                             &mut seg_hits,

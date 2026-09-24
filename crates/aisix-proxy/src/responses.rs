@@ -638,6 +638,7 @@ async fn dispatch(
         let verdict = crate::redact::moderate_body(
             resolved_chain.as_ref(),
             crate::redact::Direction::Input,
+            Some(model_name.as_str()),
             verdict,
             redactions_out,
             monitor_hits_out,
@@ -1660,6 +1661,7 @@ async fn responses_to_target(
             let verdict = crate::redact::moderate_body(
                 chain,
                 crate::redact::Direction::Output,
+                None,
                 verdict,
                 &mut output_redactions,
                 &mut output_monitor_hits,
@@ -2089,6 +2091,7 @@ async fn responses_to_target(
             let verdict = crate::redact::moderate_body(
                 chain,
                 crate::redact::Direction::Output,
+                None,
                 verdict,
                 &mut output_seg_counts,
                 &mut output_monitor_hits,
@@ -2657,6 +2660,7 @@ async fn responses_cross_provider_to_target(
         let verdict = crate::redact::moderate_body(
             chain.as_ref(),
             crate::redact::Direction::Output,
+            None,
             verdict,
             &mut output_seg_counts,
             &mut output_monitor_hits,
