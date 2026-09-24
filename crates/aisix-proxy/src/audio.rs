@@ -1596,6 +1596,7 @@ async fn multipart_dispatch(
         target,
         attempt_started,
         member_reservation,
+        in_flight,
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
@@ -1638,6 +1639,8 @@ async fn multipart_dispatch(
             let post_stream_keys = reservation.keys();
             let stream_hold = reservation.into_stream_hold();
             let limiter = std::sync::Arc::clone(&state.limiter);
+            // least_busy: the target stays busy until the relay ends.
+            let in_flight_hold = in_flight;
 
             // Monitor-only output chains still get their end-of-stream
             // observation (AISIX-Cloud#1010); a block-capable chain never
@@ -1693,6 +1696,7 @@ async fn multipart_dispatch(
                         limiter.add_tokens_post_stream(key, total);
                     }
                     drop(stream_hold);
+                    drop(in_flight_hold);
                     // A stream can outlive several config generations, so
                     // the end-of-stream emit reads a FRESH snapshot rather
                     // than the one the request started on (#941).
@@ -2309,6 +2313,7 @@ async fn speech_dispatch(
         target,
         attempt_started,
         member_reservation,
+        in_flight,
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
@@ -2338,7 +2343,9 @@ async fn speech_dispatch(
     let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
     let signal = read_timeout.clone();
     let body = Box::pin(async_stream::stream! {
-        let _hold = stream_hold;
+        // least_busy: the target stays busy until the relay ends, with
+        // the concurrency slot.
+        let _hold = (stream_hold, in_flight);
         let inner = crate::stream_timeout::with_read_timeout_bytes_signalled(
             upstream_resp.bytes_stream(),
             stream_budget,

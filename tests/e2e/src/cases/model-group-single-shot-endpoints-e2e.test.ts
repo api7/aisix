@@ -31,10 +31,17 @@ import { startMockOtlp, type CapturedSpan, type MockOtlp } from "../harness/otlp
 // fan-out, which exports one span per event. The request's one access-log
 // line carries the same failover as its routing summary.
 //
-// Last, each endpoint serves a `least_latency` group whose slower target is
+// Each endpoint also serves a `least_latency` group whose slower target is
 // declared first: once both targets have answered once, the faster one
 // must serve, which it can only do if the endpoint feeds the per-target
 // latency the strategy ranks by.
+//
+// Last, each endpoint serves a `least_busy` group whose slow target is
+// declared first: while one request is still in flight on it, the next
+// must go to the idle target, which it can only do if the endpoint counts
+// its requests in flight. The two relayed bodies — synthesized speech and
+// a streamed transcript — must keep the target counted until the relay
+// ends, not only until the response head is out.
 
 const CALLER_PLAINTEXT = "sk-model-group-single-shot-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -103,6 +110,9 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
   let ok: OpenAiUpstream | undefined;
   let slow: OpenAiUpstream | undefined;
   let fast: OpenAiUpstream | undefined;
+  let busySlow: OpenAiUpstream | undefined;
+  let busySpeech: OpenAiUpstream | undefined;
+  let busyTranscript: OpenAiUpstream | undefined;
   let otlp: MockOtlp | undefined;
   const auth = { authorization: `Bearer ${CALLER_PLAINTEXT}` };
 
@@ -176,6 +186,33 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
     path,
     call(`lat-${group}`),
   ]);
+  // [label, group, upstream path, call, whether the slow target relays a
+  // body that is still streaming once the response head is out].
+  const busyCases: Array<[string, string, string, Call, boolean]> = [
+    ...endpoints.map(
+      ([label, group, path, call]): [string, string, string, Call, boolean] => [
+        label,
+        `busy-${group}`,
+        path,
+        call(`busy-${group}`),
+        false,
+      ],
+    ),
+    [
+      "audio/speech (relayed body)",
+      "busy-relay-speech",
+      "/v1/audio/speech",
+      json("/v1/audio/speech", { model: "busy-relay-speech", input: "hello", voice: "alloy" }),
+      true,
+    ],
+    [
+      "audio/transcriptions (streamed)",
+      "busy-relay-transcriptions",
+      "/v1/audio/transcriptions",
+      multipart("/v1/audio/transcriptions", { model: "busy-relay-transcriptions", stream: "true" }, "file"),
+      true,
+    ],
+  ];
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -200,6 +237,25 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
     ok = await startOpenAiUpstream({ nonStreamBody: OK_BODY });
     slow = await startOpenAiUpstream({ nonStreamBody: OK_BODY, responseDelayMs: 400 });
     fast = await startOpenAiUpstream({ nonStreamBody: OK_BODY });
+    busySlow = await startOpenAiUpstream({ nonStreamBody: OK_BODY, responseDelayMs: 800 });
+    // Answer the head at once, then trickle the body.
+    busySpeech = await startOpenAiUpstream({
+      rawBodyChunks: ["ID3-chunk-1", "chunk-2", "chunk-3"],
+      rawContentType: "audio/mpeg",
+      eventDelayMs: 600,
+    });
+    busyTranscript = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `data: ${JSON.stringify({ type: "transcript.text.delta", delta: "hello" })}\n\n`,
+        `data: ${JSON.stringify({ type: "transcript.text.delta", delta: " world" })}\n\n`,
+        `data: ${JSON.stringify({
+          type: "transcript.text.done",
+          text: "hello world",
+          usage: { type: "tokens", input_tokens: 3, output_tokens: 2, total_tokens: 5 },
+        })}\n\n`,
+      ],
+      eventDelayMs: 600,
+    });
 
     // The videos surface appends `/v1/videos` to the key's base itself;
     // every other endpoint takes a `/v1` base.
@@ -213,6 +269,10 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
     const fastPk = await pk("lat-fast-pk", `${fast.baseUrl}/v1`);
     const slowVideoPk = await pk("lat-slow-video-pk", slow.baseUrl);
     const fastVideoPk = await pk("lat-fast-video-pk", fast.baseUrl);
+    const busySlowPk = await pk("busy-slow-pk", `${busySlow.baseUrl}/v1`);
+    const busySlowVideoPk = await pk("busy-slow-video-pk", busySlow.baseUrl);
+    const busySpeechPk = await pk("busy-speech-pk", `${busySpeech.baseUrl}/v1`);
+    const busyTranscriptPk = await pk("busy-transcript-pk", `${busyTranscript.baseUrl}/v1`);
 
     for (const [label, group] of cases) {
       const video = label === "videos";
@@ -266,6 +326,37 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
       });
     }
 
+    for (const [label, group] of busyCases) {
+      const video = label === "videos";
+      const slowKey =
+        group === "busy-relay-speech"
+          ? busySpeechPk
+          : group === "busy-relay-transcriptions"
+            ? busyTranscriptPk
+            : video
+              ? busySlowVideoPk
+              : busySlowPk;
+      for (const [member, key] of [
+        ["slow", slowKey],
+        ["idle", video ? fastVideoPk : fastPk],
+      ] as const) {
+        await seed.createModel({
+          display_name: `${group}-${member}`,
+          provider: "openai",
+          model_name: OK_UPSTREAM_MODEL,
+          provider_key_id: key,
+        });
+      }
+      await seed.createModel({
+        display_name: group,
+        routing: {
+          strategy: "least_busy",
+          // Slow first: with both idle, declaration order picks it.
+          targets: [{ model: `${group}-slow` }, { model: `${group}-idle` }],
+        },
+      });
+    }
+
     // Seeded last: once it authenticates, every model above is in the
     // snapshot (tests/e2e/AGENTS.md).
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
@@ -282,6 +373,9 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
     await ok?.close();
     await slow?.close();
     await fast?.close();
+    await busySlow?.close();
+    await busySpeech?.close();
+    await busyTranscript?.close();
     await otlp?.close();
   });
 
@@ -369,6 +463,48 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
       const hits = (u: OpenAiUpstream) => u.receivedRequests.filter((r) => r.path === upstreamPath).length;
       expect(hits(slow), `${group}: requests the slow target served`).toBe(1);
       expect(hits(fast), `${group}: requests the fast target served`).toBe(3);
+    },
+  );
+
+  test.for(busyCases)(
+    "%s: a least_busy Model Group routes away from a target with a request in flight",
+    { timeout: 60_000 },
+    async ([, group, upstreamPath, call, relayed], ctx) => {
+      if (!etcdReachable || !app || !busySlow || !busySpeech || !busyTranscript || !fast) {
+        ctx.skip();
+        return;
+      }
+      const slowUpstream =
+        group === "busy-relay-speech" ? busySpeech : group === "busy-relay-transcriptions" ? busyTranscript : busySlow;
+      const hits = (u: OpenAiUpstream) => u.receivedRequests.filter((r) => r.path === upstreamPath).length;
+      const slowBase = hits(slowUpstream);
+      const idleBase = hits(fast);
+
+      // Both idle: declaration order sends the first request to the slow
+      // target. Wait until the upstream has it rather than sleeping.
+      const occupying = call();
+      const deadline = Date.now() + 10_000;
+      while (hits(slowUpstream) - slowBase < 1 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(hits(slowUpstream) - slowBase, `${group}: the first request reached the slow target`).toBe(1);
+      let occupied: Response | undefined;
+      if (relayed) {
+        // The head is out and the body is still arriving: the request is
+        // still in flight on the slow target.
+        occupied = await occupying;
+        expect(occupied.status, group).toBe(200);
+      }
+
+      const diverted = await call();
+      const divertedText = await diverted.text();
+      expect(diverted.status, `${group}: ${divertedText}`).toBe(200);
+      expect(hits(fast) - idleBase, `${group}: requests the idle target served`).toBe(1);
+      expect(hits(slowUpstream) - slowBase, `${group}: requests the slow target served`).toBe(1);
+
+      const first = occupied ?? (await occupying);
+      await first.text();
+      expect(first.status, group).toBe(200);
     },
   );
 });

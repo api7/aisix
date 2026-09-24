@@ -508,6 +508,11 @@ pub(crate) struct Dispatched<T> {
     /// the failed attempts before it are not counted twice.
     pub attempt_started: std::time::Instant,
     pub member_reservation: Option<aisix_ratelimit::MultiReservation>,
+    /// The target's `least_busy` in-flight count, raised for the winning
+    /// attempt. A buffered response is complete once `value` exists, so
+    /// dropping it with the rest is right; a relayed stream moves it into
+    /// its body so the target counts as busy until the relay ends.
+    pub in_flight: crate::health::InFlightGuard,
 }
 
 /// Dispatch a single-shot (non-streaming-relay) request to the Model the
@@ -537,7 +542,9 @@ pub(crate) struct Dispatched<T> {
 ///
 /// A successful attempt also feeds the target's latency to the
 /// `least_latency` strategy, exactly as chat does, so a group on that
-/// strategy learns its targets on every endpoint of the family.
+/// strategy learns its targets on every endpoint of the family. Every
+/// attempt is counted in flight for `least_busy` while it runs, and the
+/// winner's count is handed back in [`Dispatched::in_flight`].
 ///
 /// The one chokepoint for the single-shot endpoint family — completions,
 /// embeddings, rerank, images, audio, videos — so they dispatch Model
@@ -661,6 +668,7 @@ where
             }
             let (index, kind) = begin(telemetry);
             let attempt_started = std::time::Instant::now();
+            let in_flight = state.runtime_status.count_in_flight(&target.id);
             match call(target.clone(), timeouts).await {
                 Ok(value) => {
                     let refusal = unsupported(&value);
@@ -701,6 +709,7 @@ where
                         target,
                         attempt_started,
                         member_reservation,
+                        in_flight,
                     });
                 }
                 Err(e) => {

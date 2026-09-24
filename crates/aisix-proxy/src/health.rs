@@ -292,11 +292,6 @@ struct RuntimeEntry {
     /// latency in milliseconds. `None` until the first sample. Drives the
     /// `least_latency` routing strategy; independent of health/cooldown.
     latency_ewma_ms: Option<f64>,
-    /// Number of requests currently in flight to this target. Held in an
-    /// `Arc` so an [`InFlightGuard`] can decrement it after the DashMap lock
-    /// is released (and for the streaming path, after the handler returns).
-    /// Drives the `least_busy` routing strategy.
-    in_flight: Arc<AtomicUsize>,
     /// Last value published to the `aisix_deployment_state` gauge for this
     /// target, so [`ModelRuntimeStatusTracker::sync_deployment_state`] can
     /// skip a write when nothing changed. `None` = never published.
@@ -578,6 +573,16 @@ pub struct ModelRuntimeStatusTracker {
     /// reasons; entries for a group or target the operator has since
     /// deleted are never revisited and cost one key each.
     exclusion_log: DashMap<(String, String, &'static str), Instant>,
+    /// Requests currently in flight to each target, driving the
+    /// `least_busy` strategy. Each counter sits in an `Arc` so an
+    /// [`InFlightGuard`] can decrement it after the map lock is released
+    /// (and for a streamed body, after the handler returns).
+    ///
+    /// Kept apart from `entries` on purpose: an entry's existence decides
+    /// whether a first success publishes `aisix_deployment_state`, so
+    /// counting a request must not create one. See
+    /// [`ModelRuntimeStatusTracker::count_in_flight`].
+    in_flight: DashMap<String, Arc<AtomicUsize>>,
 }
 
 /// RAII guard that decrements a target's in-flight counter when dropped.
@@ -691,6 +696,7 @@ impl ModelRuntimeStatusTracker {
             snapshot: Some(snapshot),
             flags: Some(flags),
             exclusion_log: DashMap::new(),
+            in_flight: DashMap::new(),
         }
     }
 
@@ -982,7 +988,24 @@ impl ModelRuntimeStatusTracker {
 
     /// Mark one request as in flight to `model_id` and return a guard that
     /// decrements the count when dropped. Drives the `least_busy` strategy.
+    ///
+    /// Also creates the target's runtime entry, which `mark_healthy`'s
+    /// first-success Healthy publish keys off: chat, messages and responses
+    /// publish `aisix_deployment_state` for their targets that way. The
+    /// single-attempt handlers count through [`Self::count_in_flight`],
+    /// which leaves the entry alone, so their targets publish only what
+    /// they already did. Steady state downgrades to a read-guard existence
+    /// check.
     pub fn begin_in_flight(&self, model_id: &str) -> InFlightGuard {
+        if self.entries.get(model_id).is_none() {
+            self.entries.entry(model_id.to_string()).or_default();
+        }
+        self.count_in_flight(model_id)
+    }
+
+    /// Count one request as in flight to `model_id` until the returned
+    /// guard drops, without creating the target's runtime entry.
+    pub fn count_in_flight(&self, model_id: &str) -> InFlightGuard {
         // The counter's only reader is `least_busy` target ordering; with
         // no such strategy configured, hand out a no-op guard instead of
         // paying the counter RMWs and guard refcount per request. When
@@ -990,25 +1013,13 @@ impl ModelRuntimeStatusTracker {
         // requests; requests already in flight hold no-op guards, so the
         // count transiently underreads until they drain — the same
         // cold-start the counter has on process start.
-        //
-        // The ENTRY-CREATION side effect is preserved: `mark_healthy`'s
-        // first-success Healthy publish keys off the entry this method
-        // creates, and only the endpoints that call begin_in_flight may
-        // publish that series (the single-attempt handlers never do).
-        // Steady state downgrades to a read-guard existence check.
         if !self.bookkeeping_active() {
-            if self.entries.get(model_id).is_none() {
-                self.entries.entry(model_id.to_string()).or_default();
-            }
             return InFlightGuard { counter: None };
         }
-        let counter = Arc::clone(
-            &self
-                .entries
-                .entry(model_id.to_string())
-                .or_default()
-                .in_flight,
-        );
+        let counter = match self.in_flight.get(model_id) {
+            Some(c) => Arc::clone(&c),
+            None => Arc::clone(&self.in_flight.entry(model_id.to_string()).or_default()),
+        };
         counter.fetch_add(1, Ordering::Relaxed);
         InFlightGuard {
             counter: Some(counter),
@@ -1017,9 +1028,9 @@ impl ModelRuntimeStatusTracker {
 
     /// Current in-flight request count for `model_id`.
     pub fn in_flight(&self, model_id: &str) -> usize {
-        self.entries
+        self.in_flight
             .get(model_id)
-            .map(|e| e.in_flight.load(Ordering::Relaxed))
+            .map(|c| c.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
 
@@ -1273,6 +1284,26 @@ mod tests {
             t.entries.get("embeddings-only-target").is_none(),
             "mark_healthy on a never-seen id must not create an entry"
         );
+    }
+
+    /// The single-attempt handlers count their requests for `least_busy`
+    /// through `count_in_flight`, which must not create the entry a first
+    /// success would publish `aisix_deployment_state` from — whether or
+    /// not bookkeeping is active.
+    #[test]
+    fn count_in_flight_counts_without_creating_an_entry() {
+        let active = ModelRuntimeStatusTracker::new();
+        let g = active.count_in_flight("single-shot-target");
+        assert_eq!(active.in_flight("single-shot-target"), 1);
+        active.mark_healthy("single-shot-target");
+        assert!(active.entries.get("single-shot-target").is_none());
+        drop(g);
+        assert_eq!(active.in_flight("single-shot-target"), 0);
+
+        let (_handle, inactive) = inactive_tracker();
+        drop(inactive.count_in_flight("single-shot-target"));
+        inactive.mark_healthy("single-shot-target");
+        assert!(inactive.entries.get("single-shot-target").is_none());
     }
 
     #[test]
