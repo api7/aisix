@@ -132,10 +132,12 @@ pub(crate) async fn read_body_capped(resp: &mut reqwest::Response, cap: usize) -
 ///     collectors read `ChatResponse::guardrail_output_text`.
 ///
 /// Non-text content blocks (image/audio) are out of scope — multimodal
-/// moderation is a separate feature. Every guardrail's input collector
-/// goes through this so the families can't drift, and `redact_chat_format`
-/// masks exactly this list — the two must stay in lockstep or a Mask rule
-/// reports a hit on text it then forwards unmasked.
+/// moderation is a separate feature. Every blob-check guardrail's input
+/// collector goes through this so the families can't drift, and
+/// `redact_chat_format` masks exactly this list — the two must stay in
+/// lockstep or a Mask rule reports a hit on text it then forwards
+/// unmasked. The local kinds (`keyword`, `pii`) read that walker instead of
+/// this blob wherever a call site walks the body (#1027).
 pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
     let mut parts: Vec<String> = Vec::new();
     let content = m.content_str();

@@ -17,6 +17,13 @@
 //! Every helper returns per-detector match counts (detector names only,
 //! never values) which callers merge into `usage_events
 //! .redacted_entity_counts`.
+//!
+//! The walkers are also the scan surface of the local guardrail kinds
+//! (`keyword`, `pii` — #1027): [`moderate_body`] collects what a walker
+//! offers and those kinds judge each slot on its own. A slot a walker does
+//! not offer is a slot they never judge, so a new scanned field is offered
+//! here — rewritable, or through `Guardrail::observe_unrewritable` when it
+//! cannot be rewritten.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
