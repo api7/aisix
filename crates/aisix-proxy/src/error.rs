@@ -421,6 +421,21 @@ pub(crate) fn guardrail_block_error(
     }
 }
 
+/// The `data:` payload of the OpenAI-shape SSE `event: error` frame that
+/// ends a streamed response an output guardrail refused. It is the buffered
+/// 422 body for the same refusal, so the two halves of an endpoint carry the
+/// same `error.type` and the same `error.code` (`guardrail_unavailable` for
+/// a fail-closed refusal, none for a policy block).
+pub(crate) fn guardrail_block_frame_payload(
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> String {
+    serde_json::to_string(
+        &guardrail_block_error("response", guardrail_name, unavailable).envelope(),
+    )
+    .expect("an error envelope serializes")
+}
+
 impl ProxyError {
     pub fn status(&self) -> StatusCode {
         match self {

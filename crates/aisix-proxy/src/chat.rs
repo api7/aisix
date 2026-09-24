@@ -5955,12 +5955,9 @@ where
                                         guard.comp().guardrail_blocked = true;
                                         yield Ok::<_, Infallible>(
                                             Event::default().event("error").data(
-                                                error_frame_payload(
-                                                    "content_filter",
-                                                    &crate::error::guardrail_block_message(
-                                                        "response",
-                                                        guardrail_name.as_deref(),
-                                                     unavailable.as_deref()),
+                                                crate::error::guardrail_block_frame_payload(
+                                                    guardrail_name.as_deref(),
+                                                    unavailable.as_deref(),
                                                 ),
                                             ),
                                         );
@@ -6040,14 +6037,12 @@ where
                                     ctx.chain.record_output_buffer_exceeded();
                                 }
                                 yield Ok::<_, Infallible>(
-                                    Event::default().event("error").data(error_frame_payload(
-                                        "content_filter",
-                                        &crate::error::guardrail_block_message(
-                                            "response",
+                                    Event::default().event("error").data(
+                                        crate::error::guardrail_block_frame_payload(
                                             None,
                                             Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
                                         ),
-                                    )),
+                                    ),
                                 );
                                 break;
                             }
@@ -6202,12 +6197,9 @@ where
                                 errored = true;
                                 guard.comp().guardrail_blocked = true;
                                 yield Ok::<_, Infallible>(
-                                    Event::default().event("error").data(error_frame_payload(
-                                        "content_filter",
-                                        &crate::error::guardrail_block_message(
-                                            "response",
-                                            guardrail_name.as_deref(),
-                                         unavailable.as_deref()),
+                                    Event::default().event("error").data(crate::error::guardrail_block_frame_payload(
+                                        guardrail_name.as_deref(),
+                                        unavailable.as_deref(),
                                     )),
                                 );
                                 true
@@ -6325,12 +6317,9 @@ where
                         yield Ok::<_, Infallible>(
                             Event::default()
                                 .event("error")
-                                .data(error_frame_payload(
-                                    "content_filter",
-                                    &crate::error::guardrail_block_message(
-                                        "response",
-                                        guardrail_name.as_deref(),
-                                     unavailable.as_deref()),
+                                .data(crate::error::guardrail_block_frame_payload(
+                                    guardrail_name.as_deref(),
+                                    unavailable.as_deref(),
                                 )),
                         );
                     }

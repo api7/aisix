@@ -3005,7 +3005,10 @@ fn build_anthropic_sse_stream(
 /// parse. What tells a refusal apart is `error.code`, the same value the
 /// 422 body carries (`anthropic_guardrail_code`); the caller reads WHICH
 /// guardrail fired from the message.
-fn guardrail_block_frame(guardrail_name: Option<&str>, unavailable: Option<&str>) -> String {
+pub(crate) fn guardrail_block_frame(
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> String {
     format!(
         "event: error\ndata: {}\n\n",
         serde_json::json!({

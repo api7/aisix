@@ -1955,15 +1955,49 @@ fn frame_parts(
     (parts, usage)
 }
 
-/// The SSE error frame appended when an output guardrail blocks mid-relay.
-fn guardrail_error_frame(guardrail_name: Option<&str>, unavailable: Option<&str>) -> Bytes {
-    let payload = serde_json::json!({
-        "error": {
-            "type": "content_filter",
-            "message": crate::error::guardrail_block_message("response", guardrail_name, unavailable),
-        }
-    });
-    Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+/// The SSE error frame appended when an output guardrail blocks mid-relay,
+/// in the protocol of the stream it ends: the frame `/v1/messages` emits for
+/// the same refusal on an Anthropic Messages stream, the one
+/// `/v1/chat/completions` emits on every other.
+fn guardrail_error_frame(
+    anthropic: bool,
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> Bytes {
+    if anthropic {
+        return Bytes::from(crate::messages::guardrail_block_frame(
+            guardrail_name,
+            unavailable,
+        ));
+    }
+    Bytes::from(format!(
+        "event: error\ndata: {}\n\n",
+        crate::error::guardrail_block_frame_payload(guardrail_name, unavailable)
+    ))
+}
+
+/// Whether a relayed chat-envelope frame is an Anthropic Messages event
+/// (`Some(true)`) or an OpenAI chat chunk (`Some(false)`). The two event
+/// shapes are disjoint; a frame that is neither (a comment, `[DONE]`, an
+/// in-band error) decides nothing.
+fn anthropic_stream_frame(frame: &[u8]) -> Option<bool> {
+    let payload = crate::redact::frame_payload(frame)?;
+    let v: serde_json::Value = serde_json::from_str(payload.trim()).ok()?;
+    if v.get("choices").is_some() {
+        return Some(false);
+    }
+    match v.get("type").and_then(serde_json::Value::as_str) {
+        Some(
+            "message_start"
+            | "message_delta"
+            | "message_stop"
+            | "content_block_start"
+            | "content_block_delta"
+            | "content_block_stop"
+            | "ping",
+        ) => Some(true),
+        _ => None,
+    }
 }
 
 /// Build the streamed relay response: upstream SSE frames are forwarded
@@ -2011,6 +2045,9 @@ fn stream_response(
         // Degrades BufferFull to live forwarding after a fail-open cap hit.
         let mut fail_opened = false;
         let mut blocked = false;
+        // The chat envelope also carries Anthropic Messages streams; the
+        // first frame that says which one decides the refusal frame's shape.
+        let mut anthropic: Option<bool> = None;
 
         'outer: loop {
             let chunk = match upstream.next().await {
@@ -2040,6 +2077,9 @@ fn stream_response(
                     .min(u32::MAX as u128) as u32;
             }
             for frame in splitter.push(&chunk) {
+                if anthropic.is_none() && matches!(protocol, PassthroughProtocol::OpenaiChat) {
+                    anthropic = anthropic_stream_frame(&frame);
+                }
                 if let Some(err) = frame_in_band_error(protocol, &frame) {
                     telemetry.record_failure(&err);
                 }
@@ -2089,7 +2129,7 @@ fn stream_response(
                                         "guardrail blocked passthrough-route stream (window)",
                                     );
                                     blocked = true;
-                                    yield Ok(guardrail_error_frame(guardrail_name.as_deref(), unavailable.as_deref()));
+                                    yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), guardrail_name.as_deref(), unavailable.as_deref()));
                                     break 'outer;
                                 }
                                 _ => {
@@ -2124,7 +2164,7 @@ fn stream_response(
                                 );
                                 blocked = true;
                                 chain.record_output_buffer_exceeded();
-                                yield Ok(guardrail_error_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
+                                yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
                                 break 'outer;
                             }
                         }
@@ -2138,6 +2178,9 @@ fn stream_response(
             // of whatever the policy has not cleared yet.
             let rest = splitter.take_rest();
             if !rest.is_empty() {
+                if anthropic.is_none() && matches!(protocol, PassthroughProtocol::OpenaiChat) {
+                    anthropic = anthropic_stream_frame(&rest);
+                }
                 let (parts, usage) = frame_parts(protocol, &rest);
                 let held = parts.held();
                 let delta = parts.scan;
@@ -2169,7 +2212,7 @@ fn stream_response(
                         );
                         chain.record_output_buffer_exceeded();
                         pending.clear();
-                        yield Ok(guardrail_error_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
+                        yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
                         telemetry.guardrail_blocked = true;
                         telemetry.stream_reached_end = true;
                         telemetry.emit();
@@ -2210,7 +2253,7 @@ fn stream_response(
                     // forwarded under EndOfStreamCheck cannot be unsent —
                     // the error frame is the caller-visible signal either way.
                     pending.clear();
-                    yield Ok(guardrail_error_frame(guardrail_name.as_deref(), unavailable.as_deref()));
+                    yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), guardrail_name.as_deref(), unavailable.as_deref()));
                     telemetry.guardrail_blocked = true;
                     telemetry.stream_reached_end = true;
                     telemetry.emit();
@@ -4320,5 +4363,96 @@ mod tests {
         .to_string();
         let text = request_guardrail_text(PassthroughProtocol::OpenaiResponses, request.as_bytes());
         assert!(text.contains("ARGS"));
+    }
+
+    /// Relay `sse` through a passthrough route governed by `guardrail`, and
+    /// return the `data:` payload of the refusal frame that ends it.
+    async fn relayed_refusal_frame(sse: &str, guardrail: &str) -> serde_json::Value {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(sse.to_owned(), "text/event-stream"),
+            )
+            .mount(&upstream)
+            .await;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry("http://unused"));
+        snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+        snap.passthrough_routes
+            .insert(inject_route(&upstream.uri()));
+        let g: aisix_core::Guardrail = serde_json::from_str(guardrail).unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", g, 1));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/passthrough/openai/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({"model": "x", "stream": true, "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hi"}]})
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = build_app(snap).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let wire = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&wire));
+        let wire = String::from_utf8_lossy(&wire).into_owned();
+        let frame = wire
+            .split("\n\n")
+            .find(|f| f.starts_with("event: error\n"))
+            .unwrap_or_else(|| panic!("no refusal frame on the wire: {wire}"));
+        assert!(!wire.contains("FORBIDDEN"), "held content leaked: {wire}");
+        serde_json::from_str(frame.trim_start_matches("event: error\ndata: ")).unwrap()
+    }
+
+    const OUTPUT_KEYWORD_BLOCK: &str = r#"{"name":"out-block","enabled":true,"hook_point":"output","kind":"keyword","patterns":[{"kind":"literal","value":"FORBIDDEN"}]}"#;
+    const OUTPUT_CAP_FAIL_CLOSED: &str = r#"{"name":"out-cap","enabled":true,"hook_point":"output","kind":"azure_content_safety_text_moderation","endpoint":"http://127.0.0.1:1","api_key":"k","stream_processing_mode":"buffer_full","max_buffer_bytes":4,"on_buffer_exceeded":"fail_closed"}"#;
+
+    const ANTHROPIC_SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"say FORBIDDEN now\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    const OPENAI_SSE: &str = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"say FORBIDDEN now\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+
+    /// A refusal ending a relayed Anthropic Messages stream is the frame
+    /// `/v1/messages` emits for it: an SDK-legal `error.type` and the
+    /// refusal named on `error.code`.
+    #[tokio::test]
+    async fn a_relayed_anthropic_stream_is_refused_in_the_anthropic_shape() {
+        let v = relayed_refusal_frame(ANTHROPIC_SSE, OUTPUT_KEYWORD_BLOCK).await;
+        assert_eq!(v["type"], "error", "{v}");
+        assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+        assert_eq!(v["error"]["code"], "content_filter", "{v}");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("out-block"));
+
+        let v = relayed_refusal_frame(ANTHROPIC_SSE, OUTPUT_CAP_FAIL_CLOSED).await;
+        assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+        assert_eq!(v["error"]["code"], "guardrail_unavailable", "{v}");
+    }
+
+    /// On an OpenAI chat stream the refusal frame is the buffered 422 body:
+    /// `guardrail_unavailable` on a fail-closed refusal, no code on a policy
+    /// block.
+    #[tokio::test]
+    async fn a_relayed_openai_stream_is_refused_in_the_openai_shape() {
+        let v = relayed_refusal_frame(OPENAI_SSE, OUTPUT_KEYWORD_BLOCK).await;
+        assert_eq!(v["error"]["type"], "content_filter", "{v}");
+        assert!(v["error"].get("code").is_none(), "{v}");
+        assert!(v.get("type").is_none(), "{v}");
+
+        let v = relayed_refusal_frame(OPENAI_SSE, OUTPUT_CAP_FAIL_CLOSED).await;
+        assert_eq!(v["error"]["type"], "content_filter", "{v}");
+        assert_eq!(v["error"]["code"], "guardrail_unavailable", "{v}");
     }
 }
