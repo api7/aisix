@@ -55,7 +55,14 @@ impl EosOutputScan {
         }
     }
 
-    pub(crate) async fn observe(self, text: &str) -> Vec<aisix_core::GuardrailMonitorHit> {
+    /// `local_segments` are the slots the buffered branch's mask walker
+    /// would rewrite, when the caller can rebuild them; the local kinds
+    /// judge those instead of the flattened text (#1027).
+    pub(crate) async fn observe(
+        self,
+        text: &str,
+        local_segments: Option<Vec<aisix_guardrails::ScanSegment>>,
+    ) -> Vec<aisix_core::GuardrailMonitorHit> {
         // Bound the provider calls the same way the buffered branch's byte
         // cap does — scan at most the cap's worth of text.
         let mut end = text
@@ -79,13 +86,14 @@ impl EosOutputScan {
         // observations too. Masks are suppressed in monitor mode, and nothing
         // could be rewritten anyway — the counts are discarded.
         let mut seg_counts = crate::redact::RedactionCounts::new();
-        let verdict = crate::redact::moderate_body(
+        let verdict = crate::redact::moderate_body_local_given(
             self.chain.as_ref(),
             crate::redact::Direction::Output,
             None,
             verdict,
             &mut seg_counts,
             &mut hits,
+            local_segments,
             |g| {
                 let _ = g.redact_output_text(scan_text);
                 crate::redact::RedactionCounts::new()

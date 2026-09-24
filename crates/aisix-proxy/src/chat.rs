@@ -5558,6 +5558,11 @@ where
         } else {
             None
         };
+        // The raw tool-call deltas, for the end-of-stream check to rebuild
+        // the channels the buffered branch's mask walker reads (#1027).
+        // Only the live-forward branch reads them; bounded like the buffer
+        // above.
+        let mut eos_tool_calls: Vec<serde_json::Value> = Vec::new();
         // P2 (#379) / #466: streamed-output policy folded over the output-hook
         // guardrails. EndOfStreamCheck (reached only when no output-hook
         // guardrail is present) leaves the live-forward path below byte-for-byte
@@ -5723,6 +5728,9 @@ where
                         for tc in tcs {
                             if buf.len() >= tool_calls_cap {
                                 break;
+                            }
+                            if !hold_back {
+                                eos_tool_calls.push(tc.clone());
                             }
                             if let Some(f) = tc.get("function") {
                                 if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
@@ -6189,8 +6197,36 @@ where
                         guard.comp().completion_tokens,
                     ),
                 };
-                let (verdict, hits) = ctx.chain.check_output_observed(&synthesized).await;
+                let (verdict, hits) = ctx
+                    .chain
+                    .check_output_non_local_observed(&synthesized)
+                    .await;
                 guard.comp().monitor_hits.extend(hits);
+                // The local kinds judge the channels the buffered branch's
+                // mask walker would rewrite — the content, and each tool
+                // call's arguments — not the joined text above (#1027).
+                let verdict = if verdict.is_block() {
+                    verdict
+                } else {
+                    let mut chunks = vec![aisix_gateway::ChatChunk {
+                        id: String::new(),
+                        model: String::new(),
+                        delta: aisix_gateway::ChatDelta {
+                            content: Some(content.clone()),
+                            tool_calls: (!eos_tool_calls.is_empty())
+                                .then(|| std::mem::take(&mut eos_tool_calls)),
+                            ..Default::default()
+                        },
+                        finish_reason: None,
+                        usage: None,
+                    }];
+                    let segments = crate::redact::collect_segments(|g| {
+                        let _ = crate::redact::redact_chat_chunks(g, &mut chunks);
+                    });
+                    let (local, hits) = ctx.chain.check_local_segments(&segments, false);
+                    guard.comp().monitor_hits.extend(hits);
+                    verdict.merged_with(local)
+                };
                 match verdict {
                     aisix_guardrails::GuardrailVerdict::Block {
                         reason,

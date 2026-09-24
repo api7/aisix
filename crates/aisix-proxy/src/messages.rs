@@ -4204,6 +4204,9 @@ where
             // pass reads raw text, so it can scan a payload nothing could
             // parse. Appended to the scanned copy only: it never reached
             // the client, so it must not reach the captured content either.
+            // Live-forward (no hold) has no held frames to walk: the
+            // accumulated text is the one slot there is.
+            let live_text = hold.is_none().then(|| text.clone());
             for payload in &unscanned {
                 if !text.is_empty() {
                     text.push('\n');
@@ -4231,13 +4234,28 @@ where
                 // live-forward stream never carries one).
                 let mut seg_counts = crate::redact::RedactionCounts::new();
                 let mut seg_hits = Vec::new();
-                let verdict = crate::redact::moderate_body(
+                let local_extra = live_text
+                    .into_iter()
+                    .map(|t| (t, aisix_guardrails::SegmentRole::Rewritable))
+                    .chain(
+                        unscanned
+                            .iter()
+                            .map(|t| (t.clone(), aisix_guardrails::SegmentRole::ScanOnly)),
+                    )
+                    .map(|(text, role)| aisix_guardrails::ScanSegment {
+                        text,
+                        role,
+                        in_latest_turn: true,
+                    })
+                    .collect();
+                let verdict = crate::redact::moderate_body_local_extra(
                     chain.as_ref(),
                     crate::redact::Direction::Output,
                     None,
                     verdict,
                     &mut seg_counts,
                     &mut seg_hits,
+                    local_extra,
                     |g| match crate::redact::redact_anthropic_sse(g, &held) {
                         Some((rewritten, counts)) => {
                             held = rewritten;

@@ -914,7 +914,7 @@ where
             // on the terminal frame drops this generator here, and the
             // Drop emit must still carry the usage it already parsed.
             let text = guard.observed().text().to_string();
-            let hits = scan.observe(&text).await;
+            let hits = scan.observe(&text, None).await;
             guard.observed().output_hits = hits;
         }
         if let Some((f, observed)) = guard.slot.take() {

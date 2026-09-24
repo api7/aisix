@@ -20,7 +20,9 @@ use aisix_core::models::{
 };
 
 use crate::audit::GuardrailAuditLog;
-use crate::{Guardrail, GuardrailVerdict, Redaction, SegmentsOutcome, StreamOutputPolicy};
+use crate::{
+    Guardrail, GuardrailVerdict, Redaction, ScanSegment, SegmentsOutcome, StreamOutputPolicy,
+};
 
 /// One chain member: the runtime guardrail plus the operator-facing name
 /// and `kind` of the row it was built from. The name is what `Block`
@@ -820,6 +822,56 @@ impl Guardrail for GuardrailChain {
         (verdict, hits)
     }
 
+    async fn check_output_non_local_observed(
+        &self,
+        resp: &ChatResponse,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let mut bypass: Option<String> = None;
+        let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
+        for m in &self.members {
+            let started = Instant::now();
+            let (verdict, member_hits) = m.guardrail.check_output_non_local_observed(resp).await;
+            // A local member answers through `check_local_segments`; this
+            // call is an instant Allow, not an execution.
+            if !m.guardrail.checks_local_segments() {
+                record_execution(
+                    self.recorders(),
+                    m,
+                    "output",
+                    started,
+                    &verdict,
+                    false,
+                    &member_hits,
+                    None,
+                );
+            }
+            hits.extend(member_hits);
+            match verdict {
+                GuardrailVerdict::Allow => continue,
+                GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                    unavailable,
+                } => {
+                    return (
+                        attribute_block(&m.name, reason, guardrail_name, unavailable),
+                        hits,
+                    )
+                }
+                GuardrailVerdict::Bypass { reason } => {
+                    if bypass.is_none() {
+                        bypass = Some(reason);
+                    }
+                }
+            }
+        }
+        let verdict = match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
+        };
+        (verdict, hits)
+    }
+
     async fn check_input_non_segment_observed(
         &self,
         req: &ChatFormat,
@@ -837,7 +889,7 @@ impl Guardrail for GuardrailChain {
             // this call is an instant Allow, not an execution; recording
             // it would pollute the member's series with zero-length
             // "allowed" samples.
-            if !m.guardrail.moderates_segments() {
+            if !m.guardrail.judged_by_segments() {
                 record_execution(
                     self.recorders(),
                     m,
@@ -885,7 +937,7 @@ impl Guardrail for GuardrailChain {
         for m in &self.members {
             let started = Instant::now();
             let (verdict, member_hits) = m.guardrail.check_output_non_segment_observed(resp).await;
-            if !m.guardrail.moderates_segments() {
+            if !m.guardrail.judged_by_segments() {
                 record_execution(
                     self.recorders(),
                     m,
@@ -928,6 +980,80 @@ impl Guardrail for GuardrailChain {
         self.members
             .iter()
             .any(|m| m.guardrail.moderates_segments())
+    }
+
+    fn checks_local_segments(&self) -> bool {
+        self.members
+            .iter()
+            .any(|m| m.guardrail.checks_local_segments())
+    }
+
+    /// Fold over the local-segment members. Mirrors the check folds: the
+    /// first Block short-circuits with attribution, the first Bypass
+    /// sticks, and every member's monitor observations are kept. A
+    /// `latest_turn` member is offered only the in-window input segments.
+    fn check_local_segments(
+        &self,
+        segments: &[ScanSegment],
+        input: bool,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let phase = if input { "input" } else { "output" };
+        let mut bypass: Option<String> = None;
+        let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
+        let mut in_window: Option<Vec<ScanSegment>> = None;
+        for m in &self.members {
+            if !m.guardrail.checks_local_segments() {
+                continue;
+            }
+            let view: &[ScanSegment] =
+                if input && m.input_messages == GuardrailInputMessages::LatestTurn {
+                    in_window.get_or_insert_with(|| {
+                        segments
+                            .iter()
+                            .filter(|s| s.in_latest_turn)
+                            .cloned()
+                            .collect()
+                    })
+                } else {
+                    segments
+                };
+            let started = Instant::now();
+            let (verdict, member_hits) = m.guardrail.check_local_segments(view, input);
+            record_execution(
+                self.recorders(),
+                m,
+                phase,
+                started,
+                &verdict,
+                false,
+                &member_hits,
+                None,
+            );
+            hits.extend(member_hits);
+            match verdict {
+                GuardrailVerdict::Allow => {}
+                GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                    unavailable,
+                } => {
+                    return (
+                        attribute_block(&m.name, reason, guardrail_name, unavailable),
+                        hits,
+                    )
+                }
+                GuardrailVerdict::Bypass { reason } => {
+                    if bypass.is_none() {
+                        bypass = Some(reason);
+                    }
+                }
+            }
+        }
+        let verdict = match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
+        };
+        (verdict, hits)
     }
 
     /// Fold over segment-moderating members only. A Block short-circuits
@@ -981,7 +1107,7 @@ impl Guardrail for GuardrailChain {
                 .guardrail
                 .check_input_non_segment(member_input(m, req, &narrowed))
                 .await;
-            if !m.guardrail.moderates_segments() {
+            if !m.guardrail.judged_by_segments() {
                 record_execution(
                     self.recorders(),
                     m,
@@ -1018,7 +1144,7 @@ impl Guardrail for GuardrailChain {
         for m in &self.members {
             let started = Instant::now();
             let verdict = m.guardrail.check_output_non_segment(resp).await;
-            if !m.guardrail.moderates_segments() {
+            if !m.guardrail.judged_by_segments() {
                 record_execution(
                     self.recorders(),
                     m,
@@ -1992,6 +2118,28 @@ mod tests {
 
     // --- segment moderation folds (#932 bedrock follow-up) ---------------
 
+    /// A blob-check member: blocks when the joined request text contains
+    /// `needle`. Neither a segment moderator nor a local-segment kind, so
+    /// the non-segment folds consult it.
+    struct BlobBlocks(&'static str);
+    #[async_trait]
+    impl Guardrail for BlobBlocks {
+        fn name(&self) -> &'static str {
+            "blob-blocks"
+        }
+        async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
+            if req
+                .messages
+                .iter()
+                .any(|m| m.content_str().contains(self.0))
+            {
+                GuardrailVerdict::block("blob matched")
+            } else {
+                GuardrailVerdict::Allow
+            }
+        }
+    }
+
     /// A stub segment moderator: uppercases every slot and reports a
     /// fixed count key, or blocks/bypasses on demand.
     struct StubSegments {
@@ -2388,9 +2536,9 @@ mod tests {
                 verdict: GuardrailVerdict::Allow,
                 mask: false,
             }),
-            Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")])),
+            Arc::new(BlobBlocks("AKIA")),
         ]);
-        // Keyword member still blocks...
+        // The blob member still blocks...
         assert!(chain
             .check_input_non_segment(&req("here is AKIAEXAMPLE"))
             .await
@@ -2715,12 +2863,7 @@ mod tests {
                         mask: true,
                     }) as Arc<dyn Guardrail>,
                 ),
-                (
-                    "kw".to_owned(),
-                    Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal(
-                        "never-matches",
-                    )])),
-                ),
+                ("kw".to_owned(), Arc::new(BlobBlocks("never-matches"))),
             ],
             vec![
                 AppliedGuardrail {
@@ -2731,7 +2874,7 @@ mod tests {
             ],
         );
 
-        // Non-segment pass: only the keyword member records.
+        // Non-segment pass: only the blob member records.
         let (v, _) = chain.check_input_non_segment_observed(&req("clean")).await;
         assert_eq!(v, GuardrailVerdict::Allow);
         assert_eq!(

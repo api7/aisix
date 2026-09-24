@@ -719,6 +719,40 @@ impl SegmentsOutcome {
     }
 }
 
+/// What enforcement can do with one [`ScanSegment`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentRole {
+    /// A slot the mask pass rewrites in place.
+    Rewritable,
+    /// Judged but forwarded byte-identical, and a mask hit is forwarded
+    /// with it: a signed reasoning block (#1104), a tool name, a frame the
+    /// gateway never releases, or a body with no maskable slot.
+    ScanOnly,
+    /// An object key of a structured payload (tool arguments, tool
+    /// results, `structuredContent`). A key cannot be rewritten without
+    /// changing the payload's contract, so a mask hit on one blocks.
+    Label,
+    /// A rewritable slot restating text another slot already carries — a
+    /// Responses stream's aggregate events repeat its deltas. Rewritten
+    /// and judged like [`Self::Rewritable`], counted once, as the mask
+    /// pass counts it.
+    Echo,
+}
+
+/// One slot of a request or response, as the wire walker that enforces a
+/// mask enumerates it. The local kinds (`keyword`, `pii`) judge each
+/// segment on its own, so a block, a monitor-mode `would_mask` and an
+/// enforced mask all see the same text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanSegment {
+    pub text: String,
+    pub role: SegmentRole,
+    /// Request side only: whether the slot sits inside the latest-turn
+    /// window (see [`Guardrail::redact_input_text_in_turn`]). Always
+    /// `true` on the response side.
+    pub in_latest_turn: bool,
+}
+
 /// Pluggable content-policy hook. Production wires `Arc<dyn Guardrail>`
 /// in `ProxyState`; tests construct in-memory chains directly.
 #[async_trait]
@@ -959,25 +993,81 @@ pub trait Guardrail: Send + Sync + 'static {
         self.moderate_input_segments_for_model(texts, model).await
     }
 
-    /// `check_input` minus segment-moderating members — used by call
-    /// sites that ALSO run [`Self::moderate_input_segments`], so a
-    /// segment member isn't consulted twice (and billed twice). For a
-    /// leaf guardrail this is all-or-nothing: a segment moderator
-    /// answers via the segment pass (Allow here), anything else answers
-    /// via its normal check. [`GuardrailChain`] overrides with a
-    /// member-filtered fold.
+    // --- local segment checks (#1027) ---------------------------------------
+    //
+    // The in-process kinds (`keyword`, `pii`) judge the same slots the mask
+    // pass rewrites, one at a time, instead of one joined blob. Call sites
+    // that walk a wire body collect those slots with the mask walker itself
+    // and hand them here; `check_*_non_segment` skips these members so they
+    // are consulted once per hook.
+
+    /// `true` when this guardrail judges per-segment via
+    /// [`Self::check_local_segments`] at call sites that walk a body.
+    fn checks_local_segments(&self) -> bool {
+        false
+    }
+
+    /// Judge the segments of one hook (`input` selects the side), each on
+    /// its own. Returns the verdict plus any monitor-mode observations.
+    fn check_local_segments(
+        &self,
+        _segments: &[ScanSegment],
+        _input: bool,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        (GuardrailVerdict::Allow, Vec::new())
+    }
+
+    /// Walker hook: a slot the walker judges but never rewrites — an object
+    /// key, a tool name. Only a segment collector records it; every other
+    /// guardrail ignores it.
+    fn observe_unrewritable(&self, _text: &str, _role: SegmentRole, _in_latest_turn: bool) {}
+
+    /// [`Self::redact_output_text`] for a slot that restates another one
+    /// (see [`SegmentRole::Echo`]). Only a segment collector tells the two
+    /// apart.
+    fn redact_output_echo(&self, text: &str) -> Option<Redaction> {
+        self.redact_output_text(text)
+    }
+
+    /// [`Self::check_output_observed`] minus the local-segment members,
+    /// for a call site with no held body to walk: it builds the segments
+    /// itself and runs [`Self::check_local_segments`] alongside. Every
+    /// other member answers exactly as the plain fold would.
+    async fn check_output_non_local_observed(
+        &self,
+        resp: &ChatResponse,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        if self.checks_local_segments() {
+            (GuardrailVerdict::Allow, Vec::new())
+        } else {
+            self.check_output_observed(resp).await
+        }
+    }
+
+    /// Whether this guardrail answers through a segment pass rather than
+    /// the `check_*_non_segment` folds.
+    fn judged_by_segments(&self) -> bool {
+        self.moderates_segments() || self.checks_local_segments()
+    }
+
+    /// `check_input` minus segment-moderating and local-segment members —
+    /// used by call sites that ALSO run [`Self::moderate_input_segments`]
+    /// and [`Self::check_local_segments`], so a member isn't consulted
+    /// twice (and billed twice). For a leaf guardrail this is
+    /// all-or-nothing. [`GuardrailChain`] overrides with a member-filtered
+    /// fold.
     async fn check_input_non_segment(&self, req: &ChatFormat) -> GuardrailVerdict {
-        if self.moderates_segments() {
+        if self.judged_by_segments() {
             GuardrailVerdict::Allow
         } else {
             self.check_input(req).await
         }
     }
 
-    /// `check_output` minus segment-moderating members (see
+    /// `check_output` minus segment-judged members (see
     /// [`Self::check_input_non_segment`]).
     async fn check_output_non_segment(&self, resp: &ChatResponse) -> GuardrailVerdict {
-        if self.moderates_segments() {
+        if self.judged_by_segments() {
             GuardrailVerdict::Allow
         } else {
             self.check_output(resp).await
@@ -1015,7 +1105,7 @@ pub trait Guardrail: Send + Sync + 'static {
         &self,
         req: &ChatFormat,
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
-        if self.moderates_segments() {
+        if self.judged_by_segments() {
             (GuardrailVerdict::Allow, Vec::new())
         } else {
             self.check_input_observed(req).await
@@ -1027,7 +1117,7 @@ pub trait Guardrail: Send + Sync + 'static {
         &self,
         resp: &ChatResponse,
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
-        if self.moderates_segments() {
+        if self.judged_by_segments() {
             (GuardrailVerdict::Allow, Vec::new())
         } else {
             self.check_output_observed(resp).await

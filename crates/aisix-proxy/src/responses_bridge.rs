@@ -2716,13 +2716,23 @@ pub fn build_responses_bridge_stream(
                 joined.extend_from_slice(b);
             }
             let mut seg_rewrote = false;
-            let verdict = crate::redact::moderate_body(
+            // Live-forward: the local kinds judge the assembled message the
+            // way the buffered walk would split it — the text, and each
+            // tool call's arguments — not the flattened text (#1027).
+            let live_local = live_seg_text.as_ref().map(|_| {
+                let mut probe = synth.clone();
+                crate::redact::collect_segments(|g| {
+                    let _ = crate::redact::redact_chat_response(g, &mut probe);
+                })
+            });
+            let verdict = crate::redact::moderate_body_local_given(
                 chain.as_ref(),
                 crate::redact::Direction::Output,
                 None,
                 verdict,
                 &mut seg_counts,
                 &mut seg_hits,
+                live_local,
                 |g| match live_seg_text.as_deref() {
                     // Live-forward: observation only — nothing to rewrite.
                     Some(t) => {

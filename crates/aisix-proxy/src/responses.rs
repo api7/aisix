@@ -1682,13 +1682,23 @@ async fn responses_to_target(
             // ANONYMIZE disposition rewrites `buf` in place (#932 bedrock
             // follow-up). The capture below reads the post-mask buffer.
             let mut output_redactions = crate::redact::RedactionCounts::new();
-            let verdict = crate::redact::moderate_body(
+            let unreleased = seal
+                .excised
+                .iter()
+                .map(|text| aisix_guardrails::ScanSegment {
+                    text: text.clone(),
+                    role: aisix_guardrails::SegmentRole::ScanOnly,
+                    in_latest_turn: true,
+                })
+                .collect();
+            let verdict = crate::redact::moderate_body_local_extra(
                 chain,
                 crate::redact::Direction::Output,
                 None,
                 verdict,
                 &mut output_redactions,
                 &mut output_monitor_hits,
+                unreleased,
                 |g| match crate::redact::redact_responses_sse(g, &buf) {
                     Some((rewritten, counts)) => {
                         buf = rewritten;
@@ -3109,6 +3119,10 @@ struct SseTextCapture {
     cap: usize,
     deltas: String,
     terminal: Option<String>,
+    /// The terminal `response` object, kept while its text fits the cap:
+    /// the end-of-stream scan rebuilds from it the slots the buffered
+    /// branch's mask walker would rewrite (#1027).
+    terminal_response: Option<Value>,
 }
 
 impl SseTextCapture {
@@ -3117,7 +3131,16 @@ impl SseTextCapture {
             cap,
             deltas: String::new(),
             terminal: None,
+            terminal_response: None,
         }
+    }
+
+    /// The local-kind segments of the terminal response, when it was kept.
+    fn terminal_segments(&self) -> Option<Vec<aisix_guardrails::ScanSegment>> {
+        let mut resp = self.terminal_response.clone()?;
+        Some(crate::redact::collect_segments(|g| {
+            let _ = crate::redact::redact_responses_response(g, &mut resp);
+        }))
     }
 
     /// Feed one parsed SSE event's JSON.
@@ -3126,6 +3149,7 @@ impl SseTextCapture {
             Some("response.completed" | "response.incomplete" | "response.failed") => {
                 if let Some(resp) = json.get("response") {
                     let full = responses_output_text(resp);
+                    self.terminal_response = (full.len() <= self.cap).then(|| resp.clone());
                     if !full.is_empty() {
                         self.terminal = Some(full);
                     }
@@ -3417,8 +3441,10 @@ where
         // fully-delivered stream.
         let hits = match eos_scan {
             Some(scan) => {
-                let text = guard.parts().1.map(|c| c.text()).unwrap_or_default();
-                scan.observe(&text).await
+                let capture = guard.parts().1;
+                let text = capture.as_ref().map(|c| c.text()).unwrap_or_default();
+                let segments = capture.and_then(|c| c.terminal_segments());
+                scan.observe(&text, segments).await
             }
             None => Vec::new(),
         };
