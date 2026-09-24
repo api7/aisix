@@ -10287,7 +10287,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
 
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/compatibility/v1/chat/completions"))
             .and(header("authorization", "Bearer cohere-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "cmpl-cohere",

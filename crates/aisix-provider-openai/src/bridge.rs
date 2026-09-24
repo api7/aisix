@@ -169,6 +169,13 @@ impl OpenAiBridge {
                 return Ok(OPENAI_DEFAULT_BASE.to_string());
             }
         };
+        if crate::cohere::is_cohere(&ctx.provider_key.provider) {
+            return Ok(format!(
+                "{}{}",
+                crate::cohere::api_root(strip_known_endpoint(&raw)),
+                crate::cohere::COMPATIBILITY_PATH
+            ));
+        }
         Ok(normalize_api_base(&raw))
     }
 }

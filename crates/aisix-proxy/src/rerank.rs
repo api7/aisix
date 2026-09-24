@@ -525,6 +525,14 @@ async fn dispatch(
                             _ => default_base_for_provider(&provider_label)
                                 .unwrap_or_else(|| "https://api.openai.com".to_string()),
                         };
+                        // Cohere's OpenAI-compatible surface has no rerank;
+                        // its native one is under the host root.
+                        if aisix_provider_openai::cohere::is_cohere(&provider_label) {
+                            return Ok(format!(
+                                "{}/v2/rerank",
+                                aisix_provider_openai::cohere::api_root(&base)
+                            ));
+                        }
                         Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
                             &base, "/rerank",
                         ))
@@ -926,11 +934,8 @@ fn emit_usage_event(
 fn default_base_for_provider(provider: &str) -> Option<String> {
     match provider {
         "openai" => Some("https://api.openai.com".to_string()),
-        // Cohere v1 path (deprecated by Cohere but still functional)
-        // is what the gateway's `build_openai_url` produces from this
-        // base. Operators who want the Cohere v2 path can override
-        // `api_base` to `https://api.cohere.com/v2` — see #213's v2
-        // follow-up for the version-routing extension if needed.
+        // The caller turns this into `…/v2/rerank`
+        // (`aisix_provider_openai::cohere`).
         "cohere" => Some("https://api.cohere.com".to_string()),
         // Jina rerank is identity-mapped to the OpenAI-compat /
         // Cohere wire shape on both request AND response — same
@@ -1217,7 +1222,7 @@ mod tests {
     async fn input_guardrail_allows_benign_rerank_forwards_200() {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/rerank"))
+            .and(path("/v2/rerank"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "rr-ok",
                 "results": [{"index": 0, "relevance_score": 0.9}],
@@ -1428,7 +1433,7 @@ mod tests {
 
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/rerank"))
+            .and(path("/v2/rerank"))
             .and(header("authorization", "Bearer sk-cohere-mock"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "rerank-resp-cohere-01",
@@ -1445,9 +1450,8 @@ mod tests {
             .await;
 
         let snap = AisixSnapshot::new();
-        // Cohere's API base form: bare host, no /v1 suffix. The
-        // gateway's `build_openai_url` appends /v1/rerank correctly for
-        // both `https://api.cohere.com` and `https://api.cohere.com/v1`.
+        // Cohere's API base form: bare host. Rerank goes to the native
+        // `/v2/rerank` under it.
         let pk_json = format!(
             r#"{{"display_name":"cohere-up","secret":"sk-cohere-mock","api_base":"{}","provider":"cohere","adapter":"openai"}}"#,
             upstream.uri()
@@ -1805,7 +1809,7 @@ mod tests {
             }
         });
         Mock::given(method("POST"))
-            .and(path("/v1/rerank"))
+            .and(path("/v2/rerank"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
             .mount(&upstream)
             .await;
