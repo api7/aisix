@@ -5616,13 +5616,21 @@ where
         // The chat non-streaming path (`guardrail_output_text`) and /v1/messages
         // streaming already scan tool calls, but chat streaming buffered only
         // `delta.content` — a blocked literal in tool-call `arguments` leaked.
-        // Bounded to the same cap as the hold-back buffer so a huge tool-call
-        // stream can't grow it without limit. Allocated only with a guardrail.
+        // Under BufferFull the held-content budget below bounds it (a stream
+        // that overflows is refused, or released unscanned and no longer
+        // collected); every other policy bounds it at the default cap.
+        // Allocated only with a guardrail.
         let mut tool_calls_buf = if output_guardrail.is_some() {
             Some(String::new())
         } else {
             None
         };
+        // The raw tool-call deltas, for the end-of-stream check to rebuild
+        // the channels the buffered branch's mask walker reads (#1027).
+        // Only the live-forward branch reads them; bounded by their own size,
+        // since a delta with no name or arguments adds nothing to the buffer
+        // above.
+        let mut eos_tool_calls = crate::held_content::BoundedValues::default();
         // P2 (#379) / #466: streamed-output policy folded over the output-hook
         // guardrails. EndOfStreamCheck (reached only when no output-hook
         // guardrail is present) leaves the live-forward path below byte-for-byte
@@ -5633,6 +5641,13 @@ where
             .map(|ctx| ctx.chain.stream_output_policy())
             .unwrap_or_default();
         let hold_back = stream_policy.holds_back();
+        let tool_calls_cap = match stream_policy {
+            aisix_guardrails::StreamOutputPolicy::BufferFull { .. } => usize::MAX,
+            _ => aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+        };
+        // What is held under BufferFull (#513): content, which
+        // `max_buffer_bytes` caps, and the raw bytes it bounds too.
+        let mut held = crate::held_content::HeldBuffer::default();
         // Content chunks withheld from the wire until their window (or the
         // whole response) scans clean. Hold-back path only. Held PRE-render
         // (#932): the BufferFull release rewrites masked spans across the
@@ -5660,6 +5675,10 @@ where
         // the truncated response as a successful one.
         let mut errored = false;
         let mut first_chunk_seen = false;
+        let mut stream_usage: Option<aisix_gateway::chat::UsageStats> = None;
+        let fold_base = base_usage != aisix_gateway::chat::UsageStats::default();
+        let mut last_chunk_id = String::new();
+        let mut last_chunk_model = String::new();
         // Render + serialise one held/live chunk into an SSE Event.
         // Serialisation of these plain structs can't realistically fail;
         // the Err arm mirrors the pre-hold-back defensive error frame.
@@ -5690,7 +5709,7 @@ where
         }
         while let Some(item) = upstream.next().await {
             let maybe_chunk = match item {
-                Ok(mut chunk) => {
+                Ok(chunk) => {
                     // Record TTFT on the first upstream chunk of ANY type,
                     // role-only preambles included — the industry convention
                     // (LiteLLM, caller-side gateways), so the figure matches
@@ -5699,6 +5718,12 @@ where
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
                             attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                    }
+                    if !chunk.id.is_empty() {
+                        last_chunk_id.clone_from(&chunk.id);
+                    }
+                    if !chunk.model.is_empty() {
+                        last_chunk_model.clone_from(&chunk.model);
                     }
                     let comp = guard.comp();
                     if !chunk.id.is_empty() {
@@ -5765,12 +5790,22 @@ where
                     // for the output guardrail. `delta.tool_calls` streams as
                     // partial JSON objects; concatenate their text WITHOUT a
                     // separator so a literal split across deltas reassembles.
-                    if let (Some(tcs), Some(buf)) =
-                        (chunk.delta.tool_calls.as_ref(), tool_calls_buf.as_mut())
+                    if let (Some(tcs), Some(buf), false) =
+                        (chunk.delta.tool_calls.as_ref(), tool_calls_buf.as_mut(), cap_released)
                     {
                         for tc in tcs {
-                            if buf.len() >= aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES {
+                            if buf.len() >= tool_calls_cap {
                                 break;
+                            }
+                            if !hold_back {
+                                // Serialized deltas carry their envelope, so
+                                // they get the raw guard's headroom over the
+                                // text cap the buffer above keeps.
+                                eos_tool_calls.push(
+                                    tc,
+                                    tool_calls_cap
+                                        .saturating_mul(crate::held_content::RAW_HOLD_FACTOR),
+                                );
                             }
                             if let Some(f) = tc.get("function") {
                                 if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
@@ -5783,34 +5818,24 @@ where
                         }
                     }
                     if let Some(u) = chunk.usage.as_ref() {
-                        if u.prompt_tokens > comp.prompt_tokens {
-                            comp.prompt_tokens = u.prompt_tokens;
-                        }
-                        if u.completion_tokens > comp.completion_tokens {
-                            comp.completion_tokens = u.completion_tokens;
-                        }
-                        let t = u.total_tokens as u64;
-                        if t > comp.total_tokens {
-                            comp.total_tokens = t;
-                        }
-                        comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);
-                        if u.cached_prompt_tokens > comp.cached_prompt_tokens {
-                            comp.cached_prompt_tokens = u.cached_prompt_tokens;
-                        }
-                        if u.reasoning_tokens > comp.reasoning_tokens {
-                            comp.reasoning_tokens = u.reasoning_tokens;
-                        }
+                        let acc = match stream_usage.as_ref() {
+                            Some(prev) => prev.max_fieldwise(u),
+                            None => u.clone(),
+                        };
+                        comp.prompt_tokens = acc.prompt_tokens;
+                        comp.completion_tokens = acc.completion_tokens;
+                        comp.total_tokens = acc.total_tokens as u64;
+                        comp.cache_write_tokens = acc.cache_write_tokens;
+                        comp.cached_prompt_tokens = acc.cached_prompt_tokens;
+                        comp.reasoning_tokens = acc.reasoning_tokens;
+                        comp.cache_creation_tokens = acc.cache_creation_tokens;
+                        comp.cache_read_tokens = acc.cache_read_tokens;
                         aisix_gateway::chat::merge_stream_upstream_total(
                             &mut comp.upstream_total_tokens,
                             u.upstream_total_tokens,
                         );
                         comp.reasoning_folded_into_completion = u.reasoning_folded_into_completion;
-                        if u.cache_creation_tokens > comp.cache_creation_tokens {
-                            comp.cache_creation_tokens = u.cache_creation_tokens;
-                        }
-                        if u.cache_read_tokens > comp.cache_read_tokens {
-                            comp.cache_read_tokens = u.cache_read_tokens;
-                        }
+                        stream_usage = Some(acc);
                     }
                     // #790: a usage-only terminal chunk (no delta payload, no
                     // finish_reason) exists because the gateway injected
@@ -5827,22 +5852,28 @@ where
                     {
                         continue;
                     }
-                    // #614: fold the ensemble panel's usage (`base_usage`) into
-                    // the client-facing usage frame, AFTER `comp` captured the
-                    // stream-only counts above. No-op when `base_usage` is zero
-                    // (every single-upstream caller).
-                    //
-                    // Assumes the judge emits `usage` on a SINGLE terminal frame
-                    // (true for the OpenAI/Anthropic/DeepSeek bridges via the
-                    // injected include_usage, so the panel sum lands exactly
-                    // once). A judge that stamps usage on multiple chunks
-                    // (Gemini/Vertex) would add the panel sum more than once —
-                    // tracked in #617 (fix: synthesize one terminal usage frame
-                    // from `comp + base_usage`).
-                    if let Some(u) = chunk.usage.as_mut() {
-                        *u = u.saturating_add(&base_usage);
+                    // #614/#617: an ensemble reports usage on ONE synthesized
+                    // terminal frame (judge + panel, emitted at EOF). A judge
+                    // may stamp usage on every chunk (Gemini/Vertex), so the
+                    // judge's own usage is stripped from each forwarded chunk
+                    // — forwarded immediately, no hold — and a chunk left with
+                    // nothing to carry is dropped. Single-upstream callers
+                    // (`base_usage` zero) are untouched.
+                    if fold_base && chunk.usage.is_some() {
+                        let mut chunk = chunk;
+                        chunk.usage = None;
+                        if chunk.finish_reason.is_none()
+                            && chunk.delta.role.is_none()
+                            && chunk.delta.content.is_none()
+                            && chunk.delta.tool_calls.is_none()
+                            && chunk.delta.reasoning_content.is_none()
+                        {
+                            continue;
+                        }
+                        Some(chunk)
+                    } else {
+                        Some(chunk)
                     }
-                    Some(chunk)
                 }
                 Err(err) => {
                     errored = true;
@@ -5870,6 +5901,8 @@ where
             } else {
                 // Hold-back: withhold this chunk until its window (or the
                 // whole response) scans clean.
+                let chunk_content = crate::held_content::chat_delta(&chunk.delta);
+                let chunk_raw = crate::held_content::chat_chunk_raw(&chunk);
                 pending.push(chunk);
                 match &stream_policy {
                     aisix_guardrails::StreamOutputPolicy::Window {
@@ -5976,14 +6009,26 @@ where
                         max_buffer_bytes,
                         on_exceeded_fail_open,
                     } => {
-                        let buffered = content_buffer.as_ref().map_or(0, |b| b.len());
-                        if buffered > *max_buffer_bytes {
+                        held.hold(chunk_content, chunk_raw);
+                        if held.exceeds(*max_buffer_bytes) {
                             if *on_exceeded_fail_open {
                                 // Fail-open overflow releases the held
                                 // chunks unscanned AND unmasked — the
                                 // operator opted into that trade-off via
                                 // `on_buffer_exceeded: fail_open`.
                                 cap_released = true;
+                                {
+                                    let comp = guard.comp();
+                                    if comp.bypass_reason.is_empty() {
+                                        comp.bypass_reason =
+                                            crate::error::TAG_OUTPUT_BUFFER_EXCEEDED.to_owned();
+                                    }
+                                }
+                                if let Some(ctx) = output_guardrail.as_ref() {
+                                    ctx.chain.record_output_bypass(
+                                        crate::error::TAG_OUTPUT_BUFFER_EXCEEDED,
+                                    );
+                                }
                                 for chunk in pending.drain(..) {
                                     let ev = chunk_event!(chunk);
                                     yield Ok::<_, Infallible>(ev);
@@ -5996,6 +6041,9 @@ where
                                 );
                                 errored = true;
                                 guard.comp().guardrail_blocked = true;
+                                if let Some(ctx) = output_guardrail.as_ref() {
+                                    ctx.chain.record_output_buffer_exceeded();
+                                }
                                 yield Ok::<_, Infallible>(
                                     Event::default().event("error").data(error_frame_payload(
                                         "content_filter",
@@ -6028,6 +6076,26 @@ where
         // body only when the consumer pulls again. Same placement as the
         // sibling streams in messages.rs and responses_bridge.rs.
         guard.comp().reached_end = true;
+        // #617: the ensemble's single usage frame — the judge's field-wise
+        // max plus the panel sum — stamped like the judge's last chunk.
+        let judge_usage = stream_usage
+            .as_ref()
+            .filter(|_| fold_base && client_requested_usage);
+        if let (Some(judge_usage), false) = (judge_usage, errored) {
+            let chunk = aisix_gateway::ChatChunk {
+                id: std::mem::take(&mut last_chunk_id),
+                model: std::mem::take(&mut last_chunk_model),
+                delta: Default::default(),
+                finish_reason: None,
+                usage: Some(judge_usage.saturating_add(&base_usage)),
+            };
+            if !hold_back || cap_released {
+                let ev = chunk_event!(chunk);
+                yield Ok::<_, Infallible>(ev);
+            } else {
+                pending.push(chunk);
+            }
+        }
         // Per #204: run the output guardrail on the accumulated
         // assistant content BEFORE emitting `[DONE]`. Buffer-then-
         // check is the right cadence for a blocking guardrail:
@@ -6210,8 +6278,35 @@ where
                         guard.comp().completion_tokens,
                     ),
                 };
-                let (verdict, hits) = ctx.chain.check_output_observed(&synthesized).await;
+                let (verdict, hits) = ctx
+                    .chain
+                    .check_output_non_local_observed(&synthesized)
+                    .await;
                 guard.comp().monitor_hits.extend(hits);
+                // The local kinds judge the channels the buffered branch's
+                // mask walker would rewrite — the content, and each tool
+                // call's arguments — not the joined text above (#1027).
+                let verdict = if verdict.is_block() {
+                    verdict
+                } else {
+                    let mut chunks = vec![aisix_gateway::ChatChunk {
+                        id: String::new(),
+                        model: String::new(),
+                        delta: aisix_gateway::ChatDelta {
+                            content: Some(content.clone()),
+                            tool_calls: eos_tool_calls.take(),
+                            ..Default::default()
+                        },
+                        finish_reason: None,
+                        usage: None,
+                    }];
+                    let segments = crate::redact::collect_segments(|g| {
+                        let _ = crate::redact::redact_chat_chunks(g, &mut chunks);
+                    });
+                    let (local, hits) = ctx.chain.check_local_segments(&segments, false);
+                    guard.comp().monitor_hits.extend(hits);
+                    verdict.merged_with(local)
+                };
                 match verdict {
                     aisix_guardrails::GuardrailVerdict::Block {
                         reason,

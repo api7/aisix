@@ -3,9 +3,9 @@
 //! Owns one [`SinkPipeline`] per configured exporter. The request hot path
 //! resolves an exporter's pipeline with [`ExporterPipelines::get_or_create`]
 //! — lazily starting it on first sighting, and rebuilding it when the
-//! exporter's config changes — then enqueues into the returned handle. A
-//! periodic [`ExporterPipelines::retain`] stops pipelines for exporters that
-//! left the snapshot.
+//! exporter's config changes — then enqueues into the returned handle.
+//! [`ExporterPipelines::retain`], run on every configuration publish, stops
+//! pipelines for exporters that left the snapshot.
 //!
 //! Lazy-on-first-sighting mirrors the previous `OtlpHttpFanOut` permit map:
 //! it is immediately consistent with the snapshot (a just-added exporter
@@ -83,16 +83,34 @@ impl ExporterPipelines {
         fingerprint: u64,
         build: impl FnOnce() -> Arc<dyn ObservabilitySink>,
     ) -> SinkHandle {
+        self.get_or_create_if(key, fingerprint, || true, build)
+            .expect("admitted unconditionally")
+    }
+
+    /// As [`Self::get_or_create`], but a pipeline is (re)started only when
+    /// `admit` holds. `admit` runs under the same lock as [`Self::retain`],
+    /// so a caller that judges liveness from state published before a
+    /// `retain` cannot start a pipeline that `retain` has already stopped.
+    pub fn get_or_create_if(
+        &self,
+        key: &str,
+        fingerprint: u64,
+        admit: impl FnOnce() -> bool,
+        build: impl FnOnce() -> Arc<dyn ObservabilitySink>,
+    ) -> Option<SinkHandle> {
         let mut running = self.running.lock();
         if let Some(existing) = running.get(key) {
             if existing.fingerprint == fingerprint {
-                return existing.handle.clone();
+                return Some(existing.handle.clone());
             }
-            // Config changed — stop the stale pipeline, then rebuild below.
-            if let Some(old) = running.remove(key) {
-                let _ = old.cancel.send(true);
-                tracing::info!(exporter = %key, "rebuilding reconfigured exporter pipeline");
-            }
+        }
+        if !admit() {
+            return None;
+        }
+        // Config changed — stop the stale pipeline, then rebuild below.
+        if let Some(old) = running.remove(key) {
+            let _ = old.cancel.send(true);
+            tracing::info!(exporter = %key, "rebuilding reconfigured exporter pipeline");
         }
         let sink = build();
         let (handle, pipeline) =
@@ -108,12 +126,12 @@ impl ExporterPipelines {
                 worker,
             },
         );
-        handle
+        Some(handle)
     }
 
     /// Stop pipelines whose exporter key is not in `live`. Stopped pipelines
     /// drain their queue and exit on their own (cancel signal); they are not
-    /// aborted. Called periodically to GC exporters that left the snapshot.
+    /// aborted.
     pub fn retain(&self, live: &HashSet<String>) {
         let mut running = self.running.lock();
         running.retain(|key, pipeline| {

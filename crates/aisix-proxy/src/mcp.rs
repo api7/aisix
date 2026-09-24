@@ -513,22 +513,49 @@ async fn dispatch(
     // Input guardrails: scan the tool arguments.
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     if let Some(chain) = &guardrail_chain {
-        let args_text = peek
+        let args = peek
             .as_ref()
             .and_then(|p| p.params.as_ref())
-            .and_then(|p| p.arguments.as_ref())
-            .map(|args| args.to_string())
+            .and_then(|p| p.arguments.as_ref());
+        // The argument VALUES, joined — the same shape the output side
+        // hands the blob-check kinds, so neither direction feeds them the
+        // tool's parameter names or JSON punctuation. A payload with no
+        // string value falls back to the serialized arguments, as the
+        // output side falls back to the serialized result.
+        let args_text = args
+            .map(|args| {
+                let mut leaves = Vec::new();
+                collect_string_leaves(args, &mut leaves);
+                if leaves.is_empty() {
+                    args.to_string()
+                } else {
+                    leaves.join("\n")
+                }
+            })
             .unwrap_or_default();
         let chat =
             aisix_gateway::ChatFormat::new("", vec![aisix_gateway::ChatMessage::user(args_text)]);
         // Segment-moderating members (custom scripts, Bedrock ANONYMIZE,
         // Presidio, Lakera, Aliyun AI) are consulted through the segment
-        // pass below instead — the same check/moderate split every LLM
-        // family uses, so a member is never consulted (or billed) twice
-        // per hook.
+        // pass below instead, and the local kinds (keyword, pii) through
+        // the local pass right after — the same check/moderate split every
+        // LLM family uses, so a member is never consulted (or billed)
+        // twice per hook.
         let (verdict, hits) =
             aisix_guardrails::Guardrail::check_input_non_segment_observed(chain, &chat).await;
         monitor_hits.extend(hits);
+        // Local pass over the leaves the mask write-back below rewrites,
+        // plus the argument keys it cannot: run on the ORIGINAL body,
+        // before any mask, so a block rule judges what the caller sent.
+        let verdict =
+            if verdict.is_block() || !aisix_guardrails::Guardrail::checks_local_segments(chain) {
+                verdict
+            } else {
+                let (local, hits) =
+                    check_local_json(chain, &bytes, tool_argument_path, args, args, true);
+                monitor_hits.extend(hits);
+                verdict.merged_with(local)
+            };
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
@@ -1054,6 +1081,75 @@ async fn moderate_selected_segments(
     }
 }
 
+/// Run the chain's local kinds (keyword, pii) over one direction of a
+/// tool call (#1027): every string leaf `pred` selects — collected by the
+/// byte-splice walker the mask write-back uses, so the judged slots and
+/// the rewritten slots are one set — plus every object key and number
+/// under `structured`, which have no write-back and so block on a mask hit.
+/// A body with none of these is judged whole, scan-only.
+fn check_local_json(
+    chain: &aisix_guardrails::GuardrailChain,
+    body: &[u8],
+    pred: fn(&[crate::json_splice::PathSeg]) -> bool,
+    structured: Option<&serde_json::Value>,
+    whole: Option<&serde_json::Value>,
+    input: bool,
+) -> (
+    aisix_guardrails::GuardrailVerdict,
+    Vec<aisix_core::GuardrailMonitorHit>,
+) {
+    use aisix_guardrails::{ScanSegment, SegmentRole};
+    let segment = |text: String, role| ScanSegment {
+        text,
+        role,
+        in_latest_turn: true,
+    };
+    let mut segments: Vec<ScanSegment> = Vec::new();
+    if let Err(err) = crate::json_splice::rewrite_string_values(body, pred, |t| {
+        if !t.is_empty() {
+            segments.push(segment(t.to_owned(), SegmentRole::Rewritable));
+        }
+        None
+    }) {
+        // Structurally impossible (the body already parsed as JSON) — fail
+        // closed rather than let content bypass the pass.
+        tracing::warn!(error = %err, "mcp local collect walk failed; blocking");
+        return (
+            aisix_guardrails::GuardrailVerdict::block_unavailable(
+                "mcp body could not be walked",
+                crate::error::TAG_UNSCANNABLE_BODY,
+            ),
+            Vec::new(),
+        );
+    }
+    if let Some(v) = structured {
+        let mut stack = vec![v];
+        while let Some(node) = stack.pop() {
+            match node {
+                serde_json::Value::Array(items) => stack.extend(items.iter().rev()),
+                serde_json::Value::Object(map) => {
+                    for (key, val) in map {
+                        if !key.is_empty() {
+                            segments.push(segment(key.clone(), SegmentRole::Label));
+                        }
+                        stack.push(val);
+                    }
+                }
+                serde_json::Value::Number(n) => {
+                    segments.push(segment(n.to_string(), SegmentRole::Label));
+                }
+                _ => {}
+            }
+        }
+    }
+    if segments.is_empty() {
+        if let Some(whole) = whole {
+            segments.push(segment(whole.to_string(), SegmentRole::ScanOnly));
+        }
+    }
+    aisix_guardrails::Guardrail::check_local_segments(chain, &segments, input)
+}
+
 /// The post-mask content-capture pair for a tool call: `prompt` is the
 /// (rewritten) `params.arguments`, `response` the (rewritten) `result`.
 /// Both re-serialise through `Value` — capture is telemetry, not wire
@@ -1198,10 +1294,28 @@ async fn apply_output_guardrails(
         finish_reason: aisix_gateway::FinishReason::Stop,
         usage: aisix_gateway::UsageStats::new(0, 0),
     };
-    // Segment-moderating members answer through the segment pass below.
+    // Segment-moderating members answer through the segment pass below,
+    // the local kinds through the local pass right after.
     let (verdict, hits) =
         aisix_guardrails::Guardrail::check_output_non_segment_observed(chain, &resp).await;
     monitor_hits.extend(hits);
+    // Local pass over the leaves the mask write-back below rewrites, plus
+    // the `structuredContent` keys it cannot — on the unmasked body.
+    let verdict =
+        if verdict.is_block() || !aisix_guardrails::Guardrail::checks_local_segments(chain) {
+            verdict
+        } else {
+            let (local, hits) = check_local_json(
+                chain,
+                response_bytes,
+                tool_result_path,
+                result.get("structuredContent"),
+                Some(result),
+                false,
+            );
+            monitor_hits.extend(hits);
+            verdict.merged_with(local)
+        };
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
@@ -1284,9 +1398,10 @@ async fn apply_output_guardrails(
 
 /// Push every non-empty string leaf of `value` — walking objects and arrays —
 /// onto `out`, in document order. Object KEYS are skipped: they are the tool's
-/// declared output-schema field names rather than its data, so scanning them
-/// would reintroduce the field-name false positives that decoding the content
-/// blocks avoids. The walk is iterative, so a deeply nested result cannot
+/// declared schema field names rather than its data, so handing them to the
+/// blob-check kinds would reintroduce the field-name false positives that
+/// decoding the content blocks avoids. (The local kinds judge keys on their
+/// own — see `check_local_json`.) The walk is iterative, so a deeply nested result cannot
 /// recurse the handler's stack.
 fn collect_string_leaves(value: &serde_json::Value, out: &mut Vec<String>) {
     let mut stack = vec![value];
@@ -3358,11 +3473,11 @@ mod tests {
         );
     }
 
-    /// The structured walk carries the same "scan data, not field names" rule
-    /// the content blocks follow: an object KEY matching the pattern is the
-    /// tool's output schema, not its data, and must not fire.
+    /// #1027: a `structuredContent` object key is its own segment for the
+    /// local kinds — judged on its own, like a value — so a keyword rule
+    /// matching one blocks.
     #[tokio::test]
-    async fn structured_content_keys_do_not_trip_the_guardrail() {
+    async fn structured_content_keys_are_judged_as_their_own_segments() {
         use aisix_guardrails::{LiveGuardrailIndex, RequestContext};
 
         const KEY_NAME_GUARD: &str = r#"{"name":"key-name-guard","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"ssn"}]}"#;
@@ -3380,8 +3495,8 @@ mod tests {
         assert!(
             output_guardrail_block(&chain, key_only, "lookup", &mut Vec::new())
                 .await
-                .is_none(),
-            "a schema field name must not be treated as tool data"
+                .is_some(),
+            "a structuredContent key is judged like any other segment"
         );
 
         // The same pattern in a VALUE fires, proving the guardrail is live here.

@@ -199,7 +199,7 @@ pub struct ObjectStoreConfig {
     #[schemars(length(min = 1))]
     pub region: Option<String>,
 
-    /// Backend host override for S3-compatible stores such as MinIO, Aliyun OSS, or Cloudflare R2. When omitted, the provider's native endpoint is used.
+    /// Backend endpoint override: an S3-compatible host such as MinIO, Aliyun OSS, or Cloudflare R2, a Cloud Storage base URL, or an Azure Blob endpoint. When omitted, the provider's native endpoint is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(
         pattern = r"^https://.+|^http://(minio|azurite|fake-gcs-server|fake-gcs|127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$"

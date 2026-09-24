@@ -243,7 +243,9 @@ pub struct AzureContentSafetyTextModerationConfig {
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_acs_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back in `buffer_full` mode
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -353,7 +355,9 @@ pub struct AliyunTextModerationConfig {
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_aliyun_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back in `buffer_full` mode
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -433,7 +437,9 @@ pub struct AliyunAiGuardrailConfig {
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_aliyun_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back in `buffer_full` mode
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -520,7 +526,9 @@ pub struct PiiConfig {
     // back (the mask spans chunk boundaries), so kind=pii always uses the
     // buffer_full policy on the output hook. These knobs mirror the ACS/
     // Aliyun buffer_full parameters.
-    /// Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -607,7 +615,9 @@ pub struct LakeraConfig {
     // Masking a streamed response requires the whole response held back
     // (a masked span can cross any chunk boundary), so kind=lakera always
     // uses the buffer_full policy on the output hook, like kind=pii.
-    /// Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -737,7 +747,9 @@ pub struct PresidioConfig {
     // Masking a streamed response requires the whole response held back,
     // so kind=presidio always uses the buffer_full policy on the output
     // hook, like kind=pii.
-    /// Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -876,7 +888,9 @@ pub struct SemanticConfig {
     // A semantic judgement needs the whole text, so this kind always
     // uses the buffer_full policy on the output hook, like
     // kind=pii and kind=presidio.
-    /// Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -988,7 +1002,9 @@ pub struct CustomConfig {
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_acs_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back in `buffer_full` mode
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -1146,11 +1162,14 @@ pub struct GuardrailMonitorHit {
     pub guardrail_name: String,
     /// Which side observed the hit: `input` or `output`.
     pub hook: String,
-    /// `would_block` (a Block verdict was downgraded) or `would_mask`
-    /// (maskable spans were observed but not rewritten).
+    /// `would_block` (a Block verdict was downgraded), `would_mask`
+    /// (maskable spans were observed but not rewritten), or
+    /// `would_mask_unsupported` (a mask rule matched on a surface that
+    /// cannot rewrite content, such as a passthrough route, so enforcing
+    /// the rule would forward the content unmodified too).
     pub action: String,
     /// Code-owned summary of the suppressed Block's kind and outcome
-    /// (`would_block` only; empty for `would_mask`).
+    /// (`would_block` only; empty for both mask actions).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reason: String,
     /// Bounded failure tag retained only until the execution metrics sink has
@@ -1160,7 +1179,8 @@ pub struct GuardrailMonitorHit {
     #[serde(skip)]
     pub error_type: String,
     /// detector/entity name → span count the guardrail would have masked
-    /// (`would_mask` only; empty for `would_block`).
+    /// (`would_mask` and `would_mask_unsupported`; empty for
+    /// `would_block`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub counts: std::collections::BTreeMap<String, u32>,
 }
@@ -1180,12 +1200,6 @@ pub struct GuardrailMonitorHit {
 /// One entry per `(guardrail_name, hook, action, error_type)`: a guardrail
 /// that masks forty string leaves of one tool result reports a single entry
 /// whose `counts` and `duration_us` are summed across those leaves.
-///
-/// An empty array alongside `guardrail_blocked: true` is a legitimate
-/// state, not a contradiction: a streamed response aborted by the
-/// guardrail buffer cap is refused without any member returning a verdict,
-/// so there is no policy to name. Read the array as "which policies acted,
-/// when one did", never as an inverse of the boolean.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuardrailEnforcedHit {
     /// The configured (row) name of the guardrail that fired.
@@ -1201,15 +1215,27 @@ pub struct GuardrailEnforcedHit {
     ///   (`fail_open: false`). The request was
     ///   refused because the check was unavailable, not because the
     ///   content matched a policy.
+    /// - `blocked_buffer_exceeded` — a streamed response outgrew the
+    ///   hold-back cap (`max_buffer_bytes`) while an output row's
+    ///   `on_buffer_exceeded` was `fail_closed`, so it was refused without
+    ///   being scanned. `guardrail_name` is the row whose cap was hit —
+    ///   the smallest among the output rows — and the refusal policy is
+    ///   the chain's folded one (fail-closed when any output row is), so
+    ///   the named row may itself be `fail_open`. Raising that cap, not
+    ///   tuning the policy, is the remedy.
+    /// - `mask_unsupported` — a mask rule matched on a surface that cannot
+    ///   rewrite content (a passthrough route, a job body, a realtime
+    ///   frame, …), so the content was forwarded unmodified. Nothing was
+    ///   redacted: `redacted_entity_counts` does not count these spans.
     pub action: String,
     /// Why the check was unavailable, on `blocked_unavailable` only: a
     /// short, bounded cause such as `lakera_timeout` or
     /// `presidio_5xx`. Empty for every other action.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error_type: String,
-    /// detector/rule name → number of spans masked (`masked` only; empty
-    /// for the two refusal actions). Same key space as
-    /// `redacted_entity_counts`.
+    /// detector/rule name → number of spans masked (`masked`), or matched
+    /// but left in place (`mask_unsupported`); empty for every refusal
+    /// action. Same key space as `redacted_entity_counts`.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub counts: std::collections::BTreeMap<String, u32>,
     /// Wall-clock time this guardrail spent on this hook, in
@@ -1316,8 +1342,9 @@ pub struct GuardrailExecution<'a> {
     /// Which side ran: `input` or `output`.
     pub phase: &'static str,
     /// Enforced outcome: `allowed` / `blocked` / `masked` / `bypassed`
-    /// (remote failure + fail-open) / `would_block` / `would_mask`
-    /// (monitor mode).
+    /// (remote failure + fail-open) / `would_block` / `would_mask` /
+    /// `would_mask_unsupported` (monitor mode; a mask rule that matched
+    /// where the content cannot be rewritten).
     pub result: &'static str,
     /// Bounded failure tag (e.g. `lakera_timeout`) when the guardrail could
     /// not evaluate: on `result = bypassed` (it failed OPEN and the request

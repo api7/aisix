@@ -571,6 +571,41 @@ impl UsageStats {
         }
     }
 
+    /// Field-wise maximum of two usage records — the accumulator for a
+    /// stream whose upstream may stamp `usage` on more than one chunk
+    /// (Gemini/Vertex reports cumulative counts on every chunk), so that
+    /// neither a repeat nor a late partial frame shrinks what was reported.
+    pub fn max_fieldwise(&self, other: &UsageStats) -> UsageStats {
+        UsageStats {
+            prompt_tokens: self.prompt_tokens.max(other.prompt_tokens),
+            completion_tokens: self.completion_tokens.max(other.completion_tokens),
+            total_tokens: self.total_tokens.max(other.total_tokens),
+            cached_prompt_tokens: self.cached_prompt_tokens.max(other.cached_prompt_tokens),
+            cache_write_tokens: self.cache_write_tokens.max(other.cache_write_tokens),
+            reasoning_tokens: self.reasoning_tokens.max(other.reasoning_tokens),
+            cache_creation_tokens: self.cache_creation_tokens.max(other.cache_creation_tokens),
+            cache_read_tokens: self.cache_read_tokens.max(other.cache_read_tokens),
+            prompt_cache_hit_tokens: self
+                .prompt_cache_hit_tokens
+                .max(other.prompt_cache_hit_tokens),
+            prompt_cache_miss_tokens: self
+                .prompt_cache_miss_tokens
+                .max(other.prompt_cache_miss_tokens),
+            // Same fold as `merge_stream_upstream_total`: a frame without a
+            // total means the stream stated none.
+            upstream_total_tokens: if self.upstream_total_tokens == 0
+                || other.upstream_total_tokens == 0
+            {
+                0
+            } else {
+                self.upstream_total_tokens.max(other.upstream_total_tokens)
+            },
+            // Describes the frame's own folded completion, so the latest
+            // frame's value stands.
+            reasoning_folded_into_completion: other.reasoning_folded_into_completion,
+        }
+    }
+
     // ── Client-facing protocol projections ─────────────────────────
     //
     // `UsageStats` stores whichever accounting shape the UPSTREAM used,

@@ -221,6 +221,7 @@ pub async fn count_tokens(
                 err.kind(),
                 err.is_guardrail_block(),
                 &client,
+                crate::usage_attr::applied_guardrails(&screening.audit),
                 crate::usage_attr::enforced_hits(&screening.audit),
                 crate::usage_attr::guardrail_scores(&screening.audit),
                 crate::usage_attr::bypass_reason(&screening.audit),

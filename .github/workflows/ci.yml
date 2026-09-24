@@ -459,6 +459,13 @@ jobs:
         if: steps.harness.outputs.present == 'true'
         working-directory: tests/e2e
         run: pnpm install --no-frozen-lockfile
+      # vitest strips types without checking them, so a type error in a
+      # case (e.g. a `test.each` callback expecting a context vitest never
+      # passes) would otherwise only surface when that branch runs.
+      - name: e2e typecheck
+        if: steps.harness.outputs.present == 'true'
+        working-directory: tests/e2e
+        run: pnpm exec tsc --noEmit
       - name: run e2e
         if: steps.harness.outputs.present == 'true'
         working-directory: tests/e2e

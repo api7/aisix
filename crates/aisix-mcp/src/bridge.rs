@@ -195,7 +195,10 @@ impl std::fmt::Debug for OAuthClientConfig {
         f.debug_struct("OAuthClientConfig")
             .field("client_id", &self.client_id)
             .field("client_secret", &"***redacted***")
-            .field("token_url", &self.token_url)
+            .field(
+                "token_url",
+                &aisix_core::redact_url_userinfo(&self.token_url),
+            )
             .field("scopes", &self.scopes)
             .finish()
     }
@@ -261,11 +264,12 @@ pub struct McpUpstream {
 }
 
 // Manual so a `Bearer` token cannot leak through `McpUpstream`'s `Debug`
-// (delegates to the redacting `McpAuth` impl above).
+// (delegates to the redacting `McpAuth` impl above), nor a credential
+// configured as the URL's userinfo.
 impl std::fmt::Debug for McpUpstream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpUpstream")
-            .field("url", &self.url)
+            .field("url", &aisix_core::redact_url_userinfo(&self.url))
             .field("auth", &self.auth)
             .field("timeout", &self.timeout)
             .field("protocol", &self.protocol)
@@ -743,7 +747,7 @@ pub(crate) fn warn_cleartext_credential(server: &McpServer) {
         if warned.insert((server.name.clone(), what, url.clone())) {
             tracing::warn!(
                 server = %server.name,
-                url = %url,
+                url = %aisix_core::redact_url_userinfo(&url),
                 "{what} is sent over cleartext http; anyone on the network path can read \
                  it — serve this upstream over https"
             );
@@ -944,11 +948,20 @@ mod tests {
         let oauth = McpAuth::OAuth2(OAuthClientConfig {
             client_id: "cid".into(),
             client_secret: "cs-LEAK".into(),
-            token_url: "https://idp.example.com/token".into(),
+            token_url: "https://cid:basic-LEAK@idp.example.com/token".into(),
             scopes: vec!["read".into()],
         });
+        // A Basic-auth credential written as a URL's userinfo is a
+        // credential too, on the server `url` and the OAuth `token_url`.
+        let upstream = McpUpstream {
+            url: "https://svc:url-LEAK@mcp.example.com/mcp".into(),
+            auth: McpAuth::None,
+            timeout: Duration::from_secs(1),
+            protocol: McpProtocol::default(),
+            forwarded_client_headers: Vec::new(),
+        };
         let rendered = format!(
-            "{oauth:?} {:?} {:?}",
+            "{oauth:?} {:?} {:?} {upstream:?}",
             McpAuth::ApiKey("key-LEAK".into()),
             McpAuth::Bearer("tok-LEAK".into())
         );
@@ -957,7 +970,8 @@ mod tests {
             "credential leaked into Debug output: {rendered}"
         );
         // The non-secret fields stay visible for operability.
-        assert!(rendered.contains("idp.example.com"));
+        assert!(rendered.contains("https://***@idp.example.com/token"));
+        assert!(rendered.contains("https://***@mcp.example.com/mcp"));
         assert!(rendered.contains("cid"));
     }
 

@@ -39,7 +39,9 @@ use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 use regex::Regex;
 
-use crate::{Guardrail, GuardrailVerdict, Redaction, StreamOutputPolicy};
+use aisix_core::models::GuardrailMonitorHit;
+
+use crate::{Guardrail, GuardrailVerdict, Redaction, ScanSegment, SegmentRole, StreamOutputPolicy};
 
 /// What to do when a detector matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -437,6 +439,55 @@ impl Guardrail for PiiGuardrail {
             }
             None => GuardrailVerdict::Allow,
         }
+    }
+
+    fn checks_local_segments(&self) -> bool {
+        true
+    }
+
+    /// Each segment on its own, the way the mask pass rewrites them. A
+    /// mask-action hit blocks on a [`SegmentRole::Label`] — an object key
+    /// has no rewrite channel, and forwarding it unmasked would defeat the
+    /// rule. Reasons carry the detector NAME only (#153).
+    fn check_local_segments(
+        &self,
+        segments: &[ScanSegment],
+        input: bool,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let (enabled, side) = if input {
+            (self.check_input_enabled, "input")
+        } else {
+            (self.check_output_enabled, "output")
+        };
+        if !enabled {
+            return (GuardrailVerdict::Allow, Vec::new());
+        }
+        for seg in segments {
+            if let Some(rule) = self.first_block_match(&seg.text) {
+                return (
+                    GuardrailVerdict::block(format!(
+                        "{side} blocked by pii detector '{}'",
+                        rule.name
+                    )),
+                    Vec::new(),
+                );
+            }
+        }
+        let unmaskable = segments
+            .iter()
+            .filter(|seg| seg.role == SegmentRole::Label)
+            .find_map(|seg| {
+                self.rules
+                    .iter()
+                    .find(|r| r.action == PiiAction::Mask && r.detects(&seg.text))
+            });
+        let verdict = unmaskable.map_or(GuardrailVerdict::Allow, |rule| {
+            GuardrailVerdict::block(format!(
+                "{side} blocked by pii detector '{}' on a field that cannot be masked",
+                rule.name
+            ))
+        });
+        (verdict, Vec::new())
     }
 
     fn redacts_input(&self) -> bool {

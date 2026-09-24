@@ -817,7 +817,8 @@ async fn guardrail_block_response(
         A2A_MODEL_LABEL,
         vec![aisix_gateway::ChatMessage::user(text)],
     );
-    let (verdict, hits) = aisix_guardrails::Guardrail::check_input_observed(chain, &chat).await;
+    let (verdict, hits) =
+        aisix_guardrails::Guardrail::check_input_unmaskable_observed(chain, &chat).await;
     call.guardrail_monitor_hits.extend(hits);
     let aisix_guardrails::GuardrailVerdict::Block {
         reason,

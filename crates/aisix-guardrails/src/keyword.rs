@@ -14,7 +14,9 @@ use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 use regex::Regex;
 
-use crate::{Guardrail, GuardrailVerdict};
+use aisix_core::models::GuardrailMonitorHit;
+
+use crate::{Guardrail, GuardrailVerdict, ScanSegment};
 
 #[derive(Debug, Clone)]
 pub enum KeywordRule {
@@ -154,6 +156,35 @@ impl Guardrail for KeywordBlocklist {
             }
             None => GuardrailVerdict::Allow,
         }
+    }
+
+    fn checks_local_segments(&self) -> bool {
+        true
+    }
+
+    /// Each segment on its own: `^`/`$` anchor to one slot, and no rule
+    /// matches across two of them. A key or tool name blocks like any
+    /// other text — this kind never rewrites.
+    fn check_local_segments(
+        &self,
+        segments: &[ScanSegment],
+        input: bool,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let (enabled, side) = if input {
+            (self.check_input_enabled, "input")
+        } else {
+            (self.check_output_enabled, "output")
+        };
+        if !enabled {
+            return (GuardrailVerdict::Allow, Vec::new());
+        }
+        let verdict = segments
+            .iter()
+            .find_map(|seg| self.first_match(&seg.text))
+            .map_or(GuardrailVerdict::Allow, |rule| {
+                GuardrailVerdict::block(format!("{side} blocked by {}", rule.description()))
+            });
+        (verdict, Vec::new())
     }
 
     async fn check_output(&self, resp: &ChatResponse) -> GuardrailVerdict {

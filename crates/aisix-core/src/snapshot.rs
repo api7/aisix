@@ -275,6 +275,10 @@ impl<T: Resource> ResourceTable<T> {
 pub struct SnapshotHandle<S> {
     inner: Arc<ArcSwap<S>>,
     version: Arc<AtomicU64>,
+    /// Carries the version of every published snapshot, for consumers that
+    /// must act when configuration changes rather than when a request
+    /// happens to arrive. See [`Self::subscribe`].
+    published: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 impl<S> Clone for SnapshotHandle<S> {
@@ -282,6 +286,7 @@ impl<S> Clone for SnapshotHandle<S> {
         Self {
             inner: Arc::clone(&self.inner),
             version: Arc::clone(&self.version),
+            published: Arc::clone(&self.published),
         }
     }
 }
@@ -291,7 +296,23 @@ impl<S: Send + Sync + 'static> SnapshotHandle<S> {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(initial)),
             version: Arc::new(AtomicU64::new(0)),
+            published: Arc::new(tokio::sync::watch::channel(0).0),
         }
+    }
+
+    /// Wakes on every `store` / `rcu`, carrying the new
+    /// [`version`](Self::version). For work that must follow a
+    /// configuration change even when no request arrives — tearing down
+    /// what a deleted resource left running. A slow subscriber sees only
+    /// the latest version, so it must re-read the snapshot rather than
+    /// count wakes.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.published.subscribe()
+    }
+
+    fn publish(&self) {
+        let version = self.version.fetch_add(1, Ordering::Release) + 1;
+        self.published.send_replace(version);
     }
 
     /// Atomic load. Cheap (one Acquire load).
@@ -318,7 +339,7 @@ impl<S: Send + Sync + 'static> SnapshotHandle<S> {
     /// fresh snapshot.
     pub fn store(&self, new: S) {
         let previous = self.inner.swap(Arc::new(new));
-        self.version.fetch_add(1, Ordering::Release);
+        self.publish();
         reclaim::retire(previous);
     }
 
@@ -339,7 +360,7 @@ impl<S: Send + Sync + 'static> SnapshotHandle<S> {
         F: FnMut(&S) -> S,
     {
         let previous = self.inner.rcu(|current| f(current.as_ref()));
-        self.version.fetch_add(1, Ordering::Release);
+        self.publish();
         reclaim::retire(previous);
     }
 }

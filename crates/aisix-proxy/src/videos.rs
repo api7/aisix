@@ -1618,6 +1618,7 @@ pub async fn create_video(
                 err.kind(),
                 err.is_guardrail_block(),
                 &client,
+                crate::usage_attr::applied_guardrails(&audit),
                 crate::usage_attr::enforced_hits(&audit),
                 crate::usage_attr::guardrail_scores(&audit),
                 crate::usage_attr::bypass_reason(&audit),
@@ -1698,7 +1699,8 @@ async fn dispatch_create(
             vec![aisix_gateway::ChatMessage::user(body.prompt.clone())],
         );
         let (verdict, hits) =
-            aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
+            aisix_guardrails::Guardrail::check_input_unmaskable_observed(&resolved_chain, &chat)
+                .await;
         monitor_hits.extend(hits);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,

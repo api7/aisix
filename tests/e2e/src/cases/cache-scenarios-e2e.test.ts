@@ -66,6 +66,7 @@ describe("cache scenarios e2e: different prompt → miss", () => {
       ctx.skip();
       return;
     }
+    const { proxyUrl } = app;
 
     const upstream = await startOpenAiUpstream();
     upstreams.push(upstream);
@@ -89,12 +90,12 @@ describe("cache scenarios e2e: different prompt → miss", () => {
 
     const client = new OpenAI({
       apiKey: CALLER_PLAINTEXT,
-      baseURL: `${app.proxyUrl}/v1`,
+      baseURL: `${proxyUrl}/v1`,
     });
 
     await waitConfigPropagation(async () => {
       try {
-        const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+        const res = await fetch(`${proxyUrl}/v1/chat/completions`, {
           method: "POST",
           headers: {
             authorization: `Bearer ${CALLER_PLAINTEXT}`,
@@ -142,7 +143,7 @@ describe("cache scenarios e2e: different prompt → miss", () => {
     };
     const headerPrompts = ["header-prompt-A", "header-prompt-B"];
     for (const prompt of headerPrompts) {
-      const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      const res = await fetch(`${proxyUrl}/v1/chat/completions`, {
         method: "POST",
         headers: headerCheckHeaders,
         body: JSON.stringify({

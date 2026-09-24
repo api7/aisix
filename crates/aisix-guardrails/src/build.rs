@@ -726,6 +726,12 @@ impl BuildError {
 /// monitor mode observes at end-of-stream without adding hold-back latency,
 /// and it can never weaken a *blocking* peer's hold-back (the chain folds to
 /// the strictest member).
+/// Monitor-hit action for a suppressed mask a real run would have applied.
+const ACTION_WOULD_MASK: &str = "would_mask";
+/// Monitor-hit action for a mask rule that matched at a call site with no
+/// channel to write a mask back: enforcing the rule would not mask either.
+const ACTION_WOULD_MASK_UNSUPPORTED: &str = "would_mask_unsupported";
+
 struct MonitorGuardrail {
     row_name: String,
     /// Code-owned discriminator used to replace the inner Block reason in
@@ -784,16 +790,18 @@ impl MonitorGuardrail {
         }
     }
 
-    /// `would_mask` telemetry hit for suppressed mask counts.
+    /// `would_mask` (or, where the call site cannot write a mask back,
+    /// `would_mask_unsupported`) telemetry hit for suppressed mask counts.
     fn would_mask_hit(
         &self,
         hook: &'static str,
+        action: &'static str,
         counts: std::collections::BTreeMap<String, u32>,
     ) -> GuardrailMonitorHit {
         GuardrailMonitorHit {
             guardrail_name: self.row_name.clone(),
             hook: hook.to_owned(),
-            action: "would_mask".to_owned(),
+            action: action.to_owned(),
             reason: String::new(),
             error_type: String::new(),
             counts,
@@ -831,7 +839,7 @@ impl MonitorGuardrail {
                 counts = ?outcome.counts,
                 "guardrail in monitor mode observed maskable spans; not redacting (enforcement_mode=monitor)",
             );
-            hits.push(self.would_mask_hit(hook, outcome.counts));
+            hits.push(self.would_mask_hit(hook, ACTION_WOULD_MASK, outcome.counts));
         }
         let verdict = self.observe_hit(hook, outcome.verdict, &mut hits);
         SegmentsOutcome {
@@ -849,6 +857,7 @@ impl MonitorGuardrail {
     fn probe_redaction(
         &self,
         hook: &'static str,
+        action: &'static str,
         redacts: bool,
         redact: impl FnOnce() -> Option<Redaction>,
         hits: &mut Vec<GuardrailMonitorHit>,
@@ -858,9 +867,58 @@ impl MonitorGuardrail {
         }
         let r = redact();
         if let Some(ref red) = r {
-            hits.push(self.would_mask_hit(hook, red.counts.clone()));
+            hits.push(self.would_mask_hit(hook, action, red.counts.clone()));
         }
         self.observe_redaction(hook, r);
+    }
+
+    /// `check_input_observed`, recording a suppressed mask under
+    /// `mask_action`.
+    async fn observe_input(
+        &self,
+        req: &ChatFormat,
+        mask_action: &'static str,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let mut hits = Vec::new();
+        let verdict = self.observe_hit("input", self.inner.check_input(req).await, &mut hits);
+        // Recover the would-mask counts the suppressed sync redactor
+        // (kind=pii) would have produced, from the same text its
+        // check_input scans.
+        let text: String = req
+            .messages
+            .iter()
+            .map(crate::message_scan_text)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.probe_redaction(
+            "input",
+            mask_action,
+            self.inner.redacts_input() && !text.is_empty(),
+            || self.inner.redact_input_text(&text),
+            &mut hits,
+        );
+        (verdict, hits)
+    }
+
+    /// `check_output_observed`, recording a suppressed mask under
+    /// `mask_action`.
+    async fn observe_output(
+        &self,
+        resp: &ChatResponse,
+        mask_action: &'static str,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let mut hits = Vec::new();
+        let verdict = self.observe_hit("output", self.inner.check_output(resp).await, &mut hits);
+        let text = resp.guardrail_output_text();
+        self.probe_redaction(
+            "output",
+            mask_action,
+            self.inner.redacts_output() && !text.is_empty(),
+            || self.inner.redact_output_text(&text),
+            &mut hits,
+        );
+        (verdict, hits)
     }
 }
 
@@ -886,41 +944,29 @@ impl Guardrail for MonitorGuardrail {
         &self,
         req: &ChatFormat,
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
-        let mut hits = Vec::new();
-        let verdict = self.observe_hit("input", self.inner.check_input(req).await, &mut hits);
-        // Recover the would-mask counts the suppressed sync redactor
-        // (kind=pii) would have produced, from the same text its
-        // check_input scans.
-        let text: String = req
-            .messages
-            .iter()
-            .map(crate::message_scan_text)
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.probe_redaction(
-            "input",
-            self.inner.redacts_input() && !text.is_empty(),
-            || self.inner.redact_input_text(&text),
-            &mut hits,
-        );
-        (verdict, hits)
+        self.observe_input(req, ACTION_WOULD_MASK).await
     }
 
     async fn check_output_observed(
         &self,
         resp: &ChatResponse,
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
-        let mut hits = Vec::new();
-        let verdict = self.observe_hit("output", self.inner.check_output(resp).await, &mut hits);
-        let text = resp.guardrail_output_text();
-        self.probe_redaction(
-            "output",
-            self.inner.redacts_output() && !text.is_empty(),
-            || self.inner.redact_output_text(&text),
-            &mut hits,
-        );
-        (verdict, hits)
+        self.observe_output(resp, ACTION_WOULD_MASK).await
+    }
+
+    async fn check_input_unmaskable_observed(
+        &self,
+        req: &ChatFormat,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        self.observe_input(req, ACTION_WOULD_MASK_UNSUPPORTED).await
+    }
+
+    async fn check_output_unmaskable_observed(
+        &self,
+        resp: &ChatResponse,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        self.observe_output(resp, ACTION_WOULD_MASK_UNSUPPORTED)
+            .await
     }
 
     /// Delegate so a monitored segment moderator (bedrock/lakera/presidio)
@@ -929,6 +975,60 @@ impl Guardrail for MonitorGuardrail {
     /// blob path, where a maskable outcome degrades to a would-block.
     fn moderates_segments(&self) -> bool {
         self.inner.moderates_segments()
+    }
+
+    fn checks_local_segments(&self) -> bool {
+        self.inner.checks_local_segments()
+    }
+
+    /// The inner verdict downgraded, plus the counts the suppressed sync
+    /// redactor would have masked over the SAME rewritable segments the
+    /// enforced mask pass rewrites — so a staged rule previews exactly
+    /// what enforcing it does (#1027).
+    fn check_local_segments(
+        &self,
+        segments: &[crate::ScanSegment],
+        input: bool,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let hook = if input { "input" } else { "output" };
+        let (verdict, mut hits) = self.inner.check_local_segments(segments, input);
+        let verdict = self.observe_hit(hook, verdict, &mut hits);
+        let redacts = if input {
+            self.inner.redacts_input()
+        } else {
+            self.inner.redacts_output()
+        };
+        if redacts {
+            let mut counts = std::collections::BTreeMap::new();
+            for seg in segments
+                .iter()
+                .filter(|s| s.role == crate::SegmentRole::Rewritable)
+            {
+                let r = if input {
+                    self.inner.redact_input_text(&seg.text)
+                } else {
+                    self.inner.redact_output_text(&seg.text)
+                };
+                if let Some(r) = r {
+                    Redaction::merge_counts(&mut counts, &r.counts);
+                }
+            }
+            if !counts.is_empty() {
+                self.probe_redaction(
+                    hook,
+                    ACTION_WOULD_MASK,
+                    true,
+                    || {
+                        Some(Redaction {
+                            text: String::new(),
+                            counts,
+                        })
+                    },
+                    &mut hits,
+                );
+            }
+        }
+        (verdict, hits)
     }
 
     async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
@@ -1821,7 +1921,8 @@ impl LiveGuardrailIndex {
         if chain.is_empty() {
             return chain;
         }
-        chain.with_audit_log(Some(Arc::new(crate::GuardrailAuditLog::new())))
+        let log = crate::GuardrailAuditLog::for_applied(chain.applied().to_vec());
+        chain.with_audit_log(Some(Arc::new(log)))
     }
 
     /// `true` when the index has no entries — no enabled attachment names a
@@ -2340,6 +2441,97 @@ mod tests {
         assert_eq!(chain.len(), 1);
         let r = chain.redact_input_text("tool version: 12.1 done").unwrap();
         assert_eq!(r.text, "tool version: *** done");
+    }
+
+    fn seg(text: &str, role: crate::SegmentRole) -> crate::ScanSegment {
+        crate::ScanSegment {
+            text: text.to_owned(),
+            role,
+            in_latest_turn: true,
+        }
+    }
+
+    fn pii_chain(enforcement_mode: &str, action: &str) -> GuardrailChain {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "pin",
+            "g-1",
+            parse(&format!(
+                r#"{{
+                    "name": "pin",
+                    "kind": "pii",
+                    "enforcement_mode": "{enforcement_mode}",
+                    "custom_patterns": [{{
+                        "name": "pin",
+                        "regex": "^\\d{{4}}$",
+                        "action": "{action}"
+                    }}]
+                }}"#
+            )),
+        ));
+        build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
+    }
+
+    /// #1027: a local kind judges each segment on its own, so a rule
+    /// anchored to a whole value blocks on the slot the mask pass would
+    /// rewrite — it could never match the joined blob.
+    #[test]
+    fn local_segments_anchor_each_slot() {
+        use crate::SegmentRole::Rewritable;
+        let chain = pii_chain("block", "block");
+        let (v, _) =
+            chain.check_local_segments(&[seg("pay", Rewritable), seg("1234", Rewritable)], true);
+        assert!(v.is_block(), "the bare slot matches ^\\d{{4}}$: {v:?}");
+        let (v, _) = chain.check_local_segments(&[seg("pay 1234", Rewritable)], true);
+        assert_eq!(v, GuardrailVerdict::Allow);
+    }
+
+    /// A mask rule that matches an object key has nowhere to write, so it
+    /// blocks; the same hit on a scan-only slot is forwarded (#1104).
+    #[test]
+    fn a_mask_hit_on_a_key_blocks_but_not_on_a_scan_only_slot() {
+        use crate::SegmentRole::{Label, Rewritable, ScanOnly};
+        let chain = pii_chain("block", "mask");
+        assert!(chain
+            .check_local_segments(&[seg("1234", Label)], true)
+            .0
+            .is_block());
+        assert_eq!(
+            chain.check_local_segments(&[seg("1234", ScanOnly)], true).0,
+            GuardrailVerdict::Allow
+        );
+        assert_eq!(
+            chain
+                .check_local_segments(&[seg("1234", Rewritable)], true)
+                .0,
+            GuardrailVerdict::Allow,
+            "a rewritable slot is masked, not blocked"
+        );
+    }
+
+    /// A monitored mask rule previews the counts enforcement would mask
+    /// over the same rewritable slots: one per slot, none for a key.
+    #[test]
+    fn monitor_would_mask_counts_the_rewritable_slots() {
+        use crate::SegmentRole::{Label, Rewritable};
+        let chain = pii_chain("monitor", "mask");
+        let (v, hits) = chain.check_local_segments(
+            &[
+                seg("1234", Rewritable),
+                seg("5678", Rewritable),
+                seg("1234 5678", Rewritable),
+                seg("9999", Label),
+            ],
+            false,
+        );
+        assert_eq!(v, GuardrailVerdict::Allow, "monitor never blocks");
+        let would_mask: Vec<_> = hits.iter().filter(|h| h.action == "would_mask").collect();
+        assert_eq!(would_mask.len(), 1);
+        assert_eq!(would_mask[0].counts.get("pin"), Some(&2));
+        assert!(
+            hits.iter().any(|h| h.action == "would_block"),
+            "the key would have blocked: {hits:?}"
+        );
     }
 
     /// A `replacement` on a pattern whose effective action is `block`

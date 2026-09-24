@@ -51,6 +51,7 @@ mod guardrail_coverage;
 mod guardrail_embedder;
 mod guardrail_stream;
 pub mod health;
+mod held_content;
 mod host;
 mod http_client;
 mod images;
@@ -3534,7 +3535,7 @@ data: [DONE]\n\n";
         let mut events = Vec::new();
         while let Some(chunk) = body_stream.next().await {
             let bytes = chunk.unwrap();
-            events.extend(decoder.feed(bytes.as_ref()));
+            events.extend(decoder.feed(bytes.as_ref()).unwrap());
         }
         assert!(events.contains(&SseEvent::Done), "missing [DONE] sentinel");
         let data_count = events
@@ -6697,7 +6698,7 @@ data: [DONE]\n\n";
         let mut decoder = SseDecoder::new();
         let mut sse_events = Vec::new();
         while let Some(chunk) = body_stream.next().await {
-            sse_events.extend(decoder.feed(chunk.unwrap().as_ref()));
+            sse_events.extend(decoder.feed(chunk.unwrap().as_ref()).unwrap());
         }
         assert!(sse_events.contains(&SseEvent::Done), "missing [DONE]");
 
@@ -11053,7 +11054,7 @@ data: [DONE]\n\n";
         let mut decoder = SseDecoder::new();
         let mut events = Vec::new();
         while let Some(chunk) = body_stream.next().await {
-            events.extend(decoder.feed(chunk.unwrap().as_ref()));
+            events.extend(decoder.feed(chunk.unwrap().as_ref()).unwrap());
         }
         assert!(events.contains(&SseEvent::Done), "missing [DONE] sentinel");
         let data: Vec<&str> = events
@@ -11187,7 +11188,7 @@ data: [DONE]\n\n";
         let mut decoder = SseDecoder::new();
         let mut events = Vec::new();
         while let Some(chunk) = body_stream.next().await {
-            events.extend(decoder.feed(chunk.unwrap().as_ref()));
+            events.extend(decoder.feed(chunk.unwrap().as_ref()).unwrap());
         }
         // The client asked for usage, so exactly one terminal usage-bearing
         // frame must reach it — carrying the aggregate, re-stamped under the
