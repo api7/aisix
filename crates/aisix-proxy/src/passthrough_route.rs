@@ -2063,7 +2063,7 @@ fn stream_response(
                         telemetry.mark_first_delivery();
                         yield Ok(frame);
                     }
-                    StreamOutputPolicy::Window { size_chars, overlap_chars } => {
+                    StreamOutputPolicy::Window { size_chars, overlap_chars, .. } => {
                         scan_buf.push_str(&delta);
                         held_bytes += frame.len();
                         pending.push(frame);

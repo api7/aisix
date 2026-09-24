@@ -243,9 +243,11 @@ pub struct AzureContentSafetyTextModerationConfig {
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_acs_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes of model-generated content held back in `buffer_full` mode
-    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
-    /// and tool-call arguments; SSE and JSON framing is not counted.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
+    /// `window` mode where the stream is held whole (`/v1/messages`,
+    /// `/v1/responses`). Counts assistant text, reasoning, and tool-call
+    /// arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -355,9 +357,11 @@ pub struct AliyunTextModerationConfig {
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_aliyun_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes of model-generated content held back in `buffer_full` mode
-    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
-    /// and tool-call arguments; SSE and JSON framing is not counted.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
+    /// `window` mode where the stream is held whole (`/v1/messages`,
+    /// `/v1/responses`). Counts assistant text, reasoning, and tool-call
+    /// arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -437,9 +441,11 @@ pub struct AliyunAiGuardrailConfig {
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_aliyun_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes of model-generated content held back in `buffer_full` mode
-    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
-    /// and tool-call arguments; SSE and JSON framing is not counted.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
+    /// `window` mode where the stream is held whole (`/v1/messages`,
+    /// `/v1/responses`). Counts assistant text, reasoning, and tool-call
+    /// arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -1002,9 +1008,11 @@ pub struct CustomConfig {
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_acs_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes of model-generated content held back in `buffer_full` mode
-    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
-    /// and tool-call arguments; SSE and JSON framing is not counted.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
+    /// `window` mode where the stream is held whole (`/v1/messages`,
+    /// `/v1/responses`). Counts assistant text, reasoning, and tool-call
+    /// arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,

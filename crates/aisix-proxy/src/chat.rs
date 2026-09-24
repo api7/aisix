@@ -5902,6 +5902,7 @@ where
                     aisix_guardrails::StreamOutputPolicy::Window {
                         size_chars,
                         overlap_chars,
+                        ..
                     } => {
                         if window_buf.chars().count() >= *size_chars {
                             if let Some(ctx) = output_guardrail.as_ref() {

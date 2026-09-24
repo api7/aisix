@@ -304,18 +304,6 @@ impl GuardrailChain {
         }
     }
 
-    /// Whether an output member that answers through the segment pass wants
-    /// a streamed response held back. That member judges the held body, so
-    /// a relay that forwards live leaves it nothing to judge before the
-    /// content is out — whatever policy the chain folds to.
-    pub fn holds_back_for_segment_member(&self) -> bool {
-        self.members.iter().any(|m| {
-            m.guardrail.runs_on_output()
-                && m.guardrail.moderates_segments()
-                && m.guardrail.stream_output_policy().holds_back()
-        })
-    }
-
     /// The request's audit log handle, for a caller that outlives the
     /// chain value: a streaming emitter running inside a `move` closure
     /// after the handler frame is gone, or a handler whose chain is
@@ -733,18 +721,15 @@ impl Guardrail for GuardrailChain {
 
     /// Names the member whose cap is the one [`Self::stream_output_policy`]
     /// folded to: the smallest `max_buffer_bytes` among output members that
-    /// hold the whole response, the first in chain order on a tie — the row
-    /// an operator raises, not the chain.
+    /// hold content back, the first in chain order on a tie — the row an
+    /// operator raises, not the chain.
     fn record_output_buffer_exceeded(&self) {
         let Some(audit) = self.audit.as_deref() else {
             return;
         };
         let mut owner: Option<(&str, usize)> = None;
         for m in self.members.iter().filter(|m| m.guardrail.runs_on_output()) {
-            if let StreamOutputPolicy::BufferFull {
-                max_buffer_bytes, ..
-            } = m.guardrail.stream_output_policy()
-            {
+            if let Some((max_buffer_bytes, _)) = m.guardrail.stream_output_policy().hold_cap() {
                 if owner.is_none_or(|(_, cap)| max_buffer_bytes < cap) {
                     owner = Some((&m.name, max_buffer_bytes));
                 }
@@ -1539,6 +1524,8 @@ mod tests {
                     StreamOutputPolicy::Window {
                         size_chars: 10,
                         overlap_chars: 2,
+                        max_buffer_bytes: 8_192,
+                        on_exceeded_fail_open: false,
                     },
                 ),
                 member("tied-first", full()),

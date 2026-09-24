@@ -1991,28 +1991,16 @@ fn keep_live_copy(copy: &mut Option<Vec<u8>>, frames: &[u8]) {
 /// for the output chain, as `(max_buffer_bytes, on_exceeded_fail_open)`;
 /// `None` relays live.
 ///
-/// `BufferFull` holds under its own cap. A `Window` chain holds only when a
-/// segment-moderating member (`custom`, `aliyun_ai_guardrail`) asked for it:
-/// that member judges the held body, so a live relay would hand it nothing
-/// until the content was already out. It is held whole under the default cap,
-/// fail-closed — the terms `/v1/responses` holds a `Window` chain on. Any
-/// other `Window` chain keeps the live relay and its end-of-stream check.
+/// A block- or mask-capable output chain holds, `Window` as well as
+/// `BufferFull`: a verdict reached after the content went out cannot take it
+/// back. The relay has no window-by-window release, so a `Window` chain is
+/// held whole, under the folded `max_buffer_bytes` / `on_buffer_exceeded` of
+/// its members. A monitor-only chain (`EndOfStreamCheck`) relays live and is
+/// scanned once at end-of-stream.
 fn anthropic_stream_hold_policy(
     chain: Option<&aisix_guardrails::GuardrailChain>,
 ) -> Option<(usize, bool)> {
-    let chain = chain?;
-    match aisix_guardrails::Guardrail::stream_output_policy(chain) {
-        aisix_guardrails::StreamOutputPolicy::BufferFull {
-            max_buffer_bytes,
-            on_exceeded_fail_open,
-        } => Some((max_buffer_bytes, on_exceeded_fail_open)),
-        aisix_guardrails::StreamOutputPolicy::Window { .. }
-            if chain.holds_back_for_segment_member() =>
-        {
-            Some((aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false))
-        }
-        _ => None,
-    }
+    aisix_guardrails::Guardrail::stream_output_policy(chain?).hold_cap()
 }
 
 /// Concatenate the text from an Anthropic response's `content` blocks — the
@@ -4252,11 +4240,11 @@ where
         guard.usage().reached_end = true;
         // End-of-stream output guardrail (#448): scan the accumulated
         // assistant text. On a block, emit a terminal Anthropic `error`
-        // event. On the hold-back path (BufferFull) nothing has been
-        // forwarded yet, so a block keeps the matched content off the
-        // wire entirely; on the live-forward path (Window /
-        // EndOfStreamCheck) the bytes were already forwarded verbatim
-        // and the error frame is the trailing signal.
+        // event. On the hold-back path (Window / BufferFull) nothing has
+        // been forwarded yet, so a block keeps the matched content off the
+        // wire entirely; on the live-forward path (EndOfStreamCheck) the
+        // bytes were already forwarded verbatim and the error frame is the
+        // trailing signal.
         let mut blocked = false;
         if let (Some(chain), false) = (output_guardrail.as_ref(), released) {
             // Clone (not take) when content capture is on, so the assembled
@@ -4301,10 +4289,9 @@ where
                 guard.usage().monitor_hits.extend(hits);
                 // Segment pass: over the held SSE bytes under a hold-back
                 // policy (a mask rewrites them), otherwise over what the
-                // live relay forwarded. A segment member that asked for
-                // hold-back always gets it (`anthropic_stream_hold_policy`),
-                // so the live copy serves monitor-mode members and the
-                // local kinds (#1027).
+                // live relay forwarded. Every holding chain is held
+                // (`anthropic_stream_hold_policy`), so the live copy serves
+                // monitor-mode members and the local kinds (#1027).
                 let mut seg_counts = crate::redact::RedactionCounts::new();
                 let mut seg_hits = Vec::new();
                 let local_extra = unscanned

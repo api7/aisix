@@ -1432,15 +1432,12 @@ async fn responses_to_target(
             // gateway. Mirror the chat surface's BufferFull policy (#466):
             // count the model-generated content as it arrives (#513) and,
             // past the cap, fail closed — or, under fail-open, release it
-            // unscanned. The cap is taken from the chain's resolved
-            // streaming policy.
-            let (max_buffer_bytes, on_exceeded_fail_open) = match output_policy {
-                aisix_guardrails::StreamOutputPolicy::BufferFull {
-                    max_buffer_bytes,
-                    on_exceeded_fail_open,
-                } => (max_buffer_bytes, on_exceeded_fail_open),
-                _ => (aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false),
-            };
+            // unscanned. The cap and the overflow policy are the chain's
+            // folded `max_buffer_bytes` / `on_buffer_exceeded`, whether it
+            // resolved to a window or a whole-response hold.
+            let (max_buffer_bytes, on_exceeded_fail_open) = output_policy
+                .hold_cap()
+                .unwrap_or((aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false));
             let stream = &mut upstream_body;
             // Effective streaming budget — applied to every buffered read,
             // consistent with the verbatim branch and the connect deadline.
@@ -2425,13 +2422,9 @@ async fn responses_cross_provider_to_target(
         .then(|| chain.clone());
         let output_policy = aisix_guardrails::Guardrail::stream_output_policy(chain.as_ref());
         let hold_back = output_policy.holds_back();
-        let (max_buffer_bytes, on_exceeded_fail_open) = match output_policy {
-            aisix_guardrails::StreamOutputPolicy::BufferFull {
-                max_buffer_bytes,
-                on_exceeded_fail_open,
-            } => (max_buffer_bytes, on_exceeded_fail_open),
-            _ => (aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false),
-        };
+        let (max_buffer_bytes, on_exceeded_fail_open) = output_policy
+            .hold_cap()
+            .unwrap_or((aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false));
 
         let state_c = state.clone();
         // The chain does not survive into the end-of-stream closure, so

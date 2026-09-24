@@ -626,6 +626,8 @@ impl Guardrail for CustomGuardrail {
             _ => StreamOutputPolicy::Window {
                 size_chars: self.window_size,
                 overlap_chars: self.window_overlap_size,
+                max_buffer_bytes: self.max_buffer_bytes,
+                on_exceeded_fail_open: self.on_buffer_exceeded_fail_open,
             },
         }
     }
@@ -2040,7 +2042,8 @@ mod tests {
             guardrail(&cfg, false).stream_output_policy(),
             StreamOutputPolicy::Window {
                 size_chars: 10_000,
-                overlap_chars: 256
+                overlap_chars: 256,
+                ..
             },
         ));
     }
