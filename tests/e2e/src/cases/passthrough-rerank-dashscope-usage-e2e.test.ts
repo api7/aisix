@@ -228,6 +228,19 @@ describe("passthrough route meters rerank and DashScope native bodies", () => {
     await sls?.close();
   });
 
+  /** Caller key authenticates; a 401 is the only transient state. */
+  async function waitCallerReady(): Promise<void> {
+    await waitConfigPropagation(async () => {
+      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      const text = await r.text();
+      if (r.status === 401) return false;
+      if (r.status !== 200) throw new Error(`readiness gate: ${r.status} ${text}`);
+      return true;
+    });
+  }
+
   async function call(path: string, body: unknown): Promise<Map<string, string>> {
     const res = await fetch(`${app!.proxyUrl}${path}`, {
       method: "POST",
@@ -260,13 +273,7 @@ describe("passthrough route meters rerank and DashScope native bodies", () => {
       ctx.skip();
       return;
     }
-    await waitConfigPropagation(async () => {
-      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
-        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
-      });
-      await r.text();
-      return r.status === 200;
-    });
+    await waitCallerReady();
 
     const jina = await call("/jina/v1/rerank", {
       model: "jina-reranker-v2-base-multilingual",
@@ -383,13 +390,7 @@ describe("passthrough route meters rerank and DashScope native bodies", () => {
       ctx.skip();
       return;
     }
-    await waitConfigPropagation(async () => {
-      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
-        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
-      });
-      await r.text();
-      return r.status === 200;
-    });
+    await waitCallerReady();
 
     const streamed = await call(
       "/ds-stream/api/v1/services/aigc/multimodal-generation/generation",
