@@ -1209,8 +1209,8 @@ async fn multipart_dispatch(
         // (#1017: the resolved URL depends on the vendor too), plus the
         // per-call path.
         &{
-            let [base, vendor] = crate::dispatch::pk_url_fingerprint(&pk_entry.value);
-            [base, vendor, upstream_path]
+            let [base, vendor, adapter] = crate::dispatch::pk_url_fingerprint(&pk_entry.value);
+            [base, vendor, adapter, upstream_path]
         },
         || {
             let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;

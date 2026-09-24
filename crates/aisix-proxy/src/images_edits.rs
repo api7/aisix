@@ -470,8 +470,8 @@ async fn dispatch(
         // Every resolve_base_url input, via the shared constructor
         // (#1017), plus the endpoint path.
         &{
-            let [base, vendor] = crate::dispatch::pk_url_fingerprint(&pk_entry.value);
-            [base, vendor, "/images/edits"]
+            let [base, vendor, adapter] = crate::dispatch::pk_url_fingerprint(&pk_entry.value);
+            [base, vendor, adapter, "/images/edits"]
         },
         || {
             let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;

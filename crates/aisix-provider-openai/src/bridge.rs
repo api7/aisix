@@ -133,6 +133,14 @@ impl OpenAiBridge {
     /// Closes the openrouter / xai / future-long-tail half of
     /// api7/AISIX-Cloud#417. cp-api must populate `api_base` for every
     /// catalog vendor via adapter_map / provider_metadata.api_base_url.
+    ///
+    /// The routes that build their URL without this bridge (audio, image
+    /// edits, jobs, realtime, responses, messages) resolve through
+    /// `falls_back_to_openai_default` in `aisix-proxy`'s dispatch module,
+    /// which states this same fallback plus the `adapter: openai` check
+    /// that dispatch applies before an empty-vendor key ever reaches this
+    /// bridge. Change the two together, or chat and the other routes
+    /// disagree about where the same key goes.
     fn resolve_base(&self, ctx: &BridgeContext) -> Result<String, BridgeError> {
         let raw = match ctx.provider_key.api_base.as_deref() {
             Some(b) if !b.trim().is_empty() => b.trim().to_string(),
