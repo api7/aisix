@@ -22,7 +22,7 @@ import type { OpenAiUpstreamOptions, OpenAiUpstreamStep } from "../harness/upstr
 // answers itself, and one the gateway raises when the upstream outlives the
 // model's timeout. Observed through the SLS exporter, which receives the
 // usage rows as the control plane does, and in the plain log, whose
-// failed-attempt line must carry the same request id.
+// failed-attempt line must carry the same request id even at `warn`.
 
 const CALLER_PLAINTEXT = "sk-retried-attempt-1136";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -236,10 +236,11 @@ describe("a retried 504 attempt stays in the usage export (AISIX-Cloud#1136)", (
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     sls = await startMockSls();
-    // At the default `info`, so the request span every line inherits its
-    // `request_id` from is live — the harness otherwise runs at `warn`.
+    // At `warn`, where the failed-attempt line is still written but the
+    // INFO-level request span is not: the line has to carry the request id
+    // on its own.
     app = await spawnApp({
-      logLevel: "info",
+      logLevel: "warn",
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",
@@ -330,7 +331,7 @@ describe("a retried 504 attempt stays in the usage export (AISIX-Cloud#1136)", (
     // The plain log names the failed attempt under the same request id.
     await waitForLogLine(
       app,
-      (l) => l.includes("routing target attempt failed") && l.includes(requestId),
+      (l) => l.includes("routing target attempt failed") && l.includes(`request_id=${requestId}`),
       `${c.label}: the failed-attempt log line of ${requestId}`,
     );
   });

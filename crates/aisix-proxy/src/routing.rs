@@ -132,7 +132,13 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
 /// to fail over and leaves exactly the trace a group with one reachable
 /// candidate leaves — one attempt, error class `upstream_status`
 /// (AISIX-Cloud#1499).
+///
+/// `request_id` is a field of the line itself, not only of the enclosing
+/// `request` span: that span is INFO-level, so at `log_level=warn` it is
+/// disabled and this line would otherwise carry no way back to the request
+/// (AISIX-Cloud#1136).
 pub(crate) fn log_attempt_failure(
+    request_id: &str,
     target_model: &str,
     attempt_number: usize,
     err: &dyn std::fmt::Display,
@@ -140,6 +146,7 @@ pub(crate) fn log_attempt_failure(
     fallback_on_statuses: &[u16],
 ) {
     tracing::warn!(
+        request_id = %request_id,
         target_model = %target_model,
         target_attempt = attempt_number,
         error = %err,
@@ -722,6 +729,7 @@ where
                     };
                     if routing.is_some() || retryable {
                         log_attempt_failure(
+                            &client.request_id,
                             &target.model.display_name,
                             attempt_idx + 1,
                             &e,

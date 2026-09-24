@@ -950,6 +950,7 @@ async fn dispatch(
                         ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
                     );
                     crate::routing::log_attempt_failure(
+                        &request_id,
                         &target.model.display_name,
                         attempt_idx + 1,
                         &e,
