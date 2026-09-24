@@ -99,11 +99,16 @@ it in both directions, so an input-only row reaches the output arm and vice
 versa. Note also that `hook_point` defaults to `both` and `fail_open` to
 `false`, so this only bites a deployment that set one of them explicitly.
 
-Not gated, deliberately: the refusals that need a HELD-BACK stream
-(`output_buffer_exceeded`, `mask_writeback_failed`, and `unscannable_body` on a
-buffered SSE body). Honouring `fail_open` there does not mean skipping a
-refusal, it means releasing already-buffered bytes that were never scanned —
-a different decision, and one nobody has taken.
+Not gated by these predicates: the refusals that need a HELD-BACK stream.
+`output_buffer_exceeded` has its own knob — each holding member's
+`on_buffer_exceeded`, folded by `StreamOutputPolicy::stricter` (fail-open only
+when every holding member says so) — and every route honours it: past the cap,
+what was held is released unscanned, the rest streams without an output scan,
+and the request records `guardrail_bypassed_reason: output_buffer_exceeded`.
+`mask_writeback_failed` and `unscannable_body` on a buffered SSE body are not
+governed by `fail_open`, deliberately: honouring it there would mean releasing
+already-buffered bytes that were never scanned — a different decision, and
+one nobody has taken.
 
 ## The bypass reason rides the audit log, and every emitter must set it
 
