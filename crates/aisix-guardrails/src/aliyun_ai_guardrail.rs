@@ -64,8 +64,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::aliyun::{
-    extract_error_code, percent_encode, sign, AliyunFailure, ACS_REQUEST_ID_HEADER,
-    MAX_ERROR_BODY_PARSE_BYTES,
+    classify_body_error_code, extract_error_code, percent_encode, sign, AliyunFailure,
+    ACS_REQUEST_ID_HEADER, MAX_ERROR_BODY_PARSE_BYTES,
 };
 use crate::chunk::chunk_text;
 use crate::{Guardrail, GuardrailVerdict, SegmentsOutcome, StreamOutputPolicy};
@@ -621,15 +621,16 @@ impl AliyunAiGuardrail {
                 );
                 Err(AliyunFailure::ConfigError)
             }
-            _ => {
+            code => {
+                let (failure, meaning) = classify_body_error_code(code);
                 tracing::warn!(
                     row = %self.row_name,
                     aliyun_request_id = %diag.request_id,
                     aliyun_code = %diag.code,
                     aliyun_message = %diag.message_field(),
-                    "aliyun MultiModalGuard non-200 Code",
+                    "aliyun MultiModalGuard non-200 Code: {meaning}",
                 );
-                Err(AliyunFailure::ServerError)
+                Err(failure)
             }
         };
         (outcome, diag)
@@ -1586,6 +1587,31 @@ mod tests {
             .await;
         let g = build(&server.uri(), false);
         assert_eq!(g.check_input(&req("x")).await, GuardrailVerdict::Allow);
+    }
+
+    /// Aliyun reports quota throttling and its own timeout as HTTP 200 +
+    /// body `Code`, never as HTTP 429 / a transport timeout.
+    #[tokio::test]
+    async fn body_code_588_and_581_classify_as_throttled_and_timeout() {
+        for (code, want) in [
+            (588, "aliyun_throttled"),
+            (581, "aliyun_timeout"),
+            (500, "aliyun_5xx"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "Code": code, "Message": "x", "RequestId": "r" })),
+                )
+                .mount(&server)
+                .await;
+            let g = build(&server.uri(), true);
+            match g.check_input(&req("x")).await {
+                GuardrailVerdict::Bypass { reason } => assert_eq!(reason, want, "Code {code}"),
+                other => panic!("Code {code}: expected Bypass({want}), got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
