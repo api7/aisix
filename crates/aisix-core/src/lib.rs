@@ -71,4 +71,4 @@ pub use resource::{Resource, ResourceEntry};
 pub use sched::{demote_current_thread, run_demoted};
 pub use similarity::{best_similarity, best_similarity_by, cosine_similarity};
 pub use snapshot::{ResourceTable, SnapshotHandle};
-pub use version::BUILD_VERSION;
+pub use version::{BUILD_VERSION, HEARTBEAT_VERSION};

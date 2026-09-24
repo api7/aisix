@@ -116,10 +116,10 @@ use tower_http::set_header::SetResponseHeaderLayer;
 /// Product token emitted in the `Server` response header. Format follows
 /// RFC 9110 §10.2.4 (`product/version`) and matches the convention used
 /// by adjacent gateways (APISIX, nginx, kong). Version is
-/// [`aisix_core::BUILD_VERSION`]: CI-stamped from the release tag, crate
-/// version for local builds.
+/// [`aisix_core::BUILD_VERSION`]: the release tag on release builds,
+/// `dev+sha-<sha>` or `dev` otherwise.
 static SERVER_HEADER_VALUE: std::sync::LazyLock<HeaderValue> = std::sync::LazyLock::new(|| {
-    HeaderValue::from_str(&format!("AISIX/{}", aisix_core::BUILD_VERSION))
+    HeaderValue::from_str(&format!("AISIX/{}", &*aisix_core::BUILD_VERSION))
         .expect("build version must be a valid ASCII header value")
 });
 
@@ -1913,7 +1913,7 @@ mod tests {
 
     /// Every response — including success bodies, error envelopes, and
     /// short-circuited middleware rejections — must carry the gateway's
-    /// `Server` product token (`AISIX/<semver>`) so clients can identify
+    /// `Server` product token (`AISIX/<version>`) so clients can identify
     /// the data plane without round-tripping to a status endpoint.
     #[tokio::test]
     async fn server_header_identifies_the_data_plane() {
