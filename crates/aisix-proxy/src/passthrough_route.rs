@@ -19,6 +19,13 @@
 //! coverage. SSE upstream responses are always relayed incrementally;
 //! anything else is buffered (guardrails and usage need the whole body).
 //!
+//! Two further request shapes are recognised among bodies that carry no
+//! LLM envelope ([`detect_raw_usage_shape`]): a Cohere-style rerank
+//! (`query` + a `documents` array) and the DashScope native service
+//! envelope (`model` + an `input` object). They stay opaque for guardrails,
+//! capture and streams; only their `model` and a unary JSON response's
+//! token counts are read.
+//!
 //! A DETECTED envelope must observe what the typed endpoint serving that
 //! same envelope observes — every token dimension of
 //! [`aisix_obs::UsageEvent`], the caller's model alias, the guardrail text
@@ -565,6 +572,7 @@ async fn dispatch(
     // Envelope detection: once per exchange, from the request body's
     // top-level keys; the response and stream frames reuse it.
     let protocol = detect_protocol(&body_bytes);
+    let raw_shape = detect_raw_usage_shape(protocol, &body_bytes);
 
     // INPUT guardrails on the (envelope-extracted) request text.
     if !resolved_chain.is_empty() {
@@ -618,7 +626,7 @@ async fn dispatch(
     let captured_prompt = content_cap.map(|_| String::from_utf8_lossy(&body_bytes).into_owned());
 
     // The alias the caller addressed, for the usage event's attribution.
-    let requested_model = body_model_name(protocol, &body_bytes);
+    let requested_model = body_model_name(protocol, raw_shape, &body_bytes);
 
     // Rate limits AFTER the input guardrail so a content block doesn't burn
     // an RPM slot (matching the typed endpoints). The body's `model` field
@@ -973,7 +981,7 @@ async fn dispatch(
         }
     }
 
-    if let Some(u) = response_usage(protocol, &resp_body) {
+    if let Some(u) = response_usage(protocol, raw_shape, &resp_body) {
         telemetry.usage.merge(u);
     }
     if telemetry.content_cap.is_some() {
@@ -1178,10 +1186,12 @@ enum PassthroughProtocol {
 }
 
 /// Detect the request envelope from the body's top-level keys. The three
-/// LLM envelopes are structurally exclusive — `messages`, `input` and
-/// `prompt` are each the required carrier field of exactly one API — so
-/// real LLM traffic detects unambiguously, and everything else (JSON-RPC,
-/// REST, non-JSON, empty/GET bodies) is `Raw`. An unknown API colliding
+/// LLM envelopes are structurally exclusive — `messages`, `input` (a string
+/// or an array) and `prompt` are each the required carrier field of exactly
+/// one API — so real LLM traffic detects unambiguously, and everything else
+/// (JSON-RPC, REST, rerank, DashScope native, non-JSON, empty/GET bodies)
+/// is `Raw`; [`detect_raw_usage_shape`] then picks out the `Raw` bodies
+/// whose unary response is still meterable. An unknown API colliding
 /// with a carrier key costs nothing: detection drives extraction only,
 /// and extraction degrades to the whole body when the detected shape
 /// yields no text.
@@ -1206,6 +1216,41 @@ fn detect_protocol(body: &[u8]) -> PassthroughProtocol {
     }
 }
 
+/// A `Raw` request whose `model` and unary JSON response usage the gateway
+/// can still read. Consulted for model attribution and the BUFFERED
+/// response's usage only — guardrail text, capture and every stream frame
+/// keep the `Raw` treatment, so a streamed response reports tokens only
+/// from a server-labelled usage frame, exactly as any opaque stream does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawUsageShape {
+    /// Cohere-style rerank: top-level `query` beside a `documents` array
+    /// (Cohere, Jina, DashScope's compatible rerank). Usage is read exactly
+    /// as `/v1/rerank` reads it ([`crate::rerank::rerank_prompt_tokens`]).
+    Rerank,
+    /// DashScope native service envelope: `{model, input: {…}, parameters}`
+    /// (native rerank, multimodal embedding, …). Usage per
+    /// [`dashscope_native_usage`].
+    DashscopeNative,
+}
+
+/// Classify a body [`detect_protocol`] left `Raw`; `None` for any other
+/// protocol, so the three LLM envelopes are never re-read.
+fn detect_raw_usage_shape(protocol: PassthroughProtocol, body: &[u8]) -> Option<RawUsageShape> {
+    if !matches!(protocol, PassthroughProtocol::Raw) {
+        return None;
+    }
+    let v = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    if v.get("documents").is_some_and(serde_json::Value::is_array) && v.get("query").is_some() {
+        Some(RawUsageShape::Rerank)
+    } else if v.get("model").is_some_and(serde_json::Value::is_string)
+        && v.get("input").is_some_and(serde_json::Value::is_object)
+    {
+        Some(RawUsageShape::DashscopeNative)
+    } else {
+        None
+    }
+}
+
 /// Cap on the recorded `requested_model` value. The body is the caller's,
 /// so the alias is bounded before it reaches telemetry.
 const REQUESTED_MODEL_CAP: usize = 128;
@@ -1214,13 +1259,18 @@ const REQUESTED_MODEL_CAP: usize = 128;
 /// `model` field — what the typed endpoint serving that envelope records
 /// as `UsageEvent::requested_model`.
 ///
-/// Read only for a recognised envelope: an opaque body's `model`-shaped key
-/// belongs to some other API and means nothing the gateway can attribute.
+/// Read only for a recognised envelope or [`RawUsageShape`]: an opaque
+/// body's `model`-shaped key belongs to some other API and means nothing
+/// the gateway can attribute.
 /// The Prometheus side is already collapse-guarded (an unregistered name
 /// folds to the `unresolved` sentinel), so an arbitrary alias here cannot
 /// mint label cardinality.
-fn body_model_name(protocol: PassthroughProtocol, body: &[u8]) -> String {
-    if matches!(protocol, PassthroughProtocol::Raw) {
+fn body_model_name(
+    protocol: PassthroughProtocol,
+    raw_shape: Option<RawUsageShape>,
+    body: &[u8],
+) -> String {
+    if matches!(protocol, PassthroughProtocol::Raw) && raw_shape.is_none() {
         return String::new();
     }
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
@@ -1417,12 +1467,58 @@ impl PassthroughUsage {
 }
 
 /// `usage` figures from a buffered protocol-aware response body.
-fn response_usage(protocol: PassthroughProtocol, body: &[u8]) -> Option<PassthroughUsage> {
-    if matches!(protocol, PassthroughProtocol::Raw) {
+fn response_usage(
+    protocol: PassthroughProtocol,
+    raw_shape: Option<RawUsageShape>,
+    body: &[u8],
+) -> Option<PassthroughUsage> {
+    if matches!(protocol, PassthroughProtocol::Raw) && raw_shape.is_none() {
         return None;
     }
     let v = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-    usage_of(v.get("usage")?)
+    match raw_shape {
+        Some(RawUsageShape::Rerank) => {
+            crate::rerank::rerank_prompt_tokens(&v).map(|prompt_tokens| PassthroughUsage {
+                prompt_tokens,
+                ..PassthroughUsage::default()
+            })
+        }
+        Some(RawUsageShape::DashscopeNative) => dashscope_native_usage(v.get("usage")?),
+        None => usage_of(v.get("usage")?),
+    }
+}
+
+/// Token counts from a DashScope native response's top-level `usage`.
+///
+/// Prompt is `input_tokens` (or `prompt_tokens`) PLUS the flat
+/// `image_tokens`, which the multimodal services report beside the text
+/// count rather than inside it (`{input_tokens: 44, image_tokens: 64,
+/// total_tokens: 108}`). A nested `input_tokens_details.image_tokens` is
+/// the opposite — a breakdown already inside `input_tokens` — and is never
+/// added. With no input-side field at all (native text rerank reports only
+/// `total_tokens`), prompt is `total_tokens` less the completion.
+fn dashscope_native_usage(usage: &serde_json::Value) -> Option<PassthroughUsage> {
+    let num = |k: &str| {
+        usage
+            .get(k)
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| n.min(u32::MAX as u64) as u32)
+    };
+    let input = num("input_tokens").or_else(|| num("prompt_tokens"));
+    let image = num("image_tokens");
+    let completion = num("output_tokens").or_else(|| num("completion_tokens"));
+    let prompt = match (input, image) {
+        (None, None) => num("total_tokens").map(|t| t.saturating_sub(completion.unwrap_or(0))),
+        _ => Some(input.unwrap_or(0).saturating_add(image.unwrap_or(0))),
+    };
+    if prompt.is_none() && completion.is_none() {
+        return None;
+    }
+    Some(PassthroughUsage {
+        prompt_tokens: prompt.unwrap_or(0),
+        completion_tokens: completion.unwrap_or(0),
+        ..PassthroughUsage::default()
+    })
 }
 
 /// Read every token dimension out of one `usage` object (or, for the
@@ -3261,9 +3357,12 @@ mod tests {
         // The no-phantom-tokens guarantee: a REST body that happens to carry
         // a usage-shaped object is not a usage report.
         let rpc = br#"{"jsonrpc":"2.0","id":1,"result":{"usage":{"prompt_tokens":99}}}"#;
-        assert_eq!(response_usage(PassthroughProtocol::Raw, rpc), None);
+        assert_eq!(response_usage(PassthroughProtocol::Raw, None, rpc), None);
         let top_level = br#"{"usage":{"prompt_tokens":99,"completion_tokens":9}}"#;
-        assert_eq!(response_usage(PassthroughProtocol::Raw, top_level), None);
+        assert_eq!(
+            response_usage(PassthroughProtocol::Raw, None, top_level),
+            None
+        );
     }
 
     #[test]
@@ -3318,19 +3417,23 @@ mod tests {
     fn requested_model_comes_only_from_a_detected_envelope() {
         let chat = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
         assert_eq!(
-            body_model_name(PassthroughProtocol::OpenaiChat, chat),
+            body_model_name(PassthroughProtocol::OpenaiChat, None, chat),
             "gpt-4o"
         );
         // An opaque body's `model`-shaped key belongs to some other API.
         let opaque = br#"{"model":"whatever","config_name":"x"}"#;
-        assert_eq!(body_model_name(PassthroughProtocol::Raw, opaque), "");
+        assert_eq!(body_model_name(PassthroughProtocol::Raw, None, opaque), "");
         // Caller-supplied, so bounded and control-char free before it
         // reaches telemetry.
         let hostile = format!(
             r#"{{"input":"x","model":"a\u0000b{}"}}"#,
             "z".repeat(REQUESTED_MODEL_CAP * 2)
         );
-        let name = body_model_name(PassthroughProtocol::OpenaiResponses, hostile.as_bytes());
+        let name = body_model_name(
+            PassthroughProtocol::OpenaiResponses,
+            None,
+            hostile.as_bytes(),
+        );
         assert_eq!(name.chars().count(), REQUESTED_MODEL_CAP);
         assert!(!name.contains('\0'));
     }
@@ -3495,7 +3598,7 @@ mod tests {
             "done"
         );
         assert_eq!(
-            response_usage(PassthroughProtocol::OpenaiResponses, resp),
+            response_usage(PassthroughProtocol::OpenaiResponses, None, resp),
             Some(usage_dims(11, 3))
         );
     }
@@ -3541,15 +3644,58 @@ mod tests {
     fn response_usage_reads_both_spellings() {
         let openai = br#"{"usage":{"prompt_tokens":5,"completion_tokens":2}}"#;
         assert_eq!(
-            response_usage(PassthroughProtocol::OpenaiChat, openai),
+            response_usage(PassthroughProtocol::OpenaiChat, None, openai),
             Some(usage_dims(5, 2))
         );
         let anthropicish = br#"{"usage":{"input_tokens":9,"output_tokens":4}}"#;
         assert_eq!(
-            response_usage(PassthroughProtocol::OpenaiChat, anthropicish),
+            response_usage(PassthroughProtocol::OpenaiChat, None, anthropicish),
             Some(usage_dims(9, 4))
         );
-        assert_eq!(response_usage(PassthroughProtocol::Raw, openai), None);
+        assert_eq!(response_usage(PassthroughProtocol::Raw, None, openai), None);
+    }
+
+    #[test]
+    fn raw_usage_shapes_are_claimed_only_from_raw_bodies() {
+        let shape = |b: &[u8]| detect_raw_usage_shape(detect_protocol(b), b);
+        // The LLM envelopes keep their classification.
+        let responses = br#"{"model":"m","input":"hi","documents":[],"query":"q"}"#;
+        assert_eq!(
+            detect_protocol(responses),
+            PassthroughProtocol::OpenaiResponses
+        );
+        assert_eq!(shape(responses), None);
+        let chat = br#"{"model":"m","messages":[],"input":{"x":1}}"#;
+        assert_eq!(shape(chat), None);
+        // Newly recognised among Raw bodies.
+        let rerank = br#"{"model":"m","query":"q","documents":["a"]}"#;
+        assert_eq!(shape(rerank), Some(RawUsageShape::Rerank));
+        let native = br#"{"model":"m","input":{"contents":[{"text":"hi"}]}}"#;
+        assert_eq!(shape(native), Some(RawUsageShape::DashscopeNative));
+        // Still opaque.
+        assert_eq!(shape(br#"{"model":"m","config_name":"x"}"#), None);
+        assert_eq!(
+            shape(br#"{"jsonrpc":"2.0","method":"m","params":{"input":{}}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn dashscope_native_usage_counts_flat_image_tokens_once() {
+        let usage = |b: &[u8]| {
+            response_usage(
+                PassthroughProtocol::Raw,
+                Some(RawUsageShape::DashscopeNative),
+                b,
+            )
+        };
+        let flat = br#"{"usage":{"input_tokens":44,"image_tokens":64,"total_tokens":108}}"#;
+        assert_eq!(usage(flat), Some(usage_dims(108, 0)));
+        let nested = br#"{"usage":{"input_tokens":903,"input_tokens_details":{"image_tokens":896,"text_tokens":7},"output_tokens":3,"total_tokens":906}}"#;
+        assert_eq!(usage(nested), Some(usage_dims(903, 3)));
+        let total_only = br#"{"output":{"results":[]},"usage":{"total_tokens":29}}"#;
+        assert_eq!(usage(total_only), Some(usage_dims(29, 0)));
+        assert_eq!(usage(br#"{"code":"InvalidParameter","message":"x"}"#), None);
     }
 
     #[tokio::test]
