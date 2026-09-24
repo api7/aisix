@@ -14,9 +14,11 @@ import {
 // caller mints under it, so a metric labelled with the caller's string
 // grows one series per invented name. Every typed endpoint must label a
 // wildcard-served success with the row's own name — the value `/v1/videos`
-// was fixed to first — and never with the caller's. `wildcard-identity`
-// pins chat; this drives the rest of the family, each through its own
-// minted alias, and reads the whole metrics dump afterwards.
+// was fixed to first — and never with the caller's. This drives the whole
+// family, each through its own minted alias, and reads the whole metrics
+// dump afterwards — chat included (`wildcard-identity` pins its streamed
+// series), and the jobs surface, whose routing model arrives as a query
+// or header hint or inside a caller-supplied gateway id.
 
 const CALLER_PLAINTEXT = "sk-wildcard-metric-family-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -72,6 +74,13 @@ describe("wildcard-served success metrics label as the row across the endpoint f
       body: JSON.stringify(body),
     });
 
+  const get = (path: string): Call => () => fetch(`${app!.proxyUrl}${path}`, { headers: auth });
+
+  // A gateway-minted jobs id, `aisix-<base64url("<raw>;model,<model>")>`,
+  // is sent back by the caller — so the model inside it is caller-supplied.
+  const routedId = (raw: string, model: string) =>
+    `aisix-${Buffer.from(`${raw};model,${model}`).toString("base64url")}`;
+
   const multipart = (path: string, fields: Record<string, string>, file: string): Call => () => {
     const form = new FormData();
     for (const [k, v] of Object.entries(fields)) form.set(k, v);
@@ -82,6 +91,10 @@ describe("wildcard-served success metrics label as the row across the endpoint f
   // Every alias carries the `minted` marker, so one assertion over the
   // dump covers every label they could have leaked into.
   const cases: Array<[string, Call]> = [
+    [
+      "chat/completions",
+      json("/v1/chat/completions", { model: "wfam/minted-chat", messages: [{ role: "user", content: "hi" }] }),
+    ],
     ["completions", json("/v1/completions", { model: "wfam/minted-completions", prompt: "hi" })],
     ["embeddings", json("/v1/embeddings", { model: "wfam/minted-embeddings", input: "hi" })],
     ["rerank", json("/v1/rerank", { model: "wfam/minted-rerank", query: "q", documents: ["a"] })],
@@ -103,6 +116,24 @@ describe("wildcard-served success metrics label as the row across the endpoint f
       }),
     ],
     ["videos", json("/v1/videos", { model: "wvid/minted-videos", prompt: "a boat" })],
+    [
+      "files",
+      multipart("/v1/files?model=wfam/minted-files", { purpose: "batch" }, "file"),
+    ],
+    [
+      "batches",
+      json("/v1/batches?model=wfam/minted-batches", {
+        input_file_id: "file-raw",
+        endpoint: "/v1/chat/completions",
+        completion_window: "24h",
+      }),
+    ],
+    [
+      "fine_tuning/jobs",
+      json("/v1/fine_tuning/jobs?model=wfam/minted-finetune", { model: "base-model", training_file: "file-raw" }),
+    ],
+    ["files/:id", get(`/v1/files/${routedId("file-raw", "wfam/minted-file-id")}`)],
+    ["batches/:id", get(`/v1/batches/${routedId("batch-raw", "wfam/minted-batch-id")}`)],
   ];
 
   beforeAll(async () => {
