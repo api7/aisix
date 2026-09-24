@@ -42,7 +42,14 @@ const CHAT_STREAM = [
   "[DONE]",
 ];
 
-type Key = "openai" | "openai-stream" | "openai-bridged-responses" | "openai-operator-rename" | "azure";
+type Key =
+  | "openai"
+  | "openai-stream"
+  | "openai-bridged-responses"
+  | "openai-operator-rename"
+  | "openai-default-cap"
+  | "azure"
+  | "azure-default-cap";
 type Inbound = "chat" | "chat-stream" | "messages" | "responses";
 
 interface Case {
@@ -89,6 +96,46 @@ const cases: Case[] = [
   { label: "azure o-series deployment", key: "azure", inbound: "chat", upstreamModel: "prod-o3-deploy", want: { max_completion_tokens: 50 } },
   { label: "azure gpt-5-chat", key: "azure", inbound: "chat", upstreamModel: "gpt-5-chat", want: { max_completion_tokens: 50 } },
   { label: "azure gpt-4o deployment", key: "azure", inbound: "chat", upstreamModel: "gpt-4o-prod", want: { max_tokens: 50 } },
+  // A key's `default_body_fields` `max_tokens` fills in behind the caller: it
+  // must not come back beside a converted cap, and it is converted itself.
+  {
+    label: "openai, key default max_tokens, caller sent max_tokens",
+    key: "openai-default-cap",
+    inbound: "chat",
+    upstreamModel: "o4-mini",
+    want: { max_completion_tokens: 50 },
+  },
+  {
+    label: "openai, key default max_tokens, caller sent no cap",
+    key: "openai-default-cap",
+    inbound: "chat",
+    upstreamModel: "gpt-5-pro",
+    extra: { max_tokens: undefined },
+    want: { max_completion_tokens: 64 },
+  },
+  {
+    label: "openai non-reasoning, key default max_tokens, caller sent no cap",
+    key: "openai-default-cap",
+    inbound: "chat",
+    upstreamModel: "gpt-4o-mini",
+    extra: { max_tokens: undefined },
+    want: { max_tokens: 64 },
+  },
+  {
+    label: "azure, key default max_tokens, caller sent max_tokens",
+    key: "azure-default-cap",
+    inbound: "chat",
+    upstreamModel: "o4-default-deploy",
+    want: { max_completion_tokens: 50 },
+  },
+  {
+    label: "azure, key default max_tokens, caller sent no cap",
+    key: "azure-default-cap",
+    inbound: "chat",
+    upstreamModel: "gpt-5-default-deploy",
+    extra: { max_tokens: undefined },
+    want: { max_completion_tokens: 64 },
+  },
 ];
 
 describe("reasoning models receive max_completion_tokens (AISIX-Cloud#936)", () => {
@@ -149,6 +196,24 @@ describe("reasoning models receive max_completion_tokens (AISIX-Cloud#936)", () 
           request: { param_renames: { max_completion_tokens: "max_tokens" } },
         })
       ).id,
+      "openai-default-cap": (
+        await seed.createProviderKey({
+          display_name: "k936-openai-default-cap",
+          secret: "sk-mock",
+          api_base: `${plain.baseUrl}/v1`,
+          request: { default_body_fields: { max_tokens: 64 } },
+        })
+      ).id,
+      "azure-default-cap": (
+        await seed.createProviderKey({
+          display_name: "k936-azure-default-cap",
+          secret: "azure-mock",
+          api_base: plain.baseUrl,
+          provider: "azure",
+          adapter: "azure-openai",
+          request: { default_body_fields: { max_tokens: 64 } },
+        })
+      ).id,
       azure: (
         await seed.createProviderKey({
           display_name: "k936-azure",
@@ -162,7 +227,7 @@ describe("reasoning models receive max_completion_tokens (AISIX-Cloud#936)", () 
     for (const c of cases) {
       await seed.createModel({
         display_name: `m936-${c.upstreamModel}`,
-        provider: c.key === "azure" ? "azure" : "openai",
+        provider: c.key.startsWith("azure") ? "azure" : "openai",
         model_name: c.upstreamModel,
         provider_key_id: keys[c.key],
       });

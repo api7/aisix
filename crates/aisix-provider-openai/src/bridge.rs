@@ -360,7 +360,14 @@ fn prepare_outbound_body<T: serde::Serialize>(
         if let Some(constraints) = &r.param_constraints {
             apply_param_constraints(&mut body, constraints);
         }
+        // A default `max_tokens` fills a cap the caller did not send, so a
+        // reasoning model needs it converted as well; a `max_tokens` already
+        // present here was put back by the operator's own rename and stays.
+        let had_max_tokens = body.get("max_tokens").is_some();
         apply_default_body_fields(&mut body, &r.default_body_fields);
+        if reasoning_model && !had_max_tokens {
+            crate::reasoning::apply_reasoning_token_cap(&mut body);
+        }
     }
     if response.is_some_and(|r| r.content_list_to_string) {
         apply_content_list_to_string(&mut body);
