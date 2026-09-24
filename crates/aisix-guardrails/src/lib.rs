@@ -852,6 +852,12 @@ pub trait Guardrail: Send + Sync + 'static {
     /// for it is pure latency with no security benefit. Default: `true`
     /// (assume output-relevant, secure-leaning); input-only impls override
     /// to gate on their hook.
+    ///
+    /// [`GuardrailChain`] also skips a member outright — no check call, no
+    /// execution record — on a hook this (or [`Self::runs_on_input`])
+    /// answers `false` for, so it must agree exactly with the hook gate
+    /// inside the kind's own checks: a hook it wrongly denies is a hook the
+    /// guardrail silently stops enforcing.
     fn runs_on_output(&self) -> bool {
         true
     }

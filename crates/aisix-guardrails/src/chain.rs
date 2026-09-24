@@ -40,6 +40,21 @@ struct ChainMember {
     input_messages: GuardrailInputMessages,
 }
 
+impl ChainMember {
+    /// Whether this member takes part in the given phase at all. The chain
+    /// asks once, here, and skips a member that does not apply — no call
+    /// and no execution record — so a single-hook row leaves no trace on
+    /// the hook it is not attached to. `runs_on_*` is each kind's own
+    /// statement of its hook point, the same one its checks gate on.
+    fn applies(&self, input: bool) -> bool {
+        if input {
+            self.guardrail.runs_on_input()
+        } else {
+            self.guardrail.runs_on_output()
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct GuardrailChain {
     members: Vec<ChainMember>,
@@ -330,7 +345,7 @@ impl GuardrailChain {
         let mut bypass: Option<String> = None;
         let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
         let narrowed = latest_turn_view_if_needed(&self.members, req);
-        for m in &self.members {
+        for m in self.members.iter().filter(|m| m.applies(true)) {
             let started = Instant::now();
             let input = member_input(m, req, &narrowed);
             let (verdict, member_hits) = if unmaskable {
@@ -394,7 +409,7 @@ impl GuardrailChain {
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
         let mut bypass: Option<String> = None;
         let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
-        for m in &self.members {
+        for m in self.members.iter().filter(|m| m.applies(false)) {
             let started = Instant::now();
             let (verdict, member_hits) = if unmaskable {
                 m.guardrail.check_output_unmaskable_observed(resp).await
@@ -803,7 +818,7 @@ impl Guardrail for GuardrailChain {
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
         let mut bypass: Option<String> = None;
         let narrowed = latest_turn_view_if_needed(&self.members, req);
-        for m in &self.members {
+        for m in self.members.iter().filter(|m| m.applies(true)) {
             let started = Instant::now();
             let verdict = m
                 .guardrail
@@ -843,7 +858,7 @@ impl Guardrail for GuardrailChain {
 
     async fn check_output(&self, resp: &ChatResponse) -> GuardrailVerdict {
         let mut bypass: Option<String> = None;
-        for m in &self.members {
+        for m in self.members.iter().filter(|m| m.applies(false)) {
             let started = Instant::now();
             let verdict = m.guardrail.check_output(resp).await;
             record_execution(
@@ -914,7 +929,7 @@ impl Guardrail for GuardrailChain {
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
         let mut bypass: Option<String> = None;
         let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
-        for m in &self.members {
+        for m in self.members.iter().filter(|m| m.applies(false)) {
             let started = Instant::now();
             let (verdict, member_hits) = m.guardrail.check_output_non_local_observed(resp).await;
             // A local member answers through `check_local_segments`; this
@@ -965,7 +980,7 @@ impl Guardrail for GuardrailChain {
         let mut bypass: Option<String> = None;
         let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
         let narrowed = latest_turn_view_if_needed(&self.members, req);
-        for m in &self.members {
+        for m in self.members.iter().filter(|m| m.applies(true)) {
             let started = Instant::now();
             let (verdict, member_hits) = m
                 .guardrail
@@ -1020,7 +1035,7 @@ impl Guardrail for GuardrailChain {
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
         let mut bypass: Option<String> = None;
         let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
-        for m in &self.members {
+        for m in self.members.iter().filter(|m| m.applies(false)) {
             let started = Instant::now();
             let (verdict, member_hits) = m.guardrail.check_output_non_segment_observed(resp).await;
             if !m.guardrail.judged_by_segments() {
@@ -1088,7 +1103,7 @@ impl Guardrail for GuardrailChain {
         let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
         let mut in_window: Option<Vec<ScanSegment>> = None;
         for m in &self.members {
-            if !m.guardrail.checks_local_segments() {
+            if !m.guardrail.checks_local_segments() || !m.applies(input) {
                 continue;
             }
             let view: &[ScanSegment] =
@@ -1187,7 +1202,7 @@ impl Guardrail for GuardrailChain {
     async fn check_input_non_segment(&self, req: &ChatFormat) -> GuardrailVerdict {
         let mut bypass: Option<String> = None;
         let narrowed = latest_turn_view_if_needed(&self.members, req);
-        for m in &self.members {
+        for m in self.members.iter().filter(|m| m.applies(true)) {
             let started = Instant::now();
             let verdict = m
                 .guardrail
@@ -1227,7 +1242,7 @@ impl Guardrail for GuardrailChain {
 
     async fn check_output_non_segment(&self, resp: &ChatResponse) -> GuardrailVerdict {
         let mut bypass: Option<String> = None;
-        for m in &self.members {
+        for m in self.members.iter().filter(|m| m.applies(false)) {
             let started = Instant::now();
             let verdict = m.guardrail.check_output_non_segment(resp).await;
             if !m.guardrail.judged_by_segments() {
@@ -1324,7 +1339,7 @@ async fn fold_segments(
     let mut bypass: Option<String> = None;
     let mut monitor_hits: Vec<GuardrailMonitorHit> = Vec::new();
     for m in members {
-        if !m.guardrail.moderates_segments() {
+        if !m.guardrail.moderates_segments() || !m.applies(input) {
             continue;
         }
         let full: &[String] = masked.as_deref().unwrap_or(texts);
@@ -2999,5 +3014,112 @@ mod tests {
             KeywordRule::literal("AKIA"),
         ]))]);
         assert!(chain.check_input(&req("AKIA")).await.is_block());
+    }
+
+    /// A member attached to one hook, answering Allow everywhere — what
+    /// every kind returns on a hook it is not attached to.
+    struct Hooked {
+        input: bool,
+        output: bool,
+        segments: bool,
+        local: bool,
+    }
+
+    #[async_trait]
+    impl Guardrail for Hooked {
+        fn name(&self) -> &'static str {
+            "hooked"
+        }
+        fn runs_on_input(&self) -> bool {
+            self.input
+        }
+        fn runs_on_output(&self) -> bool {
+            self.output
+        }
+        fn moderates_segments(&self) -> bool {
+            self.segments
+        }
+        fn checks_local_segments(&self) -> bool {
+            self.local
+        }
+        async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+            GuardrailVerdict::Allow
+        }
+    }
+
+    /// A member leaves an execution record only on the hooks it is attached
+    /// to, through every fold that records one: a single-hook row must not
+    /// put zero-length `allowed` samples on the other phase's series.
+    #[tokio::test]
+    async fn a_member_records_only_on_the_hooks_it_is_attached_to() {
+        let hooked = |name: &str, input, output, segments, local| {
+            (
+                name.to_owned(),
+                Arc::new(Hooked {
+                    input,
+                    output,
+                    segments,
+                    local,
+                }) as Arc<dyn Guardrail>,
+            )
+        };
+        let (chain, sink) = sinked_chain(
+            vec![
+                hooked("in", true, false, false, false),
+                hooked("out", false, true, false, false),
+                hooked("both", true, true, false, false),
+                hooked("seg-in", true, false, true, false),
+                hooked("local-out", false, true, false, true),
+            ],
+            Vec::new(),
+        );
+        let seen = |phase: &str| {
+            sink.take()
+                .into_iter()
+                .map(|r| {
+                    assert_eq!(r.phase, phase, "{r:?}");
+                    r.guardrail
+                })
+                .collect::<Vec<_>>()
+        };
+        let (r, o) = (req("clean"), resp("clean"));
+        let segs = [ScanSegment {
+            text: "clean".to_owned(),
+            role: crate::SegmentRole::Rewritable,
+            in_latest_turn: true,
+        }];
+        let texts = ["clean".to_owned()];
+
+        chain.check_input(&r).await;
+        assert_eq!(seen("input"), ["in", "both", "seg-in"]);
+        chain.check_input_observed(&r).await;
+        assert_eq!(seen("input"), ["in", "both", "seg-in"]);
+        chain.check_input_unmaskable_observed(&r).await;
+        assert_eq!(seen("input"), ["in", "both", "seg-in"]);
+        chain.check_input_non_segment(&r).await;
+        assert_eq!(seen("input"), ["in", "both"]);
+        chain.check_input_non_segment_observed(&r).await;
+        assert_eq!(seen("input"), ["in", "both"]);
+        chain.moderate_input_segments(&texts).await;
+        assert_eq!(seen("input"), ["seg-in"]);
+        chain.check_local_segments(&segs, true);
+        assert!(seen("input").is_empty());
+
+        chain.check_output(&o).await;
+        assert_eq!(seen("output"), ["out", "both", "local-out"]);
+        chain.check_output_observed(&o).await;
+        assert_eq!(seen("output"), ["out", "both", "local-out"]);
+        chain.check_output_unmaskable_observed(&o).await;
+        assert_eq!(seen("output"), ["out", "both", "local-out"]);
+        chain.check_output_non_segment(&o).await;
+        assert_eq!(seen("output"), ["out", "both"]);
+        chain.check_output_non_segment_observed(&o).await;
+        assert_eq!(seen("output"), ["out", "both"]);
+        chain.check_output_non_local_observed(&o).await;
+        assert_eq!(seen("output"), ["out", "both"]);
+        chain.moderate_output_segments(&texts).await;
+        assert!(seen("output").is_empty());
+        chain.check_local_segments(&segs, false);
+        assert_eq!(seen("output"), ["local-out"]);
     }
 }
