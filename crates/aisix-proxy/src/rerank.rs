@@ -473,8 +473,9 @@ async fn dispatch(
                     matches!(provider_label.as_str(), "openai" | "cohere" | "jina");
                 if !provider_allowed {
                     return Err(ProxyError::InvalidRequest(format!(
-                        "model `{model_name}` is not an OpenAI, Cohere, or Jina provider; \
-                     /v1/rerank requires OpenAI, Cohere, or Jina"
+                        "{} is not an OpenAI, Cohere, or Jina provider; \
+                     /v1/rerank requires OpenAI, Cohere, or Jina",
+                        crate::routing::refused_model_label(model_name, &target.model)
                     )));
                 }
 

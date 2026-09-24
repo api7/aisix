@@ -522,6 +522,17 @@ pub(crate) struct Dispatched<T> {
     pub in_flight: crate::health::InFlightGuard,
 }
 
+/// The caller-addressed model as a refusal names it, with the dispatched
+/// target added when the two differ (a Model Group member), so a group
+/// holding a target the endpoint cannot serve says which one.
+pub(crate) fn refused_model_label(addressed: &str, target: &aisix_core::Model) -> String {
+    if crate::model_resolve::row_serves_name(target, addressed) {
+        format!("model `{addressed}`")
+    } else {
+        format!("model `{addressed}` (target `{}`)", target.display_name)
+    }
+}
+
 /// Dispatch a single-shot (non-streaming-relay) request to the Model the
 /// caller addressed: a direct model is its own only target, a Model Group
 /// walks its `routing.targets` exactly as `/v1/chat/completions` does

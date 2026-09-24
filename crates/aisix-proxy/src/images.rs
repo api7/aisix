@@ -456,8 +456,9 @@ async fn dispatch(
                 // at the gateway boundary.
                 if target.model.provider.as_deref() != Some("openai") {
                     return Err(ProxyError::InvalidRequest(format!(
-                        "model `{model_name}` is not an OpenAI provider; \
-                         /v1/images/generations requires OpenAI"
+                        "{} is not an OpenAI provider; \
+                         /v1/images/generations requires OpenAI",
+                        crate::routing::refused_model_label(model_name, &target.model)
                     )));
                 }
                 let provider =

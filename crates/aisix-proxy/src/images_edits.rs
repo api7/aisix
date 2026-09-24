@@ -521,8 +521,9 @@ async fn dispatch(
                 // (Gemini / Vertex / BFL) are the AISIX-Cloud#1360 Phase 2 follow-up.
                 if model.provider.as_deref() != Some("openai") {
                     return Err(ProxyError::InvalidRequest(format!(
-                        "model `{model_name}` is not an OpenAI provider; \
-                         /v1/images/edits requires OpenAI"
+                        "{} is not an OpenAI provider; \
+                         /v1/images/edits requires OpenAI",
+                        crate::routing::refused_model_label(model_name, model)
                     )));
                 }
 
@@ -1213,6 +1214,37 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("requires OpenAI"));
+    }
+
+    /// A Model Group whose first target is not OpenAI ends the request with
+    /// the same 400, naming the group and the target, without trying the
+    /// next one: every target of a group must serve the endpoint.
+    #[tokio::test]
+    async fn a_group_with_a_non_openai_target_names_it_in_the_400() {
+        let snap = new_snap("http://unused");
+        snap.models.insert(anthropic_model_entry("claude-img"));
+        let mut ok = model_entry("edit-ok");
+        ok.id = "m-ok".into();
+        snap.models.insert(ok);
+        let group: Model = serde_json::from_str(
+            r#"{"display_name":"mixed-group","routing":{"strategy":"failover","targets":[{"model":"claude-img"},{"model":"edit-ok"}]}}"#,
+        )
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-group", group, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, make_req("mixed-group", "add a hat"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["error"]["message"],
+            "request payload is invalid: model `mixed-group` (target `claude-img`) \
+             is not an OpenAI provider; /v1/images/edits requires OpenAI"
+        );
     }
 
     /// `stream=true` (partial-image SSE) is not relayed yet — explicit
