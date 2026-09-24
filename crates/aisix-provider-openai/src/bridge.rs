@@ -768,7 +768,7 @@ where
         // it here. Both forms occur in the wild (the OpenAI SDK
         // tolerates both), so we treat `finish()`-returned Done the
         // same as a feed()-returned Done.
-        match decoder.finish() {
+        match decoder.finish().map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
             Some(SseEvent::Done) => {
                 done_marker_seen = true;
             }

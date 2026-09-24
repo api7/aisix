@@ -1335,7 +1335,10 @@ impl VertexBridge {
             }
             // Flush a partial trailing chunk if the connection drops
             // without a final blank line.
-            if let Some(SseEvent::Data(data)) = decoder.finish() {
+            if let Some(SseEvent::Data(data)) = decoder
+                .finish()
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+            {
                 let parsed = parse_vertex_openai_stream_payload(
                     &data,
                     "vertex openai-shim stream tail parse",
@@ -1554,7 +1557,10 @@ impl VertexBridge {
                     }
                 }
             }
-            if let Some(SseEvent::Data(data)) = decoder.finish() {
+            if let Some(SseEvent::Data(data)) = decoder
+                .finish()
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+            {
                 let parsed = parse_vertex_openai_stream_payload(
                     &data,
                     "vertex partner :streamRawPredict tail parse",
@@ -1688,7 +1694,10 @@ impl VertexBridge {
             // cleanly so this rarely fires, but it covers a partial
             // last chunk if the upstream connection drops without a
             // final `\n\n`.
-            if let Some(SseEvent::Data(data)) = decoder.finish() {
+            if let Some(SseEvent::Data(data)) = decoder
+                .finish()
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+            {
                 let parsed = parse_vertex_gemini_stream_payload(
                     &data,
                     "vertex stream tail parse",

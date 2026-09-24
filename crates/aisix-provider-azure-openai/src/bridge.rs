@@ -894,7 +894,7 @@ where
                 }
             }
         }
-        match decoder.finish() {
+        match decoder.finish().map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
             Some(SseEvent::Done) => {
                 done_marker_seen = true;
             }

@@ -327,6 +327,9 @@ pub enum SseEvent {
 #[derive(Debug)]
 pub struct SseDecoder {
     frames: SseFrameSplitter,
+    /// A frame outgrew the bound after this feed's complete frames were
+    /// returned; the next feed reports it.
+    overflow: Option<SseFrameTooLarge>,
 }
 
 impl Default for SseDecoder {
@@ -343,27 +346,44 @@ impl SseDecoder {
     pub fn with_max_frame_bytes(max_frame_bytes: usize) -> Self {
         Self {
             frames: SseFrameSplitter::new(max_frame_bytes),
+            overflow: None,
         }
     }
 
     /// Feed a chunk of bytes. Returns every event this feed completed, or
-    /// the error that ends the stream: a frame outgrew the bound.
+    /// the error that ends the stream: a frame outgrew the bound. Events
+    /// completed ahead of the oversized frame are returned first, and the
+    /// error on the next call.
     pub fn feed<'a>(
         &mut self,
         bytes: impl Into<Cow<'a, [u8]>>,
     ) -> Result<Vec<SseEvent>, SseFrameTooLarge> {
+        if let Some(err) = self.overflow.clone() {
+            return Err(err);
+        }
         self.frames.push(&bytes.into());
         let mut events = Vec::new();
-        while let Some(frame) = self.frames.next_frame()? {
-            events.extend(decode_event(&frame));
+        loop {
+            match self.frames.next_frame() {
+                Ok(Some(frame)) => events.extend(decode_event(&frame)),
+                Ok(None) => return Ok(events),
+                Err(err) if events.is_empty() => return Err(err),
+                Err(err) => {
+                    self.overflow = Some(err);
+                    return Ok(events);
+                }
+            }
         }
-        Ok(events)
     }
 
     /// Flush the unterminated trailing frame, if any. Call once the body
-    /// has ended.
-    pub fn finish(&mut self) -> Option<SseEvent> {
-        decode_event(&self.frames.take_rest())
+    /// has ended. A frame that outgrew the bound is the error a later feed
+    /// would have reported, never flushed.
+    pub fn finish(&mut self) -> Result<Option<SseEvent>, SseFrameTooLarge> {
+        match self.overflow.take() {
+            Some(err) => Err(err),
+            None => Ok(decode_event(&self.frames.take_rest())),
+        }
     }
 }
 
@@ -445,7 +465,7 @@ mod tests {
         for chunk in ["data: {\"x\":1}\r", "\n\r", "\ndata: {\"y\":2}\r\n", "\r\n"] {
             seen.extend(d.feed(chunk.as_bytes()).unwrap());
         }
-        seen.extend(d.finish());
+        seen.extend(d.finish().unwrap());
         assert_eq!(
             seen,
             vec![
@@ -516,14 +536,14 @@ mod tests {
         let mut d = SseDecoder::new();
         let mid = d.feed(b"data: tail-only".as_slice()).unwrap();
         assert!(mid.is_empty());
-        let finale = d.finish();
+        let finale = d.finish().unwrap();
         assert_eq!(finale, Some(SseEvent::Data("tail-only".into())));
     }
 
     #[test]
     fn finish_on_empty_buffer_returns_none() {
         let mut d = SseDecoder::new();
-        assert!(d.finish().is_none());
+        assert!(d.finish().unwrap().is_none());
     }
 
     // ---- regression coverage for issue #111 -------------------------
@@ -591,7 +611,7 @@ mod tests {
         d.feed(b"data: ".as_slice()).unwrap();
         // First two bytes of the 3-byte sequence for "你" — no third byte ever arrives.
         d.feed(&[0xE4_u8, 0xBD][..]).unwrap();
-        let final_event = d.finish().expect("trailing bytes should surface");
+        let final_event = d.finish().unwrap().expect("trailing bytes should surface");
         let SseEvent::Data(s) = final_event else {
             panic!("expected Data event");
         };
@@ -812,6 +832,23 @@ mod tests {
             d.feed(&b"data: 0123456789abc"[..]),
             Err(SseFrameTooLarge { limit: 16 })
         );
+    }
+
+    /// Events completed in the same chunk as an oversized tail are returned
+    /// before the overflow is reported — by the next feed, or by `finish`
+    /// when the body ends there — and the oversized frame is never flushed.
+    #[test]
+    fn decoder_returns_completed_events_before_reporting_overflow() {
+        let chunk = &b"data: done\n\ndata: 0123456789abcdef"[..];
+        let too_large = SseFrameTooLarge { limit: 16 };
+
+        let mut d = SseDecoder::with_max_frame_bytes(16);
+        assert_eq!(d.feed(chunk), Ok(vec![SseEvent::Data("done".into())]));
+        assert_eq!(d.feed(&b"\n\n"[..]), Err(too_large.clone()));
+
+        let mut d = SseDecoder::with_max_frame_bytes(16);
+        assert_eq!(d.feed(chunk), Ok(vec![SseEvent::Data("done".into())]));
+        assert_eq!(d.finish(), Err(too_large));
     }
 
     /// Bytes are decoded per complete frame, so a multibyte character split

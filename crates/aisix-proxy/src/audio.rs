@@ -896,7 +896,7 @@ where
         if let Some(mut d) = decoder.take() {
             observe_transcript_events(
                 guard.observed(),
-                &d.finish().into_iter().collect::<Vec<_>>(),
+                &d.finish().ok().flatten().into_iter().collect::<Vec<_>>(),
                 text_cap,
             );
         }
@@ -2128,7 +2128,7 @@ fn extract_sse_token_usage(headers: &HeaderMap, body: &[u8]) -> Option<(u32, u32
     // no bound applies to it here.
     let mut decoder = aisix_gateway::SseDecoder::with_max_frame_bytes(usize::MAX);
     let mut events = decoder.feed(body).ok()?;
-    events.extend(decoder.finish());
+    events.extend(decoder.finish().ok()?);
     events.iter().rev().find_map(|event| match event {
         aisix_gateway::SseEvent::Data(payload) => serde_json::from_str::<Value>(payload)
             .ok()
