@@ -869,7 +869,7 @@ mod tests {
 
         let mut req = ChatFormat::new("m", vec![ChatMessage::user("weather?")]);
         req.extra = extra;
-        let messages = messages_from(&req);
+        let messages = messages_from(&req, DeveloperRoleMode::Preserve);
         let typed = build_request(&req, "gpt-4o", &messages, false);
         let body = prepare_outbound_body(&typed, None, None).unwrap();
 
@@ -919,7 +919,7 @@ mod tests {
                 "json_schema": {"name": "answer", "schema": schema, "strict": false},
             }),
         );
-        let messages = messages_from(&req);
+        let messages = messages_from(&req, DeveloperRoleMode::Preserve);
         let typed = build_request(&req, "gpt-4o", &messages, false);
         let body = prepare_outbound_body(&typed, None, None).unwrap();
         // Not strict: the caller's `required` is theirs, and OpenAI does

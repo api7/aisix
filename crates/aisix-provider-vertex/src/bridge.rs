@@ -2976,7 +2976,7 @@ mod tests {
                 ChatMessage::user("hi"),
             ],
         );
-        let body = build_gemini_request(&req);
+        let body = build_gemini_request(&req, "gemini-2.0-flash");
         assert_eq!(body.contents.len(), 1);
         let sys = body.system_instruction.as_ref().unwrap();
         assert_eq!(sys.parts[0].text, "follow application instructions");

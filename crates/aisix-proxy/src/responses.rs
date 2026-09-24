@@ -1048,7 +1048,7 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
                 let text = responses_item_text(item);
                 messages.push(match responses_item_role(item) {
                     Role::Assistant => ChatMessage::assistant(text),
-                    Role::System => ChatMessage::system(text),
+                    Role::System | Role::Developer => ChatMessage::system(text),
                     Role::Tool => ChatMessage::tool(text),
                     Role::User => ChatMessage::user(text),
                 });

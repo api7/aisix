@@ -988,7 +988,7 @@ mod tests {
 
         let mut req = ChatFormat::new("m", vec![ChatMessage::user("weather?")]);
         req.extra = extra;
-        let messages = messages_from(&req);
+        let messages = messages_from(&req, AZURE_DEVELOPER_ROLE_MODE);
         let typed = build_request(&req, "ci-chat", &messages, false);
         let body = prepare_outbound_body(&typed, None, None).unwrap();
 
