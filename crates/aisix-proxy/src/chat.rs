@@ -5627,7 +5627,8 @@ where
         let mut first_chunk_seen = false;
         let mut stream_usage: Option<aisix_gateway::chat::UsageStats> = None;
         let fold_base = base_usage != aisix_gateway::chat::UsageStats::default();
-        let mut held_usage_chunk: Option<aisix_gateway::ChatChunk> = None;
+        let mut last_chunk_id = String::new();
+        let mut last_chunk_model = String::new();
         // Render + serialise one held/live chunk into an SSE Event.
         // Serialisation of these plain structs can't realistically fail;
         // the Err arm mirrors the pre-hold-back defensive error frame.
@@ -5667,6 +5668,12 @@ where
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
                             attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                    }
+                    if !chunk.id.is_empty() {
+                        last_chunk_id.clone_from(&chunk.id);
+                    }
+                    if !chunk.model.is_empty() {
+                        last_chunk_model.clone_from(&chunk.model);
                     }
                     let comp = guard.comp();
                     if !chunk.id.is_empty() {
@@ -5780,29 +5787,31 @@ where
                     {
                         continue;
                     }
-                    // #614/#617: the ensemble panel's usage (`base_usage`) is
-                    // folded into the LAST usage-bearing frame only — a judge
-                    // may stamp usage on every chunk (Gemini/Vertex), and a
-                    // per-frame fold would bill the panel once per frame to a
-                    // client summing across them. So each usage-bearing chunk
-                    // is held until the next one arrives and then forwarded
-                    // with the judge's own usage; the one still held at EOF is
-                    // the terminal frame and carries `stream_usage + base`.
-                    // Single-upstream callers (`base_usage` zero) never hold.
+                    // #614/#617: an ensemble reports usage on ONE synthesized
+                    // terminal frame (judge + panel, emitted at EOF). A judge
+                    // may stamp usage on every chunk (Gemini/Vertex), so the
+                    // judge's own usage is stripped from each forwarded chunk
+                    // — forwarded immediately, no hold — and a chunk left with
+                    // nothing to carry is dropped. Single-upstream callers
+                    // (`base_usage` zero) are untouched.
                     if fold_base && chunk.usage.is_some() {
-                        held_usage_chunk.replace(chunk)
+                        let mut chunk = chunk;
+                        chunk.usage = None;
+                        if chunk.finish_reason.is_none()
+                            && chunk.delta.role.is_none()
+                            && chunk.delta.content.is_none()
+                            && chunk.delta.tool_calls.is_none()
+                            && chunk.delta.reasoning_content.is_none()
+                        {
+                            continue;
+                        }
+                        Some(chunk)
                     } else {
                         Some(chunk)
                     }
                 }
                 Err(err) => {
                     errored = true;
-                    if let Some(chunk) = held_usage_chunk.take() {
-                        if !hold_back || cap_released {
-                            let ev = chunk_event!(chunk);
-                            yield Ok::<_, Infallible>(ev);
-                        }
-                    }
                     crate::attempt::StreamFailure::record(&mut guard.comp().failure, &err);
                     let etype = err.error_type();
                     yield Ok::<_, Infallible>(
@@ -5985,20 +5994,24 @@ where
         // body only when the consumer pulls again. Same placement as the
         // sibling streams in messages.rs and responses_bridge.rs.
         guard.comp().reached_end = true;
-        if let Some(mut chunk) = held_usage_chunk.take() {
-            if !errored {
-                chunk.usage = Some(
-                    stream_usage
-                        .clone()
-                        .unwrap_or_default()
-                        .saturating_add(&base_usage),
-                );
-                if !hold_back || cap_released {
-                    let ev = chunk_event!(chunk);
-                    yield Ok::<_, Infallible>(ev);
-                } else {
-                    pending.push(chunk);
-                }
+        // #617: the ensemble's single usage frame — the judge's field-wise
+        // max plus the panel sum — stamped like the judge's last chunk.
+        let judge_usage = stream_usage
+            .as_ref()
+            .filter(|_| fold_base && client_requested_usage);
+        if let (Some(judge_usage), false) = (judge_usage, errored) {
+            let chunk = aisix_gateway::ChatChunk {
+                id: std::mem::take(&mut last_chunk_id),
+                model: std::mem::take(&mut last_chunk_model),
+                delta: Default::default(),
+                finish_reason: None,
+                usage: Some(judge_usage.saturating_add(&base_usage)),
+            };
+            if !hold_back || cap_released {
+                let ev = chunk_event!(chunk);
+                yield Ok::<_, Infallible>(ev);
+            } else {
+                pending.push(chunk);
             }
         }
         // Per #204: run the output guardrail on the accumulated

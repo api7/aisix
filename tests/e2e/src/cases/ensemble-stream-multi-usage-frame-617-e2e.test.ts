@@ -14,10 +14,10 @@ import { slsLogsFor, startMockSls, waitForSlsLog, type MockSls } from "../harnes
 
 // E2E for api7/aisix#617: a streaming ensemble whose judge stamps `usage` on
 // more than one chunk (the Gemini/Vertex shape — cumulative counts on every
-// chunk) must add the panel's usage to the client stream exactly once, on the
-// terminal usage frame. Every earlier frame carries the judge's own usage
-// unchanged, and the billed UsageEvents stay one per sub-call at the judge's
-// final (not summed) counts.
+// chunk) must add the panel's usage to the client stream exactly once. The
+// judge chunks are forwarded with their usage stripped and one synthesized
+// terminal frame carries judge + panel, and the billed UsageEvents stay one
+// per sub-call at the judge's final (not summed) counts.
 
 const CALLER_PLAINTEXT = "sk-ensemble-multi-usage-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -58,10 +58,16 @@ const JUDGE_STREAM = [
   judgeChunk({ role: "assistant", content: "Hello" }, null, 1),
   judgeChunk({ content: " world" }, null, 3),
   judgeChunk({}, "stop", 7),
+  // Usage-only trailer (empty `choices`): nothing left once stripped.
+  JSON.stringify({
+    id: "chatcmpl-judge",
+    object: "chat.completion.chunk",
+    model: "judge-upstream",
+    choices: [],
+    usage: { prompt_tokens: 30, completion_tokens: 7, total_tokens: 37 },
+  }),
   "[DONE]",
 ];
-
-type Usage = { prompt_tokens: number; completion_tokens: number; total_tokens: number };
 
 function dataFrames(text: string): Array<Record<string, unknown>> {
   const frames: Array<Record<string, unknown>> = [];
@@ -184,18 +190,24 @@ describe("streaming ensemble folds the panel usage once with a multi-usage-frame
       .join("");
     expect(content).toBe("Hello world");
 
-    const usages = frames.filter((f) => f.usage != null).map((f) => f.usage as Usage);
-    // The judge stamped usage on three chunks; each still reaches the client.
-    expect(usages).toHaveLength(3);
-    // Intermediate frames: the judge's own cumulative usage, no panel folded in.
-    expect(usages[0]).toMatchObject({ prompt_tokens: 30, completion_tokens: 1, total_tokens: 31 });
-    expect(usages[1]).toMatchObject({ prompt_tokens: 30, completion_tokens: 3, total_tokens: 33 });
-    // Terminal frame: judge final + panel sum (10 / 22 / 32), exactly once.
-    expect(usages[2]).toMatchObject({ prompt_tokens: 40, completion_tokens: 29, total_tokens: 69 });
-    // …and it is the last data frame the client sees.
-    expect(frames[frames.length - 1]?.usage).toMatchObject({ total_tokens: 69 });
-    const panelFolds = usages.filter((u) => u.prompt_tokens >= 40).length;
-    expect(panelFolds).toBe(1);
+    // Only the synthesized terminal frame carries usage: every judge chunk
+    // reaches the client with its own usage stripped.
+    const usageFrames = frames.filter((f) => f.usage != null);
+    expect(usageFrames).toHaveLength(1);
+    const terminal = frames[frames.length - 1]!;
+    expect(usageFrames[0]).toBe(terminal);
+    // Judge final (30 / 7 / 37) + panel sum (10 / 22 / 32), exactly once.
+    expect(terminal.usage).toMatchObject({ prompt_tokens: 40, completion_tokens: 29, total_tokens: 69 });
+    expect(terminal.id).toBe("chatcmpl-judge");
+    expect(terminal.model).toBe(ENSEMBLE);
+    expect(terminal.choices).toEqual([{ index: 0, delta: {} }]);
+    // The stripped usage-only trailer is dropped, not forwarded empty: the
+    // terminal frame is the only chunk with nothing but an empty delta.
+    const emptyFrames = frames.filter((f) => {
+      const c = (f.choices as Array<{ delta?: object; finish_reason?: string | null }>)[0];
+      return Object.keys(c?.delta ?? {}).length === 0 && c?.finish_reason == null;
+    });
+    expect(emptyFrames).toEqual([terminal]);
 
     // Billing: one row per sub-call, the judge at its final counts (not summed
     // across its three usage frames, and never carrying the panel's).
