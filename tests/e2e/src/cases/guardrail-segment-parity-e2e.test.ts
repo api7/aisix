@@ -560,3 +560,161 @@ describe("guardrail segment parity e2e: chat and responses", () => {
     expect(JSON.parse(call.arguments!)).toEqual({ pin: "[PIN_REDACTED]", door: "front" });
   });
 });
+
+describe("guardrail segment parity e2e: streaming /v1/messages", () => {
+  // A monitor-only output chain forwards the stream live and checks it at
+  // end-of-stream; an enforcing one holds it back and masks the held frames.
+  // The preview must count what the enforcement masks: the tool_use input is
+  // judged value by value, not as the accumulated text.
+  const KEY = "sk-segment-parity-messages";
+  const LOGSTORE_M = "segment-parity-messages";
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let sls: MockSls | undefined;
+  let etcdReachable = false;
+
+  const STREAM_EVENTS = [
+    JSON.stringify({
+      type: "message_start",
+      message: {
+        id: "msg_seg",
+        role: "assistant",
+        content: [],
+        model: "claude-3-5-haiku-20241022",
+        stop_reason: null,
+        usage: { input_tokens: 5, output_tokens: 1 },
+      },
+    }),
+    JSON.stringify({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "tool_use", id: "tu_1", name: "unlock", input: {} },
+    }),
+    JSON.stringify({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "input_json_delta", partial_json: '{"pin":"1234",' },
+    }),
+    JSON.stringify({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "input_json_delta", partial_json: '"door":"front"}' },
+    }),
+    JSON.stringify({ type: "content_block_stop", index: 0 }),
+    JSON.stringify({
+      type: "message_delta",
+      delta: { stop_reason: "tool_use" },
+      usage: { output_tokens: 10 },
+    }),
+    JSON.stringify({ type: "message_stop" }),
+  ];
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    upstream = await startOpenAiUpstream({ streamEvents: STREAM_EVENTS, eventDelayMs: 2 });
+    sls = await startMockSls();
+    app = await spawnApp({
+      extraEnv: {
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",
+      },
+    });
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createObservabilityExporter({
+      name: "sls-segment-parity-messages",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: SLS_PROJECT,
+      logstore: LOGSTORE_M,
+      credential_ref: CREDENTIAL_REF,
+      content_mode: "metadata_only",
+    });
+    for (const mode of ["block", "monitor"]) {
+      const name = `seg-msg-${mode}`;
+      const pk = await seed.createProviderKey({
+        display_name: `${name}-pk`,
+        secret: "sk-anth-mock",
+        api_base: upstream.baseUrl,
+      });
+      const model = await seed.createModel({
+        display_name: name,
+        provider: "anthropic",
+        model_name: "claude-3-5-haiku-20241022",
+        provider_key_id: pk.id,
+      });
+      const g = await seed.createGuardrail(
+        {
+          name: `${name}-guard`,
+          enabled: true,
+          hook_point: "output",
+          enforcement_mode: mode,
+          kind: "pii",
+          custom_patterns: [{ name: "pin", regex: PIN, action: "mask" }],
+        },
+        { attach: false },
+      );
+      await seed.attachGuardrailToModel(g.id as string, model.id as string);
+    }
+    await seed.createApiKey({
+      key_hash: sha256(KEY),
+      allowed_models: ["seg-msg-block", "seg-msg-monitor"],
+    });
+    const proxy = new ProxyClient(app.proxyUrl, KEY);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
+  }, 90_000);
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+    await sls?.close();
+  });
+
+  const stream = async (model: string) => {
+    const res = await fetch(`${app!.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": KEY },
+      body: JSON.stringify({
+        model,
+        max_tokens: 64,
+        stream: true,
+        messages: [{ role: "user", content: "open the door" }],
+      }),
+    });
+    return { status: res.status, body: await res.text() };
+  };
+
+  const eventFor = (model: string) =>
+    waitForSlsLog(
+      sls!,
+      LOGSTORE_M,
+      (log) => log.get("requested_model") === model,
+      `usage event for ${model}`,
+    );
+
+  test("a live stream's would_mask equals the counts the held stream masks", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+
+    const enforced = await stream("seg-msg-block");
+    expect(enforced.status).toBe(200);
+    expect(enforced.body).toContain("[PIN_REDACTED]");
+    expect(enforced.body).not.toContain("1234");
+
+    const monitored = await stream("seg-msg-monitor");
+    expect(monitored.status).toBe(200);
+    expect(monitored.body).toContain("1234");
+
+    const counts = JSON.parse(
+      (await eventFor("seg-msg-block")).get("redacted_entity_counts") ?? "{}",
+    ) as Record<string, number>;
+    expect(counts).toEqual({ pin: 1 });
+    const hits = JSON.parse(
+      (await eventFor("seg-msg-monitor")).get("guardrail_monitor_hits") ?? "[]",
+    ) as MonitorHit[];
+    const preview = hits.find((h) => h.action === "would_mask" && h.hook === "output");
+    expect(preview?.counts).toEqual(counts);
+  });
+});
