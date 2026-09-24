@@ -629,6 +629,45 @@ pub(crate) fn emit_failed_attempts(
     attempts: &[crate::attempt::AttemptRecord],
     terminal_last: bool,
     guardrail_blocked: bool,
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    redactions: crate::redact::RedactionCounts,
+    audit: &GuardrailAudit,
+) {
+    emit_failed_attempts_as(
+        state,
+        snap,
+        surface,
+        "openai",
+        request_id,
+        requested_model,
+        api_key_id,
+        client,
+        applied_guardrails,
+        attempts,
+        terminal_last,
+        guardrail_blocked,
+        monitor_hits,
+        redactions,
+        audit,
+    );
+}
+
+/// [`emit_failed_attempts`] for a route whose callers speak a protocol
+/// other than OpenAI's — `/v1/messages/count_tokens` records `anthropic`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_failed_attempts_as(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    surface: Surface,
+    inbound_protocol: &str,
+    request_id: &str,
+    requested_model: &str,
+    api_key_id: &str,
+    client: &ClientContext,
+    applied_guardrails: &[aisix_core::AppliedGuardrail],
+    attempts: &[crate::attempt::AttemptRecord],
+    terminal_last: bool,
+    guardrail_blocked: bool,
     mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     mut redactions: crate::redact::RedactionCounts,
     audit: &GuardrailAudit,
@@ -645,7 +684,7 @@ pub(crate) fn emit_failed_attempts(
             requested_model: requested_model.to_string(),
             upstream_latency_ms: rec.latency_ms,
             status_code: rec.status,
-            inbound_protocol: "openai".to_string(),
+            inbound_protocol: inbound_protocol.to_string(),
             applied_guardrails: applied_guardrails.to_vec(),
             client_source_ip: client.source_ip.clone(),
             client_user_agent: client.user_agent.clone(),
