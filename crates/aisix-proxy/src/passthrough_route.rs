@@ -2000,9 +2000,10 @@ fn stream_response(
         let mut pending: Vec<Bytes> = Vec::new();
         // Frame bytes held under Window (a memory bound for delta-free runs).
         let mut held_bytes: usize = 0;
-        // Generated content held under BufferFull (#513) — what
-        // `max_buffer_bytes` caps; the SSE framing around it is not counted.
-        let mut held_content: usize = 0;
+        // What BufferFull holds (#513): content, which `max_buffer_bytes`
+        // caps (the SSE framing is not counted), and the raw frame bytes it
+        // bounds too.
+        let mut held_content = crate::held_content::HeldBuffer::default();
         // Unscanned delta text for the CURRENT window / buffer.
         let mut scan_buf = String::new();
         // Overlap carried between Window scans.
@@ -2106,9 +2107,9 @@ fn stream_response(
                     }
                     StreamOutputPolicy::BufferFull { max_buffer_bytes, on_exceeded_fail_open } => {
                         scan_buf.push_str(&delta);
-                        held_content += held;
+                        held_content.hold(held, frame.len());
                         pending.push(frame);
-                        if held_content > *max_buffer_bytes {
+                        if held_content.exceeds(*max_buffer_bytes) {
                             if *on_exceeded_fail_open {
                                 for f in pending.drain(..) {
                                     telemetry.mark_first_delivery();

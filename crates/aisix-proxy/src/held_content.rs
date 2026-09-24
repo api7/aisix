@@ -11,9 +11,61 @@
 //! Every hold-back route measures through this module so the definition
 //! cannot drift between them. A payload that is not one JSON document
 //! counts whole: nothing can separate its content from its envelope.
+//!
+//! Content is not memory, though: the held buffer keeps every frame whole,
+//! and frames that carry no content (pings, snapshots, base64 media) count
+//! nothing. So each hold-back also bounds the raw bytes it keeps, at
+//! [`RAW_HOLD_FACTOR`] times the same cap, through [`HeldBuffer`]. Crossing
+//! either bound is the same buffer-exceeded event.
 
 use aisix_gateway::ChatDelta;
 use serde_json::Value;
+
+/// Raw bytes a hold-back may keep, as a multiple of `max_buffer_bytes`
+/// (16 MiB at the 256 KiB default). Far above the framing an ordinary
+/// token stream wraps around its content, so a normal response still trips
+/// on content first.
+pub(crate) const RAW_HOLD_FACTOR: usize = 64;
+
+/// What one hold-back buffer holds: generated content (the cap
+/// `max_buffer_bytes` names) and the raw bytes kept to hold it.
+#[derive(Debug, Default)]
+pub(crate) struct HeldBuffer {
+    content: usize,
+    raw: usize,
+}
+
+impl HeldBuffer {
+    pub(crate) fn hold(&mut self, content: usize, raw: usize) {
+        self.content = self.content.saturating_add(content);
+        self.raw = self.raw.saturating_add(raw);
+    }
+
+    /// Past either bound: the content cap, or the raw-byte guard derived
+    /// from it.
+    pub(crate) fn exceeds(&self, max_buffer_bytes: usize) -> bool {
+        self.content > max_buffer_bytes
+            || self.raw > max_buffer_bytes.saturating_mul(RAW_HOLD_FACTOR)
+    }
+}
+
+/// Raw size of a held chat chunk: its serialized length, which is what the
+/// chunk occupies once rendered at release.
+pub(crate) fn chat_chunk_raw(chunk: &aisix_gateway::ChatChunk) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Count(0);
+    let _ = serde_json::to_writer(&mut c, chunk);
+    c.0
+}
 
 /// Held content in one normalised chat delta.
 pub(crate) fn chat_delta(delta: &ChatDelta) -> usize {
@@ -233,6 +285,18 @@ mod tests {
             "data: [DONE]\n\n",
         );
         assert_eq!(sse_frames(frames.as_bytes(), responses_event), 5 + 2);
+    }
+
+    #[test]
+    fn held_buffer_trips_on_content_or_on_raw_bytes() {
+        let mut b = HeldBuffer::default();
+        b.hold(10, 10 * RAW_HOLD_FACTOR);
+        assert!(!b.exceeds(10));
+        b.hold(1, 0);
+        assert!(b.exceeds(10), "content past the cap");
+        let mut b = HeldBuffer::default();
+        b.hold(0, 10 * RAW_HOLD_FACTOR + 1);
+        assert!(b.exceeds(10), "content-free bytes past the raw guard");
     }
 
     #[test]
