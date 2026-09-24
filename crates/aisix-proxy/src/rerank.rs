@@ -572,7 +572,7 @@ async fn dispatch(
     // operators need to see it).
     let (usage, provider_request_id) = match serde_json::from_slice::<Value>(&body_bytes) {
         Ok(v) => (
-            extract_rerank_usage(&v),
+            rerank_prompt_tokens(&v).map(|prompt_tokens| RerankUsage { prompt_tokens }),
             crate::usage_attr::provider_response_id(&v),
         ),
         Err(e) => {
@@ -666,7 +666,10 @@ async fn dispatch(
 /// Rerank has no completion side — all three providers tokenise
 /// only the input (query + documents). The single counter is what
 /// cp-api multiplies by the model's per-token price for billing.
-fn extract_rerank_usage(body: &Value) -> Option<RerankUsage> {
+///
+/// Shared with passthrough routes that relay a rerank body, so the typed
+/// endpoint and a route meter the same response identically.
+pub(crate) fn rerank_prompt_tokens(body: &Value) -> Option<u32> {
     // OpenAI-compat / Jina shape: `usage` object at the top level.
     if let Some(usage) = body.get("usage") {
         let tokens = usage
@@ -675,17 +678,13 @@ fn extract_rerank_usage(body: &Value) -> Option<RerankUsage> {
             .or_else(|| usage.get("total_tokens"))
             .and_then(|v| v.as_u64());
         if let Some(t) = tokens {
-            return Some(RerankUsage {
-                prompt_tokens: t as u32,
-            });
+            return Some(t as u32);
         }
     }
     // Cohere shape: `meta.billed_units.input_tokens`.
     if let Some(units) = body.get("meta").and_then(|m| m.get("billed_units")) {
         if let Some(t) = units.get("input_tokens").and_then(|v| v.as_u64()) {
-            return Some(RerankUsage {
-                prompt_tokens: t as u32,
-            });
+            return Some(t as u32);
         }
     }
     None
