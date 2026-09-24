@@ -202,8 +202,8 @@ jobs:
             org.opencontainers.image.licenses=Apache-2.0
 
       # Same short sha the `type=sha,prefix=sha-` tag uses, stamped into
-      # the binary so the DP's heartbeat reports `0.1.0+sha-<short>` and
-      # operators can match a node to its image tag.
+      # the binary so a DP reports `<version>+sha-<short>` (release) or
+      # `dev+sha-<short>` and operators can match a node to its image tag.
       - name: Compute short sha
         id: shortsha
         # First 7 chars of the commit sha — identical to what
@@ -213,7 +213,7 @@ jobs:
       # Release version stamped into the binary so the shipped image
       # self-reports the tagged version (Server header, --version,
       # heartbeat dp_version) with no manual Cargo.toml bump. Empty on
-      # non-tag builds → binary falls back to the crate version.
+      # non-tag builds → binary reports `dev+sha-<short>`.
       - name: Compute release version from tag
         id: relver
         run: |
@@ -279,15 +279,15 @@ jobs:
           docker run --rm --entrypoint /usr/local/bin/aisix "$IMG" --version | tee /tmp/aisix-version
           grep -qx "aisix ${VER}" /tmp/aisix-version
 
-      # Non-tag images get BUILD_VERSION="" from the step above; the binary
-      # must still report a real version (the crate fallback), never a bare
-      # `aisix ` — which is what the heartbeat and `Server` header carry too
-      # (aisix#974).
-      - name: Verify non-tag image self-reports a version
+      # Non-tag images get BUILD_VERSION="" and the short sha, so the binary
+      # must report `dev+sha-<short>` — the same string the `Server` header,
+      # the User-Agents and the heartbeat carry.
+      - name: Verify non-tag image self-reports dev+sha
         if: "!startsWith(github.ref, 'refs/tags/v')"
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
+          SHORT_SHA: ${{ steps.shortsha.outputs.value }}
         run: |
           set -eux
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -297,7 +297,8 @@ jobs:
             docker pull "$IMG"
           fi
           docker run --rm --entrypoint /usr/local/bin/aisix "$IMG" --version | tee /tmp/aisix-version
-          grep -qxE 'aisix [0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?' /tmp/aisix-version
+          test -n "$SHORT_SHA"
+          grep -qxF "aisix dev+sha-${SHORT_SHA}" /tmp/aisix-version
 
       # Fail-closed release gate (#967): every image built with PGO=on must
       # carry the proof marker the Dockerfile writes only after the
