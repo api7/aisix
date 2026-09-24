@@ -82,12 +82,12 @@ pub enum GuardrailHookPoint {
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailInputMessages {
     /// Read every message in the request, including replayed history and
-    /// system prompts.
+    /// system and developer messages.
     #[default]
     All,
     /// Read only the messages after the last assistant message, excluding
-    /// system messages: the current user message together with any tool
-    /// results answering it. Messages the model has already replied to are
+    /// system and developer messages: the current user message together
+    /// with any tool results answering it. Messages the model has already replied to are
     /// neither screened nor rewritten.
     LatestTurn,
 }
@@ -1369,10 +1369,10 @@ pub struct Guardrail {
     /// How much of the request this rule reads at the input hook.
     ///
     /// `all` (the default) scans every message the caller sent, including
-    /// replayed history and system prompts. `latest_turn` scans only the
-    /// messages after the last assistant message, with system messages
-    /// excluded — the current user message plus any tool results answering
-    /// it. It exists for clients that resend the whole conversation on
+    /// replayed history and system and developer messages. `latest_turn`
+    /// scans only the messages after the last assistant message, with
+    /// system and developer messages excluded — the current user message
+    /// plus any tool results answering it. It exists for clients that resend the whole conversation on
     /// every call, where a rule that matched one earlier message would
     /// otherwise keep refusing the rest of the session.
     ///
