@@ -3133,6 +3133,72 @@ mod tests {
         assert_eq!(counts.get("email"), Some(&1));
     }
 
+    /// #1027: a Responses stream restates each delta channel on its
+    /// aggregate events. The mask pass counts a span once, so a collector
+    /// must tell the restatements apart — or a monitor preview counts the
+    /// same span three times.
+    #[test]
+    fn responses_sse_aggregates_are_collected_as_echoes() {
+        use aisix_guardrails::SegmentRole;
+        let raw = concat!(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"mail a@x.com ok\"}\n\n",
+            "event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"item_id\":\"msg_1\",\"text\":\"mail a@x.com ok\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"mail a@x.com ok\"}]}]}}\n\n",
+        );
+        let segments = collect_segments(|g| {
+            let _ = redact_responses_sse(g, raw.as_bytes());
+        });
+        let counted: Vec<&str> = segments
+            .iter()
+            .filter(|s| s.role == SegmentRole::Rewritable)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(counted, vec!["mail a@x.com ok"]);
+        assert_eq!(
+            segments
+                .iter()
+                .filter(|s| s.role == SegmentRole::Echo)
+                .count(),
+            2
+        );
+    }
+
+    /// #1027: a tool call's arguments are offered value by value, each key
+    /// as a label, and the tool name as a scan-only slot.
+    #[test]
+    fn chat_tool_call_arguments_are_offered_as_values_keys_and_a_name() {
+        use aisix_guardrails::SegmentRole;
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "unlock", "arguments": "{\"pin\":\"1234\",\"door\":{\"side\":\"front\"}}"}
+                }]
+            }]
+        }))
+        .unwrap();
+        let segments = collect_segments(|g| {
+            let _ = redact_chat_format(g, &mut req);
+        });
+        let got: Vec<(&str, SegmentRole)> =
+            segments.iter().map(|s| (s.text.as_str(), s.role)).collect();
+        for want in [
+            ("unlock", SegmentRole::ScanOnly),
+            ("pin", SegmentRole::Label),
+            ("1234", SegmentRole::Rewritable),
+            ("door", SegmentRole::Label),
+            ("side", SegmentRole::Label),
+            ("front", SegmentRole::Rewritable),
+        ] {
+            assert!(got.contains(&want), "missing {want:?} in {got:?}");
+        }
+        assert_eq!(got.len(), 6, "{got:?}");
+    }
+
     /// The bridged encoder now emits reasoning-summary frames alongside the
     /// message frames it always did. Generated reasoning is out of
     /// output-guardrail scope, so an output mask that rewrites the held
