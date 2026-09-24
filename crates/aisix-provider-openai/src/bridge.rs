@@ -42,6 +42,7 @@ use crate::overrides::{
     apply_param_renames, apply_stream_done_marker_policy, extract_reasoning_field,
     StreamDoneOutcome,
 };
+use crate::reasoning::{is_reasoning_model, ReasoningFamily};
 use crate::wire::{
     build_request, embed_request_body, embed_response_into, messages_from,
     response_into_chat_response, stream_chunk_into_chat_chunk, DeveloperRoleMode,
@@ -328,12 +329,17 @@ where
 /// gateway convention). Anything not configured is a no-op.
 fn prepare_outbound_body<T: serde::Serialize>(
     typed: &T,
+    reasoning_model: bool,
     request: Option<&RequestOverrides>,
     response: Option<&ResponseOverrides>,
 ) -> Result<Value, BridgeError> {
     let mut body = serde_json::to_value(typed)
         .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
     close_strict_response_format_schema(&mut body);
+    // Before `param_renames`, so an operator's explicit rename wins.
+    if reasoning_model {
+        crate::reasoning::apply_reasoning_token_cap(&mut body);
+    }
     if let Some(r) = request {
         apply_param_renames(&mut body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
@@ -448,6 +454,7 @@ impl Bridge for OpenAiBridge {
         let typed = build_request(req, upstream, &messages, false);
         let body = prepare_outbound_body(
             &typed,
+            is_reasoning_model(ReasoningFamily::Openai, upstream),
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
@@ -501,6 +508,7 @@ impl Bridge for OpenAiBridge {
         // consistency follow-up). No-op when the PK carries no overrides.
         let body = prepare_outbound_body(
             &embed_request_body(req, upstream),
+            false,
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
@@ -559,6 +567,7 @@ impl Bridge for OpenAiBridge {
         // follow-up); no-op when none are configured.
         let outbound = prepare_outbound_body(
             &outbound,
+            false,
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
@@ -616,6 +625,7 @@ impl Bridge for OpenAiBridge {
         // follow-up); no-op when none are configured.
         let outbound = prepare_outbound_body(
             &outbound,
+            false,
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
@@ -665,6 +675,7 @@ impl Bridge for OpenAiBridge {
         let typed = build_request(req, upstream, &messages, true);
         let body = prepare_outbound_body(
             &typed,
+            is_reasoning_model(ReasoningFamily::Openai, upstream),
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
@@ -871,7 +882,7 @@ mod tests {
         req.extra = extra;
         let messages = messages_from(&req, DeveloperRoleMode::Preserve);
         let typed = build_request(&req, "gpt-4o", &messages, false);
-        let body = prepare_outbound_body(&typed, None, None).unwrap();
+        let body = prepare_outbound_body(&typed, false, None, None).unwrap();
 
         assert_eq!(
             body["response_format"],
@@ -921,7 +932,7 @@ mod tests {
         );
         let messages = messages_from(&req, DeveloperRoleMode::Preserve);
         let typed = build_request(&req, "gpt-4o", &messages, false);
-        let body = prepare_outbound_body(&typed, None, None).unwrap();
+        let body = prepare_outbound_body(&typed, false, None, None).unwrap();
         // Not strict: the caller's `required` is theirs, and OpenAI does
         // not demand the closing.
         assert_eq!(body["response_format"]["json_schema"]["schema"], schema);

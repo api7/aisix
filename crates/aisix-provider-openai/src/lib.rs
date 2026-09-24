@@ -13,6 +13,7 @@
 
 mod bridge;
 pub mod overrides;
+pub mod reasoning;
 pub mod wire;
 
 pub use bridge::{close_strict_response_format_schema, OpenAiBridge, OPENAI_DEFAULT_BASE};

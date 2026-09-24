@@ -35,6 +35,7 @@ use aisix_provider_openai::overrides::{
     apply_param_renames, apply_stream_done_marker_policy, extract_reasoning_field,
     StreamDoneOutcome,
 };
+use aisix_provider_openai::reasoning::{is_reasoning_model, ReasoningFamily};
 use aisix_provider_openai::wire::{
     build_request, messages_from, response_into_chat_response, stream_chunk_into_chat_chunk,
     DeveloperRoleMode, OpenAiResponse, OpenAiStreamChunk,
@@ -597,6 +598,7 @@ where
 /// transforms before sending. Mirrors `OpenAiBridge::prepare_outbound_body`.
 fn prepare_outbound_body<T: serde::Serialize>(
     typed: &T,
+    reasoning_model: bool,
     request: Option<&RequestOverrides>,
     response: Option<&ResponseOverrides>,
 ) -> Result<Value, BridgeError> {
@@ -606,6 +608,10 @@ fn prepare_outbound_body<T: serde::Serialize>(
     // schema closing the OpenAI edge applies — one function, not a
     // second copy, because these two bodies have to stay identical.
     close_strict_response_format_schema(&mut body);
+    // Before `param_renames`, so an operator's explicit rename wins.
+    if reasoning_model {
+        aisix_provider_openai::reasoning::apply_reasoning_token_cap(&mut body);
+    }
     if let Some(r) = request {
         apply_param_renames(&mut body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
@@ -731,6 +737,7 @@ impl Bridge for AzureOpenAiBridge {
         let typed = build_request(req, deployment, &messages, false);
         let body = prepare_outbound_body(
             &typed,
+            is_reasoning_model(ReasoningFamily::AzureOpenai, deployment),
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
@@ -783,6 +790,7 @@ impl Bridge for AzureOpenAiBridge {
         let typed = build_request(req, deployment, &messages, true);
         let body = prepare_outbound_body(
             &typed,
+            is_reasoning_model(ReasoningFamily::AzureOpenai, deployment),
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
@@ -990,7 +998,7 @@ mod tests {
         req.extra = extra;
         let messages = messages_from(&req, AZURE_DEVELOPER_ROLE_MODE);
         let typed = build_request(&req, "ci-chat", &messages, false);
-        let body = prepare_outbound_body(&typed, None, None).unwrap();
+        let body = prepare_outbound_body(&typed, false, None, None).unwrap();
 
         assert_eq!(
             body["response_format"],
