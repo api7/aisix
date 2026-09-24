@@ -169,9 +169,13 @@ fn role_from_str(s: &str) -> Role {
     }
 }
 
+/// `model` defaults to empty for the same reason as on
+/// [`OpenAiStreamChunk`]: the caller-facing body names the model the caller
+/// addressed, so the upstream's echo is never needed to answer.
 #[derive(Debug, Deserialize)]
 pub struct OpenAiResponse {
     pub id: String,
+    #[serde(default)]
     pub model: String,
     pub choices: Vec<OpenAiChoice>,
     #[serde(default)]
@@ -414,9 +418,15 @@ fn finish_reason(raw: Option<&str>) -> FinishReason {
     }
 }
 
+/// `model` defaults to empty: OpenAI-compatible servers and proxies in
+/// front of them do not all repeat it on every chunk, and nothing
+/// downstream needs it (the caller-facing body names the model the caller
+/// addressed; an empty value only leaves the recorded provider model
+/// version unset).
 #[derive(Debug, Deserialize)]
 pub struct OpenAiStreamChunk {
     pub id: String,
+    #[serde(default)]
     pub model: String,
     pub choices: Vec<OpenAiStreamChoice>,
     #[serde(default)]
@@ -555,6 +565,8 @@ pub(crate) struct OpenAiEmbedUsage {
 #[derive(Debug, Deserialize)]
 pub(crate) struct OpenAiEmbedResponse {
     pub object: String,
+    /// Defaults to empty, as on [`OpenAiResponse`].
+    #[serde(default)]
     pub model: String,
     pub data: Vec<OpenAiEmbeddingObject>,
     #[serde(default)]
