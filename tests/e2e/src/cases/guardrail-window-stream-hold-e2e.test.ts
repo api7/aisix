@@ -31,6 +31,12 @@ import {
 //     outgrew (`blocked_buffer_exceeded`);
 //   - `fail_open` releases it unscanned and records the skipped scan as an
 //     `output_buffer_exceeded` bypass.
+// With several window rows the caps fold: the smallest wins, fail-closed
+// unless every row fails open. A chain with a `buffer_full` row takes its
+// cap and overflow policy from its `buffer_full` rows alone, on every route
+// including chat: a default window row beside a 1 MiB fail-open
+// `buffer_full` row does not tighten it to the window default (256 KiB,
+// fail-closed).
 
 const CALLER = "sk-window-stream-hold-e2e";
 const CREDENTIAL_REF = "mock";
@@ -44,10 +50,17 @@ const CLEAN_TAIL = "Nothing else to add.";
 const BLOCK_ROW = "window-azure-block";
 const CLOSED_ROW = "window-azure-cap-closed";
 const OPEN_ROW = "window-azure-cap-open";
+const FOLD_OPEN_ROW = "window-azure-fold-open";
+const FOLD_CLOSED_ROW = "window-azure-fold-closed";
+const MIXED_FULL_ROW = "mixed-azure-buffer-full";
+const MIXED_WINDOW_ROW = "mixed-azure-window-default";
 
 // 30 pieces of 100 bytes: three times the rows' cap, far under the window.
 const CAP = 1_000;
 const BIG = Array.from({ length: 30 }, (_, i) => `${String(i).padStart(2, "0")}${"w".repeat(98)}`);
+// 300 pieces of 1,000 bytes: past the window default (256 KiB), under the
+// buffer_full row's 1 MiB.
+const HUGE = Array.from({ length: 300 }, (_, i) => `${String(i).padStart(3, "0")}${"h".repeat(997)}`);
 
 const chatChunk = (delta: Record<string, unknown>, finish: string | null = null) =>
   JSON.stringify({
@@ -140,9 +153,10 @@ async function startMockAzure(): Promise<{ url: string; close: () => Promise<voi
   };
 }
 
-type Variant = "block" | "clean" | "closed" | "open";
+type Variant = "block" | "clean" | "closed" | "open" | "fold" | "mixed";
+const variants = ["block", "clean", "closed", "open", "fold", "mixed"] as const;
 const piecesFor = (v: Variant) =>
-  v === "block" ? [LEAD, FLAGGED, CLEAN_TAIL] : v === "clean" ? [LEAD, CLEAN_TAIL] : BIG;
+  v === "block" ? [LEAD, FLAGGED, CLEAN_TAIL] : v === "clean" ? [LEAD, CLEAN_TAIL] : v === "mixed" ? HUGE : BIG;
 
 interface EnforcedHit {
   guardrail_name: string;
@@ -164,7 +178,11 @@ describe("a window-mode output guardrail holds a streamed response it cannot rel
     // `apis: {}`: no `/v1/responses` on this endpoint, so the route reaches
     // it through the chat bridge.
     { route: "/v1/responses (bridged)", slug: "resp-bridge", provider: "openai", events: chatEvents, pk: { apis: {} } },
+    // Chat releases a window chain window by window; only the mixed chain,
+    // which holds as buffer_full, is driven through it.
+    { route: "/v1/chat/completions", slug: "chat", provider: "openai", events: chatEvents, pk: {} },
   ] as const;
+  const variantsFor = (slug: string): readonly Variant[] => (slug === "chat" ? ["mixed"] : variants);
   const modelName = (slug: string, v: Variant) => `wnd-${slug}-${v}`;
 
   beforeAll(async () => {
@@ -206,15 +224,27 @@ describe("a window-mode output guardrail holds a streamed response it cannot rel
         },
         { attach: false },
       );
-    const rows: Record<Variant, { id: string }> = {
-      block: await row(BLOCK_ROW),
-      clean: await row(`${BLOCK_ROW}-clean`),
-      closed: await row(CLOSED_ROW, { max_buffer_bytes: CAP, on_buffer_exceeded: "fail_closed" }),
-      open: await row(OPEN_ROW, { max_buffer_bytes: CAP, on_buffer_exceeded: "fail_open" }),
+    const rows: Record<Variant, { id: string }[]> = {
+      block: [await row(BLOCK_ROW)],
+      clean: [await row(`${BLOCK_ROW}-clean`)],
+      closed: [await row(CLOSED_ROW, { max_buffer_bytes: CAP, on_buffer_exceeded: "fail_closed" })],
+      open: [await row(OPEN_ROW, { max_buffer_bytes: CAP, on_buffer_exceeded: "fail_open" })],
+      fold: [
+        await row(FOLD_OPEN_ROW, { max_buffer_bytes: 2 * CAP, on_buffer_exceeded: "fail_open" }),
+        await row(FOLD_CLOSED_ROW, { max_buffer_bytes: CAP, on_buffer_exceeded: "fail_closed" }),
+      ],
+      mixed: [
+        await row(MIXED_FULL_ROW, {
+          stream_processing_mode: "buffer_full",
+          max_buffer_bytes: 1_048_576,
+          on_buffer_exceeded: "fail_open",
+        }),
+        await row(MIXED_WINDOW_ROW),
+      ],
     };
 
     for (const r of routes) {
-      for (const v of ["block", "clean", "closed", "open"] as const) {
+      for (const v of variantsFor(r.slug)) {
         const upstream = await startOpenAiUpstream({ streamEvents: r.events(piecesFor(v)) });
         upstreams.push(upstream);
         const pk = await seed.createProviderKey({
@@ -230,7 +260,7 @@ describe("a window-mode output guardrail holds a streamed response it cannot rel
           model_name: r.provider === "openai" ? "gpt-4o-mini" : "claude-3-5-haiku-20241022",
           provider_key_id: pk.id,
         });
-        await seed.attachGuardrailToModel(rows[v].id, m.id);
+        for (const g of rows[v]) await seed.attachGuardrailToModel(g.id, m.id);
       }
     }
 
@@ -248,10 +278,12 @@ describe("a window-mode output guardrail holds a streamed response it cannot rel
   });
 
   const send = async (slug: string, model: string) => {
-    const path = slug.startsWith("msg") ? "/v1/messages" : "/v1/responses";
+    const path = slug.startsWith("msg") ? "/v1/messages" : slug === "chat" ? "/v1/chat/completions" : "/v1/responses";
     const body = slug.startsWith("msg")
       ? { model, max_tokens: 256, messages: [{ role: "user", content: "go" }] }
-      : { model, input: "go" };
+      : slug === "chat"
+        ? { model, messages: [{ role: "user", content: "go" }] }
+        : { model, input: "go" };
     const res = await fetch(`${app!.proxyUrl}${path}`, {
       method: "POST",
       headers: {
@@ -267,6 +299,32 @@ describe("a window-mode output guardrail holds a streamed response it cannot rel
   const byModel = (model: string) => (l: Map<string, string>) => l.get("requested_model") === model;
 
   for (const r of routes) {
+    test(`${r.route}: a default window row does not tighten a 1 MiB fail_open buffer_full sibling`, async (ctx) => {
+      if (!etcdReachable || !app || !sls) return ctx.skip();
+      const model = modelName(r.slug, "mixed");
+      const body = await send(r.slug, model);
+      expect(body, "the chain was capped below the buffer_full row's 1 MiB").not.toContain("output_buffer_exceeded");
+      expect(body).toContain(HUGE[299]);
+      const log = await waitForSlsLog(sls, LOGSTORE, byModel(model), r.route);
+      expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
+      expect(log.get("guardrail_bypassed_reason") ?? "", `${r.route}: scanned whole, nothing bypassed`).toBe("");
+    });
+  }
+
+  for (const r of routes.filter((r) => r.slug !== "chat")) {
+    test(`${r.route}: window rows fold to the smallest cap, fail_closed unless all fail open`, async (ctx) => {
+      if (!etcdReachable || !app || !sls) return ctx.skip();
+      const model = modelName(r.slug, "fold");
+      const body = await send(r.slug, model);
+      expect(body).toContain("output_buffer_exceeded");
+      expect(body).not.toContain(BIG[29]);
+      const log = await waitForSlsLog(sls, LOGSTORE, byModel(model), r.route);
+      const hits = JSON.parse(log.get("guardrail_enforced_hits") ?? "[]") as EnforcedHit[];
+      expect(hits.map(({ guardrail_name, action }) => ({ guardrail_name, action }))).toEqual([
+        { guardrail_name: FOLD_CLOSED_ROW, action: "blocked_buffer_exceeded" },
+      ]);
+    });
+
     test(`${r.route}: a flagged stream is refused with none of it sent`, async (ctx) => {
       if (!etcdReachable || !app || !sls) return ctx.skip();
       const model = modelName(r.slug, "block");

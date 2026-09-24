@@ -647,13 +647,16 @@ impl StreamOutputPolicy {
 
     /// Pick the stricter of two policies (used to fold a chain into one).
     /// Higher rank wins; ties break toward the tighter parameters
-    /// (smaller window). The hold cap folds across ranks: the smaller cap,
-    /// and fail-closed unless every holding member fails open.
+    /// (smaller window). The hold cap folds within the winning rank only:
+    /// the smaller cap, and fail-closed unless every member of that rank
+    /// fails open. A `buffer_full` member therefore sets the chain's cap on
+    /// its own, and a `window` member's cap binds only a chain whose holding
+    /// members are all `window`.
     pub fn stricter(self, other: Self) -> Self {
         use StreamOutputPolicy::*;
         let winner = match self.rank().cmp(&other.rank()) {
-            std::cmp::Ordering::Less => other.clone(),
-            std::cmp::Ordering::Greater => self.clone(),
+            std::cmp::Ordering::Less => return other,
+            std::cmp::Ordering::Greater => return self,
             std::cmp::Ordering::Equal => match (&self, &other) {
                 (
                     Window {
@@ -1398,7 +1401,7 @@ mod tests {
     }
 
     #[test]
-    fn hold_cap_folds_across_window_and_buffer_full() {
+    fn hold_cap_folds_within_the_winning_rank() {
         let window = |cap, open| StreamOutputPolicy::Window {
             size_chars: 100,
             overlap_chars: 10,
@@ -1411,6 +1414,7 @@ mod tests {
         };
         assert_eq!(window(500, true).hold_cap(), Some((500, true)));
         assert_eq!(StreamOutputPolicy::EndOfStreamCheck.hold_cap(), None);
+        // An all-window chain folds its rows' caps.
         assert_eq!(
             window(500, true).stricter(window(900, true)).hold_cap(),
             Some((500, true)),
@@ -1419,17 +1423,23 @@ mod tests {
             window(900, false).stricter(window(500, true)).hold_cap(),
             Some((500, false)),
         );
-        // BufferFull outranks Window, but the window row's tighter cap and
-        // fail-closed policy still bind.
+        // A buffer_full member sets the cap alone: a window row's tighter
+        // cap or fail-closed policy does not bind it, in either order.
         let mixed = full(900, true).stricter(window(500, false));
-        assert!(matches!(mixed, StreamOutputPolicy::BufferFull { .. }));
-        assert_eq!(mixed.hold_cap(), Some((500, false)));
+        assert_eq!(mixed, full(900, true));
         assert_eq!(
-            window(900, true)
-                .stricter(full(500, true))
+            window(500, false).stricter(full(900, true)),
+            full(900, true)
+        );
+        assert_eq!(
+            window(100, false)
+                .stricter(window(200, false))
+                .stricter(full(900, true))
+                .stricter(full(700, true))
+                .stricter(window(50, false))
                 .stricter(StreamOutputPolicy::EndOfStreamCheck)
                 .hold_cap(),
-            Some((500, true)),
+            Some((700, true)),
         );
     }
 

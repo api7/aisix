@@ -246,8 +246,10 @@ pub struct AzureContentSafetyTextModerationConfig {
     /// Max bytes of model-generated content held back from a streamed response
     /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
     /// `window` mode where the stream is held whole (`/v1/messages`,
-    /// `/v1/responses`). Counts assistant text, reasoning, and tool-call
-    /// arguments; SSE and JSON framing is not counted.
+    /// `/v1/responses`) and no output guardrail in the chain uses
+    /// `buffer_full`, whose rows alone then set the cap. Counts assistant
+    /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
+    /// counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -360,8 +362,10 @@ pub struct AliyunTextModerationConfig {
     /// Max bytes of model-generated content held back from a streamed response
     /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
     /// `window` mode where the stream is held whole (`/v1/messages`,
-    /// `/v1/responses`). Counts assistant text, reasoning, and tool-call
-    /// arguments; SSE and JSON framing is not counted.
+    /// `/v1/responses`) and no output guardrail in the chain uses
+    /// `buffer_full`, whose rows alone then set the cap. Counts assistant
+    /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
+    /// counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -444,8 +448,10 @@ pub struct AliyunAiGuardrailConfig {
     /// Max bytes of model-generated content held back from a streamed response
     /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
     /// `window` mode where the stream is held whole (`/v1/messages`,
-    /// `/v1/responses`). Counts assistant text, reasoning, and tool-call
-    /// arguments; SSE and JSON framing is not counted.
+    /// `/v1/responses`) and no output guardrail in the chain uses
+    /// `buffer_full`, whose rows alone then set the cap. Counts assistant
+    /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
+    /// counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -1011,8 +1017,10 @@ pub struct CustomConfig {
     /// Max bytes of model-generated content held back from a streamed response
     /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
     /// `window` mode where the stream is held whole (`/v1/messages`,
-    /// `/v1/responses`). Counts assistant text, reasoning, and tool-call
-    /// arguments; SSE and JSON framing is not counted.
+    /// `/v1/responses`) and no output guardrail in the chain uses
+    /// `buffer_full`, whose rows alone then set the cap. Counts assistant
+    /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
+    /// counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,

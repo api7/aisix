@@ -641,7 +641,7 @@
         },
         "max_buffer_bytes": {
           "default": 262144,
-          "description": "Max bytes of model-generated content held back from a streamed response before `on_buffer_exceeded` applies: in `buffer_full` mode, and in `window` mode where the stream is held whole (`/v1/messages`, `/v1/responses`). Counts assistant text, reasoning, and tool-call arguments; SSE and JSON framing is not counted.",
+          "description": "Max bytes of model-generated content held back from a streamed response before `on_buffer_exceeded` applies: in `buffer_full` mode, and in `window` mode where the stream is held whole (`/v1/messages`, `/v1/responses`) and no output guardrail in the chain uses `buffer_full`, whose rows alone then set the cap. Counts assistant text, reasoning, and tool-call arguments; SSE and JSON framing is not counted.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
@@ -810,7 +810,7 @@
         },
         "max_buffer_bytes": {
           "default": 262144,
-          "description": "Max bytes of model-generated content held back from a streamed response before `on_buffer_exceeded` applies: in `buffer_full` mode, and in `window` mode where the stream is held whole (`/v1/messages`, `/v1/responses`). Counts assistant text, reasoning, and tool-call arguments; SSE and JSON framing is not counted.",
+          "description": "Max bytes of model-generated content held back from a streamed response before `on_buffer_exceeded` applies: in `buffer_full` mode, and in `window` mode where the stream is held whole (`/v1/messages`, `/v1/responses`) and no output guardrail in the chain uses `buffer_full`, whose rows alone then set the cap. Counts assistant text, reasoning, and tool-call arguments; SSE and JSON framing is not counted.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
@@ -958,7 +958,7 @@
         },
         "max_buffer_bytes": {
           "default": 262144,
-          "description": "Max bytes of model-generated content held back from a streamed response before `on_buffer_exceeded` applies: in `buffer_full` mode, and in `window` mode where the stream is held whole (`/v1/messages`, `/v1/responses`). Counts assistant text, reasoning, and tool-call arguments; SSE and JSON framing is not counted.",
+          "description": "Max bytes of model-generated content held back from a streamed response before `on_buffer_exceeded` applies: in `buffer_full` mode, and in `window` mode where the stream is held whole (`/v1/messages`, `/v1/responses`) and no output guardrail in the chain uses `buffer_full`, whose rows alone then set the cap. Counts assistant text, reasoning, and tool-call arguments; SSE and JSON framing is not counted.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
@@ -1755,7 +1755,7 @@
         },
         "max_buffer_bytes": {
           "default": 262144,
-          "description": "Max bytes of model-generated content held back from a streamed response before `on_buffer_exceeded` applies: in `buffer_full` mode, and in `window` mode where the stream is held whole (`/v1/messages`, `/v1/responses`). Counts assistant text, reasoning, and tool-call arguments; SSE and JSON framing is not counted.",
+          "description": "Max bytes of model-generated content held back from a streamed response before `on_buffer_exceeded` applies: in `buffer_full` mode, and in `window` mode where the stream is held whole (`/v1/messages`, `/v1/responses`) and no output guardrail in the chain uses `buffer_full`, whose rows alone then set the cap. Counts assistant text, reasoning, and tool-call arguments; SSE and JSON framing is not counted.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
