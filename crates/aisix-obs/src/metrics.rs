@@ -293,7 +293,10 @@ pub const M_AUTH_DECISIONS_TOTAL: &str = "aisix_auth_decisions_total";
 ///   splits local vs remote latency).
 /// - `phase`: `input` / `output`.
 /// - `result`: `allowed` / `blocked` / `masked` / `bypassed` (remote
-///   failure + fail-open) / `would_block` / `would_mask` (monitor mode).
+///   failure + fail-open) / `would_block` / `would_mask` /
+///   `would_mask_unsupported` (monitor mode; the last is a mask rule that
+///   matched where the content cannot be rewritten, e.g. a passthrough
+///   route — enforcing it records `allowed`, since nothing is masked).
 /// - `error_type`: bounded failure tag (e.g. `lakera_timeout`,
 ///   `custom_unknown_action`) whenever the guardrail could not EVALUATE
 ///   the content, else `none`. It is populated on `result="bypassed"`

@@ -538,11 +538,10 @@ fn classify_execution<'v>(
                     .find(|h| h.action == "would_block" && !h.error_type.is_empty())
                     .map(|h| h.error_type.as_str());
                 ("would_block", error_type)
-            } else if hits
-                .iter()
-                .any(|h| matches!(h.action.as_str(), "would_mask" | "would_mask_unsupported"))
-            {
+            } else if hits.iter().any(|h| h.action == "would_mask") {
                 ("would_mask", None)
+            } else if hits.iter().any(|h| h.action == "would_mask_unsupported") {
+                ("would_mask_unsupported", None)
             } else {
                 ("allowed", None)
             }

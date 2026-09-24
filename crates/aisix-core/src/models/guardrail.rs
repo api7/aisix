@@ -1342,8 +1342,9 @@ pub struct GuardrailExecution<'a> {
     /// Which side ran: `input` or `output`.
     pub phase: &'static str,
     /// Enforced outcome: `allowed` / `blocked` / `masked` / `bypassed`
-    /// (remote failure + fail-open) / `would_block` / `would_mask`
-    /// (monitor mode).
+    /// (remote failure + fail-open) / `would_block` / `would_mask` /
+    /// `would_mask_unsupported` (monitor mode; a mask rule that matched
+    /// where the content cannot be rewritten).
     pub result: &'static str,
     /// Bounded failure tag (e.g. `lakera_timeout`) when the guardrail could
     /// not evaluate: on `result = bypassed` (it failed OPEN and the request

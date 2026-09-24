@@ -316,6 +316,34 @@ describe("a pii mask rule where content cannot be rewritten is reported, not sil
     expectReported(log, "passthrough", BOTH);
   });
 
+  test("passthrough route: the Prometheus outcome says what the event says", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const count = async (labels: Record<string, string>) => {
+      const scrape = await (await fetch(`${app!.metricsUrl}/metrics`)).text();
+      let sum = 0;
+      for (const line of scrape.split("\n")) {
+        if (!line.startsWith("aisix_guardrail_latency_seconds_count{")) continue;
+        if (!Object.entries(labels).every(([k, v]) => line.includes(`${k}="${v}"`))) continue;
+        const v = parseFloat(line.split("}").at(-1)?.trim() ?? "");
+        if (!Number.isNaN(v)) sum += v;
+      }
+      return sum;
+    };
+    const monitorUnsupported = { guardrail: MONITOR, phase: "input", result: "would_mask_unsupported" };
+    const enforceAllowed = { guardrail: ENFORCE, phase: "input", result: "allowed" };
+    const [unsupportedBefore, allowedBefore] = [await count(monitorUnsupported), await count(enforceAllowed)];
+    const res = await postJson("/passthrough/pmu/chat/completions", {
+      model: "gpt-4o",
+      messages: [{ role: "user", content: PROMPT }],
+    });
+    expect(res.status).toBe(200);
+    expect(await count(monitorUnsupported), "monitor row outcome").toBe(unsupportedBefore + 1);
+    expect(await count(enforceAllowed), "the enforcing row allowed the request").toBe(allowedBefore + 1);
+    // Every surface in this app is one that cannot rewrite, so no execution
+    // of the monitor row may ever have been labelled a plain would-mask.
+    expect(await count({ guardrail: MONITOR, result: "would_mask" }), "a preview of a mask nobody applies").toBe(0);
+  });
+
   test("streamed passthrough route: the held stream is released unmodified and the match is reported", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
     const res = await postJson("/passthrough/pmu-stream/chat/completions", {
