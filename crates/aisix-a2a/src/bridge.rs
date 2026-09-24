@@ -62,9 +62,12 @@ const SSE_CONTENT_TYPE: &str = "text/event-stream";
 
 /// Hard cap on a SINGLE buffered SSE event. A stream has no total size — a task
 /// may push updates for hours — so the cap is per event: it bounds how much an
-/// upstream can accumulate without ever emitting a newline, which is the only
-/// way a streaming reader can be made to grow without limit.
+/// upstream can accumulate without ever emitting the blank line that ends an
+/// event, which is the only way a streaming reader can be made to grow without
+/// limit.
 const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
+
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
 /// Hard cap on an upstream response body the gateway will buffer. A registered
 /// agent is semi-trusted, but a compromised or misbehaving one must not be able
@@ -590,17 +593,22 @@ impl A2aBridge for HttpBridge {
     }
 }
 
-/// Parse an upstream SSE body into the JSON-RPC envelope of each `data:` field.
+/// Parse an upstream SSE body into one JSON-RPC envelope per event.
 ///
-/// Deliberately minimal: A2A carries one JSON-RPC envelope per `data:` line, so
-/// `event:` / `id:` / `retry:` fields and comments are metadata this gateway has
-/// no use for and passes over. A `data:` line that is not JSON ends the stream
-/// with an error rather than being skipped — a caller that silently dropped
-/// events would report a truncated task as a complete one.
+/// Join an event's `data:` fields with newlines before parsing, as specified by
+/// https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation.
+/// Metadata and comments are ignored. Malformed JSON fails the stream once the
+/// event ends, rather than silently reporting a truncated task as complete.
 fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> + Send {
     async_stream::stream! {
         let mut bytes = resp.bytes_stream();
         let mut pending: Vec<u8> = Vec::new();
+        let mut line_start = 0;
+        // Set while the last byte was a `\r`, so the `\n` of a CRLF pair split
+        // across two chunks is swallowed instead of read as a blank line.
+        let mut after_cr = false;
+        // The stream's first bytes may be a UTF-8 BOM, which the spec strips.
+        let mut at_stream_start = true;
         loop {
             let chunk = match bytes.next().await {
                 Some(Ok(chunk)) => chunk,
@@ -610,34 +618,50 @@ fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> 
                 }
                 None => break,
             };
-            pending.extend_from_slice(&chunk);
-            // A single event is bounded even though the stream is not: an
-            // upstream that never emits a newline must not grow this buffer
-            // without limit.
-            if pending.len() > MAX_SSE_EVENT_BYTES {
-                yield Err(A2aError::Request(
-                    "upstream SSE event exceeded size cap".to_string(),
-                ));
-                return;
-            }
-            while let Some(newline) = pending.iter().position(|b| *b == b'\n') {
-                let line: Vec<u8> = pending.drain(..=newline).collect();
-                match parse_sse_data_line(&line) {
-                    Ok(Some(event)) => yield Ok(event),
-                    Ok(None) => {}
-                    Err(e) => {
-                        yield Err(e);
-                        return;
+            for byte in chunk {
+                if after_cr && byte == b'\n' {
+                    after_cr = false;
+                    continue;
+                }
+                after_cr = byte == b'\r';
+                pending.push(byte);
+                if at_stream_start {
+                    if pending == UTF8_BOM {
+                        pending.clear();
+                        at_stream_start = false;
+                        continue;
                     }
+                    at_stream_start = UTF8_BOM.starts_with(&pending);
+                }
+                // Bound the whole event, including multiple data lines, rather
+                // than a network chunk that may contain many small events.
+                if pending.len() > MAX_SSE_EVENT_BYTES {
+                    yield Err(A2aError::Request(
+                        "upstream SSE event exceeded size cap".to_string(),
+                    ));
+                    return;
+                }
+                // `\r`, `\n` and `\r\n` each end a line; an empty line ends the event.
+                if byte == b'\n' || byte == b'\r' {
+                    if pending.len() - 1 == line_start {
+                        match parse_sse_frame(&pending) {
+                            Ok(Some(event)) => yield Ok(event),
+                            Ok(None) => {}
+                            Err(e) => {
+                                yield Err(e);
+                                return;
+                            }
+                        }
+                        pending.clear();
+                    }
+                    line_start = pending.len();
                 }
             }
         }
         // A body that ends without its final newline still carries an event —
-        // and if that last line is malformed it fails the stream like any
-        // other. Swallowing the error here would make a truncated task read as
-        // a clean end, which is the exact failure the per-line rule exists to
-        // prevent.
-        match parse_sse_data_line(&pending) {
+        // preserve that compatibility, but parse all of its data fields together.
+        // A malformed trailing event must still fail rather than end quietly.
+        match parse_sse_frame(&pending) {
             Ok(Some(event)) => yield Ok(event),
             Ok(None) => {}
             Err(e) => yield Err(e),
@@ -645,14 +669,25 @@ fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> 
     }
 }
 
-/// Extract the JSON-RPC envelope from one SSE line, or `None` when the line
-/// carries no `data:` field.
-fn parse_sse_data_line(line: &[u8]) -> Result<Option<serde_json::Value>, A2aError> {
-    let text = std::str::from_utf8(line)
+/// Extract the JSON-RPC envelope from an SSE event's joined data fields.
+fn parse_sse_frame(frame: &[u8]) -> Result<Option<serde_json::Value>, A2aError> {
+    let text = std::str::from_utf8(frame)
         .map_err(|_| A2aError::Request("upstream SSE event was not valid UTF-8".to_string()))?;
-    let Some(payload) = text.trim_end_matches(['\r', '\n']).strip_prefix("data:") else {
-        return Ok(None);
-    };
+    // Split on either terminator rather than `lines()`, which misses a bare
+    // `\r`; empty pieces are blank lines and the second half of a `\r\n`.
+    let payload = text
+        .split(['\n', '\r'])
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let data = if line == "data" {
+                ""
+            } else {
+                line.strip_prefix("data:")?
+            };
+            Some(data.strip_prefix(' ').unwrap_or(data))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let payload = payload.trim();
     if payload.is_empty() {
         return Ok(None);
@@ -784,7 +819,7 @@ mod tests {
 
     #[test]
     fn sse_lines_yield_only_data_payloads() {
-        let event = |line: &str| parse_sse_data_line(line.as_bytes()).unwrap();
+        let event = |line: &str| parse_sse_frame(line.as_bytes()).unwrap();
 
         assert_eq!(
             event("data: {\"jsonrpc\":\"2.0\",\"id\":1}\n").unwrap()["id"],
@@ -804,15 +839,38 @@ mod tests {
     }
 
     #[test]
+    fn sse_frame_joins_data_fields_before_parsing() {
+        for newline in ["\n", "\r\n", "\r"] {
+            let frame = [
+                "data: {\"jsonrpc\":\"2.0\",",
+                ": keep-alive",
+                "event: status-update",
+                "data",
+                "data:\"result\":{\"final\":true}}",
+                "",
+                "",
+            ]
+            .join(newline);
+            assert_eq!(
+                parse_sse_frame(frame.as_bytes()).unwrap().unwrap(),
+                serde_json::json!({"jsonrpc": "2.0", "result": {"final": true}})
+            );
+        }
+        // Joining without the required newline would silently turn invalid
+        // JSON into a different, valid string.
+        assert!(parse_sse_frame(b"data: {\"text\":\"hel\ndata: lo\"}\n\n").is_err());
+    }
+
+    #[test]
     fn a_data_line_that_is_not_json_is_an_error_not_a_skip() {
         // Silently dropping it would let a truncated task read as a complete
         // one, which is worse than failing the stream.
-        let err = parse_sse_data_line(b"data: not-json\n").unwrap_err();
+        let err = parse_sse_frame(b"data: not-json\n").unwrap_err();
         assert!(
             matches!(err, A2aError::Request(ref m) if m.contains("malformed JSON-RPC event")),
             "got {err:?}"
         );
-        assert!(parse_sse_data_line(b"data: \xff\xfe\n").is_err());
+        assert!(parse_sse_frame(b"data: \xff\xfe\n").is_err());
     }
 
     #[test]

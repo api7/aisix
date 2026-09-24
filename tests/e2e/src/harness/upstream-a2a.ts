@@ -70,6 +70,13 @@ export interface A2aUpstreamOptions {
    * event sequence the streaming-relay suite counts.
    */
   streamAnswer?: boolean;
+  /**
+   * Write each streamed envelope pretty-printed across several `data:` lines,
+   * every line ended with CRLF. The event-stream format joins an event's data
+   * lines with `\n`, so this is the same envelope in a framing a reader that
+   * parses line by line cannot handle.
+   */
+  multiLineData?: boolean;
 }
 
 const PATH_PREFIX = "/v3/agents/serve/tenant-42";
@@ -130,6 +137,7 @@ export async function startA2aUpstream(
       token: options.token,
       wireShape: options.wireShape ?? "0.3",
       streamAnswer: options.streamAnswer ?? false,
+      multiLineData: options.multiLineData ?? false,
     }).catch((err: unknown) => {
       // `handle` rejects on a malformed body, and on a write to an already
       // closed socket. Unhandled, that terminates the test process; worse, the
@@ -166,6 +174,7 @@ async function handle(
     token?: string;
     wireShape: A2aWireShape;
     streamAnswer: boolean;
+    multiLineData: boolean;
   },
 ): Promise<void> {
   const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
@@ -266,8 +275,14 @@ async function handle(
       "cache-control": "no-cache",
       connection: "keep-alive",
     });
-    const envelope = (result: Record<string, unknown>) =>
-      `data: ${JSON.stringify({ jsonrpc: "2.0", id: body?.id ?? null, result })}\n\n`;
+    const envelope = (result: Record<string, unknown>) => {
+      const rpc = { jsonrpc: "2.0", id: body?.id ?? null, result };
+      if (!ctx.multiLineData) return `data: ${JSON.stringify(rpc)}\n\n`;
+      return JSON.stringify(rpc, null, 2)
+        .split("\n")
+        .map((line) => `data: ${line}\r\n`)
+        .join("") + "\r\n";
+    };
     res.write(": open\n\n");
     // The agent thinks before it says anything, like a real one. Without this
     // the first event lands sub-millisecond and a time-to-first-event of 0 is
