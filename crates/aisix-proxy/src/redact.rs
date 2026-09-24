@@ -1212,7 +1212,7 @@ fn frame_terminator(raw: &[u8]) -> Option<(usize, usize)> {
 /// Byte offset just past the LAST complete frame terminator in `raw`
 /// (`0` when there is none, `raw.len()` when the body ends on one).
 /// `raw[end..]` is therefore the unterminated trailing fragment.
-fn last_frame_end(raw: &[u8]) -> usize {
+pub(crate) fn last_frame_end(raw: &[u8]) -> usize {
     let mut end = 0usize;
     let mut rest = raw;
     while let Some((pos, len)) = frame_terminator(rest) {

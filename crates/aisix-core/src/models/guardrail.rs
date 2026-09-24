@@ -243,7 +243,9 @@ pub struct AzureContentSafetyTextModerationConfig {
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_acs_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back in `buffer_full` mode
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -353,7 +355,9 @@ pub struct AliyunTextModerationConfig {
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_aliyun_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back in `buffer_full` mode
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -433,7 +437,9 @@ pub struct AliyunAiGuardrailConfig {
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_aliyun_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back in `buffer_full` mode
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -520,7 +526,9 @@ pub struct PiiConfig {
     // back (the mask spans chunk boundaries), so kind=pii always uses the
     // buffer_full policy on the output hook. These knobs mirror the ACS/
     // Aliyun buffer_full parameters.
-    /// Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -607,7 +615,9 @@ pub struct LakeraConfig {
     // Masking a streamed response requires the whole response held back
     // (a masked span can cross any chunk boundary), so kind=lakera always
     // uses the buffer_full policy on the output hook, like kind=pii.
-    /// Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -737,7 +747,9 @@ pub struct PresidioConfig {
     // Masking a streamed response requires the whole response held back,
     // so kind=presidio always uses the buffer_full policy on the output
     // hook, like kind=pii.
-    /// Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -876,7 +888,9 @@ pub struct SemanticConfig {
     // A semantic judgement needs the whole text, so this kind always
     // uses the buffer_full policy on the output hook, like
     // kind=pii and kind=presidio.
-    /// Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -988,7 +1002,9 @@ pub struct CustomConfig {
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_acs_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back in `buffer_full` mode
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,

@@ -573,8 +573,11 @@ pub enum StreamOutputPolicy {
         overlap_chars: usize,
     },
     /// Hold the whole response; scan once; release all or block.
-    /// `max_buffer_bytes` caps the hold; `on_exceeded_fail_open` decides
-    /// release-vs-block when the cap is exceeded.
+    /// `max_buffer_bytes` caps the model-generated content held (assistant
+    /// text + reasoning + tool-call arguments, never the SSE/JSON framing);
+    /// `on_exceeded_fail_open` decides what happens past the cap: release
+    /// what is held unscanned and stream the rest without an output scan,
+    /// or block.
     BufferFull {
         max_buffer_bytes: usize,
         on_exceeded_fail_open: bool,
@@ -640,7 +643,8 @@ impl StreamOutputPolicy {
 }
 
 /// Default whole-response hold-back cap for output guardrails that don't
-/// configure their own streaming policy (keyword, prompt shield, bedrock).
+/// configure their own streaming policy (keyword, prompt shield, bedrock,
+/// OpenAI moderation), measured like a configured `max_buffer_bytes`.
 /// Matches the Azure text-moderation buffer-mode default.
 pub const DEFAULT_STREAM_OUTPUT_BUFFER_BYTES: usize = 262_144;
 

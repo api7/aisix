@@ -51,6 +51,7 @@ mod guardrail_coverage;
 mod guardrail_embedder;
 mod guardrail_stream;
 pub mod health;
+mod held_content;
 mod host;
 mod http_client;
 mod images;
