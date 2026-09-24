@@ -6,19 +6,41 @@
 //! self-reports the version it was tagged with — the `Server` response
 //! header, `aisix --version`, and the heartbeat `dp_version` all come
 //! from here, and no manual `Cargo.toml` bump is required at release
-//! time. Local builds (no stamp) fall back to the workspace crate
-//! version. (QA v0.3.0 finding: the 0.3.0 image self-reported 0.1.0
+//! time. Builds without a stamp fall back to the workspace crate
+//! version — and so do builds where the stamp is set but empty, which is
+//! what every non-tag image gets: the Dockerfile always exports
+//! `AISIX_BUILD_VERSION`, and CI fills it only for release tags. (QA v0.3.0 finding: the 0.3.0 image self-reported 0.1.0
 //! because the crate version was the only source and was never bumped.)
 
 /// Version the binary reports about itself.
-pub const BUILD_VERSION: &str = match option_env!("AISIX_BUILD_VERSION") {
-    Some(v) => v,
-    None => env!("CARGO_PKG_VERSION"),
-};
+pub const BUILD_VERSION: &str = resolve_build_version(
+    option_env!("AISIX_BUILD_VERSION"),
+    env!("CARGO_PKG_VERSION"),
+);
+
+const fn resolve_build_version(
+    stamp: Option<&'static str>,
+    fallback: &'static str,
+) -> &'static str {
+    match stamp {
+        Some(v) if !v.is_empty() => v,
+        _ => fallback,
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use super::BUILD_VERSION;
+    use super::{resolve_build_version, BUILD_VERSION};
+
+    #[test]
+    fn empty_stamp_falls_back_to_crate_version() {
+        assert_eq!(resolve_build_version(Some(""), "0.3.0"), "0.3.0");
+        assert_eq!(resolve_build_version(None, "0.3.0"), "0.3.0");
+        assert_eq!(
+            resolve_build_version(Some("1.4.0-rc.2"), "0.3.0"),
+            "1.4.0-rc.2"
+        );
+    }
 
     #[test]
     fn build_version_is_nonempty_semverish() {

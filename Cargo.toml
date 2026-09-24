@@ -25,6 +25,9 @@ members = [
 exclude = ["bench/pgo-training/trainer", "bench/metrics-scale"]
 
 [workspace.package]
+# Frozen placeholder: real versions are stamped at build time through
+# AISIX_BUILD_VERSION. The control plane keys its "unstamped build" class on
+# this exact value, so changing it requires a matching control-plane change.
 version = "0.3.0"
 edition = "2021"
 rust-version = "1.93"

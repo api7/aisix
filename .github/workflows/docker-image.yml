@@ -279,6 +279,26 @@ jobs:
           docker run --rm --entrypoint /usr/local/bin/aisix "$IMG" --version | tee /tmp/aisix-version
           grep -qx "aisix ${VER}" /tmp/aisix-version
 
+      # Non-tag images get BUILD_VERSION="" from the step above; the binary
+      # must still report a real version (the crate fallback), never a bare
+      # `aisix ` — which is what the heartbeat and `Server` header carry too
+      # (aisix#974).
+      - name: Verify non-tag image self-reports a version
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eux
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            IMG="$(printf '%s\n' "$TAGS" | head -n1)"
+          else
+            IMG="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+            docker pull "$IMG"
+          fi
+          docker run --rm --entrypoint /usr/local/bin/aisix "$IMG" --version | tee /tmp/aisix-version
+          grep -qxE 'aisix [0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?' /tmp/aisix-version
+
       # Fail-closed release gate (#967): every image built with PGO=on must
       # carry the proof marker the Dockerfile writes only after the
       # profile-optimized build succeeds. An absent marker, a short shape
