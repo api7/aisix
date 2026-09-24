@@ -30,6 +30,7 @@ const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("he
 const E2E_SERIES = "aisix_request_e2e_latency_seconds";
 const TTFT_SERIES = "aisix_request_ttft_seconds";
 const DETAILED_TTFT_SERIES = "aisix_llm_time_to_first_token_seconds";
+const SIDES = ["upstream", "downstream"] as const;
 
 const RESPONSES_NATIVE_MODEL = "histo-responses-native";
 const RESPONSES_BRIDGE_MODEL = "histo-responses-bridge";
@@ -380,7 +381,10 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
     // AND stream-completion both recording) or a dropped one shifts this
     // off 1. Same for its single TTFT.
     expect(countOf(body, E2E_SERIES, { model: "histo-stream-model" })).toBe(1);
-    expect(countOf(body, TTFT_SERIES, { model: "histo-stream-model" })).toBe(1);
+    // One streaming request is one observation per `side`.
+    for (const side of SIDES) {
+      expect(countOf(body, TTFT_SERIES, { model: "histo-stream-model", side })).toBe(1);
+    }
     expect(countOf(body, E2E_SERIES, { model: "histo-fail-model" })).toBe(1);
 
     // histogram_quantile() needs _sum/_count too.
@@ -431,26 +435,27 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
           countOf(body, TTFT_SERIES, {
             endpoint: "/v1/responses",
             model,
-          }) === 1 &&
+          }) === SIDES.length &&
           countOf(body, DETAILED_TTFT_SERIES, {
             endpoint: "/v1/responses",
             model,
-          }) === 1,
+          }) === SIDES.length,
       );
       if (complete || Date.now() > deadline) break;
       await new Promise((r) => setTimeout(r, 100));
     }
 
-    for (const [model, provider] of [
+    for (const [model, provider, side] of [
       [RESPONSES_NATIVE_MODEL, "openai"],
       [RESPONSES_BRIDGE_MODEL, "deepseek"],
-    ] as const) {
+    ].flatMap(([m, p]) => SIDES.map((side) => [m, p, side] as const))) {
       const lowCardLabels = {
         endpoint: "/v1/responses",
         model,
         provider,
         streaming: "true",
         status_class: "2xx",
+        side,
       };
       expect(
         bucketLines(body, TTFT_SERIES, lowCardLabels).length,
@@ -468,6 +473,7 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
         provider,
         inbound_protocol: "openai",
         upstream_protocol: "openai",
+        side,
       };
       expect(countOf(body, DETAILED_TTFT_SERIES, detailedLabels)).toBe(1);
       expect(
@@ -507,36 +513,40 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
       const before = await scrape();
       expect((await responses(RESPONSES_NATIVE_MODEL)).status).toBe(status);
       const after = await scrape();
-      const lowCardLabels = {
-        endpoint: "/v1/responses",
-        model: RESPONSES_NATIVE_MODEL,
-        provider: "openai",
-        streaming: "true",
-        status_class: statusClass,
-      };
-      const detailedLabels = {
-        endpoint: "/v1/responses",
-        model: RESPONSES_NATIVE_MODEL,
-        provider: "openai",
-        inbound_protocol: "openai",
-        upstream_protocol: "openai",
-      };
-      expect(
-        countOf(after, TTFT_SERIES, lowCardLabels) -
-          countOf(before, TTFT_SERIES, lowCardLabels),
-      ).toBe(1);
-      expect(
-        sumOf(after, TTFT_SERIES, lowCardLabels) -
-          sumOf(before, TTFT_SERIES, lowCardLabels),
-      ).toBeGreaterThan(0);
-      expect(
-        countOf(after, DETAILED_TTFT_SERIES, detailedLabels) -
-          countOf(before, DETAILED_TTFT_SERIES, detailedLabels),
-      ).toBe(1);
-      expect(
-        sumOf(after, DETAILED_TTFT_SERIES, detailedLabels) -
-          sumOf(before, DETAILED_TTFT_SERIES, detailedLabels),
-      ).toBeGreaterThan(0);
+      for (const side of SIDES) {
+        const lowCardLabels = {
+          endpoint: "/v1/responses",
+          model: RESPONSES_NATIVE_MODEL,
+          provider: "openai",
+          streaming: "true",
+          status_class: statusClass,
+          side,
+        };
+        const detailedLabels = {
+          endpoint: "/v1/responses",
+          model: RESPONSES_NATIVE_MODEL,
+          provider: "openai",
+          inbound_protocol: "openai",
+          upstream_protocol: "openai",
+          side,
+        };
+        expect(
+          countOf(after, TTFT_SERIES, lowCardLabels) -
+            countOf(before, TTFT_SERIES, lowCardLabels),
+        ).toBe(1);
+        expect(
+          sumOf(after, TTFT_SERIES, lowCardLabels) -
+            sumOf(before, TTFT_SERIES, lowCardLabels),
+        ).toBeGreaterThan(0);
+        expect(
+          countOf(after, DETAILED_TTFT_SERIES, detailedLabels) -
+            countOf(before, DETAILED_TTFT_SERIES, detailedLabels),
+        ).toBe(1);
+        expect(
+          sumOf(after, DETAILED_TTFT_SERIES, detailedLabels) -
+            sumOf(before, DETAILED_TTFT_SERIES, detailedLabels),
+        ).toBeGreaterThan(0);
+      }
     };
 
     await assertDelta(422, "4xx");

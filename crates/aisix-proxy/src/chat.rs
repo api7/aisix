@@ -2441,7 +2441,7 @@ async fn dispatch(
                     },
                     started.elapsed(),
                 );
-                metrics_for_stream.record_request_ttft(
+                metrics_for_stream.record_ttft(
                     LatencyLabels {
                         endpoint: "/v1/chat/completions",
                         model: &bounded_model_for_metrics,
@@ -2464,23 +2464,7 @@ async fn dispatch(
                         },
                     },
                     Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
-                );
-                metrics_for_stream.record_time_to_first_token(
-                    UsageLabels {
-                        endpoint: "/v1/chat/completions",
-                        inbound_protocol: "openai",
-                        upstream_protocol: pk.labels().protocol(),
-                        provider: &provider_for_metrics,
-                        model: &bounded_model_for_metrics,
-                        upstream_model: &bounded_upstream_for_metrics,
-                        provider_key_id: pk.labels().id(),
-                        provider_key_name: pk.labels().name(),
-                        api_key_id: &api_key_id_for_telem,
-                        team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
-                        user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
-                        user_name: user_name_for_metrics.as_deref().unwrap_or("unknown"),
-                    },
-                    Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
+                    Duration::from_millis(u64::from(comp.downstream_latency_ms)),
                 );
                 // Release the concurrency permit(s) now that the stream has
                 // completed (or was cancelled). on_complete is fired by the
@@ -4332,7 +4316,7 @@ async fn dispatch_ensemble(
                     },
                     started.elapsed(),
                 );
-                state_for_telem.metrics.record_request_ttft(
+                state_for_telem.metrics.record_ttft(
                     LatencyLabels {
                         endpoint: "/v1/chat/completions",
                         model: &bounded_model_for_telem,
@@ -4355,23 +4339,7 @@ async fn dispatch_ensemble(
                         },
                     },
                     Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
-                );
-                state_for_telem.metrics.record_time_to_first_token(
-                    UsageLabels {
-                        endpoint: "/v1/chat/completions",
-                        inbound_protocol: "openai",
-                        upstream_protocol: ensemble_pk.labels().protocol(),
-                        provider: "ensemble",
-                        model: &bounded_model_for_telem,
-                        upstream_model: crate::request_metrics::UNKNOWN,
-                        provider_key_id: ensemble_pk.labels().id(),
-                        provider_key_name: ensemble_pk.labels().name(),
-                        api_key_id: caller.api_key_id,
-                        team_id: caller.team_id,
-                        user_id: caller.user_id,
-                        user_name: caller.user_name,
-                    },
-                    Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
+                    Duration::from_millis(u64::from(comp.downstream_latency_ms)),
                 );
                 // Release the concurrency permit(s) now the stream is done
                 // (or was cancelled) — on_complete fires on both paths (#450).

@@ -365,15 +365,16 @@ impl AliyunTextModerationGuardrail {
                 );
                 Err(AliyunFailure::ConfigError)
             }
-            _ => {
+            code => {
+                let (failure, meaning) = classify_body_error_code(code);
                 tracing::warn!(
                     row = %self.row_name,
                     aliyun_request_id = %diag.request_id,
                     aliyun_code = %diag.code,
                     aliyun_message = %diag.message_field(),
-                    "aliyun TextModerationPlus non-200 Code",
+                    "aliyun TextModerationPlus non-200 Code: {meaning}",
                 );
-                Err(AliyunFailure::ServerError)
+                Err(failure)
             }
         };
         (outcome, diag)
@@ -544,6 +545,32 @@ impl AliyunFailure {
             Self::MalformedResponse => "aliyun_bad_response",
             Self::ConfigError => "aliyun_config_error",
         }
+    }
+}
+
+/// Classify a non-success body `Code` that is not a configuration error,
+/// returning the failure bucket and a log-ready meaning.
+///
+/// Aliyun's RPC API reports throttling and its own timeouts as HTTP 200
+/// with a body `Code`, not as an HTTP status, so these never reach the
+/// HTTP-429 / transport-timeout arms. Both MultiModalGuard and
+/// TextModerationPlus document the same table:
+/// <https://help.aliyun.com/zh/document_detail/2937221.html>,
+/// <https://help.aliyun.com/zh/document_detail/2671445.html>.
+///
+/// 581 shares `aliyun_timeout` with our own `timeout_ms` elapsing; the
+/// meaning string is what tells the two apart in the log.
+pub(crate) fn classify_body_error_code(code: i32) -> (AliyunFailure, &'static str) {
+    match code {
+        588 => (
+            AliyunFailure::Throttled,
+            "request rate exceeded the Aliyun quota (Code 588 EXCEED_QUOTA)",
+        ),
+        581 => (
+            AliyunFailure::Timeout,
+            "Aliyun-side request timeout (Code 581 TIMEOUT)",
+        ),
+        _ => (AliyunFailure::ServerError, "unrecognised non-200 Code"),
     }
 }
 
@@ -1039,6 +1066,31 @@ mod tests {
             .await;
         let g = build(&server.uri(), "high", true);
         assert_eq!(g.check_output(&resp("ok")).await, GuardrailVerdict::Allow);
+    }
+
+    /// Aliyun reports quota throttling and its own timeout as HTTP 200 +
+    /// body `Code`, never as HTTP 429 / a transport timeout.
+    #[tokio::test]
+    async fn body_code_588_and_581_classify_as_throttled_and_timeout() {
+        for (code, want) in [
+            (588, "aliyun_throttled"),
+            (581, "aliyun_timeout"),
+            (500, "aliyun_5xx"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "Code": code, "Message": "x", "RequestId": "r" })),
+                )
+                .mount(&server)
+                .await;
+            let g = build(&server.uri(), "high", true);
+            match g.check_input(&req("x")).await {
+                GuardrailVerdict::Bypass { reason } => assert_eq!(reason, want, "Code {code}"),
+                other => panic!("Code {code}: expected Bypass({want}), got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
