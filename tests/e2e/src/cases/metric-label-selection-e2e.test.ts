@@ -105,7 +105,8 @@ describe("metric label configuration is applied to real request observations", (
         expect(response.status, `${scenario.model}: ${body}`).toBe(200);
       }
     }
-    await expect.poll(async () => sumMetric(await scrapeMetrics(app!.metricsUrl), `${TTFT}_count`), { timeout: 5000 }).toBe(scenarios.length * 2);
+    // TTFT observes every streamed request once per `side`.
+    await expect.poll(async () => sumMetric(await scrapeMetrics(app!.metricsUrl), `${TTFT}_count`), { timeout: 5000 }).toBe(scenarios.length * 2 * 2);
     const after = await scrapeMetrics(app!.metricsUrl);
     expect(metricDelta(before, after, "aisix_requests_total")).toBe(scenarios.length * 2);
     expect(after.filter((s) => s.name === "aisix_requests_total")).toHaveLength(1);
@@ -114,12 +115,16 @@ describe("metric label configuration is applied to real request observations", (
       for (const family of [TTFT, E2E]) {
         const samples = after.filter((s) => s.name.startsWith(`${family}_`) && s.labels.provider_key_name === scenario.name);
         expect(samples.length, scenario.name).toBeGreaterThan(2);
-        expect(sumMetric(samples, `${family}_count`)).toBe(2);
-        expect(sumMetric(samples, `${family}_bucket`, { le: "+Inf" })).toBe(2);
+        for (const side of family === TTFT ? ["upstream", "downstream"] : [undefined]) {
+          const want: Record<string, string> = side ? { side } : {};
+          expect(sumMetric(samples, `${family}_count`, want), `${scenario.name} ${side ?? ""}`).toBe(2);
+          expect(sumMetric(samples, `${family}_bucket`, { le: "+Inf", ...want })).toBe(2);
+        }
         expect(sumMetric(samples, `${family}_sum`)).toBeGreaterThan(0);
         for (const sample of samples) {
           const labels = Object.keys(sample.labels).filter((key) => key !== "le").sort();
-          expect(labels).toEqual((family === TTFT ? ["provider_key_name", "upstream_model", "api_key_id"] : ["endpoint", "provider_key_name"]).sort());
+          // `side` is kept although the configured TTFT selection omits it.
+          expect(labels).toEqual((family === TTFT ? ["provider_key_name", "upstream_model", "api_key_id", "side"] : ["endpoint", "provider_key_name"]).sort());
           if (family === TTFT) {
             expect(sample.labels.upstream_model).toBe("upstream");
             expect(sample.labels.api_key_id).not.toBe("unknown");
