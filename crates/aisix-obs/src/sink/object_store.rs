@@ -327,16 +327,26 @@ pub fn build_object_store(
                 service_account_key,
             },
         ) => {
-            // GCS has no HTTP-endpoint override on the builder the way S3 /
-            // Azure do (`with_url` expects a `gs://` location, not a host). An
-            // emulator base URL (fake-gcs-server) or a private endpoint rides
-            // the service-account JSON's `gcs_base_url` field instead, so the
-            // `endpoint` config is intentionally not applied for GCS.
-            let b = object_store::gcp::GoogleCloudStorageBuilder::new()
+            let mut b = object_store::gcp::GoogleCloudStorageBuilder::new()
                 .with_client_options(upstream_client_options())
                 .with_retry(export_retry_config())
                 .with_bucket_name(bucket)
                 .with_service_account_key(service_account_key);
+            // `endpoint` is the base URL (fake-gcs-server, a private
+            // endpoint) and takes precedence over a `gcs_base_url` in the
+            // service-account JSON. GCS's builder has no `with_allow_http`,
+            // so plaintext loopback is enabled through its client config.
+            if let Some(ep) = endpoint {
+                b = b.with_base_url(ep);
+                if ep.starts_with("http://") {
+                    b = b.with_config(
+                        object_store::gcp::GoogleConfigKey::Client(
+                            object_store::ClientConfigKey::AllowHttp,
+                        ),
+                        "true",
+                    );
+                }
+            }
             let store = b
                 .build()
                 .map_err(|e| SinkError::Permanent(format!("object_store: build gcs: {e}")))?;
@@ -1510,14 +1520,14 @@ mod smoke {
             eprintln!("objstore_smoke_gcs: AISIX_E2E_OBJSTORE_GCS_* not set — skipping");
             return;
         };
-        // GCS ignores the `endpoint` arg (an emulator base URL rides the
-        // service-account JSON's `gcs_base_url` instead), so it is not read
-        // here — native GCS needs only the bucket + service-account key.
+        // endpoint optional: set it for an emulator (fake-gcs-server);
+        // omit it for native GCS.
+        let endpoint = env("AISIX_E2E_OBJSTORE_GCS_ENDPOINT");
         let store = build_object_store(
             ObjectStoreProvider::Gcs,
             &bucket,
             None,
-            None,
+            endpoint.as_deref(),
             ObjectStoreCredentials::Gcs {
                 service_account_key,
             },
