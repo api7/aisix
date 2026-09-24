@@ -629,7 +629,7 @@
         },
         "max_buffer_bytes": {
           "default": 262144,
-          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
+          "description": "Max bytes of model-generated content held back in `buffer_full` mode before `on_buffer_exceeded` applies. Counts assistant text, reasoning, and tool-call arguments; SSE and JSON framing is not counted.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
@@ -797,7 +797,7 @@
         },
         "max_buffer_bytes": {
           "default": 262144,
-          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
+          "description": "Max bytes of model-generated content held back in `buffer_full` mode before `on_buffer_exceeded` applies. Counts assistant text, reasoning, and tool-call arguments; SSE and JSON framing is not counted.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
@@ -944,7 +944,7 @@
         },
         "max_buffer_bytes": {
           "default": 262144,
-          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
+          "description": "Max bytes of model-generated content held back in `buffer_full` mode before `on_buffer_exceeded` applies. Counts assistant text, reasoning, and tool-call arguments; SSE and JSON framing is not counted.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
@@ -1091,7 +1091,7 @@
         },
         "max_buffer_bytes": {
           "default": 262144,
-          "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
+          "description": "Max bytes of model-generated content held back from a streamed response before `on_buffer_exceeded` applies. Counts assistant text, reasoning, and tool-call arguments; SSE and JSON framing is not counted.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
@@ -1178,7 +1178,7 @@
         },
         "max_buffer_bytes": {
           "default": 262144,
-          "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
+          "description": "Max bytes of model-generated content held back from a streamed response before `on_buffer_exceeded` applies. Counts assistant text, reasoning, and tool-call arguments; SSE and JSON framing is not counted.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
@@ -1411,7 +1411,7 @@
         },
         "max_buffer_bytes": {
           "default": 262144,
-          "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
+          "description": "Max bytes of model-generated content held back from a streamed response before `on_buffer_exceeded` applies. Counts assistant text, reasoning, and tool-call arguments; SSE and JSON framing is not counted.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
@@ -1568,7 +1568,7 @@
         },
         "max_buffer_bytes": {
           "default": 262144,
-          "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
+          "description": "Max bytes of model-generated content held back from a streamed response before `on_buffer_exceeded` applies. Counts assistant text, reasoning, and tool-call arguments; SSE and JSON framing is not counted.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"
@@ -1677,7 +1677,7 @@
         },
         "max_buffer_bytes": {
           "default": 262144,
-          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
+          "description": "Max bytes of model-generated content held back in `buffer_full` mode before `on_buffer_exceeded` applies. Counts assistant text, reasoning, and tool-call arguments; SSE and JSON framing is not counted.",
           "format": "uint64",
           "minimum": 1.0,
           "type": "integer"

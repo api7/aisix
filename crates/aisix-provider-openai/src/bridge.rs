@@ -134,6 +134,14 @@ impl OpenAiBridge {
     /// Closes the openrouter / xai / future-long-tail half of
     /// api7/AISIX-Cloud#417. cp-api must populate `api_base` for every
     /// catalog vendor via adapter_map / provider_metadata.api_base_url.
+    ///
+    /// The routes that build their URL without this bridge (audio, image
+    /// edits, jobs, realtime, responses, messages) resolve through
+    /// `falls_back_to_openai_default` in `aisix-proxy`'s dispatch module,
+    /// which states this same fallback plus the `adapter: openai` check
+    /// that dispatch applies before an empty-vendor key ever reaches this
+    /// bridge. Change the two together, or chat and the other routes
+    /// disagree about where the same key goes.
     fn resolve_base(&self, ctx: &BridgeContext) -> Result<String, BridgeError> {
         let raw = match ctx.provider_key.api_base.as_deref() {
             Some(b) if !b.trim().is_empty() => b.trim().to_string(),
@@ -758,7 +766,7 @@ where
         let mut done_marker_seen = false;
         'outer: while let Some(next) = stream.next().await {
             let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-            for event in decoder.feed(chunk.as_ref()) {
+            for event in decoder.feed(chunk.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
                 match event {
                     SseEvent::Done => {
                         done_marker_seen = true;
@@ -778,7 +786,7 @@ where
         // it here. Both forms occur in the wild (the OpenAI SDK
         // tolerates both), so we treat `finish()`-returned Done the
         // same as a feed()-returned Done.
-        match decoder.finish() {
+        match decoder.finish().map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
             Some(SseEvent::Done) => {
                 done_marker_seen = true;
             }

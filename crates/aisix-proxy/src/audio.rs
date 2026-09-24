@@ -293,7 +293,7 @@ pub async fn transcriptions(
                 &attributed.requested_model,
                 &api_key_id,
                 &client,
-                &[],
+                &crate::usage_attr::applied_guardrails(&audit),
                 &routing.attempts,
                 failed_terminal,
                 err.is_guardrail_block(),
@@ -316,6 +316,7 @@ pub async fn transcriptions(
                     err.kind(),
                     err.is_guardrail_block(),
                     &client,
+                    crate::usage_attr::applied_guardrails(&audit),
                     crate::usage_attr::enforced_hits(&audit),
                     crate::usage_attr::guardrail_scores(&audit),
                     crate::usage_attr::bypass_reason(&audit),
@@ -522,7 +523,7 @@ pub async fn translations(
                 &attributed.requested_model,
                 &api_key_id,
                 &client,
-                &[],
+                &crate::usage_attr::applied_guardrails(&audit),
                 &routing.attempts,
                 failed_terminal,
                 err.is_guardrail_block(),
@@ -545,6 +546,7 @@ pub async fn translations(
                     err.kind(),
                     err.is_guardrail_block(),
                     &client,
+                    crate::usage_attr::applied_guardrails(&audit),
                     crate::usage_attr::enforced_hits(&audit),
                     crate::usage_attr::guardrail_scores(&audit),
                     crate::usage_attr::bypass_reason(&audit),
@@ -786,7 +788,7 @@ pub async fn speech(
                 &model_name,
                 &api_key_id,
                 &client,
-                &[],
+                &crate::usage_attr::applied_guardrails(&audit),
                 &routing.attempts,
                 failed_terminal,
                 err.is_guardrail_block(),
@@ -809,6 +811,7 @@ pub async fn speech(
                     err.kind(),
                     err.is_guardrail_block(),
                     &client,
+                    crate::usage_attr::applied_guardrails(&audit),
                     crate::usage_attr::enforced_hits(&audit),
                     crate::usage_attr::guardrail_scores(&audit),
                     crate::usage_attr::bypass_reason(&audit),
@@ -1009,33 +1012,28 @@ where
         let mut guard = TranscriptGuard { slot: Some((on_complete, StreamedTranscript::default())) };
         // `None` once the side-channel parse has been abandoned; the
         // relay itself carries on either way.
-        let mut decoder = Some(aisix_gateway::SseDecoder::new());
-        // Bytes fed since the decoder last unlocked a frame. The decoder
-        // holds an unterminated frame indefinitely, so an upstream that
-        // streams without a `\n\n` terminator would grow it without
-        // bound; drop the parse at the cap (losing telemetry for that
-        // pathological case) rather than OOM. Same bound and same trade
-        // as the `/v1/responses` passthrough.
-        let mut unterminated: usize = 0;
+        // An upstream that streams without ever ending a frame would grow
+        // the decoder without bound; drop the parse at the cap (losing
+        // telemetry for that pathological case) rather than OOM. Same
+        // bound and same trade as the `/v1/responses` passthrough.
+        let mut decoder = Some(aisix_gateway::SseDecoder::with_max_frame_bytes(
+            crate::messages::MAX_SSE_FRAME_BUF_BYTES,
+        ));
         futures::pin_mut!(upstream);
         while let Some(item) = upstream.next().await {
             if let (Ok(bytes), Some(d)) = (&item, decoder.as_mut()) {
                 // Side-channel parse over a copy of the frames; `item` is
                 // yielded below untouched.
-                let events = d.feed(bytes.as_ref());
-                unterminated = if events.is_empty() {
-                    unterminated + bytes.len()
-                } else {
-                    0
-                };
-                observe_transcript_events(guard.observed(), &events, text_cap);
-                if unterminated > crate::messages::MAX_SSE_FRAME_BUF_BYTES {
-                    tracing::warn!(
-                        buffered = unterminated,
-                        "transcription stream: no SSE frame terminator within the buffer cap; \
-                         dropping the parse (usage and capture skipped)"
-                    );
-                    decoder = None;
+                match d.feed(bytes.as_ref()) {
+                    Ok(events) => observe_transcript_events(guard.observed(), &events, text_cap),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "transcription stream: no SSE frame terminator within the buffer cap; \
+                             dropping the parse (usage and capture skipped)"
+                        );
+                        decoder = None;
+                    }
                 }
             }
             if let Err(e) = &item {
@@ -1052,7 +1050,7 @@ where
         if let Some(mut d) = decoder.take() {
             observe_transcript_events(
                 guard.observed(),
-                &d.finish().into_iter().collect::<Vec<_>>(),
+                &d.finish().ok().flatten().into_iter().collect::<Vec<_>>(),
                 text_cap,
             );
         }
@@ -1065,7 +1063,7 @@ where
             // on the terminal frame drops this generator here, and the
             // Drop emit must still carry the usage it already parsed.
             let text = guard.observed().text().to_string();
-            let hits = scan.observe(&text).await;
+            let hits = scan.observe(&text, None).await;
             guard.observed().output_hits = hits;
         }
         if let Some((f, observed)) = guard.slot.take() {
@@ -1392,8 +1390,9 @@ async fn multipart_dispatch(
                     // (#1017: the resolved URL depends on the vendor too), plus the
                     // per-call path.
                     &{
-                        let [base, vendor] = crate::dispatch::pk_url_fingerprint(&pk_entry.value);
-                        [base, vendor, upstream_path]
+                        let [base, vendor, adapter] =
+                            crate::dispatch::pk_url_fingerprint(&pk_entry.value);
+                        [base, vendor, adapter, upstream_path]
                     },
                     || {
                         let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
@@ -2402,9 +2401,11 @@ fn extract_sse_token_usage(headers: &HeaderMap, body: &[u8]) -> Option<(u32, u32
     if !is_event_stream(headers) {
         return None;
     }
-    let mut decoder = aisix_gateway::SseDecoder::new();
-    let mut events = decoder.feed(body);
-    events.extend(decoder.finish());
+    // The body is already buffered whole, so no frame is still arriving and
+    // no bound applies to it here.
+    let mut decoder = aisix_gateway::SseDecoder::with_max_frame_bytes(usize::MAX);
+    let mut events = decoder.feed(body).ok()?;
+    events.extend(decoder.finish().ok()?);
     events.iter().rev().find_map(|event| match event {
         aisix_gateway::SseEvent::Data(payload) => serde_json::from_str::<Value>(payload)
             .ok()

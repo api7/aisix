@@ -20,7 +20,9 @@ use aisix_core::models::{
 };
 
 use crate::audit::GuardrailAuditLog;
-use crate::{Guardrail, GuardrailVerdict, Redaction, SegmentsOutcome, StreamOutputPolicy};
+use crate::{
+    Guardrail, GuardrailVerdict, Redaction, ScanSegment, SegmentsOutcome, StreamOutputPolicy,
+};
 
 /// One chain member: the runtime guardrail plus the operator-facing name
 /// and `kind` of the row it was built from. The name is what `Block`
@@ -225,10 +227,12 @@ impl GuardrailChain {
     /// Record a bypass the PROXY performed on the chain's behalf, rather
     /// than one a member returned.
     ///
-    /// One caller shape: a body the scanner cannot read, which the
+    /// Two caller shapes: a body the scanner cannot read, which the
     /// handler passes through when nothing attached both reads that side
-    /// and refuses when it cannot evaluate (#1115). No member ran, so no
-    /// member can report it, yet the request was screened by nothing —
+    /// and refuses when it cannot evaluate (#1115); and a held-back stream
+    /// that outgrew its cap under `on_buffer_exceeded: fail_open`, released
+    /// without an output scan (`output_buffer_exceeded`). No member ran, so
+    /// no member can report it, yet the content was screened by nothing —
     /// exactly what the field is read to rule out.
     ///
     /// Reported to BOTH receivers, and they answer different questions.
@@ -314,6 +318,156 @@ impl GuardrailChain {
         self.audit.clone()
     }
 
+    /// The observed input fold. `unmaskable` marks a call site with no
+    /// channel to write a mask back: each member is asked through its
+    /// `*_unmaskable_observed` hook, and an enforcing mask rule that
+    /// matches records `mask_unsupported` instead of passing silently.
+    async fn fold_input_observed(
+        &self,
+        req: &ChatFormat,
+        unmaskable: bool,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let mut bypass: Option<String> = None;
+        let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
+        let narrowed = latest_turn_view_if_needed(&self.members, req);
+        for m in &self.members {
+            let started = Instant::now();
+            let input = member_input(m, req, &narrowed);
+            let (verdict, member_hits) = if unmaskable {
+                m.guardrail.check_input_unmaskable_observed(input).await
+            } else {
+                m.guardrail.check_input_observed(input).await
+            };
+            record_execution(
+                self.recorders(),
+                m,
+                "input",
+                started,
+                &verdict,
+                false,
+                &member_hits,
+                None,
+            );
+            hits.extend(member_hits);
+            if unmaskable && !verdict.is_block() && m.guardrail.redacts_input() {
+                let text = input
+                    .messages
+                    .iter()
+                    .map(crate::message_scan_text)
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.record_mask_unsupported(m, "input", || m.guardrail.redact_input_text(&text));
+            }
+            match verdict {
+                GuardrailVerdict::Allow => continue,
+                GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                    unavailable,
+                } => {
+                    return (
+                        attribute_block(&m.name, reason, guardrail_name, unavailable),
+                        hits,
+                    )
+                }
+                GuardrailVerdict::Bypass { reason } => {
+                    if bypass.is_none() {
+                        bypass = Some(reason);
+                    }
+                }
+            }
+        }
+        let verdict = match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
+        };
+        (verdict, hits)
+    }
+
+    /// The observed output fold; `unmaskable` as in
+    /// [`Self::fold_input_observed`].
+    async fn fold_output_observed(
+        &self,
+        resp: &ChatResponse,
+        unmaskable: bool,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let mut bypass: Option<String> = None;
+        let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
+        for m in &self.members {
+            let started = Instant::now();
+            let (verdict, member_hits) = if unmaskable {
+                m.guardrail.check_output_unmaskable_observed(resp).await
+            } else {
+                m.guardrail.check_output_observed(resp).await
+            };
+            record_execution(
+                self.recorders(),
+                m,
+                "output",
+                started,
+                &verdict,
+                false,
+                &member_hits,
+                None,
+            );
+            hits.extend(member_hits);
+            if unmaskable && !verdict.is_block() && m.guardrail.redacts_output() {
+                let text = resp.guardrail_output_text();
+                self.record_mask_unsupported(m, "output", || m.guardrail.redact_output_text(&text));
+            }
+            match verdict {
+                GuardrailVerdict::Allow => continue,
+                GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                    unavailable,
+                } => {
+                    return (
+                        attribute_block(&m.name, reason, guardrail_name, unavailable),
+                        hits,
+                    )
+                }
+                GuardrailVerdict::Bypass { reason } => {
+                    if bypass.is_none() {
+                        bypass = Some(reason);
+                    }
+                }
+            }
+        }
+        let verdict = match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
+        };
+        (verdict, hits)
+    }
+
+    /// Record what an enforcing mask member matched at a call site that
+    /// forwards the content unmodified. Nothing was redacted, so this is
+    /// an enforced hit of its own and never a `masked` one, and
+    /// `redacted_entity_counts` stays untouched.
+    fn record_mask_unsupported(
+        &self,
+        m: &ChainMember,
+        phase: &'static str,
+        redact: impl FnOnce() -> Option<Redaction>,
+    ) {
+        let Some(audit) = self.audit.as_deref() else {
+            return;
+        };
+        let started = Instant::now();
+        if let Some(r) = redact() {
+            audit.record(
+                &m.name,
+                phase,
+                ACTION_MASK_UNSUPPORTED,
+                None,
+                started.elapsed(),
+                &r.counts,
+            );
+        }
+    }
+
     /// Borrow both execution receivers for one fold.
     fn recorders(&self) -> Recorders<'_> {
         Recorders {
@@ -386,12 +540,24 @@ fn classify_execution<'v>(
                 ("would_block", error_type)
             } else if hits.iter().any(|h| h.action == "would_mask") {
                 ("would_mask", None)
+            } else if hits.iter().any(|h| h.action == "would_mask_unsupported") {
+                ("would_mask_unsupported", None)
             } else {
                 ("allowed", None)
             }
         }
     }
 }
+
+/// `action` of the enforced hit a fail-closed buffer-cap refusal records
+/// (#1029): the check never ran, so it is neither `blocked` nor
+/// `blocked_unavailable`.
+const ACTION_BLOCKED_BUFFER_EXCEEDED: &str = "blocked_buffer_exceeded";
+
+/// `action` of the enforced hit an enforcing mask rule records at a call
+/// site that has no channel to write the mask back: the content was
+/// forwarded unmodified.
+const ACTION_MASK_UNSUPPORTED: &str = "mask_unsupported";
 
 /// The two receivers a fold reports each member execution to: the
 /// process-global metrics sink (AISIX-Cloud#1076) and the request's
@@ -549,6 +715,41 @@ impl Guardrail for GuardrailChain {
         self.members.iter().any(|m| m.guardrail.runs_on_output())
     }
 
+    fn record_output_bypass(&self, reason: &str) {
+        self.record_bypass(reason);
+    }
+
+    /// Names the member whose cap is the one [`Self::stream_output_policy`]
+    /// folded to: the smallest `max_buffer_bytes` among output members that
+    /// hold the whole response, the first in chain order on a tie — the row
+    /// an operator raises, not the chain.
+    fn record_output_buffer_exceeded(&self) {
+        let Some(audit) = self.audit.as_deref() else {
+            return;
+        };
+        let mut owner: Option<(&str, usize)> = None;
+        for m in self.members.iter().filter(|m| m.guardrail.runs_on_output()) {
+            if let StreamOutputPolicy::BufferFull {
+                max_buffer_bytes, ..
+            } = m.guardrail.stream_output_policy()
+            {
+                if owner.is_none_or(|(_, cap)| max_buffer_bytes < cap) {
+                    owner = Some((&m.name, max_buffer_bytes));
+                }
+            }
+        }
+        if let Some((name, _)) = owner {
+            audit.record(
+                name,
+                "output",
+                ACTION_BLOCKED_BUFFER_EXCEEDED,
+                None,
+                std::time::Duration::ZERO,
+                &std::collections::BTreeMap::new(),
+            );
+        }
+    }
+
     /// `true` when at least one member inspects the request. An empty
     /// chain — and a chain whose every member is attached on the output
     /// hook alone — reports `false`, so a caller can tell "guardrails are
@@ -686,53 +887,31 @@ impl Guardrail for GuardrailChain {
         &self,
         req: &ChatFormat,
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
-        let mut bypass: Option<String> = None;
-        let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
-        let narrowed = latest_turn_view_if_needed(&self.members, req);
-        for m in &self.members {
-            let started = Instant::now();
-            let (verdict, member_hits) = m
-                .guardrail
-                .check_input_observed(member_input(m, req, &narrowed))
-                .await;
-            record_execution(
-                self.recorders(),
-                m,
-                "input",
-                started,
-                &verdict,
-                false,
-                &member_hits,
-                None,
-            );
-            hits.extend(member_hits);
-            match verdict {
-                GuardrailVerdict::Allow => continue,
-                GuardrailVerdict::Block {
-                    reason,
-                    guardrail_name,
-                    unavailable,
-                } => {
-                    return (
-                        attribute_block(&m.name, reason, guardrail_name, unavailable),
-                        hits,
-                    )
-                }
-                GuardrailVerdict::Bypass { reason } => {
-                    if bypass.is_none() {
-                        bypass = Some(reason);
-                    }
-                }
-            }
-        }
-        let verdict = match bypass {
-            Some(reason) => GuardrailVerdict::Bypass { reason },
-            None => GuardrailVerdict::Allow,
-        };
-        (verdict, hits)
+        self.fold_input_observed(req, false).await
     }
 
     async fn check_output_observed(
+        &self,
+        resp: &ChatResponse,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        self.fold_output_observed(resp, false).await
+    }
+
+    async fn check_input_unmaskable_observed(
+        &self,
+        req: &ChatFormat,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        self.fold_input_observed(req, true).await
+    }
+
+    async fn check_output_unmaskable_observed(
+        &self,
+        resp: &ChatResponse,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        self.fold_output_observed(resp, true).await
+    }
+
+    async fn check_output_non_local_observed(
         &self,
         resp: &ChatResponse,
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
@@ -740,17 +919,21 @@ impl Guardrail for GuardrailChain {
         let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
         for m in &self.members {
             let started = Instant::now();
-            let (verdict, member_hits) = m.guardrail.check_output_observed(resp).await;
-            record_execution(
-                self.recorders(),
-                m,
-                "output",
-                started,
-                &verdict,
-                false,
-                &member_hits,
-                None,
-            );
+            let (verdict, member_hits) = m.guardrail.check_output_non_local_observed(resp).await;
+            // A local member answers through `check_local_segments`; this
+            // call is an instant Allow, not an execution.
+            if !m.guardrail.checks_local_segments() {
+                record_execution(
+                    self.recorders(),
+                    m,
+                    "output",
+                    started,
+                    &verdict,
+                    false,
+                    &member_hits,
+                    None,
+                );
+            }
             hits.extend(member_hits);
             match verdict {
                 GuardrailVerdict::Allow => continue,
@@ -795,7 +978,7 @@ impl Guardrail for GuardrailChain {
             // this call is an instant Allow, not an execution; recording
             // it would pollute the member's series with zero-length
             // "allowed" samples.
-            if !m.guardrail.moderates_segments() {
+            if !m.guardrail.judged_by_segments() {
                 record_execution(
                     self.recorders(),
                     m,
@@ -843,7 +1026,7 @@ impl Guardrail for GuardrailChain {
         for m in &self.members {
             let started = Instant::now();
             let (verdict, member_hits) = m.guardrail.check_output_non_segment_observed(resp).await;
-            if !m.guardrail.moderates_segments() {
+            if !m.guardrail.judged_by_segments() {
                 record_execution(
                     self.recorders(),
                     m,
@@ -886,6 +1069,80 @@ impl Guardrail for GuardrailChain {
         self.members
             .iter()
             .any(|m| m.guardrail.moderates_segments())
+    }
+
+    fn checks_local_segments(&self) -> bool {
+        self.members
+            .iter()
+            .any(|m| m.guardrail.checks_local_segments())
+    }
+
+    /// Fold over the local-segment members. Mirrors the check folds: the
+    /// first Block short-circuits with attribution, the first Bypass
+    /// sticks, and every member's monitor observations are kept. A
+    /// `latest_turn` member is offered only the in-window input segments.
+    fn check_local_segments(
+        &self,
+        segments: &[ScanSegment],
+        input: bool,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let phase = if input { "input" } else { "output" };
+        let mut bypass: Option<String> = None;
+        let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
+        let mut in_window: Option<Vec<ScanSegment>> = None;
+        for m in &self.members {
+            if !m.guardrail.checks_local_segments() {
+                continue;
+            }
+            let view: &[ScanSegment] =
+                if input && m.input_messages == GuardrailInputMessages::LatestTurn {
+                    in_window.get_or_insert_with(|| {
+                        segments
+                            .iter()
+                            .filter(|s| s.in_latest_turn)
+                            .cloned()
+                            .collect()
+                    })
+                } else {
+                    segments
+                };
+            let started = Instant::now();
+            let (verdict, member_hits) = m.guardrail.check_local_segments(view, input);
+            record_execution(
+                self.recorders(),
+                m,
+                phase,
+                started,
+                &verdict,
+                false,
+                &member_hits,
+                None,
+            );
+            hits.extend(member_hits);
+            match verdict {
+                GuardrailVerdict::Allow => {}
+                GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                    unavailable,
+                } => {
+                    return (
+                        attribute_block(&m.name, reason, guardrail_name, unavailable),
+                        hits,
+                    )
+                }
+                GuardrailVerdict::Bypass { reason } => {
+                    if bypass.is_none() {
+                        bypass = Some(reason);
+                    }
+                }
+            }
+        }
+        let verdict = match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
+        };
+        (verdict, hits)
     }
 
     /// Fold over segment-moderating members only. A Block short-circuits
@@ -939,7 +1196,7 @@ impl Guardrail for GuardrailChain {
                 .guardrail
                 .check_input_non_segment(member_input(m, req, &narrowed))
                 .await;
-            if !m.guardrail.moderates_segments() {
+            if !m.guardrail.judged_by_segments() {
                 record_execution(
                     self.recorders(),
                     m,
@@ -976,7 +1233,7 @@ impl Guardrail for GuardrailChain {
         for m in &self.members {
             let started = Instant::now();
             let verdict = m.guardrail.check_output_non_segment(resp).await;
-            if !m.guardrail.moderates_segments() {
+            if !m.guardrail.judged_by_segments() {
                 record_execution(
                     self.recorders(),
                     m,
@@ -1234,6 +1491,59 @@ mod tests {
     use super::*;
     use crate::{KeywordBlocklist, KeywordRule};
     use aisix_gateway::{ChatMessage, FinishReason, Role, UsageStats};
+
+    /// #1029: on an equal cap the entry names the member that runs first,
+    /// and a windowed member never set the cap, so it is never named.
+    #[test]
+    fn a_buffer_cap_refusal_names_the_first_member_on_a_tied_cap() {
+        struct Policy(StreamOutputPolicy);
+        #[async_trait]
+        impl Guardrail for Policy {
+            fn name(&self) -> &'static str {
+                "policy"
+            }
+            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+                GuardrailVerdict::Allow
+            }
+            fn stream_output_policy(&self) -> StreamOutputPolicy {
+                self.0.clone()
+            }
+        }
+        let full = || StreamOutputPolicy::BufferFull {
+            max_buffer_bytes: 4_096,
+            on_exceeded_fail_open: false,
+        };
+        let member = |name: &str, policy| {
+            (
+                name.to_owned(),
+                Arc::new(Policy(policy)) as Arc<dyn Guardrail>,
+            )
+        };
+        let audit = Arc::new(GuardrailAuditLog::new());
+        let chain = GuardrailChain::new_with_applied_all(
+            vec![
+                member(
+                    "windowed",
+                    StreamOutputPolicy::Window {
+                        size_chars: 10,
+                        overlap_chars: 2,
+                    },
+                ),
+                member("tied-first", full()),
+                member("tied-second", full()),
+            ],
+            Vec::new(),
+        )
+        .with_audit_log(Some(Arc::clone(&audit)));
+
+        chain.record_output_buffer_exceeded();
+
+        let hits = chain.enforced_hits();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].guardrail_name, "tied-first");
+        assert_eq!(hits[0].hook, "output");
+        assert_eq!(hits[0].action, "blocked_buffer_exceeded");
+    }
 
     /// AISIX-Cloud#1330: the audit log and the metrics sink are gated
     /// independently. `record_execution` used to bail the moment the sink
@@ -1897,6 +2207,28 @@ mod tests {
 
     // --- segment moderation folds (#932 bedrock follow-up) ---------------
 
+    /// A blob-check member: blocks when the joined request text contains
+    /// `needle`. Neither a segment moderator nor a local-segment kind, so
+    /// the non-segment folds consult it.
+    struct BlobBlocks(&'static str);
+    #[async_trait]
+    impl Guardrail for BlobBlocks {
+        fn name(&self) -> &'static str {
+            "blob-blocks"
+        }
+        async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
+            if req
+                .messages
+                .iter()
+                .any(|m| m.content_str().contains(self.0))
+            {
+                GuardrailVerdict::block("blob matched")
+            } else {
+                GuardrailVerdict::Allow
+            }
+        }
+    }
+
     /// A stub segment moderator: uppercases every slot and reports a
     /// fixed count key, or blocks/bypasses on demand.
     struct StubSegments {
@@ -2293,9 +2625,9 @@ mod tests {
                 verdict: GuardrailVerdict::Allow,
                 mask: false,
             }),
-            Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")])),
+            Arc::new(BlobBlocks("AKIA")),
         ]);
-        // Keyword member still blocks...
+        // The blob member still blocks...
         assert!(chain
             .check_input_non_segment(&req("here is AKIAEXAMPLE"))
             .await
@@ -2620,12 +2952,7 @@ mod tests {
                         mask: true,
                     }) as Arc<dyn Guardrail>,
                 ),
-                (
-                    "kw".to_owned(),
-                    Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal(
-                        "never-matches",
-                    )])),
-                ),
+                ("kw".to_owned(), Arc::new(BlobBlocks("never-matches"))),
             ],
             vec![
                 AppliedGuardrail {
@@ -2636,7 +2963,7 @@ mod tests {
             ],
         );
 
-        // Non-segment pass: only the keyword member records.
+        // Non-segment pass: only the blob member records.
         let (v, _) = chain.check_input_non_segment_observed(&req("clean")).await;
         assert_eq!(v, GuardrailVerdict::Allow);
         assert_eq!(

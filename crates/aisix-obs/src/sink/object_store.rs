@@ -327,16 +327,26 @@ pub fn build_object_store(
                 service_account_key,
             },
         ) => {
-            // GCS has no HTTP-endpoint override on the builder the way S3 /
-            // Azure do (`with_url` expects a `gs://` location, not a host). An
-            // emulator base URL (fake-gcs-server) or a private endpoint rides
-            // the service-account JSON's `gcs_base_url` field instead, so the
-            // `endpoint` config is intentionally not applied for GCS.
-            let b = object_store::gcp::GoogleCloudStorageBuilder::new()
+            let mut b = object_store::gcp::GoogleCloudStorageBuilder::new()
                 .with_client_options(upstream_client_options())
                 .with_retry(export_retry_config())
                 .with_bucket_name(bucket)
                 .with_service_account_key(service_account_key);
+            // `endpoint` is the base URL (fake-gcs-server, a private
+            // endpoint) and takes precedence over a `gcs_base_url` in the
+            // service-account JSON. GCS's builder has no `with_allow_http`,
+            // so plaintext loopback is enabled through its client config.
+            if let Some(ep) = endpoint {
+                b = b.with_base_url(ep);
+                if ep.starts_with("http://") {
+                    b = b.with_config(
+                        object_store::gcp::GoogleConfigKey::Client(
+                            object_store::ClientConfigKey::AllowHttp,
+                        ),
+                        "true",
+                    );
+                }
+            }
             let store = b
                 .build()
                 .map_err(|e| SinkError::Permanent(format!("object_store: build gcs: {e}")))?;
@@ -380,7 +390,8 @@ pub fn build_object_store(
 /// is rejected for S3, since ambient credentials require the provider's
 /// metadata service. **GCS** uses
 /// Application Default Credentials (GKE Workload Identity / GCE metadata) by
-/// constructing the builder with no service-account key. **Azure** is not
+/// constructing the builder with no service-account key; a custom `endpoint`
+/// is rejected for GCS too, as the control plane does. **Azure** is not
 /// supported here — its managed identity still needs a non-secret account name
 /// the keyless config does not carry; cp-api rejects that combination at create
 /// time, and this arm returns a clear permanent error as a backstop.
@@ -419,6 +430,16 @@ pub fn build_object_store_ambient(
             Ok(Arc::new(store))
         }
         ObjectStoreProvider::Gcs => {
+            // Refused like S3, and as the control plane refuses it for every
+            // provider: a custom base URL is only reachable with a
+            // credential_ref service account.
+            if endpoint.is_some() {
+                return Err(SinkError::Permanent(
+                    "object_store: cloud_identity for gcs does not support a custom \
+                     endpoint; use credential_ref"
+                        .to_string(),
+                ));
+            }
             // No service-account key set → `object_store` sources Application
             // Default Credentials (GKE Workload Identity / GCE metadata).
             let store = object_store::gcp::GoogleCloudStorageBuilder::new()
@@ -1066,6 +1087,25 @@ mod tests {
     }
 
     #[test]
+    fn build_object_store_ambient_gcs_rejects_endpoint() {
+        let r = build_object_store_ambient(
+            ObjectStoreProvider::Gcs,
+            "bucket",
+            None,
+            Some("https://storage-private.example.com"),
+        );
+        match r {
+            Err(SinkError::Permanent(msg)) => {
+                assert!(msg.contains("endpoint"), "msg: {msg}");
+                assert!(msg.contains("credential_ref"), "msg: {msg}");
+            }
+            other => {
+                panic!("expected Permanent error for gcs cloud_identity + endpoint, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
     fn build_object_store_ambient_dispatches_gcs() {
         // Cloud-identity GCS builds with no service-account key → Application
         // Default Credentials at request time; build() succeeds offline.
@@ -1510,14 +1550,14 @@ mod smoke {
             eprintln!("objstore_smoke_gcs: AISIX_E2E_OBJSTORE_GCS_* not set — skipping");
             return;
         };
-        // GCS ignores the `endpoint` arg (an emulator base URL rides the
-        // service-account JSON's `gcs_base_url` instead), so it is not read
-        // here — native GCS needs only the bucket + service-account key.
+        // endpoint optional: set it for an emulator (fake-gcs-server);
+        // omit it for native GCS.
+        let endpoint = env("AISIX_E2E_OBJSTORE_GCS_ENDPOINT");
         let store = build_object_store(
             ObjectStoreProvider::Gcs,
             &bucket,
             None,
-            None,
+            endpoint.as_deref(),
             ObjectStoreCredentials::Gcs {
                 service_account_key,
             },

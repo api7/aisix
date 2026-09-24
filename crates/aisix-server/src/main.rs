@@ -1291,6 +1291,13 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         ));
     }
 
+    tokio::spawn(
+        proxy_state
+            .otlp_fan_out
+            .clone()
+            .reap_on_config_change(snapshot_handle.clone(), cancel_rx.clone()),
+    );
+
     // Clone shared trackers before consuming proxy_state in build_router.
     let health_tracker = proxy_state.health.clone();
     let livez_state = proxy_state.livez.clone();

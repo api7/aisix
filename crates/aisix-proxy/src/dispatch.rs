@@ -311,27 +311,21 @@ fn strip_endpoint_suffix(base: &str) -> &str {
 /// pasting the full upstream URL into `api_base` by stripping any
 /// trailing endpoint suffix — see [`API_BASE_ENDPOINT_SUFFIXES`].
 ///
-/// The `openai` vendor is the single default-base exception (#1017):
-/// before it, an OpenAI key with no `api_base` worked on the
-/// bridge-dispatched routes (chat, generations) and `/v1/videos` —
-/// both fall back to [`aisix_provider_openai::OPENAI_DEFAULT_BASE`] —
-/// but 400'd on every direct-HTTP route through this resolver (audio,
-/// image edits, jobs, realtime). The fallback here converges all of
-/// them. Strictly the exact vendor string: an empty or
-/// OpenAI-compatible vendor still errors, because this resolver also
-/// serves non-OpenAI-family paths (messages / count_tokens) and must
-/// never send another vendor's credential to api.openai.com. Note the
-/// family bridge is LOOSER: it refuses only a non-empty non-openai
-/// vendor and still falls back for the legacy empty-provider shape —
-/// so a legacy `{provider: "", adapter: "openai"}` row with no
-/// `api_base` remains route-dependent (chat falls back, direct routes
-/// 400); that residue is tracked in #1019 rather than widened here. A
-/// key misdeclared as `provider: "openai"` on an anthropic-adapter
-/// path now dispatches to api.openai.com and gets the upstream's 401
-/// instead of a gateway 400 — by declaration that secret is an OpenAI
-/// credential, so nothing crosses vendors. Every other catalog vendor
-/// keeps requiring `api_base` — the DP does not enumerate per-vendor
-/// default URLs.
+/// The OpenAI default base is the single default-base exception
+/// (#1017, #1019): a key with no `api_base` resolves to
+/// [`aisix_provider_openai::OPENAI_DEFAULT_BASE`] exactly when
+/// [`falls_back_to_openai_default`] says so, which is the same set of
+/// keys the OpenAI bridge sends there on chat — so every route treats a
+/// key the way chat does. Every other key keeps requiring `api_base`:
+/// this resolver also serves the Anthropic-wire routes (messages /
+/// count_tokens) and must never send another vendor's credential to
+/// api.openai.com, and the DP does not enumerate per-vendor default
+/// URLs; the Anthropic default for the Anthropic-wire routes is applied
+/// one level up, in [`resolve_base_url_for`]. A key misdeclared as
+/// `provider: "openai"` on an
+/// anthropic-adapter path dispatches to api.openai.com and gets the
+/// upstream's 401 instead of a gateway 400 — by declaration that secret
+/// is an OpenAI credential, so nothing crosses vendors.
 ///
 /// Callers that cache the built URL take their fingerprint from
 /// [`pk_url_fingerprint`], which carries every input this resolver
@@ -339,7 +333,7 @@ fn strip_endpoint_suffix(base: &str) -> &str {
 pub(crate) fn resolve_base_url(provider_key: &ProviderKey) -> Result<String, ProxyError> {
     match provider_key.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => Ok(strip_endpoint_suffix(b.trim()).to_string()),
-        _ if provider_key.provider.trim().eq_ignore_ascii_case("openai") => {
+        _ if falls_back_to_openai_default(provider_key) => {
             Ok(aisix_provider_openai::OPENAI_DEFAULT_BASE.to_string())
         }
         _ => {
@@ -362,6 +356,26 @@ pub(crate) fn resolve_base_url(provider_key: &ProviderKey) -> Result<String, Pro
             )))
         }
     }
+}
+
+/// Whether a key with no `api_base` resolves to the built-in OpenAI base:
+/// the `openai` vendor, or the legacy empty-vendor row on the `openai`
+/// adapter.
+///
+/// This is the OpenAI bridge's own fallback (`resolve_base` in
+/// `aisix-provider-openai`) restricted to the keys two-tier dispatch
+/// actually hands that bridge. The bridge falls back for an empty or
+/// `openai` vendor; a `provider: "openai"` key reaches it as the
+/// specialized bridge, and an empty-vendor key only through its
+/// `adapter: openai` family registration. The adapter check is what the
+/// bridge gets for free from dispatch and this resolver has to state:
+/// without it, an empty-vendor `adapter: anthropic` row reaching the
+/// messages passthrough would send its credential to api.openai.com.
+/// Change the two together.
+fn falls_back_to_openai_default(provider_key: &ProviderKey) -> bool {
+    let vendor = provider_key.provider.trim();
+    vendor.eq_ignore_ascii_case("openai")
+        || (vendor.is_empty() && provider_key.adapter == Some(aisix_core::Adapter::Openai))
 }
 
 /// True when `base` carries a path component beyond the host — i.e. the
@@ -445,19 +459,26 @@ pub(crate) fn require_utf8_prompt_fields(
 
 /// The cache-fingerprint elements for a URL derived from
 /// [`resolve_base_url`]: every raw input the resolved URL depends on —
-/// `api_base` AND the vendor (the #1017 default-base fallback made the
-/// output vendor-dependent). One constructor for all call sites, so a
+/// `api_base`, the vendor AND the adapter (the default-base fallback
+/// reads both, #1017 / #1019). One constructor for all call sites, so a
 /// future input added here reaches every cached URL at once instead of
 /// relying on each site's comment discipline.
-pub(crate) fn pk_url_fingerprint(provider_key: &ProviderKey) -> [&str; 2] {
+pub(crate) fn pk_url_fingerprint(provider_key: &ProviderKey) -> [&str; 3] {
     [
         provider_key.api_base.as_deref().unwrap_or(""),
         provider_key.provider.as_str(),
+        provider_key
+            .adapter
+            .map_or("", aisix_core::Adapter::wire_protocol),
     ]
 }
 
 /// The base URL for one API surface: the `apis` entry's own `base` when
-/// the Provider Key declares one, else [`resolve_base_url`].
+/// the Provider Key declares one, else [`resolve_base_url`] — except
+/// that on `Messages` a key [`falls_back_to_anthropic_default`] names,
+/// with no `api_base`, gets the Anthropic default base: this is the
+/// Anthropic wire, so the wire-agnostic resolver's OpenAI default does
+/// not apply to it.
 ///
 /// This is what lets a single upstream account serve two protocols from
 /// two paths — `…/v1` for the OpenAI wire and `…/anthropic` for the
@@ -469,8 +490,34 @@ pub(crate) fn resolve_base_url_for(
 ) -> Result<String, ProxyError> {
     match surface_base(provider_key, surface) {
         Some(base) => Ok(strip_endpoint_suffix(base.trim()).to_string()),
+        None if surface == ApiSurface::Messages
+            && provider_key
+                .api_base
+                .as_deref()
+                .is_none_or(|b| b.trim().is_empty())
+            && falls_back_to_anthropic_default(provider_key) =>
+        {
+            Ok(aisix_provider_anthropic::ANTHROPIC_DEFAULT_BASE.to_string())
+        }
         None => resolve_base_url(provider_key),
     }
+}
+
+/// Whether a key with no `api_base` reaches the built-in Anthropic base
+/// on the Anthropic-wire routes: the `anthropic` vendor, or the legacy
+/// empty-vendor row on the `anthropic` adapter.
+///
+/// The Anthropic counterpart of [`falls_back_to_openai_default`], and
+/// for the same reason: it is `AnthropicBridge`'s own fallback
+/// (`resolve_base` in `aisix-provider-anthropic`, which falls back for
+/// an empty or `anthropic` vendor) restricted to the keys two-tier
+/// dispatch hands that bridge — the `anthropic` vendor through its
+/// specialized registration, an empty vendor only through the
+/// `adapter: anthropic` family one. Change the two together.
+fn falls_back_to_anthropic_default(provider_key: &ProviderKey) -> bool {
+    let vendor = provider_key.provider.trim();
+    vendor.eq_ignore_ascii_case("anthropic")
+        || (vendor.is_empty() && provider_key.adapter == Some(aisix_core::Adapter::Anthropic))
 }
 
 /// The raw per-surface `base` override, if this key declares a non-empty
@@ -493,11 +540,13 @@ fn surface_base(provider_key: &ProviderKey, surface: ApiSurface) -> Option<&str>
 pub(crate) fn pk_surface_url_fingerprint(
     provider_key: &ProviderKey,
     surface: ApiSurface,
-) -> [&str; 3] {
+) -> [&str; 4] {
+    let [api_base, vendor, adapter] = pk_url_fingerprint(provider_key);
     [
         surface_base(provider_key, surface).unwrap_or(""),
-        provider_key.api_base.as_deref().unwrap_or(""),
-        provider_key.provider.as_str(),
+        api_base,
+        vendor,
+        adapter,
     ]
 }
 
@@ -1154,6 +1203,122 @@ mod tests {
         assert_eq!(
             resolve_base_url(&pk).unwrap(),
             aisix_provider_openai::OPENAI_DEFAULT_BASE
+        );
+    }
+
+    /// #1019: the legacy empty-vendor row on the `openai` adapter is
+    /// the shape chat already sends to the default base through the
+    /// OpenAI family bridge; the direct-HTTP routes must agree instead of
+    /// answering 400.
+    #[test]
+    fn resolve_base_url_legacy_empty_vendor_openai_adapter_falls_back() {
+        let pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"x","secret":"k","provider":"","adapter":"openai"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_base_url(&pk).unwrap(),
+            aisix_provider_openai::OPENAI_DEFAULT_BASE
+        );
+    }
+
+    /// The empty-vendor fallback is keyed on the adapter: the same legacy
+    /// shape on any other adapter keeps requiring `api_base`, so its
+    /// credential never reaches api.openai.com through the messages
+    /// passthrough or any other resolver-fed route.
+    #[test]
+    fn resolve_base_url_legacy_empty_vendor_other_adapter_still_errors() {
+        for adapter in aisix_core::Adapter::ALL
+            .into_iter()
+            .filter(|a| *a != aisix_core::Adapter::Openai)
+        {
+            let pk: ProviderKey = serde_json::from_str(&format!(
+                r#"{{"display_name":"x","secret":"k","provider":"","adapter":"{}"}}"#,
+                adapter.wire_protocol()
+            ))
+            .unwrap();
+            assert!(
+                matches!(resolve_base_url(&pk), Err(ProxyError::InvalidRequest(_))),
+                "adapter {adapter:?} must not fall back to the OpenAI default base"
+            );
+        }
+    }
+
+    /// The adapter is a resolver input, so it is a fingerprint input: a
+    /// legacy row cached on the `openai` adapter (default base) must not
+    /// keep serving api.openai.com once it is edited to another adapter.
+    #[test]
+    fn cached_url_rebuilds_when_adapter_changes_without_api_base() {
+        let openai_pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"legacy","secret":"k","provider":"","adapter":"openai"}"#,
+        )
+        .unwrap();
+        let anthropic_pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"legacy","secret":"k2","provider":"","adapter":"anthropic"}"#,
+        )
+        .unwrap();
+        let resource_id = "test-1019-fingerprint-adapter";
+        for (surface_pk, expect_ok) in [(&openai_pk, true), (&anthropic_pk, false)] {
+            let url = aisix_gateway::url_cache::cached_endpoint_url(
+                resource_id,
+                "test/1019-fingerprint",
+                &pk_url_fingerprint(surface_pk),
+                || {
+                    let base = resolve_base_url(surface_pk)?;
+                    Ok::<_, ProxyError>(build_openai_url(&base, "/responses"))
+                },
+            );
+            assert_eq!(url.is_ok(), expect_ok, "adapter edit must rebuild the URL");
+        }
+    }
+
+    /// The Anthropic counterpart of #1019: a key the Anthropic bridge
+    /// sends to its default base on chat resolves to the same base on the
+    /// verbatim Anthropic-wire routes, and only on those.
+    #[test]
+    fn resolve_base_url_for_messages_falls_back_to_anthropic_default() {
+        for doc in [
+            r#"{"display_name":"x","secret":"k","provider":"anthropic","adapter":"anthropic"}"#,
+            r#"{"display_name":"x","secret":"k","provider":" Anthropic "}"#,
+            r#"{"display_name":"x","secret":"k","provider":"","adapter":"anthropic","api_base":" "}"#,
+            r#"{"display_name":"x","secret":"k","provider":"anthropic","apis":{"messages":{}}}"#,
+        ] {
+            let pk: ProviderKey = serde_json::from_str(doc).unwrap();
+            assert_eq!(
+                resolve_base_url_for(&pk, ApiSurface::Messages).unwrap(),
+                aisix_provider_anthropic::ANTHROPIC_DEFAULT_BASE,
+                "{doc}"
+            );
+            assert!(
+                resolve_base_url_for(&pk, ApiSurface::Responses).is_err(),
+                "the Anthropic default is not an OpenAI-wire base: {doc}"
+            );
+        }
+    }
+
+    /// Everything else keeps its existing answer on the Anthropic wire:
+    /// an OpenAI-compatible or unknown vendor still requires `api_base`,
+    /// an empty vendor on another adapter too, and a configured base wins.
+    #[test]
+    fn resolve_base_url_for_messages_keeps_non_anthropic_keys() {
+        for doc in [
+            r#"{"display_name":"x","secret":"k","provider":"deepseek","adapter":"anthropic"}"#,
+            r#"{"display_name":"x","secret":"k","provider":"","adapter":"bedrock"}"#,
+            r#"{"display_name":"x","secret":"k","provider":""}"#,
+        ] {
+            let pk: ProviderKey = serde_json::from_str(doc).unwrap();
+            assert!(
+                resolve_base_url_for(&pk, ApiSurface::Messages).is_err(),
+                "{doc}"
+            );
+        }
+        let pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"x","secret":"k","provider":"anthropic","api_base":"https://proxy.example.com/"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_base_url_for(&pk, ApiSurface::Messages).unwrap(),
+            "https://proxy.example.com"
         );
     }
 

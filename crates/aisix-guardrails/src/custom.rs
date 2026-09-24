@@ -1098,11 +1098,17 @@ async fn host_fetch(
     .unwrap_or_else(|e| fetch_error(e.to_string()))
 }
 
-/// Scheme, authority and path only — the query string is where a
-/// script-built URL carries its credential.
+/// Scheme, host and path only — the query string and the userinfo are
+/// where a script-built URL carries its credential.
 fn redact_url(url: &str) -> String {
     match reqwest::Url::parse(url) {
-        Ok(u) => format!("{}://{}{}", u.scheme(), u.authority(), u.path()),
+        Ok(u) => aisix_core::redact_url_userinfo(&format!(
+            "{}://{}{}",
+            u.scheme(),
+            u.authority(),
+            u.path()
+        ))
+        .into_owned(),
         Err(_) => "<unparsable url>".to_owned(),
     }
 }
@@ -2017,6 +2023,10 @@ mod tests {
         assert_eq!(
             redact_url("https://scan.internal:8443/v1/scan?key=sk-live-42&x=1"),
             "https://scan.internal:8443/v1/scan",
+        );
+        assert_eq!(
+            redact_url("https://svc:sk-live-43@scan.internal/v1/scan"),
+            "https://***@scan.internal/v1/scan",
         );
         assert_eq!(redact_url("not a url"), "<unparsable url>");
     }

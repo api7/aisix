@@ -65,9 +65,7 @@ const SSE_CONTENT_TYPE: &str = "text/event-stream";
 /// upstream can accumulate without ever emitting the blank line that ends an
 /// event, which is the only way a streaming reader can be made to grow without
 /// limit.
-const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
-
-const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+const MAX_SSE_EVENT_BYTES: usize = aisix_gateway::sse::MAX_SSE_FRAME_BYTES;
 
 /// Hard cap on an upstream response body the gateway will buffer. A registered
 /// agent is semi-trusted, but a compromised or misbehaving one must not be able
@@ -168,11 +166,12 @@ pub struct A2aUpstream {
 }
 
 // Manual so a `Bearer` token cannot leak through `A2aUpstream`'s `Debug`
-// (delegates to the redacting `A2aAuth` impl above).
+// (delegates to the redacting `A2aAuth` impl above), nor a Basic-auth
+// credential configured as the URL's userinfo.
 impl std::fmt::Debug for A2aUpstream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("A2aUpstream")
-            .field("url", &self.url)
+            .field("url", &aisix_core::redact_url_userinfo(&self.url))
             .field("auth", &self.auth)
             .field("protocol_version", &self.protocol_version)
             .field("timeout", &self.timeout)
@@ -207,7 +206,7 @@ fn warn_cleartext_credential(agent: &A2aAgent) {
     if warned.insert((agent.name.clone(), agent.url.clone())) {
         tracing::warn!(
             agent = %agent.name,
-            url = %agent.url,
+            url = %aisix_core::redact_url_userinfo(&agent.url),
             "the gateway-held A2A agent credential is sent over cleartext http; anyone \
              on the network path can read it — serve this agent over https"
         );
@@ -485,7 +484,7 @@ impl A2aBridge for HttpBridge {
             let budget = deadline.saturating_duration_since(Instant::now());
             if budget.is_zero() {
                 tracing::debug!(
-                    agent_url = %self.upstream.url,
+                    agent_url = %aisix_core::redact_url_userinfo(&self.upstream.url),
                     "A2A agent card fetch exhausted its deadline before trying every candidate"
                 );
                 break;
@@ -493,7 +492,11 @@ impl A2aBridge for HttpBridge {
             match self.fetch_card_at(url.clone(), budget).await {
                 Ok(card) => return Ok(card),
                 Err(err) => {
-                    tracing::debug!(%url, error = %err, "A2A agent card candidate did not answer");
+                    tracing::debug!(
+                        url = %aisix_core::redact_url_userinfo(url.as_str()),
+                        error = %err,
+                        "A2A agent card candidate did not answer"
+                    );
                     last_err = Some(err);
                 }
             }
@@ -602,13 +605,9 @@ impl A2aBridge for HttpBridge {
 fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> + Send {
     async_stream::stream! {
         let mut bytes = resp.bytes_stream();
-        let mut pending: Vec<u8> = Vec::new();
-        let mut line_start = 0;
-        // Set while the last byte was a `\r`, so the `\n` of a CRLF pair split
-        // across two chunks is swallowed instead of read as a blank line.
-        let mut after_cr = false;
-        // The stream's first bytes may be a UTF-8 BOM, which the spec strips.
-        let mut at_stream_start = true;
+        // Bound the whole event, including multiple data lines, rather than a
+        // network chunk that may contain many small events.
+        let mut frames = aisix_gateway::sse::SseFrameSplitter::new(MAX_SSE_EVENT_BYTES);
         loop {
             let chunk = match bytes.next().await {
                 Some(Ok(chunk)) => chunk,
@@ -618,50 +617,32 @@ fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> 
                 }
                 None => break,
             };
-            for byte in chunk {
-                if after_cr && byte == b'\n' {
-                    after_cr = false;
-                    continue;
-                }
-                after_cr = byte == b'\r';
-                pending.push(byte);
-                if at_stream_start {
-                    if pending == UTF8_BOM {
-                        pending.clear();
-                        at_stream_start = false;
-                        continue;
+            frames.push(&chunk);
+            loop {
+                let frame = match frames.next_frame() {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break,
+                    Err(_) => {
+                        yield Err(A2aError::Request(
+                            "upstream SSE event exceeded size cap".to_string(),
+                        ));
+                        return;
                     }
-                    at_stream_start = UTF8_BOM.starts_with(&pending);
-                }
-                // Bound the whole event, including multiple data lines, rather
-                // than a network chunk that may contain many small events.
-                if pending.len() > MAX_SSE_EVENT_BYTES {
-                    yield Err(A2aError::Request(
-                        "upstream SSE event exceeded size cap".to_string(),
-                    ));
-                    return;
-                }
-                // `\r`, `\n` and `\r\n` each end a line; an empty line ends the event.
-                if byte == b'\n' || byte == b'\r' {
-                    if pending.len() - 1 == line_start {
-                        match parse_sse_frame(&pending) {
-                            Ok(Some(event)) => yield Ok(event),
-                            Ok(None) => {}
-                            Err(e) => {
-                                yield Err(e);
-                                return;
-                            }
-                        }
-                        pending.clear();
+                };
+                match parse_sse_frame(&frame) {
+                    Ok(Some(event)) => yield Ok(event),
+                    Ok(None) => {}
+                    Err(e) => {
+                        yield Err(e);
+                        return;
                     }
-                    line_start = pending.len();
                 }
             }
         }
         // A body that ends without its final newline still carries an event —
         // preserve that compatibility, but parse all of its data fields together.
         // A malformed trailing event must still fail rather than end quietly.
-        match parse_sse_frame(&pending) {
+        match parse_sse_frame(&frames.take_rest()) {
             Ok(Some(event)) => yield Ok(event),
             Ok(None) => {}
             Err(e) => yield Err(e),
@@ -671,24 +652,16 @@ fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> 
 
 /// Extract the JSON-RPC envelope from an SSE event's joined data fields.
 fn parse_sse_frame(frame: &[u8]) -> Result<Option<serde_json::Value>, A2aError> {
-    let text = std::str::from_utf8(frame)
+    // Strict: an event that is not valid UTF-8 fails the stream rather than
+    // being read around.
+    std::str::from_utf8(frame)
         .map_err(|_| A2aError::Request("upstream SSE event was not valid UTF-8".to_string()))?;
-    // Split on either terminator rather than `lines()`, which misses a bare
-    // `\r`; empty pieces are blank lines and the second half of a `\r\n`.
-    let payload = text
-        .split(['\n', '\r'])
-        .filter(|line| !line.is_empty())
-        .filter_map(|line| {
-            let data = if line == "data" {
-                ""
-            } else {
-                line.strip_prefix("data:")?
-            };
-            Some(data.strip_prefix(' ').unwrap_or(data))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let payload = payload.trim();
+    let Some(data) = aisix_gateway::sse::parse_frame(frame).data else {
+        return Ok(None);
+    };
+    let payload = std::str::from_utf8(&data)
+        .map_err(|_| A2aError::Request("upstream SSE event was not valid UTF-8".to_string()))?
+        .trim();
     if payload.is_empty() {
         return Ok(None);
     }
@@ -755,6 +728,16 @@ mod tests {
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
         };
         assert!(!format!("{up:?}").contains("super-secret"));
+        // Nor a Basic-auth credential configured as the URL's userinfo.
+        let up = A2aUpstream {
+            url: "https://agent:basic-secret@x/a2a".into(),
+            auth: A2aAuth::None,
+            protocol_version: A2aProtocolVersion::V1_0,
+            timeout: DEFAULT_UPSTREAM_TIMEOUT,
+        };
+        let rendered = format!("{up:?}");
+        assert!(!rendered.contains("basic-secret"), "{rendered}");
+        assert!(rendered.contains("https://***@x/a2a"), "{rendered}");
     }
 
     fn bridge_at(url: &str) -> HttpBridge {

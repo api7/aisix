@@ -240,11 +240,13 @@ pub const M_USAGE_EVENTS_REJECTED_TOTAL: &str = "aisix_usage_events_rejected_tot
 ///
 /// `aisix_guardrail_bypasses_total` counts fail-OPEN EVENTS, sliced by the
 /// bounded DP-internal `reason` (e.g. `bedrock_5xx` / `bedrock_timeout` /
-/// `bedrock_throttled` / `unscannable_body`). Two producers reach it: a
-/// member that executed and was bypassed — a remote-API guardrail's
-/// upstream was unreachable but `fail_open` let the request through — and
-/// a bypass the proxy records with no member execution behind it, an
-/// unscannable body a fail-open chain let through (#1115). The second
+/// `bedrock_throttled` / `unscannable_body` / `output_buffer_exceeded`).
+/// Two producers reach it: a member that executed and was bypassed — a
+/// remote-API guardrail's upstream was unreachable but `fail_open` let the
+/// request through — and a bypass the proxy records with no member
+/// execution behind it: an unscannable body a fail-open chain let through
+/// (#1115), or a held-back stream released unscanned past its cap under
+/// `on_buffer_exceeded: fail_open`. The second
 /// producer reaches THIS counter only: with no execution there is no
 /// `aisix_guardrail_latency_seconds` row, so that family's
 /// `result="bypassed"` slice stays execution-only and the two no longer
@@ -291,7 +293,10 @@ pub const M_AUTH_DECISIONS_TOTAL: &str = "aisix_auth_decisions_total";
 ///   splits local vs remote latency).
 /// - `phase`: `input` / `output`.
 /// - `result`: `allowed` / `blocked` / `masked` / `bypassed` (remote
-///   failure + fail-open) / `would_block` / `would_mask` (monitor mode).
+///   failure + fail-open) / `would_block` / `would_mask` /
+///   `would_mask_unsupported` (monitor mode; the last is a mask rule that
+///   matched where the content cannot be rewritten, e.g. a passthrough
+///   route — enforcing it records `allowed`, since nothing is masked).
 /// - `error_type`: bounded failure tag (e.g. `lakera_timeout`,
 ///   `custom_unknown_action`) whenever the guardrail could not EVALUATE
 ///   the content, else `none`. It is populated on `result="bypassed"`

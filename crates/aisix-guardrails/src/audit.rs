@@ -27,6 +27,12 @@
 //! usage event, and a bypass is recorded on an execution this log already
 //! sees.
 //!
+//! And it carries the resolved chain's `{kind, hook}` set, which
+//! `usage_events.applied_guardrails` is built from. That set is fixed at
+//! resolve time, but it rides here for the same reason: a failure event
+//! is built in the handler's outer frame, which holds this handle and
+//! nothing else from the chain.
+//!
 //! Names, counts, indices and bounded failure tags only: the matched value,
 //! the block reason, the screened text and the example text never enter
 //! this log (#153 / #932 no-leak criterion).
@@ -35,7 +41,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use aisix_core::models::{GuardrailEnforcedHit, GuardrailScore};
+use aisix_core::models::{AppliedGuardrail, GuardrailEnforcedHit, GuardrailScore};
 
 /// Coalescing key: one entry per guardrail row, per hook, per action —
 /// and, for the one action that carries a cause, per cause. The cause is
@@ -73,11 +79,27 @@ pub struct GuardrailAuditLog {
     /// `usage_events.guardrail_bypassed_reason`. Not a map: a bypass is
     /// one fact per request, and the field it feeds is a single string.
     bypass: Mutex<Option<String>>,
+    /// The `{kind, hook}` of every member of the chain this log was minted
+    /// for.
+    applied: Vec<AppliedGuardrail>,
 }
 
 impl GuardrailAuditLog {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A log for a chain whose members are `applied`.
+    pub fn for_applied(applied: Vec<AppliedGuardrail>) -> Self {
+        Self {
+            applied,
+            ..Self::default()
+        }
+    }
+
+    /// The `{kind, hook}` set of the chain this log was minted for.
+    pub fn applied(&self) -> &[AppliedGuardrail] {
+        &self.applied
     }
 
     /// Record one enforcing outcome. `counts` is empty for both refusal
@@ -160,7 +182,7 @@ impl GuardrailAuditLog {
 
     /// Record that a guardrail was bypassed instead of enforced, under
     /// the kind's bounded failure tag (`lakera_timeout`,
-    /// `unscannable_body`, …).
+    /// `unscannable_body`, `output_buffer_exceeded`, …).
     ///
     /// First one sticks, matching the chain folds and `chat.rs`: the
     /// policy that failed FIRST is the one that explains the request, and

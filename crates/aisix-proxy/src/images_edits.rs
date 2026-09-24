@@ -251,7 +251,7 @@ pub async fn image_edits(
                 &attributed.requested_model,
                 &api_key_id,
                 &client,
-                &[],
+                &crate::usage_attr::applied_guardrails(&audit),
                 &routing.attempts,
                 failed_terminal,
                 err.is_guardrail_block(),
@@ -274,6 +274,7 @@ pub async fn image_edits(
                     err.kind(),
                     err.is_guardrail_block(),
                     &client,
+                    crate::usage_attr::applied_guardrails(&audit),
                     crate::usage_attr::enforced_hits(&audit),
                     crate::usage_attr::guardrail_scores(&audit),
                     crate::usage_attr::bypass_reason(&audit),
@@ -536,8 +537,9 @@ async fn dispatch(
                     // Every resolve_base_url input, via the shared constructor
                     // (#1017), plus the endpoint path.
                     &{
-                        let [base, vendor] = crate::dispatch::pk_url_fingerprint(&pk_entry.value);
-                        [base, vendor, "/images/edits"]
+                        let [base, vendor, adapter] =
+                            crate::dispatch::pk_url_fingerprint(&pk_entry.value);
+                        [base, vendor, adapter, "/images/edits"]
                     },
                     || {
                         let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;

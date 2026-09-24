@@ -53,6 +53,7 @@ pub(crate) fn render_openai_envelope(
     let message = view
         .message
         .clone()
+        .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| fallback_message.to_string());
     let upstream_kind = view.kind.as_deref();
     let derived_code = match wire {

@@ -1977,6 +1977,18 @@ fn anthropic_estimation_output_text(body: &Value) -> String {
 
 /// Concatenate the text from an Anthropic response's `content` blocks — the
 /// assistant's assembled output text, for content-capturing exporters.
+/// Extend the live-forward frame copy with `frames`, dropping the copy once
+/// it would outgrow the end-of-stream scan bound.
+fn keep_live_copy(copy: &mut Option<Vec<u8>>, frames: &[u8]) {
+    if let Some(c) = copy.as_mut() {
+        if c.len() + frames.len() <= aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES {
+            c.extend_from_slice(frames);
+            return;
+        }
+    }
+    *copy = None;
+}
+
 fn anthropic_response_text(body: &Value) -> String {
     body.get("content")
         .and_then(Value::as_array)
@@ -2618,8 +2630,9 @@ fn build_anthropic_sse_stream(
     let hold_policy = output_guardrail.as_ref().and_then(|c| {
         match aisix_guardrails::Guardrail::stream_output_policy(c.as_ref()) {
             aisix_guardrails::StreamOutputPolicy::BufferFull {
-                max_buffer_bytes, ..
-            } => Some(max_buffer_bytes),
+                max_buffer_bytes,
+                on_exceeded_fail_open,
+            } => Some((max_buffer_bytes, on_exceeded_fail_open)),
             _ => None,
         }
     });
@@ -2643,7 +2656,15 @@ fn build_anthropic_sse_stream(
         // clears them (hold-back policies only). Held PRE-encode so the
         // mask rewrite can run on the normalised chunks.
         let mut held_chunks: Vec<aisix_gateway::ChatChunk> = Vec::new();
-        let mut held_bytes: usize = 0;
+        // What is held (#513): content, which `max_buffer_bytes` caps, and
+        // the raw bytes it bounds too.
+        let mut held_bytes = crate::held_content::HeldBuffer::default();
+        // The cap was hit under a fail-closed policy.
+        let mut overflowed = false;
+        // The cap was hit under `on_buffer_exceeded: fail_open`: the held
+        // chunks went out unscanned and the rest of the response streams
+        // live, with no output scan.
+        let mut released = false;
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
@@ -2683,7 +2704,7 @@ fn build_anthropic_sse_stream(
                         );
                         comp.reasoning_folded_into_completion = u.reasoning_folded_into_completion;
                     }
-                    if output_guardrail.is_some() {
+                    if output_guardrail.is_some() && !released {
                         if let Some(t) = chunk.delta.content.as_deref() {
                             content_text.push_str(t);
                         }
@@ -2726,22 +2747,38 @@ fn build_anthropic_sse_stream(
                             }
                         }
                     }
-                    if let Some(max_hold) = hold_policy {
+                    if let (Some((max_hold, fail_open)), false) = (hold_policy, released) {
                         // Hold-back: withhold the chunk until the end-of-
-                        // stream scan clears it. Overflow fails closed —
-                        // unscannable content must not be released.
-                        held_bytes += chunk.delta.content.as_deref().map_or(0, str::len);
-                        if held_bytes > max_hold {
-                            tracing::warn!(
-                                guardrail_hook = "output",
-                                max_buffer_bytes = max_hold,
-                                "streaming /v1/messages response exceeded hold-back cap; failing closed",
-                            );
-                            guard.comp().guardrail_blocked = true;
-                            yield Ok(bytes::Bytes::from(guardrail_block_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED))));
-                            return;
-                        }
+                        // stream scan clears it.
+                        held_bytes.hold(
+                            crate::held_content::chat_delta(&chunk.delta),
+                            crate::held_content::chat_chunk_raw(&chunk),
+                        );
                         held_chunks.push(chunk);
+                        if !held_bytes.exceeds(max_hold) {
+                            continue;
+                        }
+                        if !fail_open {
+                            overflowed = true;
+                            break;
+                        }
+                        // `on_buffer_exceeded: fail_open`: release what is
+                        // held unscanned and unmasked, then stream the rest.
+                        released = true;
+                        if let Some(chain) = output_guardrail.as_ref() {
+                            chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                        }
+                        for chunk in held_chunks.drain(..) {
+                            for ev in encoder.next_events(&chunk) {
+                                yield Ok::<_, std::io::Error>(downstream_bytes!(guard, ev));
+                            }
+                            if encoder.is_finished() {
+                                break;
+                            }
+                        }
+                        if encoder.is_finished() {
+                            break;
+                        }
                         continue;
                     }
                     for ev in encoder.next_events(&chunk) {
@@ -2765,6 +2802,21 @@ fn build_anthropic_sse_stream(
                 }
             }
         }
+        // Hold-back overflow under a fail-closed policy: content that could
+        // not be fully held to scan must not be released.
+        if let (true, Some((max_hold, _))) = (overflowed, hold_policy) {
+            tracing::warn!(
+                guardrail_hook = "output",
+                max_buffer_bytes = max_hold,
+                "streaming /v1/messages response exceeded hold-back cap; failing closed",
+            );
+            guard.comp().guardrail_blocked = true;
+            if let Some(chain) = output_guardrail.as_ref() {
+                aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
+            }
+            yield Ok(bytes::Bytes::from(guardrail_block_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED))));
+            return;
+        }
         // Upstream stream over — the response was received in full. Record
         // it before the scan below, which awaits a remote provider and is a
         // routine drop point for clients that close on the terminal event.
@@ -2772,7 +2824,7 @@ fn build_anthropic_sse_stream(
         // End-of-stream output guardrail (#448): scan the accumulated
         // assistant text and, on a block, emit a terminal Anthropic
         // `error` event instead of completing the stream cleanly.
-        if let Some(chain) = output_guardrail.as_ref() {
+        if let (Some(chain), false) = (output_guardrail.as_ref(), released) {
             if !content_text.is_empty() || !tool_call_fragments.is_empty() {
                 let mut message =
                     aisix_gateway::ChatMessage::assistant(std::mem::take(&mut content_text));
@@ -3683,7 +3735,7 @@ fn update_anthropic_usage(
 
 /// Drain every complete SSE frame from `buf`, updating `acc` and
 /// appending the frame to `out` with the client-facing `model` restamped
-/// onto `message_start`. A frame ends at the first blank line (`\n\n`);
+/// onto `message_start`. A frame ends at the first blank line;
 /// incomplete trailing bytes are left in `buf` for the next chunk. The
 /// `data:` payload is parsed as JSON for the usage side; non-JSON or
 /// non-`data` frames are skipped there and forwarded untouched.
@@ -3702,9 +3754,7 @@ fn drain_anthropic_sse_frames(
     client_facing_model: &str,
     out: &mut Vec<u8>,
 ) {
-    // SSE event delimiter is a blank line. Anthropic emits `\n\n`;
-    // tolerate `\r\n\r\n` defensively by normalising the search.
-    while let Some(end) = find_frame_end(buf) {
+    while let Some(end) = aisix_gateway::sse::find_frame_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
         // The frame's WHOLE payload, not just its first `data:` line: this
         // is what feeds `response_text`, the text the end-of-stream output
@@ -3724,29 +3774,6 @@ fn drain_anthropic_sse_frames(
             None => out.extend_from_slice(&frame),
         }
     }
-}
-
-/// Find the byte index just past the first SSE frame terminator
-/// (`\n\n` or `\r\n\r\n`). Returns the number of bytes to drain
-/// (frame + terminator), or `None` if no complete frame is buffered.
-/// Shared with the `/v1/responses` streaming usage parser (#808).
-pub(crate) fn find_frame_end(buf: &[u8]) -> Option<usize> {
-    let mut i = 0;
-    while i + 1 < buf.len() {
-        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
-            return Some(i + 2);
-        }
-        if i + 3 < buf.len()
-            && buf[i] == b'\r'
-            && buf[i + 1] == b'\n'
-            && buf[i + 2] == b'\r'
-            && buf[i + 3] == b'\n'
-        {
-            return Some(i + 4);
-        }
-        i += 1;
-    }
-    None
 }
 
 /// Drop guard that fires `on_complete` exactly once with the
@@ -3887,8 +3914,9 @@ where
     let hold_policy = output_guardrail.as_ref().and_then(|c| {
         match aisix_guardrails::Guardrail::stream_output_policy(c.as_ref()) {
             aisix_guardrails::StreamOutputPolicy::BufferFull {
-                max_buffer_bytes, ..
-            } => Some(max_buffer_bytes),
+                max_buffer_bytes,
+                on_exceeded_fail_open,
+            } => Some((max_buffer_bytes, on_exceeded_fail_open)),
             _ => None,
         }
     });
@@ -3903,6 +3931,24 @@ where
         let mut first_token_seen = false;
         // Whole-response hold-back buffer (BufferFull policies only).
         let mut held: Vec<u8> = Vec::new();
+        // `None` once the stream is live: no policy, or the cap was hit under
+        // `on_buffer_exceeded: fail_open`.
+        let mut hold = hold_policy;
+        // What `held` holds (#513): content, which `max_buffer_bytes` caps
+        // (the SSE/JSON envelope is not counted), and the raw bytes it
+        // bounds too.
+        let mut held_content = crate::held_content::HeldBuffer::default();
+        // The cap was hit under a fail-closed policy.
+        let mut overflowed = false;
+        // The cap was hit under fail-open: `held` went out unscanned and the
+        // rest of the response streams live, with no output scan.
+        let mut released = false;
+        // Live-forward with an output chain (monitor-only): a bounded copy of
+        // the forwarded frames, so the end-of-stream check can judge the
+        // slots the hold-back mask walk would rewrite (#1027). `None` once
+        // it outgrows the cap; the check then falls back to the text.
+        let mut live_copy: Option<Vec<u8>> =
+            (hold_policy.is_none() && output_guardrail.is_some()).then(Vec::new);
         while let Some(item) = upstream.next().await {
             if let Ok(bytes) = &item {
                 // Accumulate, then drain every COMPLETE frame — restamped
@@ -3941,7 +3987,7 @@ where
                 // until OOM. Delivery is preserved — only that frame's usage
                 // parse and model restamp are lost.
                 if buf.len() > MAX_SSE_FRAME_BUF_BYTES {
-                    if hold_policy.is_some() {
+                    if hold.is_some() {
                         tracing::warn!(
                             guardrail_hook = "output",
                             buffered = buf.len(),
@@ -3965,23 +4011,29 @@ where
                     );
                     forward.append(&mut buf);
                 }
-                if let Some(max_hold) = hold_policy {
+                if let Some((max_hold, fail_open)) = hold {
                     // Hold-back: withhold the bytes until the end-of-stream
-                    // scan clears (and masks) them. Overflow fails closed —
-                    // content that can't be fully buffered to scan must not
-                    // be released (mirrors /v1/responses).
-                    if held.len() + forward.len() > max_hold {
-                        tracing::warn!(
-                            guardrail_hook = "output",
-                            max_buffer_bytes = max_hold,
-                            "streaming /v1/messages passthrough exceeded hold-back cap; failing closed",
-                        );
-                        guard.usage().guardrail_blocked = true;
-                        yield Ok(Bytes::from(guardrail_block_frame(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED))));
-                        return;
-                    }
+                    // scan clears (and masks) them.
+                    held_content.hold(
+                        crate::held_content::sse_frames(&forward, crate::held_content::anthropic_event),
+                        forward.len(),
+                    );
                     held.extend_from_slice(&forward);
-                    continue;
+                    if !held_content.exceeds(max_hold) {
+                        continue;
+                    }
+                    if !fail_open {
+                        overflowed = true;
+                        break;
+                    }
+                    // `on_buffer_exceeded: fail_open`: release what is held
+                    // unscanned and unmasked, then stream the rest live.
+                    hold = None;
+                    released = true;
+                    if let Some(chain) = output_guardrail.as_ref() {
+                        chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                    }
+                    forward = std::mem::take(&mut held);
                 }
                 // Nothing completed yet — keep reading rather than yielding
                 // an empty chunk.
@@ -3992,6 +4044,7 @@ where
                     guard.usage().downstream_latency_ms =
                         started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 }
+                keep_live_copy(&mut live_copy, &forward);
                 yield Ok(Bytes::from(forward));
                 continue;
             }
@@ -4006,7 +4059,7 @@ where
                 );
             }
             yield item;
-            if hold_policy.is_some() {
+            if hold.is_some() {
                 return;
             }
         }
@@ -4027,7 +4080,7 @@ where
         // an ordinary frame; one that does not parse is dropped, because
         // nothing can extract its text and releasing it after the output
         // check is exactly the bypass hold-back exists to prevent.
-        if !buf.is_empty() {
+        if !overflowed && !buf.is_empty() {
             let tail = std::mem::take(&mut buf);
             // The upstream has ended, so this fragment is a final frame it
             // never terminated — complete, just missing its blank line. Parse
@@ -4049,7 +4102,7 @@ where
                     );
                 }
             }
-            if let Some(max_hold) = hold_policy {
+            if let Some((max_hold, fail_open)) = hold {
                 // Scanned like every other frame — hold it with them, but
                 // under the same size policy: this path reaches `held`
                 // outside the loop, so without this the last frame could
@@ -4060,21 +4113,27 @@ where
                     crate::model_echo::anthropic_message_model,
                 )
                 .unwrap_or(tail);
-                if held.len() + tail.len() > max_hold {
-                    tracing::warn!(
-                        guardrail_hook = "output",
-                        max_buffer_bytes = max_hold,
-                        "streaming /v1/messages passthrough exceeded hold-back cap on its \
-                         final frame; failing closed",
-                    );
-                    guard.usage().guardrail_blocked = true;
-                    yield Ok(Bytes::from(guardrail_block_frame(
-                        None,
-                        Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
-                    )));
-                    return;
-                }
+                held_content.hold(
+                    crate::held_content::sse_frames(&tail, crate::held_content::anthropic_event),
+                    tail.len(),
+                );
                 held.extend_from_slice(&tail);
+                if held_content.exceeds(max_hold) {
+                    if fail_open {
+                        hold = None;
+                        released = true;
+                        if let Some(chain) = output_guardrail.as_ref() {
+                            chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                        }
+                        if guard.usage().downstream_latency_ms == 0 {
+                            guard.usage().downstream_latency_ms =
+                                started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        }
+                        yield Ok(Bytes::from(std::mem::take(&mut held)));
+                    } else {
+                        overflowed = true;
+                    }
+                }
             } else {
                 // Restamp on the way out, for the same reason the `/v1/responses`
                 // relay does: the upstream has ended, so this is a final frame it
@@ -4095,6 +4154,9 @@ where
                     guard.usage().downstream_latency_ms =
                         started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 }
+                // The copy is walked frame by frame, so give the final frame
+                // the terminator the upstream left off.
+                keep_live_copy(&mut live_copy, &[tail.as_slice(), b"\n\n"].concat());
                 yield Ok(Bytes::from(tail));
             }
         }
@@ -4107,8 +4169,26 @@ where
         // the two agree: an unterminated final frame that parses gets the
         // terminator its upstream left off, and a frame whose payload is
         // not one JSON document is cut, since nothing can mask it.
+        // Hold-back overflow under a fail-closed policy: content that could
+        // not be fully held to scan must not be released.
+        if let (true, Some((max_hold, _))) = (overflowed, hold) {
+            tracing::warn!(
+                guardrail_hook = "output",
+                max_buffer_bytes = max_hold,
+                "streaming /v1/messages passthrough exceeded hold-back cap; failing closed",
+            );
+            guard.usage().guardrail_blocked = true;
+            if let Some(chain) = output_guardrail.as_ref() {
+                aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
+            }
+            yield Ok(Bytes::from(guardrail_block_frame(
+                None,
+                Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+            )));
+            return;
+        }
         let mut unscanned: Vec<String> = Vec::new();
-        if hold_policy.is_some() {
+        if hold.is_some() {
             let seal = crate::redact::seal_buffered_sse(&mut held);
             if let crate::redact::SseTailSeal::Dropped { dropped } = seal.tail {
                 tracing::warn!(
@@ -4158,7 +4238,7 @@ where
         // EndOfStreamCheck) the bytes were already forwarded verbatim
         // and the error frame is the trailing signal.
         let mut blocked = false;
-        if let Some(chain) = output_guardrail.as_ref() {
+        if let (Some(chain), false) = (output_guardrail.as_ref(), released) {
             // Clone (not take) when content capture is on, so the assembled
             // response survives for the on_complete content capture below;
             // otherwise take it (nothing downstream reads it).
@@ -4172,6 +4252,21 @@ where
             // pass reads raw text, so it can scan a payload nothing could
             // parse. Appended to the scanned copy only: it never reached
             // the client, so it must not reach the captured content either.
+            // Live-forward (no hold) has no held frames to walk: the
+            // accumulated text is the one slot there is.
+            let live_segments: Vec<aisix_guardrails::ScanSegment> = if hold.is_some() {
+                Vec::new()
+            } else if let Some(frames) = live_copy.take() {
+                crate::redact::collect_segments(|g| {
+                    let _ = crate::redact::redact_anthropic_sse(g, &frames);
+                })
+            } else {
+                vec![aisix_guardrails::ScanSegment {
+                    text: text.clone(),
+                    role: aisix_guardrails::SegmentRole::Rewritable,
+                    in_latest_turn: true,
+                }]
+            };
             for payload in &unscanned {
                 if !text.is_empty() {
                     text.push('\n');
@@ -4199,13 +4294,22 @@ where
                 // live-forward stream never carries one).
                 let mut seg_counts = crate::redact::RedactionCounts::new();
                 let mut seg_hits = Vec::new();
-                let verdict = crate::redact::moderate_body(
+                let local_extra = live_segments
+                    .into_iter()
+                    .chain(unscanned.iter().map(|t| aisix_guardrails::ScanSegment {
+                        text: t.clone(),
+                        role: aisix_guardrails::SegmentRole::ScanOnly,
+                        in_latest_turn: true,
+                    }))
+                    .collect();
+                let verdict = crate::redact::moderate_body_local_extra(
                     chain.as_ref(),
                     crate::redact::Direction::Output,
                     None,
                     verdict,
                     &mut seg_counts,
                     &mut seg_hits,
+                    local_extra,
                     |g| match crate::redact::redact_anthropic_sse(g, &held) {
                         Some((rewritten, counts)) => {
                             held = rewritten;
@@ -4256,7 +4360,7 @@ where
         }
         // Hold-back release (#932): the scan cleared — mask the held SSE
         // bytes (channel reassembly across frames) and release them.
-        if hold_policy.is_some() && !blocked && !held.is_empty() {
+        if hold.is_some() && !blocked && !held.is_empty() {
             match output_guardrail
                 .as_ref()
                 .and_then(|c| crate::redact::redact_anthropic_sse(c.as_ref(), &held))
@@ -5937,6 +6041,37 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
                 String::from_utf8_lossy(frame),
             );
         }
+    }
+
+    /// A bare `\r` ends a line too. A CR-framed upstream is framed as it
+    /// arrives, read for usage, and restamped, and its bytes reach the
+    /// client in their own framing.
+    #[test]
+    fn sse_frame_parser_reads_a_cr_framed_stream() {
+        use super::{drain_anthropic_sse_frames, AnthropicStreamUsage};
+
+        let mut acc = AnthropicStreamUsage::default();
+        let mut first_token_seen = false;
+        let mut buf: Vec<u8> = b"event: message_start\rdata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":11}}}\r\r\
+event: message_delta\rdata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":23}}\r\r".to_vec();
+        let mut out: Vec<u8> = Vec::new();
+        drain_anthropic_sse_frames(
+            &mut buf,
+            &mut acc,
+            std::time::Instant::now(),
+            &mut first_token_seen,
+            "gw-alias",
+            &mut out,
+        );
+        assert!(buf.is_empty(), "both frames drained: {buf:?}");
+        assert_eq!(acc.prompt_tokens, 11);
+        assert_eq!(acc.completion_tokens, 23);
+        let emitted = String::from_utf8(out).unwrap();
+        assert!(
+            emitted.contains("\"model\":\"gw-alias\"") && !emitted.contains("claude-x"),
+            "{emitted:?}"
+        );
+        assert!(!emitted.contains('\n'), "{emitted:?}");
     }
 
     /// Issue #245: the SSE frame parser must reassemble events that

@@ -1562,8 +1562,6 @@ pub struct ResponsesSseEncoder {
     tool_calls: std::collections::BTreeMap<u64, ToolCallState>,
     /// What the request declared (see [`ResponsesReplyContext`]).
     reply: ResponsesReplyContext,
-    /// Serialized size of the request echo every Response object carries.
-    echo_len: usize,
     /// Withheld terminal status + incomplete reason while waiting on a
     /// trailing usage frame.
     pending_status: Option<&'static str>,
@@ -1590,7 +1588,6 @@ impl ResponsesSseEncoder {
         reply: ResponsesReplyContext,
     ) -> Self {
         Self {
-            echo_len: serde_json::to_string(&reply.echo).map_or(0, |s| s.len()),
             reply,
             response_id: response_id.into(),
             model_display_name: model_display_name.into(),
@@ -2205,20 +2202,6 @@ impl ResponsesSseEncoder {
         self.finished
     }
 
-    /// What one encoded event costs against an output guardrail's
-    /// hold-back budget. A lifecycle event repeats the request's own
-    /// settings (`instructions`, `tools`, …); those are bounded by the
-    /// request, not by what the model generated, and an agent client's run
-    /// to tens of kilobytes — so they are not charged, or every guarded
-    /// stream would fail closed on a fraction of the output it used to.
-    pub fn buffer_cost(&self, event: &ResponsesSseEvent, encoded_len: usize) -> usize {
-        if event.data.get("response").is_some() {
-            encoded_len.saturating_sub(self.echo_len)
-        } else {
-            encoded_len
-        }
-    }
-
     /// Whether any chunk so far carried something a response is made of —
     /// content, reasoning, a tool call, or a finish reason. A stream that
     /// ends before one did produced no response at all: a bare `[DONE]`, or
@@ -2375,9 +2358,10 @@ impl<F: FnOnce(ResponsesStreamCompletion)> Drop for CompleteOnDrop<F> {
 /// assistant output passes the scan — mirroring the verbatim `/v1/responses`
 /// path's secure BufferFull default (#719), so a configured output block
 /// can't be bypassed by streaming a non-OpenAI model. The scan reads the
-/// fully-reassembled text + tool calls (not raw deltas), and the buffer is
-/// capped — an output guardrail must never release content it couldn't fully
-/// buffer to scan, so an overflow fails closed. When `hold_back` is false
+/// fully-reassembled text + tool calls (not raw deltas), and the held content
+/// is capped at `max_buffer_bytes` (#513): past it the stream fails closed,
+/// or — with `on_exceeded_fail_open` — the held events are released unscanned
+/// and the rest streams live without an output scan. When `hold_back` is false
 /// (EndOfStreamCheck — a monitor-only chain, which can never block), the
 /// bytes forward live and the same end-of-stream scan runs for observation
 /// only (AISIX-Cloud#1010). With no output guardrail the bytes forward live
@@ -2393,6 +2377,7 @@ pub fn build_responses_bridge_stream(
     output_guardrail: Option<Arc<aisix_guardrails::GuardrailChain>>,
     hold_back: bool,
     max_buffer_bytes: usize,
+    on_exceeded_fail_open: bool,
     model_label: String,
     // Largest content cap any content-capturing exporter wants
     // (AISIX-Cloud#947); `None` skips response-text accumulation entirely.
@@ -2430,12 +2415,19 @@ pub fn build_responses_bridge_stream(
         }
         let mut upstream = upstream;
         let mut first_chunk_seen = false;
-        let buffering = output_guardrail.is_some() && hold_back;
+        let mut buffering = output_guardrail.is_some() && hold_back;
         // Held SSE events when an output guardrail is attached; empty (and
         // unused) on the live-forward path.
         let mut held: Vec<bytes::Bytes> = Vec::new();
-        let mut held_bytes = 0usize;
+        // What `held` holds (#513): content, which `max_buffer_bytes` caps,
+        // and the raw bytes it bounds too.
+        let mut held_content = crate::held_content::HeldBuffer::default();
+        // The cap was hit under a fail-closed policy.
         let mut overflowed = false;
+        // The cap was hit under `on_buffer_exceeded: fail_open`: the held
+        // events went out unscanned and the rest of the response streams
+        // live, with no output scan.
+        let mut released = false;
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
@@ -2513,21 +2505,37 @@ pub fn build_responses_bridge_stream(
                             comp.reasoning_folded_into_completion = u.reasoning_folded_into_completion;
                         }
                     }
+                    if buffering {
+                        held_content.hold(crate::held_content::chat_delta(&chunk.delta), 0);
+                    }
                     for ev in encoder.next_events(&chunk) {
                         let b = bytes::Bytes::from(ev.to_sse_string());
                         if buffering {
-                            held_bytes += encoder.buffer_cost(&ev, b.len());
-                            if held_bytes > max_buffer_bytes {
-                                overflowed = true;
-                                break;
-                            }
+                            held_content.hold(0, b.len());
                             held.push(b);
                         } else {
                             downstream_mark!();
                             yield Ok::<_, std::io::Error>(b);
                         }
                     }
-                    if overflowed || encoder.is_finished() {
+                    if buffering && held_content.exceeds(max_buffer_bytes) {
+                        if !on_exceeded_fail_open {
+                            overflowed = true;
+                            break;
+                        }
+                        // `on_buffer_exceeded: fail_open`: release what is
+                        // held unscanned and unmasked, then stream the rest.
+                        buffering = false;
+                        released = true;
+                        if let Some(chain) = output_guardrail.as_ref() {
+                            chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                        }
+                        for b in held.drain(..) {
+                            downstream_mark!();
+                            yield Ok(b);
+                        }
+                    }
+                    if encoder.is_finished() {
                         break;
                     }
                 }
@@ -2612,19 +2620,32 @@ pub fn build_responses_bridge_stream(
             }
         }
 
-        if !encoder.is_finished() {
+        if !overflowed && !encoder.is_finished() {
             for ev in encoder.force_finish() {
                 let b = bytes::Bytes::from(ev.to_sse_string());
                 if buffering {
-                    held_bytes += encoder.buffer_cost(&ev, b.len());
-                    if held_bytes > max_buffer_bytes {
-                        overflowed = true;
-                        break;
-                    }
+                    held_content.hold(0, b.len());
                     held.push(b);
                 } else {
                     downstream_mark!();
                     yield Ok(b);
+                }
+            }
+            // The closing events are held like any others, under the same
+            // cap: the terminal response repeats the request echo and the
+            // whole output.
+            if buffering && held_content.exceeds(max_buffer_bytes) {
+                if on_exceeded_fail_open {
+                    released = true;
+                    if let Some(chain) = output_guardrail.as_ref() {
+                        chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                    }
+                    for b in held.drain(..) {
+                        downstream_mark!();
+                        yield Ok(b);
+                    }
+                } else {
+                    overflowed = true;
                 }
             }
         }
@@ -2634,8 +2655,12 @@ pub fn build_responses_bridge_stream(
         // routine drop point for clients that close on the terminal frame.
         guard.comp().reached_end = true;
 
-        // No output-hook guardrail: nothing to scan.
+        // No output-hook guardrail, or its cap was exceeded under fail-open:
+        // nothing to scan.
         let Some(chain) = output_guardrail.as_ref() else { return; };
+        if released {
+            return;
+        }
 
         // Buffer overflow (hold-back mode only): an output guardrail must
         // not release content it couldn't fully buffer to scan — fail
@@ -2648,6 +2673,7 @@ pub fn build_responses_bridge_stream(
                 "streaming /v1/responses (cross-provider) output exceeded buffer cap; failing closed",
             );
             guard.comp().guardrail_blocked = true;
+            aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
             yield Ok(guardrail_failure_frames(
                 &mut encoder,
                 sent_downstream,
@@ -2714,18 +2740,28 @@ pub fn build_responses_bridge_stream(
             // follow-up).
             let mut seg_counts = crate::redact::RedactionCounts::new();
             let mut seg_hits = Vec::new();
-            let mut joined: Vec<u8> = Vec::with_capacity(held_bytes);
+            let mut joined: Vec<u8> = Vec::with_capacity(held.iter().map(bytes::Bytes::len).sum());
             for b in &held {
                 joined.extend_from_slice(b);
             }
             let mut seg_rewrote = false;
-            let verdict = crate::redact::moderate_body(
+            // Live-forward: the local kinds judge the assembled message the
+            // way the buffered walk would split it — the text, and each
+            // tool call's arguments — not the flattened text (#1027).
+            let live_local = live_seg_text.as_ref().map(|_| {
+                let mut probe = synth.clone();
+                crate::redact::collect_segments(|g| {
+                    let _ = crate::redact::redact_chat_response(g, &mut probe);
+                })
+            });
+            let verdict = crate::redact::moderate_body_local_given(
                 chain.as_ref(),
                 crate::redact::Direction::Output,
                 None,
                 verdict,
                 &mut seg_counts,
                 &mut seg_hits,
+                live_local,
                 |g| match live_seg_text.as_deref() {
                     // Live-forward: observation only — nothing to rewrite.
                     Some(t) => {
@@ -2797,7 +2833,7 @@ pub fn build_responses_bridge_stream(
         // Passed (#932): mask the held SSE frames (channel reassembly)
         // before release, then hand them to the client.
         if !held.is_empty() && aisix_guardrails::Guardrail::redacts_output(chain.as_ref()) {
-            let mut joined: Vec<u8> = Vec::with_capacity(held_bytes);
+            let mut joined: Vec<u8> = Vec::with_capacity(held.iter().map(bytes::Bytes::len).sum());
             for b in &held {
                 joined.extend_from_slice(b);
             }
@@ -5049,37 +5085,6 @@ mod tests {
         );
     }
 
-    /// The request echo on a lifecycle event is not charged against an
-    /// output guardrail's hold-back budget: an agent's instructions and
-    /// tools are tens of kilobytes, repeated on three events per stream.
-    #[test]
-    fn the_request_echo_is_not_charged_to_the_hold_back_budget() {
-        let cost_of_created = |request: Value| {
-            let mut enc = ResponsesSseEncoder::new(
-                "resp_1",
-                "m",
-                0,
-                ResponsesReplyContext::from_request(&request),
-            );
-            let events = enc.next_events(&content_chunk("hi"));
-            let created = &events[0];
-            assert_eq!(created.event_type, "response.created");
-            enc.buffer_cost(created, created.to_sse_string().len())
-        };
-        let small = cost_of_created(json!({}));
-        let large = cost_of_created(json!({"instructions": "x".repeat(50_000)}));
-        assert_eq!(small, large);
-        // An output event is charged in full.
-        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
-        let events = enc.next_events(&content_chunk("hi"));
-        let delta = events
-            .iter()
-            .find(|e| e.event_type == "response.output_text.delta")
-            .unwrap();
-        let len = delta.to_sse_string().len();
-        assert_eq!(enc.buffer_cost(delta, len), len);
-    }
-
     fn namespace_reply() -> ResponsesReplyContext {
         ResponsesReplyContext::from_request(&json!({"tools": [multi_agent_namespace()]}))
     }
@@ -5307,6 +5312,7 @@ mod tests {
             None,
             false,
             usize::MAX,
+            false,
             "m".to_string(),
             None,
             None,

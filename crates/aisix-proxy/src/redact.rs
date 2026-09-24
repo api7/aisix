@@ -17,6 +17,13 @@
 //! Every helper returns per-detector match counts (detector names only,
 //! never values) which callers merge into `usage_events
 //! .redacted_entity_counts`.
+//!
+//! The walkers are also the scan surface of the local guardrail kinds
+//! (`keyword`, `pii` — #1027): [`moderate_body`] collects what a walker
+//! offers and those kinds judge each slot on its own. A slot a walker does
+//! not offer is a slot they never judge, so a new scanned field is offered
+//! here — rewritable, or through `Guardrail::observe_unrewritable` when it
+//! cannot be rewritten.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -58,6 +65,11 @@ pub enum Direction {
     /// message. Only rows left on `input_messages: all` read it.
     InputHistory,
     Output,
+    /// Response text restating a slot the walk already offered — a
+    /// Responses stream's aggregate events repeat its deltas. Rewritten
+    /// like [`Direction::Output`]; a collector records it as
+    /// [`aisix_guardrails::SegmentRole::Echo`] so it is counted once.
+    OutputEcho,
 }
 
 impl Direction {
@@ -86,6 +98,7 @@ fn redact_str(
         Direction::Input => chain.redact_input_text_in_turn(text, true),
         Direction::InputHistory => chain.redact_input_text_in_turn(text, false),
         Direction::Output => chain.redact_output_text(text),
+        Direction::OutputEcho => chain.redact_output_echo(text),
     }
 }
 
@@ -120,25 +133,37 @@ fn redact_str(
 const SEGMENT_APPLY_MARKER: &str = "__segment_apply__";
 
 /// Pass-1 probe: records every text slot the walker offers, with the
-/// latest-turn window each one belongs to. Never rewrites, so the body is
-/// bit-identical after the collect walk.
+/// latest-turn window each one belongs to, plus the slots the walker
+/// judges without rewriting (object keys, tool names). Never rewrites, so
+/// the body is bit-identical after the collect walk.
 #[derive(Default)]
 struct SegmentCollector {
-    texts: std::sync::Mutex<Vec<(String, bool)>>,
+    segments: std::sync::Mutex<Vec<aisix_guardrails::ScanSegment>>,
 }
 
 impl SegmentCollector {
-    /// The collected slots and their window flags, positionally aligned.
-    fn take(&self) -> (Vec<String>, Vec<bool>) {
-        let mut slots = self.texts.lock().expect("collector poisoned");
-        std::mem::take(&mut *slots).into_iter().unzip()
+    /// Everything collected, in walk order.
+    fn take(&self) -> Vec<aisix_guardrails::ScanSegment> {
+        std::mem::take(&mut *self.segments.lock().expect("collector poisoned"))
+    }
+
+    fn push(&self, text: &str, role: aisix_guardrails::SegmentRole, in_latest_turn: bool) {
+        self.segments
+            .lock()
+            .expect("collector poisoned")
+            .push(aisix_guardrails::ScanSegment {
+                text: text.to_owned(),
+                role,
+                in_latest_turn,
+            });
     }
 
     fn record(&self, text: &str, in_latest_turn: bool) -> Option<aisix_guardrails::Redaction> {
-        self.texts
-            .lock()
-            .expect("collector poisoned")
-            .push((text.to_owned(), in_latest_turn));
+        self.push(
+            text,
+            aisix_guardrails::SegmentRole::Rewritable,
+            in_latest_turn,
+        );
         None
     }
 }
@@ -168,6 +193,49 @@ impl Guardrail for SegmentCollector {
     }
     fn redact_output_text(&self, text: &str) -> Option<aisix_guardrails::Redaction> {
         self.record(text, true)
+    }
+    fn observe_unrewritable(
+        &self,
+        text: &str,
+        role: aisix_guardrails::SegmentRole,
+        in_latest_turn: bool,
+    ) {
+        self.push(text, role, in_latest_turn);
+    }
+    fn redact_output_echo(&self, text: &str) -> Option<aisix_guardrails::Redaction> {
+        self.push(text, aisix_guardrails::SegmentRole::Echo, true);
+        None
+    }
+}
+
+/// The segments `walk` offers, collected without rewriting anything — for
+/// a call site with no held body to hand [`moderate_body`], which builds
+/// the slots itself and runs the local pass on them directly.
+pub fn collect_segments(walk: impl FnOnce(&dyn Guardrail)) -> Vec<aisix_guardrails::ScanSegment> {
+    let collector = SegmentCollector::default();
+    walk(&collector);
+    collector.take()
+}
+
+/// Offer a slot the walker judges but never rewrites. Empty text is
+/// skipped, like an empty rewritable slot.
+fn offer_unrewritable(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    text: &str,
+    role: aisix_guardrails::SegmentRole,
+) {
+    if !text.is_empty() {
+        chain.observe_unrewritable(text, role, dir != Direction::InputHistory);
+    }
+}
+
+/// A tool name is structural — masking it would break the call it
+/// identifies — so it is judged and forwarded: a block rule refuses, a
+/// mask hit passes.
+fn offer_tool_name(chain: &dyn Guardrail, dir: Direction, name: Option<&Value>) {
+    if let Some(name) = name.and_then(Value::as_str) {
+        offer_unrewritable(chain, dir, name, aisix_guardrails::SegmentRole::ScanOnly);
     }
 }
 
@@ -238,13 +306,20 @@ impl Guardrail for SegmentApplier {
 }
 
 /// Complete one hook's moderation over a wire body: fold the already-run
-/// `check_*_non_segment` verdict with the remote segment pass. The
-/// segment pass is skipped when the check already blocked (the request
-/// is dead — don't burn a provider call) or when the chain has no
-/// segment-moderating member (zero overhead for non-Bedrock chains).
-/// Masked replacements are written back through `walk`; the provider's
-/// entity counts merge into `counts_out` (they feed
-/// `redacted_entity_counts`, names only — #932 no-leak).
+/// `check_*_non_segment` verdict with the two segment passes, both fed by
+/// ONE collect walk of `walk`:
+///
+/// - the local pass (`keyword`, `pii`, #1027) judges each collected slot on
+///   its own — the same slots the sync mask pass rewrites, so a block, a
+///   monitor `would_mask` and an enforced mask cannot disagree;
+/// - the remote segment pass (Bedrock, Presidio, Lakera, Aliyun AI,
+///   custom) moderates the rewritable slots in one provider call and its
+///   masked replacements are written back through `walk`; the provider's
+///   entity counts merge into `counts_out` (names only — #932 no-leak).
+///
+/// Nothing runs when the check already blocked (the request is dead —
+/// don't burn a provider call), and each pass is skipped when the chain
+/// has no member for it.
 ///
 /// `model` is the model the request addressed, exactly as the check pass
 /// saw it in `ChatFormat::model`, so a segment member that exposes it (a
@@ -259,7 +334,7 @@ pub async fn moderate_body(
     monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
     walk: impl FnMut(&dyn Guardrail) -> RedactionCounts,
 ) -> aisix_guardrails::GuardrailVerdict {
-    moderate_body_scanning(
+    moderate_body_inner(
         chain,
         dir,
         model,
@@ -267,6 +342,7 @@ pub async fn moderate_body(
         counts_out,
         monitor_hits_out,
         Vec::new(),
+        LocalSegments::Walk(Vec::new()),
         walk,
     )
     .await
@@ -297,22 +373,115 @@ pub async fn moderate_body_scanning(
     counts_out: &mut RedactionCounts,
     monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
     scan_only: Vec<String>,
+    walk: impl FnMut(&dyn Guardrail) -> RedactionCounts,
+) -> aisix_guardrails::GuardrailVerdict {
+    moderate_body_inner(
+        chain,
+        dir,
+        model,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        scan_only,
+        LocalSegments::Walk(Vec::new()),
+        walk,
+    )
+    .await
+}
+
+/// [`moderate_body`] plus segments only the LOCAL pass judges — text the
+/// walk cannot offer because no held body carries it: frames a held-back
+/// stream excised and will never release (#1100), or a live-forwarded
+/// stream's accumulated text. The `check_*_non_segment` text already
+/// carries them for every other kind, and the remote segment pass never
+/// saw them.
+#[allow(clippy::too_many_arguments)]
+pub async fn moderate_body_local_extra(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    model: Option<&str>,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+    local_extra: Vec<aisix_guardrails::ScanSegment>,
+    walk: impl FnMut(&dyn Guardrail) -> RedactionCounts,
+) -> aisix_guardrails::GuardrailVerdict {
+    moderate_body_inner(
+        chain,
+        dir,
+        model,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        Vec::new(),
+        LocalSegments::Walk(local_extra),
+        walk,
+    )
+    .await
+}
+
+/// [`moderate_body`] with the local pass judging `segments`, when given,
+/// INSTEAD of what `walk` offers — for a live-forwarded stream, where the
+/// walk can only offer the flattened text the remote pass has always
+/// read, while the call site can rebuild the slots the buffered branch's
+/// mask walker would rewrite.
+#[allow(clippy::too_many_arguments)]
+pub async fn moderate_body_local_given(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    model: Option<&str>,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+    segments: Option<Vec<aisix_guardrails::ScanSegment>>,
+    walk: impl FnMut(&dyn Guardrail) -> RedactionCounts,
+) -> aisix_guardrails::GuardrailVerdict {
+    moderate_body_inner(
+        chain,
+        dir,
+        model,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        Vec::new(),
+        segments.map_or(LocalSegments::Walk(Vec::new()), LocalSegments::Given),
+        walk,
+    )
+    .await
+}
+
+/// Where the local pass takes its segments from.
+enum LocalSegments {
+    /// The collect walk, plus these.
+    Walk(Vec<aisix_guardrails::ScanSegment>),
+    /// These alone.
+    Given(Vec<aisix_guardrails::ScanSegment>),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn moderate_body_inner(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    model: Option<&str>,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+    scan_only: Vec<String>,
+    local: LocalSegments,
     mut walk: impl FnMut(&dyn Guardrail) -> RedactionCounts,
 ) -> aisix_guardrails::GuardrailVerdict {
-    if non_segment_verdict.is_block() || !chain.moderates_segments() {
+    use aisix_guardrails::{ScanSegment, SegmentRole};
+
+    let has_local = chain.checks_local_segments();
+    let remote = chain.moderates_segments();
+    if non_segment_verdict.is_block() || !(has_local || remote) {
         return non_segment_verdict;
     }
     let collector = SegmentCollector::default();
     walk(&collector);
-    let (mut texts, mut in_latest_turn) = collector.take();
-    // Everything past here is judged but unwritable; the apply walk only
-    // ever offers the first `writable` slots back.
-    let writable = texts.len();
-    texts.extend(scan_only);
-    // The scan-only tail is Anthropic signed reasoning — assistant content,
-    // and so outside every latest-turn window by construction.
-    in_latest_turn.resize(texts.len(), false);
-    // The pass runs even with zero collected slots. "Nothing to scan" is
+    let collected = collector.take();
+    let mut verdict = non_segment_verdict;
+    // Both passes run even with zero collected slots. "Nothing to scan" is
     // not "nothing to decide": a segment-moderating member may hold a
     // verdict that does not depend on the text (a `kind: custom` policy
     // script), and skipping the pass turned an operator's block rule into
@@ -320,13 +489,50 @@ pub async fn moderate_body_scanning(
     // Every member that needs a remote call short-circuits empty input
     // itself (bedrock/lakera/presidio/aliyun all refuse empty content), so
     // consulting the chain here costs no provider round-trip.
+    if has_local {
+        let segments = match local {
+            LocalSegments::Given(segments) => segments,
+            LocalSegments::Walk(extra) => {
+                let mut segments = collected.clone();
+                // The scan-only tail is Anthropic signed reasoning —
+                // assistant content, and so outside every latest-turn
+                // window by construction.
+                segments.extend(scan_only.iter().map(|text| ScanSegment {
+                    text: text.clone(),
+                    role: SegmentRole::ScanOnly,
+                    in_latest_turn: false,
+                }));
+                segments.extend(extra);
+                segments
+            }
+        };
+        let (local_verdict, mut hits) = chain.check_local_segments(&segments, dir.is_input());
+        monitor_hits_out.append(&mut hits);
+        verdict = verdict.merged_with(local_verdict);
+        if verdict.is_block() {
+            return verdict;
+        }
+    }
+    if !remote {
+        return verdict;
+    }
+    let (mut texts, mut in_latest_turn): (Vec<String>, Vec<bool>) = collected
+        .into_iter()
+        .filter(|s| matches!(s.role, SegmentRole::Rewritable | SegmentRole::Echo))
+        .map(|s| (s.text, s.in_latest_turn))
+        .unzip();
+    // Everything past here is judged but unwritable; the apply walk only
+    // ever offers the first `writable` slots back.
+    let writable = texts.len();
+    texts.extend(scan_only);
+    in_latest_turn.resize(texts.len(), false);
     let mut outcome = match dir {
         Direction::Input | Direction::InputHistory => {
             chain
                 .moderate_input_segments_in_turn(&texts, &in_latest_turn, model)
                 .await
         }
-        Direction::Output => chain.moderate_output_segments(&texts).await,
+        Direction::Output | Direction::OutputEcho => chain.moderate_output_segments(&texts).await,
     };
     monitor_hits_out.append(&mut outcome.monitor_hits);
     if !outcome.verdict.is_block() {
@@ -347,7 +553,7 @@ pub async fn moderate_body_scanning(
             merge_counts(counts_out, outcome.counts);
         }
     }
-    non_segment_verdict.merged_with(outcome.verdict)
+    verdict.merged_with(outcome.verdict)
 }
 
 /// Rewrite one owned text field in place. No-op (and no allocation) when
@@ -388,7 +594,8 @@ fn apply_to_value_string(
 /// array elements). Keys and non-string scalars are untouched, so the
 /// tree stays structurally valid — a phone number stored as a JSON number
 /// is out of scope by design (rewriting it to a mask token would corrupt
-/// the document).
+/// the document). Each object key and each number is offered as a
+/// [`aisix_guardrails::SegmentRole::Label`]: judged, never rewritten.
 pub fn redact_value_strings(
     chain: &dyn Guardrail,
     dir: Direction,
@@ -403,9 +610,18 @@ pub fn redact_value_strings(
             }
         }
         Value::Object(map) => {
-            for (_, val) in map.iter_mut() {
+            for (key, val) in map.iter_mut() {
+                offer_unrewritable(chain, dir, key, aisix_guardrails::SegmentRole::Label);
                 redact_value_strings(chain, dir, val, counts);
             }
+        }
+        Value::Number(n) => {
+            offer_unrewritable(
+                chain,
+                dir,
+                &n.to_string(),
+                aisix_guardrails::SegmentRole::Label,
+            );
         }
         _ => {}
     }
@@ -523,7 +739,7 @@ fn chat_latest_turn_start(messages: &[aisix_gateway::ChatMessage]) -> usize {
 
 /// Mask `function.arguments` (JSON-encoded string) on each element of an
 /// OpenAI-shaped `tool_calls` array. Names/ids are structural, not
-/// content, and stay untouched.
+/// content, and stay untouched; the name is still judged (scan-only).
 fn redact_tool_call_arguments(
     chain: &dyn Guardrail,
     dir: Direction,
@@ -534,6 +750,7 @@ fn redact_tool_call_arguments(
         return;
     };
     for tc in items {
+        offer_tool_name(chain, dir, tc.get("function").and_then(|f| f.get("name")));
         if let Some(Value::String(s)) = tc.get_mut("function").and_then(|f| f.get_mut("arguments"))
         {
             let mut owned = std::mem::take(s);
@@ -635,6 +852,7 @@ fn redact_anthropic_content(
                         }
                     }
                     Some("tool_use") => {
+                        offer_tool_name(chain, dir, block.get("name"));
                         if let Some(input) = block.get_mut("input") {
                             redact_value_strings(chain, dir, input, counts);
                         }
@@ -791,6 +1009,7 @@ fn redact_responses_item(
             _ => {}
         },
         Some("function_call") => {
+            offer_tool_name(chain, dir, item.get("name"));
             if let Some(Value::String(args)) = item.get_mut("arguments") {
                 let mut owned = std::mem::take(args);
                 redact_json_encoded(chain, dir, &mut owned, counts);
@@ -804,13 +1023,14 @@ fn redact_responses_item(
         // and this walk does not is a Mask rule that reports a hit and
         // then forwards the match unmasked.
         Some("custom_tool_call") => {
+            offer_tool_name(chain, dir, item.get("name"));
             if let Some(input) = item.get_mut("input") {
                 apply_to_value_string(chain, dir, input, counts);
             }
         }
         Some("function_call_output" | "custom_tool_call_output") => {
             if let Some(output) = item.get_mut("output") {
-                apply_to_value_string(chain, dir, output, counts);
+                apply_to_text_slot(chain, dir, output, counts);
             }
         }
         // A `reasoning` item replayed on the REQUEST. Its `content[].text`
@@ -842,6 +1062,75 @@ fn redact_responses_item(
                             apply_to_value_string(chain, dir, text, counts);
                         }
                     }
+                }
+            }
+        }
+        _ => {}
+    }
+    // Every other slot the scan reads on this item — the scan reads a fixed
+    // set of keys on ANY item type (`responses::responses_item_text` on the
+    // request, `responses::responses_output_text` on the response), while
+    // the arms above know only the common types. Walking the rest here is
+    // what keeps the mask surface equal to the scan surface for items like
+    // `mcp_call` / `mcp_approval_response` (#1027).
+    let ty = item.get("type").and_then(Value::as_str).map(str::to_owned);
+    let covered: &[&str] = match ty.as_deref() {
+        Some("message") | None => &["content"],
+        Some("function_call") => &["name", "arguments"],
+        Some("custom_tool_call") => &["name", "input"],
+        Some("function_call_output" | "custom_tool_call_output") => &["output"],
+        // Generated reasoning is out of the output scope; replayed
+        // reasoning is walked above.
+        Some("reasoning") => return,
+        _ => &[],
+    };
+    let scanned: &[&str] = if dir.is_input() {
+        &[
+            "content",
+            "output",
+            "reason",
+            "summary",
+            "name",
+            "arguments",
+            "input",
+        ]
+    } else {
+        &["content", "name", "arguments", "input"]
+    };
+    for key in scanned.iter().filter(|k| !covered.contains(k)) {
+        match *key {
+            "name" => offer_tool_name(chain, dir, item.get("name")),
+            "arguments" => {
+                if let Some(Value::String(args)) = item.get_mut("arguments") {
+                    let mut owned = std::mem::take(args);
+                    redact_json_encoded(chain, dir, &mut owned, counts);
+                    *args = owned;
+                }
+            }
+            key => {
+                if let Some(slot) = item.get_mut(key) {
+                    apply_to_text_slot(chain, dir, slot, counts);
+                }
+            }
+        }
+    }
+}
+
+/// A Responses text slot: a bare string, or an array of typed parts whose
+/// `text` fields are rewritten — the two shapes `responses_value_text`
+/// reads.
+fn apply_to_text_slot(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    slot: &mut Value,
+    counts: &mut RedactionCounts,
+) {
+    match slot {
+        Value::String(_) => apply_to_value_string(chain, dir, slot, counts),
+        Value::Array(parts) => {
+            for part in parts {
+                if let Some(text) = part.get_mut("text") {
+                    apply_to_value_string(chain, dir, text, counts);
                 }
             }
         }
@@ -1069,6 +1358,11 @@ pub fn redact_chat_chunks(chain: &dyn Guardrail, chunks: &mut [ChatChunk]) -> Re
     for (ci, chunk) in chunks.iter().enumerate() {
         if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
             for (ti, tc) in tcs.iter().enumerate() {
+                offer_tool_name(
+                    chain,
+                    Direction::Output,
+                    tc.get("function").and_then(|f| f.get("name")),
+                );
                 let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
                 if tc
                     .get("function")
@@ -1145,74 +1439,82 @@ impl SseFrame {
         let Some(data) = self.data.as_ref() else {
             return self.raw.clone();
         };
-        let text = String::from_utf8_lossy(&self.raw);
-        let mut out = String::new();
+        let raw = &self.raw;
+        let mut out = Vec::with_capacity(raw.len());
+        // `raw[cursor..]` has not been copied yet.
+        let mut cursor = 0usize;
         let mut data_written = false;
-        for line in text.split('\n') {
-            if line.starts_with("data:") {
-                if !data_written {
-                    out.push_str("data: ");
-                    out.push_str(&serde_json::to_string(data).unwrap_or_default());
-                    // Keep the line's own ending: the rest of the frame
-                    // passes through verbatim, so dropping the `\r` here
-                    // alone would leave one LF line in a CRLF frame.
-                    if line.ends_with('\r') {
-                        out.push('\r');
-                    }
-                    out.push('\n');
-                    data_written = true;
-                }
-            } else {
-                out.push_str(line);
-                out.push('\n');
+        // Where the previous line's content ended — its terminator follows.
+        let mut prev_end = 0usize;
+        for line in aisix_gateway::sse::lines(raw) {
+            let is_data = aisix_gateway::sse::parse_field(&raw[line.start..line.end])
+                .is_some_and(|(name, _)| name == b"data");
+            if is_data && !data_written {
+                // Keep the line's own terminator: the rest of the frame
+                // passes through verbatim, so a CRLF (or CR) frame stays one.
+                out.extend_from_slice(&raw[cursor..line.start]);
+                out.extend_from_slice(b"data: ");
+                out.extend_from_slice(serde_json::to_string(data).unwrap_or_default().as_bytes());
+                cursor = line.end;
+                data_written = true;
+            } else if is_data {
+                // Drop the line together with the terminator BEFORE it, so
+                // its own terminator ends whatever preceded it — and a
+                // dropped last line leaves no stray line ending ahead of the
+                // separator the caller re-adds.
+                out.extend_from_slice(&raw[cursor..prev_end]);
+                cursor = line.end;
             }
+            prev_end = line.end;
         }
-        // Drop the final artificial newline added by the loop; the caller
-        // re-adds the frame separator.
-        if out.ends_with('\n') {
-            out.pop();
-        }
-        // ...and, on a CRLF frame whose LAST line was a dropped `data:`
-        // line, the CR that line ending left behind. The frame's own
-        // terminator CR was split off with the frame, so anything trailing
-        // here belongs to a line that is no longer followed by one — it
-        // would reach the client as a lone CR before the separator.
-        if out.ends_with('\r') {
-            out.pop();
-        }
-        out.into_bytes()
+        out.extend_from_slice(&raw[cursor..]);
+        out
     }
 }
 
-/// Offset and length of the first frame terminator (a blank line) in `raw`.
+/// Offset and length of the first frame's separator in `raw`: the last
+/// line's terminator plus the blank line after it, as the upstream wrote
+/// them.
 ///
 /// The ONE place this crate decides where an SSE frame ends. Everything
 /// below derives from it, so the frame-based redaction pass and the
 /// line-based scan passes cannot end up with two notions of framing —
 /// which is exactly how an unterminated final frame slipped past one pass
-/// while the other read it (#1091).
-///
-/// It is the relay's own `messages::find_frame_end`, deliberately called
-/// rather than reimplemented: two functions that agree today are how the
-/// disagreement this fixes got in. That one is CRLF-aware, and it has to
-/// be — the scan passes read lines and trim, so a CRLF-framed upstream is
-/// ordinary text to them, while a splitter that knew only `\n\n` would hand
-/// the whole body back as one unframed blob and the redactor would render
-/// it down to its first `data:` line. Same disagreement, second costume.
+/// while the other read it (#1091). It is the gateway's shared splitter,
+/// the same one every streaming relay drains with, so a frame the relay
+/// forwarded is a frame the scans read.
 fn frame_terminator(raw: &[u8]) -> Option<(usize, usize)> {
-    let end = crate::messages::find_frame_end(raw)?;
-    let term: &'static [u8] = if raw[..end].ends_with(b"\r\n\r\n") {
-        b"\r\n\r\n"
-    } else {
-        b"\n\n"
-    };
-    Some((end - term.len(), term.len()))
+    let (content_end, frame_end) = aisix_gateway::sse::split_frame_end(raw)?;
+    Some((content_end, frame_end - content_end))
+}
+
+/// The separator `frame_terminator` found, as a `'static` slice: a frame
+/// keeps the separator its upstream wrote, so a masked CRLF (or CR)
+/// document does not come back LF-framed.
+fn separator(bytes: &[u8]) -> &'static [u8] {
+    const SEPARATORS: [&[u8]; 11] = [
+        b"\n\n",
+        b"\r\n\r\n",
+        b"\r\r",
+        b"\n\r\n",
+        b"\r\n\n",
+        b"\n\r",
+        b"\r\r\n",
+        b"\r\n\r",
+        b"\n",
+        b"\r",
+        b"\r\n",
+    ];
+    SEPARATORS
+        .into_iter()
+        .find(|s| *s == bytes)
+        .unwrap_or(b"\n\n")
 }
 
 /// Byte offset just past the LAST complete frame terminator in `raw`
 /// (`0` when there is none, `raw.len()` when the body ends on one).
 /// `raw[end..]` is therefore the unterminated trailing fragment.
-fn last_frame_end(raw: &[u8]) -> usize {
+pub(crate) fn last_frame_end(raw: &[u8]) -> usize {
     let mut end = 0usize;
     let mut rest = raw;
     while let Some((pos, len)) = frame_terminator(rest) {
@@ -1253,22 +1555,7 @@ pub(crate) fn frame_payload(frame_raw: &[u8]) -> Option<String> {
 /// the restamp came to see only the first line of a multi-line frame
 /// (#1105) while every other consumer saw all of it (#1100).
 pub(crate) fn data_line_ranges(frame_raw: &[u8]) -> Vec<Range<usize>> {
-    let mut out = Vec::new();
-    let mut offset = 0usize;
-    for line in frame_raw.split(|&b| b == b'\n') {
-        let start = offset;
-        offset += line.len() + 1; // the split consumed one `\n`
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let Some(after_colon) = line.strip_prefix(b"data:") else {
-            continue;
-        };
-        let mut from = start + b"data:".len();
-        if after_colon.first() == Some(&b' ') {
-            from += 1;
-        }
-        out.push(from..start + line.len());
-    }
-    out
+    aisix_gateway::sse::data_ranges(frame_raw)
 }
 
 /// The `data:` payload of every frame in a buffered SSE body, in order,
@@ -1316,7 +1603,7 @@ fn split_sse_frames(raw: &[u8]) -> (Vec<SseFrame>, &[u8]) {
             raw: frame_raw.to_vec(),
             data: frame_payload(frame_raw)
                 .and_then(|l| serde_json::from_str::<Value>(l.trim()).ok()),
-            term: if len == 4 { b"\r\n\r\n" } else { b"\n\n" },
+            term: separator(&rest[pos..pos + len]),
             dirty: false,
         });
         rest = &rest[pos + len..];
@@ -1428,10 +1715,17 @@ pub fn seal_buffered_sse(buf: &mut Vec<u8>) -> BufferedSseSeal {
 /// Pads by what is MISSING, not a fixed `\n\n`: a fragment that already
 /// ends in half its terminator needs only the other half, and a full pad
 /// would leave a stray blank line in the released bytes. The upstream's own
-/// line ending is matched, so a CRLF stream stays a CRLF stream.
+/// line ending is matched, so a CRLF (or CR) stream stays one.
 fn seal_sse_tail(buf: &mut Vec<u8>) -> SseTailSeal {
     let end = last_frame_end(buf);
     if end == buf.len() {
+        // A CRLF stream cut between the `\r` and the `\n` of its last blank
+        // line: that `\r` already ends the frame, but a client that frames on
+        // `\r\n\r\n` alone would never see it end.
+        if buf.ends_with(b"\r\n\r") {
+            buf.push(b'\n');
+            return SseTailSeal::Completed { padded: 1 };
+        }
         return SseTailSeal::Terminated;
     }
     // An empty payload and the `[DONE]` sentinel carry no text (the scan
@@ -1451,16 +1745,19 @@ fn seal_sse_tail(buf: &mut Vec<u8>) -> SseTailSeal {
     // says nothing, so the frames before it are the only evidence.
     let frag = &buf[end..];
     let crlf_stream = buf[..end].ends_with(b"\r\n\r\n");
-    let pad: &[u8] = if frag.ends_with(b"\r\n\r") {
-        b"\n"
-    } else if frag.ends_with(b"\r\n") {
+    let cr_stream = buf[..end].ends_with(b"\r\r");
+    let pad: &[u8] = if frag.ends_with(b"\r\n") {
         b"\r\n"
     } else if frag.ends_with(b"\r") && crlf_stream {
         b"\n\r\n"
+    } else if frag.ends_with(b"\r") {
+        b"\r"
     } else if frag.ends_with(b"\n") {
         b"\n"
     } else if crlf_stream {
         b"\r\n\r\n"
+    } else if cr_stream {
+        b"\r\r"
     } else {
         b"\n\n"
     };
@@ -1587,6 +1884,11 @@ pub fn redact_anthropic_sse(
                 }
             }
             Some("content_block_start") => {
+                if let Some(block) = data.get("content_block") {
+                    if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                        offer_tool_name(chain, Direction::Output, block.get("name"));
+                    }
+                }
                 // A `text` block may open with non-empty initial text; it
                 // belongs at the head of the same channel as its deltas.
                 if data
@@ -1813,7 +2115,11 @@ pub fn redact_responses_sse(
                     text_channels.entry(channel_key(data)).or_default().push(fi);
                 }
             }
-            Some("response.function_call_arguments.delta") => {
+            // MCP tool calls stream their JSON-encoded arguments on their
+            // own event; the scan reads it, so the mask has to (#1027).
+            Some(
+                "response.function_call_arguments.delta" | "response.mcp_call_arguments.delta",
+            ) => {
                 if data
                     .get("delta")
                     .and_then(Value::as_str)
@@ -1900,7 +2206,13 @@ pub fn redact_responses_sse(
     // counts are NOT merged into the totals: they duplicate the delta
     // channels' matches (the audit count is per span served, not per
     // wire occurrence). Only count them when the delta channel was absent
-    // (e.g. a `.done`-only encoder).
+    // (e.g. a `.done`-only encoder). A collector is told the same thing,
+    // so a monitor preview counts what this pass counts.
+    let aggregate = if text_channels.is_empty() && args_channels.is_empty() {
+        Direction::Output
+    } else {
+        Direction::OutputEcho
+    };
     for frame in frames.iter_mut() {
         let Some(data) = frame.data.as_mut() else {
             continue;
@@ -1914,29 +2226,29 @@ pub fn redact_responses_sse(
         match ty.as_str() {
             "response.output_text.done" => {
                 if let Some(text) = data.get_mut("text") {
-                    apply_to_value_string(chain, Direction::Output, text, &mut local);
+                    apply_to_value_string(chain, aggregate, text, &mut local);
                 }
             }
             "response.content_part.done" => {
                 if let Some(text) = data.get_mut("part").and_then(|p| p.get_mut("text")) {
-                    apply_to_value_string(chain, Direction::Output, text, &mut local);
+                    apply_to_value_string(chain, aggregate, text, &mut local);
                 }
             }
-            "response.function_call_arguments.done" => {
+            "response.function_call_arguments.done" | "response.mcp_call_arguments.done" => {
                 if let Some(Value::String(args)) = data.get_mut("arguments") {
                     let mut owned = std::mem::take(args);
-                    redact_json_encoded(chain, Direction::Output, &mut owned, &mut local);
+                    redact_json_encoded(chain, aggregate, &mut owned, &mut local);
                     *args = owned;
                 }
             }
             "response.custom_tool_call_input.done" => {
                 if let Some(input) = data.get_mut("input") {
-                    apply_to_value_string(chain, Direction::Output, input, &mut local);
+                    apply_to_value_string(chain, aggregate, input, &mut local);
                 }
             }
             "response.output_item.done" => {
                 if let Some(item) = data.get_mut("item") {
-                    redact_responses_item(chain, Direction::Output, item, &mut local);
+                    redact_responses_item(chain, aggregate, item, &mut local);
                 }
             }
             "response.completed" | "response.incomplete" | "response.failed" => {
@@ -1944,7 +2256,7 @@ pub fn redact_responses_sse(
                     data.get_mut("response").and_then(|r| r.get_mut("output"))
                 {
                     for item in items {
-                        redact_responses_item(chain, Direction::Output, item, &mut local);
+                        redact_responses_item(chain, aggregate, item, &mut local);
                     }
                 }
             }
@@ -2839,6 +3151,74 @@ mod tests {
         assert_eq!(counts.get("email"), Some(&1));
     }
 
+    /// #1027: a Responses stream restates each delta channel on its
+    /// aggregate events. The mask pass counts a span once, so a collector
+    /// must tell the restatements apart — or a monitor preview counts the
+    /// same span three times.
+    #[test]
+    fn responses_sse_aggregates_are_collected_as_echoes() {
+        use aisix_guardrails::SegmentRole;
+        let raw = concat!(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"mail a@x.com ok\"}\n\n",
+            "event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"item_id\":\"msg_1\",\"text\":\"mail a@x.com ok\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"mail a@x.com ok\"}]}]}}\n\n",
+        );
+        let segments = collect_segments(|g| {
+            let _ = redact_responses_sse(g, raw.as_bytes());
+        });
+        let counted: Vec<&str> = segments
+            .iter()
+            .filter(|s| s.role == SegmentRole::Rewritable)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(counted, vec!["mail a@x.com ok"]);
+        assert_eq!(
+            segments
+                .iter()
+                .filter(|s| s.role == SegmentRole::Echo)
+                .count(),
+            2
+        );
+    }
+
+    /// #1027: a tool call's arguments are offered value by value, each key
+    /// and number as a label, and the tool name as a scan-only slot.
+    #[test]
+    fn chat_tool_call_arguments_are_offered_as_values_keys_and_a_name() {
+        use aisix_guardrails::SegmentRole;
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "unlock", "arguments": "{\"pin\":\"1234\",\"door\":{\"side\":\"front\",\"floor\":2}}"}
+                }]
+            }]
+        }))
+        .unwrap();
+        let segments = collect_segments(|g| {
+            let _ = redact_chat_format(g, &mut req);
+        });
+        let got: Vec<(&str, SegmentRole)> =
+            segments.iter().map(|s| (s.text.as_str(), s.role)).collect();
+        for want in [
+            ("unlock", SegmentRole::ScanOnly),
+            ("pin", SegmentRole::Label),
+            ("1234", SegmentRole::Rewritable),
+            ("door", SegmentRole::Label),
+            ("side", SegmentRole::Label),
+            ("front", SegmentRole::Rewritable),
+            ("floor", SegmentRole::Label),
+            ("2", SegmentRole::Label),
+        ] {
+            assert!(got.contains(&want), "missing {want:?} in {got:?}");
+        }
+        assert_eq!(got.len(), 8, "{got:?}");
+    }
+
     /// The bridged encoder now emits reasoning-summary frames alongside the
     /// message frames it always did. Generated reasoning is out of
     /// output-guardrail scope, so an output mask that rewrites the held
@@ -3431,6 +3811,65 @@ mod tests {
         assert!(!out.contains("\r\r"), "stray CR: {out:?}");
     }
 
+    /// The event-stream spec lets a line end in a bare `\r` too. A body
+    /// framed that way is framed, scanned and masked like any other, and
+    /// comes back framed the way it arrived.
+    #[test]
+    fn a_cr_framed_body_is_read_masked_and_left_cr_framed() {
+        let chain = both();
+        let raw = concat!(
+            "event: response.output_text.delta\rdata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"mail a@x.com\"}\r\r",
+            "event: response.completed\rdata: {\"type\":\"response.completed\",\"response\":{}}\r\r",
+        )
+        .as_bytes()
+        .to_vec();
+        assert_eq!(sse_frame_payloads(&raw).len(), 2);
+        let mut sealed = raw.clone();
+        assert_eq!(seal_buffered_sse(&mut sealed).tail, SseTailSeal::Terminated);
+        assert_eq!(sealed, raw);
+        let (out, counts) = redact_responses_sse(chain.as_ref(), &sealed).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "out: {out:?}");
+        assert_eq!(counts.get("email"), Some(&1));
+        assert!(!out.contains('\n'), "re-framed with LF: {out:?}");
+        assert_eq!(out.matches("\r\r").count(), 2, "out: {out:?}");
+    }
+
+    #[test]
+    fn a_masked_cr_frame_spanning_several_data_lines_keeps_one_line_and_its_framing() {
+        let chain = both();
+        let raw = concat!(
+            "event: content_block_delta\rdata: {\"type\":\"content_block_delta\",\"index\":0,\r",
+            "data: \"delta\":{\"type\":\"text_delta\",\"text\":\"mail a@x.com\"}}\r\r",
+        );
+        let (out, _) = redact_anthropic_sse(chain.as_ref(), raw.as_bytes())
+            .expect("the whole payload must reach the redactor");
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "left unmasked: {out:?}");
+        assert!(
+            out.starts_with("event: content_block_delta\rdata: {"),
+            "out: {out:?}"
+        );
+        assert_eq!(out.matches("data:").count(), 1, "out: {out:?}");
+        assert!(out.ends_with("}\r\r"), "out: {out:?}");
+    }
+
+    #[test]
+    fn seal_pads_a_cr_stream_with_cr() {
+        let mut raw = b"data: {\"a\":1}\r\rdata: {\"b\":2}".to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut raw).tail,
+            SseTailSeal::Completed { padded: 2 }
+        );
+        assert_eq!(raw, b"data: {\"a\":1}\r\rdata: {\"b\":2}\r\r");
+        let mut raw = b"data: {\"a\":1}\r".to_vec();
+        assert_eq!(
+            seal_buffered_sse(&mut raw).tail,
+            SseTailSeal::Completed { padded: 1 }
+        );
+        assert_eq!(raw, b"data: {\"a\":1}\r\r");
+    }
+
     #[test]
     fn responses_sse_returns_none_when_clean() {
         let chain = both();
@@ -3702,7 +4141,7 @@ mod tests {
 
     /// An already-blocked prior verdict skips the remote call entirely
     /// (the request is dead — don't burn a provider call), and a chain
-    /// with no segment member is a no-op.
+    /// with no segment or local member is a no-op.
     #[tokio::test]
     async fn moderate_body_skips_remote_when_blocked_or_absent() {
         let chain = seg_chain(StubSegments {
@@ -3728,10 +4167,11 @@ mod tests {
         .await;
         assert!(verdict.is_block(), "prior Block passes through");
 
-        // A sync-only (non-segment) chain never enters the pass.
-        let sync_only = both();
+        // A chain with neither a segment nor a local member never enters
+        // the pass.
+        let sync_only = aisix_guardrails::GuardrailChain::new(vec![]);
         let verdict = moderate_body(
-            sync_only.as_ref(),
+            &sync_only,
             Direction::Input,
             None,
             GuardrailVerdict::Allow,

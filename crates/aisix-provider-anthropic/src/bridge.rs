@@ -124,6 +124,13 @@ fn declared_messages_base(ctx: &BridgeContext) -> &str {
         .unwrap_or("")
 }
 
+/// The verbatim `/v1/messages` and `count_tokens` passthrough builds its
+/// URL without this bridge, through `resolve_base_url_for` in
+/// `aisix-proxy`'s dispatch module; its `falls_back_to_anthropic_default`
+/// states this same fallback plus the `adapter: anthropic` check dispatch
+/// applies before an empty-vendor key reaches this bridge. Change the two
+/// together, or the translated and the verbatim path send one key to two
+/// different hosts.
 fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
     // A Provider Key that declares `apis.messages` names where the
     // Anthropic wire lives on this upstream, which is where this bridge
@@ -490,9 +497,21 @@ where
         let mut stream = Box::pin(byte_stream);
         let mut state = StreamState::default();
 
-        while let Some(next) = stream.next().await {
-            let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-            for event in decoder.feed(chunk.as_ref()) {
+        loop {
+            // At EOF, `finish` flushes a last frame the upstream never
+            // terminated, and reports a frame that outgrew the bound after
+            // the last events were returned.
+            let (events, eof) = match stream.next().await {
+                Some(next) => {
+                    let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                    (decoder.feed(chunk.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?, false)
+                }
+                None => (
+                    decoder.finish().map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?.into_iter().collect(),
+                    true,
+                ),
+            };
+            for event in events {
                 let SseEvent::Data(payload) = event else { continue };
                 let parsed: AnthropicStreamEvent = serde_json::from_str(&payload)
                     .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
@@ -507,6 +526,9 @@ where
                     return;
                 }
             }
+            if eof {
+                break;
+            }
         }
     }
 }
@@ -519,6 +541,61 @@ mod tests {
     use std::sync::Arc;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn collect_stream(chunks: Vec<Vec<u8>>) -> Vec<Result<ChatChunk, BridgeError>> {
+        let bytes = futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<_, reqwest::Error>(bytes::Bytes::from(c))),
+        );
+        build_chunk_stream(bytes).collect().await
+    }
+
+    fn sse(event: &str, data: serde_json::Value) -> String {
+        format!("event: {event}\ndata: {data}\n\n")
+    }
+
+    /// A last chunk that completes a frame and then outgrows the frame bound
+    /// fails the stream once the body ends, rather than ending it cleanly on
+    /// truncated output.
+    #[tokio::test]
+    async fn stream_fails_when_the_last_chunk_ends_in_an_oversized_frame() {
+        let mut last = sse(
+            "content_block_delta",
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}),
+        )
+        .into_bytes();
+        last.extend(b"data: ");
+        last.extend(std::iter::repeat_n(
+            b'x',
+            aisix_gateway::sse::MAX_SSE_FRAME_BYTES,
+        ));
+        let items = collect_stream(vec![last]).await;
+        assert!(
+            matches!(items.last(), Some(Err(BridgeError::UpstreamDecode(_)))),
+            "{:?}",
+            items.iter().map(|i| i.is_ok()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A last frame the upstream never terminated is still read.
+    #[tokio::test]
+    async fn stream_reads_an_unterminated_last_frame() {
+        let mut body = sse(
+            "content_block_delta",
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}),
+        );
+        body.push_str(&format!(
+            "event: message_delta\ndata: {}",
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}})
+        ));
+        let items = collect_stream(vec![body.into_bytes()]).await;
+        let chunks: Vec<ChatChunk> = items.into_iter().map(Result::unwrap).collect();
+        assert_eq!(
+            chunks.last().and_then(|c| c.finish_reason.clone()),
+            Some(FinishReason::Stop)
+        );
+    }
 
     fn sample_model() -> Arc<Model> {
         Arc::new(

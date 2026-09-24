@@ -55,6 +55,20 @@ pub(crate) fn enforced_hits(audit: &GuardrailAudit) -> Vec<aisix_core::Guardrail
     audit.as_ref().map(|a| a.snapshot()).unwrap_or_default()
 }
 
+/// Snapshot `audit` into a `UsageEvent`'s `applied_guardrails`: the
+/// `{kind, hook}` set of the chain the request resolved.
+///
+/// The failure path reads it here rather than off the chain because the
+/// chain is resolved inside a dispatch frame the `Err` has already left,
+/// and a guardrail refusal — the one failure whose row an operator is
+/// certain to open — would otherwise claim that no guardrail governed it.
+pub(crate) fn applied_guardrails(audit: &GuardrailAudit) -> Vec<aisix_core::AppliedGuardrail> {
+    audit
+        .as_ref()
+        .map(|a| a.applied().to_vec())
+        .unwrap_or_default()
+}
+
 /// Snapshot `audit` into a `UsageEvent`'s `guardrail_bypassed_reason`:
 /// the bounded tag of the first guardrail this request failed OPEN on,
 /// empty when none did.
@@ -555,6 +569,10 @@ pub(crate) fn emit_error_usage_event(
     // — reads it off the error it is reporting.
     guardrail_blocked: bool,
     client: &ClientContext,
+    // The request's applied guardrail set, from [`applied_guardrails`].
+    // Required for the same reason as `guardrail_blocked`: a refusal whose
+    // row names no governing guardrail contradicts its own enforced hit.
+    applied: Vec<aisix_core::AppliedGuardrail>,
     // The request's enforced guardrail hits. The failure path is where a
     // `blocked` hit lands — a guardrail refusal IS the error — so the
     // error event is the one that must not drop it. Drained by the caller
@@ -582,6 +600,7 @@ pub(crate) fn emit_error_usage_event(
         error_class,
         guardrail_blocked,
         client,
+        applied,
         enforced,
         scores,
         bypass,
@@ -792,6 +811,7 @@ pub(crate) fn build_error_usage_event(
     // See [`emit_error_usage_event`].
     guardrail_blocked: bool,
     client: &ClientContext,
+    applied: Vec<aisix_core::AppliedGuardrail>,
     enforced: Vec<aisix_core::GuardrailEnforcedHit>,
     scores: Vec<aisix_core::GuardrailScore>,
     // See [`emit_error_usage_event`].
@@ -808,6 +828,7 @@ pub(crate) fn build_error_usage_event(
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         guardrail_blocked,
+        applied_guardrails: applied,
         guardrail_enforced_hits: enforced,
         guardrail_scores: scores,
         guardrail_bypassed_reason: bypass,
@@ -1266,15 +1287,18 @@ mod tests {
     }
 
     /// Every `UsageEvent` this crate builds must set
-    /// `guardrail_bypassed_reason`, and an emitter that genuinely has no
-    /// chain behind it must say so where it is written.
+    /// `guardrail_bypassed_reason` and `applied_guardrails`, and an emitter
+    /// that genuinely has no chain behind it must say so where it is
+    /// written.
     ///
-    /// The field defaults to empty, so an emitter that forgets it reports
-    /// "nothing was bypassed" for a request that went upstream unscreened —
-    /// and no behavioural test can see the omission, because an unset field
-    /// and a screened request produce the same row. That is exactly how the
-    /// field spent its whole life written on `/v1/chat/completions` and
-    /// nowhere else.
+    /// Both fields default to empty, so an emitter that forgets one reports
+    /// "nothing was bypassed" for a request that went upstream unscreened,
+    /// or "no guardrail governed this" for one a guardrail refused — and no
+    /// behavioural test can see the omission, because an unset field and an
+    /// unguarded request produce the same row. That is exactly how the
+    /// bypass reason spent its whole life written on
+    /// `/v1/chat/completions` and nowhere else, and how every
+    /// single-attempt failure row lost its applied set (api7/aisix#1030).
     ///
     /// A parse of the source rather than a list of emitters, for the reason
     /// `guardrail_coverage` parses the router instead of listing routes: a
@@ -1282,7 +1306,7 @@ mod tests {
     /// emitter family here has sixteen members that keep gaining a
     /// seventeenth.
     #[test]
-    fn every_usage_event_this_crate_builds_answers_the_bypass_question() {
+    fn every_usage_event_this_crate_builds_answers_the_guardrail_questions() {
         /// Written inside an emitter that has no guardrail chain behind it
         /// at all, followed by why.
         const EXEMPT: &str = "NO-GUARDRAIL-CHAIN:";
@@ -1321,9 +1345,14 @@ mod tests {
                     panic!("{name}: unbalanced UsageEvent literal at byte {idx}");
                 };
                 blocks += 1;
-                if !sets_bypass_reason(block) && !block.contains(EXEMPT) {
-                    let line = src[..idx].lines().count();
-                    missing.push(format!("{name}:{line}"));
+                if block.contains(EXEMPT) {
+                    continue;
+                }
+                for field in ["guardrail_bypassed_reason", "applied_guardrails"] {
+                    if !sets_field(block, field) {
+                        let line = src[..idx].lines().count();
+                        missing.push(format!("{name}:{line} ({field})"));
+                    }
                 }
             }
         }
@@ -1341,10 +1370,10 @@ mod tests {
         );
         assert!(
             missing.is_empty(),
-            "these UsageEvent emitters neither set guardrail_bypassed_reason nor carry a \
+            "these UsageEvent emitters neither set the named field nor carry a \
              `{EXEMPT} <why>` comment saying they have no guardrail chain: {missing:?}\n\
-             An unset field reports a screened request, so an emitter that skips it makes the \
-             field unusable as a negative answer.",
+             An unset field reads as an unguarded request, so an emitter that skips it makes \
+             the field unusable as a negative answer.",
         );
     }
 
@@ -1524,18 +1553,21 @@ mod tests {
         mask
     }
 
-    /// Whether an emitter block ASSIGNS the field, rather than merely
+    /// Whether an emitter block ASSIGNS `field`, rather than merely
     /// mentioning it.
     ///
-    /// `block.contains("guardrail_bypassed_reason")` would be satisfied by
-    /// a comment, and by `guardrail_bypassed_reason: String::new()` — which
-    /// is exactly the shape of a reverted fix, so the check would have been
-    /// unfalsifiable in the one dimension it is here to guard.
-    fn sets_bypass_reason(block: &str) -> bool {
-        let Some(at) = block.find("guardrail_bypassed_reason") else {
+    /// `block.contains(field)` would be satisfied by a comment, and by
+    /// `guardrail_bypassed_reason: String::new()` — which is exactly the
+    /// shape of a reverted fix, so the check would have been unfalsifiable
+    /// in the one dimension it is here to guard.
+    fn sets_field(block: &str, field: &str) -> bool {
+        let Some(at) = block
+            .find(&format!("{field}:"))
+            .or_else(|| block.find(&format!("{field},")))
+        else {
             return false;
         };
-        let rest = &block[at + "guardrail_bypassed_reason".len()..];
+        let rest = &block[at + field.len()..];
         // Field-init shorthand (`guardrail_bypassed_reason,`) takes its
         // value from a binding, which cannot be an inline empty literal.
         let Some(rest) = rest.strip_prefix(':') else {
@@ -1553,7 +1585,12 @@ mod tests {
             .trim();
         !matches!(
             value,
-            "" | "\"\"" | "String::new()" | "String::default()" | "Default::default()"
+            "" | "\"\""
+                | "String::new()"
+                | "String::default()"
+                | "Default::default()"
+                | "Vec::new()"
+                | "vec![]"
         )
     }
 

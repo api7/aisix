@@ -118,19 +118,20 @@ describe("request id e2e: gateway-generated request IDs are UUIDs", () => {
       ctx.skip();
       return;
     }
+    const { proxyUrl } = app;
 
     await waitConfigPropagation(async () => {
       try {
         const [chat, embeddings, messages] = await Promise.all([
-          postJson(app.proxyUrl, "/v1/chat/completions", {
+          postJson(proxyUrl, "/v1/chat/completions", {
             model: "request-id-chat",
             messages: [{ role: "user", content: "ready" }],
           }),
-          postJson(app.proxyUrl, "/v1/embeddings", {
+          postJson(proxyUrl, "/v1/embeddings", {
             model: "request-id-embeddings",
             input: "ready",
           }),
-          postJson(app.proxyUrl, "/v1/messages", {
+          postJson(proxyUrl, "/v1/messages", {
             model: "request-id-messages",
             messages: [{ role: "user", content: "ready" }],
             max_tokens: 16,
@@ -147,19 +148,19 @@ describe("request id e2e: gateway-generated request IDs are UUIDs", () => {
     const messagesBaseline = messagesUpstream.receivedRequests.length;
 
     await expectOk(
-      postJson(app.proxyUrl, "/v1/chat/completions", {
+      postJson(proxyUrl, "/v1/chat/completions", {
         model: "request-id-chat",
         messages: [{ role: "user", content: "hello" }],
       }),
     );
     await expectOk(
-      postJson(app.proxyUrl, "/v1/embeddings", {
+      postJson(proxyUrl, "/v1/embeddings", {
         model: "request-id-embeddings",
         input: "hello",
       }),
     );
     await expectOk(
-      postJson(app.proxyUrl, "/v1/messages", {
+      postJson(proxyUrl, "/v1/messages", {
         model: "request-id-messages",
         messages: [{ role: "user", content: "hello" }],
         max_tokens: 16,

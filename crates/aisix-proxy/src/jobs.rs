@@ -465,6 +465,9 @@ async fn scan_input_blob(
     // The request's fail-open bypass tag, accumulated the same way and
     // for the same reason. First one sticks, matching the chain folds.
     bypass: &mut String,
+    // The applied set. Both scans resolve the same context, so the first
+    // non-empty chain's set is the request's.
+    applied: &mut Vec<aisix_core::AppliedGuardrail>,
 ) -> Result<(), ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
@@ -477,12 +480,16 @@ async fn scan_input_blob(
     if chain.is_empty() {
         return Ok(());
     }
+    if applied.is_empty() {
+        *applied = chain.applied().to_vec();
+    }
     let text = String::from_utf8_lossy(blob);
     let chat = aisix_gateway::ChatFormat::new(
         target.display_name(),
         vec![aisix_gateway::ChatMessage::user(text.into_owned())],
     );
-    let (verdict, hits) = aisix_guardrails::Guardrail::check_input_observed(&chain, &chat).await;
+    let (verdict, hits) =
+        aisix_guardrails::Guardrail::check_input_unmaskable_observed(&chain, &chat).await;
     monitor_hits.extend(hits);
     // Drained BEFORE the block branch: a `blocked` hit is exactly the one
     // that leaves through `Err`, and the caller's `?` would drop it.
@@ -532,6 +539,9 @@ async fn scan_output_blob(
     // The request's fail-open bypass tag, accumulated the same way and
     // for the same reason. First one sticks, matching the chain folds.
     bypass: &mut String,
+    // The applied set. Both scans resolve the same context, so the first
+    // non-empty chain's set is the request's.
+    applied: &mut Vec<aisix_core::AppliedGuardrail>,
 ) -> Result<(), ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
@@ -544,6 +554,9 @@ async fn scan_output_blob(
     if chain.is_empty() {
         return Ok(());
     }
+    if applied.is_empty() {
+        *applied = chain.applied().to_vec();
+    }
     let synth = aisix_gateway::ChatResponse {
         id: String::new(),
         model: target.display_name().to_string(),
@@ -551,7 +564,8 @@ async fn scan_output_blob(
         finish_reason: aisix_gateway::FinishReason::Stop,
         usage: aisix_gateway::UsageStats::default(),
     };
-    let (verdict, hits) = aisix_guardrails::Guardrail::check_output_observed(&chain, &synth).await;
+    let (verdict, hits) =
+        aisix_guardrails::Guardrail::check_output_unmaskable_observed(&chain, &synth).await;
     monitor_hits.extend(hits);
     // See `scan_input_blob`.
     enforced_hits.extend(chain.enforced_hits());
@@ -636,6 +650,7 @@ fn emit_job_usage_event(
     elapsed: Duration,
     client: &ClientContext,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    applied_guardrails: Vec<aisix_core::AppliedGuardrail>,
     // What an ENFORCING guardrail actually did to this request
     // (AISIX-Cloud#1330).
     guardrail_enforced_hits: Vec<aisix_core::GuardrailEnforcedHit>,
@@ -657,6 +672,7 @@ fn emit_job_usage_event(
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         guardrail_monitor_hits,
+        applied_guardrails,
         guardrail_enforced_hits,
         guardrail_scores,
         guardrail_bypassed_reason,
@@ -752,6 +768,7 @@ fn finish(
     enforced_hits: Vec<aisix_core::GuardrailEnforcedHit>,
     scores: Vec<aisix_core::GuardrailScore>,
     bypass: String,
+    applied: Vec<aisix_core::AppliedGuardrail>,
 ) -> Response {
     let elapsed = started.elapsed();
     // `path` carries the real job/file id — bounded route template only.
@@ -792,6 +809,7 @@ fn finish(
                 elapsed,
                 client,
                 monitor_hits,
+                applied,
                 enforced_hits,
                 scores,
                 bypass,
@@ -837,6 +855,7 @@ fn finish(
                 err.kind(),
                 err.is_guardrail_block(),
                 client,
+                applied,
                 enforced_hits,
                 scores,
                 bypass,
@@ -1037,6 +1056,7 @@ pub(crate) async fn create_file(
         Vec::new(),
         Vec::new(),
         String::new(),
+        Vec::new(),
     )
 }
 
@@ -1194,6 +1214,7 @@ pub(crate) async fn create_batch(
     let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
     let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
     let mut bypass = String::new();
+    let mut applied: Vec<aisix_core::AppliedGuardrail> = Vec::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1246,6 +1267,7 @@ pub(crate) async fn create_batch(
             &mut enforced_hits,
             &mut scores,
             &mut bypass,
+            &mut applied,
         )
         .await?;
         let _reservation = crate::quota::enforce(
@@ -1279,6 +1301,7 @@ pub(crate) async fn create_batch(
             &mut enforced_hits,
             &mut scores,
             &mut bypass,
+            &mut applied,
         )
         .await?;
         let model = target.display_name().to_string();
@@ -1304,6 +1327,7 @@ pub(crate) async fn create_batch(
         enforced_hits,
         scores,
         bypass,
+        applied,
     )
 }
 
@@ -1322,6 +1346,7 @@ pub(crate) async fn get_batch(
     let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
     let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
     let mut bypass = String::new();
+    let mut applied: Vec<aisix_core::AppliedGuardrail> = Vec::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1361,6 +1386,7 @@ pub(crate) async fn get_batch(
             &mut enforced_hits,
             &mut scores,
             &mut bypass,
+            &mut applied,
         )
         .await?;
 
@@ -1395,6 +1421,7 @@ pub(crate) async fn get_batch(
         enforced_hits,
         scores,
         bypass,
+        applied,
     )
 }
 
@@ -1492,6 +1519,7 @@ pub(crate) async fn create_ft_job(
     let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
     let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
     let mut bypass = String::new();
+    let mut applied: Vec<aisix_core::AppliedGuardrail> = Vec::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1541,6 +1569,7 @@ pub(crate) async fn create_ft_job(
             &mut enforced_hits,
             &mut scores,
             &mut bypass,
+            &mut applied,
         )
         .await?;
         let _reservation = crate::quota::enforce(
@@ -1574,6 +1603,7 @@ pub(crate) async fn create_ft_job(
             &mut enforced_hits,
             &mut scores,
             &mut bypass,
+            &mut applied,
         )
         .await?;
         let model = target.display_name().to_string();
@@ -1599,6 +1629,7 @@ pub(crate) async fn create_ft_job(
         enforced_hits,
         scores,
         bypass,
+        applied,
     )
 }
 
@@ -1726,6 +1757,7 @@ async fn forward_simple(
     let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
     let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
     let mut bypass = String::new();
+    let mut applied: Vec<aisix_core::AppliedGuardrail> = Vec::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1751,6 +1783,7 @@ async fn forward_simple(
                 &mut enforced_hits,
                 &mut scores,
                 &mut bypass,
+                &mut applied,
             )
             .await?;
         }
@@ -1789,6 +1822,7 @@ async fn forward_simple(
                 &mut enforced_hits,
                 &mut scores,
                 &mut bypass,
+                &mut applied,
             )
             .await?;
         }
@@ -1825,6 +1859,7 @@ async fn forward_simple(
         enforced_hits,
         scores,
         bypass,
+        applied,
     )
 }
 

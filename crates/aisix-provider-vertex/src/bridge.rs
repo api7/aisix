@@ -228,7 +228,7 @@ impl VertexBridge {
                 // the error string — the whole point of rejecting `@` is
                 // that operator-pasted credentials shouldn't appear in
                 // logs. Audit #392 re-audit LOW-1.
-                let redacted = redact_userinfo(b);
+                let redacted = aisix_core::redact_url_userinfo(b);
                 return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "vertex provider_key api_base must not embed userinfo (@); use the request's \
                      Authorization header instead, got {redacted:?}",
@@ -507,35 +507,6 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
         .model_name
         .as_deref()
         .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
-}
-
-/// Redact embedded userinfo from a URL string before echoing it
-/// into an error message. Specifically: `scheme://user:pass@host`
-/// becomes `scheme://<redacted>@host`. Only touches the substring
-/// between `://` and the first `@`; leaves the rest of the URL
-/// intact (including any other `@` in a path component). PR #392
-/// re-audit LOW-1.
-fn redact_userinfo(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_string();
-    };
-    let rest_start = scheme_end + "://".len();
-    let rest = &url[rest_start..];
-    let Some(at_offset) = rest.find('@') else {
-        return url.to_string();
-    };
-    // Don't redact if the `@` is past the first path slash — that's
-    // RFC 3986 path syntax, not userinfo.
-    if let Some(slash_offset) = rest.find('/') {
-        if slash_offset < at_offset {
-            return url.to_string();
-        }
-    }
-    format!(
-        "{}://<redacted>@{}",
-        &url[..scheme_end],
-        &rest[at_offset + 1..],
-    )
 }
 
 /// Wrap a future in the optional deadline. `None` → no timeout.
@@ -1171,9 +1142,21 @@ impl VertexBridge {
             let mut state = StreamState::default();
             let mut byte_stream = Box::pin(byte_stream);
 
-            while let Some(item) = byte_stream.next().await {
-                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-                for event in decoder.feed(bytes.as_ref()) {
+            loop {
+                // At EOF, `finish` flushes a last frame the upstream never
+                // terminated, and reports a frame that outgrew the bound
+                // after the last events were returned.
+                let (events, eof) = match byte_stream.next().await {
+                    Some(item) => {
+                        let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                        (decoder.feed(bytes.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?, false)
+                    }
+                    None => (
+                        decoder.finish().map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?.into_iter().collect(),
+                        true,
+                    ),
+                };
+                for event in events {
                     let SseEvent::Data(data) = event else { continue };
                     let parsed: AnthropicStreamEvent =
                         serde_json::from_str(&data).map_err(|e| {
@@ -1191,6 +1174,9 @@ impl VertexBridge {
                     if StreamState::is_terminal(&parsed) {
                         return;
                     }
+                }
+                if eof {
+                    break;
                 }
             }
         };
@@ -1347,7 +1333,7 @@ impl VertexBridge {
 
             while let Some(item) = byte_stream.next().await {
                 let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-                for event in decoder.feed(bytes.as_ref()) {
+                for event in decoder.feed(bytes.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
                     match event {
                         SseEvent::Data(data) => {
                             let parsed = parse_vertex_openai_stream_payload(
@@ -1364,7 +1350,10 @@ impl VertexBridge {
             }
             // Flush a partial trailing chunk if the connection drops
             // without a final blank line.
-            if let Some(SseEvent::Data(data)) = decoder.finish() {
+            if let Some(SseEvent::Data(data)) = decoder
+                .finish()
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+            {
                 let parsed = parse_vertex_openai_stream_payload(
                     &data,
                     "vertex openai-shim stream tail parse",
@@ -1568,7 +1557,7 @@ impl VertexBridge {
 
             while let Some(item) = byte_stream.next().await {
                 let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-                for event in decoder.feed(bytes.as_ref()) {
+                for event in decoder.feed(bytes.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
                     match event {
                         SseEvent::Data(data) => {
                             let parsed = parse_vertex_openai_stream_payload(
@@ -1583,7 +1572,10 @@ impl VertexBridge {
                     }
                 }
             }
-            if let Some(SseEvent::Data(data)) = decoder.finish() {
+            if let Some(SseEvent::Data(data)) = decoder
+                .finish()
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+            {
                 let parsed = parse_vertex_openai_stream_payload(
                     &data,
                     "vertex partner :streamRawPredict tail parse",
@@ -1695,7 +1687,7 @@ impl VertexBridge {
 
             while let Some(item) = byte_stream.next().await {
                 let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-                for event in decoder.feed(bytes.as_ref()) {
+                for event in decoder.feed(bytes.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
                     if let SseEvent::Data(data) = event {
                         let parsed = parse_vertex_gemini_stream_payload(
                             &data,
@@ -1717,7 +1709,10 @@ impl VertexBridge {
             // cleanly so this rarely fires, but it covers a partial
             // last chunk if the upstream connection drops without a
             // final `\n\n`.
-            if let Some(SseEvent::Data(data)) = decoder.finish() {
+            if let Some(SseEvent::Data(data)) = decoder
+                .finish()
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+            {
                 let parsed = parse_vertex_gemini_stream_payload(
                     &data,
                     "vertex stream tail parse",
@@ -2556,51 +2551,20 @@ mod tests {
                 assert!(msg.contains("userinfo") || msg.contains("@"));
                 // Defense-in-depth: the error message MUST NOT echo
                 // the original userinfo back into log output (re-audit
-                // LOW-1). The redactor replaces `user:secret` with
-                // `<redacted>` so an operator-supplied credential
-                // doesn't propagate into operational telemetry.
+                // LOW-1). The shared redactor replaces `user:secret`
+                // with `***` so an operator-supplied credential doesn't
+                // propagate into operational telemetry.
                 assert!(
                     !msg.contains("user:secret"),
                     "error message leaked operator-supplied userinfo: {msg}"
                 );
                 assert!(
-                    msg.contains("<redacted>"),
+                    msg.contains("https://***@proxy.internal"),
                     "error message should redact userinfo: {msg}"
                 );
             }
             other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn redact_userinfo_strips_user_and_password() {
-        assert_eq!(
-            redact_userinfo("https://user:secret@proxy.internal"),
-            "https://<redacted>@proxy.internal",
-        );
-        assert_eq!(
-            redact_userinfo("http://just-user@host:8001/path"),
-            "http://<redacted>@host:8001/path",
-        );
-    }
-
-    #[test]
-    fn redact_userinfo_leaves_non_userinfo_at_alone() {
-        // `@` past the first path slash is NOT userinfo per RFC 3986.
-        assert_eq!(
-            redact_userinfo("https://proxy.internal/v1@my-namespace"),
-            "https://proxy.internal/v1@my-namespace",
-        );
-        // No scheme → unchanged.
-        assert_eq!(
-            redact_userinfo("proxy.internal@path"),
-            "proxy.internal@path"
-        );
-        // No `@` at all → unchanged.
-        assert_eq!(
-            redact_userinfo("https://proxy.internal/x"),
-            "https://proxy.internal/x"
-        );
     }
 
     #[test]
@@ -5524,6 +5488,47 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             }
         }
         assert!(saw_in_band, "expected typed in-band error");
+    }
+
+    /// A last frame the upstream never terminated is still read, as on the
+    /// native Anthropic bridge.
+    #[tokio::test]
+    async fn chat_anthropic_stream_reads_an_unterminated_last_frame() {
+        let body = "event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}"
+            .to_string();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-3-5-sonnet-v2@20241022"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        let chunks: Vec<_> = bridge
+            .chat_stream(&req, &ctx)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            chunks.last().and_then(|c| c.finish_reason.clone()),
+            Some(aisix_gateway::FinishReason::Stop)
+        );
     }
 
     /// The OpenAI-shim rail probes the same envelope shape.
