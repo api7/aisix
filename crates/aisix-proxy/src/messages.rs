@@ -2986,8 +2986,9 @@ fn build_anthropic_sse_stream(
 /// be: Anthropic's `error.type` is a closed enum in its SDK and carries no
 /// `content_filter` member, so emitting one made the streaming half of
 /// this endpoint disagree with the buffered half AND fail the SDK's typed
-/// parse. No `code` field either — the Anthropic envelope has none, and
-/// the caller reads WHICH guardrail fired from the message.
+/// parse. What tells a refusal apart is `error.code`, the same value the
+/// 422 body carries (`anthropic_guardrail_code`); the caller reads WHICH
+/// guardrail fired from the message.
 fn guardrail_block_frame(guardrail_name: Option<&str>, unavailable: Option<&str>) -> String {
     format!(
         "event: error\ndata: {}\n\n",
@@ -2995,6 +2996,7 @@ fn guardrail_block_frame(guardrail_name: Option<&str>, unavailable: Option<&str>
             "type": "error",
             "error": {
                 "type": "invalid_request_error",
+                "code": crate::error::anthropic_guardrail_code(unavailable),
                 "message": crate::error::guardrail_block_message("response", guardrail_name, unavailable),
             }
         })
@@ -7295,21 +7297,31 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
     /// Anthropic's `error.type` is a closed enum with no `content_filter`
     /// member — so the streaming terminal frame emitting `content_filter`
     /// both disagreed with its own sibling and failed the SDK's typed
-    /// parse. The envelope carries no `code` either; Anthropic's shape has
-    /// none.
+    /// parse. The refusal signal rides on `error.code` instead, on both
+    /// halves (AISIX-Cloud#726).
     #[test]
     fn streaming_block_frame_uses_a_legal_anthropic_error_type() {
-        let frame = super::guardrail_block_frame(Some("gr-block"), None);
-        let payload = frame
-            .strip_prefix("event: error\ndata: ")
-            .and_then(|r| r.strip_suffix("\n\n"))
-            .expect("an SSE error frame labelled `error`");
-        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let parse = |frame: String| -> serde_json::Value {
+            let payload = frame
+                .strip_prefix("event: error\ndata: ")
+                .and_then(|r| r.strip_suffix("\n\n"))
+                .expect("an SSE error frame labelled `error`")
+                .to_owned();
+            serde_json::from_str(&payload).unwrap()
+        };
+        let v = parse(super::guardrail_block_frame(Some("gr-block"), None));
         assert_eq!(v["type"], "error");
         assert_eq!(v["error"]["type"], "invalid_request_error");
         assert!(v["error"]["message"].as_str().unwrap().contains("gr-block"));
-        assert!(v["error"].get("code").is_none());
-        assert_eq!(v["error"].as_object().unwrap().len(), 2);
+        assert_eq!(v["error"]["code"], "content_filter");
+        assert_eq!(v["error"].as_object().unwrap().len(), 3);
+
+        let v = parse(super::guardrail_block_frame(
+            None,
+            Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+        ));
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], "guardrail_unavailable");
 
         // The same value the buffered half renders for this refusal.
         assert_eq!(
