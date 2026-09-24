@@ -26,14 +26,19 @@ import {
 //   - Jina rerank: `usage.total_tokens`
 //   - Cohere rerank: `meta.billed_units.input_tokens`
 //   - DashScope native text rerank: only `usage.total_tokens`
-//   - DashScope native multimodal embedding: `input_tokens` plus a flat
-//     `image_tokens` counted beside it (44 + 64 = 108)
+//   - DashScope native multimodal embedding: a flat `image_tokens` counted
+//     beside `input_tokens` (44 + 64 = 108 = total_tokens)
 //   - DashScope tongyi-embedding-vision: `input_tokens` already includes the
 //     nested `input_tokens_details.image_tokens` breakdown (903, not 1799)
+//   - DashScope native multimodal generation: the flat `image_tokens` is
+//     already inside `input_tokens` (79, not 145), with its cache-hit and
+//     reasoning counts carried through
+//   - DashScope embedding with no `total_tokens`: images beside the text
+//     (5 + 128 = 133)
 //
 // A streamed response to a newly recognised body is metered exactly as any
 // opaque stream: DashScope native frames carry cumulative usage, and the
-// flat-image-token rule is a unary-response rule.
+// total-less-completion prompt rule is a unary-response rule.
 
 const CALLER_PLAINTEXT = "sk-ptr-rerank-ds-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -109,6 +114,42 @@ const CASES: Case[] = [
             total_tokens: 906,
           },
           request_id: "ds-emb-2",
+        },
+      }),
+  },
+  {
+    route: "ptr-ds-mm-gen",
+    prefix: "/ds-mm-gen",
+    upstream: () =>
+      startOpenAiUpstream({
+        nonStreamBody: {
+          output: {
+            choices: [
+              { finish_reason: "stop", message: { role: "assistant", content: [{ text: "a dog" }] } },
+            ],
+          },
+          usage: {
+            input_tokens: 79,
+            image_tokens: 66,
+            input_tokens_details: { image_tokens: 66, text_tokens: 13 },
+            prompt_tokens_details: { cached_tokens: 40 },
+            output_tokens: 14,
+            output_tokens_details: { text_tokens: 8, reasoning_tokens: 6 },
+            total_tokens: 93,
+          },
+          request_id: "ds-gen-1",
+        },
+      }),
+  },
+  {
+    route: "ptr-ds-no-total",
+    prefix: "/ds-no-total",
+    upstream: () =>
+      startOpenAiUpstream({
+        nonStreamBody: {
+          output: { embeddings: [{ index: 0, embedding: [0.5], type: "image" }] },
+          usage: { duration: 0, image_count: 1, image_tokens: 128, input_tokens: 5 },
+          request_id: "ds-emb-3",
         },
       }),
   },
@@ -293,6 +334,48 @@ describe("passthrough route meters rerank and DashScope native bodies", () => {
       model: "tongyi-embedding-vision-plus",
       operation: "passthrough",
     });
+
+    // Multimodal generation counts its flat image tokens INSIDE
+    // input_tokens (79 = 66 image + 13 text), and its cache hit and
+    // reasoning breakdowns reach the event like any other usage report.
+    const generation = await call(
+      "/ds-mm-gen/api/v1/services/aigc/multimodal-generation/generation",
+      {
+        model: "qwen3-vl-plus",
+        input: {
+          messages: [
+            {
+              role: "user",
+              content: [{ image: "https://example.com/c.png" }, { text: "what is this" }],
+            },
+          ],
+        },
+      },
+    );
+    expect(tokens(generation)).toEqual({
+      prompt: 79,
+      completion: 14,
+      model: "qwen3-vl-plus",
+      operation: "passthrough",
+    });
+    expect(Number(generation.get("cached_prompt_tokens"))).toBe(40);
+    expect(Number(generation.get("reasoning_tokens"))).toBe(6);
+
+    // An embedding model that reports no total counts its image tokens
+    // beside the text ones.
+    const noTotal = await call(
+      "/ds-no-total/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
+      {
+        model: "multimodal-embedding-v1",
+        input: { contents: [{ text: "hello" }, { image: "https://example.com/d.png" }] },
+      },
+    );
+    expect(tokens(noTotal)).toEqual({
+      prompt: 133,
+      completion: 0,
+      model: "multimodal-embedding-v1",
+      operation: "passthrough",
+    });
   });
 
   test("a streamed response to a recognised body is metered as an opaque stream", async (ctx) => {
@@ -317,8 +400,8 @@ describe("passthrough route meters rerank and DashScope native bodies", () => {
       },
     );
     // The caller's model attributes the row; the tokens are what an opaque
-    // stream reads from its `usage` objects — the unary image-token rule is
-    // not applied to stream frames.
+    // stream reads from its `usage` objects (`input_tokens`) — the unary
+    // total-less-completion rule (108) is not applied to stream frames.
     expect(tokens(streamed)).toEqual({
       prompt: 44,
       completion: 3,

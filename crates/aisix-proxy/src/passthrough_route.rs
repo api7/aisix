@@ -1490,13 +1490,19 @@ fn response_usage(
 
 /// Token counts from a DashScope native response's top-level `usage`.
 ///
-/// Prompt is `input_tokens` (or `prompt_tokens`) PLUS the flat
-/// `image_tokens`, which the multimodal services report beside the text
-/// count rather than inside it (`{input_tokens: 44, image_tokens: 64,
-/// total_tokens: 108}`). A nested `input_tokens_details.image_tokens` is
-/// the opposite — a breakdown already inside `input_tokens` — and is never
-/// added. With no input-side field at all (native text rerank reports only
-/// `total_tokens`), prompt is `total_tokens` less the completion.
+/// Every dimension the generic reader knows (cache hit, reasoning, …) is
+/// read by [`usage_of`]; only prompt and completion follow DashScope's own
+/// arithmetic. The flat `image_tokens` means different things per service:
+/// multimodal generation counts it inside `input_tokens`
+/// (`{input_tokens: 79, image_tokens: 66, output_tokens: 14,
+/// total_tokens: 93}`), while the multimodal embedding and rerank services
+/// count it beside (`{input_tokens: 44, image_tokens: 64,
+/// total_tokens: 108}`). So `total_tokens` less the completion is the
+/// prompt whenever a total is reported; without one (only some embedding
+/// models omit it, and those report images beside the text), prompt is
+/// `input_tokens` (or `prompt_tokens`) plus the flat `image_tokens`. A
+/// nested `input_tokens_details.image_tokens` is a breakdown already inside
+/// `input_tokens` and is never added.
 fn dashscope_native_usage(usage: &serde_json::Value) -> Option<PassthroughUsage> {
     let num = |k: &str| {
         usage
@@ -1504,20 +1510,24 @@ fn dashscope_native_usage(usage: &serde_json::Value) -> Option<PassthroughUsage>
             .and_then(serde_json::Value::as_u64)
             .map(|n| n.min(u32::MAX as u64) as u32)
     };
-    let input = num("input_tokens").or_else(|| num("prompt_tokens"));
-    let image = num("image_tokens");
     let completion = num("output_tokens").or_else(|| num("completion_tokens"));
-    let prompt = match (input, image) {
-        (None, None) => num("total_tokens").map(|t| t.saturating_sub(completion.unwrap_or(0))),
-        _ => Some(input.unwrap_or(0).saturating_add(image.unwrap_or(0))),
+    let prompt = match num("total_tokens") {
+        Some(total) => Some(total.saturating_sub(completion.unwrap_or(0))),
+        None => {
+            let input = num("input_tokens").or_else(|| num("prompt_tokens"));
+            let image = num("image_tokens");
+            (input.is_some() || image.is_some())
+                .then(|| input.unwrap_or(0).saturating_add(image.unwrap_or(0)))
+        }
     };
-    if prompt.is_none() && completion.is_none() {
+    let generic = usage_of(usage);
+    if prompt.is_none() && completion.is_none() && generic.is_none() {
         return None;
     }
     Some(PassthroughUsage {
         prompt_tokens: prompt.unwrap_or(0),
         completion_tokens: completion.unwrap_or(0),
-        ..PassthroughUsage::default()
+        ..generic.unwrap_or_default()
     })
 }
 
@@ -3681,7 +3691,7 @@ mod tests {
     }
 
     #[test]
-    fn dashscope_native_usage_counts_flat_image_tokens_once() {
+    fn dashscope_native_usage_counts_image_tokens_once() {
         let usage = |b: &[u8]| {
             response_usage(
                 PassthroughProtocol::Raw,
@@ -3689,12 +3699,30 @@ mod tests {
                 b,
             )
         };
+        // Embedding: flat image tokens beside the text count, total reported.
         let flat = br#"{"usage":{"input_tokens":44,"image_tokens":64,"total_tokens":108}}"#;
         assert_eq!(usage(flat), Some(usage_dims(108, 0)));
+        // Generation: flat image tokens already inside input_tokens.
+        let generation = br#"{"usage":{"input_tokens":79,"image_tokens":66,"input_tokens_details":{"image_tokens":66,"text_tokens":13},"output_tokens":14,"total_tokens":93}}"#;
+        assert_eq!(usage(generation), Some(usage_dims(79, 14)));
         let nested = br#"{"usage":{"input_tokens":903,"input_tokens_details":{"image_tokens":896,"text_tokens":7},"output_tokens":3,"total_tokens":906}}"#;
         assert_eq!(usage(nested), Some(usage_dims(903, 3)));
+        // No total: images counted beside the text.
+        let no_total =
+            br#"{"usage":{"duration":0,"image_count":1,"image_tokens":128,"input_tokens":5}}"#;
+        assert_eq!(usage(no_total), Some(usage_dims(133, 0)));
         let total_only = br#"{"output":{"results":[]},"usage":{"total_tokens":29}}"#;
         assert_eq!(usage(total_only), Some(usage_dims(29, 0)));
+        // The generic dimensions ride along.
+        let cached = br#"{"usage":{"input_tokens":120,"output_tokens":30,"total_tokens":150,"prompt_tokens_details":{"cached_tokens":100},"output_tokens_details":{"reasoning_tokens":20}}}"#;
+        assert_eq!(
+            usage(cached),
+            Some(PassthroughUsage {
+                cached_prompt_tokens: 100,
+                reasoning_tokens: 20,
+                ..usage_dims(120, 30)
+            })
+        );
         assert_eq!(usage(br#"{"code":"InvalidParameter","message":"x"}"#), None);
     }
 
