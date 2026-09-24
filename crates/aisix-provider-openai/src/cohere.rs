@@ -5,7 +5,8 @@
 //! `<host>/v1/embeddings` 404). Rerank has no compatible counterpart there
 //! and uses the native `<host>/v2/rerank`. The control plane writes a
 //! Cohere `api_base` in either of two forms — the bare host, or the host
-//! with `/compatibility/v1` — so every route derives its URL from the host
+//! with `/compatibility/v1` — and a key written by hand may carry a native
+//! version (`/v1`, `/v2`), so every route derives its URL from the host
 //! root rather than appending to `api_base` as written.
 //!
 //! <https://docs.cohere.com/docs/compatibility-api>,
@@ -19,12 +20,13 @@ pub fn is_cohere(provider: &str) -> bool {
     provider.trim().eq_ignore_ascii_case("cohere")
 }
 
-/// The host root of a Cohere `api_base`: trailing slashes and the
-/// `/compatibility/v1` suffix removed.
+/// The host root of a Cohere `api_base`: trailing slashes and a
+/// `/compatibility/v1`, `/v1` or `/v2` suffix removed.
 pub fn api_root(base: &str) -> &str {
     let trimmed = base.trim().trim_end_matches('/');
-    trimmed
-        .strip_suffix(COMPATIBILITY_PATH)
+    [COMPATIBILITY_PATH, "/v1", "/v2"]
+        .iter()
+        .find_map(|suffix| trimmed.strip_suffix(suffix))
         .unwrap_or(trimmed)
         .trim_end_matches('/')
 }
@@ -41,6 +43,8 @@ mod tests {
             "https://api.cohere.com/compatibility/v1",
             "https://api.cohere.com/compatibility/v1/",
             " https://api.cohere.com/compatibility/v1 ",
+            "https://api.cohere.com/v1",
+            "https://api.cohere.com/v2/",
         ] {
             assert_eq!(api_root(base), "https://api.cohere.com", "{base:?}");
         }

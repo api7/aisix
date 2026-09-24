@@ -37,8 +37,12 @@ const BODY = {
   usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
 };
 
-type BaseForm = "bare host" | "compatibility base";
-const forms: BaseForm[] = ["bare host", "compatibility base"];
+// The third form is the native versioned base an operator may have set by
+// hand (`https://api.cohere.com/v2`), which rerank used to append to.
+type BaseForm = "bare host" | "compatibility base" | "versioned base";
+const forms: BaseForm[] = ["bare host", "compatibility base", "versioned base"];
+const apiBase = (form: BaseForm, base: string) =>
+  form === "bare host" ? base : form === "compatibility base" ? `${base}/compatibility/v1` : `${base}/v2`;
 
 const routes = [
   {
@@ -87,7 +91,7 @@ describe("Cohere Provider Key upstream URLs", () => {
         secret: "cohere-mock-key",
         provider: "cohere",
         adapter: "openai",
-        api_base: form === "bare host" ? upstream.baseUrl : `${upstream.baseUrl}/compatibility/v1`,
+        api_base: apiBase(form, upstream.baseUrl),
       });
       for (const c of cases.filter((c) => c.form === form)) {
         await seed.createModel({
