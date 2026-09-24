@@ -101,7 +101,9 @@ pub const M_LLM_REQUEST_DURATION: &str = "aisix_llm_request_duration_seconds";
 /// - `downstream`: from the gateway receiving the request to the first
 ///   frame handed to the client — what the caller waited for, including
 ///   all of the above. Recorded only for requests that also record
-///   `upstream`, so both sides count the same requests.
+///   `upstream` and whose stream got a first frame to the client; a
+///   stream refused by an output guardrail, or abandoned by the client,
+///   before that point observes `upstream` only.
 ///
 /// On the two protocol bridges — `/v1/messages` to a non-Anthropic
 /// upstream and `/v1/responses` to a chat-protocol upstream — the
@@ -392,7 +394,9 @@ pub const M_REQUEST_E2E_LATENCY_SECONDS: &str = "aisix_request_e2e_latency_secon
 /// - `downstream`: from the gateway receiving the request to the first
 ///   frame handed to the client — what the caller waited for, including
 ///   all of the above. Recorded only for requests that also record
-///   `upstream`, so both sides count the same requests.
+///   `upstream` and whose stream got a first frame to the client; a
+///   stream refused by an output guardrail, or abandoned by the client,
+///   before that point observes `upstream` only.
 ///
 /// On the two protocol bridges — `/v1/messages` to a non-Anthropic
 /// upstream and `/v1/responses` to a chat-protocol upstream — the
@@ -2202,7 +2206,8 @@ impl Metrics {
     /// Record one streaming request's TTFT on both [`M_REQUEST_TTFT_SECONDS`]
     /// and [`M_LLM_TTFT`]: `upstream` as the `side="upstream"` observation,
     /// and `downstream` as `side="downstream"` — the latter only when the
-    /// upstream one is recorded too, so both sides count the same requests.
+    /// upstream one is recorded too and `downstream` is non-zero (a first
+    /// frame reached the client).
     pub fn record_ttft(&self, labels: LatencyLabels<'_>, upstream: Duration, downstream: Duration) {
         if upstream.is_zero() {
             return;
