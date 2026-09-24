@@ -5798,7 +5798,14 @@ where
                                 break;
                             }
                             if !hold_back {
-                                eos_tool_calls.push(tc, tool_calls_cap);
+                                // Serialized deltas carry their envelope, so
+                                // they get the raw guard's headroom over the
+                                // text cap the buffer above keeps.
+                                eos_tool_calls.push(
+                                    tc,
+                                    tool_calls_cap
+                                        .saturating_mul(crate::held_content::RAW_HOLD_FACTOR),
+                                );
                             }
                             if let Some(f) = tc.get("function") {
                                 if let Some(n) = f.get("name").and_then(|v| v.as_str()) {

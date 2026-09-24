@@ -49,20 +49,28 @@ impl HeldBuffer {
     }
 }
 
-/// JSON values kept up to `cap` serialized bytes; the rest are dropped.
+/// The leading JSON values that fit in `cap` serialized bytes. Once one
+/// does not fit, nothing after it is kept, so the values stay a prefix of
+/// the stream.
 #[derive(Debug, Default)]
 pub(crate) struct BoundedValues {
     values: Vec<Value>,
     bytes: usize,
+    full: bool,
 }
 
 impl BoundedValues {
     pub(crate) fn push(&mut self, v: &Value, cap: usize) {
-        let len = json_len(v);
-        if self.bytes.saturating_add(len) <= cap {
-            self.bytes += len;
-            self.values.push(v.clone());
+        if self.full {
+            return;
         }
+        let len = json_len(v);
+        if self.bytes.saturating_add(len) > cap {
+            self.full = true;
+            return;
+        }
+        self.bytes += len;
+        self.values.push(v.clone());
     }
 
     /// The kept values, or `None` when there are none.
@@ -336,6 +344,16 @@ mod tests {
         }
         assert_eq!(kept.take().map(|v| v.len()), Some(10));
         assert_eq!(kept.take(), None);
+    }
+
+    #[test]
+    fn bounded_values_stay_a_prefix() {
+        let mut kept = BoundedValues::default();
+        // 6 bytes fit, 10 more don't, and the 3 after them would.
+        kept.push(&json!("aaaa"), 10);
+        kept.push(&json!("bbbbbbbb"), 10);
+        kept.push(&json!("c"), 10);
+        assert_eq!(kept.take(), Some(vec![json!("aaaa")]));
     }
 
     #[test]
