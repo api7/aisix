@@ -622,7 +622,7 @@ async fn dispatch(
                 // #554/#911: the per-model E2E request timeout bounds the whole
                 // buffered exchange, like the other direct-upstream paths.
                 let request_budget = timeouts.request;
-                let body_bytes = match {
+                let resp_json = match {
                     let mut req = url
                         .clone()
                         .post_on(&client)
@@ -660,12 +660,27 @@ async fn dispatch(
                                 ),
                             ));
                         }
-                        resp.bytes().await.map_err(|e| {
+                        let body_bytes = resp.bytes().await.map_err(|e| {
                             crate::cooldown::note_failure(
                                 tracker,
                                 model_id,
                                 cooldown_cfg,
                                 aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+                            )
+                        })?;
+                        // The edits response is a JSON object (`{created,
+                        // data, usage?}`) on every documented success; a
+                        // body that doesn't parse is a failed attempt, so
+                        // it neither marks the target healthy nor ends a
+                        // group's failover.
+                        serde_json::from_slice::<Value>(&body_bytes).map_err(|e| {
+                            crate::cooldown::note_failure(
+                                tracker,
+                                model_id,
+                                cooldown_cfg,
+                                aisix_gateway::BridgeError::UpstreamDecode(format!(
+                                    "image edits response is not JSON: {e}"
+                                )),
                             )
                         })
                     }
@@ -676,7 +691,7 @@ async fn dispatch(
                     Err(err) => return Err(ProxyError::Bridge(err)),
                 };
                 Ok((
-                    body_bytes,
+                    resp_json,
                     provider_label,
                     pk_entry.id.to_string(),
                     upstream_model,
@@ -686,7 +701,7 @@ async fn dispatch(
     )
     .await;
     let crate::routing::Dispatched {
-        value: (body_bytes, provider_label, pk_id, upstream_model),
+        value: (resp_json, provider_label, pk_id, upstream_model),
         target,
         member_reservation,
         ..
@@ -703,17 +718,6 @@ async fn dispatch(
     if let Some(member) = member_reservation {
         reservation.merge(member);
     }
-
-    // The edits response is a JSON object (`{created, data, usage?}`) on
-    // every documented success; a body that doesn't parse is an upstream
-    // defect surfaced as 502 rather than relayed as ambiguous bytes.
-    // Parsed BEFORE the health marks below, so a 2xx-with-garbage answer
-    // doesn't record the model healthy on a request the caller sees fail.
-    let resp_json: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
-        ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(format!(
-            "image edits response is not JSON: {e}"
-        )))
-    })?;
 
     state.health.record_success(&target.model.display_name);
     state.runtime_status.mark_healthy(&target.id);
@@ -970,6 +974,53 @@ mod tests {
         let app = build_app(snap);
         let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A 2xx whose body is not JSON is a failed attempt: a Model Group
+    /// fails over to its next target instead of answering 502.
+    #[tokio::test]
+    async fn a_non_json_2xx_fails_over_to_the_next_group_target() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .and(wiremock::matchers::body_string_contains("garbage-upstream"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>not json</html>"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .and(wiremock::matchers::body_string_contains("gpt-image-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        let garbage: Model = serde_json::from_str(&format!(
+            r#"{{"display_name":"edit-garbage","provider":"openai","model_name":"garbage-upstream","provider_key_id":"{PK_ID}"}}"#
+        ))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("m-garbage", garbage, 1));
+        let mut ok = model_entry("edit-ok");
+        ok.id = "m-ok".into();
+        snap.models.insert(ok);
+        let group: Model = serde_json::from_str(
+            r#"{"display_name":"edit-group","routing":{"strategy":"failover","targets":[{"model":"edit-garbage"},{"model":"edit-ok"}],"retries":0,"max_fallbacks":1}}"#,
+        )
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-group", group, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, make_req("edit-group", "add a hat"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["data"][0]["b64_json"].is_string());
     }
 
     /// The alias must NOT reach the upstream — the form's `model` field
