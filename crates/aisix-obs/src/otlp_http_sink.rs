@@ -90,6 +90,11 @@ struct FanOutInner {
     exporters: ExporterPipelines,
     /// Shared HTTP client handed to every sink (connection-pool reuse).
     client: reqwest::Client,
+    /// The published snapshot, once [`OtlpHttpFanOut::reap_on_config_change`]
+    /// runs: a pipeline starts only for an exporter it still holds enabled,
+    /// so a request carrying an older snapshot cannot restart one the reaper
+    /// has stopped.
+    published: std::sync::OnceLock<SnapshotHandle<AisixSnapshot>>,
 }
 
 /// Delivery tuning for otlp exporter pipelines. A short flush keeps a
@@ -133,8 +138,22 @@ impl OtlpHttpFanOut {
                     }
                 },
                 client,
+                published: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// Whether a pipeline may start for exporter `name`: the published
+    /// snapshot still has it enabled (always, before the reaper runs).
+    fn admits(&self, name: &str) -> bool {
+        self.inner.published.get().is_none_or(|snapshot| {
+            snapshot
+                .load()
+                .observability_exporters
+                .entries()
+                .iter()
+                .any(|e| e.value.enabled && e.value.name == name)
+        })
     }
 
     /// Fan one event out to every enabled exporter, dispatched per kind and
@@ -196,20 +215,25 @@ impl OtlpHttpFanOut {
                     let name = exp.name.clone();
                     let endpoint = cfg.endpoint.clone();
                     let headers = cfg.headers.clone();
-                    self.inner
-                        .exporters
-                        .get_or_create(&exp.name, fingerprint, move || {
+                    self.inner.exporters.get_or_create_if(
+                        &exp.name,
+                        fingerprint,
+                        || self.admits(&exp.name),
+                        move || {
                             Arc::new(OtlpSink::new(name, endpoint, headers, client))
                                 as Arc<dyn ObservabilitySink>
-                        })
+                        },
+                    )
                 }
                 ExporterKind::AliyunSls(cfg) => {
                     let fingerprint = fingerprint_sls(cfg);
                     let name = exp.name.clone();
                     let cfg = cfg.clone();
-                    self.inner
-                        .exporters
-                        .get_or_create(&exp.name, fingerprint, move || {
+                    self.inner.exporters.get_or_create_if(
+                        &exp.name,
+                        fingerprint,
+                        || self.admits(&exp.name),
+                        move || {
                             // Resolve the AccessKey from the DP's local env at
                             // build time (the key never rode the kine path).
                             // Missing creds → empty key → SLS 401 surfaces as a
@@ -225,30 +249,36 @@ impl OtlpHttpFanOut {
                                 ak_secret,
                                 client,
                             )) as Arc<dyn ObservabilitySink>
-                        })
+                        },
+                    )
                 }
                 ExporterKind::ObjectStore(cfg) => {
                     let fingerprint = fingerprint_object_store(cfg);
                     let name = exp.name.clone();
                     let cfg = cfg.clone();
-                    self.inner
-                        .exporters
-                        .get_or_create(&exp.name, fingerprint, move || {
+                    self.inner.exporters.get_or_create_if(
+                        &exp.name,
+                        fingerprint,
+                        || self.admits(&exp.name),
+                        move || {
                             // Resolve cloud creds from the DP's local env and
                             // build the backend at build time. Missing creds or
                             // an un-buildable backend yield a sink that reports
                             // the reason via delivery health (never a silent
                             // drop) — mirroring the SLS path.
                             build_object_store_sink(name, &cfg)
-                        })
+                        },
+                    )
                 }
                 ExporterKind::Datadog(cfg) => {
                     let fingerprint = fingerprint_datadog(cfg);
                     let name = exp.name.clone();
                     let cfg = cfg.clone();
-                    self.inner
-                        .exporters
-                        .get_or_create(&exp.name, fingerprint, move || {
+                    self.inner.exporters.get_or_create_if(
+                        &exp.name,
+                        fingerprint,
+                        || self.admits(&exp.name),
+                        move || {
                             // Resolve the Datadog API key from the DP's local
                             // env at build time (the key never rode the kine
                             // path). Missing key → empty → Datadog 403 surfaces
@@ -265,9 +295,14 @@ impl OtlpHttpFanOut {
                                 &cfg.service,
                                 client,
                             )) as Arc<dyn ObservabilitySink>
-                        })
+                        },
+                    )
                 }
             };
+
+            // The exporter left the published snapshot after this request
+            // loaded its own: its pipeline stays stopped.
+            let Some(handle) = handle else { continue };
 
             // A content-bearing record for an SLS exporter that opted into
             // full capture (and only when the handler captured content); the
@@ -304,6 +339,7 @@ impl OtlpHttpFanOut {
         snapshot: SnapshotHandle<AisixSnapshot>,
         mut cancel: tokio::sync::watch::Receiver<bool>,
     ) {
+        let _ = self.inner.published.set(snapshot.clone());
         let mut published = snapshot.subscribe();
         let mut reaped = None;
         loop {
@@ -2529,6 +2565,15 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(f.exporter_stats().contains_key("keep"));
+
+        // A request that loaded the snapshot before the publish emits after
+        // the reap: the removed exporters' pipelines stay stopped.
+        f.fan_out(&sample_event(), None, None, live.iter().map(|e| &e.value));
+        assert_eq!(
+            f.exporter_stats().into_keys().collect::<Vec<_>>(),
+            ["keep"],
+            "a stale snapshot restarted a reaped pipeline"
+        );
 
         cancel_tx.send(true).unwrap();
         reaper.await.unwrap();
