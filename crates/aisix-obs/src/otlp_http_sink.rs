@@ -846,7 +846,7 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
     ));
     attributes.push(attr_int(
         "gen_ai.usage.output_tokens",
-        event.completion_tokens as i64,
+        event.genai_output_tokens() as i64,
     ));
     attributes.push(attr_int(
         "http.response.status_code",
@@ -1807,6 +1807,41 @@ mod tests {
             content_capture_cap([&otlp_exp("ot", "metadata_only", 4096)]),
             None
         );
+    }
+
+    /// GenAI `output_tokens` includes reasoning. A record that counts its
+    /// reasoning beside the completion (Gemini thoughts) exports the sum;
+    /// one that counts it inside (OpenAI) exports the completion as is.
+    #[test]
+    fn output_tokens_include_reasoning_counted_beside_the_completion() {
+        let output = |event: UsageEvent| {
+            let body = build_otlp_traces_payload(&event, "test-exp");
+            let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+                .as_array()
+                .unwrap()
+                .clone();
+            attrs
+                .iter()
+                .find(|a| a["key"] == "gen_ai.usage.output_tokens")
+                .expect("output tokens exported")["value"]["intValue"]
+                .clone()
+        };
+        let gemini = UsageEvent {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            reasoning_tokens: 30,
+            total_tokens: 150,
+            ..sample_event()
+        };
+        assert_eq!(output(gemini), serde_json::json!("50"));
+        let openai = UsageEvent {
+            prompt_tokens: 40,
+            completion_tokens: 25,
+            reasoning_tokens: 10,
+            total_tokens: 65,
+            ..sample_event()
+        };
+        assert_eq!(output(openai), serde_json::json!("25"));
     }
 
     #[test]

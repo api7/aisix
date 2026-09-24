@@ -775,6 +775,33 @@ fn is_zero_u32(n: &u32) -> bool {
     *n == 0
 }
 
+impl UsageEvent {
+    /// Whether this record counts its reasoning BESIDE its completion rather
+    /// than inside it — the control plane's additive-billing rule, stated
+    /// once here so every exporter reads the record the way billing does:
+    /// an upstream total that equals `prompt + completion + reasoning` and
+    /// not `prompt + completion`.
+    pub fn reasoning_beside_completion(&self) -> bool {
+        let pc = u64::from(self.prompt_tokens) + u64::from(self.completion_tokens);
+        let total = u64::from(self.total_tokens);
+        total > 0
+            && self.reasoning_tokens > 0
+            && pc + u64::from(self.reasoning_tokens) == total
+            && pc != total
+    }
+
+    /// OTel GenAI `gen_ai.usage.output_tokens`, which includes reasoning.
+    /// The record keeps the upstream's own completion count; exporters that
+    /// speak the GenAI convention report through this instead.
+    pub fn genai_output_tokens(&self) -> u32 {
+        if self.reasoning_beside_completion() {
+            self.completion_tokens.saturating_add(self.reasoning_tokens)
+        } else {
+            self.completion_tokens
+        }
+    }
+}
+
 #[inline]
 fn is_false(b: &bool) -> bool {
     !*b
@@ -991,6 +1018,59 @@ impl UsageSink {
 
 #[cfg(test)]
 mod tests {
+    /// A Gemini thinking call whose thoughts sit beside the candidates.
+    fn gemini_additive() -> UsageEvent {
+        UsageEvent {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            reasoning_tokens: 30,
+            total_tokens: 150,
+            ..UsageEvent::default()
+        }
+    }
+
+    /// The exported GenAI output count follows the control plane's additive
+    /// rule and nothing looser: only a total that equals prompt + completion
+    /// + reasoning (and not prompt + completion) adds the reasoning.
+    #[test]
+    fn genai_output_tokens_add_reasoning_only_when_it_sits_beside_completion() {
+        let additive = gemini_additive();
+        assert!(additive.reasoning_beside_completion());
+        assert_eq!(additive.genai_output_tokens(), 50);
+
+        // OpenAI shape: reasoning inside the completion.
+        let inclusive = UsageEvent {
+            prompt_tokens: 40,
+            completion_tokens: 25,
+            reasoning_tokens: 10,
+            total_tokens: 65,
+            ..UsageEvent::default()
+        };
+        assert_eq!(inclusive.genai_output_tokens(), 25);
+
+        // No upstream total: nothing says the reasoning is beside.
+        let no_total = UsageEvent {
+            total_tokens: 0,
+            ..gemini_additive()
+        };
+        assert_eq!(no_total.genai_output_tokens(), 20);
+
+        // No reasoning: prompt + completion == total, nothing to add.
+        let plain = UsageEvent {
+            prompt_tokens: 7,
+            completion_tokens: 3,
+            total_tokens: 10,
+            ..UsageEvent::default()
+        };
+        assert_eq!(plain.genai_output_tokens(), 3);
+
+        // The record itself stays raw.
+        let wire = serde_json::to_value(gemini_additive()).unwrap();
+        assert_eq!(wire["completion_tokens"], 20);
+        assert_eq!(wire["reasoning_tokens"], 30);
+        assert_eq!(wire["total_tokens"], 150);
+    }
+
     use super::*;
 
     #[test]
