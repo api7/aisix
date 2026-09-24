@@ -124,6 +124,13 @@ fn declared_messages_base(ctx: &BridgeContext) -> &str {
         .unwrap_or("")
 }
 
+/// The verbatim `/v1/messages` and `count_tokens` passthrough builds its
+/// URL without this bridge, through `resolve_base_url_for` in
+/// `aisix-proxy`'s dispatch module; its `falls_back_to_anthropic_default`
+/// states this same fallback plus the `adapter: anthropic` check dispatch
+/// applies before an empty-vendor key reaches this bridge. Change the two
+/// together, or the translated and the verbatim path send one key to two
+/// different hosts.
 fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
     // A Provider Key that declares `apis.messages` names where the
     // Anthropic wire lives on this upstream, which is where this bridge

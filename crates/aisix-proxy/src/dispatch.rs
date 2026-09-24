@@ -320,7 +320,9 @@ fn strip_endpoint_suffix(base: &str) -> &str {
 /// this resolver also serves the Anthropic-wire routes (messages /
 /// count_tokens) and must never send another vendor's credential to
 /// api.openai.com, and the DP does not enumerate per-vendor default
-/// URLs. A key misdeclared as `provider: "openai"` on an
+/// URLs; the Anthropic default for the Anthropic-wire routes is applied
+/// one level up, in [`resolve_base_url_for`]. A key misdeclared as
+/// `provider: "openai"` on an
 /// anthropic-adapter path dispatches to api.openai.com and gets the
 /// upstream's 401 instead of a gateway 400 — by declaration that secret
 /// is an OpenAI credential, so nothing crosses vendors.
@@ -472,7 +474,11 @@ pub(crate) fn pk_url_fingerprint(provider_key: &ProviderKey) -> [&str; 3] {
 }
 
 /// The base URL for one API surface: the `apis` entry's own `base` when
-/// the Provider Key declares one, else [`resolve_base_url`].
+/// the Provider Key declares one, else [`resolve_base_url`] — except
+/// that on `Messages` a key [`falls_back_to_anthropic_default`] names,
+/// with no `api_base`, gets the Anthropic default base: this is the
+/// Anthropic wire, so the wire-agnostic resolver's OpenAI default does
+/// not apply to it.
 ///
 /// This is what lets a single upstream account serve two protocols from
 /// two paths — `…/v1` for the OpenAI wire and `…/anthropic` for the
@@ -484,8 +490,34 @@ pub(crate) fn resolve_base_url_for(
 ) -> Result<String, ProxyError> {
     match surface_base(provider_key, surface) {
         Some(base) => Ok(strip_endpoint_suffix(base.trim()).to_string()),
+        None if surface == ApiSurface::Messages
+            && provider_key
+                .api_base
+                .as_deref()
+                .is_none_or(|b| b.trim().is_empty())
+            && falls_back_to_anthropic_default(provider_key) =>
+        {
+            Ok(aisix_provider_anthropic::ANTHROPIC_DEFAULT_BASE.to_string())
+        }
         None => resolve_base_url(provider_key),
     }
+}
+
+/// Whether a key with no `api_base` reaches the built-in Anthropic base
+/// on the Anthropic-wire routes: the `anthropic` vendor, or the legacy
+/// empty-vendor row on the `anthropic` adapter.
+///
+/// The Anthropic counterpart of [`falls_back_to_openai_default`], and
+/// for the same reason: it is `AnthropicBridge`'s own fallback
+/// (`resolve_base` in `aisix-provider-anthropic`, which falls back for
+/// an empty or `anthropic` vendor) restricted to the keys two-tier
+/// dispatch hands that bridge — the `anthropic` vendor through its
+/// specialized registration, an empty vendor only through the
+/// `adapter: anthropic` family one. Change the two together.
+fn falls_back_to_anthropic_default(provider_key: &ProviderKey) -> bool {
+    let vendor = provider_key.provider.trim();
+    vendor.eq_ignore_ascii_case("anthropic")
+        || (vendor.is_empty() && provider_key.adapter == Some(aisix_core::Adapter::Anthropic))
 }
 
 /// The raw per-surface `base` override, if this key declares a non-empty
@@ -1230,14 +1262,64 @@ mod tests {
             let url = aisix_gateway::url_cache::cached_endpoint_url(
                 resource_id,
                 "test/1019-fingerprint",
-                &pk_surface_url_fingerprint(surface_pk, ApiSurface::Messages),
+                &pk_url_fingerprint(surface_pk),
                 || {
-                    let base = resolve_base_url_for(surface_pk, ApiSurface::Messages)?;
-                    Ok::<_, ProxyError>(build_anthropic_url(&base, "/messages"))
+                    let base = resolve_base_url(surface_pk)?;
+                    Ok::<_, ProxyError>(build_openai_url(&base, "/responses"))
                 },
             );
             assert_eq!(url.is_ok(), expect_ok, "adapter edit must rebuild the URL");
         }
+    }
+
+    /// The Anthropic counterpart of #1019: a key the Anthropic bridge
+    /// sends to its default base on chat resolves to the same base on the
+    /// verbatim Anthropic-wire routes, and only on those.
+    #[test]
+    fn resolve_base_url_for_messages_falls_back_to_anthropic_default() {
+        for doc in [
+            r#"{"display_name":"x","secret":"k","provider":"anthropic","adapter":"anthropic"}"#,
+            r#"{"display_name":"x","secret":"k","provider":" Anthropic "}"#,
+            r#"{"display_name":"x","secret":"k","provider":"","adapter":"anthropic","api_base":" "}"#,
+            r#"{"display_name":"x","secret":"k","provider":"anthropic","apis":{"messages":{}}}"#,
+        ] {
+            let pk: ProviderKey = serde_json::from_str(doc).unwrap();
+            assert_eq!(
+                resolve_base_url_for(&pk, ApiSurface::Messages).unwrap(),
+                aisix_provider_anthropic::ANTHROPIC_DEFAULT_BASE,
+                "{doc}"
+            );
+            assert!(
+                resolve_base_url_for(&pk, ApiSurface::Responses).is_err(),
+                "the Anthropic default is not an OpenAI-wire base: {doc}"
+            );
+        }
+    }
+
+    /// Everything else keeps its existing answer on the Anthropic wire:
+    /// an OpenAI-compatible or unknown vendor still requires `api_base`,
+    /// an empty vendor on another adapter too, and a configured base wins.
+    #[test]
+    fn resolve_base_url_for_messages_keeps_non_anthropic_keys() {
+        for doc in [
+            r#"{"display_name":"x","secret":"k","provider":"deepseek","adapter":"anthropic"}"#,
+            r#"{"display_name":"x","secret":"k","provider":"","adapter":"bedrock"}"#,
+            r#"{"display_name":"x","secret":"k","provider":""}"#,
+        ] {
+            let pk: ProviderKey = serde_json::from_str(doc).unwrap();
+            assert!(
+                resolve_base_url_for(&pk, ApiSurface::Messages).is_err(),
+                "{doc}"
+            );
+        }
+        let pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"x","secret":"k","provider":"anthropic","api_base":"https://proxy.example.com/"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_base_url_for(&pk, ApiSurface::Messages).unwrap(),
+            "https://proxy.example.com"
+        );
     }
 
     /// The vendor match is trim + case-insensitive (operator-typed
