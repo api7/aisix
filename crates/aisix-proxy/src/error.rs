@@ -660,12 +660,25 @@ impl ProxyError {
 ///
 /// **`UpstreamWire::Unknown`** (cooldown fixtures / synthesised
 /// errors): legacy generic envelope.
+///
+/// An upstream that answers with no usable message (an empty body, or an
+/// envelope whose `message` is blank) is named by its status and reason
+/// phrase instead, so the caller never receives an empty `error.message`.
+/// Response headers are deliberately not echoed: a redirect's `Location`
+/// names a host the operator never configured.
 fn render_bridge_upstream_envelope(
     status: u16,
     message: &str,
     parsed: Option<&aisix_gateway::UpstreamErrorView>,
     wire: aisix_gateway::UpstreamWire,
 ) -> ErrorEnvelope {
+    let status_message;
+    let message = if message.trim().is_empty() {
+        status_message = upstream_status_message(status);
+        status_message.as_str()
+    } else {
+        message
+    };
     let is_4xx = (400..500).contains(&status);
     if is_4xx && !matches!(wire, aisix_gateway::UpstreamWire::Unknown) {
         return ErrorEnvelope {
@@ -681,6 +694,16 @@ fn render_bridge_upstream_envelope(
         message.to_string()
     };
     ErrorEnvelope::new(safe_message, "upstream_error")
+}
+
+fn upstream_status_message(status: u16) -> String {
+    match StatusCode::from_u16(status)
+        .ok()
+        .and_then(|s| s.canonical_reason())
+    {
+        Some(reason) => format!("upstream returned {status} {reason}"),
+        None => format!("upstream returned {status}"),
+    }
 }
 
 /// Auth-failure classification attached to the response as an extension

@@ -28,8 +28,13 @@ export interface OpenAiUpstreamOptions {
   eventDelayMs?: number;
   /** Status code to return (default 200). */
   status?: number;
-  /** Body to return when `status` >= 400. */
+  /** Body to return when `status` >= 300. */
   errorBody?: unknown;
+  /**
+   * Error body written VERBATIM instead of JSON-encoding `errorBody` — an
+   * empty string reproduces an upstream that answers with no body at all.
+   */
+  rawErrorBody?: string;
   /**
    * Content-Type for the error body (default `application/json`). Lets
    * tests reproduce upstreams / edge layers that return a JSON error
@@ -86,6 +91,8 @@ export interface OpenAiUpstreamStep {
   eventDelayMs?: number;
   status?: number;
   errorBody?: unknown;
+  /** See `OpenAiUpstreamOptions.rawErrorBody`. */
+  rawErrorBody?: string;
   /** Content-Type for the error body (default `application/json`). See #543. */
   errorContentType?: string;
   disconnectAfterEvents?: number;
@@ -172,8 +179,12 @@ export async function startOpenAiUpstream(
       }
 
       const status = step.status ?? 200;
-      if (status >= 400) {
+      if (status >= 300) {
         res.statusCode = status;
+        if (step.rawErrorBody !== undefined) {
+          res.end(step.rawErrorBody);
+          return;
+        }
         res.setHeader(
           "content-type",
           step.errorContentType ?? opts.errorContentType ?? "application/json",
