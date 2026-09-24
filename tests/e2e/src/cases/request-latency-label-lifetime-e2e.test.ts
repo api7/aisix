@@ -183,12 +183,14 @@ describe("request latency labels survive buffering and configuration reloads", (
     await expect.poll(async () => sumMetric(await scrapeMetrics(app.metricsUrl), `${E2E}_count`)).toBe(contexts.length);
     const samples = await scrapeMetrics(app.metricsUrl);
     for (const [index, context] of contexts.entries()) {
-      for (const metric of [E2E, TTFT]) {
+      // TTFT observes each request once per `side`; both keep the labels.
+      for (const [metric, side] of [[E2E, undefined], [TTFT, "upstream"], [TTFT, "downstream"]] as const) {
         expect(sumMetric(samples, `${metric}_count`, {
           endpoint: `/v1/${context.endpoint}`, model: allowed[index],
           upstream_model: context.provider === "ensemble" ? "unknown" : "*", streaming: "true",
           api_key_id: apiKey.id, team_id: "original-team", user_id: "original-user", user_name: "Original User",
-        }), `${metric} ${context.endpoint} ${context.provider}`).toBe(1);
+          ...(side ? { side } : {}),
+        }), `${metric} ${side ?? ""} ${context.endpoint} ${context.provider}`).toBe(1);
       }
     }
     expect(samples.filter((s) => s.name.startsWith(`${E2E}_`)).every((s) =>

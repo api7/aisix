@@ -436,7 +436,7 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
             model: STREAM_MODEL,
             streaming: "true",
           }) ===
-          1
+          2
       ) {
         break;
       }
@@ -457,33 +457,38 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
         metricValue(before, "aisix_llm_total_tokens_total", labels),
     ).toBe(AGGREGATE.total);
 
-    const lowCardLabels = {
-      endpoint: "/v1/chat/completions",
-      provider: "ensemble",
-      model: STREAM_MODEL,
-      streaming: "true",
-    };
-    expect(
-      metricValue(after, "aisix_request_ttft_seconds_count", lowCardLabels) -
-        metricValue(before, "aisix_request_ttft_seconds_count", lowCardLabels),
-    ).toBe(1);
-    expect(
-      metricValue(after, "aisix_request_ttft_seconds_sum", lowCardLabels) -
-        metricValue(before, "aisix_request_ttft_seconds_sum", lowCardLabels),
-    ).toBeGreaterThan(0);
-    const detailedLabels = {
-      ...labels,
-      inbound_protocol: "openai",
-      upstream_protocol: "unknown",
-    };
-    expect(
-      metricValue(after, "aisix_llm_time_to_first_token_seconds_count", detailedLabels) -
-        metricValue(before, "aisix_llm_time_to_first_token_seconds_count", detailedLabels),
-    ).toBe(1);
-    expect(
-      metricValue(after, "aisix_llm_time_to_first_token_seconds_sum", detailedLabels) -
-        metricValue(before, "aisix_llm_time_to_first_token_seconds_sum", detailedLabels),
-    ).toBeGreaterThan(0);
+    // One observation per `side`.
+    for (const side of ["upstream", "downstream"]) {
+      const lowCardLabels = {
+        endpoint: "/v1/chat/completions",
+        provider: "ensemble",
+        model: STREAM_MODEL,
+        streaming: "true",
+        side,
+      };
+      expect(
+        metricValue(after, "aisix_request_ttft_seconds_count", lowCardLabels) -
+          metricValue(before, "aisix_request_ttft_seconds_count", lowCardLabels),
+      ).toBe(1);
+      expect(
+        metricValue(after, "aisix_request_ttft_seconds_sum", lowCardLabels) -
+          metricValue(before, "aisix_request_ttft_seconds_sum", lowCardLabels),
+      ).toBeGreaterThan(0);
+      const detailedLabels = {
+        ...labels,
+        inbound_protocol: "openai",
+        upstream_protocol: "unknown",
+        side,
+      };
+      expect(
+        metricValue(after, "aisix_llm_time_to_first_token_seconds_count", detailedLabels) -
+          metricValue(before, "aisix_llm_time_to_first_token_seconds_count", detailedLabels),
+      ).toBe(1);
+      expect(
+        metricValue(after, "aisix_llm_time_to_first_token_seconds_sum", detailedLabels) -
+          metricValue(before, "aisix_llm_time_to_first_token_seconds_sum", detailedLabels),
+      ).toBeGreaterThan(0);
+    }
   });
 
   test("locally estimated subcalls contribute to non-streaming and streaming aggregates", async (ctx) => {

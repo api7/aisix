@@ -75,6 +75,7 @@ pub static METRIC_VARIABLES: &[MetricVariable] = &[
     variable!("agent", "The registered A2A agent name."),
     variable!("state", "The A2A task state reported by the upstream agent."),
     variable!("hash", "The hash of the applied gateway resource configuration."),
+    variable!("side", "Which interval a time-to-first-token observation measures: upstream (attempt start to the upstream's first frame) or downstream (request received to the first frame handed to the client). Always emitted on the metrics that carry it; it cannot be removed by a label selection."),
 ];
 
 #[derive(Debug)]
@@ -83,6 +84,11 @@ pub struct MetricDefinition {
     pub default_labels: &'static [&'static str],
     pub extra_labels: &'static [&'static str],
     pub required_labels: &'static [&'static str],
+    /// Emitted whatever the configured selection lists. For a label whose
+    /// values are different measurements rather than slices of one, so
+    /// dropping it would merge them into a single series. Unlike
+    /// `required_labels`, a selection that omits it is still accepted.
+    pub always_labels: &'static [&'static str],
 }
 
 impl MetricDefinition {
@@ -90,6 +96,7 @@ impl MetricDefinition {
         label == "env_id"
             || self.default_labels.contains(&label)
             || self.extra_labels.contains(&label)
+            || self.always_labels.contains(&label)
     }
 }
 
@@ -151,6 +158,7 @@ const LATENCY: &[&str] = &[
     "streaming",
 ];
 const DEPLOYMENT: &[&str] = &["provider", "model", "upstream_model", "provider_key_id"];
+const TTFT_ALWAYS: &[&str] = &["side"];
 const BUDGET: &[&str] = &["api_key_id", "team_id", "user_id", "user_name"];
 
 macro_rules! metric {
@@ -160,6 +168,7 @@ macro_rules! metric {
             default_labels: $defaults,
             extra_labels: &[],
             required_labels: &[],
+            always_labels: &[],
         }
     };
     ($name:ident, $defaults:expr, extra = $extra:expr) => {
@@ -168,6 +177,7 @@ macro_rules! metric {
             default_labels: $defaults,
             extra_labels: $extra,
             required_labels: &[],
+            always_labels: &[],
         }
     };
     ($name:ident, $defaults:expr, required = $required:expr) => {
@@ -176,6 +186,25 @@ macro_rules! metric {
             default_labels: $defaults,
             extra_labels: &[],
             required_labels: $required,
+            always_labels: &[],
+        }
+    };
+    ($name:ident, $defaults:expr, always = $always:expr) => {
+        MetricDefinition {
+            name: $name,
+            default_labels: $defaults,
+            extra_labels: &[],
+            required_labels: &[],
+            always_labels: $always,
+        }
+    };
+    ($name:ident, $defaults:expr, extra = $extra:expr, always = $always:expr) => {
+        MetricDefinition {
+            name: $name,
+            default_labels: $defaults,
+            extra_labels: $extra,
+            required_labels: &[],
+            always_labels: $always,
         }
     };
 }
@@ -201,7 +230,7 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         REQUEST_DURATION,
         extra = &["is_fallback"]
     ),
-    metric!(M_LLM_TTFT, USAGE),
+    metric!(M_LLM_TTFT, USAGE, always = TTFT_ALWAYS),
     metric!(
         M_LLM_TOKENS_BY_CLIENT_TOTAL,
         &["client_type", "model", "token_type"]
@@ -303,7 +332,12 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
     metric!(M_OTLP_FANOUT_DROPS_TOTAL, &["exporter", "reason"]),
     metric!(M_OTLP_FANOUT_FAILURES_TOTAL, &["exporter"]),
     metric!(M_REQUEST_E2E_LATENCY_SECONDS, LATENCY, extra = USAGE),
-    metric!(M_REQUEST_TTFT_SECONDS, LATENCY, extra = USAGE),
+    metric!(
+        M_REQUEST_TTFT_SECONDS,
+        LATENCY,
+        extra = USAGE,
+        always = TTFT_ALWAYS
+    ),
     metric!(M_A2A_REQUESTS_TOTAL, &["agent", "operation", "status"]),
     metric!(M_A2A_TTFB_SECONDS, &["agent", "operation"]),
     metric!(M_A2A_STREAM_EVENTS_TOTAL, &["agent", "operation"]),
@@ -392,6 +426,16 @@ impl LabelSelection {
             })
             .collect();
         labels.extend(config.clone());
+        for metric in METRIC_DEFINITIONS {
+            let selected = labels
+                .get_mut(metric.name)
+                .expect("every metric has a selection");
+            for always in metric.always_labels {
+                if !selected.iter().any(|label| label == always) {
+                    selected.push((*always).to_owned());
+                }
+            }
+        }
         Ok(Self { labels })
     }
 
@@ -589,6 +633,7 @@ mod tests {
                     },
                     ..Default::default()
                 },
+                TtftSide::Upstream,
                 Duration::from_millis(ms),
             );
         }
@@ -621,6 +666,56 @@ mod tests {
                     && line.ends_with(" 1")),
             "{out}"
         );
+    }
+
+    #[test]
+    fn ttft_side_is_kept_by_every_label_selection() {
+        let selections: [&[&str]; 3] = [&[], &["provider_key_name"], &["side", "model"]];
+        for labels in selections {
+            let config = BTreeMap::from([
+                (
+                    M_REQUEST_TTFT_SECONDS.to_owned(),
+                    labels.iter().map(|l| (*l).to_owned()).collect(),
+                ),
+                (
+                    M_LLM_TTFT.to_owned(),
+                    labels.iter().map(|l| (*l).to_owned()).collect(),
+                ),
+            ]);
+            let metrics =
+                Metrics::new_with_labels("env", &HistogramBuckets::default(), &config).unwrap();
+            let latency = LatencyLabels {
+                streaming: true,
+                ..Default::default()
+            };
+            metrics.record_ttft(
+                latency,
+                Duration::from_millis(100),
+                Duration::from_millis(300),
+            );
+            // No downstream stamp: only the upstream side observes.
+            metrics.record_ttft(latency, Duration::from_millis(100), Duration::ZERO);
+            // No upstream stamp: neither side observes.
+            metrics.record_ttft(latency, Duration::ZERO, Duration::from_millis(300));
+            let out = metrics.render();
+            for name in [
+                "aisix_request_ttft_seconds_count",
+                "aisix_llm_time_to_first_token_seconds_count",
+            ] {
+                let rows = sample(&out, name);
+                assert_eq!(rows.len(), 2, "{labels:?}: {out}");
+                assert!(
+                    rows.iter()
+                        .any(|l| l.contains("side=\"upstream\"") && l.ends_with(" 2")),
+                    "{labels:?}: {out}"
+                );
+                assert!(
+                    rows.iter()
+                        .any(|l| l.contains("side=\"downstream\"") && l.ends_with(" 1")),
+                    "{labels:?}: {out}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -701,7 +796,12 @@ mod tests {
             .collect();
         assert_eq!(variables.len(), METRIC_VARIABLES.len());
         for metric in METRIC_DEFINITIONS {
-            for label in metric.default_labels.iter().chain(metric.extra_labels) {
+            for label in metric
+                .default_labels
+                .iter()
+                .chain(metric.extra_labels)
+                .chain(metric.always_labels)
+            {
                 assert!(
                     variables.contains(label),
                     "{} uses undocumented {label}",

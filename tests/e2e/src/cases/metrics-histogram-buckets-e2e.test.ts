@@ -50,6 +50,8 @@ function edgesOf(body: string, series: string): string[] {
   return body
     .split("\n")
     .filter((l) => l.startsWith(`${series}_bucket{`))
+    // TTFT carries one series per `side` with the same edges; read one.
+    .filter((l) => series !== TTFT_SERIES || l.includes('side="upstream"'))
     .map((l) => l.match(/le="([^"]+)"/)?.[1])
     .filter((le): le is string => le !== undefined);
 }

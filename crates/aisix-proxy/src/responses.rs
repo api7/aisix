@@ -3699,7 +3699,7 @@ fn emit_usage_event(
         let (bounded_model, bounded_upstream) =
             crate::usage_attr::metric_model_label_pair(snap, metric_model, upstream_model);
         let ttft = Duration::from_millis(u64::from(usage.upstream_ttft_ms));
-        state.metrics.record_request_ttft(
+        state.metrics.record_ttft(
             LatencyLabels {
                 endpoint: "/v1/responses",
                 model: bounded_model.as_ref(),
@@ -3722,23 +3722,7 @@ fn emit_usage_event(
                 },
             },
             ttft,
-        );
-        state.metrics.record_time_to_first_token(
-            UsageLabels {
-                endpoint: "/v1/responses",
-                inbound_protocol: "openai",
-                upstream_protocol: pk.labels().protocol(),
-                provider,
-                model: bounded_model.as_ref(),
-                upstream_model: bounded_upstream.as_ref(),
-                provider_key_id: pk.labels().id(),
-                provider_key_name: pk.labels().name(),
-                api_key_id: caller.api_key_id,
-                team_id: caller.team_id,
-                user_id: caller.user_id,
-                user_name: caller.user_name,
-            },
-            ttft,
+            Duration::from_millis(u64::from(usage.downstream_latency_ms)),
         );
     }
 }

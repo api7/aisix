@@ -89,6 +89,27 @@ pub const M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL: &str =
     "aisix_llm_cache_creation_input_tokens_total";
 pub const M_LLM_REQUESTS_TOTAL: &str = "aisix_llm_requests_total";
 pub const M_LLM_REQUEST_DURATION: &str = "aisix_llm_request_duration_seconds";
+/// Time-to-first-token for streaming requests, sliced by the per-key
+/// `aisix_llm_*` label set (summary).
+///
+/// `side` (always emitted, not removable by label selection) splits each
+/// streaming request into two observations of the same request:
+/// - `upstream`: from the start of the attempt that served the stream to
+///   the first frame the upstream delivered (any frame type). Excludes
+///   request parsing, input guardrails, earlier failed attempts and
+///   backoff, and output-guardrail hold-back.
+/// - `downstream`: from the gateway receiving the request to the first
+///   frame handed to the client — what the caller waited for, including
+///   all of the above. Recorded only for requests that also record
+///   `upstream`, so both sides count the same requests.
+///
+/// On the two protocol bridges — `/v1/messages` to a non-Anthropic
+/// upstream and `/v1/responses` to a chat-protocol upstream — the
+/// client's first frame is the first content-bearing event, so
+/// `downstream` there also contains the wait for it (for a reasoning
+/// upstream, its thinking time); `downstream - upstream` is not pure
+/// gateway overhead on those paths. A query that does not filter on
+/// `side` blends both measurements.
 pub const M_LLM_TTFT: &str = "aisix_llm_time_to_first_token_seconds";
 /// Issue #890 req-4: token volume sliced by inbound client type — a
 /// DEDICATED low-cardinality series so the client dimension never multiplies
@@ -361,7 +382,42 @@ pub const M_OTLP_FANOUT_FAILURES_TOTAL: &str = "aisix_otlp_fanout_failures_total
 pub const M_REQUEST_E2E_LATENCY_SECONDS: &str = "aisix_request_e2e_latency_seconds";
 /// Time-to-first-token for streaming requests, same label set as
 /// [`M_REQUEST_E2E_LATENCY_SECONDS`] (with `streaming="true"` always).
+///
+/// `side` (always emitted, not removable by label selection) splits each
+/// streaming request into two observations of the same request:
+/// - `upstream`: from the start of the attempt that served the stream to
+///   the first frame the upstream delivered (any frame type). Excludes
+///   request parsing, input guardrails, earlier failed attempts and
+///   backoff, and output-guardrail hold-back.
+/// - `downstream`: from the gateway receiving the request to the first
+///   frame handed to the client — what the caller waited for, including
+///   all of the above. Recorded only for requests that also record
+///   `upstream`, so both sides count the same requests.
+///
+/// On the two protocol bridges — `/v1/messages` to a non-Anthropic
+/// upstream and `/v1/responses` to a chat-protocol upstream — the
+/// client's first frame is the first content-bearing event, so
+/// `downstream` there also contains the wait for it (for a reasoning
+/// upstream, its thinking time); `downstream - upstream` is not pure
+/// gateway overhead on those paths. A query that does not filter on
+/// `side` blends both measurements.
 pub const M_REQUEST_TTFT_SECONDS: &str = "aisix_request_ttft_seconds";
+
+/// The `side` label value of the two TTFT metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtftSide {
+    Upstream,
+    Downstream,
+}
+
+impl TtftSide {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Upstream => "upstream",
+            Self::Downstream => "downstream",
+        }
+    }
+}
 
 // ── A2A gateway series (AISIX-Cloud#1215) ──────────────────────────────────
 //
@@ -2143,7 +2199,29 @@ impl Metrics {
         });
     }
 
-    pub fn record_time_to_first_token(&self, labels: UsageLabels<'_>, ttft: Duration) {
+    /// Record one streaming request's TTFT on both [`M_REQUEST_TTFT_SECONDS`]
+    /// and [`M_LLM_TTFT`]: `upstream` as the `side="upstream"` observation,
+    /// and `downstream` as `side="downstream"` — the latter only when the
+    /// upstream one is recorded too, so both sides count the same requests.
+    pub fn record_ttft(&self, labels: LatencyLabels<'_>, upstream: Duration, downstream: Duration) {
+        if upstream.is_zero() {
+            return;
+        }
+        for (side, ttft) in [
+            (TtftSide::Upstream, upstream),
+            (TtftSide::Downstream, downstream),
+        ] {
+            self.record_request_ttft(labels, side, ttft);
+            self.record_time_to_first_token(labels.details, side, ttft);
+        }
+    }
+
+    pub fn record_time_to_first_token(
+        &self,
+        labels: UsageLabels<'_>,
+        side: TtftSide,
+        ttft: Duration,
+    ) {
         if ttft.is_zero() {
             return;
         }
@@ -2151,6 +2229,7 @@ impl Metrics {
             M_LLM_TTFT,
             ttft.as_secs_f64(),
             |k| {
+                k.label(side.as_str());
                 k.label(labels.endpoint);
                 k.label(labels.inbound_protocol);
                 k.label(labels.upstream_protocol);
@@ -2167,6 +2246,7 @@ impl Metrics {
             || {
                 metrics::histogram!(
                     M_LLM_TTFT,
+                    "side" => side.as_str(),
                     "endpoint" => labels.endpoint.to_string(),
                     "inbound_protocol" => labels.inbound_protocol.to_string(),
                     "upstream_protocol" => labels.upstream_protocol.to_string(),
@@ -2622,7 +2702,7 @@ impl Metrics {
     /// at handler return for non-streaming requests and failures, at
     /// stream completion for committed streams.
     pub fn record_request_e2e_latency(&self, labels: LatencyLabels<'_>, elapsed: Duration) {
-        self.cached_latency_histogram(M_REQUEST_E2E_LATENCY_SECONDS, labels, elapsed);
+        self.cached_latency_histogram(M_REQUEST_E2E_LATENCY_SECONDS, labels, None, elapsed);
     }
 
     /// Shared cached emit for the two SLO latency histograms — identical
@@ -2632,8 +2712,10 @@ impl Metrics {
         &self,
         metric: &'static str,
         labels: LatencyLabels<'_>,
+        side: Option<TtftSide>,
         elapsed: Duration,
     ) {
+        let side = side.map_or("unknown", TtftSide::as_str);
         let model = if labels.model.is_empty() {
             "unknown"
         } else {
@@ -2665,6 +2747,7 @@ impl Metrics {
                         "team_id" => labels.details.team_id,
                         "user_id" => labels.details.user_id,
                         "user_name" => labels.details.user_name,
+                        "side" => side,
                         _ => "unknown",
                     };
                     k.label(value);
@@ -2673,6 +2756,7 @@ impl Metrics {
             || {
                 metrics::histogram!(
                     metric,
+                    "side" => side,
                     "env_id" => self.inner.env_id.clone(),
                     "endpoint" => labels.endpoint.to_string(),
                     "model" => model.to_string(),
@@ -2696,11 +2780,11 @@ impl Metrics {
     /// Observe a streaming request's time-to-first-token on
     /// [`M_REQUEST_TTFT_SECONDS`]. Zero durations are skipped (TTFT was
     /// never measured — e.g. the stream died before the first token).
-    pub fn record_request_ttft(&self, labels: LatencyLabels<'_>, ttft: Duration) {
+    pub fn record_request_ttft(&self, labels: LatencyLabels<'_>, side: TtftSide, ttft: Duration) {
         if ttft.is_zero() {
             return;
         }
-        self.cached_latency_histogram(M_REQUEST_TTFT_SECONDS, labels, ttft);
+        self.cached_latency_histogram(M_REQUEST_TTFT_SECONDS, labels, Some(side), ttft);
     }
 }
 
@@ -4006,7 +4090,7 @@ mod tests {
                 spend_usd: 0.001,
             },
         );
-        m.record_time_to_first_token(usage_labels, Duration::from_millis(42));
+        m.record_time_to_first_token(usage_labels, TtftSide::Upstream, Duration::from_millis(42));
 
         let rendered = m.render();
         assert!(rendered.contains(M_PROXY_REQUESTS_TOTAL));
@@ -4110,7 +4194,7 @@ mod tests {
                 ..Default::default()
             };
             defaults.record_request_e2e_latency(labels, Duration::from_millis(1));
-            defaults.record_request_ttft(labels, Duration::from_millis(1));
+            defaults.record_request_ttft(labels, TtftSide::Upstream, Duration::from_millis(1));
         }
         assert_eq!(
             WORKER_CACHE.with(|cell| cell.borrow().histograms.len()),
@@ -4138,6 +4222,7 @@ mod tests {
                         },
                         ..Default::default()
                     },
+                    TtftSide::Upstream,
                     Duration::from_millis(1),
                 );
             }
@@ -5180,10 +5265,10 @@ mod tests {
             },
         ];
         let m = Metrics::new(false);
-        m.record_time_to_first_token(base, Duration::from_millis(1));
-        m.record_time_to_first_token(base, Duration::from_millis(1));
+        m.record_time_to_first_token(base, TtftSide::Upstream, Duration::from_millis(1));
+        m.record_time_to_first_token(base, TtftSide::Upstream, Duration::from_millis(1));
         for v in &variants {
-            m.record_time_to_first_token(*v, Duration::from_millis(1));
+            m.record_time_to_first_token(*v, TtftSide::Upstream, Duration::from_millis(1));
         }
         assert_one_series_per_label_set(
             &m.render(),
@@ -6091,6 +6176,7 @@ mod tests {
                 streaming: true,
                 ..labels
             },
+            TtftSide::Upstream,
             Duration::from_millis(80),
         );
         let out = m.render();
@@ -6180,7 +6266,7 @@ mod tests {
             streaming: true,
             details: Default::default(),
         };
-        m.record_request_ttft(labels, Duration::ZERO);
+        m.record_request_ttft(labels, TtftSide::Upstream, Duration::ZERO);
         assert!(
             !m.render().contains("aisix_request_ttft_seconds"),
             "zero TTFT must not be observed"
@@ -6228,7 +6314,7 @@ mod tests {
             details: Default::default(),
         };
         m.record_request_e2e_latency(labels, Duration::from_millis(1500));
-        m.record_request_ttft(labels, Duration::from_millis(1500));
+        m.record_request_ttft(labels, TtftSide::Upstream, Duration::from_millis(1500));
         let out = m.render();
 
         assert_eq!(
@@ -6261,6 +6347,7 @@ mod tests {
                 streaming: true,
                 details: Default::default(),
             },
+            TtftSide::Upstream,
             Duration::from_millis(1500),
         );
         let out = m.render();
@@ -6299,7 +6386,7 @@ mod tests {
             details: Default::default(),
         };
         m.record_request_e2e_latency(labels, Duration::from_millis(1500));
-        m.record_request_ttft(labels, Duration::from_millis(1500));
+        m.record_request_ttft(labels, TtftSide::Upstream, Duration::from_millis(1500));
         m.record_guardrail_execution(&aisix_core::GuardrailExecution {
             guardrail_name: "g",
             kind: "keyword",

@@ -177,7 +177,9 @@ observability:
   metrics:
     # Complete label lists per metric. Omitted metrics retain their defaults.
     # Restart after changing labels. [] removes all optional business labels;
-    # gauges retain required identity labels. See the variable reference:
+    # gauges retain required identity labels, and the two time-to-first-token
+    # metrics always keep `side` (upstream/downstream) whether listed or not.
+    # See the variable reference:
     # https://docs.api7.ai/ai-gateway/dev/reference/metric-labels
     # Env: AISIX_OBSERVABILITY__METRICS__LABELS='{"aisix_request_ttft_seconds":["provider_key_name","model"]}'
     # labels:

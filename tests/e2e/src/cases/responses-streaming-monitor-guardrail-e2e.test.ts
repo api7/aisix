@@ -194,6 +194,7 @@ describe("responses streaming with monitor-mode output guardrail (AISIX-Cloud#10
       provider: "openai",
       streaming: "true",
       status_class: "4xx",
+      side: "upstream",
     };
     expect(
       metricValue(metricsAfter, "aisix_request_ttft_seconds_count", lowCardLabels) -
@@ -209,6 +210,7 @@ describe("responses streaming with monitor-mode output guardrail (AISIX-Cloud#10
       provider: "openai",
       inbound_protocol: "openai",
       upstream_protocol: "openai",
+      side: "upstream",
     };
     expect(
       metricValue(

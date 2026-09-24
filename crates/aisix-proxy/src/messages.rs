@@ -3353,7 +3353,7 @@ fn emit_anthropic_usage_event(
             metric_model,
             upstream_model,
         );
-        state.metrics.record_request_ttft(
+        state.metrics.record_ttft(
             LatencyLabels {
                 endpoint: "/v1/messages",
                 model: bounded_model.as_ref(),
@@ -3376,23 +3376,7 @@ fn emit_anthropic_usage_event(
                 },
             },
             Duration::from_millis(u64::from(metrics.upstream_ttft_ms)),
-        );
-        state.metrics.record_time_to_first_token(
-            UsageLabels {
-                endpoint: "/v1/messages",
-                inbound_protocol: "anthropic",
-                upstream_protocol,
-                provider,
-                model: bounded_model.as_ref(),
-                upstream_model: bounded_upstream.as_ref(),
-                provider_key_id: pk.labels().id(),
-                provider_key_name: pk.labels().name(),
-                api_key_id,
-                team_id: team_id.unwrap_or("unknown"),
-                user_id: user_id.unwrap_or("unknown"),
-                user_name: user_name.unwrap_or("unknown"),
-            },
-            Duration::from_millis(u64::from(metrics.upstream_ttft_ms)),
+            Duration::from_millis(u64::from(metrics.downstream_latency_ms)),
         );
     }
 }
