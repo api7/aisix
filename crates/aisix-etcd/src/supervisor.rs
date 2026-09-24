@@ -479,11 +479,9 @@ pub struct Supervisor<P: ConfigProvider> {
     // JoinHandles for in-flight `flush_cache` writes. [`Self::run`]
     // drains them before returning so a gateway stopped shortly after an
     // apply comes back with a persisted snapshot rather than none. WHICH
-    // apply is a separate question: `SnapshotCache::store` serialises its
-    // snapshot before taking the cache's write lock, so two writes racing
-    // that work can commit in the opposite order to the applies that
-    // produced them. Draining does not change that, and does not claim
-    // to. Tests use
+    // apply is decided by the write ticket `flush_cache` takes at capture:
+    // a write that reaches the file after a later capture is dropped.
+    // Tests use
     // [`Self::await_pending_cache_writes`] to order against a write
     // without relying on a wall-clock sleep, which proved flaky on slow
     // CI runners. Kept to the writes actually in flight: `flush_cache`
@@ -1683,13 +1681,18 @@ impl<P: ConfigProvider> Supervisor<P> {
         if !self.cache.is_enabled() {
             return;
         }
-        let entries: Vec<Arc<[u8]>> = {
+        // The ticket is taken under the state lock so ticket order is the
+        // order the captured states were produced in; the spawned writes
+        // below may reach the file in any order.
+        let (ticket, entries): (_, Vec<Arc<[u8]>>) = {
             let state = self.state.lock().unwrap();
-            state
+            let ticket = self.cache.ticket();
+            let entries = state
                 .entries
                 .values()
                 .map(StateEntry::cache_record)
-                .collect()
+                .collect();
+            (ticket, entries)
         };
         let stale: Vec<Arc<[u8]>> = {
             let guard = self.stale_serving.lock().unwrap();
@@ -1705,8 +1708,11 @@ impl<P: ConfigProvider> Supervisor<P> {
         // `tokio::time::sleep`, which under CI load raced the spawn
         // (~50ms wasn't enough on heavily loaded GitHub Actions runners).
         if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
-            let join = rt_handle
-                .spawn(async move { cache.store_encoded(&entries, revision, &stale).await });
+            let join = rt_handle.spawn(async move {
+                cache
+                    .store_encoded(ticket, &entries, revision, &stale)
+                    .await
+            });
             let mut pending = self.pending_writes.lock().unwrap();
             // Only writes still in flight are worth draining, and only
             // those may be retained: the list is appended to on every

@@ -25,6 +25,7 @@
 //! (the default unless `managed.snapshot_cache_enabled` is true).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -52,16 +53,26 @@ pub struct SnapshotCache {
 struct Inner {
     /// Some(path) → enabled; None → no-op.
     path: Option<PathBuf>,
+    /// Hands out [`WriteTicket`]s in the order snapshots are captured.
+    next_ticket: AtomicU64,
     /// Serialise concurrent writes so the tmp-file rename dance can't
-    /// race with itself, and carry the highest revision committed so far
-    /// so they also commit in order. Reads are unguarded — they go
-    /// through OS caches and the rename is atomic.
+    /// race with itself, and carry the ticket of the last committed write
+    /// so they also commit in capture order. Reads are unguarded — they
+    /// go through OS caches and the rename is atomic.
     ///
-    /// Applies spawn independent tasks, so a newer revision may acquire
-    /// the lock first. Never let a late older task replace it. `i64::MIN`
-    /// until the first write so revision zero also commits.
-    write_lock: Mutex<i64>,
+    /// Applies spawn independent tasks, so a later capture may acquire
+    /// the lock first. Never let a late earlier capture replace it — not
+    /// even at the same revision: a delete flushes at the current
+    /// revision floor, so two captures can share a revision and differ
+    /// in content. Zero until the first write; tickets start at one.
+    write_lock: Mutex<u64>,
 }
+
+/// The position of one captured snapshot in apply order. Taken where the
+/// snapshot is captured, not where it is written, because the write runs
+/// on a task of its own and may reach the lock out of order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct WriteTicket(u64);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedFile {
@@ -114,7 +125,8 @@ impl SnapshotCache {
         Self {
             inner: Arc::new(Inner {
                 path: Some(path.into()),
-                write_lock: Mutex::new(i64::MIN),
+                next_ticket: AtomicU64::new(0),
+                write_lock: Mutex::new(0),
             }),
         }
     }
@@ -126,7 +138,8 @@ impl SnapshotCache {
         Self {
             inner: Arc::new(Inner {
                 path: None,
-                write_lock: Mutex::new(i64::MIN),
+                next_ticket: AtomicU64::new(0),
+                write_lock: Mutex::new(0),
             }),
         }
     }
@@ -213,13 +226,21 @@ impl SnapshotCache {
         if !self.is_enabled() {
             return;
         }
+        let ticket = self.ticket();
         let entries: Vec<_> = entries.iter().map(encode_entry).collect();
         let stale: Vec<_> = stale.iter().map(encode_stale).collect();
-        self.store_encoded(&entries, revision, &stale).await;
+        self.store_encoded(ticket, &entries, revision, &stale).await;
+    }
+
+    /// Reserve the next position in apply order. Take it while the
+    /// snapshot being written is captured.
+    pub(crate) fn ticket(&self) -> WriteTicket {
+        WriteTicket(self.inner.next_ticket.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
     pub(crate) async fn store_encoded(
         &self,
+        ticket: WriteTicket,
         entries: &[Arc<[u8]>],
         revision: i64,
         stale: &[Arc<[u8]>],
@@ -228,20 +249,18 @@ impl SnapshotCache {
             return;
         };
         let mut committed = self.inner.write_lock.lock().await;
-        // A write that lost the serialisation race to a NEWER apply has
+        // A write that lost the serialisation race to a LATER capture has
         // nothing to add: committing it would roll the cache back to a
         // snapshot the gateway has already moved past, and the next
-        // restart would then serve it. Equal revisions still commit — a
-        // delete flushes at the current revision floor, so same-revision
-        // writes carry different content.
-        if revision < *committed {
+        // restart would then serve it.
+        if ticket.0 <= *committed {
             return;
         }
         if let Err(e) = atomic_write(path, entries, revision, stale).await {
             tracing::warn!(error = %e, path = %path.display(), "snapshot cache write failed");
             return;
         }
-        *committed = revision;
+        *committed = ticket.0;
     }
 }
 
@@ -342,36 +361,67 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_that_lost_its_race_cannot_roll_the_cache_back() {
-        // The supervisor spawns one write per apply and does not order
-        // them, and `store` serialises its snapshot before taking the
-        // write lock — so a write for an older apply can reach the lock
-        // after a newer one. Committing it would roll the cache back to
-        // a snapshot the gateway has already moved past, and the next
-        // restart would serve it. Sequential calls stand in for the race:
-        // the lock is what the race resolves to, and this is the order it
-        // can resolve to.
+        // The supervisor captures a snapshot per apply and spawns its
+        // write, so the write for an earlier apply can reach the lock
+        // after a later one. Committing it would roll the cache back to a
+        // snapshot the gateway has already moved past, and the next
+        // restart would serve it.
         let dir = tempdir().unwrap();
-        let path = dir.path().join("snap.json");
-        let cache = SnapshotCache::new(&path);
+        let cache = SnapshotCache::new(dir.path().join("snap.json"));
 
-        let newer = vec![entry("/aisix/models/m-1", br#"{"name":"new"}"#, 9)];
-        let older = vec![entry("/aisix/models/m-1", br#"{"name":"old"}"#, 8)];
-        cache.store(&newer, 9, &[]).await;
-        cache.store(&older, 8, &[]).await;
+        let older = [encode_entry(&entry(
+            "/aisix/models/m-1",
+            br#"{"name":"old"}"#,
+            8,
+        ))];
+        let newer_entry = entry("/aisix/models/m-1", br#"{"name":"new"}"#, 9);
+        let older_ticket = cache.ticket();
+        let newer_ticket = cache.ticket();
+        cache
+            .store_encoded(newer_ticket, &[encode_entry(&newer_entry)], 9, &[])
+            .await;
+        cache.store_encoded(older_ticket, &older, 8, &[]).await;
 
         let cached = cache.load().expect("cache file exists");
         assert_eq!(
             cached.revision, 9,
-            "the older apply must not overwrite the newer one",
+            "the older apply must not overwrite the newer one"
         );
-        assert_eq!(cached.entries, newer);
+        assert_eq!(cached.entries, vec![newer_entry]);
+    }
+
+    #[tokio::test]
+    async fn a_late_write_at_the_same_revision_cannot_restore_a_deleted_row() {
+        // A delete flushes at the current revision floor, so the capture
+        // before it and the capture after it share a revision. If the
+        // earlier one lands last, the deleted row comes back on restart.
+        let dir = tempdir().unwrap();
+        let cache = SnapshotCache::new(dir.path().join("snap.json"));
+
+        let before_delete = [encode_entry(&entry(
+            "/aisix/models/m-1",
+            br#"{"name":"m1"}"#,
+            9,
+        ))];
+        let before_ticket = cache.ticket();
+        let after_ticket = cache.ticket();
+        cache.store_encoded(after_ticket, &[], 9, &[]).await;
+        cache
+            .store_encoded(before_ticket, &before_delete, 9, &[])
+            .await;
+
+        let cached = cache.load().expect("cache file exists");
+        assert!(
+            cached.entries.is_empty(),
+            "the deleted row must stay deleted: {:?}",
+            cached.entries,
+        );
     }
 
     #[tokio::test]
     async fn a_write_at_the_same_revision_still_commits() {
-        // A delete flushes at the current revision floor rather than a
-        // revision of its own, so same-revision writes carry different
-        // content and the guard above must not swallow them.
+        // Same-revision captures carry different content, so a later one
+        // must still replace the earlier.
         let dir = tempdir().unwrap();
         let path = dir.path().join("snap.json");
         let cache = SnapshotCache::new(&path);
