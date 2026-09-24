@@ -1166,7 +1166,7 @@ async fn guardrail_block_event(
             model_name,
             vec![aisix_gateway::ChatMessage::user(text.to_string())],
         );
-        aisix_guardrails::Guardrail::check_input_observed(chain, &chat).await
+        aisix_guardrails::Guardrail::check_input_unmaskable_observed(chain, &chat).await
     } else {
         let synth = aisix_gateway::ChatResponse {
             id: String::new(),
@@ -1175,7 +1175,7 @@ async fn guardrail_block_event(
             finish_reason: aisix_gateway::FinishReason::Stop,
             usage: aisix_gateway::UsageStats::default(),
         };
-        aisix_guardrails::Guardrail::check_output_observed(chain, &synth).await
+        aisix_guardrails::Guardrail::check_output_unmaskable_observed(chain, &synth).await
     };
     monitor_hits.extend(hits);
     if let aisix_guardrails::GuardrailVerdict::Block {

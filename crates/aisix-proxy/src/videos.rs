@@ -1699,7 +1699,8 @@ async fn dispatch_create(
             vec![aisix_gateway::ChatMessage::user(body.prompt.clone())],
         );
         let (verdict, hits) =
-            aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
+            aisix_guardrails::Guardrail::check_input_unmaskable_observed(&resolved_chain, &chat)
+                .await;
         monitor_hits.extend(hits);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,

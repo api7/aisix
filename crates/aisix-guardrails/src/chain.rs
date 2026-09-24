@@ -318,6 +318,156 @@ impl GuardrailChain {
         self.audit.clone()
     }
 
+    /// The observed input fold. `unmaskable` marks a call site with no
+    /// channel to write a mask back: each member is asked through its
+    /// `*_unmaskable_observed` hook, and an enforcing mask rule that
+    /// matches records `mask_unsupported` instead of passing silently.
+    async fn fold_input_observed(
+        &self,
+        req: &ChatFormat,
+        unmaskable: bool,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let mut bypass: Option<String> = None;
+        let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
+        let narrowed = latest_turn_view_if_needed(&self.members, req);
+        for m in &self.members {
+            let started = Instant::now();
+            let input = member_input(m, req, &narrowed);
+            let (verdict, member_hits) = if unmaskable {
+                m.guardrail.check_input_unmaskable_observed(input).await
+            } else {
+                m.guardrail.check_input_observed(input).await
+            };
+            record_execution(
+                self.recorders(),
+                m,
+                "input",
+                started,
+                &verdict,
+                false,
+                &member_hits,
+                None,
+            );
+            hits.extend(member_hits);
+            if unmaskable && !verdict.is_block() && m.guardrail.redacts_input() {
+                let text = input
+                    .messages
+                    .iter()
+                    .map(crate::message_scan_text)
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.record_mask_unsupported(m, "input", || m.guardrail.redact_input_text(&text));
+            }
+            match verdict {
+                GuardrailVerdict::Allow => continue,
+                GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                    unavailable,
+                } => {
+                    return (
+                        attribute_block(&m.name, reason, guardrail_name, unavailable),
+                        hits,
+                    )
+                }
+                GuardrailVerdict::Bypass { reason } => {
+                    if bypass.is_none() {
+                        bypass = Some(reason);
+                    }
+                }
+            }
+        }
+        let verdict = match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
+        };
+        (verdict, hits)
+    }
+
+    /// The observed output fold; `unmaskable` as in
+    /// [`Self::fold_input_observed`].
+    async fn fold_output_observed(
+        &self,
+        resp: &ChatResponse,
+        unmaskable: bool,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let mut bypass: Option<String> = None;
+        let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
+        for m in &self.members {
+            let started = Instant::now();
+            let (verdict, member_hits) = if unmaskable {
+                m.guardrail.check_output_unmaskable_observed(resp).await
+            } else {
+                m.guardrail.check_output_observed(resp).await
+            };
+            record_execution(
+                self.recorders(),
+                m,
+                "output",
+                started,
+                &verdict,
+                false,
+                &member_hits,
+                None,
+            );
+            hits.extend(member_hits);
+            if unmaskable && !verdict.is_block() && m.guardrail.redacts_output() {
+                let text = resp.guardrail_output_text();
+                self.record_mask_unsupported(m, "output", || m.guardrail.redact_output_text(&text));
+            }
+            match verdict {
+                GuardrailVerdict::Allow => continue,
+                GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                    unavailable,
+                } => {
+                    return (
+                        attribute_block(&m.name, reason, guardrail_name, unavailable),
+                        hits,
+                    )
+                }
+                GuardrailVerdict::Bypass { reason } => {
+                    if bypass.is_none() {
+                        bypass = Some(reason);
+                    }
+                }
+            }
+        }
+        let verdict = match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
+        };
+        (verdict, hits)
+    }
+
+    /// Record what an enforcing mask member matched at a call site that
+    /// forwards the content unmodified. Nothing was redacted, so this is
+    /// an enforced hit of its own and never a `masked` one, and
+    /// `redacted_entity_counts` stays untouched.
+    fn record_mask_unsupported(
+        &self,
+        m: &ChainMember,
+        phase: &'static str,
+        redact: impl FnOnce() -> Option<Redaction>,
+    ) {
+        let Some(audit) = self.audit.as_deref() else {
+            return;
+        };
+        let started = Instant::now();
+        if let Some(r) = redact() {
+            audit.record(
+                &m.name,
+                phase,
+                ACTION_MASK_UNSUPPORTED,
+                None,
+                started.elapsed(),
+                &r.counts,
+            );
+        }
+    }
+
     /// Borrow both execution receivers for one fold.
     fn recorders(&self) -> Recorders<'_> {
         Recorders {
@@ -388,7 +538,10 @@ fn classify_execution<'v>(
                     .find(|h| h.action == "would_block" && !h.error_type.is_empty())
                     .map(|h| h.error_type.as_str());
                 ("would_block", error_type)
-            } else if hits.iter().any(|h| h.action == "would_mask") {
+            } else if hits
+                .iter()
+                .any(|h| matches!(h.action.as_str(), "would_mask" | "would_mask_unsupported"))
+            {
                 ("would_mask", None)
             } else {
                 ("allowed", None)
@@ -401,6 +554,11 @@ fn classify_execution<'v>(
 /// (#1029): the check never ran, so it is neither `blocked` nor
 /// `blocked_unavailable`.
 const ACTION_BLOCKED_BUFFER_EXCEEDED: &str = "blocked_buffer_exceeded";
+
+/// `action` of the enforced hit an enforcing mask rule records at a call
+/// site that has no channel to write the mask back: the content was
+/// forwarded unmodified.
+const ACTION_MASK_UNSUPPORTED: &str = "mask_unsupported";
 
 /// The two receivers a fold reports each member execution to: the
 /// process-global metrics sink (AISIX-Cloud#1076) and the request's
@@ -730,96 +888,28 @@ impl Guardrail for GuardrailChain {
         &self,
         req: &ChatFormat,
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
-        let mut bypass: Option<String> = None;
-        let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
-        let narrowed = latest_turn_view_if_needed(&self.members, req);
-        for m in &self.members {
-            let started = Instant::now();
-            let (verdict, member_hits) = m
-                .guardrail
-                .check_input_observed(member_input(m, req, &narrowed))
-                .await;
-            record_execution(
-                self.recorders(),
-                m,
-                "input",
-                started,
-                &verdict,
-                false,
-                &member_hits,
-                None,
-            );
-            hits.extend(member_hits);
-            match verdict {
-                GuardrailVerdict::Allow => continue,
-                GuardrailVerdict::Block {
-                    reason,
-                    guardrail_name,
-                    unavailable,
-                } => {
-                    return (
-                        attribute_block(&m.name, reason, guardrail_name, unavailable),
-                        hits,
-                    )
-                }
-                GuardrailVerdict::Bypass { reason } => {
-                    if bypass.is_none() {
-                        bypass = Some(reason);
-                    }
-                }
-            }
-        }
-        let verdict = match bypass {
-            Some(reason) => GuardrailVerdict::Bypass { reason },
-            None => GuardrailVerdict::Allow,
-        };
-        (verdict, hits)
+        self.fold_input_observed(req, false).await
     }
 
     async fn check_output_observed(
         &self,
         resp: &ChatResponse,
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
-        let mut bypass: Option<String> = None;
-        let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
-        for m in &self.members {
-            let started = Instant::now();
-            let (verdict, member_hits) = m.guardrail.check_output_observed(resp).await;
-            record_execution(
-                self.recorders(),
-                m,
-                "output",
-                started,
-                &verdict,
-                false,
-                &member_hits,
-                None,
-            );
-            hits.extend(member_hits);
-            match verdict {
-                GuardrailVerdict::Allow => continue,
-                GuardrailVerdict::Block {
-                    reason,
-                    guardrail_name,
-                    unavailable,
-                } => {
-                    return (
-                        attribute_block(&m.name, reason, guardrail_name, unavailable),
-                        hits,
-                    )
-                }
-                GuardrailVerdict::Bypass { reason } => {
-                    if bypass.is_none() {
-                        bypass = Some(reason);
-                    }
-                }
-            }
-        }
-        let verdict = match bypass {
-            Some(reason) => GuardrailVerdict::Bypass { reason },
-            None => GuardrailVerdict::Allow,
-        };
-        (verdict, hits)
+        self.fold_output_observed(resp, false).await
+    }
+
+    async fn check_input_unmaskable_observed(
+        &self,
+        req: &ChatFormat,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        self.fold_input_observed(req, true).await
+    }
+
+    async fn check_output_unmaskable_observed(
+        &self,
+        resp: &ChatResponse,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        self.fold_output_observed(resp, true).await
     }
 
     async fn check_output_non_local_observed(

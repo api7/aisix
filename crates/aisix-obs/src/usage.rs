@@ -368,7 +368,8 @@ pub struct UsageEvent {
     /// this request (AISIX-Cloud#562): one entry per suppressed Block
     /// (`would_block`, with a code-owned kind/outcome summary) or suppressed
     /// mask (`would_mask`, with safe per-detector counts; custom scripts use
-    /// the fixed key `custom`). Names only — never matched content (#153).
+    /// the fixed key `custom`), or a mask rule that matched where content
+    /// cannot be rewritten (`would_mask_unsupported`, same counts). Names only — never matched content (#153).
     /// Lets operators stage a
     /// policy and audit its hit rate in the dashboard before flipping it to
     /// `block`. Empty (no monitor-mode guardrail fired) is omitted from the
@@ -379,8 +380,10 @@ pub struct UsageEvent {
 
     /// What each `enforcement_mode` guardrail ACTUALLY did to this request
     /// (AISIX-Cloud#1330): one entry per `(guardrail_name, hook, action)`,
-    /// where `action` is `masked` (content rewritten, request continued) or
-    /// `blocked` (request refused), with the per-detector span counts and
+    /// where `action` is `masked` (content rewritten, request continued),
+    /// `mask_unsupported` (a mask rule matched where content cannot be
+    /// rewritten; forwarded unmodified) or `blocked` (request refused), with
+    /// the per-detector span counts and
     /// the time the guardrail spent. The enforcing counterpart of
     /// `guardrail_monitor_hits` — until this field, an enforced mask was
     /// invisible in the audit trail and an enforced block recorded only the

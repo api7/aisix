@@ -1102,6 +1102,27 @@ pub trait Guardrail: Send + Sync + 'static {
         (self.check_output(resp).await, Vec::new())
     }
 
+    /// [`Self::check_input_observed`] for a call site that has no channel
+    /// to write a mask back (a passthrough body, a job body, a realtime
+    /// frame, …): the request is forwarded unmodified, so a mask rule that
+    /// matches is reported as `mask_unsupported` / `would_mask_unsupported`
+    /// rather than as a mask. Only the chain and the monitor decorator
+    /// override it.
+    async fn check_input_unmaskable_observed(
+        &self,
+        req: &ChatFormat,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        self.check_input_observed(req).await
+    }
+
+    /// [`Self::check_input_unmaskable_observed`] for the response side.
+    async fn check_output_unmaskable_observed(
+        &self,
+        resp: &ChatResponse,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        self.check_output_observed(resp).await
+    }
+
     /// [`Self::check_input_non_segment`] plus any monitor-mode observations.
     async fn check_input_non_segment_observed(
         &self,

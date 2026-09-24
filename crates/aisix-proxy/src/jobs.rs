@@ -488,7 +488,8 @@ async fn scan_input_blob(
         target.display_name(),
         vec![aisix_gateway::ChatMessage::user(text.into_owned())],
     );
-    let (verdict, hits) = aisix_guardrails::Guardrail::check_input_observed(&chain, &chat).await;
+    let (verdict, hits) =
+        aisix_guardrails::Guardrail::check_input_unmaskable_observed(&chain, &chat).await;
     monitor_hits.extend(hits);
     // Drained BEFORE the block branch: a `blocked` hit is exactly the one
     // that leaves through `Err`, and the caller's `?` would drop it.
@@ -563,7 +564,8 @@ async fn scan_output_blob(
         finish_reason: aisix_gateway::FinishReason::Stop,
         usage: aisix_gateway::UsageStats::default(),
     };
-    let (verdict, hits) = aisix_guardrails::Guardrail::check_output_observed(&chain, &synth).await;
+    let (verdict, hits) =
+        aisix_guardrails::Guardrail::check_output_unmaskable_observed(&chain, &synth).await;
     monitor_hits.extend(hits);
     // See `scan_input_blob`.
     enforced_hits.extend(chain.enforced_hits());

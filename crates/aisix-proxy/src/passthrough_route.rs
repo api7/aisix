@@ -583,7 +583,8 @@ async fn dispatch(
             vec![aisix_gateway::ChatMessage::user(text)],
         );
         let (verdict, hits) =
-            aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
+            aisix_guardrails::Guardrail::check_input_unmaskable_observed(&resolved_chain, &chat)
+                .await;
         monitor_hits.extend(hits);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
@@ -953,7 +954,8 @@ async fn dispatch(
             usage: aisix_gateway::UsageStats::default(),
         };
         let (verdict, hits) =
-            aisix_guardrails::Guardrail::check_output_observed(&resolved_chain, &synth).await;
+            aisix_guardrails::Guardrail::check_output_unmaskable_observed(&resolved_chain, &synth)
+                .await;
         telemetry.monitor_hits.extend(hits);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
@@ -2261,7 +2263,7 @@ async fn scan_output(
         finish_reason: aisix_gateway::FinishReason::Stop,
         usage: aisix_gateway::UsageStats::default(),
     };
-    let (verdict, hits) = chain.check_output_observed(&synth).await;
+    let (verdict, hits) = chain.check_output_unmaskable_observed(&synth).await;
     telemetry.monitor_hits.extend(hits);
     verdict
 }

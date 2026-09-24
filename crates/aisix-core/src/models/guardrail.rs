@@ -1162,11 +1162,14 @@ pub struct GuardrailMonitorHit {
     pub guardrail_name: String,
     /// Which side observed the hit: `input` or `output`.
     pub hook: String,
-    /// `would_block` (a Block verdict was downgraded) or `would_mask`
-    /// (maskable spans were observed but not rewritten).
+    /// `would_block` (a Block verdict was downgraded), `would_mask`
+    /// (maskable spans were observed but not rewritten), or
+    /// `would_mask_unsupported` (a mask rule matched on a surface that
+    /// cannot rewrite content, such as a passthrough route, so enforcing
+    /// the rule would forward the content unmodified too).
     pub action: String,
     /// Code-owned summary of the suppressed Block's kind and outcome
-    /// (`would_block` only; empty for `would_mask`).
+    /// (`would_block` only; empty for both mask actions).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reason: String,
     /// Bounded failure tag retained only until the execution metrics sink has
@@ -1176,7 +1179,8 @@ pub struct GuardrailMonitorHit {
     #[serde(skip)]
     pub error_type: String,
     /// detector/entity name → span count the guardrail would have masked
-    /// (`would_mask` only; empty for `would_block`).
+    /// (`would_mask` and `would_mask_unsupported`; empty for
+    /// `would_block`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub counts: std::collections::BTreeMap<String, u32>,
 }
@@ -1219,15 +1223,19 @@ pub struct GuardrailEnforcedHit {
     ///   the chain's folded one (fail-closed when any output row is), so
     ///   the named row may itself be `fail_open`. Raising that cap, not
     ///   tuning the policy, is the remedy.
+    /// - `mask_unsupported` — a mask rule matched on a surface that cannot
+    ///   rewrite content (a passthrough route, a job body, a realtime
+    ///   frame, …), so the content was forwarded unmodified. Nothing was
+    ///   redacted: `redacted_entity_counts` does not count these spans.
     pub action: String,
     /// Why the check was unavailable, on `blocked_unavailable` only: a
     /// short, bounded cause such as `lakera_timeout` or
     /// `presidio_5xx`. Empty for every other action.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error_type: String,
-    /// detector/rule name → number of spans masked (`masked` only; empty
-    /// for every refusal action). Same key space as
-    /// `redacted_entity_counts`.
+    /// detector/rule name → number of spans masked (`masked`), or matched
+    /// but left in place (`mask_unsupported`); empty for every refusal
+    /// action. Same key space as `redacted_entity_counts`.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub counts: std::collections::BTreeMap<String, u32>,
     /// Wall-clock time this guardrail spent on this hook, in
