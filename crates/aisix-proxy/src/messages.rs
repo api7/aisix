@@ -3277,7 +3277,9 @@ fn emit_anthropic_usage_event(
         requested_model: model.to_string(),
         prompt_tokens: metrics.prompt_tokens,
         completion_tokens: aisix_gateway::chat::recorded_completion_tokens(
+            metrics.prompt_tokens,
             metrics.completion_tokens,
+            metrics.reasoning_tokens,
             metrics.reasoning_folded_into_completion,
             metrics.upstream_total_tokens,
         ),

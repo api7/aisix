@@ -432,11 +432,14 @@ fn is_zero(n: &u32) -> bool {
 /// The completion count a UsageEvent records: the upstream's own, before
 /// the gateway folded its separately-reported reasoning in.
 ///
-/// Only when the record also carries the upstream's total. The total is
-/// how cp-api tells reasoning counted BESIDE the completion from reasoning
-/// counted inside it; without one it reads reasoning as a subset, so an
-/// unfolded completion would bill the candidates as nothing. With no total
-/// the record keeps the folded count, which that reading bills correctly.
+/// Only when the unfolded row states that itself: cp-api reads reasoning
+/// as counted BESIDE the completion exactly when
+/// `prompt + completion + reasoning` equals the upstream's total, and as a
+/// subset of the completion otherwise. An unfolded row that misses that
+/// identity — no total reported, or a total built from terms this gateway
+/// does not map — would bill the candidates as nothing under the subset
+/// reading, so the record keeps the folded count, which that reading bills
+/// correctly.
 ///
 /// Takes the completion the caller is about to record rather than reading
 /// `UsageStats`, because that value may have been estimated (#1074) or
@@ -445,14 +448,23 @@ fn is_zero(n: &u32) -> bool {
 /// exceeds the folded completion, so subtracting with saturation is exact
 /// in every case.
 pub fn recorded_completion_tokens(
+    prompt_tokens: u32,
     completion_tokens: u32,
+    reasoning_tokens: u32,
     reasoning_folded: u32,
     upstream_total_tokens: u32,
 ) -> u32 {
-    if upstream_total_tokens == 0 {
+    if reasoning_folded == 0 || upstream_total_tokens == 0 {
         return completion_tokens;
     }
-    completion_tokens.saturating_sub(reasoning_folded)
+    let unfolded = completion_tokens.saturating_sub(reasoning_folded);
+    let additive = u64::from(prompt_tokens) + u64::from(unfolded) + u64::from(reasoning_tokens)
+        == u64::from(upstream_total_tokens);
+    if additive {
+        unfolded
+    } else {
+        completion_tokens
+    }
 }
 
 /// Fold one streamed usage frame's [`UsageStats::upstream_total_tokens`]
@@ -1300,13 +1312,21 @@ mod tests {
 
     #[test]
     fn recorded_completion_removes_only_the_folded_reasoning() {
-        assert_eq!(recorded_completion_tokens(50, 30, 150), 20);
-        assert_eq!(recorded_completion_tokens(50, 0, 150), 50);
-        // #419 zeroes the completion of a stream nobody received.
-        assert_eq!(recorded_completion_tokens(0, 30, 150), 0);
+        // prompt 100, candidates 20, thoughts 30, total 150: additive.
+        assert_eq!(recorded_completion_tokens(100, 50, 30, 30, 150), 20);
+        assert_eq!(recorded_completion_tokens(100, 50, 30, 0, 150), 50);
+        // #419 zeroes the completion (and reasoning) of a stream nobody
+        // received.
+        assert_eq!(recorded_completion_tokens(100, 0, 0, 30, 150), 0);
         // Without the upstream's total nothing marks the reasoning as
         // beside the completion, so the folded count stands.
-        assert_eq!(recorded_completion_tokens(50, 30, 0), 50);
+        assert_eq!(recorded_completion_tokens(100, 50, 30, 30, 0), 50);
+        // A total the unfolded row does not add up to reads as the subset
+        // shape too.
+        assert_eq!(recorded_completion_tokens(100, 50, 30, 30, 160), 50);
+        // A thinking-only frame whose total has not caught up (candidates
+        // 0, thoughts 30, total == prompt).
+        assert_eq!(recorded_completion_tokens(100, 30, 30, 30, 100), 30);
     }
 
     /// PR #442 audit MEDIUM-4 (forward-compat): an *old-shape*

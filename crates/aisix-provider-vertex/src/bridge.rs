@@ -3384,7 +3384,9 @@ mod tests {
         assert_eq!(u.reasoning_folded_into_completion, 30);
         assert_eq!(
             aisix_gateway::chat::recorded_completion_tokens(
+                u.prompt_tokens,
                 u.completion_tokens,
+                u.reasoning_tokens,
                 u.reasoning_folded_into_completion,
                 u.upstream_total_tokens
             ),

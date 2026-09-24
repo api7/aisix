@@ -4932,7 +4932,9 @@ fn emit_usage_event(
         requested_model: requested_model.to_string(),
         prompt_tokens,
         completion_tokens: aisix_gateway::chat::recorded_completion_tokens(
+            prompt_tokens,
             completion_tokens,
+            extras.reasoning_tokens,
             extras.reasoning_folded_into_completion,
             extras.upstream_total_tokens,
         ),

@@ -3620,7 +3620,9 @@ fn emit_usage_event(
         requested_model: requested_model.to_string(),
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: aisix_gateway::chat::recorded_completion_tokens(
+            usage.prompt_tokens,
             usage.completion_tokens,
+            usage.reasoning_tokens,
             usage.reasoning_folded_into_completion,
             usage.upstream_total_tokens,
         ),
