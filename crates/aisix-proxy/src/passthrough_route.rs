@@ -19,6 +19,13 @@
 //! coverage. SSE upstream responses are always relayed incrementally;
 //! anything else is buffered (guardrails and usage need the whole body).
 //!
+//! Two further request shapes are recognised among bodies that carry no
+//! LLM envelope ([`detect_raw_usage_shape`]): a Cohere-style rerank
+//! (`query` + a `documents` array) and the DashScope native service
+//! envelope (`model` + an `input` object). They stay opaque for guardrails,
+//! capture and streams; only their `model` and a unary JSON response's
+//! token counts are read.
+//!
 //! A DETECTED envelope must observe what the typed endpoint serving that
 //! same envelope observes — every token dimension of
 //! [`aisix_obs::UsageEvent`], the caller's model alias, the guardrail text
@@ -565,6 +572,7 @@ async fn dispatch(
     // Envelope detection: once per exchange, from the request body's
     // top-level keys; the response and stream frames reuse it.
     let protocol = detect_protocol(&body_bytes);
+    let raw_shape = detect_raw_usage_shape(protocol, &body_bytes);
 
     // INPUT guardrails on the (envelope-extracted) request text.
     if !resolved_chain.is_empty() {
@@ -618,7 +626,7 @@ async fn dispatch(
     let captured_prompt = content_cap.map(|_| String::from_utf8_lossy(&body_bytes).into_owned());
 
     // The alias the caller addressed, for the usage event's attribution.
-    let requested_model = body_model_name(protocol, &body_bytes);
+    let requested_model = body_model_name(protocol, raw_shape, &body_bytes);
 
     // Rate limits AFTER the input guardrail so a content block doesn't burn
     // an RPM slot (matching the typed endpoints). The body's `model` field
@@ -886,6 +894,7 @@ async fn dispatch(
         streaming: false,
         error_class: String::new(),
         error_message: String::new(),
+        failure_status: None,
         monitor_hits,
         audit: audit_out.clone(),
         captured_prompt,
@@ -972,7 +981,7 @@ async fn dispatch(
         }
     }
 
-    if let Some(u) = response_usage(protocol, &resp_body) {
+    if let Some(u) = response_usage(protocol, raw_shape, &resp_body) {
         telemetry.usage.merge(u);
     }
     if telemetry.content_cap.is_some() {
@@ -1177,10 +1186,12 @@ enum PassthroughProtocol {
 }
 
 /// Detect the request envelope from the body's top-level keys. The three
-/// LLM envelopes are structurally exclusive — `messages`, `input` and
-/// `prompt` are each the required carrier field of exactly one API — so
-/// real LLM traffic detects unambiguously, and everything else (JSON-RPC,
-/// REST, non-JSON, empty/GET bodies) is `Raw`. An unknown API colliding
+/// LLM envelopes are structurally exclusive — `messages`, `input` (a string
+/// or an array) and `prompt` are each the required carrier field of exactly
+/// one API — so real LLM traffic detects unambiguously, and everything else
+/// (JSON-RPC, REST, rerank, DashScope native, non-JSON, empty/GET bodies)
+/// is `Raw`; [`detect_raw_usage_shape`] then picks out the `Raw` bodies
+/// whose unary response is still meterable. An unknown API colliding
 /// with a carrier key costs nothing: detection drives extraction only,
 /// and extraction degrades to the whole body when the detected shape
 /// yields no text.
@@ -1205,6 +1216,41 @@ fn detect_protocol(body: &[u8]) -> PassthroughProtocol {
     }
 }
 
+/// A `Raw` request whose `model` and unary JSON response usage the gateway
+/// can still read. Consulted for model attribution and the BUFFERED
+/// response's usage only — guardrail text, capture and every stream frame
+/// keep the `Raw` treatment, so a streamed response reports tokens only
+/// from a server-labelled usage frame, exactly as any opaque stream does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawUsageShape {
+    /// Cohere-style rerank: top-level `query` beside a `documents` array
+    /// (Cohere, Jina, DashScope's compatible rerank). Usage is read exactly
+    /// as `/v1/rerank` reads it ([`crate::rerank::rerank_prompt_tokens`]).
+    Rerank,
+    /// DashScope native service envelope: `{model, input: {…}, parameters}`
+    /// (native rerank, multimodal embedding, …). Usage per
+    /// [`dashscope_native_usage`].
+    DashscopeNative,
+}
+
+/// Classify a body [`detect_protocol`] left `Raw`; `None` for any other
+/// protocol, so the three LLM envelopes are never re-read.
+fn detect_raw_usage_shape(protocol: PassthroughProtocol, body: &[u8]) -> Option<RawUsageShape> {
+    if !matches!(protocol, PassthroughProtocol::Raw) {
+        return None;
+    }
+    let v = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    if v.get("documents").is_some_and(serde_json::Value::is_array) && v.get("query").is_some() {
+        Some(RawUsageShape::Rerank)
+    } else if v.get("model").is_some_and(serde_json::Value::is_string)
+        && v.get("input").is_some_and(serde_json::Value::is_object)
+    {
+        Some(RawUsageShape::DashscopeNative)
+    } else {
+        None
+    }
+}
+
 /// Cap on the recorded `requested_model` value. The body is the caller's,
 /// so the alias is bounded before it reaches telemetry.
 const REQUESTED_MODEL_CAP: usize = 128;
@@ -1213,13 +1259,18 @@ const REQUESTED_MODEL_CAP: usize = 128;
 /// `model` field — what the typed endpoint serving that envelope records
 /// as `UsageEvent::requested_model`.
 ///
-/// Read only for a recognised envelope: an opaque body's `model`-shaped key
-/// belongs to some other API and means nothing the gateway can attribute.
+/// Read only for a recognised envelope or [`RawUsageShape`]: an opaque
+/// body's `model`-shaped key belongs to some other API and means nothing
+/// the gateway can attribute.
 /// The Prometheus side is already collapse-guarded (an unregistered name
 /// folds to the `unresolved` sentinel), so an arbitrary alias here cannot
 /// mint label cardinality.
-fn body_model_name(protocol: PassthroughProtocol, body: &[u8]) -> String {
-    if matches!(protocol, PassthroughProtocol::Raw) {
+fn body_model_name(
+    protocol: PassthroughProtocol,
+    raw_shape: Option<RawUsageShape>,
+    body: &[u8],
+) -> String {
+    if matches!(protocol, PassthroughProtocol::Raw) && raw_shape.is_none() {
         return String::new();
     }
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
@@ -1416,12 +1467,68 @@ impl PassthroughUsage {
 }
 
 /// `usage` figures from a buffered protocol-aware response body.
-fn response_usage(protocol: PassthroughProtocol, body: &[u8]) -> Option<PassthroughUsage> {
-    if matches!(protocol, PassthroughProtocol::Raw) {
+fn response_usage(
+    protocol: PassthroughProtocol,
+    raw_shape: Option<RawUsageShape>,
+    body: &[u8],
+) -> Option<PassthroughUsage> {
+    if matches!(protocol, PassthroughProtocol::Raw) && raw_shape.is_none() {
         return None;
     }
     let v = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-    usage_of(v.get("usage")?)
+    match raw_shape {
+        Some(RawUsageShape::Rerank) => {
+            crate::rerank::rerank_prompt_tokens(&v).map(|prompt_tokens| PassthroughUsage {
+                prompt_tokens,
+                ..PassthroughUsage::default()
+            })
+        }
+        Some(RawUsageShape::DashscopeNative) => dashscope_native_usage(v.get("usage")?),
+        None => usage_of(v.get("usage")?),
+    }
+}
+
+/// Token counts from a DashScope native response's top-level `usage`.
+///
+/// Every dimension the generic reader knows (cache hit, reasoning, …) is
+/// read by [`usage_of`]; only prompt and completion follow DashScope's own
+/// arithmetic. The flat `image_tokens` means different things per service:
+/// multimodal generation counts it inside `input_tokens`
+/// (`{input_tokens: 79, image_tokens: 66, output_tokens: 14,
+/// total_tokens: 93}`), while the multimodal embedding and rerank services
+/// count it beside (`{input_tokens: 44, image_tokens: 64,
+/// total_tokens: 108}`). So `total_tokens` less the completion is the
+/// prompt whenever a total is reported; without one (only some embedding
+/// models omit it, and those report images beside the text), prompt is
+/// `input_tokens` (or `prompt_tokens`) plus the flat `image_tokens`. A
+/// nested `input_tokens_details.image_tokens` is a breakdown already inside
+/// `input_tokens` and is never added.
+fn dashscope_native_usage(usage: &serde_json::Value) -> Option<PassthroughUsage> {
+    let num = |k: &str| {
+        usage
+            .get(k)
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| n.min(u32::MAX as u64) as u32)
+    };
+    let completion = num("output_tokens").or_else(|| num("completion_tokens"));
+    let prompt = match num("total_tokens") {
+        Some(total) => Some(total.saturating_sub(completion.unwrap_or(0))),
+        None => {
+            let input = num("input_tokens").or_else(|| num("prompt_tokens"));
+            let image = num("image_tokens");
+            (input.is_some() || image.is_some())
+                .then(|| input.unwrap_or(0).saturating_add(image.unwrap_or(0)))
+        }
+    };
+    let generic = usage_of(usage);
+    if prompt.is_none() && completion.is_none() && generic.is_none() {
+        return None;
+    }
+    Some(PassthroughUsage {
+        prompt_tokens: prompt.unwrap_or(0),
+        completion_tokens: completion.unwrap_or(0),
+        ..generic.unwrap_or_default()
+    })
 }
 
 /// Read every token dimension out of one `usage` object (or, for the
@@ -1676,6 +1783,42 @@ fn is_usage_labelled_frame(frame_text: &str) -> bool {
 ///
 /// Frames accumulate field-wise (see [`PassthroughUsage::merge`]) at the
 /// call site, so a partial report never truncates an earlier one.
+/// The upstream failure an SSE frame reports in-band, read with the same
+/// mappings the typed endpoints use for the protocol the route carries. An
+/// opaque (`Raw`) stream has no error envelope the gateway could recognise.
+fn frame_in_band_error(
+    protocol: PassthroughProtocol,
+    frame: &[u8],
+) -> Option<aisix_gateway::BridgeError> {
+    if matches!(protocol, PassthroughProtocol::Raw) {
+        return None;
+    }
+    let payload = crate::redact::frame_payload(frame)?;
+    let payload = payload.trim();
+    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    match protocol {
+        PassthroughProtocol::Raw => None,
+        PassthroughProtocol::OpenaiResponses => crate::responses::responses_in_band_error(&value),
+        // The chat envelope carries Anthropic Messages traffic too, whose
+        // in-band failure is a `type: "error"` event.
+        PassthroughProtocol::OpenaiChat | PassthroughProtocol::OpenaiCompletions => {
+            if value.get("type").and_then(|t| t.as_str()) == Some("error") {
+                if let Some(body) = value.get("error").and_then(|e| {
+                    serde_json::from_value::<
+                            aisix_provider_anthropic::wire::AnthropicStreamErrorBody,
+                        >(e.clone())
+                        .ok()
+                }) {
+                    return Some(
+                        aisix_provider_anthropic::wire::stream_error_into_bridge_error(&body),
+                    );
+                }
+            }
+            aisix_gateway::capture_in_band_error(payload, aisix_gateway::UpstreamWire::OpenAI)
+        }
+    }
+}
+
 fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<PassthroughUsage>) {
     let frame_text = String::from_utf8_lossy(frame);
     let usage_labelled = matches!(protocol, PassthroughProtocol::Raw)
@@ -1853,9 +1996,7 @@ fn stream_response(
                     // no status left to carry the failure — record it on the
                     // event instead of ending as a silent success.
                     let bridge = crate::dispatch::reqwest_error_to_bridge(&err, telemetry.started);
-                    telemetry.error_class =
-                        crate::attempt::routing_error_class(&bridge).to_string();
-                    telemetry.error_message = crate::attempt::attempt_error_message(&bridge);
+                    telemetry.record_failure(&bridge);
                     tracing::warn!(
                         route = %route_name,
                         error = %telemetry.error_message,
@@ -1875,6 +2016,9 @@ fn stream_response(
                     .min(u32::MAX as u128) as u32;
             }
             for frame in splitter.push(&chunk) {
+                if let Some(err) = frame_in_band_error(protocol, &frame) {
+                    telemetry.record_failure(&err);
+                }
                 let (delta, usage) = frame_delta(protocol, &frame);
                 if let Some(u) = usage {
                     telemetry.usage.merge(u);
@@ -2167,6 +2311,11 @@ struct RouteTelemetry {
     /// the response head is already on the wire.
     error_class: String,
     error_message: String,
+    /// The status that same failure gets before the response head
+    /// ([`aisix_gateway::BridgeError::http_status`]). The emit records it in
+    /// place of the upstream's `200`: the caller's response line cannot
+    /// change any more, but the record of what happened can.
+    failure_status: Option<u16>,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// The request's ENFORCE-mode audit handle (AISIX-Cloud#1330). Held
     /// rather than snapshotted at construction: this struct's emit runs
@@ -2181,6 +2330,19 @@ struct RouteTelemetry {
 }
 
 impl RouteTelemetry {
+    /// Record the upstream failure that ended a streamed relay after its
+    /// head went out. The first one is the cause; later ones do not replace
+    /// it.
+    fn record_failure(&mut self, err: &aisix_gateway::BridgeError) {
+        if self.failure_status.is_some() {
+            return;
+        }
+        let failure = crate::attempt::StreamFailure::from_bridge(err);
+        self.error_class = failure.error_class.to_string();
+        self.error_message = failure.error_message;
+        self.failure_status = Some(failure.status);
+    }
+
     /// Stamp the caller's wait at the first RELAYED frame handed
     /// downstream.
     ///
@@ -2210,8 +2372,14 @@ impl RouteTelemetry {
         // generator's end. The upstream status is then not what happened
         // to the request, so record the same 499 the typed streaming
         // endpoints do rather than a success the caller never received.
-        if self.streaming && !self.stream_reached_end {
-            self.status = crate::CLIENT_CLOSED_REQUEST;
+        // One an upstream failure ended records that failure's status
+        // instead, unless a guardrail refused it.
+        if self.streaming {
+            match self.failure_status.filter(|_| !self.guardrail_blocked) {
+                Some(status) => self.status = status,
+                None if !self.stream_reached_end => self.status = crate::CLIENT_CLOSED_REQUEST,
+                None => {}
+            }
         }
         let elapsed = self.started.elapsed();
         let snapshot = self.state.snapshot.load();
@@ -2849,6 +3017,30 @@ mod tests {
     }
 
     #[test]
+    fn frame_in_band_error_reads_the_protocol_s_own_failure_events() {
+        let anthropic = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n";
+        let err = frame_in_band_error(PassthroughProtocol::OpenaiChat, anthropic).unwrap();
+        // Anthropic documents 529 for overloaded; not a 4xx, so it maps to 502.
+        assert_eq!(err.http_status(), 502);
+        let openai =
+            br#"data: {"error":{"message":"slow down","type":"rate_limit_error","code":429}}
+
+"#;
+        let err = frame_in_band_error(PassthroughProtocol::OpenaiCompletions, openai).unwrap();
+        assert_eq!(err.http_status(), 429);
+        let responses = br#"data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"x"}}}
+
+"#;
+        assert!(frame_in_band_error(PassthroughProtocol::OpenaiResponses, responses).is_some());
+        // An opaque stream is never read for one, and ordinary frames are not one.
+        assert!(frame_in_band_error(PassthroughProtocol::Raw, openai).is_none());
+        let delta = br#"data: {"choices":[{"delta":{"content":"hel"}}]}
+
+"#;
+        assert!(frame_in_band_error(PassthroughProtocol::OpenaiChat, delta).is_none());
+    }
+
+    #[test]
     fn frame_delta_extracts_chat_content_and_usage() {
         let frame = br#"data: {"choices":[{"delta":{"content":"hel"}}]}
 
@@ -3175,9 +3367,12 @@ mod tests {
         // The no-phantom-tokens guarantee: a REST body that happens to carry
         // a usage-shaped object is not a usage report.
         let rpc = br#"{"jsonrpc":"2.0","id":1,"result":{"usage":{"prompt_tokens":99}}}"#;
-        assert_eq!(response_usage(PassthroughProtocol::Raw, rpc), None);
+        assert_eq!(response_usage(PassthroughProtocol::Raw, None, rpc), None);
         let top_level = br#"{"usage":{"prompt_tokens":99,"completion_tokens":9}}"#;
-        assert_eq!(response_usage(PassthroughProtocol::Raw, top_level), None);
+        assert_eq!(
+            response_usage(PassthroughProtocol::Raw, None, top_level),
+            None
+        );
     }
 
     #[test]
@@ -3232,19 +3427,23 @@ mod tests {
     fn requested_model_comes_only_from_a_detected_envelope() {
         let chat = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
         assert_eq!(
-            body_model_name(PassthroughProtocol::OpenaiChat, chat),
+            body_model_name(PassthroughProtocol::OpenaiChat, None, chat),
             "gpt-4o"
         );
         // An opaque body's `model`-shaped key belongs to some other API.
         let opaque = br#"{"model":"whatever","config_name":"x"}"#;
-        assert_eq!(body_model_name(PassthroughProtocol::Raw, opaque), "");
+        assert_eq!(body_model_name(PassthroughProtocol::Raw, None, opaque), "");
         // Caller-supplied, so bounded and control-char free before it
         // reaches telemetry.
         let hostile = format!(
             r#"{{"input":"x","model":"a\u0000b{}"}}"#,
             "z".repeat(REQUESTED_MODEL_CAP * 2)
         );
-        let name = body_model_name(PassthroughProtocol::OpenaiResponses, hostile.as_bytes());
+        let name = body_model_name(
+            PassthroughProtocol::OpenaiResponses,
+            None,
+            hostile.as_bytes(),
+        );
         assert_eq!(name.chars().count(), REQUESTED_MODEL_CAP);
         assert!(!name.contains('\0'));
     }
@@ -3409,7 +3608,7 @@ mod tests {
             "done"
         );
         assert_eq!(
-            response_usage(PassthroughProtocol::OpenaiResponses, resp),
+            response_usage(PassthroughProtocol::OpenaiResponses, None, resp),
             Some(usage_dims(11, 3))
         );
     }
@@ -3455,15 +3654,76 @@ mod tests {
     fn response_usage_reads_both_spellings() {
         let openai = br#"{"usage":{"prompt_tokens":5,"completion_tokens":2}}"#;
         assert_eq!(
-            response_usage(PassthroughProtocol::OpenaiChat, openai),
+            response_usage(PassthroughProtocol::OpenaiChat, None, openai),
             Some(usage_dims(5, 2))
         );
         let anthropicish = br#"{"usage":{"input_tokens":9,"output_tokens":4}}"#;
         assert_eq!(
-            response_usage(PassthroughProtocol::OpenaiChat, anthropicish),
+            response_usage(PassthroughProtocol::OpenaiChat, None, anthropicish),
             Some(usage_dims(9, 4))
         );
-        assert_eq!(response_usage(PassthroughProtocol::Raw, openai), None);
+        assert_eq!(response_usage(PassthroughProtocol::Raw, None, openai), None);
+    }
+
+    #[test]
+    fn raw_usage_shapes_are_claimed_only_from_raw_bodies() {
+        let shape = |b: &[u8]| detect_raw_usage_shape(detect_protocol(b), b);
+        // The LLM envelopes keep their classification.
+        let responses = br#"{"model":"m","input":"hi","documents":[],"query":"q"}"#;
+        assert_eq!(
+            detect_protocol(responses),
+            PassthroughProtocol::OpenaiResponses
+        );
+        assert_eq!(shape(responses), None);
+        let chat = br#"{"model":"m","messages":[],"input":{"x":1}}"#;
+        assert_eq!(shape(chat), None);
+        // Newly recognised among Raw bodies.
+        let rerank = br#"{"model":"m","query":"q","documents":["a"]}"#;
+        assert_eq!(shape(rerank), Some(RawUsageShape::Rerank));
+        let native = br#"{"model":"m","input":{"contents":[{"text":"hi"}]}}"#;
+        assert_eq!(shape(native), Some(RawUsageShape::DashscopeNative));
+        // Still opaque.
+        assert_eq!(shape(br#"{"model":"m","config_name":"x"}"#), None);
+        assert_eq!(
+            shape(br#"{"jsonrpc":"2.0","method":"m","params":{"input":{}}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn dashscope_native_usage_counts_image_tokens_once() {
+        let usage = |b: &[u8]| {
+            response_usage(
+                PassthroughProtocol::Raw,
+                Some(RawUsageShape::DashscopeNative),
+                b,
+            )
+        };
+        // Embedding: flat image tokens beside the text count, total reported.
+        let flat = br#"{"usage":{"input_tokens":44,"image_tokens":64,"total_tokens":108}}"#;
+        assert_eq!(usage(flat), Some(usage_dims(108, 0)));
+        // Generation: flat image tokens already inside input_tokens.
+        let generation = br#"{"usage":{"input_tokens":79,"image_tokens":66,"input_tokens_details":{"image_tokens":66,"text_tokens":13},"output_tokens":14,"total_tokens":93}}"#;
+        assert_eq!(usage(generation), Some(usage_dims(79, 14)));
+        let nested = br#"{"usage":{"input_tokens":903,"input_tokens_details":{"image_tokens":896,"text_tokens":7},"output_tokens":3,"total_tokens":906}}"#;
+        assert_eq!(usage(nested), Some(usage_dims(903, 3)));
+        // No total: images counted beside the text.
+        let no_total =
+            br#"{"usage":{"duration":0,"image_count":1,"image_tokens":128,"input_tokens":5}}"#;
+        assert_eq!(usage(no_total), Some(usage_dims(133, 0)));
+        let total_only = br#"{"output":{"results":[]},"usage":{"total_tokens":29}}"#;
+        assert_eq!(usage(total_only), Some(usage_dims(29, 0)));
+        // The generic dimensions ride along.
+        let cached = br#"{"usage":{"input_tokens":120,"output_tokens":30,"total_tokens":150,"prompt_tokens_details":{"cached_tokens":100},"output_tokens_details":{"reasoning_tokens":20}}}"#;
+        assert_eq!(
+            usage(cached),
+            Some(PassthroughUsage {
+                cached_prompt_tokens: 100,
+                reasoning_tokens: 20,
+                ..usage_dims(120, 30)
+            })
+        );
+        assert_eq!(usage(br#"{"code":"InvalidParameter","message":"x"}"#), None);
     }
 
     #[tokio::test]

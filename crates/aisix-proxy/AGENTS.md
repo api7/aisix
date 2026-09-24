@@ -43,7 +43,7 @@ the four errors when missed:
   budget (`routing::effective_timeouts`).
 - **The rate-limit reservation has to become a `into_stream_hold()`.** Dropping it
   at handler return releases the concurrency slot while the stream is still
-  running, which is how a key capped at N serves more than N at once (#450). The
+  running, which is how a key capped at N serves more than N at once. The
   terminal token cost then rides `Limiter::add_tokens_post_stream` instead of
   `commit_tokens`.
 - **The UsageEvent moves into the stream's Drop guard.** Counts that arrive on a
@@ -56,7 +56,7 @@ the four errors when missed:
   request is a way around the check the same request gets without it. That is
   `runs_on_output(chain) && chain.stream_output_policy().holds_back()`. A
   monitor-only chain resolves to `EndOfStreamCheck` and must NOT hold the stream
-  back (AISIX-Cloud#1010) — it takes the live path and scans once at
+  back — it takes the live path and scans once at
   end-of-stream via `guardrail_stream::EosOutputScan`.
 
 Retry semantics change too, and that is intended: the retryable unit ends at the
@@ -164,12 +164,10 @@ Note that `record_unevaluable_*` is the wrong helper at such a site: its
 predicate assumes the fail-closed case was already refused, so at a site that
 never refuses it would silently drop exactly the case worth reporting.
 
-What is no longer in that set is the multipart `prompt` on `audio.rs` and
-`images_edits.rs`: since #1016 both call
-`dispatch::require_utf8_prompt_fields` after model resolution and before the
-chain runs, so an undecodable `prompt` part is answered 400 and the
-`filter_map` in their scan builders can no longer be reached by one. Do not
-describe those surfaces as silently dropping non-UTF-8 prompt parts. Audio's
+The multipart `prompt` on `audio.rs` and `images_edits.rs` is not in that set:
+both call `dispatch::require_utf8_prompt_fields` after model resolution and
+before the chain runs, so an undecodable `prompt` part is answered 400 and the
+`filter_map` in their scan builders cannot be reached by one. Audio's
 transcript OUTPUT scan is a separate site and is gated rather than dropped:
 `transcription_output_text` reports whether the plain-text fallback (`text` /
 `srt` / `vtt`) had to decode lossily, and its caller runs the same gate as
@@ -207,8 +205,8 @@ when the request ends — so it parks the line on the attribution cell
 `usage_attr::emit_usage` with the request's TERMINAL usage event, whichever of
 the stream's endings produced it. That is what makes the line and the row agree
 on `status`, `error_class` and `error_message` by construction; writing the line
-at the tail instead reported every abandoned stream as a `200` beside its own
-`499` row (AISIX-Cloud#1571). Two consequences for a new streaming family: park
+at the tail instead would report every abandoned stream as a `200` beside its
+own `499` row. Two consequences for a new streaming family: park
 the line whenever the response IS a stream (a "telemetry already emitted" flag
 is NOT the same predicate — chat's buffered ensemble sets one), and make sure
 the stream really does emit a terminal usage event, because that emit is now
@@ -233,7 +231,7 @@ Emit the request metrics through `request_metrics::record` and nothing else. It
 writes the legacy `aisix_requests_total` **and** the detailed `aisix_proxy_*` /
 `aisix_llm_*` families from one call, so calling `Metrics::record_request`
 directly silently produces a request that exists in one family and not the
-others — the bug AISIX-Cloud#1234 fixed across ten endpoints.
+others.
 
 There is a third shape, and it reaches no tail at all: a caller that hangs up
 before the response head is written. axum **drops** the handler future, so the
@@ -245,8 +243,7 @@ standing rule: **anything a cancelled request must report has to be published to
 the request's attribution cell (`attribution.rs`) at a chokepoint the handlers
 already pass through — never held only in a handler local.** A value kept in a
 local is correct on every path except the one nobody tests, and the symptom is a
-missing row rather than an error (AISIX-Cloud#1571, where a fallback chain's
-failed attempts lived in a `RoutingTelemetry` local).
+missing row rather than an error.
 
 That guard's lifetime does **not** end when the handler returns: it rides the
 response body (`TelemetryBody`), because a streaming family's own terminal
@@ -270,8 +267,7 @@ a typed endpoint has a second home: a new `UsageEvent` token dimension needs
 reading in `usage_of`, a new guardrail scan input needs adding to
 `message_scan_text` / `request_guardrail_text`, a new attribution field needs
 setting on `RouteTelemetry`. Miss it and the route keeps answering 200 while
-metering and enforcement silently weaken — the shape of #988, where the cache
-and reasoning counters existed everywhere except here.
+metering and enforcement silently weaken.
 
 Two rules bound the extraction:
 
@@ -290,8 +286,7 @@ Adding a `.route(…)` in `build_router` is not enough, and nothing fails loudly
 if you stop there:
 
 1. `normalize_endpoint_label` — an unlisted path collapses to `"other"`, so the
-   route is invisible per-endpoint in every request series (how `/v1/videos`
-   shipped).
+   route is invisible per-endpoint in every request series.
 2. `request_metrics::LLM_ENDPOINTS` — decides whether the route counts as model
    inference. Unlisted means proxy-only, which is the safe default but a silent
    one.
@@ -355,8 +350,8 @@ never becomes a probe for which members exist.
 
 ## `request_id` is caller-controlled input, not a gateway-minted UUID
 
-Since AISIX-Cloud#1288 a caller can supply the request id via a configured inbound
-header and `request_id::ensure_request_id` adopts it verbatim, so every
+A caller can supply the request id via a configured inbound header, and
+`request_id::ensure_request_id` adopts it verbatim, so every
 `ClientContext.request_id` / `RequestId` value downstream may be a string the
 caller chose. It is only guaranteed to be 1..=256 bytes of visible ASCII
 (`request_id::is_acceptable`) — **not** a UUID, and not unique: nothing stops two

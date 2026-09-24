@@ -49,4 +49,6 @@ pub use redis::{
 };
 pub use semantic::{MemorySemanticCache, SemanticCacheStore, SemanticHit};
 #[cfg(feature = "redis")]
-pub use semantic_redis::{RedisSemanticCache, DEFAULT_PREFIX as SEMANTIC_REDIS_DEFAULT_PREFIX};
+pub use semantic_redis::{
+    ProbeOutcome, RedisSemanticCache, DEFAULT_PREFIX as SEMANTIC_REDIS_DEFAULT_PREFIX,
+};

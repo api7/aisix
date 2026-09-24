@@ -69,7 +69,8 @@ pub enum GuardrailHookPoint {
     Both,
 }
 
-/// How much of a request's message history an input guardrail reads.
+/// Which messages of a request an input guardrail considers — its window.
+/// What the guardrail reads inside the window depends on its kind.
 ///
 /// IDE and agent clients replay the whole conversation on every call, so a
 /// rule that matched once keeps matching for the rest of the session even
@@ -81,14 +82,19 @@ pub enum GuardrailHookPoint {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailInputMessages {
-    /// Read every message in the request, including replayed history and
-    /// system prompts.
+    /// The window is the whole request: system, developer, user, assistant
+    /// and tool messages alike.
     #[default]
     All,
-    /// Read only the messages after the last assistant message, excluding
-    /// system messages: the current user message together with any tool
-    /// results answering it. Messages the model has already replied to are
-    /// neither screened nor rewritten.
+    /// The window is only the messages after the last assistant message,
+    /// with system and developer messages excluded — this turn's user
+    /// messages together with the tool results answering them. That
+    /// assistant message is looked for only before the request's final
+    /// message other than a system or developer one, so a trailing
+    /// assistant prefill stays inside the current turn. For a request
+    /// carrying no assistant message, the window is the whole request
+    /// apart from its system and developer messages. Messages the model has
+    /// already replied to are neither screened nor rewritten.
     LatestTurn,
 }
 
@@ -1366,17 +1372,20 @@ pub struct Guardrail {
     #[serde(default)]
     pub hook_point: GuardrailHookPoint,
 
-    /// How much of the request this rule reads at the input hook.
+    /// Which messages of a request this rule's input check considers — its
+    /// window. What the rule reads inside the window depends on its kind:
+    /// some kinds read only its user messages by default.
     ///
-    /// `all` (the default) scans every message the caller sent, including
-    /// replayed history and system prompts. `latest_turn` scans only the
-    /// messages after the last assistant message, with system messages
-    /// excluded — the current user message plus any tool results answering
-    /// it. It exists for clients that resend the whole conversation on
-    /// every call, where a rule that matched one earlier message would
-    /// otherwise keep refusing the rest of the session.
+    /// `all` (the default) makes the window the whole request: system,
+    /// developer, user, assistant and tool messages alike. `latest_turn`
+    /// makes it only the messages after the last assistant message, with
+    /// system and developer messages excluded — the current user message
+    /// plus any tool results answering it. It exists for clients that
+    /// resend the whole conversation on every call, where a rule that
+    /// matched one earlier message would otherwise keep refusing the rest
+    /// of the session.
     ///
-    /// The narrowing governs everything the rule does on the request:
+    /// A rule reads, and can rewrite, only the messages in its window:
     /// under `latest_turn` a masking rule rewrites only the current turn,
     /// and messages outside it reach the upstream exactly as the caller
     /// sent them. A rule whose job is to mask the whole conversation

@@ -6,6 +6,7 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -200,7 +201,8 @@ describe("graceful drain e2e: SIGTERM stops readiness, not service", () => {
       // on its own. No SIGKILL, so the clean-shutdown path runs.
       await app.waitForExit(15_000);
       expect(await readyzStatus(proxyUrl)).toBe("refused");
-      expect(app.output()).toContain("drain complete");
+      // The exit event can precede the last of the child's log pipe.
+      await waitForLogLine(app, (l) => l.includes("drain complete"), "the drain-complete line");
     },
     60_000,
   );

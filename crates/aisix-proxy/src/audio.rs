@@ -515,16 +515,19 @@ pub async fn speech(
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
-            emit_access_log(
-                "POST",
-                "/v1/audio/speech",
-                &model_name,
-                &success.provider,
-                &api_key_id,
-                status,
-                elapsed,
-                &request_id,
-                None,
+            // The audio has not streamed yet — the caller may read it to the
+            // end or walk away, and the upstream may fail part-way. Park the
+            // line for the relay's own emitter to write beside the usage
+            // event (AISIX-Cloud#1571), as the transcription stream does.
+            crate::attribution::defer_access_log(
+                crate::attribution::PendingAccessLog::new(
+                    "POST",
+                    "/v1/audio/speech",
+                    &request_id,
+                    &api_key_id,
+                    started,
+                )
+                .with_model(&success.provider, &model_name),
             );
             // One ProviderKey lookup for the metric emit + the usage event
             // below (#941).
@@ -547,35 +550,68 @@ pub async fn speech(
             // with no usage block — emit a zero-token UsageEvent so the
             // request is visible in /logs and attributed to the api_key.
             // (TTS is billed per input character; that cost basis is the
-            // same cross-repo follow-up as audio duration.)
-            emit_usage_event(
-                &state,
-                &snapshot,
-                &pk,
-                &request_id,
-                &success.model_id,
-                &model_name,
-                &api_key_id,
-                "/v1/audio/speech",
-                crate::operation::SPEECH,
-                &success.provider,
-                &success.upstream_model,
-                &success.applied_guardrails,
-                status,
-                elapsed,
-                0,
-                0,
-                // TTS is billed per input character, not by the length of
-                // the audio it produced — no duration cost basis here.
-                0.0,
-                &client,
-                success.redactions,
-                success.monitor_hits,
-                /* guardrail_blocked */ false,
-                success.captured_content.as_ref(),
-                &audit,
-            );
-            success.response
+            // same cross-repo follow-up as audio duration.) Emitted when
+            // the audio ends, so it records how it ended: a caller that
+            // left is a 499, an upstream failure its own status.
+            let SpeechDispatchSuccess {
+                mut response,
+                body,
+                read_timeout,
+                provider,
+                model_id,
+                provider_key_id,
+                upstream_model,
+                applied_guardrails,
+                redactions,
+                monitor_hits,
+                captured_content,
+            } = success;
+            let state_c = state.clone();
+            let client_c = client.clone();
+            let request_id_c = request_id.clone();
+            let api_key_id_c = api_key_id.clone();
+            let model_name_c = model_name.clone();
+            let expected_len = response
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            let relayed = speech_relay(body, read_timeout, expected_len, move |outcome| {
+                // A stream can outlive several config generations, so the
+                // emit reads a FRESH snapshot (#941).
+                let snap = state_c.snapshot.load();
+                let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &provider_key_id);
+                emit_usage_event(
+                    &state_c,
+                    &snap,
+                    &pk,
+                    &request_id_c,
+                    &model_id,
+                    &model_name_c,
+                    &api_key_id_c,
+                    "/v1/audio/speech",
+                    crate::operation::SPEECH,
+                    &provider,
+                    &upstream_model,
+                    &applied_guardrails,
+                    crate::attempt::stream_status(outcome.reached_end, outcome.failure.as_ref()),
+                    started.elapsed(),
+                    0,
+                    0,
+                    // TTS is billed per input character, not by the length
+                    // of the audio it produced — no duration cost basis here.
+                    0.0,
+                    &client_c,
+                    redactions,
+                    monitor_hits,
+                    /* guardrail_blocked */ false,
+                    captured_content.as_ref(),
+                    &audit,
+                    outcome.failure.as_ref(),
+                );
+            });
+            *response.body_mut() = axum::body::Body::from_stream(relayed);
+            response
         }
         Err(err) => {
             let status = err.status().as_u16();
@@ -669,6 +705,9 @@ struct StreamedTranscript {
     terminal: Option<String>,
     /// False when the caller disconnected before the upstream ended.
     reached_end: bool,
+    /// The upstream failure that ended the stream after its `200` went out:
+    /// a transport error, a read timeout, or an in-band error envelope.
+    failure: Option<crate::attempt::StreamFailure>,
     /// End-of-stream monitor observations (AISIX-Cloud#1010).
     output_hits: Vec<aisix_core::GuardrailMonitorHit>,
 }
@@ -719,6 +758,59 @@ impl<F: FnOnce(StreamedTranscript)> Drop for TranscriptGuard<F> {
     }
 }
 
+/// Relay synthesized speech verbatim, firing `on_complete` once when the
+/// audio ends or the caller leaves, with how it ended: the upstream's
+/// failure, if one cut it short, and whether it ran to its end.
+fn speech_relay<S, F>(
+    upstream: S,
+    read_timeout: crate::stream_timeout::ReadTimeoutSignal,
+    // The `Content-Length` relayed to the caller, if any. The server stops
+    // polling a sized body once that many bytes are written, so the relay
+    // never sees its own end: reaching the length IS the end.
+    expected_len: Option<u64>,
+    on_complete: F,
+) -> impl futures::Stream<Item = reqwest::Result<Bytes>> + Send
+where
+    S: futures::Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+    F: FnOnce(StreamedTranscript) + Send + 'static,
+{
+    use futures::StreamExt as _;
+    // Anchors a timed-out read's reported elapsed time.
+    let started = std::time::Instant::now();
+    crate::request_id::in_request_span(async_stream::stream! {
+        // Built on the first poll, like every streaming family's guard: a
+        // body dropped before that is filed by the request's cancel guard
+        // (`crate::cancel`), and arming this one earlier would file it twice.
+        let mut guard = TranscriptGuard {
+            slot: Some((on_complete, StreamedTranscript::default())),
+        };
+        futures::pin_mut!(upstream);
+        let mut relayed: u64 = 0;
+        while let Some(item) = upstream.next().await {
+            match &item {
+                Ok(bytes) => {
+                    relayed += bytes.len() as u64;
+                    if expected_len.is_some_and(|len| relayed >= len) {
+                        guard.observed().reached_end = true;
+                    }
+                }
+                Err(e) => crate::attempt::StreamFailure::record(
+                    &mut guard.observed().failure,
+                    &crate::dispatch::reqwest_error_to_bridge(e, started),
+                ),
+            }
+            yield item;
+        }
+        if let Some(e) = read_timeout.fired() {
+            crate::attempt::StreamFailure::record(&mut guard.observed().failure, &e);
+        }
+        guard.observed().reached_end = true;
+        if let Some((f, observed)) = guard.slot.take() {
+            f(observed);
+        }
+    })
+}
+
 /// Relay a streamed transcription verbatim while reading its telemetry off
 /// the same bytes (#998).
 ///
@@ -734,6 +826,8 @@ impl<F: FnOnce(StreamedTranscript)> Drop for TranscriptGuard<F> {
 /// consumer sees past its own limit.
 fn transcription_relay<S, F>(
     upstream: S,
+    // Set when `upstream` ended on a read timeout rather than its own end.
+    read_timeout: crate::stream_timeout::ReadTimeoutSignal,
     content_cap: Option<u32>,
     eos_scan: Option<crate::guardrail_stream::EosOutputScan>,
     on_complete: F,
@@ -744,6 +838,8 @@ where
 {
     use futures::StreamExt as _;
 
+    // Anchors a timed-out read's reported elapsed time.
+    let started = std::time::Instant::now();
     let text_cap = content_cap
         .map(|cap| cap as usize)
         .unwrap_or(0)
@@ -788,7 +884,16 @@ where
                     decoder = None;
                 }
             }
+            if let Err(e) = &item {
+                crate::attempt::StreamFailure::record(
+                    &mut guard.observed().failure,
+                    &crate::dispatch::reqwest_error_to_bridge(e, started),
+                );
+            }
             yield item;
+        }
+        if let Some(e) = read_timeout.fired() {
+            crate::attempt::StreamFailure::record(&mut guard.observed().failure, &e);
         }
         if let Some(mut d) = decoder.take() {
             observe_transcript_events(
@@ -836,6 +941,12 @@ fn observe_transcript_events(
         let Ok(value) = serde_json::from_str::<Value>(payload) else {
             continue;
         };
+        if let Some(err) =
+            aisix_gateway::capture_in_band_error(payload, aisix_gateway::UpstreamWire::OpenAI)
+        {
+            crate::attempt::StreamFailure::record(&mut observed.failure, &err);
+            continue;
+        }
         if let Some(usage) = extract_token_usage(&value) {
             observed.usage = Some(usage);
         }
@@ -1353,8 +1464,14 @@ async fn multipart_dispatch(
             let client_c = client_ctx.clone();
             let captured_prompt_c = captured_prompt.clone();
 
+            let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
             let relayed = transcription_relay(
-                crate::stream_timeout::with_read_timeout_bytes(resp.bytes_stream(), stream_budget),
+                crate::stream_timeout::with_read_timeout_bytes_signalled(
+                    resp.bytes_stream(),
+                    stream_budget,
+                    read_timeout.clone(),
+                ),
+                read_timeout,
                 content_cap,
                 eos_scan,
                 move |outcome| {
@@ -1391,14 +1508,14 @@ async fn multipart_dispatch(
                         &upstream_model_c,
                         &applied_c,
                         // A caller that walked away mid-transcript is
-                        // reported as 499, matching the other streaming
+                        // reported as 499, an upstream failure as that
+                        // failure's status, matching the other streaming
                         // surfaces — the upstream work still happened, so
                         // the event is emitted either way.
-                        if outcome.reached_end {
-                            200
-                        } else {
-                            crate::CLIENT_CLOSED_REQUEST
-                        },
+                        crate::attempt::stream_status(
+                            outcome.reached_end,
+                            outcome.failure.as_ref(),
+                        ),
                         dispatch_started.elapsed(),
                         prompt_tokens,
                         completion_tokens,
@@ -1409,6 +1526,7 @@ async fn multipart_dispatch(
                         /* guardrail_blocked */ false,
                         captured_content.as_ref(),
                         &audit_c,
+                        outcome.failure.as_ref(),
                     );
                 },
             );
@@ -1681,7 +1799,14 @@ fn speech_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat 
 /// this carries only what the terminal emit needs — a struct rather than
 /// the tuple it used to be, matching `AudioDispatchSuccess` above.
 struct SpeechDispatchSuccess {
+    /// Headers only: the handler attaches the body through
+    /// [`speech_relay`], which owns the request's usage event.
     response: Response,
+    /// The upstream audio, bounded by the per-chunk read timeout and
+    /// holding the key's concurrency slot until it ends.
+    body: std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<Bytes>> + Send>>,
+    /// Set when `body` ended on a read timeout rather than its own end.
+    read_timeout: crate::stream_timeout::ReadTimeoutSignal,
     provider: String,
     model_id: String,
     provider_key_id: String,
@@ -1942,18 +2067,21 @@ async fn speech_dispatch(
     let stream_hold = reservation.into_stream_hold();
 
     let upstream_headers = upstream_resp.headers().clone();
-    let relayed = crate::request_id::in_request_span(async_stream::stream! {
+    let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
+    let signal = read_timeout.clone();
+    let body = Box::pin(async_stream::stream! {
         let _hold = stream_hold;
-        let inner = crate::stream_timeout::with_read_timeout_bytes(
+        let inner = crate::stream_timeout::with_read_timeout_bytes_signalled(
             upstream_resp.bytes_stream(),
             stream_budget,
+            signal,
         );
         futures::pin_mut!(inner);
         while let Some(item) = futures::StreamExt::next(&mut inner).await {
             yield item;
         }
     });
-    let mut out = axum::response::Response::new(axum::body::Body::from_stream(relayed));
+    let mut out = axum::response::Response::new(axum::body::Body::empty());
     copy_response_header(&upstream_headers, &mut out, header::CONTENT_TYPE);
     // Relayed verbatim when the upstream sent one, like `/v1/videos`'
     // content proxy: reqwest strips it only when it decompresses, which it
@@ -1963,6 +2091,8 @@ async fn speech_dispatch(
     copy_response_header(&upstream_headers, &mut out, header::CONTENT_LENGTH);
     Ok(SpeechDispatchSuccess {
         response: out,
+        body,
+        read_timeout,
         provider: provider_label,
         model_id: model_entry.id.to_string(),
         provider_key_id: pk_entry.id.to_string(),
@@ -2143,6 +2273,7 @@ fn emit_audio_usage(
         success.guardrail_blocked,
         success.captured_content.as_ref(),
         audit,
+        /* failure */ None,
     );
 }
 
@@ -2195,6 +2326,9 @@ fn emit_usage_event(
     // so the held-back relay's end-of-stream emit reports the output-hook
     // mask that ran after the handler frame was already gone.
     audit: &crate::usage_attr::GuardrailAudit,
+    // The upstream failure that ended a streamed transcript after its
+    // `200`; its class and message are the event's error fields.
+    failure: Option<&crate::attempt::StreamFailure>,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -2220,6 +2354,10 @@ fn emit_usage_event(
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
         guardrail_scores: crate::usage_attr::guardrail_scores(audit),
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
+        error_class: failure
+            .map(|f| f.error_class.to_string())
+            .unwrap_or_default(),
+        error_message: failure.map(|f| f.error_message.clone()).unwrap_or_default(),
         ..Default::default()
     };
     // Per-PK telemetry attribution, same lookup as chat / messages /
@@ -2493,6 +2631,8 @@ mod tests {
         let req = speech_req(r#"{"model":"my-tts","input":"hello","voice":"alloy"}"#);
         let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        // The event is emitted when the audio has streamed.
+        to_bytes(resp.into_body(), 65536).await.unwrap();
 
         let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
             .await
@@ -3323,6 +3463,37 @@ mod tests {
         assert_eq!(observed.text(), "日本");
     }
 
+    /// An error envelope inside a transcription stream is the upstream's
+    /// failure, recorded with the status its own code maps to; the
+    /// ordinary transcript events never are one.
+    #[test]
+    fn an_in_band_error_envelope_is_recorded_as_the_stream_s_failure() {
+        let mut observed = super::StreamedTranscript::default();
+        let events = [
+            r#"{"type":"transcript.text.delta","delta":"hel"}"#,
+            r#"{"type":"error","error":{"message":"slow down","type":"rate_limit_error","code":429}}"#,
+        ]
+        .map(|p| aisix_gateway::SseEvent::Data(p.to_string()));
+        super::observe_transcript_events(&mut observed, &events, 1024);
+        let failure = observed
+            .failure
+            .clone()
+            .expect("the error envelope is a failure");
+        assert_eq!(failure.status, 429);
+        assert_eq!(failure.error_class, "upstream_in_band");
+        assert!(failure.error_message.contains("slow down"));
+        assert_eq!(observed.text(), "hel");
+
+        let mut clean = super::StreamedTranscript::default();
+        let events = [
+            r#"{"type":"transcript.text.delta","delta":"hi"}"#,
+            r#"{"type":"transcript.text.done","text":"hi","error":null}"#,
+        ]
+        .map(|p| aisix_gateway::SseEvent::Data(p.to_string()));
+        super::observe_transcript_events(&mut clean, &events, 1024);
+        assert!(clean.failure.is_none());
+    }
+
     /// The SSE read is content-type gated: a `srt`/`vtt` transcript is
     /// `text/plain` and may legitimately contain a line starting with
     /// `data:`, which must never be decoded as a usage-bearing event.
@@ -3462,6 +3633,8 @@ mod tests {
             .unwrap();
         let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        // The event is emitted when the audio has streamed.
+        to_bytes(resp.into_body(), 65536).await.unwrap();
 
         let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
             .await

@@ -322,6 +322,7 @@ async fn screen_input(
     let verdict = crate::redact::moderate_body_scanning(
         &chain,
         crate::redact::Direction::Input,
+        Some(chat.model.as_str()),
         verdict,
         &mut screening.redactions,
         // The segment pass's monitor-mode observations belong on the same

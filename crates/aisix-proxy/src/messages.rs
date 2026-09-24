@@ -727,6 +727,7 @@ async fn dispatch(
         let verdict = crate::redact::moderate_body_scanning(
             resolved_chain.as_ref(),
             crate::redact::Direction::Input,
+            Some(chat.model.as_str()),
             verdict,
             redactions_out,
             monitor_hits_out,
@@ -1420,10 +1421,12 @@ async fn anthropic_passthrough_dispatch(
         // (pre-#554 behavior). A mid-stream stall truncates the forwarded
         // stream — there is no in-band error frame for an opaque passthrough.
         let stream_budget = timeouts.stream;
+        let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
         let wrapped: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
-            Box::pin(crate::stream_timeout::with_read_timeout_bytes(
+            Box::pin(crate::stream_timeout::with_read_timeout_bytes_signalled(
                 upstream_resp.bytes_stream(),
                 stream_budget,
+                read_timeout.clone(),
             ));
         let body_stream: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
             if timeouts.stream_configured {
@@ -1547,6 +1550,7 @@ async fn anthropic_passthrough_dispatch(
         );
         let parsed_stream = build_anthropic_passthrough_stream(
             body_stream,
+            read_timeout,
             started,
             attempt_started,
             stream_guardrail,
@@ -1641,17 +1645,25 @@ async fn anthropic_passthrough_dispatch(
                     // end-of-upstream marker instead; same answer, and this
                     // way `reached_end` keeps meaning what it says
                     // (AISIX-Cloud#1428).
-                    if usage.reached_end || usage.guardrail_blocked {
-                        200
-                    } else {
-                        crate::CLIENT_CLOSED_REQUEST
-                    },
+                    //
+                    // An upstream failure after the headers — a transport
+                    // error, a read timeout, an in-band `error` event — is
+                    // recorded as that failure's status and error.
+                    anthropic_stream_status(
+                        usage.reached_end,
+                        usage.guardrail_blocked,
+                        usage.failure.as_ref(),
+                    ),
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
                     attempt_started.elapsed(),
                     metrics,
                     &client_ctx_c,
-                    attempt_c.clone(),
+                    anthropic_stream_attempt(
+                        &attempt_c,
+                        usage.guardrail_blocked,
+                        usage.failure.as_ref(),
+                    ),
                     usage.guardrail_blocked,
                     applied_guardrails_c.clone(),
                     // #932: input-side mask counts captured before dispatch,
@@ -1814,6 +1826,7 @@ async fn anthropic_passthrough_dispatch(
                 let verdict = crate::redact::moderate_body(
                     resolved_chain.as_ref(),
                     crate::redact::Direction::Output,
+                    None,
                     verdict,
                     &mut output_seg_counts,
                     &mut output_monitor_hits,
@@ -2340,19 +2353,21 @@ async fn cross_provider_dispatch(
                     team_id_for_telem.as_deref(),
                     user_id_for_telem.as_deref(),
                     user_name_for_telem.as_deref(),
-                    // See the sibling passthrough path: an abandoned stream
-                    // is reported as 499, matching LiteLLM — and a guardrail
-                    // refusal is not an abandonment.
-                    if comp.reached_end || comp.guardrail_blocked {
-                        200
-                    } else {
-                        crate::CLIENT_CLOSED_REQUEST
-                    },
+                    // See the sibling passthrough path.
+                    anthropic_stream_status(
+                        comp.reached_end,
+                        comp.guardrail_blocked,
+                        comp.failure.as_ref(),
+                    ),
                     // Attempt-scoped — see the sibling passthrough path.
                     attempt_started_for_telem.elapsed(),
                     metrics,
                     &client_for_telem,
-                    attempt_for_telem.clone(),
+                    anthropic_stream_attempt(
+                        &attempt_for_telem,
+                        comp.guardrail_blocked,
+                        comp.failure.as_ref(),
+                    ),
                     comp.guardrail_blocked,
                     applied_guardrails_for_telem.clone(),
                     // #932: input-side mask counts captured before dispatch,
@@ -2443,6 +2458,7 @@ async fn cross_provider_dispatch(
         let verdict = crate::redact::moderate_body(
             resolved_chain.as_ref(),
             crate::redact::Direction::Output,
+            None,
             verdict,
             &mut output_seg_counts,
             &mut output_monitor_hits,
@@ -2717,6 +2733,7 @@ fn build_anthropic_sse_stream(
                     }
                 }
                 Err(e) => {
+                    crate::attempt::StreamFailure::record(&mut guard.comp().failure, &e);
                     // Hold-back: the held (unscanned) chunks are dropped —
                     // fail closed; only the error frame reaches the client.
                     let frame = format!(
@@ -2767,6 +2784,7 @@ fn build_anthropic_sse_stream(
                 let verdict = crate::redact::moderate_body(
                     chain.as_ref(),
                     crate::redact::Direction::Output,
+                    None,
                     verdict,
                     &mut seg_counts,
                     &mut seg_hits,
@@ -2923,6 +2941,35 @@ fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
     }
 }
 
+/// The usage-event status of a `/v1/messages` stream. A guardrail refusal
+/// stays a `200` whatever `reached_end` says (AISIX-Cloud#1428); otherwise see
+/// [`crate::attempt::stream_status`].
+fn anthropic_stream_status(
+    reached_end: bool,
+    guardrail_blocked: bool,
+    failure: Option<&crate::attempt::StreamFailure>,
+) -> u16 {
+    if guardrail_blocked {
+        200
+    } else {
+        crate::attempt::stream_status(reached_end, failure)
+    }
+}
+
+/// The attempt record of a `/v1/messages` stream's usage event, carrying
+/// the upstream failure that ended it, if any.
+fn anthropic_stream_attempt(
+    attempt: &AttemptInfo,
+    guardrail_blocked: bool,
+    failure: Option<&crate::attempt::StreamFailure>,
+) -> AttemptInfo {
+    let mut attempt = attempt.clone();
+    if let Some(f) = failure.filter(|_| !guardrail_blocked) {
+        f.apply_to(&mut attempt);
+    }
+    attempt
+}
+
 #[derive(Default)]
 struct AnthropicStreamCompletion {
     /// `true` once the upstream stream reached its end, i.e. the response
@@ -2973,6 +3020,9 @@ struct AnthropicStreamCompletion {
     /// but it must not read as a clean delivery (AISIX-Cloud#1428). Mirrors
     /// `chat::StreamCompletion::guardrail_blocked`.
     guardrail_blocked: bool,
+    /// The upstream error that ended the stream after its `200` went out.
+    /// The usage event reports it instead of a `200` or a `499`.
+    failure: Option<crate::attempt::StreamFailure>,
 }
 
 struct CompleteAnthropicStreamOnDrop<F: FnOnce(AnthropicStreamCompletion)> {
@@ -3381,6 +3431,10 @@ struct AnthropicStreamUsage {
     /// first — the generator is dropped at a suspension point and the tail
     /// never runs — which the telemetry closure reports as `499`.
     reached_end: bool,
+    /// The upstream failure that ended the stream after its `200` went out:
+    /// a transport error, a read timeout, or an in-band `error` event. The
+    /// usage event reports it instead of a `200` or a `499`.
+    failure: Option<crate::attempt::StreamFailure>,
     prompt_tokens: u32,
     completion_tokens: u32,
     cache_creation_tokens: u32,
@@ -3452,6 +3506,26 @@ fn update_anthropic_usage(
         acc.upstream_ttft_ms = attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
     }
     match json.get("type").and_then(Value::as_str) {
+        // Anthropic reports a failure inside a committed stream as an
+        // in-band `error` event, forwarded to the caller as-is.
+        Some("error") => {
+            let err = match json.get("error").and_then(|e| {
+                serde_json::from_value::<aisix_provider_anthropic::wire::AnthropicStreamErrorBody>(
+                    e.clone(),
+                )
+                .ok()
+            }) {
+                Some(body) => aisix_provider_anthropic::wire::stream_error_into_bridge_error(&body),
+                // An error event whose body does not parse is still one.
+                None => aisix_gateway::BridgeError::UpstreamInBand {
+                    status: None,
+                    message: "upstream reported an in-band stream error".to_string(),
+                    parsed: None,
+                    wire: aisix_gateway::UpstreamWire::Anthropic,
+                },
+            };
+            crate::attempt::StreamFailure::record(&mut acc.failure, &err);
+        }
         Some("message_start") => {
             let msg = json.get("message");
             if let Some(usage) = msg.and_then(|m| m.get("usage")) {
@@ -3753,6 +3827,8 @@ impl<T> Stream for AnthropicDeliveryCounter<T> {
 #[allow(clippy::too_many_arguments)]
 fn build_anthropic_passthrough_stream<S, F>(
     upstream: S,
+    // Set when `upstream` ended on a read timeout rather than its own end.
+    read_timeout: crate::stream_timeout::ReadTimeoutSignal,
     // Request clock — what the CALLER waited for
     // (`downstream_latency_ms`), spanning every earlier attempt.
     started: Instant,
@@ -3897,10 +3973,19 @@ where
             // accumulator keeps whatever was captured before it. In
             // hold-back mode an Err lands here too: it is forwarded and
             // the held (unscanned) content is dropped — fail closed.
+            if let Err(e) = &item {
+                crate::attempt::StreamFailure::record(
+                    &mut guard.usage().failure,
+                    &crate::dispatch::reqwest_error_to_bridge(e, attempt_started),
+                );
+            }
             yield item;
             if hold_policy.is_some() {
                 return;
             }
+        }
+        if let Some(e) = read_timeout.fired() {
+            crate::attempt::StreamFailure::record(&mut guard.usage().failure, &e);
         }
         // A non-conformant upstream can end without terminating its last
         // frame. Those bytes were never forwarded (they are still the
@@ -4091,6 +4176,7 @@ where
                 let verdict = crate::redact::moderate_body(
                     chain.as_ref(),
                     crate::redact::Direction::Output,
+                    None,
                     verdict,
                     &mut seg_counts,
                     &mut seg_hits,
@@ -4255,6 +4341,42 @@ fn emit_access_log(
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod stream_failure_tests {
+    use super::*;
+
+    /// Anthropic's in-band `error` event is the stream's failure, at the
+    /// status its error type documents; one whose body does not parse is
+    /// still one, just without a status of its own.
+    #[test]
+    fn an_in_band_error_event_is_recorded_even_when_its_body_does_not_parse() {
+        let mut first_token_seen = false;
+        let mut typed = AnthropicStreamUsage::default();
+        let event = serde_json::json!({
+            "type": "error",
+            "error": {"type": "rate_limit_error", "message": "slow down"},
+        });
+        update_anthropic_usage(&mut typed, &event, Instant::now(), &mut first_token_seen);
+        let failure = typed.failure.expect("a typed error event is a failure");
+        assert_eq!(failure.status, 429);
+        assert!(failure.error_message.contains("slow down"));
+
+        let mut malformed = AnthropicStreamUsage::default();
+        let event = serde_json::json!({"type": "error", "error": "not an object"});
+        update_anthropic_usage(
+            &mut malformed,
+            &event,
+            Instant::now(),
+            &mut first_token_seen,
+        );
+        let failure = malformed
+            .failure
+            .expect("a malformed error event is still a failure");
+        assert_eq!(failure.status, 502);
+        assert_eq!(failure.error_class, "upstream_in_band");
+    }
+}
 
 #[cfg(test)]
 mod tests {

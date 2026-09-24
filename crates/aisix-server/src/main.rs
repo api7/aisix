@@ -67,7 +67,7 @@ mod managed_bundle;
 mod telemetry;
 
 use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore, FileManagedStore};
-use aisix_cache::{Cache, MemoryCache, RedisCache};
+use aisix_cache::{Cache, MemoryCache};
 use aisix_core::models::Adapter;
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{
@@ -94,7 +94,7 @@ use tokio::sync::watch;
 #[derive(Debug, Parser)]
 #[command(
     name = "aisix",
-    version = aisix_core::BUILD_VERSION,
+    version = aisix_core::BUILD_VERSION.as_str(),
     about = "aisix AI Gateway",
     subcommand_negates_reqs = true
 )]
@@ -786,7 +786,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     etcd_prefix.clone(),
                     connect_options.clone(),
                     cfg.etcd.request_timeout(),
-                    cfg.etcd.dial_timeout(),
+                    cfg.etcd.dial_budget(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
@@ -801,7 +801,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     global_prefix.clone(),
                     connect_options.clone(),
                     cfg.etcd.request_timeout(),
-                    cfg.etcd.dial_timeout(),
+                    cfg.etcd.dial_budget(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
@@ -822,7 +822,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     Arc::new(aisix_etcd::LazyEtcdClient::new(
                         cfg.etcd.endpoints.clone(),
                         connect_options.clone(),
-                        cfg.etcd.dial_timeout(),
+                        cfg.etcd.dial_budget(),
                     )),
                     etcd_prefix.clone(),
                     cfg.etcd.request_timeout(),
@@ -943,12 +943,50 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 backend = "redis",
                 "connecting shared rate-limit backend"
             );
-            // No URL in the message: redis URLs carry credentials.
-            let store = RedisStore::connect(redis_cfg)
+            aisix_redis::warn_on_credential_shadowing(redis_cfg);
+            // A Redis that is unreachable HERE does not stop the boot: the
+            // listeners must bind whether or not the shared counters are
+            // reachable, and the store degrades to per-replica counting
+            // and re-attaches on its own.
+            let (store, degraded) = RedisStore::connect_or_attach_later(redis_cfg)
                 .await
                 .map_err(|e| {
                     anyhow::anyhow!("redis rate-limit connect failed (ratelimit.redis): {e}")
-                })?
+                })?;
+            if let Some(e) = degraded {
+                // Host and port only, never the configured URL: redis URLs
+                // carry credentials. `error` is as specific as the driver
+                // allows: it passes a refused `SELECT` through with the
+                // server's own text, but replaces a refused AUTH with a
+                // fixed "Password authentication failed", so the WARN can
+                // promise the refusal and not always which setting.
+                let reason = aisix_redis::failure_reason(&e);
+                let endpoint = aisix_redis::endpoint_label(redis_cfg);
+                if reason == "refused" {
+                    tracing::warn!(
+                        target: "aisix::ratelimit",
+                        backend = "redis",
+                        %endpoint,
+                        %reason,
+                        error = %e,
+                        "shared rate-limit backend REFUSED the configured connection \
+                         settings at startup; serving with per-replica in-memory counting \
+                         (cluster limits not enforced) and retrying in the background"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "aisix::ratelimit",
+                        backend = "redis",
+                        %endpoint,
+                        %reason,
+                        error = %e,
+                        "shared rate-limit backend unreachable at startup; serving with \
+                         per-replica in-memory counting (cluster limits not enforced) and \
+                         attaching the shared backend in the background"
+                    );
+                }
+            }
+            let store = store
                 .with_conc_ttl(cfg.ratelimit.concurrency_ttl_secs)
                 .with_env_namespace(&cfg.etcd.env_id)
                 .with_metrics((*metrics).clone());
@@ -1013,103 +1051,123 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         .redis
         .as_ref()
         .map(|c| (c, aisix_cache::FailurePolicy::new(c)));
-    let redis_cache: Option<Arc<dyn Cache>> = match &cache_redis {
-        Some((redis_cfg, policy)) => {
-            tracing::info!(target: "aisix::cache", backend = "redis", "connecting cache backend");
-            let redis = RedisCache::connect_with(redis_cfg, policy)
-                .await
-                .map_err(|e| {
-                    // Deliberately no URL in the message: redis URLs carry
-                    // credentials (redis://user:pass@host) and this error
-                    // lands in logs that may ship to centralized sinks.
-                    anyhow::anyhow!("redis cache connect failed (cache.redis): {e}")
-                })?
+    // A Redis that is unreachable HERE does not stop the boot either.
+    // The cache's whole failure contract is already a miss — every
+    // operation on both stores fails open to one — and a RUNNING gateway
+    // rides out an unbounded cache-Redis outage that way, so a boot that
+    // exited instead was the odd one out. It also took down precisely the
+    // deployment this release is fixing: `config.example.yaml` says the
+    // rate limiter may point at the same Redis as the cache, and with
+    // both blocks on one unreachable server the limiter degraded
+    // correctly and then the cache killed the process anyway.
+    let exact_slot = aisix_redis::ConnSlot::empty();
+    if let Some(redis_cfg) = cache_redis.as_ref() {
+        aisix_redis::warn_on_credential_shadowing(redis_cfg.0);
+    }
+    let redis_cache: Option<Arc<dyn Cache>> = cache_redis.as_ref().map(|_| {
+        Arc::new(
+            aisix_cache::RedisCache::with_slot(exact_slot.clone())
                 .with_env_namespace(&cfg.etcd.env_id)
-                .with_metrics((*metrics).clone());
-            Some(Arc::new(redis) as Arc<dyn Cache>)
-        }
-        None => None,
-    };
-    // Shared semantic (L2) store for `backend: redis` policies. Wired
-    // only when the server passes the vector-search probe — a plain
-    // Redis 6/7 (or cluster mode, unsupported yet) degrades those
-    // policies to exact-only, loudly, HERE at boot rather than
-    // silently per request.
-    let semantic_redis: Option<Arc<dyn aisix_cache::SemanticCacheStore>> = match &cache_redis {
-        Some((redis_cfg, _)) if redis_cfg.mode == aisix_core::RedisMode::Cluster => {
+                .with_metrics((*metrics).clone()),
+        ) as Arc<dyn Cache>
+    });
+    let cache_backends = CacheBackends::new(Arc::new(MemoryCache::with_defaults()), redis_cache);
+    if let Some((redis_cfg, policy)) = &cache_redis {
+        tracing::info!(target: "aisix::cache", backend = "redis", "connecting cache backend");
+        // Cluster mode has no vector search yet, so nothing is ever
+        // published into the semantic cell there.
+        let semantic_cell = (redis_cfg.mode != aisix_core::RedisMode::Cluster)
+            .then(|| cache_backends.semantic_redis_cell());
+        if semantic_cell.is_none() {
             tracing::warn!(
                 target: "aisix::cache",
                 "cache.redis is in cluster mode; semantic matching on backend=redis \
                  policies is not supported yet and stays exact-only"
             );
-            None
         }
-        Some((redis_cfg, policy)) => {
-            // Degrade (never abort) on any failure here: the exact
-            // redis cache above is the load-bearing connection; the
-            // semantic store is an optimization layer.
-            //
-            // `connect_with`, on the policy the exact cache is already
-            // running under: separate connection, one shared cool-off.
-            match aisix_cache::RedisSemanticCache::connect_with(redis_cfg, policy).await {
-                Err(e) => {
+        match attach_cache_backends(
+            &exact_slot,
+            semantic_cell.as_deref(),
+            redis_cfg,
+            policy,
+            &cfg.etcd.env_id,
+            &metrics,
+        )
+        .await
+        {
+            Ok(CacheAttach::Settled) => {}
+            // The exact half is up, so `backend: redis` policies are
+            // being served — but the vector-search question has not been
+            // answered, and dropping it here would mean exact-only for
+            // the life of the process on a server that may well support
+            // it. A task carries on asking.
+            Ok(CacheAttach::SemanticPending) => {
+                tracing::warn!(
+                    target: "aisix::cache",
+                    backend = "redis",
+                    endpoint = %aisix_redis::endpoint_label(redis_cfg),
+                    "cache.redis connected but the vector-search probe did not \
+                     complete; semantic matching on backend=redis policies stays \
+                     exact-only until it does, and is retried in the background"
+                );
+                spawn_cache_attach(
+                    exact_slot.clone(),
+                    semantic_cell,
+                    (*redis_cfg).clone(),
+                    policy.clone(),
+                    cfg.etcd.env_id.clone(),
+                    (*metrics).clone(),
+                );
+            }
+            // A config the process rejected by ITSELF is still fatal:
+            // retrying a typo'd `ca_file` forever would leave the gateway
+            // healthy and permanently uncached, which is worse than the
+            // boot failure it replaced. A server that answered and
+            // refused is degraded around instead — it can be corrected
+            // server-side while this gateway keeps serving.
+            Err(e) if aisix_redis::is_boot_fatal(&e) => {
+                anyhow::bail!("redis cache connect failed (cache.redis): {e}");
+            }
+            Err(e) => {
+                // Deliberately no URL: redis URLs carry credentials
+                // (redis://user:pass@host) and this error lands in logs
+                // that may ship to centralized sinks. `error` is as
+                // specific as the driver allows — see the rate-limit
+                // site above.
+                let reason = aisix_redis::failure_reason(&e);
+                let endpoint = aisix_redis::endpoint_label(redis_cfg);
+                if reason == "refused" {
                     tracing::warn!(
                         target: "aisix::cache",
+                        backend = "redis",
+                        %endpoint,
+                        %reason,
                         error = %e,
-                        "redis semantic cache connect failed; semantic matching \
-                         on backend=redis policies stays exact-only"
+                        "cache backend REFUSED the configured connection settings at \
+                         startup; serving with backend=redis cache policies treated as \
+                         misses and retrying in the background"
                     );
-                    None
+                } else {
+                    tracing::warn!(
+                        target: "aisix::cache",
+                        backend = "redis",
+                        %endpoint,
+                        %reason,
+                        error = %e,
+                        "cache backend unreachable at startup; serving with backend=redis \
+                         cache policies treated as misses and attaching in the background"
+                    );
                 }
-                Ok(store) => {
-                    let store = store
-                        .with_env_namespace(&cfg.etcd.env_id)
-                        .with_metrics((*metrics).clone());
-                    match store.probe().await {
-                        Ok(()) => {
-                            match store.sweep_empty_indexes().await {
-                                Ok(dropped) if dropped > 0 => {
-                                    tracing::info!(
-                                        target: "aisix::cache",
-                                        dropped,
-                                        "reclaimed empty semantic-cache indexes"
-                                    );
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    tracing::warn!(
-                                        target: "aisix::cache",
-                                        error = %e,
-                                        "semantic-cache index sweep failed; continuing"
-                                    );
-                                }
-                            }
-                            tracing::info!(
-                                target: "aisix::cache",
-                                "cache.redis supports vector search; semantic matching \
-                                 enabled for backend=redis policies"
-                            );
-                            Some(Arc::new(store) as Arc<dyn aisix_cache::SemanticCacheStore>)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "aisix::cache",
-                                error = %e,
-                                "cache.redis has no vector-search support; semantic matching \
-                                 on backend=redis policies stays exact-only"
-                            );
-                            None
-                        }
-                    }
-                }
+                spawn_cache_attach(
+                    exact_slot.clone(),
+                    semantic_cell,
+                    (*redis_cfg).clone(),
+                    policy.clone(),
+                    cfg.etcd.env_id.clone(),
+                    (*metrics).clone(),
+                );
             }
         }
-        None => None,
-    };
-    let mut cache_backends =
-        CacheBackends::new(Arc::new(MemoryCache::with_defaults()), redis_cache);
-    if let Some(store) = semantic_redis {
-        cache_backends = cache_backends.with_semantic_redis(store);
     }
     let cache = Some(cache_backends);
 
@@ -1560,7 +1618,9 @@ fn build_etcd_connect_options_with_extra_ca(
 
     // `with_connect_timeout` bounds establishing the channel only; it is
     // not a deadline on the calls made over it (that is
-    // `etcd.request_timeout_ms`, applied per call).
+    // `etcd.request_timeout_ms`, applied per call). Per ATTEMPT, so the
+    // per-endpoint value rather than `dial_budget`, which is what bounds
+    // the whole dial one level up.
     if let Some(dial) = etcd.dial_timeout() {
         options = options.with_connect_timeout(dial);
         needs_options = true;
@@ -1611,6 +1671,227 @@ fn build_etcd_connect_options_with_extra_ca(
     }
 
     Ok(needs_options.then_some(options))
+}
+
+/// How often a gateway that started without its cache backend re-states
+/// that `backend: redis` policies are being served as misses. Same
+/// reasoning, and same interval, as the rate limiter's: a Redis that is
+/// merely late says nothing beyond the boot WARN, while a permanent
+/// misconfiguration stays greppable in any retained log window.
+const CACHE_DEGRADED_REMINDER: Duration = Duration::from_secs(300);
+
+/// How far [`attach_cache_backends`] got.
+///
+/// The two connections do not settle together, and the difference is
+/// what tells the retry loop whether to stop. A semantic connection that
+/// failed, or a probe that never reached an answer, leaves the question
+/// open — and giving up on it would mean exact-only for the life of the
+/// process on a server that may well do vector search.
+enum CacheAttach {
+    /// Both halves are settled: the exact connection is up, and the
+    /// vector-search question has a final answer — published, or
+    /// answered no by a server that answered.
+    Settled,
+    /// The exact connection is up; the vector-search question is still
+    /// open. Keep asking.
+    SemanticPending,
+}
+
+/// Connect the cache subsystem and publish what it got.
+///
+/// The exact-KV connection is what the subsystem IS: failing it fails
+/// this call, and the caller decides whether that is a boot warning or a
+/// retry that has not landed yet. The vector-search half never fails
+/// this call — it reports through [`CacheAttach`] instead, because its
+/// failure is not the subsystem's.
+///
+/// The semantic store is BUILT here rather than handed in, because the
+/// question it answers — does this server do vector search at all — can
+/// only be asked of a live connection. Publishing it is the yes; leaving
+/// the cell empty is the no, and that is the same "no" a `cache.redis`
+/// without the search module has always produced: the gate reports it
+/// once per policy and then serves exact-only, with no embedding call
+/// and no Redis round trip per request. A store published with a dead
+/// connection would instead charge an embedding call for every semantic
+/// lookup for the life of the process, which is why nothing is published
+/// until the probe has passed.
+///
+/// Re-entrant: the retry loop calls it again for the half that has not
+/// settled, and neither half is re-dialled once it has.
+async fn attach_cache_backends(
+    exact: &aisix_redis::ConnSlot,
+    semantic: Option<&aisix_proxy::SemanticRedisCell>,
+    cfg: &aisix_core::RedisConnConfig,
+    policy: &aisix_cache::FailurePolicy,
+    env_id: &str,
+    metrics: &Metrics,
+) -> Result<CacheAttach, aisix_redis::ConnectError> {
+    if !exact.is_attached() {
+        exact.attach(aisix_redis::connect_bounded(cfg, policy).await?);
+    }
+    let Some(cell) = semantic else {
+        return Ok(CacheAttach::Settled);
+    };
+    if cell.get().is_some() {
+        return Ok(CacheAttach::Settled);
+    }
+    // Its own connection — same policy, so the two share one cool-off,
+    // but separate so they do not serialize on one pipeline.
+    let conn = match aisix_redis::connect_bounded(cfg, policy).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            // Not settled: the exact connection landing a moment earlier
+            // says the server is there, so this is a blip — a connection
+            // limit, a restart between the two dials — and the answer is
+            // still unknown rather than no.
+            tracing::debug!(
+                target: "aisix::cache",
+                error = %e,
+                "redis semantic cache connect failed; retrying"
+            );
+            return Ok(CacheAttach::SemanticPending);
+        }
+    };
+    let store = aisix_cache::RedisSemanticCache::from_conn(conn)
+        .with_env_namespace(env_id)
+        .with_metrics(metrics.clone());
+    match store.probe_outcome().await {
+        aisix_cache::ProbeOutcome::Inconclusive(e) => {
+            // The probe did not reach an answer. Recording "no vector
+            // search" on that would be recording a timeout as a server
+            // capability, for the life of the process.
+            tracing::debug!(
+                target: "aisix::cache",
+                error = %e,
+                "vector-search probe did not complete; retrying"
+            );
+            return Ok(CacheAttach::SemanticPending);
+        }
+        aisix_cache::ProbeOutcome::Unsupported(e) => {
+            tracing::warn!(
+                target: "aisix::cache",
+                error = %e,
+                "cache.redis has no vector-search support; semantic matching \
+                 on backend=redis policies stays exact-only"
+            );
+            return Ok(CacheAttach::Settled);
+        }
+        aisix_cache::ProbeOutcome::Supported => {}
+    }
+    match store.sweep_empty_indexes().await {
+        Ok(dropped) if dropped > 0 => {
+            tracing::info!(target: "aisix::cache", dropped, "reclaimed empty semantic-cache indexes");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                target: "aisix::cache",
+                error = %e,
+                "semantic-cache index sweep failed; continuing"
+            );
+        }
+    }
+    let _ = cell.set(Arc::new(store) as Arc<dyn aisix_cache::SemanticCacheStore>);
+    tracing::info!(
+        target: "aisix::cache",
+        "cache.redis supports vector search; semantic matching \
+         enabled for backend=redis policies"
+    );
+    Ok(CacheAttach::Settled)
+}
+
+/// Keep trying the cache backend until both halves settle, then stop.
+///
+/// Same cadence and same reasoning as the rate limiter's attach task: one
+/// attempt per configured budget, off the request path, so the
+/// node-reboot case — Redis coming up seconds after the gateway —
+/// recovers in seconds.
+///
+/// It does NOT stop as soon as the exact connection lands. The semantic
+/// half is a second connection and a capability question, and either can
+/// miss for a transient reason; giving up on the first attempt would
+/// leave every semantic policy exact-only for the life of the process on
+/// a server that does support vector search.
+fn spawn_cache_attach(
+    exact: aisix_redis::ConnSlot,
+    semantic: Option<Arc<aisix_proxy::SemanticRedisCell>>,
+    cfg: aisix_core::RedisConnConfig,
+    policy: aisix_cache::FailurePolicy,
+    env_id: String,
+    metrics: Metrics,
+) {
+    tokio::spawn(async move {
+        let retry = Duration::from_secs(cfg.timeout_secs.max(1));
+        let endpoint = aisix_redis::endpoint_label(&cfg);
+        let mut last_reminder = std::time::Instant::now();
+        let mut announced = false;
+        loop {
+            tokio::time::sleep(retry).await;
+            match attach_cache_backends(
+                &exact,
+                semantic.as_deref(),
+                &cfg,
+                &policy,
+                &env_id,
+                &metrics,
+            )
+            .await
+            {
+                Ok(settled) => {
+                    // Announced on the first round that gets the exact
+                    // connection up, not on every subsequent semantic
+                    // retry: that is when `backend: redis` policies start
+                    // being served again.
+                    if !announced {
+                        announced = true;
+                        tracing::info!(
+                            target: "aisix::cache",
+                            %endpoint,
+                            "cache backend attached; backend=redis policies are served again"
+                        );
+                    }
+                    if matches!(settled, CacheAttach::Settled) {
+                        return;
+                    }
+                }
+                Err(e) if last_reminder.elapsed() >= CACHE_DEGRADED_REMINDER => {
+                    last_reminder = std::time::Instant::now();
+                    // Same `reason` the boot line carried, so the two read
+                    // as one story and one filter finds both.
+                    let reason = aisix_redis::failure_reason(&e);
+                    if reason == "refused" {
+                        tracing::warn!(
+                            target: "aisix::cache",
+                            %endpoint,
+                            %reason,
+                            error = %e,
+                            "cache backend is still REFUSING the configured connection \
+                             settings; every backend=redis cache policy is being served \
+                             as a miss"
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "aisix::cache",
+                            %endpoint,
+                            %reason,
+                            error = %e,
+                            "cache backend still unreachable; every backend=redis cache \
+                             policy is being served as a miss"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "aisix::cache",
+                        %endpoint,
+                        error = %e,
+                        retry_secs = retry.as_secs(),
+                        "cache backend still unreachable; serving misses"
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Extract the host portion of a URL-like endpoint (`http://host:2379`,

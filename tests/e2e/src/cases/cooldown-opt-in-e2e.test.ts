@@ -9,6 +9,8 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
+  waitForLogLines,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -272,14 +274,12 @@ describe("an enabled cooldown records the exclusion it causes", () => {
     expect(second.choices[0]?.message.content).toBe("survivor-served");
     expect(failing.receivedRequests.length - beforeSecond).toBe(0);
 
-    const out = app.output();
-    const excluded = out
-      .split("\n")
-      .filter((l) => l.includes("routing candidate excluded before dispatch"));
-    expect(
-      excluded.length,
-      `no exclusion line in gateway output:\n${out}`,
-    ).toBeGreaterThan(0);
+    const excluded = await waitForLogLines(
+      app,
+      (l) => l.includes("routing candidate excluded before dispatch"),
+      1,
+      "the exclusion line",
+    );
     const line = excluded[0]!;
     expect(line).toContain("excl-primary");
     expect(line).toContain("excl-router");
@@ -293,15 +293,13 @@ describe("an enabled cooldown records the exclusion it causes", () => {
     // judged against — so an operator can tell "the status was not in
     // the list" from "the list never reached the gateway". Before this
     // change only /v1/chat/completions wrote such a line at all.
-    const failures = out
-      .split("\n")
-      .filter((l) => l.includes("routing target attempt failed"));
-    expect(
-      failures.length,
-      `no attempt-failure line in gateway output:\n${out}`,
-    ).toBeGreaterThan(0);
-    expect(failures[0]!).toContain("excl-primary");
-    expect(failures[0]!).toContain("fallback_on_statuses=[418]");
+    const failure = await waitForLogLine(
+      app,
+      (l) => l.includes("routing target attempt failed"),
+      "the attempt-failure line",
+    );
+    expect(failure).toContain("excl-primary");
+    expect(failure).toContain("fallback_on_statuses=[418]");
   });
 });
 
@@ -440,10 +438,12 @@ describe("every routing endpoint records a failed target attempt", () => {
       input: "hello",
     });
 
-    const failures = app
-      .output()
-      .split("\n")
-      .filter((l) => l.includes("routing target attempt failed"));
+    const failures = await waitForLogLines(
+      app,
+      (l) => l.includes("routing target attempt failed"),
+      3,
+      "an attempt-failure line per endpoint family",
+    );
     // Each of the three requests failed on its group's only target, and
     // each target is addressed by exactly one endpoint — so every one of
     // the three emitters is pinned on its own.

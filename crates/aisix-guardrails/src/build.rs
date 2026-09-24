@@ -935,6 +935,19 @@ impl Guardrail for MonitorGuardrail {
         self.observe_segments("input", self.inner.moderate_input_segments(texts).await)
     }
 
+    async fn moderate_input_segments_for_model(
+        &self,
+        texts: &[String],
+        model: Option<&str>,
+    ) -> SegmentsOutcome {
+        self.observe_segments(
+            "input",
+            self.inner
+                .moderate_input_segments_for_model(texts, model)
+                .await,
+        )
+    }
+
     async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
         self.observe_segments("output", self.inner.moderate_output_segments(texts).await)
     }
@@ -2007,6 +2020,33 @@ mod tests {
         let wire = serde_json::to_string(&hits).unwrap();
         assert!(!wire.contains("telemetry-secret"), "{wire}");
         assert!(!wire.contains("customer-private-text"), "{wire}");
+    }
+
+    /// A monitor-mode row must hand the addressed model through to its
+    /// script on the segment pass, or a staged model policy never records
+    /// the hit it would enforce.
+    #[tokio::test]
+    async fn custom_monitor_passes_the_model_through_the_segment_pass() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "custom-monitor-model",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "custom-monitor-model",
+                    "enforcement_mode": "monitor",
+                    "kind": "custom",
+                    "script": "export function checkInput(ctx) { return ctx.model === 'restricted' ? { action: 'block' } : { action: 'none' }; }"
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let outcome = chain
+            .moderate_input_segments_for_model(&["hi".to_owned()], Some("restricted"))
+            .await;
+        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+        assert_eq!(outcome.monitor_hits.len(), 1, "{:?}", outcome.monitor_hits);
+        assert_eq!(outcome.monitor_hits[0].action, "would_block");
     }
 
     #[tokio::test]

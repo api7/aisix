@@ -158,11 +158,11 @@ export interface AppOverrides {
    * `false` returns as soon as the process is spawned, for the one shape
    * `awaitProxyListener` cannot express: a gateway that binds nothing at
    * all. The boot dials etcd before any listener is opened, so an
-   * endpoint that accepts TCP and then goes silent — with
-   * `dial_timeout_ms` unset, which is the shipped default — leaves the
-   * process running with no port at all. A spec that opts out has only
-   * `output()` to assert on, so it must poll for the line it expects
-   * rather than assume the binary got anywhere.
+   * endpoint that accepts TCP and then goes silent leaves the process
+   * running with no port at all — which now takes an explicit
+   * `dial_timeout_ms: 0`, since the key defaults to 5000 ms. A spec that
+   * opts out has only `output()` to assert on, so it must poll for the
+   * line it expects rather than assume the binary got anywhere.
    */
   awaitListeners?: boolean;
   /**
@@ -375,11 +375,13 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     ...(fileMode
       ? { resources_file: resourcesPath }
       : {
-          // No `dial_timeout_ms` / `request_timeout_ms`: unset is the
-          // shipped default and means unbounded. A suite-wide bound on
-          // the configuration range read would be a source of flakes
-          // that no case is asking for; the cases that ARE about those
-          // keys set them through `extra`.
+          // Neither timeout key is set: `request_timeout_ms` is then
+          // unbounded, which is the shipped default — a suite-wide bound
+          // on the configuration range read would be a source of flakes
+          // that no case is asking for. `dial_timeout_ms` takes its own
+          // shipped default (5000 ms) here for the same reason, so the
+          // suite exercises what an operator ships with; the cases that
+          // ARE about those keys set them through `extra`.
           etcd: {
             endpoints: [etcdEndpoint()],
             prefix: etcdPrefix,

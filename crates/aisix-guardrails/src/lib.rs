@@ -165,7 +165,8 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
 }
 
 /// The messages a `input_messages: latest_turn` guardrail may read: every
-/// message after the last assistant one, with system messages dropped.
+/// message after the last assistant one, with system and developer
+/// messages dropped.
 ///
 /// IDE and agent clients replay the whole conversation on every call, so a
 /// rule that matched one message keeps matching for the rest of the
@@ -199,7 +200,7 @@ pub fn latest_turn_view(req: &ChatFormat) -> ChatFormat {
     let answered = req
         .messages
         .iter()
-        .rposition(|m| m.role != Role::System)
+        .rposition(|m| !m.role.is_instruction())
         .unwrap_or(0);
     let start = req.messages[..answered]
         .iter()
@@ -208,7 +209,7 @@ pub fn latest_turn_view(req: &ChatFormat) -> ChatFormat {
     let mut view = req.clone();
     view.messages = req.messages[start..]
         .iter()
-        .filter(|m| m.role != Role::System)
+        .filter(|m| !m.role.is_instruction())
         .cloned()
         .collect();
     view
@@ -902,6 +903,19 @@ pub trait Guardrail: Send + Sync + 'static {
         SegmentsOutcome::allow()
     }
 
+    /// [`Self::moderate_input_segments`] told which model the request
+    /// addressed — the name the caller put in the request, the same value
+    /// the check pass sees as `ChatFormat::model`. Only a kind that exposes
+    /// the model to its policy (`custom`, as `ctx.model`) overrides it.
+    async fn moderate_input_segments_for_model(
+        &self,
+        texts: &[String],
+        model: Option<&str>,
+    ) -> SegmentsOutcome {
+        let _ = model;
+        self.moderate_input_segments(texts).await
+    }
+
     /// Moderate the response's text segments in one remote call.
     async fn moderate_output_segments(&self, _texts: &[String]) -> SegmentsOutcome {
         SegmentsOutcome::allow()
@@ -919,9 +933,10 @@ pub trait Guardrail: Send + Sync + 'static {
         &self,
         texts: &[String],
         in_latest_turn: &[bool],
+        model: Option<&str>,
     ) -> SegmentsOutcome {
         let _ = in_latest_turn;
-        self.moderate_input_segments(texts).await
+        self.moderate_input_segments_for_model(texts, model).await
     }
 
     /// `check_input` minus segment-moderating members — used by call

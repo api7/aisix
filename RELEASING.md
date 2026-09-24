@@ -1,9 +1,8 @@
 # Releasing
 
-How an AISIX AI Gateway release is cut. Order matters: downstream packaging
-(AISIX Cloud and the On-Premises package, whose artifact name is
-`aisix-self-hosted`) pins the exact gateway image version, so the gateway is
-always tagged and published **first**.
+How an AISIX AI Gateway release is cut. Order matters: the On-Premises package
+(artifact name `aisix-self-hosted`) bundles the exact gateway image version, so
+that image must be **published before the package is built** (§4).
 
 ## 1. Tag
 
@@ -133,7 +132,30 @@ version for patch releases.
 
 ## 4. Downstream
 
-Only after the images are published, downstream release flows (AISIX Cloud /
-the On-Premises package named `aisix-self-hosted`) may tag the same `vX.Y.Z` —
-their packaging pulls
-`docker.io/api7/aisix:X.Y.Z` and fails if it does not exist yet.
+The On-Premises package (artifact name `aisix-self-hosted`) bundles
+`docker.io/api7/aisix:X.Y.Z` together with the AISIX Cloud images. When AISIX
+Cloud creates its own `vX.Y.Z` tag no longer matters: packaging is not
+triggered by that tag push any more, and it never waits for an image — the
+tag-push trigger and the 75-minute Docker Hub poll that idled a runner through
+this repository's PGO build are both gone.
+
+What the gateway image gates now is the package **dispatch**. The release
+runbook runs it on the release tag, only once both repositories' `docker-image`
+runs for that tag have succeeded:
+
+```bash
+gh workflow run release-offline-package.yml --repo api7/AISIX-Cloud --ref vX.Y.Z
+```
+
+The job then checks up front, in one pass, that `docker.io/api7/aisix:X.Y.Z`
+and the three `aisix-cp-*:X.Y.Z` images all exist as `linux/amd64` +
+`linux/arm64` manifest lists, and fails in seconds rather than building a
+partial package. It moves the `latest` / `version` / `quickstart` pointers only
+for a stable tag that is not older than the currently published version; a
+`vX.Y.Z-rc.N` candidate is dispatched the same way and publishes its own
+version-pinned packages, moving no pointers. (`workflow_dispatch` reads the
+workflow at the ref it is dispatched on, so the tag has to contain the
+dispatch-only workflow.)
+
+Nothing in this repository's tag build changes: both native legs plus the
+manifest merge, with PGO on stable tags.

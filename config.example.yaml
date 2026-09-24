@@ -7,17 +7,34 @@ etcd:
   prefix: "/aisix"
   # user: "aisix"
   # password_env: "AISIX_ETCD_PASSWORD"
-  # Optional bounds on etcd I/O. Both are unset by default, and unset
-  # means unbounded. `0` means unbounded as well — the same reading a
-  # model's `timeout: 0` gets. (A model's `stream_timeout: 0` is the odd
-  # one out: it falls back to the next level of a resolution chain these
-  # flat startup settings do not have.)
+  # Optional bounds on etcd I/O. `0` means unbounded on either key — the
+  # same reading a model's `timeout: 0` gets. (A model's
+  # `stream_timeout: 0` is the odd one out: it falls back to the next
+  # level of a resolution chain these flat startup settings do not have.)
   #
-  # `dial_timeout_ms` bounds the whole dial: the TCP connect, the TLS
-  # handshake after it, and the authentication exchange when `user` is
-  # set. An expired dial is treated as an etcd that is not reachable —
-  # the gateway keeps retrying it rather than exiting.
-  # `request_timeout_ms` bounds a single request/response call — the
+  # `dial_timeout_ms` bounds a dial: the TCP connect, the TLS handshake
+  # after it, and the authentication exchange when `user` is set. The
+  # value reaches the connector as its per-TCP-connect bound, and the
+  # whole dial — handshake and authentication included — gets it once per
+  # configured endpoint, `dial_timeout_ms x max(1, endpoints)`. The extra
+  # budget is headroom for a cluster with unreachable members, which is
+  # what a multi-endpoint list is for; the client offers no per-endpoint
+  # bound to set instead. What you plan around is the window in which no
+  # listener is bound, and boot dials two providers one after the other,
+  # so against a wholly unreachable cluster that window is
+  # `dial_timeout_ms x endpoints x 2`. It defaults to 5000 — the two keys
+  # default differently on purpose. Boot awaits the dial before it binds
+  # ANY listener, so an endpoint that accepts the connection and then
+  # answers nothing used to hold both ports closed for as long as it
+  # stayed quiet, with the snapshot cache that exists for exactly that
+  # outage sitting unread behind it. Set `0` for the old unbounded
+  # behaviour. An expired
+  # dial is treated as an etcd that is not reachable — the gateway binds,
+  # serves whatever the snapshot cache holds, and keeps retrying in the
+  # background rather than exiting.
+  #
+  # `request_timeout_ms` is unset by default, and unset means unbounded.
+  # It bounds a single request/response call — the
   # configuration range read at boot and on every reconnect, creating the
   # watch, and the admin API's reads. It deliberately does not apply to
   # the established watch stream, which is long-lived and would be torn
@@ -27,7 +44,7 @@ etcd:
   # etcd to fail fast: the range read grows with the size of your
   # configuration, and a bound it cannot finish inside makes the gateway
   # retry the same read forever without ever serving traffic.
-  # dial_timeout_ms: 5000
+  # dial_timeout_ms: 5000   # this is the default; 0 = unbounded
   # request_timeout_ms: 5000
   # Optional TLS / mTLS bundle. Required when connecting to an
   # AISIX Cloud Data Plane Manager (endpoint is https:// and the control plane issues
@@ -242,9 +259,10 @@ cache:
   # exact matches only (probed and logged at boot).
   backend: "memory"   # memory | redis
   # redis:
-  #   # mode picks the topology. Credentials travel inside the URLs, as
-  #   # in single mode; a `rediss://` URL turns TLS on and the `tls` block
-  #   # below configures what it trusts.
+  #   # mode picks the topology. Credentials can travel inside the URLs,
+  #   # or be given below as `username`/`password`/`database`, which win
+  #   # over anything the URL carries; a `rediss://` URL turns TLS on and
+  #   # the `tls` block below configures what it trusts.
   #   mode: "single"   # single | cluster | sentinel
   #   # mode: single  → one endpoint:
   #   url: "redis://127.0.0.1:6379"
@@ -252,14 +270,18 @@ cache:
   #   # nodes: ["redis://10.0.0.1:6379", "redis://10.0.0.2:6379"]
   #   # mode: sentinel → sentinel node URLs + the monitored master name.
   #   # Sentinel auth goes in the sentinels URLs; username/password/database
-  #   # below authenticate the data node (master) Sentinel discovers — it
-  #   # has no URL of its own. Supply `password` via the matching env var
-  #   # (AISIX_CACHE__REDIS__PASSWORD) to keep it out of this file.
+  #   # below authenticate the data node — the cluster nodes, or the master
+  #   # Sentinel discovers, which has no URL of its own. Supply `password`
+  #   # via the matching env var (AISIX_CACHE__REDIS__PASSWORD) to keep it
+  #   # out of this file.
   #   # sentinels: ["redis://10.0.0.1:26379", "redis://10.0.0.2:26379"]
   #   # master_name: "mymaster"
-  #   # username: "default"      # Redis ACL user (cluster nodes / sentinel master)
+  #   # Applied in every mode, and they OVERRIDE a credential embedded in
+  #   # the URL — a value injected through the environment is no use if a
+  #   # stale one left in `url` outranks it.
+  #   # username: "default"      # Redis ACL user for the data node
   #   # password: "s3cret"
-  #   # database: 0              # DB index for the sentinel master (not used by cluster)
+  #   # database: 0              # DB index (single / sentinel; Redis Cluster has only DB 0)
   #   # Trust settings for a `rediss://` URL, ignored on plaintext
   #   # `redis://`. Separate from `upstream.tls` because an in-cluster
   #   # Redis is normally issued by a different authority than the model
@@ -274,14 +296,29 @@ cache:
   #   # (it is logged at startup). Use SSL_CERT_FILE or the system trust
   #   # store for that one case; `verify` does apply.
   #   #
-  #   # Seconds one Redis round trip, or one connection attempt, may take
+  #   # Seconds one Redis round trip, or the startup connection, may take
   #   # before it is abandoned and the request proceeds without the cache.
-  #   # A Redis that stops answering without closing the socket (host down,
-  #   # network partition, stopped container) would otherwise block the
-  #   # request for minutes instead of degrading it. After a failure,
-  #   # commands short-circuit for 30 seconds and then ONE request probes,
-  #   # so an outage costs this budget roughly once per 30 seconds rather
-  #   # than once per request. Must be >= 1.
+  #   # A Redis that stops answering without closing the socket (host
+  #   # down, network partition, stopped container) would otherwise block
+  #   # the request for minutes instead of degrading it. The startup
+  #   # connection gets this budget once per endpoint the discovery may
+  #   # have to walk, plus one — so `cluster` mode with two nodes can
+  #   # spend three of them, and `sentinel` mode one per sentinel plus one
+  #   # for the master. A cache Redis that is unreachable at STARTUP does
+  #   # not stop the gateway: the listeners bind, every `backend: redis`
+  #   # policy is served as a miss, one WARN names the backend, and the
+  #   # connection is attached in the background as soon as Redis answers.
+  #   # Settings the server ANSWERS and refuses — a rejected credential,
+  #   # a `database` it does not have — degrade the same way, and the WARN
+  #   # says the server REFUSED rather than that it timed out. They are
+  #   # retried too: the credential may be corrected on the server, and
+  #   # the connection is then attached without restarting the gateway.
+  #   # Only configuration this process can reject by itself still ends
+  #   # the boot: a `url` the driver cannot parse, TLS material that
+  #   # cannot be read. Nothing outside the process can fix those.
+  #   # After a failure, commands short-circuit for 30 seconds and then
+  #   # ONE request probes, so an outage costs this budget roughly once per
+  #   # 30 seconds rather than once per request. Must be >= 1.
   #   #
   #   # The cool-off is per SUBSYSTEM, not per connection. This cache
   #   # opens two connections to this Redis — the exact-KV one and, for
@@ -306,7 +343,10 @@ cache:
 # enforces ONE global window — set this on multi-replica deployments.
 # May point at the same Redis as `cache` (keys are namespaced
 # `aisix:rl:`). On a Redis outage the limiter fails open to per-replica
-# in-memory counting (logged) so traffic keeps flowing.
+# in-memory counting (logged) so traffic keeps flowing — including when
+# Redis is already unreachable at startup, where the gateway binds its
+# listeners anyway and attaches the shared backend in the background as
+# soon as Redis answers. It never falls back to `memory` permanently.
 ratelimit:
   backend: "memory"   # memory | redis
   # redis:
@@ -317,11 +357,30 @@ ratelimit:
   #   # sentinels: ["redis://10.0.0.1:26379"]   # mode: sentinel
   #   # master_name: "mymaster"                  # mode: sentinel
   #   # tls: { ca_file: "/etc/aisix/tls/redis-ca.pem" }   # for rediss://
-  #   # Seconds one Redis round trip, or one connection attempt, may take
+  #   # Data-node credentials, as in cache.redis above: applied in every
+  #   # mode, and they override a credential embedded in the URL. Supply
+  #   # `password` via AISIX_RATELIMIT__REDIS__PASSWORD to keep it out of
+  #   # this file.
+  #   # username: "default"
+  #   # password: "s3cret"
+  #   # database: 0              # single / sentinel; Redis Cluster has only DB 0
+  #   # Seconds one Redis round trip, or the startup connection, may take
   #   # before it is abandoned and the limiter falls back to per-replica
-  #   # counting. Same field and same meaning as cache.redis above; without
-  #   # it an unreachable Redis blocks every rate-limited request for
-  #   # minutes instead of degrading it. Must be >= 1.
+  #   # counting. Same field and same meaning as cache.redis above,
+  #   # including the per-endpoint multiplier on the startup connection;
+  #   # without it an unreachable Redis blocks every rate-limited request
+  #   # — and the whole boot — for minutes instead of degrading.
+  #   # Must be >= 1.
+  #   #
+  #   # A Redis that is unreachable at STARTUP does not stop the gateway:
+  #   # the listeners bind, counting is per-replica (so cluster-wide
+  #   # limits are not enforced), one WARN names the backend, and the
+  #   # shared backend is attached in the background as soon as Redis
+  #   # answers. A Redis that ANSWERS and refuses the settings degrades
+  #   # the same way, with a WARN that says REFUSED rather than timed out,
+  #   # and is retried too. Only configuration this process can reject by
+  #   # itself still ends the boot: a `url` the driver cannot parse, TLS
+  #   # material that cannot be read.
   #   #
   #   # The limiter is a separate subsystem from the cache and cools off
   #   # independently, so a request that uses both can pay one budget for

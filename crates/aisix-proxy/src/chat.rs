@@ -17,6 +17,7 @@
 //!    status, error type, and (for rate-limits) Retry-After.
 
 use aisix_cache::{semantic_prompt_text, Cache, CacheKey, SemanticCacheStore};
+use aisix_core::models::CacheBackend;
 use aisix_core::models::{CacheScope, SemanticCacheConfig};
 use aisix_core::{AisixSnapshot, AppliedGuardrail};
 use aisix_gateway::{BridgeError, ChatFormat, ChatResponse};
@@ -973,6 +974,46 @@ async fn cache_semantic_embed(
     }
 }
 
+/// Which half of the cache subsystem a degradation belongs to. They fail
+/// and recover independently, and only the semantic half costs an
+/// embedding call, so they are reported separately.
+#[derive(Clone, Copy)]
+enum CacheHalf {
+    Exact,
+    Semantic,
+}
+
+/// True when this failure is the FIRST of an outage, so the caller logs
+/// it at WARN and the rest of the outage at debug. How hard and how long
+/// the backend is failing is `aisix_redis_failures_total{operation}`; the
+/// log line only has to say that it started.
+///
+/// `backend` is the matched policy's, and only `redis` participates. A
+/// memory-backed policy shares neither the connection nor the failure
+/// mode, and it essentially cannot fail — so counting its successes
+/// would re-arm the latch on every such request and bring the per-request
+/// flood straight back in a deployment that runs both kinds of policy.
+fn note_cache_failed(state: &ProxyState, backend: Option<CacheBackend>, half: CacheHalf) -> bool {
+    let (Some(CacheBackend::Redis), Some(backends)) = (backend, state.cache.as_ref()) else {
+        return true;
+    };
+    match half {
+        CacheHalf::Exact => backends.note_exact_failure(),
+        CacheHalf::Semantic => backends.note_semantic_failure(),
+    }
+}
+
+/// Re-arm [`note_cache_failed`], so a LATER outage is reported again.
+fn note_cache_ok(state: &ProxyState, backend: Option<CacheBackend>, half: CacheHalf) {
+    let (Some(CacheBackend::Redis), Some(backends)) = (backend, state.cache.as_ref()) else {
+        return;
+    };
+    match half {
+        CacheHalf::Exact => backends.note_exact_success(),
+        CacheHalf::Semantic => backends.note_semantic_success(),
+    }
+}
+
 /// Read path of the cache gate: exact (L1) lookup first, then — on an
 /// exact miss, when the policy configures it — the semantic (L2)
 /// similarity lookup. A semantic hit backfills the exact layer so the
@@ -991,12 +1032,22 @@ async fn resolve_cache_hit(
     semantic_gate: Option<&SemanticGateCtx>,
     request_id: &str,
     semantic_embedding: &mut Option<Vec<f32>>,
+    policy_backend: Option<CacheBackend>,
 ) -> Option<(ChatResponse, CacheHitLayer, Option<f32>)> {
     match cache.get(key).await {
-        Ok(Some(cached)) => return Some((cached, CacheHitLayer::Exact, None)),
-        Ok(None) => {}
-        Err(err) => {
+        Ok(Some(cached)) => {
+            note_cache_ok(state, policy_backend, CacheHalf::Exact);
+            return Some((cached, CacheHitLayer::Exact, None));
+        }
+        Ok(None) => note_cache_ok(state, policy_backend, CacheHalf::Exact),
+        // Once per outage, not once per request: the count lives on
+        // `aisix_redis_failures_total`, and a cache Redis can now stay
+        // unreachable from boot onwards.
+        Err(err) if note_cache_failed(state, policy_backend, CacheHalf::Exact) => {
             tracing::warn!(error = %err, key = %key, "cache lookup failed");
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, key = %key, "cache lookup failed");
         }
     }
     let sem = semantic_gate?;
@@ -1013,6 +1064,11 @@ async fn resolve_cache_hit(
         .await
     {
         Ok(Some(hit)) => {
+            // A hit is a success too: without this a semantic cache that
+            // recovered and went straight to serving hits would leave the
+            // latch set, and the NEXT outage's first failure would report
+            // at debug.
+            note_cache_ok(state, policy_backend, CacheHalf::Semantic);
             // Backfill TTL is capped at the matched entry's own
             // remaining lifetime: a paraphrase near expiry must not
             // grant the stored response a fresh full TTL, or repeated
@@ -1022,11 +1078,19 @@ async fn resolve_cache_hit(
                 .saturating_duration_since(std::time::Instant::now());
             let backfill_ttl = ttl.map(|t| t.min(remaining)).unwrap_or(remaining);
             if !backfill_ttl.is_zero() {
-                if let Err(err) = cache
+                // The backfill is an exact-half write, so it reports
+                // under the exact latch like the other two.
+                match cache
                     .put_with_ttl(key, hit.response.clone(), backfill_ttl)
                     .await
                 {
-                    tracing::warn!(error = %err, key = %key, "cache backfill write failed");
+                    Ok(()) => note_cache_ok(state, policy_backend, CacheHalf::Exact),
+                    Err(err) if note_cache_failed(state, policy_backend, CacheHalf::Exact) => {
+                        tracing::warn!(error = %err, key = %key, "cache backfill write failed");
+                    }
+                    Err(err) => {
+                        tracing::debug!(error = %err, key = %key, "cache backfill write failed");
+                    }
                 }
             }
             // 4-dp similarity everywhere it surfaces (header, usage
@@ -1035,16 +1099,26 @@ async fn resolve_cache_hit(
             Some((hit.response, CacheHitLayer::Semantic, Some(similarity)))
         }
         Ok(None) => {
+            note_cache_ok(state, policy_backend, CacheHalf::Semantic);
             *semantic_embedding = Some(vector);
             None
         }
         Err(err) => {
-            tracing::warn!(
-                target: "aisix::cache",
-                policy_name = %sem.policy_name,
-                error = %err,
-                "semantic cache lookup failed",
-            );
+            if note_cache_failed(state, policy_backend, CacheHalf::Semantic) {
+                tracing::warn!(
+                    target: "aisix::cache",
+                    policy_name = %sem.policy_name,
+                    error = %err,
+                    "semantic cache lookup failed",
+                );
+            } else {
+                tracing::debug!(
+                    target: "aisix::cache",
+                    policy_name = %sem.policy_name,
+                    error = %err,
+                    "semantic cache lookup failed",
+                );
+            }
             state
                 .metrics
                 .record_cache_semantic_store_failure(&sem.policy_name, "lookup");
@@ -1484,9 +1558,13 @@ async fn dispatch(
     // ANONYMIZE masks back into `req` (#932 bedrock follow-up).
     let (input_verdict, hits) = resolved_chain.check_input_non_segment_observed(req).await;
     monitor_hits_out.extend(hits);
+    // The segment walker below borrows `req` mutably, so the addressed
+    // model the check pass just read from `req.model` is taken first.
+    let addressed_model = req.model.clone();
     let input_verdict = crate::redact::moderate_body(
         resolved_chain.as_ref(),
         crate::redact::Direction::Input,
+        Some(addressed_model.as_str()),
         input_verdict,
         redactions_out,
         monitor_hits_out,
@@ -2212,14 +2290,10 @@ async fn dispatch(
                     &model_for_metrics,
                     &api_key_id_for_telem,
                     // A stream the consumer abandoned mid-flight is reported
-                    // as 499, matching what LiteLLM records for the same
-                    // event. The upstream work still happened, so the event
+                    // as 499, one an upstream error ended as that error's
+                    // status. The upstream work still happened, so the event
                     // is emitted either way — only its outcome differs.
-                    if comp.reached_end {
-                        200
-                    } else {
-                        crate::CLIENT_CLOSED_REQUEST
-                    },
+                    stream_terminal_status(&comp),
                     // Scoped to the winning attempt, not the request: the
                     // failed attempts before it emit their own events and
                     // `started` would double-count them (plus the pre-dispatch
@@ -2267,8 +2341,16 @@ async fn dispatch(
                         attempt_index: winner_idx,
                         attempt_kind: winner_kind.to_string(),
                         attempt_model: attempt_model_for_telem.clone(),
-                        error_class: String::new(),
-                        error_message: String::new(),
+                        error_class: comp
+                            .failure
+                            .as_ref()
+                            .map(|f| f.error_class.to_string())
+                            .unwrap_or_default(),
+                        error_message: comp
+                            .failure
+                            .as_ref()
+                            .map(|f| f.error_message.clone())
+                            .unwrap_or_default(),
                         applied_guardrails: applied_guardrails_for_telem.clone(),
                         redacted_entity_counts: {
                             let mut merged = input_redactions_for_telem.clone();
@@ -2505,6 +2587,9 @@ async fn dispatch(
             .cloned(),
         _ => None,
     };
+    // Which backend's degradation the gate is reporting on. See
+    // `note_cache_failed`.
+    let policy_backend = matched_policy.as_ref().map(|entry| entry.value.backend);
     let matched_policy_ttl = policy_cache
         .as_ref()
         .and(matched_policy.as_ref())
@@ -2639,6 +2724,7 @@ async fn dispatch(
                 semantic_gate.as_ref(),
                 request_id,
                 &mut semantic_embedding,
+                policy_backend,
             )
             .await
         };
@@ -2664,6 +2750,7 @@ async fn dispatch(
                 let cached_verdict = crate::redact::moderate_body(
                     resolved_chain.as_ref(),
                     crate::redact::Direction::Output,
+                    None,
                     cached_verdict,
                     redactions_out,
                     monitor_hits_out,
@@ -3283,6 +3370,7 @@ async fn dispatch(
     let output_verdict = crate::redact::moderate_body(
         resolved_chain.as_ref(),
         crate::redact::Direction::Output,
+        None,
         output_verdict,
         redactions_out,
         monitor_hits_out,
@@ -3386,8 +3474,12 @@ async fn dispatch(
         // `Cache-Control: no-store` suppresses both layers' writes.
         cc.no_store,
     ) {
-        if let Err(err) = cache.put_with_ttl(key, upstream.clone(), ttl).await {
-            tracing::warn!(error = %err, key = %key, "cache write failed");
+        match cache.put_with_ttl(key, upstream.clone(), ttl).await {
+            Ok(()) => note_cache_ok(state, policy_backend, CacheHalf::Exact),
+            Err(err) if note_cache_failed(state, policy_backend, CacheHalf::Exact) => {
+                tracing::warn!(error = %err, key = %key, "cache write failed");
+            }
+            Err(err) => tracing::debug!(error = %err, key = %key, "cache write failed"),
         }
         // Semantic (L2) write. Reuses the read path's embedding; when
         // the read path was bypassed (`no-cache`) compute one now so
@@ -3401,7 +3493,7 @@ async fn dispatch(
                 None => None,
             };
             if let Some(vector) = vector {
-                if let Err(err) = sem
+                match sem
                     .store
                     .store(
                         &sem.policy_id,
@@ -3415,15 +3507,30 @@ async fn dispatch(
                     )
                     .await
                 {
-                    tracing::warn!(
-                        target: "aisix::cache",
-                        policy_name = %sem.policy_name,
-                        error = %err,
-                        "semantic cache write failed",
-                    );
-                    state
-                        .metrics
-                        .record_cache_semantic_store_failure(&sem.policy_name, "store");
+                    // Re-armed here too, not only on the lookup: a
+                    // `no-cache` request skips the lookup entirely, so
+                    // the write is the only success that half sees.
+                    Ok(()) => note_cache_ok(state, policy_backend, CacheHalf::Semantic),
+                    Err(err) => {
+                        if note_cache_failed(state, policy_backend, CacheHalf::Semantic) {
+                            tracing::warn!(
+                                target: "aisix::cache",
+                                policy_name = %sem.policy_name,
+                                error = %err,
+                                "semantic cache write failed",
+                            );
+                        } else {
+                            tracing::debug!(
+                                target: "aisix::cache",
+                                policy_name = %sem.policy_name,
+                                error = %err,
+                                "semantic cache write failed",
+                            );
+                        }
+                        state
+                            .metrics
+                            .record_cache_semantic_store_failure(&sem.policy_name, "store");
+                    }
                 }
             }
         }
@@ -4098,7 +4205,9 @@ async fn dispatch_ensemble(
                     &judge_model_id,
                     &client_model_for_telem,
                     &api_key_id_for_telem,
-                    200,
+                    // The judge's stream is the one the caller reads: its
+                    // abandonment or upstream failure is the request's.
+                    stream_terminal_status(&comp),
                     started.elapsed(),
                     comp.prompt_tokens,
                     comp.completion_tokens,
@@ -4126,6 +4235,16 @@ async fn dispatch_ensemble(
                         attempt_index: judge_attempt_index,
                         attempt_kind: "judge".to_string(),
                         attempt_model: judge_attempt_model.clone(),
+                        error_class: comp
+                            .failure
+                            .as_ref()
+                            .map(|f| f.error_class.to_string())
+                            .unwrap_or_default(),
+                        error_message: comp
+                            .failure
+                            .as_ref()
+                            .map(|f| f.error_message.clone())
+                            .unwrap_or_default(),
                         applied_guardrails: applied_guardrails_for_telem.clone(),
                         redacted_entity_counts: {
                             let mut merged = input_redactions_for_telem.clone();
@@ -4466,6 +4585,7 @@ async fn dispatch_ensemble(
     let ensemble_verdict = crate::redact::moderate_body(
         resolved_chain.as_ref(),
         crate::redact::Direction::Output,
+        None,
         ensemble_verdict,
         &mut ensemble_redactions,
         &mut ensemble_monitor_hits,
@@ -5245,6 +5365,20 @@ struct StreamCompletion {
     /// still be abandoned midway, and a zero-chunk stream can still
     /// legitimately reach its end (an immediate error frame).
     reached_end: bool,
+    /// The upstream error that ended the stream after its `200` went out,
+    /// if one did. The terminal usage event reports it instead of a `200`.
+    failure: Option<crate::attempt::StreamFailure>,
+}
+
+/// The terminal usage-event status of a chat stream. A guardrail block keeps
+/// what it recorded before upstream failures were told apart: `200` once the
+/// stream ran to its end, `499` if the caller left first.
+fn stream_terminal_status(comp: &StreamCompletion) -> u16 {
+    if comp.guardrail_blocked {
+        crate::attempt::stream_status(comp.reached_end, None)
+    } else {
+        crate::attempt::stream_status(comp.reached_end, comp.failure.as_ref())
+    }
 }
 
 /// Parameters needed to run output-guardrail evaluation at
@@ -5672,6 +5806,7 @@ where
                 }
                 Err(err) => {
                     errored = true;
+                    crate::attempt::StreamFailure::record(&mut guard.comp().failure, &err);
                     let etype = err.error_type();
                     yield Ok::<_, Infallible>(
                         Event::default()
@@ -5918,6 +6053,7 @@ where
                         let verdict = crate::redact::moderate_body(
                             ctx.chain.as_ref(),
                             crate::redact::Direction::Output,
+                            None,
                             verdict,
                             &mut seg_counts,
                             &mut seg_hits,

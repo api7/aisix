@@ -5,7 +5,7 @@
 Every remote kind talks to an API that caps how much text one call may
 carry. When you add or change one, do not re-decide what happens at that
 cap — the family already answered it, and answering it again in isolation
-is how the same defect shipped twice (#448, then AISIX-Cloud#1381):
+reintroduces the defect this section exists to prevent:
 
 - **Split, never clip.** Over-limit content is chunked and *every* chunk
   is submitted. Truncating hands the caller a bypass they control: the
@@ -25,7 +25,7 @@ is how the same defect shipped twice (#448, then AISIX-Cloud#1381):
 A kind whose provider documents no usable limit submits whole — its
 bound is the provider's own. Do not invent a local one for it, and do
 not treat "we could not find the number" as "nobody looked": the numbers
-were looked for, and they are not there to hold (AISIX-Cloud#1386).
+were looked for, and they are not there to hold.
 Bedrock's ceiling is a service quota that varies by region, policy type
 and tier and is adjustable per account; Lakera publishes no size limit
 and no error shape at all; OpenAI documents no input limit for
@@ -52,7 +52,7 @@ prefers availability opts in explicitly.
 
 A guardrail that could not evaluate reaches the request through two
 shapes, both carrying the same bounded per-kind failure tag and neither
-allowed to carry matched content (#153): an explicitly fail-open row
+allowed to carry matched content: an explicitly fail-open row
 emits `Bypass`, a fail-closed row emits `Block { unavailable: Some(tag) }`.
 
 **Carry that tag all the way to the caller.** A fail-closed availability

@@ -752,10 +752,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unset_dial_timeout_leaves_the_dial_unbounded() {
-        // `0` and unset both mean unbounded (#1134), and that has to keep
-        // meaning it here: a bound reintroduced as a default would abort
-        // dials an operator asked to leave alone.
+    async fn no_dial_timeout_leaves_the_dial_unbounded() {
+        // `None` here still means unbounded, and has to: it is what an
+        // operator who wrote `dial_timeout_ms: 0` gets, and a bound
+        // applied anyway would abort a dial they asked to leave alone.
+        // What changed is only how `None` is REACHED — `EtcdConfig`
+        // defaults the key to 5000 ms now, so omitting it no longer
+        // lands here.
         let endpoint = spawn_silent_h2_server().await;
         let deferred = tokio::time::timeout(
             Duration::from_millis(750),

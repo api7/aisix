@@ -594,6 +594,81 @@ describe("guardrail input_messages: latest_turn (AISIX-Cloud#1558)", () => {
     60_000,
   );
 
+  // ── developer messages sit outside the window, like system ones ───────
+
+  test(
+    "/v1/chat/completions: a developer message after a prefill does not close the window",
+    async (ctx) => {
+      if (!etcdReachable || !app) {
+        ctx.skip();
+        return;
+      }
+      await waitForLane(kwLatest.model);
+      await waitForLane(scriptLatest.model);
+
+      // `developer` is the newer spelling of `system`. Were it read as a
+      // conversation turn, it would become the last message the prefill
+      // rule measures against, the prefill would look answered, and the
+      // window would hold the developer message alone.
+      const messages = [
+        { role: "user", content: `please handle ${MARKER}` },
+        { role: "assistant", content: "Sure, here is" },
+        { role: "developer", content: "trailing policy" },
+      ];
+      expect(
+        await blocked(chat(kwLatest.model, messages)),
+        "check pass: the window must still hold the user message",
+      ).toBe(true);
+      expect(
+        await blocked(chat(scriptLatest.model, messages)),
+        "segment pass must agree with the check pass",
+      ).toBe(true);
+    },
+    60_000,
+  );
+
+  test(
+    "/v1/chat/completions: a masking row on `latest_turn` leaves a developer message in the current turn untouched",
+    async (ctx) => {
+      if (!etcdReachable || !app || !upstream) {
+        ctx.skip();
+        return;
+      }
+      await waitConfigPropagation(async () => {
+        const before = upstream!.receivedRequests.length;
+        const probe = await chat(maskLatest.model, [
+          { role: "user", content: `probe ${SECRET}` },
+        ]);
+        if (!probe.ok) return false;
+        return upstream!.receivedRequests
+          .slice(before)
+          .some((r) => r.body.includes(MASKED));
+      });
+
+      const before = upstream.receivedRequests.length;
+      const res = await chat(maskLatest.model, [
+        { role: "user", content: "earlier" },
+        { role: "assistant", content: "understood" },
+        { role: "developer", content: `developer holds ${SECRET}` },
+        { role: "user", content: `this turn holds ${SECRET}` },
+      ]);
+      expect(res.status, "a masking row must not refuse the request").toBe(200);
+      const sent = upstream.receivedRequests.slice(before);
+      expect(sent.length, "the request must reach the upstream").toBeGreaterThan(0);
+      const body = JSON.parse(sent[sent.length - 1].body) as {
+        messages: Array<{ role: string; content: string | null }>;
+      };
+      const developer = body.messages.find((m) => m.role === "developer");
+      expect(
+        developer?.content,
+        "a developer message is outside the window, like a system one",
+      ).toContain(SECRET);
+      const current = body.messages.filter((m) => m.role === "user")[1];
+      expect(current?.content, "the current turn is rewritten").toContain(MASKED);
+    },
+    60_000,
+  );
+
   // ── masking follows the same window ───────────────────────────────────
 
   test(

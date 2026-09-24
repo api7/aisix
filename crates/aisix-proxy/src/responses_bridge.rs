@@ -55,6 +55,7 @@ pub fn responses_request_to_chat(model: &str, body: &Value) -> ChatFormat {
             for item in items {
                 append_input_item(&mut messages, item);
             }
+            messages = attach_replayed_reasoning(messages);
         }
         _ => {}
     }
@@ -148,6 +149,17 @@ fn append_input_item(messages: &mut Vec<ChatMessage>, item: &Value) {
                 .get("name")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
+            // A call to a namespace sub-tool goes back under the flattened
+            // name the model was offered it as (see
+            // [`namespace_chat_tool_name`]).
+            let name = match item
+                .get("namespace")
+                .and_then(Value::as_str)
+                .filter(|ns| !ns.is_empty())
+            {
+                Some(namespace) => namespace_chat_tool_name(namespace, name),
+                None => name.to_string(),
+            };
             let arguments = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
             push_tool_call(
                 messages,
@@ -210,8 +222,26 @@ fn append_input_item(messages: &mut Vec<ChatMessage>, item: &Value) {
                 extra: Map::new(),
             });
         }
-        // Reasoning items can't be replayed across providers — drop them.
-        Some("reasoning") => {}
+        // The model's own earlier chain-of-thought. It becomes an assistant
+        // message carrying nothing but `reasoning_content`, which
+        // [`attach_replayed_reasoning`] then folds onto the assistant turn it
+        // belongs to. An item with no readable text (only
+        // `encrypted_content`, which is another provider's ciphertext)
+        // replays nothing.
+        Some("reasoning") => {
+            if let Some(text) = replayed_reasoning_text(item) {
+                let mut extra = Map::new();
+                extra.insert(REASONING_CONTENT.to_string(), Value::String(text));
+                messages.push(ChatMessage {
+                    role: Role::Assistant,
+                    content: None,
+                    content_blocks: None,
+                    name: None,
+                    tool_call_id: None,
+                    extra,
+                });
+            }
+        }
         // A `message` item (or an untyped `{role, content}` element).
         _ => {
             let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
@@ -238,16 +268,23 @@ fn append_input_item(messages: &mut Vec<ChatMessage>, item: &Value) {
 }
 
 /// Append an OpenAI-shape tool call, folding it into the immediately
-/// preceding assistant tool-call message when contiguous so parallel
-/// `function_call` items land in one assistant turn (one `tool_calls`
-/// array) — the standard OpenAI history shape every bridge expects.
+/// preceding assistant message: parallel `function_call` items land in one
+/// `tool_calls` array, and the calls a model made right after its text go
+/// back on that same turn (content + `tool_calls`) — the shape the model
+/// produced them in, which the Responses history splits into a `message`
+/// item followed by `function_call` items. A replayed reasoning item's own
+/// assistant message takes the calls that follow it the same way.
 fn push_tool_call(messages: &mut Vec<ChatMessage>, tc: Value) {
     if let Some(last) = messages.last_mut() {
-        if matches!(last.role, Role::Assistant) && last.content.is_none() {
-            if let Some(Value::Array(arr)) = last.extra.get_mut("tool_calls") {
-                arr.push(tc);
-                return;
+        if matches!(last.role, Role::Assistant) {
+            match last.extra.get_mut("tool_calls") {
+                Some(Value::Array(arr)) => arr.push(tc),
+                _ => {
+                    last.extra
+                        .insert("tool_calls".to_string(), Value::Array(vec![tc]));
+                }
             }
+            return;
         }
     }
     let mut extra = Map::new();
@@ -260,6 +297,101 @@ fn push_tool_call(messages: &mut Vec<ChatMessage>, tc: Value) {
         tool_call_id: None,
         extra,
     });
+}
+
+/// The chat message field a replayed reasoning item travels in — the one
+/// the OpenAI-compatible reasoning models (DeepSeek, GLM, Qwen, Kimi, …)
+/// read their own earlier chain-of-thought from on an assistant turn.
+const REASONING_CONTENT: &str = "reasoning_content";
+
+/// The plaintext of a replayed `reasoning` input item: its `content` parts
+/// when they carry any text, otherwise its `summary` parts; each part
+/// trimmed and the non-blank ones joined by newlines. `encrypted_content`
+/// is never read — it is another provider's ciphertext and means nothing to
+/// the upstream this request is going to.
+fn replayed_reasoning_text(item: &Value) -> Option<String> {
+    let parts_text = |parts: &Value, skip_opaque: bool| -> Option<String> {
+        let parts = parts.as_array()?;
+        let texts: Vec<&str> = parts
+            .iter()
+            .filter(|p| {
+                !skip_opaque
+                    || !matches!(
+                        p.get("type").and_then(Value::as_str),
+                        Some("encrypted_content" | "redacted_thinking")
+                    )
+            })
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        (!texts.is_empty()).then(|| texts.join("\n"))
+    };
+    // Parts arrays only, the shape the API defines: they are also the only
+    // shape the input mask rewrites, so a bare-string `content` would reach
+    // the upstream past a Mask rule that reported a hit on it.
+    item.get("content")
+        .and_then(|c| parts_text(c, true))
+        .or_else(|| item.get("summary").and_then(|s| parts_text(s, false)))
+}
+
+/// Fold each reasoning-only assistant message onto the assistant message
+/// that follows it, so the chain-of-thought rides the turn that carries the
+/// answer or the tool calls it led to — the placement the OpenAI-compatible
+/// reasoning models expect, some of which reject a multi-turn request whose
+/// assistant turns lost their reasoning. Consecutive reasoning items join,
+/// in order, ahead of any reasoning the target already carries.
+///
+/// Reasoning that no assistant message follows (the next turn is the user's,
+/// a tool result, or the end of the input) stays a message of its own so it
+/// is still passed back rather than dropped.
+fn attach_replayed_reasoning(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    fn flush_standalone(pending: &mut Vec<String>, out: &mut Vec<ChatMessage>) {
+        for text in pending.drain(..) {
+            let mut extra = Map::new();
+            extra.insert(REASONING_CONTENT.to_string(), Value::String(text));
+            out.push(ChatMessage {
+                role: Role::Assistant,
+                content: None,
+                content_blocks: None,
+                name: None,
+                tool_call_id: None,
+                extra,
+            });
+        }
+    }
+
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    let mut pending: Vec<String> = Vec::new();
+    for mut m in messages {
+        if m.is_reasoning_only() {
+            if let Some(Value::String(text)) = m.extra.remove(REASONING_CONTENT) {
+                pending.push(text);
+            }
+            continue;
+        }
+        if !pending.is_empty() {
+            if matches!(m.role, Role::Assistant) {
+                let existing = m
+                    .extra
+                    .get(REASONING_CONTENT)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                pending.extend(existing);
+                m.extra.insert(
+                    REASONING_CONTENT.to_string(),
+                    Value::String(pending.join("\n")),
+                );
+                pending.clear();
+            } else {
+                flush_standalone(&mut pending, &mut out);
+            }
+        }
+        out.push(m);
+    }
+    flush_standalone(&mut pending, &mut out);
+    out
 }
 
 /// A Responses-API content slot rendered for a chat message: the
@@ -527,6 +659,12 @@ fn responses_text_format_to_response_format(text: &Value) -> Option<Value> {
 ///     is the shape that keeps the model able to call it. A grammar under
 ///     `format.definition` rides along in the description, the only place a
 ///     chat upstream will read it.
+///   * `{type:"namespace", name, description, tools:[…]}` → one function
+///     tool per `function` sub-tool, named `<namespace>__<tool>` (see
+///     [`namespace_chat_tool_name`]) and described by the namespace's
+///     description followed by the sub-tool's own. A sub-tool whose
+///     flattened name is already a top-level function's is left out, so
+///     the model is never offered two tools under one name.
 ///   * hosted tools (`web_search*`, `file_search`, `code_interpreter`,
 ///     `mcp`, `computer_use*`, `image_generation`, …) have no chat
 ///     equivalent and are dropped.
@@ -535,41 +673,116 @@ fn responses_text_format_to_response_format(text: &Value) -> Option<Value> {
 /// the wire.
 fn responses_tools_to_chat(tools: &Value) -> Option<Value> {
     let arr = tools.as_array()?;
+    let top_level_functions = top_level_function_names(arr);
     let out: Vec<Value> = arr
         .iter()
-        .filter_map(|t| match t.get("type").and_then(|v| v.as_str()) {
-            Some("function") => {
-                let name = t.get("name").and_then(|v| v.as_str())?;
-                let mut func = Map::new();
-                func.insert("name".to_string(), json!(name));
-                if let Some(d) = t.get("description") {
-                    func.insert("description".to_string(), d.clone());
-                }
-                if let Some(p) = t.get("parameters") {
-                    func.insert("parameters".to_string(), p.clone());
-                }
-                Some(json!({"type": "function", "function": Value::Object(func)}))
+        .flat_map(|t| -> Vec<Value> {
+            match t.get("type").and_then(|v| v.as_str()) {
+                Some("function") => function_chat_tool(t, None).into_iter().collect(),
+                Some("namespace") => namespace_members(t)
+                    .filter(|(chat_name, _, _)| !top_level_functions.contains(chat_name.as_str()))
+                    .filter_map(|(chat_name, member, description)| {
+                        function_chat_tool(member, Some((chat_name, description)))
+                    })
+                    .collect(),
+                Some("custom") => custom_chat_tool(t).into_iter().collect(),
+                _ => Vec::new(),
             }
-            Some("custom") => {
-                let name = t.get("name").and_then(|v| v.as_str())?;
-                let mut description = t
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                description.push_str(&custom_tool_grammar_suffix(t.get("format")));
-                let mut func = Map::new();
-                func.insert("name".to_string(), json!(name));
-                if !description.is_empty() {
-                    func.insert("description".to_string(), json!(description));
-                }
-                func.insert("parameters".to_string(), custom_tool_parameters(name));
-                Some(json!({"type": "function", "function": Value::Object(func)}))
-            }
-            _ => None,
         })
         .collect();
     (!out.is_empty()).then_some(Value::Array(out))
+}
+
+/// A Responses `function` tool as a chat function tool. `rename` carries
+/// the flattened name and combined description of a namespace sub-tool.
+fn function_chat_tool(t: &Value, rename: Option<(String, Option<String>)>) -> Option<Value> {
+    let name = t.get("name").and_then(|v| v.as_str())?;
+    let mut func = Map::new();
+    match rename {
+        Some((chat_name, description)) => {
+            func.insert("name".to_string(), json!(chat_name));
+            if let Some(d) = description {
+                func.insert("description".to_string(), json!(d));
+            }
+        }
+        None => {
+            func.insert("name".to_string(), json!(name));
+            if let Some(d) = t.get("description") {
+                func.insert("description".to_string(), d.clone());
+            }
+        }
+    }
+    if let Some(p) = t.get("parameters") {
+        func.insert("parameters".to_string(), p.clone());
+    }
+    Some(json!({"type": "function", "function": Value::Object(func)}))
+}
+
+/// The chat function name a namespace sub-tool travels under: chat tools
+/// are one flat list, so the namespace is folded into the name. Both
+/// directions of the translation derive it here — the request side names
+/// the tool and re-names replayed calls with it, the reply side maps a call
+/// back through [`ResponsesReplyContext`].
+fn namespace_chat_tool_name(namespace: &str, tool: &str) -> String {
+    format!("{namespace}__{tool}")
+}
+
+/// Names of the top-level `function` tools a request declared.
+fn top_level_function_names(tools: &[Value]) -> std::collections::BTreeSet<&str> {
+    tools
+        .iter()
+        .filter(|t| t.get("type").and_then(Value::as_str) == Some("function"))
+        .filter_map(|t| t.get("name").and_then(Value::as_str))
+        .collect()
+}
+
+/// The `function` sub-tools of one `namespace` tool, each as
+/// `(flattened chat name, sub-tool, description)`. The description is the
+/// namespace's followed by the sub-tool's, so the model still reads what
+/// the group is for; either alone when the other is missing.
+fn namespace_members(t: &Value) -> impl Iterator<Item = (String, &Value, Option<String>)> {
+    let namespace = t.get("name").and_then(Value::as_str).unwrap_or_default();
+    let namespace_description = t
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|d| !d.is_empty());
+    t.get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(move |_| !namespace.is_empty())
+        .filter(|m| m.get("type").and_then(Value::as_str) == Some("function"))
+        .filter_map(move |m| {
+            let name = m.get("name").and_then(Value::as_str)?;
+            let own = m
+                .get("description")
+                .and_then(Value::as_str)
+                .filter(|d| !d.is_empty());
+            let description = match (namespace_description, own) {
+                (Some(ns), Some(own)) => Some(format!("{ns}\n\n{own}")),
+                (Some(ns), None) => Some(ns.to_string()),
+                (None, own) => own.map(str::to_string),
+            };
+            Some((namespace_chat_tool_name(namespace, name), m, description))
+        })
+}
+
+/// A Responses `custom` tool as a chat function tool taking one string.
+fn custom_chat_tool(t: &Value) -> Option<Value> {
+    let name = t.get("name").and_then(|v| v.as_str())?;
+    let mut description = t
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    description.push_str(&custom_tool_grammar_suffix(t.get("format")));
+    let mut func = Map::new();
+    func.insert("name".to_string(), json!(name));
+    if !description.is_empty() {
+        func.insert("description".to_string(), json!(description));
+    }
+    func.insert("parameters".to_string(), custom_tool_parameters(name));
+    Some(json!({"type": "function", "function": Value::Object(func)}))
 }
 
 /// The single string parameter a `custom` tool takes once it has been
@@ -626,24 +839,115 @@ fn unwrap_custom_tool_input(arguments: &str) -> String {
         .unwrap_or_else(|| arguments.to_string())
 }
 
-/// The names of the `custom` tools a Responses request declared.
+/// What the reply translators need to know about the Responses request
+/// they are answering.
 ///
-/// The request side turns each of them into an ordinary function tool
-/// ([`responses_tools_to_chat`]), so the reply arrives as a chat tool call
-/// carrying nothing that says which Responses tool kind it came from. The
-/// caller registered the tool as `custom` and is waiting for a
-/// `custom_tool_call` item back, so both response translators need the
-/// request's own tool list to tell the two kinds apart.
-pub fn custom_tool_names(body: &Value) -> std::collections::BTreeSet<String> {
-    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
-        return std::collections::BTreeSet::new();
-    };
-    tools
+/// The request side turns `custom` tools and namespace sub-tools into
+/// ordinary chat function tools ([`responses_tools_to_chat`]), so a reply
+/// arrives as a chat tool call carrying nothing that says which Responses
+/// tool it came from; the caller is waiting for a `custom_tool_call` item,
+/// or a `function_call` naming the sub-tool and its `namespace`, so only the
+/// request's own tool list can tell them apart. Every Response object also
+/// echoes the request's own settings ([`response_echo_fields`]).
+#[derive(Debug, Clone)]
+pub struct ResponsesReplyContext {
+    custom_tools: std::collections::BTreeSet<String>,
+    /// Chat function name → `(namespace, sub-tool name)`.
+    namespace_tools: std::collections::BTreeMap<String, (String, String)>,
+    echo: Map<String, Value>,
+}
+
+/// How one chat tool call is returned to a Responses caller.
+enum ReplyToolCall<'a> {
+    /// A `custom_tool_call` item.
+    Custom,
+    /// A `function_call` item, naming a namespace sub-tool when `namespace`
+    /// is set.
+    Function {
+        name: &'a str,
+        namespace: Option<&'a str>,
+    },
+}
+
+/// A request that declared no tools and set nothing: every Response field
+/// at its default.
+impl Default for ResponsesReplyContext {
+    fn default() -> Self {
+        Self::from_request(&Value::Null)
+    }
+}
+
+impl ResponsesReplyContext {
+    pub fn from_request(body: &Value) -> Self {
+        let tools: &[Value] = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let custom_tools = tools
+            .iter()
+            .filter(|t| t.get("type").and_then(Value::as_str) == Some("custom"))
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        Self {
+            custom_tools,
+            namespace_tools: namespace_tool_map(tools),
+            echo: response_echo_fields(body),
+        }
+    }
+
+    fn tool_call<'a>(&'a self, chat_name: &'a str) -> ReplyToolCall<'a> {
+        if self.custom_tools.contains(chat_name) {
+            return ReplyToolCall::Custom;
+        }
+        match self.namespace_tools.get(chat_name) {
+            Some((namespace, name)) => ReplyToolCall::Function {
+                name,
+                namespace: Some(namespace),
+            },
+            None => ReplyToolCall::Function {
+                name: chat_name,
+                namespace: None,
+            },
+        }
+    }
+}
+
+/// The chat function names a model may call a namespace sub-tool by, each
+/// mapped to `(namespace, sub-tool name)`: the flattened name it was
+/// offered under, and — when no top-level function and no other namespace
+/// uses it — the sub-tool's bare name, which a model sometimes answers with
+/// instead. A flattened name that collides with a top-level function was
+/// never offered (see [`responses_tools_to_chat`]) and maps to nothing, so
+/// a call to that function stays a plain `function_call`.
+fn namespace_tool_map(tools: &[Value]) -> std::collections::BTreeMap<String, (String, String)> {
+    let top_level = top_level_function_names(tools);
+    let members: Vec<(String, String)> = tools
         .iter()
-        .filter(|t| t.get("type").and_then(Value::as_str) == Some("custom"))
-        .filter_map(|t| t.get("name").and_then(Value::as_str))
-        .map(str::to_string)
-        .collect()
+        .filter(|t| t.get("type").and_then(Value::as_str) == Some("namespace"))
+        .flat_map(|t| {
+            let namespace = t.get("name").and_then(Value::as_str).unwrap_or_default();
+            namespace_members(t).filter_map(move |(_, member, _)| {
+                let name = member.get("name").and_then(Value::as_str)?;
+                Some((namespace.to_string(), name.to_string()))
+            })
+        })
+        .collect();
+    let mut map = std::collections::BTreeMap::new();
+    for (namespace, name) in &members {
+        let chat_name = namespace_chat_tool_name(namespace, name);
+        if !top_level.contains(chat_name.as_str()) {
+            map.insert(chat_name, (namespace.clone(), name.clone()));
+        }
+    }
+    for (namespace, name) in &members {
+        let unique = members.iter().filter(|(_, n)| n == name).count() == 1;
+        if unique && !top_level.contains(name.as_str()) {
+            map.insert(name.clone(), (namespace.clone(), name.clone()));
+        }
+    }
+    map
 }
 
 /// A custom tool's grammar, rendered for the tail of its description. Empty
@@ -681,6 +985,15 @@ fn responses_tool_choice_to_chat(tc: &Value) -> Option<Value> {
         Value::Object(o) => match o.get("type").and_then(|v| v.as_str())? {
             "function" | "custom" | "tool" => {
                 let name = o.get("name").and_then(|v| v.as_str())?;
+                // A namespace sub-tool was offered under its flattened name.
+                let name = match o
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .filter(|ns| !ns.is_empty())
+                {
+                    Some(namespace) => namespace_chat_tool_name(namespace, name),
+                    None => name.to_string(),
+                };
                 Some(json!({"type": "function", "function": {"name": name}}))
             }
             "any" => Some(Value::String("required".to_string())),
@@ -708,15 +1021,13 @@ fn responses_tool_choice_to_chat(tc: &Value) -> Option<Value> {
 
 /// Build the non-streaming Responses-API response object from a bridge
 /// [`ChatResponse`]. `requested_model` is echoed back (not the upstream
-/// id). `created_at` is a unix timestamp stamped by the caller.
-/// `custom_tools` names the request's `custom` tools (see
-/// [`custom_tool_names`]) so a call to one of them is returned as the
-/// `custom_tool_call` item the caller registered it for.
+/// id). `created_at` is a unix timestamp stamped by the caller. `reply`
+/// carries what the request declared (see [`ResponsesReplyContext`]).
 pub fn chat_response_to_responses_json(
     resp: &ChatResponse,
     requested_model: &str,
     created_at: i64,
-    custom_tools: &std::collections::BTreeSet<String>,
+    reply: &ResponsesReplyContext,
 ) -> Value {
     let (status, incomplete_reason) = responses_status(&resp.finish_reason);
     let output = build_output_items(
@@ -726,22 +1037,216 @@ pub fn chat_response_to_responses_json(
             .extra
             .get("tool_calls")
             .and_then(|v| v.as_array()),
-        custom_tools,
+        reply,
     );
+    response_resource(
+        reply,
+        ResponseState {
+            id: &format!("resp_{}", Uuid::new_v4().simple()),
+            created_at,
+            model: requested_model,
+            status,
+            output: Value::Array(output),
+            usage: responses_usage_json(&resp.usage),
+            incomplete_reason,
+            error: None,
+        },
+    )
+}
 
-    let mut obj = json!({
-        "id": format!("resp_{}", Uuid::new_v4().simple()),
-        "object": "response",
-        "created_at": created_at,
-        "status": status,
-        "model": requested_model,
-        "output": output,
-        "usage": responses_usage_json(&resp.usage),
-    });
-    if let Some(reason) = incomplete_reason {
-        obj["incomplete_details"] = json!({"reason": reason});
+/// The per-response half of a Response object; the request half comes
+/// from [`ResponsesReplyContext`].
+struct ResponseState<'a> {
+    id: &'a str,
+    created_at: i64,
+    model: &'a str,
+    status: &'a str,
+    output: Value,
+    /// `null` until the response has finished, and for a failed one.
+    usage: Value,
+    incomplete_reason: Option<&'static str>,
+    /// `(code, message)` of a failed response.
+    error: Option<(&'a str, &'a str)>,
+}
+
+/// A complete Response object — the full top-level field set the Responses
+/// API defines, on every object the bridge emits (the non-streaming body
+/// and the `response` of every lifecycle event), so a client that
+/// validates the object against the API's schema accepts it.
+fn response_resource(reply: &ResponsesReplyContext, state: ResponseState<'_>) -> Value {
+    let mut obj = reply.echo.clone();
+    obj.insert("id".to_string(), json!(state.id));
+    obj.insert("object".to_string(), json!("response"));
+    obj.insert("created_at".to_string(), json!(state.created_at));
+    obj.insert(
+        "completed_at".to_string(),
+        if state.status == "completed" {
+            json!(chrono::Utc::now().timestamp())
+        } else {
+            Value::Null
+        },
+    );
+    obj.insert("status".to_string(), json!(state.status));
+    obj.insert("model".to_string(), json!(state.model));
+    obj.insert("output".to_string(), state.output);
+    obj.insert("usage".to_string(), state.usage);
+    obj.insert(
+        "incomplete_details".to_string(),
+        state
+            .incomplete_reason
+            .map_or(Value::Null, |reason| json!({"reason": reason})),
+    );
+    obj.insert(
+        "error".to_string(),
+        state.error.map_or(
+            Value::Null,
+            |(code, message)| json!({"code": code, "message": message}),
+        ),
+    );
+    Value::Object(obj)
+}
+
+/// The top-level Response fields that describe the request rather than the
+/// generation: the caller's own value where it sent one, the API's default
+/// (or `null`) where it did not.
+fn response_echo_fields(body: &Value) -> Map<String, Value> {
+    let get = |key: &str| body.get(key).filter(|v| !v.is_null());
+    let string_or_null = |key: &str| {
+        get(key)
+            .filter(|v| v.is_string())
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let int_or_null = |key: &str| {
+        get(key)
+            .filter(|v| v.is_u64())
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let number_or = |key: &str, default: Value| {
+        get(key)
+            .filter(|v| v.is_number())
+            .cloned()
+            .unwrap_or(default)
+    };
+    let bool_or = |key: &str, default: bool| {
+        get(key)
+            .filter(|v| v.is_boolean())
+            .cloned()
+            .unwrap_or(json!(default))
+    };
+    let string_or = |key: &str, default: &str| {
+        get(key)
+            .filter(|v| v.is_string())
+            .cloned()
+            .unwrap_or(json!(default))
+    };
+
+    let mut m = Map::new();
+    m.insert("instructions".into(), string_or_null("instructions"));
+    m.insert(
+        "previous_response_id".into(),
+        string_or_null("previous_response_id"),
+    );
+    m.insert(
+        "tools".into(),
+        Value::Array(
+            get("tools")
+                .and_then(Value::as_array)
+                .map(|tools| tools.iter().map(echo_tool).collect())
+                .unwrap_or_default(),
+        ),
+    );
+    m.insert(
+        "tool_choice".into(),
+        get("tool_choice").cloned().unwrap_or(json!("auto")),
+    );
+    m.insert("truncation".into(), string_or("truncation", "disabled"));
+    m.insert(
+        "parallel_tool_calls".into(),
+        bool_or("parallel_tool_calls", true),
+    );
+    m.insert("text".into(), echo_text(get("text")));
+    m.insert("temperature".into(), number_or("temperature", json!(1.0)));
+    m.insert("top_p".into(), number_or("top_p", json!(1.0)));
+    m.insert(
+        "presence_penalty".into(),
+        number_or("presence_penalty", json!(0.0)),
+    );
+    m.insert(
+        "frequency_penalty".into(),
+        number_or("frequency_penalty", json!(0.0)),
+    );
+    m.insert(
+        "top_logprobs".into(),
+        get("top_logprobs")
+            .filter(|v| v.is_u64())
+            .cloned()
+            .unwrap_or(json!(0)),
+    );
+    m.insert(
+        "reasoning".into(),
+        get("reasoning")
+            .filter(|v| v.is_object())
+            .map_or(Value::Null, |r| {
+                let field = |key: &str| r.get(key).cloned().unwrap_or(Value::Null);
+                json!({"effort": field("effort"), "summary": field("summary")})
+            }),
+    );
+    m.insert("max_output_tokens".into(), int_or_null("max_output_tokens"));
+    m.insert("max_tool_calls".into(), int_or_null("max_tool_calls"));
+    m.insert("store".into(), bool_or("store", true));
+    m.insert("background".into(), bool_or("background", false));
+    m.insert("service_tier".into(), string_or("service_tier", "default"));
+    m.insert(
+        "metadata".into(),
+        get("metadata")
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or(json!({})),
+    );
+    m.insert(
+        "safety_identifier".into(),
+        string_or_null("safety_identifier"),
+    );
+    m.insert(
+        "prompt_cache_key".into(),
+        string_or_null("prompt_cache_key"),
+    );
+    if let Some(user) = get("user").filter(|v| v.is_string()) {
+        m.insert("user".into(), user.clone());
     }
-    obj
+    m
+}
+
+/// One request tool as the Response object reports it. A `function` tool
+/// carries every member the API defines for it, `null` where the caller
+/// left one out; any other tool is echoed as sent.
+fn echo_tool(tool: &Value) -> Value {
+    let mut tool = tool.clone();
+    if let Some(obj) = tool.as_object_mut() {
+        if obj.get("type").and_then(Value::as_str) == Some("function") {
+            for key in ["description", "parameters", "strict"] {
+                obj.entry(key).or_insert(Value::Null);
+            }
+        }
+    }
+    tool
+}
+
+/// The request's `text` setting, with the plain-text format filled in when
+/// the caller named none.
+fn echo_text(text: Option<&Value>) -> Value {
+    let mut text = text
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = text.as_object_mut() {
+        if obj.get("format").is_none_or(Value::is_null) {
+            obj.insert("format".to_string(), json!({"type": "text"}));
+        }
+    }
+    text
 }
 
 /// Map an internal finish reason to a Responses-API `status` plus optional
@@ -786,13 +1291,14 @@ fn message_reasoning_text(message: &ChatMessage) -> Option<&str> {
 /// Assemble the `output` array: a `reasoning` item carrying the upstream's
 /// chain-of-thought (when any), then a `message` item carrying the assistant
 /// text (when any), followed by one tool-call item per tool call —
-/// `custom_tool_call` for a call naming one of `custom_tools`,
-/// `function_call` for everything else.
+/// `custom_tool_call` for a call naming one of the request's `custom`
+/// tools, `function_call` for everything else (see
+/// [`ResponsesReplyContext`]).
 fn build_output_items(
     reasoning: Option<&str>,
     text: Option<&str>,
     tool_calls: Option<&Vec<Value>>,
-    custom_tools: &std::collections::BTreeSet<String>,
+    reply: &ResponsesReplyContext,
 ) -> Vec<Value> {
     let mut output: Vec<Value> = Vec::new();
     // Reasoning leads the output array, as it does on a native Responses
@@ -826,28 +1332,52 @@ fn build_output_items(
                 .and_then(|f| f.get("arguments"))
                 .and_then(|a| a.as_str())
                 .unwrap_or("");
-            if custom_tools.contains(name) {
-                output.push(json!({
+            output.push(match reply.tool_call(name) {
+                ReplyToolCall::Custom => json!({
                     "type": "custom_tool_call",
                     "id": format!("ctc_{}", Uuid::new_v4().simple()),
                     "call_id": call_id,
                     "name": name,
                     "input": unwrap_custom_tool_input(arguments),
                     "status": "completed",
-                }));
-            } else {
-                output.push(json!({
-                    "type": "function_call",
-                    "id": format!("fc_{}", Uuid::new_v4().simple()),
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": arguments,
-                    "status": "completed",
-                }));
-            }
+                }),
+                ReplyToolCall::Function { name, namespace } => function_call_item(
+                    &format!("fc_{}", Uuid::new_v4().simple()),
+                    call_id,
+                    name,
+                    namespace,
+                    arguments,
+                    "completed",
+                ),
+            });
         }
     }
     output
+}
+
+/// A `function_call` output item. `namespace` rides along only for a
+/// namespace sub-tool: the caller dispatches on the `{name, namespace}`
+/// pair.
+fn function_call_item(
+    id: &str,
+    call_id: &str,
+    name: &str,
+    namespace: Option<&str>,
+    arguments: &str,
+    status: &str,
+) -> Value {
+    let mut item = json!({
+        "type": "function_call",
+        "id": id,
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+        "status": status,
+    });
+    if let Some(namespace) = namespace {
+        item["namespace"] = json!(namespace);
+    }
+    item
 }
 
 /// Render usage in the Responses-API shape, which is OpenAI accounting:
@@ -955,6 +1485,9 @@ struct ToolCallState {
     /// The call names one of the request's `custom` tools, so it streams as
     /// a `custom_tool_call` item rather than a `function_call` one.
     custom: bool,
+    /// `(namespace, sub-tool name)` when the call names a flattened
+    /// namespace sub-tool. Fixed when the item is announced, like `custom`.
+    namespace: Option<(String, String)>,
     output_index: u32,
     arguments: String,
     item_added: bool,
@@ -980,15 +1513,25 @@ impl ToolCallState {
                 "status": "completed",
             })
         } else {
-            json!({
-                "type": "function_call",
-                "id": self.item_id(),
-                "call_id": self.call_id,
-                "name": self.name,
-                "arguments": self.arguments,
-                "status": "completed",
-            })
+            self.function_call_item(&self.arguments, "completed")
         }
+    }
+
+    /// This call as a `function_call` item, under the sub-tool name and
+    /// its namespace when it names a namespace sub-tool.
+    fn function_call_item(&self, arguments: &str, status: &str) -> Value {
+        let (name, namespace) = match &self.namespace {
+            Some((namespace, name)) => (name.as_str(), Some(namespace.as_str())),
+            None => (self.name.as_str(), None),
+        };
+        function_call_item(
+            &self.item_id(),
+            &self.call_id,
+            name,
+            namespace,
+            arguments,
+            status,
+        )
     }
 }
 
@@ -1017,9 +1560,10 @@ pub struct ResponsesSseEncoder {
     reasoning_done: Vec<ReasoningState>,
     // Tool-call items keyed by the OpenAI delta index.
     tool_calls: std::collections::BTreeMap<u64, ToolCallState>,
-    /// The request's `custom` tool names (see [`custom_tool_names`]) — a
-    /// call naming one of them streams as a `custom_tool_call` item.
-    custom_tools: std::collections::BTreeSet<String>,
+    /// What the request declared (see [`ResponsesReplyContext`]).
+    reply: ResponsesReplyContext,
+    /// Serialized size of the request echo every Response object carries.
+    echo_len: usize,
     /// Withheld terminal status + incomplete reason while waiting on a
     /// trailing usage frame.
     pending_status: Option<&'static str>,
@@ -1037,17 +1581,17 @@ pub struct ResponsesSseEncoder {
 }
 
 impl ResponsesSseEncoder {
-    /// `custom_tools` names the request's `custom` tools (see
-    /// [`custom_tool_names`]); pass an empty set for a request that declared
-    /// none.
+    /// `reply` carries what the request declared (see
+    /// [`ResponsesReplyContext`]).
     pub fn new(
         response_id: impl Into<String>,
         model_display_name: impl Into<String>,
         created_at: i64,
-        custom_tools: std::collections::BTreeSet<String>,
+        reply: ResponsesReplyContext,
     ) -> Self {
         Self {
-            custom_tools,
+            echo_len: serde_json::to_string(&reply.echo).map_or(0, |s| s.len()),
+            reply,
             response_id: response_id.into(),
             model_display_name: model_display_name.into(),
             created_at,
@@ -1084,6 +1628,17 @@ impl ResponsesSseEncoder {
         let seq = self.sequence_number;
         self.sequence_number += 1;
         seq
+    }
+
+    /// `response.created` then `response.in_progress`, each carrying the
+    /// Response object with `status: "in_progress"`: the two events every
+    /// stream opens with, a failed one included.
+    fn opening_events(&mut self) -> [ResponsesSseEvent; 2] {
+        let response = self.response_object("in_progress", false, None, None);
+        [
+            self.event("response.created", json!({"response": response.clone()})),
+            self.event("response.in_progress", json!({"response": response})),
+        ]
     }
 
     /// Build one event, stamping `type` + `sequence_number`.
@@ -1187,20 +1742,38 @@ impl ResponsesSseEncoder {
         )
     }
 
-    /// The bare response object embedded in lifecycle events.
-    fn response_object(&self, status: &str, with_output: bool, with_usage: bool) -> Value {
-        let mut obj = json!({
-            "id": self.response_id,
-            "object": "response",
-            "created_at": self.created_at,
-            "status": status,
-            "model": self.model_display_name,
-            "output": if with_output { Value::Array(self.final_output_items()) } else { json!([]) },
-        });
-        if with_usage {
-            obj["usage"] = self.usage_value();
-        }
-        obj
+    /// The Response object embedded in a lifecycle event. `output` and
+    /// `usage` are filled only on a terminal event that reports the
+    /// generation (`completed` / `incomplete`); a failed response carries
+    /// neither.
+    fn response_object(
+        &self,
+        status: &str,
+        with_output_and_usage: bool,
+        incomplete_reason: Option<&'static str>,
+        error: Option<(&str, &str)>,
+    ) -> Value {
+        response_resource(
+            &self.reply,
+            ResponseState {
+                id: &self.response_id,
+                created_at: self.created_at,
+                model: &self.model_display_name,
+                status,
+                output: if with_output_and_usage {
+                    Value::Array(self.final_output_items())
+                } else {
+                    json!([])
+                },
+                usage: if with_output_and_usage {
+                    self.usage_value()
+                } else {
+                    Value::Null
+                },
+                incomplete_reason,
+                error,
+            },
+        )
     }
 
     /// Rebuild the completed `output` array from accumulated state.
@@ -1267,14 +1840,7 @@ impl ResponsesSseEncoder {
 
         if !self.sent_created && (has_content || has_tools || has_reasoning || has_finish) {
             self.sent_created = true;
-            events.push(self.event(
-                "response.created",
-                json!({"response": self.response_object("in_progress", false, false)}),
-            ));
-            events.push(self.event(
-                "response.in_progress",
-                json!({"response": self.response_object("in_progress", false, false)}),
-            ));
+            events.extend(self.opening_events());
         }
 
         // ── Reasoning ──
@@ -1398,13 +1964,21 @@ impl ResponsesSseEncoder {
                             call_id: String::new(),
                             name: String::new(),
                             custom: false,
+                            namespace: None,
                             output_index,
                             arguments: String::new(),
                             item_added: false,
                         },
                     );
                 }
-                let custom = self.custom_tools.contains(name);
+                let (custom, namespace) = match self.reply.tool_call(name) {
+                    ReplyToolCall::Custom => (true, None),
+                    ReplyToolCall::Function {
+                        name: sub_name,
+                        namespace: Some(namespace),
+                    } => (false, Some((namespace.to_string(), sub_name.to_string()))),
+                    ReplyToolCall::Function { .. } => (false, None),
+                };
                 let state = self.tool_calls.get_mut(&oai_index).expect("just inserted");
                 if !id.is_empty() {
                     state.call_id = id.to_string();
@@ -1420,23 +1994,18 @@ impl ResponsesSseEncoder {
                     // the client already read.
                     if !state.item_added {
                         state.custom = custom;
+                        state.namespace = namespace;
                     }
                 }
 
                 // Emit output_item.added once the call id + name are known.
                 if !state.item_added && !state.call_id.is_empty() && !state.name.is_empty() {
                     state.item_added = true;
-                    let (item_id, call_id, name, output_index, custom) = (
-                        state.item_id(),
-                        state.call_id.clone(),
-                        state.name.clone(),
-                        state.output_index,
-                        state.custom,
-                    );
-                    let item = if custom {
-                        json!({"type": "custom_tool_call", "id": item_id, "call_id": call_id, "name": name, "input": "", "status": "in_progress"})
+                    let output_index = state.output_index;
+                    let item = if state.custom {
+                        json!({"type": "custom_tool_call", "id": state.item_id(), "call_id": state.call_id, "name": state.name, "input": "", "status": "in_progress"})
                     } else {
-                        json!({"type": "function_call", "id": item_id, "call_id": call_id, "name": name, "arguments": "", "status": "in_progress"})
+                        state.function_call_item("", "in_progress")
                     };
                     events.push(self.event(
                         "response.output_item.added",
@@ -1628,10 +2197,7 @@ impl ResponsesSseEncoder {
         } else {
             "response.incomplete"
         };
-        let mut response = self.response_object(status, true, true);
-        if let Some(reason) = reason {
-            response["incomplete_details"] = json!({"reason": reason});
-        }
+        let response = self.response_object(status, true, reason, None);
         self.event(event_type, json!({"response": response}))
     }
 
@@ -1639,31 +2205,59 @@ impl ResponsesSseEncoder {
         self.finished
     }
 
+    /// What one encoded event costs against an output guardrail's
+    /// hold-back budget. A lifecycle event repeats the request's own
+    /// settings (`instructions`, `tools`, …); those are bounded by the
+    /// request, not by what the model generated, and an agent client's run
+    /// to tens of kilobytes — so they are not charged, or every guarded
+    /// stream would fail closed on a fraction of the output it used to.
+    pub fn buffer_cost(&self, event: &ResponsesSseEvent, encoded_len: usize) -> usize {
+        if event.data.get("response").is_some() {
+            encoded_len.saturating_sub(self.echo_len)
+        } else {
+            encoded_len
+        }
+    }
+
+    /// Whether any chunk so far carried something a response is made of —
+    /// content, reasoning, a tool call, or a finish reason. A stream that
+    /// ends before one did produced no response at all: a bare `[DONE]`, or
+    /// a usage-only frame, is not an answer.
+    pub fn has_output(&self) -> bool {
+        self.sent_created
+    }
+
+    /// The upstream sent its finish reason and the terminal event is being
+    /// held for the trailing usage frame.
+    pub fn awaiting_usage(&self) -> bool {
+        !self.finished && self.pending_status.is_some()
+    }
+
     /// Flush a clean close when the upstream stream ended without a finish
-    /// chunk, or while the completed event was withheld for usage.
+    /// chunk, or while the completed event was withheld for usage. Only for
+    /// a stream that produced output (see [`Self::has_output`]); one that
+    /// did not has failed rather than finished.
     pub fn force_finish(&mut self) -> Vec<ResponsesSseEvent> {
         if self.finished {
             return Vec::new();
         }
-        let mut events = Vec::new();
-        // No renderable signal ever arrived → synthesize the preamble so
-        // the client still gets a well-formed (empty) response.
-        if !self.sent_created {
-            self.sent_created = true;
-            events.push(self.event(
-                "response.created",
-                json!({"response": self.response_object("in_progress", false, false)}),
-            ));
-            events.push(self.event(
-                "response.in_progress",
-                json!({"response": self.response_object("in_progress", false, false)}),
-            ));
-        }
         let status = self.pending_status.take().unwrap_or("completed");
         let reason = self.pending_reason.take();
-        events.extend(self.close_items());
+        let mut events = self.close_items();
         events.push(self.completed_event(status, reason));
         events
+    }
+
+    /// The terminal `response.failed` event: the Response object with
+    /// `status: "failed"`, the `error` that ended it, no output and no
+    /// usage. Whether a terminal event already reached the client is the
+    /// relay's call, not this encoder's: under a held-back output
+    /// guardrail the encoder has produced `response.completed` long before
+    /// anything is released.
+    pub fn failed_event(&mut self, code: &str, message: &str) -> ResponsesSseEvent {
+        self.finished = true;
+        let response = self.response_object("failed", false, None, Some((code, message)));
+        self.event("response.failed", json!({"response": response}))
     }
 }
 
@@ -1699,6 +2293,10 @@ pub struct ResponsesStreamCompletion {
     /// the non-streaming path so the dashboard's Blocked tab + budget ledger
     /// see it.
     pub guardrail_blocked: bool,
+    /// The upstream failure that ended the stream — a mid-stream error, or
+    /// a stream that carried no response. The usage event reports it
+    /// instead of a `200`.
+    pub failure: Option<crate::attempt::StreamFailure>,
     /// Per-detector PII mask counts applied to the held stream at release
     /// (#932). Merged with the input-side counts by the on_complete emit.
     pub redacted_entity_counts: crate::redact::RedactionCounts,
@@ -1808,10 +2406,18 @@ pub fn build_responses_bridge_stream(
             slot: Some((on_complete, ResponsesStreamCompletion::default())),
             estimator,
         };
+        // Whether any event has left for the client yet; a failure that
+        // would be the first one opens the stream itself.
+        let mut sent_downstream = false;
         // Stamped on the first bytes that actually leave for the client —
         // under hold-back that is the release, not the upstream chunk.
         macro_rules! downstream_mark {
             () => {
+                // Dead after the final release, which no failure follows.
+                #[allow(unused_assignments)]
+                {
+                    sent_downstream = true;
+                }
                 if guard.comp().downstream_latency_ms == 0 {
                     guard.comp().downstream_latency_ms =
                         started.elapsed().as_millis().min(u32::MAX as u128) as u32;
@@ -1901,7 +2507,7 @@ pub fn build_responses_bridge_stream(
                     for ev in encoder.next_events(&chunk) {
                         let b = bytes::Bytes::from(ev.to_sse_string());
                         if buffering {
-                            held_bytes += b.len();
+                            held_bytes += encoder.buffer_cost(&ev, b.len());
                             if held_bytes > max_buffer_bytes {
                                 overflowed = true;
                                 break;
@@ -1917,14 +2523,58 @@ pub fn build_responses_bridge_stream(
                     }
                 }
                 Err(e) => {
-                    yield Ok(bytes::Bytes::from(upstream_error_frame(
-                        encoder.take_sequence_number(),
+                    // The upstream had already finished its answer and the
+                    // connection dropped before the usage frame or `[DONE]`:
+                    // nothing the caller asked for is missing, so the
+                    // response completes, on estimated usage if need be.
+                    if matches!(e, aisix_gateway::BridgeError::Transport(_))
+                        && encoder.awaiting_usage()
+                    {
+                        break;
+                    }
+                    let message = e.to_string();
+                    crate::attempt::StreamFailure::record(&mut guard.comp().failure, &e);
+                    // The loop stops at the terminal event, so none went out.
+                    yield Ok(failure_frames(
+                        &mut encoder,
+                        sent_downstream,
+                        false,
                         e.error_type(),
-                        &e.to_string(),
-                    )));
+                        upstream_failed_code(&e),
+                        &message,
+                    ));
                     return;
                 }
             }
+        }
+
+        // The upstream closed a stream that never carried a single piece of
+        // a response. Completing it would hand the caller an empty answer
+        // as a success; failing it with a retryable code lets the client
+        // retry the turn. Accounted exactly like a mid-stream upstream
+        // failure: the usage record comes from the Drop guard.
+        if !encoder.is_finished() && !encoder.has_output() {
+            tracing::warn!(
+                model = %model_label,
+                "streaming /v1/responses (cross-provider) upstream returned an empty stream",
+            );
+            // Recorded as what the same empty stream is before the headers
+            // go out — an aborted stream — with its own message.
+            guard.comp().failure = Some(crate::attempt::StreamFailure {
+                error_message: EMPTY_STREAM_MESSAGE.to_string(),
+                ..crate::attempt::StreamFailure::from_bridge(
+                    &aisix_gateway::BridgeError::StreamAborted,
+                )
+            });
+            yield Ok(failure_frames(
+                &mut encoder,
+                sent_downstream,
+                false,
+                EMPTY_STREAM_CODE,
+                EMPTY_STREAM_CODE,
+                EMPTY_STREAM_MESSAGE,
+            ));
+            return;
         }
         // Token-estimation fallback (AISIX-Cloud#1074), run HERE rather than
         // from the Drop guard below: the terminal `response.completed` this
@@ -1957,7 +2607,7 @@ pub fn build_responses_bridge_stream(
             for ev in encoder.force_finish() {
                 let b = bytes::Bytes::from(ev.to_sse_string());
                 if buffering {
-                    held_bytes += b.len();
+                    held_bytes += encoder.buffer_cost(&ev, b.len());
                     if held_bytes > max_buffer_bytes {
                         overflowed = true;
                         break;
@@ -1989,7 +2639,14 @@ pub fn build_responses_bridge_stream(
                 "streaming /v1/responses (cross-provider) output exceeded buffer cap; failing closed",
             );
             guard.comp().guardrail_blocked = true;
-            yield Ok(bytes::Bytes::from(guardrail_error_frame(encoder.take_sequence_number(), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED))));
+            yield Ok(guardrail_failure_frames(
+                &mut encoder,
+                sent_downstream,
+                // Only a held-back stream can overflow: nothing was sent.
+                false,
+                None,
+                Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+            ));
             return;
         }
 
@@ -2056,6 +2713,7 @@ pub fn build_responses_bridge_stream(
             let verdict = crate::redact::moderate_body(
                 chain.as_ref(),
                 crate::redact::Direction::Output,
+                None,
                 verdict,
                 &mut seg_counts,
                 &mut seg_hits,
@@ -2111,7 +2769,16 @@ pub fn build_responses_bridge_stream(
                     "guardrail blocked streaming /v1/responses (cross-provider) response",
                 );
                 guard.comp().guardrail_blocked = true;
-                yield Ok(bytes::Bytes::from(guardrail_error_frame(encoder.take_sequence_number(), guardrail_name.as_deref(), unavailable.as_deref())));
+                // On the live-forward path the terminal event is already on
+                // the wire; the error frame is all that can follow it.
+                let terminal_sent = !buffering && encoder.is_finished();
+                yield Ok(guardrail_failure_frames(
+                    &mut encoder,
+                    sent_downstream,
+                    terminal_sent,
+                    guardrail_name.as_deref(),
+                    unavailable.as_deref(),
+                ));
                 return;
             }
             if seg_rewrote {
@@ -2188,24 +2855,109 @@ fn responses_error_frame(seq: u64, code: &str, message: &str) -> String {
     )
 }
 
-/// Responses-API SSE `error` frame for an upstream failure mid-relay.
-fn upstream_error_frame(seq: u64, error_type: &str, message: &str) -> String {
-    responses_error_frame(seq, error_type, message)
+/// The frames that end a bridged stream on a failure: the flat `error`
+/// event, then — unless a terminal event already reached the client —
+/// `response.failed`, the event a client reads the failure from. A client
+/// that does not recognise the flat `error` event (the Codex CLI is one)
+/// otherwise sees only a connection that closed before the response ended,
+/// and retries the turn without ever showing why.
+///
+/// The two carry the same message; `frame_code` is the flat event's code,
+/// `failed_code` the Response object's `error.code`, which clients map to a
+/// retry decision.
+///
+/// A failure that is the first thing the client receives — the upstream
+/// failed or ended before producing anything, or a held-back stream was
+/// withheld — is preceded by `response.created` and
+/// `response.in_progress`: a stream that does not open with
+/// `response.created` is one the OpenAI SDKs' `responses.stream()` helper
+/// rejects with its own error, and the caller never sees this one. The
+/// numbering then starts at 0: events a held-back stream withheld were
+/// numbered, but the client never saw them.
+fn failure_frames(
+    encoder: &mut ResponsesSseEncoder,
+    sent_downstream: bool,
+    terminal_sent: bool,
+    frame_code: &str,
+    failed_code: &str,
+    message: &str,
+) -> bytes::Bytes {
+    let mut frames = String::new();
+    if !sent_downstream {
+        encoder.sequence_number = 0;
+        for ev in encoder.opening_events() {
+            frames.push_str(&ev.to_sse_string());
+        }
+    }
+    frames.push_str(&responses_error_frame(
+        encoder.take_sequence_number(),
+        frame_code,
+        message,
+    ));
+    if !terminal_sent {
+        frames.push_str(&encoder.failed_event(failed_code, message).to_sse_string());
+    }
+    bytes::Bytes::from(frames)
 }
 
-/// Responses-API SSE `error` frame for an output-guardrail block. Carries the
-/// firing guardrail's name (#519 B.4b) but never the matched-pattern detail.
-fn guardrail_error_frame(
-    seq: u64,
+/// [`failure_frames`] for an output-guardrail stop — a block verdict, or a
+/// held-back response that outgrew the buffer. Carries the firing
+/// guardrail's name (#519 B.4b) but never the matched-pattern detail.
+///
+/// `response.failed` reports `invalid_prompt`: re-running the same turn
+/// meets the same guardrail, so the code is one clients treat as a request
+/// that will not succeed on retry, and show its message.
+fn guardrail_failure_frames(
+    encoder: &mut ResponsesSseEncoder,
+    sent_downstream: bool,
+    terminal_sent: bool,
     guardrail_name: Option<&str>,
     unavailable: Option<&str>,
-) -> String {
-    responses_error_frame(
-        seq,
+) -> bytes::Bytes {
+    failure_frames(
+        encoder,
+        sent_downstream,
+        terminal_sent,
         "content_filter",
+        "invalid_prompt",
         &crate::error::guardrail_block_message("response", guardrail_name, unavailable),
     )
 }
+
+/// The `error.code` of the `response.failed` that ends a stream on an
+/// upstream failure: the flat frame's code, unless the upstream's own
+/// in-band error named one of the codes clients act on specifically, which
+/// is passed through so the client can (a context overflow, an exhausted
+/// quota, a rate limit, an overloaded server).
+fn upstream_failed_code(e: &aisix_gateway::BridgeError) -> &str {
+    const PASSED_THROUGH: [&str; 5] = [
+        "context_length_exceeded",
+        "insufficient_quota",
+        "rate_limit_exceeded",
+        "server_is_overloaded",
+        "slow_down",
+    ];
+    if let aisix_gateway::BridgeError::UpstreamInBand {
+        parsed: Some(parsed),
+        ..
+    } = e
+    {
+        if let Some(code) = [parsed.code.as_deref(), parsed.kind.as_deref()]
+            .into_iter()
+            .flatten()
+            .find(|c| PASSED_THROUGH.contains(c))
+        {
+            return code;
+        }
+    }
+    e.error_type()
+}
+
+/// Code of the failure a stream that carried no response ends with. The
+/// same one an upstream failure carries, which clients retry.
+const EMPTY_STREAM_CODE: &str = "upstream_error";
+const EMPTY_STREAM_MESSAGE: &str =
+    "upstream returned an empty stream: no content, reasoning, tool call or finish reason";
 
 fn finish_reason_label(reason: &FinishReason) -> String {
     match reason {
@@ -2223,9 +2975,18 @@ mod tests {
     use aisix_gateway::{ChatDelta, Role};
     use std::collections::BTreeSet;
 
-    /// A request that declared no `custom` tools.
-    fn no_custom_tools() -> BTreeSet<String> {
-        BTreeSet::new()
+    /// A request that declared no tools and no settings.
+    fn no_custom_tools() -> ResponsesReplyContext {
+        ResponsesReplyContext::default()
+    }
+
+    /// A request that declared these `custom` tools.
+    fn custom_tools(names: &[&str]) -> ResponsesReplyContext {
+        let tools: Vec<Value> = names
+            .iter()
+            .map(|n| json!({"type": "custom", "name": n}))
+            .collect();
+        ResponsesReplyContext::from_request(&json!({"tools": tools}))
     }
 
     // ── Request translation ──────────────────────────────────────
@@ -2739,20 +3500,22 @@ mod tests {
     }
 
     #[test]
-    fn custom_tool_names_reads_only_the_custom_entries() {
-        let body = json!({
+    fn reply_context_reads_only_the_custom_entries_as_custom_tools() {
+        let reply = ResponsesReplyContext::from_request(&json!({
             "tools": [
                 {"type": "function", "name": "get_weather"},
                 {"type": "custom", "name": "apply_patch"},
                 {"type": "custom"},
                 {"type": "web_search_preview"},
             ],
-        });
+        }));
         assert_eq!(
-            custom_tool_names(&body),
+            reply.custom_tools,
             BTreeSet::from(["apply_patch".to_string()])
         );
-        assert!(custom_tool_names(&json!({"input": "hi"})).is_empty());
+        assert!(ResponsesReplyContext::from_request(&json!({"input": "hi"}))
+            .custom_tools
+            .is_empty());
     }
 
     #[test]
@@ -3024,12 +3787,7 @@ mod tests {
             "function": {"name": "apply_patch", "arguments": "{\"content\":\"*** Begin Patch\"}"},
         }]);
         let resp = chat_response_with(None, Some(tcs), FinishReason::ToolCalls);
-        let out = chat_response_to_responses_json(
-            &resp,
-            "m",
-            1,
-            &BTreeSet::from(["apply_patch".to_string()]),
-        );
+        let out = chat_response_to_responses_json(&resp, "m", 1, &custom_tools(&["apply_patch"]));
         let item = &out["output"][0];
         assert_eq!(item["type"], "custom_tool_call");
         assert_eq!(item["call_id"], "call_9");
@@ -3046,7 +3804,7 @@ mod tests {
     /// is what the caller's freeform tool was going to receive either way.
     #[test]
     fn custom_tool_input_falls_back_to_the_raw_arguments() {
-        let custom = BTreeSet::from(["apply_patch".to_string()]);
+        let custom = custom_tools(&["apply_patch"]);
         for arguments in [
             "not json at all",
             "{\"other\":\"x\"}",
@@ -3076,12 +3834,7 @@ mod tests {
             {"id": "c2", "type": "function", "function": {"name": "apply_patch", "arguments": "{\"content\":\"p\"}"}},
         ]);
         let resp = chat_response_with(None, Some(tcs), FinishReason::ToolCalls);
-        let out = chat_response_to_responses_json(
-            &resp,
-            "m",
-            1,
-            &BTreeSet::from(["apply_patch".to_string()]),
-        );
+        let out = chat_response_to_responses_json(&resp, "m", 1, &custom_tools(&["apply_patch"]));
         assert_eq!(out["output"][0]["type"], "function_call");
         assert_eq!(out["output"][0]["arguments"], "{\"cmd\":\"ls\"}");
         assert_eq!(out["output"][1]["type"], "custom_tool_call");
@@ -3239,12 +3992,7 @@ mod tests {
     /// unwrapped input delta, its done event, and the full item.
     #[test]
     fn streaming_custom_tool_call_emits_one_unwrapped_input_delta() {
-        let mut enc = ResponsesSseEncoder::new(
-            "resp_1",
-            "m",
-            0,
-            BTreeSet::from(["apply_patch".to_string()]),
-        );
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, custom_tools(&["apply_patch"]));
         let mut all = enc.next_events(&ChatChunk {
             id: "c".into(),
             model: "m".into(),
@@ -3333,12 +4081,7 @@ mod tests {
     /// never saw opened.
     #[test]
     fn a_tool_name_completed_after_the_item_opened_keeps_its_announced_identity() {
-        let mut enc = ResponsesSseEncoder::new(
-            "resp_1",
-            "m",
-            0,
-            BTreeSet::from(["apply_patch".to_string()]),
-        );
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, custom_tools(&["apply_patch"]));
         // First fragment carries a PREFIX of the custom tool's name, so the
         // item opens as a plain function call.
         let mut all = enc.next_events(&ChatChunk {
@@ -3385,12 +4128,7 @@ mod tests {
 
     #[test]
     fn streaming_custom_tool_call_emits_no_function_call_argument_events() {
-        let mut enc = ResponsesSseEncoder::new(
-            "resp_1",
-            "m",
-            0,
-            BTreeSet::from(["apply_patch".to_string()]),
-        );
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, custom_tools(&["apply_patch"]));
         let mut all = enc.next_events(&ChatChunk {
             id: "c".into(),
             model: "m".into(),
@@ -3414,12 +4152,7 @@ mod tests {
     /// families, at their own `output_index`.
     #[test]
     fn streaming_mixed_tool_calls_keep_their_own_event_families() {
-        let mut enc = ResponsesSseEncoder::new(
-            "resp_1",
-            "m",
-            0,
-            BTreeSet::from(["apply_patch".to_string()]),
-        );
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, custom_tools(&["apply_patch"]));
         let mut all = enc.next_events(&ChatChunk {
             id: "c".into(),
             model: "m".into(),
@@ -3460,20 +4193,23 @@ mod tests {
         assert!(output[1]["id"].as_str().unwrap().starts_with("ctc_"));
     }
 
+    /// A bare `[DONE]` or a usage-only stream carries nothing a response
+    /// is made of; only content, reasoning, a tool call or a finish reason
+    /// counts.
     #[test]
-    fn force_finish_on_empty_stream_emits_well_formed_completed() {
+    fn only_a_renderable_chunk_counts_as_output() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
-        let events = enc.force_finish();
-        let types = types_of(&events);
-        assert_eq!(
-            types,
-            vec![
-                "response.created",
-                "response.in_progress",
-                "response.completed"
-            ]
-        );
-        assert!(enc.is_finished());
+        let usage_only = ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta::default(),
+            finish_reason: None,
+            usage: Some(UsageStats::new(10, 0)),
+        };
+        assert!(enc.next_events(&usage_only).is_empty());
+        assert!(!enc.has_output());
+        let _ = enc.next_events(&content_chunk("hi"));
+        assert!(enc.has_output());
     }
 
     #[test]
@@ -3585,26 +4321,49 @@ mod tests {
         );
     }
 
+    /// `(event, data)` of every SSE event in a relay's output.
+    fn sse_events(frames: &[u8]) -> Vec<(String, Value)> {
+        std::str::from_utf8(frames)
+            .unwrap()
+            .split("\n\n")
+            .filter(|e| !e.is_empty())
+            .map(|e| {
+                let (event, data) = e
+                    .strip_prefix("event: ")
+                    .and_then(|r| r.split_once("\ndata: "))
+                    .expect("an `event:` line followed by one `data:` line");
+                (
+                    event.to_string(),
+                    serde_json::from_str(data).expect("one JSON document"),
+                )
+            })
+            .collect()
+    }
+
     /// The Responses API defines its `error` event FLAT, discriminated on
     /// the top-level `type`, and the official SDKs parse it that way —
     /// `openai-python`'s `ResponseErrorEvent` is
     /// `{type, code, message, param, sequence_number}`. Nesting it under an
     /// `error` object (which is what every other SSE error in this crate
     /// does) would hand a `responses.stream()` client an event it cannot
-    /// classify. Both of this relay's error frames are checked, because a
+    /// classify. Both of this relay's failure kinds are checked, because a
     /// client should not have to know which failure it hit.
     #[test]
     fn both_sse_error_frames_match_the_responses_api_error_event() {
-        let payload_of = |frame: &str| -> serde_json::Value {
-            let body = frame
-                .strip_prefix("event: error\ndata: ")
-                .and_then(|r| r.strip_suffix("\n\n"))
-                .expect("an SSE error frame labelled `error`")
-                .to_owned();
-            serde_json::from_str(&body).expect("one JSON document")
-        };
-
-        let block = payload_of(&guardrail_error_frame(7, Some("gr-block"), None));
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
+        for _ in 0..7 {
+            enc.take_sequence_number();
+        }
+        let block = sse_events(&guardrail_failure_frames(
+            &mut enc,
+            true,
+            true,
+            Some("gr-block"),
+            None,
+        ));
+        assert_eq!(block.len(), 1, "a terminal event already went out");
+        let (event, block) = &block[0];
+        assert_eq!(event, "error");
         assert_eq!(block["type"], "error");
         assert_eq!(block["code"], "content_filter");
         assert!(block["message"].as_str().unwrap().contains("gr-block"));
@@ -3613,11 +4372,15 @@ mod tests {
 
         // The upstream-failure frame on the same stream, same envelope. Its
         // message is JSON-escaped through serde rather than interpolated.
-        let upstream = payload_of(&upstream_error_frame(
-            8,
+        let upstream = sse_events(&failure_frames(
+            &mut enc,
+            true,
+            true,
+            "upstream_error",
             "upstream_error",
             "boom \"quoted\"",
         ));
+        let (_, upstream) = &upstream[0];
         assert_eq!(upstream["type"], "error");
         assert_eq!(upstream["code"], "upstream_error");
         assert_eq!(upstream["message"], "boom \"quoted\"");
@@ -3625,7 +4388,7 @@ mod tests {
 
         // Exactly the SDK's field set, and nothing nested: an `error` key
         // here is the shape this deliberately does NOT use.
-        for v in [&block, &upstream] {
+        for v in [block, upstream] {
             assert!(v.get("error").is_none());
             let keys: std::collections::BTreeSet<&str> =
                 v.as_object().unwrap().keys().map(String::as_str).collect();
@@ -3636,6 +4399,82 @@ mod tests {
                     .collect::<std::collections::BTreeSet<_>>(),
             );
         }
+    }
+
+    /// The flat `error` frame is followed by `response.failed`, the event a
+    /// client reads a failure from, numbered after it. A guardrail stop
+    /// reports `invalid_prompt` there — re-running the turn meets the same
+    /// guardrail — while the flat frame keeps its own code.
+    #[test]
+    fn a_failure_is_followed_by_response_failed_carrying_the_error() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
+        let _ = enc.next_events(&content_chunk("partial"));
+        let events = sse_events(&guardrail_failure_frames(
+            &mut enc,
+            true,
+            false,
+            Some("gr-block"),
+            None,
+        ));
+        assert_eq!(
+            events.iter().map(|(e, _)| e.as_str()).collect::<Vec<_>>(),
+            ["error", "response.failed"]
+        );
+        let (error, failed) = (&events[0].1, &events[1].1);
+        assert_eq!(error["code"], "content_filter");
+        assert_eq!(failed["type"], "response.failed");
+        assert_eq!(
+            failed["sequence_number"].as_u64().unwrap(),
+            error["sequence_number"].as_u64().unwrap() + 1
+        );
+        let response = &failed["response"];
+        assert_eq!(response["id"], "resp_1");
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["error"]["code"], "invalid_prompt");
+        assert_eq!(response["error"]["message"], error["message"]);
+        // The output that was held back is not reported on a failure.
+        assert_eq!(response["output"], json!([]));
+        assert_eq!(response["usage"], Value::Null);
+        assert!(enc.is_finished());
+    }
+
+    fn in_band_error(code: Option<&str>, kind: Option<&str>) -> aisix_gateway::BridgeError {
+        aisix_gateway::BridgeError::UpstreamInBand {
+            status: None,
+            message: "upstream said no".into(),
+            parsed: Some(Box::new(aisix_gateway::UpstreamErrorView {
+                kind: kind.map(str::to_string),
+                message: Some("upstream said no".into()),
+                code: code.map(str::to_string),
+                param: None,
+            })),
+            wire: aisix_gateway::UpstreamWire::Unknown,
+        }
+    }
+
+    /// The codes a client acts on specifically pass through from the
+    /// upstream's own in-band error; anything else reports the flat
+    /// frame's code.
+    #[test]
+    fn response_failed_passes_through_the_codes_clients_act_on() {
+        for code in [
+            "context_length_exceeded",
+            "insufficient_quota",
+            "rate_limit_exceeded",
+            "server_is_overloaded",
+            "slow_down",
+        ] {
+            assert_eq!(upstream_failed_code(&in_band_error(Some(code), None)), code);
+            assert_eq!(upstream_failed_code(&in_band_error(None, Some(code))), code);
+        }
+        assert_eq!(
+            upstream_failed_code(&in_band_error(Some("1302"), Some("some_vendor_error"))),
+            "upstream_in_band_error"
+        );
+        assert_eq!(
+            upstream_failed_code(&aisix_gateway::BridgeError::Transport("eof".into())),
+            "transport_error"
+        );
     }
 
     // ── Reasoning on the bridged path ────────────────────────────
@@ -3935,5 +4774,658 @@ mod tests {
         let usage = &events.last().unwrap().data["response"]["usage"];
         assert_eq!(usage["input_tokens"], 3, "the frame was read, not guessed");
         assert_eq!(usage["output_tokens"], 4);
+    }
+
+    // ── Replayed reasoning ───────────────────────────────────────
+
+    fn reasoning_item(summary: &str) -> Value {
+        json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": summary}],
+            "content": null,
+            "encrypted_content": null,
+        })
+    }
+
+    fn reasoning_of(m: &ChatMessage) -> Option<&str> {
+        m.extra.get("reasoning_content").and_then(Value::as_str)
+    }
+
+    /// The Codex turn shape: the reasoning that produced an answer rides the
+    /// answer's own assistant message as `reasoning_content`, never as
+    /// visible content and never as a turn of its own.
+    #[test]
+    fn replayed_reasoning_rides_the_assistant_message_that_follows_it() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({"input": [
+                {"role": "user", "content": "hi"},
+                reasoning_item("the user greets me"),
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]},
+            ]}),
+        );
+        assert_eq!(chat.messages.len(), 2);
+        assert!(matches!(chat.messages[1].role, Role::Assistant));
+        assert_eq!(chat.messages[1].content_str(), "hello");
+        assert_eq!(reasoning_of(&chat.messages[1]), Some("the user greets me"));
+    }
+
+    /// Reasoning that led to tool calls rides the one assistant message that
+    /// carries them, parallel calls included.
+    #[test]
+    fn replayed_reasoning_rides_the_tool_calls_it_led_to() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({"input": [
+                {"role": "user", "content": "list and read"},
+                reasoning_item("run two commands"),
+                {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+                {"type": "function_call", "call_id": "c2", "name": "shell", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "a"},
+                {"type": "function_call_output", "call_id": "c2", "output": "b"},
+            ]}),
+        );
+        assert_eq!(chat.messages.len(), 4);
+        let assistant = &chat.messages[1];
+        assert_eq!(reasoning_of(assistant), Some("run two commands"));
+        assert!(assistant.content.is_none());
+        assert_eq!(assistant.extra["tool_calls"].as_array().unwrap().len(), 2);
+        assert!(matches!(chat.messages[2].role, Role::Tool));
+    }
+
+    /// The Codex turn shape with tools: the model's text, then the calls it
+    /// made in the same turn. They go back as ONE assistant message
+    /// carrying both, with the turn's reasoning on it — the shape the model
+    /// produced them in.
+    #[test]
+    fn assistant_text_and_the_calls_that_follow_it_are_one_turn() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({"input": [
+                {"role": "user", "content": "list files"},
+                reasoning_item("run ls"),
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Running ls."}]},
+                {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+                {"type": "function_call", "call_id": "c2", "name": "shell", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "a"},
+                {"type": "function_call_output", "call_id": "c2", "output": "b"},
+            ]}),
+        );
+        assert_eq!(chat.messages.len(), 4);
+        let turn = &chat.messages[1];
+        assert_eq!(turn.content_str(), "Running ls.");
+        assert_eq!(reasoning_of(turn), Some("run ls"));
+        let ids: Vec<&str> = turn.extra["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tc| tc["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["c1", "c2"]);
+    }
+
+    /// Consecutive reasoning items join in order; `content` text wins over
+    /// the summary, `encrypted_content` is never read, and an item with no
+    /// readable text replays nothing.
+    #[test]
+    fn replayed_reasoning_text_prefers_content_and_joins_consecutive_items() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({"input": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "summary"}],
+                 "content": [{"type": "reasoning_text", "text": " full thought "}]},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "a"}, {"type": "summary_text", "text": "b"}]},
+                {"type": "reasoning", "summary": [], "encrypted_content": "ciphertext"},
+                {"role": "assistant", "content": "done"},
+            ]}),
+        );
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(reasoning_of(&chat.messages[0]), Some("full thought\na\nb"));
+        assert!(!serde_json::to_string(&chat.messages)
+            .unwrap()
+            .contains("ciphertext"));
+    }
+
+    /// A bare-string `content` is not a shape the input mask rewrites, so it
+    /// is never replayed; the summary is used instead.
+    #[test]
+    fn a_bare_string_reasoning_content_is_not_replayed() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({"input": [
+                {"type": "reasoning", "content": "raw a@x.com", "summary": [{"type": "summary_text", "text": "masked"}]},
+                {"role": "assistant", "content": "done"},
+            ]}),
+        );
+        assert_eq!(reasoning_of(&chat.messages[0]), Some("masked"));
+    }
+
+    /// Reasoning that no assistant message follows is still passed back, as
+    /// an assistant message of its own ahead of the turn that came next.
+    #[test]
+    fn replayed_reasoning_without_a_following_answer_stays_its_own_message() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({"input": [
+                {"role": "user", "content": "q1"},
+                reasoning_item("thinking, then interrupted"),
+                {"role": "user", "content": "q2"},
+            ]}),
+        );
+        assert_eq!(chat.messages.len(), 3);
+        assert!(matches!(chat.messages[1].role, Role::Assistant));
+        assert!(chat.messages[1].content.is_none());
+        assert_eq!(
+            reasoning_of(&chat.messages[1]),
+            Some("thinking, then interrupted")
+        );
+        assert!(matches!(chat.messages[2].role, Role::User));
+        // Bridges with no slot for it skip exactly this message.
+        assert!(chat.messages[1].is_reasoning_only());
+    }
+
+    // ── Namespace tools ──────────────────────────────────────────
+
+    fn multi_agent_namespace() -> Value {
+        json!({
+            "type": "namespace",
+            "name": "multi_agent_v1",
+            "description": "Tools for spawning and managing sub-agents.",
+            "tools": [
+                {"type": "function", "name": "spawn_agent", "description": "Spawn one.",
+                 "strict": false, "parameters": {"type": "object", "properties": {"task": {"type": "string"}}}},
+                {"type": "function", "name": "close_agent",
+                 "parameters": {"type": "object", "properties": {"target": {"type": "string"}}}},
+                {"type": "custom", "name": "not_a_function"},
+            ],
+        })
+    }
+
+    #[test]
+    fn namespace_function_sub_tools_flatten_into_prefixed_chat_tools() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({"input": "go", "tools": [
+                {"type": "function", "name": "exec_command", "parameters": {"type": "object"}},
+                multi_agent_namespace(),
+                {"type": "web_search", "external_web_access": true},
+            ]}),
+        );
+        let tools = chat.extra["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "exec_command",
+                "multi_agent_v1__spawn_agent",
+                "multi_agent_v1__close_agent"
+            ]
+        );
+        assert_eq!(
+            tools[1]["function"]["description"],
+            "Tools for spawning and managing sub-agents.\n\nSpawn one."
+        );
+        assert_eq!(
+            tools[2]["function"]["description"],
+            "Tools for spawning and managing sub-agents."
+        );
+        assert_eq!(
+            tools[1]["function"]["parameters"]["properties"]["task"]["type"],
+            "string"
+        );
+    }
+
+    /// A sub-tool whose flattened name a top-level function already has is
+    /// not offered twice, and a call to that name stays the top-level one.
+    #[test]
+    fn a_flattened_name_taken_by_a_top_level_function_is_not_offered_twice() {
+        let body = json!({"input": "go", "tools": [
+            {"type": "function", "name": "ns__a"},
+            {"type": "namespace", "name": "ns", "tools": [{"type": "function", "name": "a"}]},
+        ]});
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(chat.extra["tools"].as_array().unwrap().len(), 1);
+        let reply = ResponsesReplyContext::from_request(&body);
+        assert!(matches!(
+            reply.tool_call("ns__a"),
+            ReplyToolCall::Function {
+                name: "ns__a",
+                namespace: None
+            }
+        ));
+        // The bare name is unambiguous, so it still maps to the sub-tool.
+        assert!(matches!(
+            reply.tool_call("a"),
+            ReplyToolCall::Function {
+                name: "a",
+                namespace: Some("ns")
+            }
+        ));
+    }
+
+    /// A replayed call to a namespace sub-tool goes back under the name the
+    /// model was offered it as.
+    #[test]
+    fn a_replayed_namespace_call_uses_the_flattened_name() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({"input": [
+                {"type": "function_call", "call_id": "c1", "name": "spawn_agent",
+                 "namespace": "multi_agent_v1", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+            ]}),
+        );
+        assert_eq!(
+            chat.messages[0].extra["tool_calls"][0]["function"]["name"],
+            "multi_agent_v1__spawn_agent"
+        );
+    }
+
+    /// A forced choice of a namespace sub-tool names the tool the model
+    /// was actually offered.
+    #[test]
+    fn a_forced_namespace_choice_names_the_flattened_tool() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({"input": "go", "tools": [multi_agent_namespace()],
+                    "tool_choice": {"type": "function", "name": "spawn_agent", "namespace": "multi_agent_v1"}}),
+        );
+        assert_eq!(
+            chat.extra["tool_choice"],
+            json!({"type": "function", "function": {"name": "multi_agent_v1__spawn_agent"}})
+        );
+    }
+
+    /// The request echo on a lifecycle event is not charged against an
+    /// output guardrail's hold-back budget: an agent's instructions and
+    /// tools are tens of kilobytes, repeated on three events per stream.
+    #[test]
+    fn the_request_echo_is_not_charged_to_the_hold_back_budget() {
+        let cost_of_created = |request: Value| {
+            let mut enc = ResponsesSseEncoder::new(
+                "resp_1",
+                "m",
+                0,
+                ResponsesReplyContext::from_request(&request),
+            );
+            let events = enc.next_events(&content_chunk("hi"));
+            let created = &events[0];
+            assert_eq!(created.event_type, "response.created");
+            enc.buffer_cost(created, created.to_sse_string().len())
+        };
+        let small = cost_of_created(json!({}));
+        let large = cost_of_created(json!({"instructions": "x".repeat(50_000)}));
+        assert_eq!(small, large);
+        // An output event is charged in full.
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
+        let events = enc.next_events(&content_chunk("hi"));
+        let delta = events
+            .iter()
+            .find(|e| e.event_type == "response.output_text.delta")
+            .unwrap();
+        let len = delta.to_sse_string().len();
+        assert_eq!(enc.buffer_cost(delta, len), len);
+    }
+
+    fn namespace_reply() -> ResponsesReplyContext {
+        ResponsesReplyContext::from_request(&json!({"tools": [multi_agent_namespace()]}))
+    }
+
+    #[test]
+    fn non_streaming_namespace_call_returns_the_sub_tool_and_its_namespace() {
+        let tcs = json!([
+            {"id": "c1", "type": "function", "function": {"name": "multi_agent_v1__spawn_agent", "arguments": "{}"}},
+            {"id": "c2", "type": "function", "function": {"name": "close_agent", "arguments": "{}"}},
+            {"id": "c3", "type": "function", "function": {"name": "shell", "arguments": "{}"}},
+        ]);
+        let resp = chat_response_with(None, Some(tcs), FinishReason::ToolCalls);
+        let out = chat_response_to_responses_json(&resp, "m", 1, &namespace_reply());
+        let output = out["output"].as_array().unwrap();
+        assert_eq!(output[0]["name"], "spawn_agent");
+        assert_eq!(output[0]["namespace"], "multi_agent_v1");
+        // A model answering with the bare, unambiguous name is understood.
+        assert_eq!(output[1]["name"], "close_agent");
+        assert_eq!(output[1]["namespace"], "multi_agent_v1");
+        // Anything else is an ordinary function call with no namespace.
+        assert_eq!(output[2]["name"], "shell");
+        assert!(output[2].get("namespace").is_none());
+    }
+
+    #[test]
+    fn streaming_namespace_call_announces_and_closes_the_sub_tool() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, namespace_reply());
+        let mut events = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![json!({
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "multi_agent_v1__spawn_agent", "arguments": "{\"task\":"},
+                })]),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        });
+        events.extend(enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![
+                    json!({"index": 0, "function": {"arguments": "\"x\"}"}}),
+                ]),
+                ..Default::default()
+            },
+            finish_reason: Some(FinishReason::ToolCalls),
+            usage: Some(UsageStats::new(3, 2)),
+        }));
+        let item_of = |t: &str| {
+            events
+                .iter()
+                .find(|e| e.event_type == t)
+                .map(|e| e.data["item"].clone())
+                .unwrap()
+        };
+        for item in [
+            item_of("response.output_item.added"),
+            item_of("response.output_item.done"),
+        ] {
+            assert_eq!(item["type"], "function_call");
+            assert_eq!(item["name"], "spawn_agent");
+            assert_eq!(item["namespace"], "multi_agent_v1");
+        }
+        assert_eq!(
+            item_of("response.output_item.done")["arguments"],
+            "{\"task\":\"x\"}"
+        );
+        let completed = &events.last().unwrap().data["response"]["output"][0];
+        assert_eq!(completed["name"], "spawn_agent");
+        assert_eq!(completed["namespace"], "multi_agent_v1");
+    }
+
+    // ── Full Response object ─────────────────────────────────────
+
+    /// Every top-level member the Responses API requires of a Response.
+    const RESPONSE_MEMBERS: [&str; 30] = [
+        "id",
+        "object",
+        "created_at",
+        "completed_at",
+        "status",
+        "incomplete_details",
+        "model",
+        "previous_response_id",
+        "instructions",
+        "output",
+        "error",
+        "tools",
+        "tool_choice",
+        "truncation",
+        "parallel_tool_calls",
+        "text",
+        "top_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "top_logprobs",
+        "temperature",
+        "reasoning",
+        "usage",
+        "max_output_tokens",
+        "max_tool_calls",
+        "store",
+        "background",
+        "service_tier",
+        "metadata",
+        "safety_identifier",
+    ];
+
+    fn assert_full_response(r: &Value) {
+        for key in RESPONSE_MEMBERS.iter().chain(["prompt_cache_key"].iter()) {
+            assert!(r.get(*key).is_some(), "Response object lacks `{key}`: {r}");
+        }
+    }
+
+    /// A Response object reports the request's own settings, and the API's
+    /// default where the request left one out.
+    #[test]
+    fn the_response_object_echoes_the_request_and_defaults_the_rest() {
+        let request = json!({
+            "model": "m",
+            "instructions": "be terse",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "f", "parameters": {"type": "object"}}, multi_agent_namespace()],
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "temperature": 0.2,
+            "max_output_tokens": 64,
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "store": false,
+            "prompt_cache_key": "session-1",
+            "text": null,
+            "previous_response_id": null,
+        });
+        let resp = chat_response_with(Some("hello"), None, FinishReason::Stop);
+        let out = chat_response_to_responses_json(
+            &resp,
+            "m",
+            1,
+            &ResponsesReplyContext::from_request(&request),
+        );
+        assert_full_response(&out);
+        assert_eq!(out["instructions"], "be terse");
+        assert_eq!(out["parallel_tool_calls"], false);
+        assert_eq!(out["temperature"], 0.2);
+        assert_eq!(out["max_output_tokens"], 64);
+        assert_eq!(
+            out["reasoning"],
+            json!({"effort": "high", "summary": "auto"})
+        );
+        assert_eq!(out["store"], false);
+        assert_eq!(out["prompt_cache_key"], "session-1");
+        // A function tool carries every member the API defines for it; any
+        // other tool is echoed as sent.
+        assert_eq!(
+            out["tools"][0],
+            json!({"type": "function", "name": "f", "parameters": {"type": "object"},
+                   "description": null, "strict": null})
+        );
+        assert_eq!(out["tools"][1], multi_agent_namespace());
+        // Defaults for what the request left out, or sent as null.
+        assert_eq!(out["text"], json!({"format": {"type": "text"}}));
+        assert_eq!(out["truncation"], "disabled");
+        assert_eq!(out["top_p"], 1.0);
+        assert_eq!(out["previous_response_id"], Value::Null);
+        assert_eq!(out["metadata"], json!({}));
+        assert_eq!(out["error"], Value::Null);
+        assert_eq!(out["incomplete_details"], Value::Null);
+        assert!(out["completed_at"].as_i64().is_some());
+    }
+
+    /// Every lifecycle event carries the full object too, `usage: null`
+    /// until the response has finished.
+    #[test]
+    fn every_lifecycle_event_carries_the_full_response_object() {
+        let mut enc = ResponsesSseEncoder::new(
+            "resp_1",
+            "m",
+            0,
+            ResponsesReplyContext::from_request(&json!({"instructions": "sys"})),
+        );
+        let mut events = enc.next_events(&content_chunk("hi"));
+        events.extend(enc.next_events(&finish_chunk(Some(UsageStats::new(3, 1)))));
+        let lifecycle: Vec<&ResponsesSseEvent> = events
+            .iter()
+            .filter(|e| e.data.get("response").is_some())
+            .collect();
+        assert_eq!(
+            lifecycle.iter().map(|e| e.event_type).collect::<Vec<_>>(),
+            [
+                "response.created",
+                "response.in_progress",
+                "response.completed"
+            ]
+        );
+        for e in &lifecycle {
+            assert_full_response(&e.data["response"]);
+            assert_eq!(e.data["response"]["instructions"], "sys");
+        }
+        assert_eq!(lifecycle[0].data["response"]["usage"], Value::Null);
+        assert_eq!(lifecycle[0].data["response"]["completed_at"], Value::Null);
+        assert_eq!(lifecycle[2].data["response"]["usage"]["input_tokens"], 3);
+
+        let failed = ResponsesSseEncoder::new("resp_2", "m", 0, no_custom_tools())
+            .failed_event("upstream_error", "boom");
+        assert_full_response(&failed.data["response"]);
+    }
+
+    // ── Stream ends ──────────────────────────────────────────────
+
+    /// Run `chunks` through the relay with no guardrail and return its SSE
+    /// events plus the end-of-stream usage record.
+    async fn relay(
+        chunks: Vec<Result<ChatChunk, aisix_gateway::BridgeError>>,
+    ) -> (Vec<(String, Value)>, ResponsesStreamCompletion) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let body = build_responses_bridge_stream(
+            Box::pin(futures::stream::iter(chunks)),
+            ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools()),
+            Instant::now(),
+            Instant::now(),
+            None,
+            false,
+            usize::MAX,
+            "m".to_string(),
+            None,
+            None,
+            move |comp| tx.send(comp).unwrap(),
+        );
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        (sse_events(&bytes), rx.recv().unwrap())
+    }
+
+    fn event_names(events: &[(String, Value)]) -> Vec<&str> {
+        events.iter().map(|(e, _)| e.as_str()).collect()
+    }
+
+    /// A stream that ends before carrying any piece of a response — here a
+    /// usage-only frame — fails with a retryable code instead of completing
+    /// with an empty output. Nothing went out before the failure, so it
+    /// opens the stream with `response.created` + `response.in_progress`.
+    #[tokio::test]
+    async fn an_empty_upstream_stream_fails_instead_of_completing() {
+        let usage_only = ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta::default(),
+            finish_reason: None,
+            usage: Some(UsageStats::new(10, 0)),
+        };
+        let (events, comp) = relay(vec![Ok(usage_only)]).await;
+        assert_eq!(event_names(&events), FAILED_BEFORE_ANY_OUTPUT);
+        assert_opened_then_failed(&events);
+        assert_eq!(events[2].1["code"], "upstream_error");
+        let failed = &events[3].1["response"];
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["error"]["code"], "upstream_error");
+        assert_eq!(failed["error"]["message"], events[2].1["message"]);
+        // Accounted like any upstream failure mid-relay.
+        assert!(!comp.reached_end);
+
+        let (events, _) = relay(Vec::new()).await;
+        assert_eq!(event_names(&events), FAILED_BEFORE_ANY_OUTPUT);
+        assert_opened_then_failed(&events);
+    }
+
+    const FAILED_BEFORE_ANY_OUTPUT: [&str; 4] = [
+        "response.created",
+        "response.in_progress",
+        "error",
+        "response.failed",
+    ];
+
+    /// The opening pair carries the same in-progress Response the failure
+    /// then ends, and the sequence runs 0..n without a gap.
+    fn assert_opened_then_failed(events: &[(String, Value)]) {
+        for (i, (_, data)) in events.iter().enumerate() {
+            assert_eq!(data["sequence_number"], i as u64);
+        }
+        for (_, data) in &events[..2] {
+            assert_eq!(data["response"]["id"], "resp_1");
+            assert_eq!(data["response"]["status"], "in_progress");
+            assert_eq!(data["response"]["output"], json!([]));
+        }
+        assert_eq!(events[3].1["response"]["id"], "resp_1");
+        assert_eq!(events[3].1["response"]["status"], "failed");
+    }
+
+    /// An upstream failure before the first chunk is also the first thing
+    /// the client receives, so it opens the stream the same way.
+    #[tokio::test]
+    async fn a_transport_error_before_any_chunk_opens_the_stream_then_fails() {
+        let (events, _) = relay(vec![Err(aisix_gateway::BridgeError::Transport(
+            "connection reset".into(),
+        ))])
+        .await;
+        assert_eq!(event_names(&events), FAILED_BEFORE_ANY_OUTPUT);
+        assert_opened_then_failed(&events);
+        assert_eq!(events[2].1["code"], "transport_error");
+    }
+
+    /// A stream that produced content and then simply ended keeps
+    /// completing: the caller has an answer, only its finish was not
+    /// reported.
+    #[tokio::test]
+    async fn a_stream_with_content_but_no_finish_still_completes() {
+        let (events, comp) = relay(vec![Ok(content_chunk("partial"))]).await;
+        assert_eq!(event_names(&events).last(), Some(&"response.completed"));
+        assert!(comp.reached_end);
+    }
+
+    /// The upstream sent its finish reason and the connection then dropped
+    /// before the usage frame: nothing the caller asked for is missing, so
+    /// the response completes rather than fails.
+    #[tokio::test]
+    async fn a_transport_error_after_the_finish_reason_completes_the_response() {
+        let (events, comp) = relay(vec![
+            Ok(content_chunk("whole answer")),
+            Ok(finish_chunk(None)),
+            Err(aisix_gateway::BridgeError::Transport(
+                "unexpected EOF".into(),
+            )),
+        ])
+        .await;
+        let names = event_names(&events);
+        assert_eq!(names.last(), Some(&"response.completed"));
+        assert!(!names.contains(&"error"));
+        assert!(comp.reached_end);
+    }
+
+    /// The same drop BEFORE the finish reason is a failure: the flat error
+    /// frame, then `response.failed` carrying the same code and message.
+    #[tokio::test]
+    async fn a_transport_error_before_the_finish_reason_fails_the_response() {
+        let (events, _) = relay(vec![
+            Ok(content_chunk("half an ans")),
+            Err(aisix_gateway::BridgeError::Transport(
+                "unexpected EOF".into(),
+            )),
+        ])
+        .await;
+        let names = event_names(&events);
+        assert_eq!(&names[names.len() - 2..], ["error", "response.failed"]);
+        // Already opened by the content chunk: not opened a second time.
+        assert_eq!(
+            names.iter().filter(|n| **n == "response.created").count(),
+            1
+        );
+        let (error, failed) = (&events[events.len() - 2].1, &events[events.len() - 1].1);
+        assert_eq!(error["code"], "transport_error");
+        assert_eq!(failed["response"]["error"]["code"], "transport_error");
+        assert_eq!(failed["response"]["error"]["message"], error["message"]);
+        assert_eq!(failed["response"]["output"], json!([]));
     }
 }

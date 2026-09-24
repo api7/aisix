@@ -301,11 +301,11 @@ const DIAL_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 /// What this closes is a silence, not a hang. `Client::connect` waits for
 /// the `Authenticate` round trip, and against an endpoint that accepts the
 /// TCP connection and then answers nothing it waits for as long as
-/// `etcd.dial_timeout_ms` allows — unset, the shipped default, means
-/// forever. The gateway is then stuck before any listener binds and, until
-/// this, wrote not one line about it: an operator saw a process with no
-/// port and no explanation. The bound itself is deliberately unchanged;
-/// this only makes the wait visible.
+/// `etcd.dial_timeout_ms` allows — which an explicit `0` makes forever.
+/// The gateway is then stuck before any listener binds and, until this,
+/// wrote not one line about it: an operator saw a process with no port
+/// and no explanation. This only makes the wait visible; what bounds it
+/// is the key's default, now finite.
 ///
 /// First tick one interval in, not immediately, so a healthy dial — which
 /// finishes in milliseconds — logs nothing at all.
@@ -359,7 +359,12 @@ pub struct LazyEtcdClient {
     /// bounds: the TLS handshake and the `Authenticate` round trip sit
     /// outside that option, so an endpoint that completes TCP and then
     /// goes silent would otherwise hang the dial with no bound at all.
-    /// `None` — the default, and what `0` means — leaves it unbounded.
+    /// The WHOLE-dial budget — `EtcdConfig::dial_budget`, which is
+    /// `dial_timeout_ms` once per configured endpoint, because one
+    /// balanced channel spans them all and a single authentication call
+    /// may fail over across the set. `None` leaves it unbounded, which
+    /// is what an explicit `dial_timeout_ms: 0` asks for; omitting the
+    /// key gets `aisix_core::DEFAULT_ETCD_DIAL_TIMEOUT_MS` per endpoint.
     dial_timeout: Option<Duration>,
     connected: Mutex<Option<Connected>>,
     /// Handed to the next connection [`LazyEtcdClient::dial`] establishes.
@@ -526,10 +531,16 @@ impl LazyEtcdClient {
                 // matters here, so this joins the retry path rather than
                 // ending the boot.
                 Err(_) => {
+                    // Not "etcd.dial_timeout_ms (15000 ms)": the value
+                    // here is the whole-dial budget, which is the
+                    // configured key once per endpoint — and an operator
+                    // grepping their config for 15000 would find nothing.
                     return Err(ConnectError::Unreachable(format!(
-                        "connect exceeded etcd.dial_timeout_ms ({} ms)",
-                        d.as_millis()
-                    )))
+                        "connect exceeded the etcd dial budget ({} ms = \
+                         etcd.dial_timeout_ms x {} endpoint(s))",
+                        d.as_millis(),
+                        self.endpoints.len().max(1),
+                    )));
                 }
             },
         };
@@ -872,15 +883,15 @@ mod reauth_tests {
 
     #[tokio::test]
     async fn a_dial_that_never_finishes_says_so_while_it_waits() {
-        // `etcd.dial_timeout_ms` unset — the shipped default — against an
-        // endpoint that accepts the TCP connection and then answers
-        // nothing. `Client::connect` waits for the `Authenticate` round
-        // trip forever, so the gateway is stuck before any listener
-        // binds; until this line it wrote nothing at all, and an operator
-        // saw a process with no port and no explanation.
-        //
-        // The bound is deliberately untouched: what is asserted here is
-        // that the wait is audible, not that it ends.
+        // No dial timeout — what an explicit `dial_timeout_ms: 0` asks
+        // for — against an endpoint that accepts the TCP connection and
+        // then answers nothing. `Client::connect` waits for the
+        // `Authenticate` round trip forever, so the gateway is stuck
+        // before any listener binds; until this line it wrote nothing at
+        // all, and an operator saw a process with no port and no
+        // explanation. Omitting the key no longer lands here, but asking
+        // for it explicitly still does, so the wait still has to be
+        // audible — which is what is asserted, not that it ends.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

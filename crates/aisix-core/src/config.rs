@@ -125,9 +125,27 @@ pub struct EtcdConfig {
     /// read at connect time — never stored in the config struct.
     #[serde(default)]
     pub password_env: Option<String>,
-    /// Bound on dialling etcd, in milliseconds. Unset — the default —
-    /// and `0` both mean unbounded (see the note on `0` under
-    /// [`EtcdConfig::request_timeout`]), leaving it to the OS TCP stack.
+    /// Bound on dialling etcd, in milliseconds. Unset, it is
+    /// [`DEFAULT_ETCD_DIAL_TIMEOUT_MS`]; an explicit `0` means unbounded
+    /// (see the note on `0` under [`EtcdConfig::request_timeout`]),
+    /// leaving it to the OS TCP stack.
+    ///
+    /// The whole dial gets this budget once per configured endpoint —
+    /// `dial_timeout_ms × max(1, endpoints)`, see
+    /// [`EtcdConfig::dial_budget`] — and the value also reaches the
+    /// connector as its per-TCP-connect bound. The TLS handshake and the
+    /// `Authenticate` exchange sit outside that connector option, which
+    /// is why the whole-dial bound exists at all.
+    ///
+    /// The default is finite, unlike `request_timeout_ms`, because the
+    /// two bound different things. A range read's cost scales with the
+    /// size of the configuration set, so a default bound on it would
+    /// abort the one call whose expiry leaves the instance with nothing
+    /// to serve. A dial has no such cost, and boot awaits it before it
+    /// binds ANY listener — so an endpoint that accepts the TCP
+    /// connection and then answers nothing held `:3000` and `:9090`
+    /// closed for as long as it stayed quiet, with the snapshot cache
+    /// that exists for exactly that outage sitting unread behind it.
     ///
     /// When set it covers the whole dial: it reaches hyper's connector
     /// via `Endpoint::connect_timeout` for the TCP handshake, and the
@@ -136,7 +154,7 @@ pub struct EtcdConfig {
     /// etcd-client issues when `user` / `password_env` are set are
     /// bounded too. An expired dial reports an etcd that could not be
     /// reached, which the gateway retries rather than exits on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default = "default_etcd_dial_timeout_ms")]
     pub dial_timeout_ms: Option<u64>,
     /// Bound on a single request/response etcd call, in milliseconds.
     /// Unset — the default — and `0` both mean unbounded (see the note on
@@ -564,21 +582,72 @@ impl Default for EtcdConfig {
             env_id: String::new(),
             user: None,
             password_env: None,
-            dial_timeout_ms: None,
+            dial_timeout_ms: Some(DEFAULT_ETCD_DIAL_TIMEOUT_MS),
             request_timeout_ms: None,
             tls: None,
         }
     }
 }
 
+fn default_etcd_dial_timeout_ms() -> Option<u64> {
+    Some(DEFAULT_ETCD_DIAL_TIMEOUT_MS)
+}
+
+/// Default bound on one etcd dial. Generous enough that a healthy dial
+/// — including its TLS handshake and the `Authenticate` round trip when
+/// `user` is set — never trips it, short enough that a gateway scheduled
+/// ahead of its control plane binds its listeners and serves from the
+/// snapshot cache instead of waiting silently.
+pub const DEFAULT_ETCD_DIAL_TIMEOUT_MS: u64 = 5000;
+
 impl EtcdConfig {
     fn default_prefix() -> String {
         "/aisix".into()
     }
-    /// `None` when unset or `0`: the dial is unbounded.
+    /// What a whole dial may spend, as opposed to one attempt of it.
     ///
-    /// See [`EtcdConfig::request_timeout`] for why `0` means unbounded
-    /// here and "fall back to the next level" elsewhere in this repo.
+    /// `None` only when `dial_timeout_ms` is an explicit `0` — omitting
+    /// the key gets [`DEFAULT_ETCD_DIAL_TIMEOUT_MS`]. See
+    /// [`EtcdConfig::request_timeout`] for why `0` means unbounded here
+    /// and "fall back to the next level" elsewhere in this repo.
+    ///
+    /// One budget per configured endpoint, as headroom rather than as a
+    /// claim about the client's internals. `Client::connect` opens one
+    /// balanced channel over the whole set and the driver exposes no
+    /// per-endpoint bound to set instead, so the only lever is the total
+    /// — and a total sized for one endpoint would cut a dial that has to
+    /// get past unreachable members, which is the deployment a multi-
+    /// endpoint cluster exists to survive.
+    ///
+    /// `× max(1, endpoints)`, with no `+1`: unlike the Redis side, where
+    /// a sentinel or cluster walk ends in a connection to a node the walk
+    /// merely pointed at, the channel here IS the endpoints and there is
+    /// no extra hop to pay for.
+    ///
+    /// What an operator actually sees is the window in which no listener
+    /// is bound, and boot dials TWO providers (the environment prefix and
+    /// the shared pricing catalog) one after the other — so against a
+    /// wholly unreachable cluster that window is
+    /// `dial_timeout_ms × endpoints × 2`.
+    ///
+    /// Blank entries are excluded from the count because they are not
+    /// endpoints anything can dial: `Client::connect` rejects the whole
+    /// set at URI parsing if one is present, which ends the boot. Paying
+    /// a budget for them would be paying for a dial that cannot happen.
+    pub fn dial_budget(&self) -> Option<Duration> {
+        let endpoints = self
+            .endpoints
+            .iter()
+            .filter(|e| !e.trim().is_empty())
+            .count()
+            .max(1);
+        self.dial_timeout()
+            .map(|per_attempt| per_attempt.saturating_mul(endpoints.try_into().unwrap_or(u32::MAX)))
+    }
+
+    /// What ONE connection attempt inside a dial may spend — the value
+    /// the operator wrote. [`Self::dial_budget`] is what the whole dial
+    /// gets.
     pub const fn dial_timeout(&self) -> Option<Duration> {
         Self::bound(self.dial_timeout_ms)
     }
@@ -1416,17 +1485,19 @@ pub enum RedisMode {
 /// - `cluster`  → `nodes` (one or more seed node URLs)
 /// - `sentinel` → `sentinels` (sentinel node URLs) + `master_name`
 ///
-/// In `single` mode all credentials and TLS (`rediss://`) travel inside
-/// `url`. In `cluster`/`sentinel` mode they can travel in the node /
-/// sentinel URLs the same way, but the **data node** (cluster nodes, or
-/// the Sentinel-discovered master) can also be authenticated explicitly
-/// with `username` + `password` (Redis ACL) and, for sentinel, a
-/// `database` — useful because the Sentinel-discovered master has no URL
-/// of its own. Sentinel-node auth still travels in the `sentinels` URLs,
-/// so Sentinel and master credentials may differ.
+/// Credentials and TLS (`rediss://`) can travel inside the URLs, and the
+/// **data node** — the `single` endpoint, the cluster nodes, or the
+/// Sentinel-discovered master — can also be authenticated explicitly
+/// with `username` + `password` (Redis ACL) and `database`. The explicit
+/// fields apply in every mode and **override** whatever the URL carries.
+/// Sentinel-node auth still travels in the `sentinels` URLs, so Sentinel
+/// and master credentials may differ.
 ///
 /// To keep secrets out of the config file, supply `password` via the
 /// matching env var instead, e.g. `AISIX_RATELIMIT__REDIS__PASSWORD`.
+/// That is the shape the precedence rule exists for: a value injected
+/// through the environment is no use if a stale credential left in `url`
+/// quietly outranks it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RedisConnConfig {
@@ -1439,12 +1510,18 @@ pub struct RedisConnConfig {
     pub sentinels: Vec<String>,
     /// Monitored master group name. Required when `mode = sentinel`.
     pub master_name: Option<String>,
-    /// ACL username for the data node (cluster nodes / sentinel master).
+    /// ACL username for the data node. Applied in every mode, and it
+    /// overrides any username the URL carries.
     pub username: Option<String>,
-    /// Password for the data node (cluster nodes / sentinel master).
+    /// Password for the data node. Applied in every mode, and it
+    /// overrides any password the URL carries.
     pub password: Option<String>,
-    /// Database index for the Sentinel-discovered master (default 0).
-    /// Not applicable to `cluster` (Redis Cluster only has DB 0).
+    /// Database index for the data node (default 0). Overrides the one
+    /// the URL's path carries. Not applicable to `cluster` (Redis
+    /// Cluster only has DB 0), where it is not sent at all. A value the
+    /// server does not have is reported as a refusal rather than as an
+    /// outage — the server answered — and the backend serves degraded
+    /// until it is corrected.
     pub database: Option<i64>,
     /// Trust settings for a `rediss://` connection. Independent of
     /// `upstream.tls` because the cache/rate-limit backend sits inside
@@ -1454,9 +1531,10 @@ pub struct RedisConnConfig {
     /// Only consulted for `rediss://` URLs; a plaintext `redis://`
     /// connection never negotiates TLS regardless of what is set here.
     pub tls: OutboundTlsConfig,
-    /// Seconds a single Redis round trip, and a single connection
-    /// attempt, may take before it is abandoned. Default
-    /// [`DEFAULT_REDIS_TIMEOUT_SECS`].
+    /// Seconds a single Redis round trip may take before it is
+    /// abandoned, and the budget the startup connection is given — once
+    /// per endpoint a `cluster`/`sentinel` discovery may have to walk,
+    /// plus one. Default [`DEFAULT_REDIS_TIMEOUT_SECS`].
     ///
     /// Every consumer of this connection fails **open** on a Redis error
     /// (the rate limiter falls back to per-replica counters, the caches
@@ -2640,11 +2718,13 @@ admin:
     }
 
     #[test]
-    fn etcd_timeouts_default_to_unset_meaning_unbounded() {
-        // Both keys are optional and default to unbounded. A finite
-        // default would bound the configuration range read, whose cost
-        // scales with the size of the configuration set — the one call
-        // whose expiry leaves the instance with nothing to serve.
+    fn an_unset_dial_timeout_is_bounded_while_an_unset_read_timeout_is_not() {
+        // The two keys default differently, on purpose. A finite default
+        // on the range read would bound a call whose cost scales with the
+        // size of the configuration set — the one call whose expiry
+        // leaves the instance with nothing to serve. A dial has no such
+        // cost and boot awaits it before binding any listener, so it does
+        // get a default.
         let f = write_yaml(
             r#"
 etcd:
@@ -2658,10 +2738,69 @@ admin:
 "#,
         );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
-        assert_eq!(cfg.etcd.dial_timeout_ms, None);
+        assert_eq!(cfg.etcd.dial_timeout_ms, Some(DEFAULT_ETCD_DIAL_TIMEOUT_MS));
         assert_eq!(cfg.etcd.request_timeout_ms, None);
-        assert_eq!(cfg.etcd.dial_timeout(), None);
+        assert_eq!(
+            cfg.etcd.dial_timeout(),
+            Some(Duration::from_millis(DEFAULT_ETCD_DIAL_TIMEOUT_MS))
+        );
         assert_eq!(cfg.etcd.request_timeout(), None);
+    }
+
+    // The whole dial gets a budget per endpoint, because the client
+    // opens ONE balanced channel over all of them and a single
+    // authentication call may fail over across the set. A flat bound
+    // would cut a dial working exactly as designed on the one topology
+    // built to survive a dead member.
+    #[test]
+    fn the_dial_budget_pays_for_every_configured_endpoint() {
+        // `ms` is written out on every case: a struct literal cannot
+        // express "the key was omitted" — that is serde's job, and the
+        // load test above pins it. What is pinned here is the arithmetic
+        // built on top of whatever value arrives.
+        let cfg = |endpoints: Vec<&str>, ms: Option<u64>| EtcdConfig {
+            endpoints: endpoints.into_iter().map(String::from).collect(),
+            dial_timeout_ms: ms,
+            ..Default::default()
+        };
+        let per = DEFAULT_ETCD_DIAL_TIMEOUT_MS;
+        let dflt = Some(per);
+
+        assert_eq!(
+            cfg(vec!["http://a:2379"], dflt).dial_budget(),
+            Some(Duration::from_millis(per))
+        );
+        assert_eq!(
+            cfg(
+                vec!["http://a:2379", "http://b:2379", "http://c:2379"],
+                dflt
+            )
+            .dial_budget(),
+            Some(Duration::from_millis(per * 3))
+        );
+        // Blank entries are dropped before anything is dialled, so they
+        // must not buy a budget the dial will never spend.
+        assert_eq!(
+            cfg(vec!["http://a:2379", "  ", ""], dflt).dial_budget(),
+            Some(Duration::from_millis(per))
+        );
+        // No endpoints at all is a config `validate` rejects; the floor
+        // keeps the arithmetic from reading as "no budget".
+        assert_eq!(
+            cfg(vec![], dflt).dial_budget(),
+            Some(Duration::from_millis(per))
+        );
+        // Unbounded scales to unbounded, not to zero.
+        assert_eq!(
+            cfg(vec!["http://a:2379", "http://b:2379"], Some(0)).dial_budget(),
+            None
+        );
+        // And the per-attempt value is untouched by the count — it is
+        // what reaches the connector for one TCP connect.
+        assert_eq!(
+            cfg(vec!["http://a:2379", "http://b:2379"], Some(1500)).dial_timeout(),
+            Some(Duration::from_millis(1500))
+        );
     }
 
     #[test]
@@ -2690,11 +2829,15 @@ admin:
 
     #[test]
     fn etcd_timeouts_read_zero_as_unbounded_not_as_an_instant_abort() {
-        // `0` is the same as unset for both keys, matching what
-        // `Model::timeout: 0` already means. The alternative reading —
-        // abort immediately — bricks the gateway silently: every connect
-        // and every read expires, so the proxy listener never binds and
-        // nothing says why. The one `0` in this repo that means "fall
+        // `0` means unbounded on both keys, matching what
+        // `Model::timeout: 0` already means. On `request_timeout_ms` that
+        // is also what unset gives; on `dial_timeout_ms` it is now the
+        // only way to ask for it, and asking is the point — an operator
+        // who wants the dial left alone says `0` rather than omitting the
+        // key. The alternative reading of `0` — abort immediately —
+        // bricks the gateway silently: every connect and every read
+        // expires, so the proxy listener never binds and nothing says
+        // why. The one `0` in this repo that means "fall
         // back to the next level" is `Model::stream_timeout`, which needs
         // a resolution chain these two flat startup keys do not have.
         let f = write_yaml(

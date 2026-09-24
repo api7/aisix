@@ -14,6 +14,8 @@
 //!
 //! Cheap to clone: every field is either an `Arc` or a small Copy scalar.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use aisix_cache::{Cache, MemoryCache, MemorySemanticCache, SemanticCacheStore};
 use aisix_core::models::CacheBackend;
 use aisix_core::models::{LiveMcpServerIndex, LivePricingIndex};
@@ -40,6 +42,14 @@ use crate::routing::RoutingRegistry;
 /// caching for its requests (`cache_status = disabled`) — never a
 /// silent fallback to node-local memory, which would lie about the
 /// sharing semantics the operator picked.
+/// The write-once home of the `backend: redis` semantic store.
+///
+/// A `OnceLock` rather than a swap cell because that is the whole
+/// contract: the vector-search question is answered once, against the
+/// first live connection, and the answer never changes for the life of
+/// the process.
+pub type SemanticRedisCell = std::sync::OnceLock<Arc<dyn SemanticCacheStore>>;
+
 #[derive(Clone)]
 pub struct CacheBackends {
     memory: Arc<dyn Cache>,
@@ -48,21 +58,50 @@ pub struct CacheBackends {
     /// built — in-process, no config needed, zero cost until a policy
     /// with a `semantic` block matches a request.
     semantic_memory: Arc<dyn SemanticCacheStore>,
-    /// Semantic (L2) store for `backend: redis` policies. Wired by the
-    /// bootstrap only when `cache.redis` is configured, is not cluster
-    /// mode, AND the server passed the vector-search capability probe —
-    /// so its absence here IS the degradation signal.
-    semantic_redis: Option<Arc<dyn SemanticCacheStore>>,
+    /// Semantic (L2) store for `backend: redis` policies. Wired only
+    /// when `cache.redis` is configured, is not cluster mode, AND the
+    /// server passed the vector-search capability probe — so its absence
+    /// here IS the degradation signal, and a policy that asks for
+    /// semantic matching is told once and then served exact-only with no
+    /// embedding call and no Redis round trip.
+    ///
+    /// Swappable because the probe can only run against a live
+    /// connection, and `cache.redis` may be unreachable when the gateway
+    /// starts: the answer is then not "no vector search" but "not asked
+    /// yet", and the background attach fills it in when it gets there.
+    /// It is written once, by that attach, and never cleared.
+    semantic_redis: Arc<SemanticRedisCell>,
     /// Policy ids already warned about an unavailable redis backend,
     /// so the gate logs once per policy instead of once per request.
     redis_warned: Arc<DashSet<String>>,
     /// Policy ids already warned about the redis semantic layer being
-    /// unavailable (same warn-once discipline as `redis_warned`).
+    /// unavailable (same warn-once discipline as `redis_warned`). The
+    /// line has to name both reasons the cell can be empty, because
+    /// warn-once means it is never corrected: a store published by the
+    /// background attach simply stops the gate reaching this branch.
     semantic_redis_warned: Arc<DashSet<String>>,
     /// Policy ids already warned about a stable semantic config error
     /// (missing / non-embedding `embedding_model`). The per-request
     /// metric keeps counting; only the log line is deduplicated.
     semantic_resolve_warned: Arc<DashSet<String>>,
+    /// Set while the redis cache is failing, so the gate reports an
+    /// outage once rather than once per request. Re-armed by the next
+    /// success, so a second outage is reported again.
+    ///
+    /// A cache Redis can now be unreachable from boot and stay that way
+    /// (the connection attaches in the background instead of the process
+    /// exiting), and every cached-policy request produces both a read and
+    /// a write failure — so an unthrottled line is two per request for as
+    /// long as the outage lasts, which buries every other line in the
+    /// log. How hard and how long it is failing is
+    /// `aisix_redis_failures_total{operation}`; the log says that it
+    /// started.
+    ///
+    /// Two latches, not one: the exact-KV and vector-search halves fail
+    /// and recover independently, and only one of them costs an
+    /// embedding call.
+    exact_degraded: Arc<AtomicBool>,
+    semantic_degraded: Arc<AtomicBool>,
 }
 
 impl CacheBackends {
@@ -71,18 +110,58 @@ impl CacheBackends {
             memory,
             redis,
             semantic_memory: Arc::new(MemorySemanticCache::new()),
-            semantic_redis: None,
+            semantic_redis: Arc::new(SemanticRedisCell::new()),
             redis_warned: Arc::new(DashSet::new()),
             semantic_redis_warned: Arc::new(DashSet::new()),
             semantic_resolve_warned: Arc::new(DashSet::new()),
+            exact_degraded: Arc::new(AtomicBool::new(false)),
+            semantic_degraded: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// True the first time the exact-KV cache fails in an outage, false
+    /// for the rest of it — the caller logs only when it is true.
+    pub fn note_exact_failure(&self) -> bool {
+        !self.exact_degraded.swap(true, Ordering::Relaxed)
+    }
+
+    /// Re-arm [`Self::note_exact_failure`] after a successful operation.
+    ///
+    /// Read before write: this runs on every cache MISS, the commonest
+    /// branch there is, and an unconditional store is a cross-core line
+    /// invalidation per request under thread-per-core serving. The
+    /// healthy path only ever reads.
+    pub fn note_exact_success(&self) {
+        if self.exact_degraded.load(Ordering::Relaxed) {
+            self.exact_degraded.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// [`Self::note_exact_failure`] for the vector-search half.
+    pub fn note_semantic_failure(&self) -> bool {
+        !self.semantic_degraded.swap(true, Ordering::Relaxed)
+    }
+
+    /// Re-arm [`Self::note_semantic_failure`]. Read before write, for
+    /// the reason on [`Self::note_exact_success`].
+    pub fn note_semantic_success(&self) {
+        if self.semantic_degraded.load(Ordering::Relaxed) {
+            self.semantic_degraded.store(false, Ordering::Relaxed);
         }
     }
 
     /// Attach the shared semantic store for `backend: redis` policies.
-    /// The bootstrap calls this only after the capability probe passed.
-    pub fn with_semantic_redis(mut self, store: Arc<dyn SemanticCacheStore>) -> Self {
-        self.semantic_redis = Some(store);
+    /// Callers reach this only after the capability probe passed.
+    pub fn with_semantic_redis(self, store: Arc<dyn SemanticCacheStore>) -> Self {
+        let _ = self.semantic_redis.set(store);
         self
+    }
+
+    /// The cell [`Self::with_semantic_redis`] writes, for a bootstrap
+    /// that has to attach the store later than it builds the backends —
+    /// a `cache.redis` that was unreachable at startup.
+    pub fn semantic_redis_cell(&self) -> Arc<SemanticRedisCell> {
+        Arc::clone(&self.semantic_redis)
     }
 
     /// True the FIRST time `policy_id` reports a stable semantic config
@@ -141,16 +220,19 @@ impl CacheBackends {
         match backend {
             CacheBackend::Memory => Some(&self.semantic_memory),
             CacheBackend::Redis => {
-                let store = self.semantic_redis.as_ref();
+                let store = self.semantic_redis.get();
                 if store.is_none() && self.semantic_redis_warned.insert(policy_id.to_string()) {
                     tracing::warn!(
                         target: "aisix::cache",
                         policy_id = %policy_id,
                         policy_name = %policy_name,
                         "cache policy configures semantic matching on backend=redis but \
-                         the configured cache.redis has no vector-search support \
-                         (requires Redis 8+ or the search module; cluster mode is not \
-                         supported yet); requests fall back to exact matching only"
+                         no vector-search store is available: either the configured \
+                         cache.redis has no vector-search support (requires Redis 8+ or \
+                         the search module; cluster mode is not supported yet), or it \
+                         was unreachable at startup and has not been probed yet — a \
+                         background attach publishes the store if the probe then \
+                         passes. Requests fall back to exact matching only"
                     );
                 }
                 store
@@ -556,6 +638,38 @@ impl ProxyState {
 
 #[cfg(test)]
 mod tests {
+
+    // The re-arm is the only direction of this latch that can cause
+    // SILENCE — a latch stuck set means the NEXT outage reports at debug
+    // and nobody hears about it — and it has already been got wrong once
+    // (a semantic HIT did not re-arm). Without this test, deleting the
+    // re-arm leaves every other test green.
+    #[test]
+    fn a_second_outage_is_reported_again() {
+        let b = super::CacheBackends::memory_only();
+        assert!(b.note_exact_failure(), "the first failure reports");
+        assert!(!b.note_exact_failure(), "the rest of the outage is quiet");
+        b.note_exact_success();
+        assert!(b.note_exact_failure(), "a later outage must report again");
+    }
+
+    // The two halves fail and recover independently — one connection is
+    // exact-KV and the other is vector search — so neither latch may
+    // speak for the other.
+    #[test]
+    fn the_two_cache_halves_latch_independently() {
+        let b = super::CacheBackends::memory_only();
+        assert!(b.note_exact_failure());
+        assert!(
+            b.note_semantic_failure(),
+            "the exact half's outage must not silence the semantic one"
+        );
+        b.note_exact_success();
+        assert!(
+            !b.note_semantic_failure(),
+            "and recovering the exact half must not re-arm the semantic one"
+        );
+    }
     use super::ProxyState;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ProxyConfig};

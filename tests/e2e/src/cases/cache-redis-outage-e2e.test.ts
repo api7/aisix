@@ -10,6 +10,7 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -78,16 +79,20 @@ async function redisVectorSupport(url: string): Promise<boolean | null> {
 /** A TCP relay in front of Redis that the test can black-hole: after
  *  `blackhole()` the sockets stay open and nothing is forwarded or
  *  answered, ever. */
-async function startRedisBlackhole(upstreamUrl: string): Promise<{
+async function startRedisBlackhole(
+  upstreamUrl: string,
+  opts: { blackholed?: boolean } = {},
+): Promise<{
   url: string;
   blackhole(): void;
+  heal(): void;
   close(): Promise<void>;
 }> {
   const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(upstreamUrl);
   if (!m) throw new Error(`unparseable redis url: ${upstreamUrl}`);
   const host = m[1];
   const port = m[2] ? Number(m[2]) : 6379;
-  let hole = false;
+  let hole = opts.blackholed ?? false;
   const live = new Set<Socket>();
   const server: Server = createServer((client) => {
     live.add(client);
@@ -119,6 +124,14 @@ async function startRedisBlackhole(upstreamUrl: string): Promise<{
     url: `redis://127.0.0.1:${addr.port}`,
     blackhole: () => {
       hole = true;
+    },
+    // Forwarding resumes for connections opened from now on; the sockets
+    // swallowed mid-handshake are dropped, which is what a Redis coming
+    // back up looks like from the client end.
+    heal: () => {
+      hole = false;
+      for (const s of live) s.destroy();
+      live.clear();
     },
     close: () =>
       new Promise<void>((resolve, reject) => {
@@ -174,6 +187,10 @@ async function startEmbeddingMock(): Promise<{
 
 const SEMANTIC_MODEL = "cache-outage-semantic";
 const EXACT_MODEL = "cache-outage-exact";
+/// Served by a `backend: memory` policy — the other half of a mixed
+/// deployment, which is the shape that can re-arm the degradation latch
+/// on a backend that never fails.
+const MEMORY_MODEL = "cache-outage-memory";
 // Longer than the OLD 5s cool-off and shorter than the 30s one, so the
 // window length alone decides whether the cache write pays a second
 // budget. Non-streaming completions — the only responses this cache
@@ -203,7 +220,7 @@ async function seed(etcdRoot: string, embedBase: string, upstreamBase: string) {
     secret: "sk-mock",
     api_base: `${upstreamBase}/v1`,
   });
-  for (const model of [SEMANTIC_MODEL, EXACT_MODEL]) {
+  for (const model of [SEMANTIC_MODEL, EXACT_MODEL, MEMORY_MODEL]) {
     await seed.createModel({
       display_name: model,
       provider: "openai",
@@ -224,6 +241,16 @@ async function seed(etcdRoot: string, embedBase: string, upstreamBase: string) {
     applies_to: `model:${EXACT_MODEL}`,
     ttl_seconds: 600,
   });
+  // A memory-backed policy on its own model, so a spec can drive traffic
+  // that does NOT touch redis while redis is down. Its cache essentially
+  // cannot fail, so if its successes counted as "redis recovered" the
+  // outage would be re-reported on every alternation.
+  await seed.createCachePolicy({
+    name: "cache-outage-memory-policy",
+    backend: "memory",
+    applies_to: `model:${MEMORY_MODEL}`,
+    ttl_seconds: 600,
+  });
   await seed.createApiKey({
     key_hash: CALLER_KEY_HASH,
     allowed_models: ["*"],
@@ -235,7 +262,7 @@ async function timeChat(
   proxyUrl: string,
   model: string,
   prompt: string,
-): Promise<{ status: number; ms: number }> {
+): Promise<{ status: number; ms: number; requestId: string }> {
   const started = Date.now();
   const res = await fetch(`${proxyUrl}/v1/chat/completions`, {
     method: "POST",
@@ -246,7 +273,11 @@ async function timeChat(
     body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }] }),
   });
   await res.text();
-  return { status: res.status, ms: Date.now() - started };
+  return {
+    status: res.status,
+    ms: Date.now() - started,
+    requestId: res.headers.get("x-aisix-request-id") ?? "",
+  };
 }
 
 interface Fixture {
@@ -453,5 +484,315 @@ describe("an exact-only policy still pays one budget", () => {
     expect(degraded.status).toBe(200);
     expect(degraded.ms).toBeGreaterThanOrEqual(TIMEOUT_SECS * 1000);
     expect(degraded.ms).toBeLessThan(ONE_BUDGET_MS);
+  }, 60_000);
+});
+
+
+// A cache Redis that is already unreachable when the gateway STARTS used
+// to end the boot. Neither half of that was right.
+//
+// The connect ran on the driver's own retry schedule rather than on
+// `timeout_secs`, so the process sat before any listener bind for about
+// eight minutes with no log line, and only then exited. And exiting at
+// all was the odd one out: every cache operation already fails open to a
+// miss, and a RUNNING gateway rides out an unbounded cache-Redis outage
+// that way — only boot was fatal.
+//
+// The deployment that makes it concrete is the one `config.example.yaml`
+// recommends: `ratelimit.redis` pointing at the same Redis as
+// `cache.redis`. With both blocks on one unreachable server the limiter
+// degraded correctly and the cache then killed the process anyway, so the
+// gateway served nothing at all — which is the shape this whole release
+// is fixing.
+describe("a cache Redis unreachable at startup degrades the cache, not the boot", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let embed: Awaited<ReturnType<typeof startEmbeddingMock>> | undefined;
+  let relay: Awaited<ReturnType<typeof startRedisBlackhole>> | undefined;
+  let ready = false;
+  const prefix = `/aisix-e2e-cache-boot-${randomUUID()}`;
+
+  beforeAll(async () => {
+    ready = await vectorRedisReady();
+    if (!ready) return;
+
+    upstream = await startOpenAiUpstream();
+    embed = await startEmbeddingMock();
+    // Silent from the first SYN: the gateway's own boot connect is what
+    // meets it. A refused connection is a different, fast path.
+    relay = await startRedisBlackhole(REDIS_URL, { blackholed: true });
+    app = await spawnApp({
+      // `info`, so the background attach announces itself in `output()`.
+      logLevel: "info",
+      // Both blocks meet the same black hole, and the limiter's connect
+      // and the cache's run one after the other — two budgets before a
+      // listener binds, against a 10s harness readiness gate. Waiting
+      // here ourselves keeps the case measuring its own subject instead
+      // of racing that gate; the assertion that it served at all is the
+      // `/livez` poll below.
+      awaitListeners: false,
+      extra: {
+        etcd: { endpoints: [ETCD_ENDPOINT], prefix },
+        cache: {
+          backend: "redis",
+          redis: { url: relay.url, timeout_secs: TIMEOUT_SECS },
+        },
+        // The shared-Redis deployment, pointed at the same dead relay.
+        ratelimit: {
+          backend: "redis",
+          redis: { url: relay.url, timeout_secs: TIMEOUT_SECS },
+        },
+      },
+    });
+    // `awaitListeners: false` means nothing has waited yet, and the
+    // config probe below would meet a refused connection rather than a
+    // not-ready one. The bound is generous on purpose: the subject is
+    // that the boot no longer takes MINUTES, and the two budgets it does
+    // take are the gateway's business, not this case's.
+    const deadline = Date.now() + 30_000;
+    let live = false;
+    while (!live && Date.now() < deadline) {
+      live = await fetch(`${app.proxyUrl}/livez`)
+        .then((r) => r.ok)
+        .catch(() => false);
+      if (!live) await new Promise((r) => setTimeout(r, 200));
+    }
+    if (!live) throw new Error("the gateway never bound its proxy listener");
+
+    await seed(prefix, embed.baseUrl, upstream.baseUrl);
+    const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(
+      async () => (await probe.listModels()).status === 200,
+    );
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+    await embed?.close();
+    await relay?.close();
+    if (ready) await new EtcdClient().deletePrefix(prefix);
+  });
+
+
+  test("it serves with every backend=redis policy a miss, then starts caching", async (ctx) => {
+    if (!ready || !app || !relay || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    // 1. It serves at all. On the pre-change binary the process exits
+    //    during `beforeAll` instead, so `waitConfigPropagation` never
+    //    sees a 200 and the case fails there.
+    expect(app.output()).toContain("aisix listening");
+    const first = await timeChat(app.proxyUrl, EXACT_MODEL, "boot degraded one");
+    expect(first.status).toBe(200);
+
+    // 2. One WARN names the backend and WHICH Redis, with no credentials.
+    const warn = app
+      .output()
+      .split("\n")
+      .find((l) => l.includes("cache backend unreachable at startup"));
+    expect(warn).toBeDefined();
+    expect(warn).toContain(new URL(relay.url).host);
+    expect(warn).not.toContain("redis://");
+
+    // 3. Every backend=redis policy is a miss while degraded, so the same
+    //    prompt reaches the upstream twice. This is what says "serving
+    //    uncached" rather than "serving from some other cache".
+    const before = upstream.receivedRequests.length;
+    await timeChat(app.proxyUrl, EXACT_MODEL, "boot degraded two");
+    await timeChat(app.proxyUrl, EXACT_MODEL, "boot degraded two");
+    expect(upstream.receivedRequests.length - before).toBe(2);
+
+    //    …and the outage is reported ONCE, not once per request. Three
+    //    requests have now been served with a failing cache, each of
+    //    which both reads and writes, so an unthrottled gateway has
+    //    logged six lines by here and will keep doing so for as long as
+    //    the outage lasts — burying everything else in the log. How hard
+    //    and how long it is failing is `aisix_redis_failures_total`;
+    //    the log line only has to say that it started.
+    // A memory-backed policy interleaved with the failing redis ones.
+    // Its cache cannot fail, so every one of these used to count as
+    // "redis recovered" and re-arm the latch — bringing the per-request
+    // flood straight back in any deployment that runs both kinds.
+    await timeChat(app.proxyUrl, MEMORY_MODEL, "memory policy one");
+    await timeChat(app.proxyUrl, EXACT_MODEL, "boot degraded three");
+    await timeChat(app.proxyUrl, MEMORY_MODEL, "memory policy two");
+    const last = await timeChat(app.proxyUrl, EXACT_MODEL, "boot degraded four");
+
+    // Every cache warning above was queued while its own request ran, so
+    // all of them precede this one's access-log line in the log queue —
+    // which is what makes the count below an upper bound and not just a
+    // lower one. Waiting for the WARN itself would settle on the FIRST
+    // one, written six requests ago, and prove nothing about these.
+    await waitForLogLine(
+      app,
+      (l) =>
+        l.includes("proxy request completed") &&
+        l.includes(`request_id="${last.requestId}"`),
+      `the access-log line for ${last.requestId}`,
+    );
+    const degraded = (l: string) =>
+      l.includes("WARN") &&
+      (l.includes("cache lookup failed") || l.includes("cache write failed"));
+    const degradedWarns = app.output().split("\n").filter(degraded).length;
+    // ONE, not one per operation: the exact-KV half is a single
+    // degradation, and whichever of its read and write gets there first
+    // is the one that reports it. The rest of the outage is debug.
+    expect(degradedWarns).toBe(1);
+
+    //    A count of one proves throttling only if the requests really
+    //    reached the cache gate — one that never got there would read
+    //    one too. The counter is what says they did: it is incremented
+    //    per failed operation and is deliberately NOT throttled, so it
+    //    supplies the lower bound the log line cannot.
+    const scrape = await (await fetch(`${app.metricsUrl}/metrics`)).text();
+    const cacheGetFailures = Number(
+      /aisix_redis_failures_total\{operation="cache_get"\} (\d+)/.exec(scrape)?.[1] ?? 0,
+    );
+    expect(cacheGetFailures).toBeGreaterThanOrEqual(3);
+
+    // 4. Redis comes up and the cache attaches itself — the degradation
+    //    is temporary, not a silent demotion for the life of the process.
+    relay.heal();
+    const deadline = Date.now() + 30_000;
+    while (
+      !app.output().includes("cache backend attached") &&
+      Date.now() < deadline
+    ) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    expect(app.output()).toContain("cache backend attached");
+
+    // …and it really caches now: the second identical prompt does not
+    //    reach the upstream. A store that had attached in name only would
+    //    still forward it.
+    const warm = upstream.receivedRequests.length;
+    const miss = await timeChat(app.proxyUrl, EXACT_MODEL, "boot attached one");
+    expect(miss.status).toBe(200);
+    const hit = await timeChat(app.proxyUrl, EXACT_MODEL, "boot attached one");
+    expect(hit.status).toBe(200);
+    expect(upstream.receivedRequests.length - warm).toBe(1);
+  }, 150_000);
+});
+
+// The cache half of the credential-refusal case. The full story — that
+// the degraded state ends by itself once the credential is corrected on
+// the server — is in `ratelimit-cluster-e2e.test.ts`, because both
+// subsystems share one connect path and one classification. What is
+// asserted here is that the cache reaches the same two conclusions
+// through its own call site: it serves, and it says the server REFUSED
+// rather than that it timed out.
+describe("a cache Redis that refuses the credential degrades the cache, not the boot", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let embed: Awaited<ReturnType<typeof startEmbeddingMock>> | undefined;
+  let ready = false;
+  const prefix = `/aisix-e2e-cache-refused-${randomUUID()}`;
+  const user = `aisix-e2e-cache-${randomUUID().slice(0, 8)}`;
+
+  /** One command over a fresh RESP connection, as bulk strings. */
+  async function redisCommand(args: string[]): Promise<void> {
+    const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(REDIS_URL);
+    if (!m) throw new Error(`not a redis url: ${REDIS_URL}`);
+    const host = m[1];
+    const port = m[2] ? Number(m[2]) : 6379;
+    const payload =
+      `*${args.length}\r\n` + args.map((a) => `$${Buffer.byteLength(a)}\r\n${a}\r\n`).join("");
+    await new Promise<void>((resolve, reject) => {
+      const sock = connect({ host, port }, () => sock.write(payload));
+      sock.once("data", (buf) => {
+        sock.destroy();
+        // A `-ERR` reply is a failed setup, and swallowing it would make
+        // the test fail later on a missing WARN and point at the product.
+        const text = buf.toString();
+        if (text.startsWith("-")) reject(new Error(text.trim()));
+        else resolve();
+      });
+      sock.once("error", (e) => {
+        sock.destroy();
+        reject(e);
+      });
+      sock.setTimeout(2000, () => {
+        sock.destroy();
+        reject(new Error("redis command timed out"));
+      });
+    });
+  }
+
+  beforeAll(async () => {
+    ready = await vectorRedisReady();
+    if (!ready) return;
+    // An ACL user rather than `requirepass`, which is server-wide and
+    // would lock every other file in this suite out of the same Redis.
+    await redisCommand(["ACL", "SETUSER", user, "on", ">not-the-one-configured", "~*", "+@all"]);
+    upstream = await startOpenAiUpstream();
+    embed = await startEmbeddingMock();
+    app = await spawnApp({
+      // `info`, so the listening line the first assertion reads is kept.
+      logLevel: "info",
+      extra: {
+        etcd: { endpoints: [ETCD_ENDPOINT], prefix },
+        cache: {
+          backend: "redis",
+          redis: {
+            url: REDIS_URL,
+            username: user,
+            password: "the-one-configured",
+            timeout_secs: 5,
+          },
+        },
+      },
+    });
+    await seed(prefix, embed.baseUrl, upstream.baseUrl);
+    const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(
+      async () => (await probe.listModels()).status === 200,
+    );
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+    await embed?.close();
+    if (ready) {
+      await redisCommand(["ACL", "DELUSER", user]).catch(() => {});
+      await new EtcdClient().deletePrefix(prefix);
+    }
+  });
+
+  test("it serves every backend=redis policy as a miss, and the WARN names a refusal rather than a timeout", async (ctx) => {
+    if (!ready || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    expect(app.output()).toContain("aisix listening");
+
+    // The behaviour the WARN promises, not just the WARN: `EXACT_MODEL`
+    // carries a `backend: redis` policy, so with the credential refused
+    // the second of two identical requests must still reach the
+    // upstream. A cache that had somehow connected would serve it from
+    // the store and the upstream would see one request, not two.
+    const before = upstream.receivedRequests.length;
+    const prompt = `refused-credential ${randomUUID()}`;
+    for (const _ of [0, 1]) {
+      const res = await timeChat(app.proxyUrl, EXACT_MODEL, prompt);
+      expect(res.status).toBe(200);
+    }
+    expect(upstream.receivedRequests.length - before).toBe(2);
+
+    const warn = app
+      .output()
+      .split("\n")
+      .find((l) => l.includes("cache backend REFUSED"));
+    expect(warn).toBeDefined();
+    expect(warn).toContain("reason=refused");
+    expect(warn).toContain(new URL(REDIS_URL).host);
+    // The server's own words: the only part that says WHICH setting.
+    expect(warn?.toLowerCase()).toContain("auth");
+    expect(warn).not.toContain("timed out");
+    expect(warn).not.toContain("unreachable");
+    expect(warn).not.toContain("redis://");
   }, 60_000);
 });

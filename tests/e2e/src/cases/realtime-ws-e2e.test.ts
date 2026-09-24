@@ -16,6 +16,7 @@ import {
   spawnApp,
   startMockIdp,
   waitConfigPropagation,
+  waitForLogLine,
   type MockIdp,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -503,15 +504,12 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     // Third surface of the same fix: the refusal's access-log line must
     // name the caller (the realtime access log carried no api_key_id on
     // any path before #932).
-    const logLine = app
-      .output()
-      .split("\n")
-      .find(
-        (l) =>
-          l.includes("proxy request completed") &&
-          l.includes(refusal.requestId),
-      );
-    expect(logLine, "access log line for the refusal").toBeTruthy();
+    const logLine = await waitForLogLine(
+      app,
+      (l) =>
+        l.includes("proxy request completed") && l.includes(refusal.requestId),
+      "the access-log line for the refusal",
+    );
     expect(logLine).toContain(restrictedKey.id);
   });
 

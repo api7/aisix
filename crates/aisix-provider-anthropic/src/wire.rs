@@ -322,7 +322,9 @@ pub enum TranslateError {
 }
 
 /// Split the gateway's flat ChatFormat into Anthropic's (system, messages)
-/// shape. Consecutive plain-text system messages at the head are
+/// shape. Developer messages always join Anthropic's top-level system
+/// field, including when interleaved with conversation turns. Consecutive
+/// plain-text system messages at the head are
 /// concatenated with a blank line into the string form, matching how
 /// users typically compose multi-paragraph system prompts in the OpenAI
 /// format; when any head system message carried typed content blocks,
@@ -342,6 +344,13 @@ pub fn split_system<'a>(
     let mut seen_non_system = false;
 
     for m in &req.messages {
+        // Nothing on this wire carries replayed reasoning, so a turn that
+        // holds only that would become an empty text block, which the
+        // upstream rejects. The user turns it separated fold together
+        // below.
+        if m.is_reasoning_only() {
+            continue;
+        }
         match m.role {
             Role::System => {
                 if seen_non_system {
@@ -352,6 +361,13 @@ pub fn split_system<'a>(
                 } else {
                     system_msgs.push(m);
                 }
+            }
+            Role::Developer => {
+                // Anthropic has no positional developer role. Keep the
+                // instruction at system authority instead of rewriting it as
+                // a user turn, even when that requires lifting it out of the
+                // conversational sequence.
+                system_msgs.push(m);
             }
             Role::User => {
                 seen_non_system = true;
@@ -3106,6 +3122,27 @@ mod tests {
     }
 
     #[test]
+    fn split_system_merges_leading_developer_messages() {
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                ChatMessage::system("system instruction"),
+                ChatMessage::developer("developer instruction"),
+                ChatMessage::user("hi"),
+            ],
+        );
+        let (system, msgs) = split_system(&req).unwrap();
+        assert_eq!(
+            system,
+            Some(AnthropicSystem::Text(
+                "system instruction\n\ndeveloper instruction".into()
+            ))
+        );
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+    }
+
+    #[test]
     fn split_system_mid_conversation_becomes_user_turn() {
         let req = ChatFormat::new(
             "claude",
@@ -3126,6 +3163,53 @@ mod tests {
         assert_eq!(msgs[0].content[0]["text"], "hi");
         assert_eq!(msgs[0].content[1]["text"], "forget everything");
         assert_eq!(msgs[1].role, "assistant");
+    }
+
+    #[test]
+    fn split_system_mid_conversation_developer_stays_system() {
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                ChatMessage::user("hi"),
+                ChatMessage::developer("follow application instructions"),
+                ChatMessage::assistant("hello"),
+            ],
+        );
+        let (system, msgs) = split_system(&req).unwrap();
+        assert_eq!(
+            system,
+            Some(AnthropicSystem::Text(
+                "follow application instructions".into()
+            ))
+        );
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[1].role, "assistant");
+    }
+
+    #[test]
+    fn split_system_hoists_interleaved_developer_and_merges_surrounding_users() {
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                ChatMessage::system("system instruction"),
+                ChatMessage::user("first user turn"),
+                ChatMessage::developer("developer instruction"),
+                ChatMessage::user("second user turn"),
+            ],
+        );
+        let (system, msgs) = split_system(&req).unwrap();
+        assert_eq!(
+            system,
+            Some(AnthropicSystem::Text(
+                "system instruction\n\ndeveloper instruction".into()
+            ))
+        );
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content.len(), 2);
+        assert_eq!(msgs[0].content[0]["text"], "first user turn");
+        assert_eq!(msgs[0].content[1]["text"], "second user turn");
     }
 
     #[test]
@@ -3180,6 +3264,46 @@ mod tests {
         assert_eq!(msgs[2].content[0]["type"], "tool_result");
         assert_eq!(msgs[2].content[0]["tool_use_id"], "toolu_abc");
         assert_eq!(msgs[2].content[0]["content"], "72F, sunny");
+    }
+
+    /// A replayed turn that holds only `reasoning_content` has no
+    /// Anthropic rendering: it is skipped rather than sent as an empty
+    /// text block, and the user turns it separated fold into one. An
+    /// assistant turn carrying reasoning beside its text keeps the text.
+    #[test]
+    fn a_reasoning_only_assistant_turn_is_skipped() {
+        let reasoning_only: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant", "content": null, "reasoning_content": "thinking",
+        }))
+        .unwrap();
+        let answered: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant", "content": "done", "reasoning_content": "thinking",
+        }))
+        .unwrap();
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::user("q1"),
+                reasoning_only,
+                ChatMessage::user("q2"),
+                answered,
+            ],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        let roles: Vec<&str> = msgs.iter().map(|m| m.role).collect();
+        assert_eq!(roles, ["user", "assistant"]);
+        assert_eq!(msgs[0].content.len(), 2, "the two user turns fold together");
+        assert_eq!(
+            msgs[1].content,
+            vec![serde_json::json!({"type": "text", "text": "done"})]
+        );
+        // An empty assistant turn with no reasoning is untouched.
+        let req = ChatFormat::new(
+            "m",
+            vec![ChatMessage::user("q"), ChatMessage::assistant("")],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        assert_eq!(msgs.len(), 2);
     }
 
     /// Build an assistant ChatMessage replaying a single tool call, the

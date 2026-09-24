@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use aisix_core::{RateLimit, RedisConnConfig};
 use aisix_obs::metrics::Metrics;
-use aisix_redis::RedisConn;
+use aisix_redis::{ConnSlot, FailurePolicy};
 use async_trait::async_trait;
 use redis::Script;
 
@@ -59,6 +59,11 @@ pub const DEFAULT_CONC_TTL_SECS: u64 = 300;
 /// Extra seconds added to each window counter's TTL so a counter doesn't
 /// expire a hair before its window mathematically closes.
 pub const DEFAULT_GRACE_SECS: u64 = 5;
+/// How often a gateway that started without its shared backend re-states
+/// that it is still counting per replica. Long enough that a Redis which
+/// is merely late says nothing beyond the boot WARN, short enough that a
+/// permanent misconfiguration is greppable in any retained log window.
+const DEGRADED_REMINDER: std::time::Duration = std::time::Duration::from_secs(300);
 
 // Result codes returned by the acquire script's first element.
 /// Dimension name reported when the script names an index this build
@@ -205,15 +210,18 @@ return {rpm, tpm, inflight, 60 - (now % 60)}
 "#;
 
 pub struct RedisStore {
-    conn: RedisConn,
+    conn: ConnSlot,
     prefix: String,
     conc_ttl: u64,
     grace: u64,
     /// Per-process fallback used when Redis is unreachable (fail-open).
     local: Arc<LocalStore>,
     /// One-shot guard so the degradation warning is logged once, not per
-    /// request, while Redis stays down.
-    degraded_logged: AtomicBool,
+    /// request, while Redis stays down. Shared with the boot attach task,
+    /// which starts it already set (the boot WARN said it) and clears it
+    /// on attach so the NEXT outage still warns even if no store
+    /// operation succeeded in between.
+    degraded_logged: Arc<AtomicBool>,
     /// Prometheus handle for `aisix_redis_failures_total`. The warning
     /// above fires once per outage by design, so it cannot answer how
     /// long or how hard Redis is failing; the counter can.
@@ -235,15 +243,75 @@ impl RedisStore {
     /// [`aisix_redis::connect`].
     pub async fn connect(cfg: &RedisConnConfig) -> Result<Self, redis::RedisError> {
         let conn = aisix_redis::connect(cfg).await?;
-        Ok(Self {
+        Ok(Self::with_slot(
+            ConnSlot::filled(conn),
+            Arc::new(AtomicBool::new(false)),
+        ))
+    }
+
+    /// Connect for the boot path: bounded by `ratelimit.redis.timeout_secs`
+    /// and never fatal.
+    ///
+    /// The gateway must bind its listeners whether or not Redis is up —
+    /// the node-reboot case has Redis coming up *after* the gateway, and
+    /// a gateway that refuses to serve until its
+    /// rate-limit counters are shareable trades an availability outage for
+    /// an accuracy one. So a connection that does not land inside the
+    /// budget leaves the store in its ordinary degraded state (per-replica
+    /// in-memory counting) and a background task attaches the shared
+    /// backend the moment Redis answers. The returned error is the boot
+    /// diagnostic, not a failure: it is `Some` exactly when the store
+    /// started degraded.
+    ///
+    /// Note what this does NOT do: fall back to the `memory` backend. That
+    /// would be permanent, and the operator asked for cluster-wide
+    /// counting.
+    ///
+    /// The outer `Err` is the one failure that is still fatal: a config
+    /// the driver can never use, which no amount of retrying fixes and
+    /// which the operator needs told loudly rather than degraded around.
+    pub async fn connect_or_attach_later(
+        cfg: &RedisConnConfig,
+    ) -> Result<(Self, Option<redis::RedisError>), redis::RedisError> {
+        let policy = FailurePolicy::new(cfg);
+        match aisix_redis::connect_bounded(cfg, &policy).await {
+            Ok(conn) => Ok((
+                Self::with_slot(ConnSlot::filled(conn), Arc::new(AtomicBool::new(false))),
+                None,
+            )),
+            // Only configuration the process rejected by itself. A
+            // server that answered and refused is degraded around like
+            // an outage: it can be corrected on the server side while
+            // this gateway keeps serving, and the re-attach below picks
+            // that up without a restart.
+            Err(e) if aisix_redis::is_boot_fatal(&e) => Err(e),
+            Err(e) => {
+                let slot = ConnSlot::empty();
+                // Already "logged": the caller WARNs this failure itself,
+                // naming the endpoint, so the first degraded request must
+                // not repeat it.
+                let degraded_logged = Arc::new(AtomicBool::new(true));
+                spawn_attach(
+                    slot.clone(),
+                    Arc::clone(&degraded_logged),
+                    cfg.clone(),
+                    policy,
+                );
+                Ok((Self::with_slot(slot, degraded_logged), Some(e)))
+            }
+        }
+    }
+
+    fn with_slot(conn: ConnSlot, degraded_logged: Arc<AtomicBool>) -> Self {
+        Self {
             conn,
             prefix: DEFAULT_PREFIX.into(),
             conc_ttl: DEFAULT_CONC_TTL_SECS,
             grace: DEFAULT_GRACE_SECS,
             local: Arc::new(LocalStore::new()),
-            degraded_logged: AtomicBool::new(false),
+            degraded_logged,
             metrics: None,
-        })
+        }
     }
 
     /// Count Redis operation failures on `metrics`. Without it the
@@ -305,6 +373,100 @@ impl RedisStore {
     fn mark_ok(&self) {
         self.degraded_logged.store(false, Ordering::Relaxed);
     }
+}
+
+/// Keep trying the shared backend until it answers, then attach it.
+///
+/// The cadence is the configured budget, not the breaker's cool-off
+/// window: the reason the request-path prober waits a whole window is
+/// that a probe against a still-dead Redis costs a caller its budget,
+/// and nothing here is billed to a caller. What it buys instead is the
+/// case this exists for — Redis coming up seconds after the gateway on a
+/// node reboot — recovering in seconds rather than half a minute.
+///
+/// One attempt per iteration, and `connect_bounded` bounds each one, so
+/// an unreachable Redis costs one connect attempt per sleep-plus-budget
+/// for as long as the outage lasts.
+///
+/// A permanent misconfiguration — a wrong host, a dead Redis, an
+/// unreachable subnet — used to announce itself by killing the boot. Now
+/// it is a gateway with a healthy `/livez` that quietly never enforces a
+/// cluster-wide limit, and the only other trace is
+/// `aisix_redis_failures_total`, which moves only while rate-limited
+/// traffic actually arrives. So the retry re-states it at WARN on
+/// [`DEGRADED_REMINDER`], leaving the individual attempts at debug.
+fn spawn_attach(
+    slot: ConnSlot,
+    degraded_logged: Arc<AtomicBool>,
+    cfg: RedisConnConfig,
+    policy: FailurePolicy,
+) {
+    tokio::spawn(async move {
+        let retry = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
+        let endpoint = aisix_redis::endpoint_label(&cfg);
+        let mut last_reminder = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(retry).await;
+            match aisix_redis::connect_bounded(&cfg, &policy).await {
+                Ok(conn) => {
+                    slot.attach(conn);
+                    // Re-arm the store's one-shot degradation warning:
+                    // it was set at boot so the first degraded request
+                    // would not repeat the boot WARN, and a LATER outage
+                    // has to be able to warn again even if no store
+                    // operation succeeded in between (which is what
+                    // `mark_ok` would otherwise be relied on for).
+                    degraded_logged.store(false, Ordering::Relaxed);
+                    tracing::info!(
+                        target: "aisix::ratelimit",
+                        %endpoint,
+                        "shared rate-limit backend attached; cluster-wide counting resumes"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    if last_reminder.elapsed() >= DEGRADED_REMINDER {
+                        last_reminder = std::time::Instant::now();
+                        // Same `reason` the boot line carried, so the two
+                        // read as one story and one filter finds both. A
+                        // server that answers and refuses is not an
+                        // outage, and saying "unreachable" about it sends
+                        // the operator to the network.
+                        let reason = aisix_redis::failure_reason(&e);
+                        if reason == "refused" {
+                            tracing::warn!(
+                                target: "aisix::ratelimit",
+                                %endpoint,
+                                %reason,
+                                error = %e,
+                                "shared rate-limit backend is still REFUSING the configured \
+                                 connection settings; cluster-wide rate limits are NOT \
+                                 enforced and counting stays per-replica"
+                            );
+                        } else {
+                            tracing::warn!(
+                                target: "aisix::ratelimit",
+                                %endpoint,
+                                %reason,
+                                error = %e,
+                                "shared rate-limit backend still unreachable; cluster-wide \
+                                 rate limits are NOT enforced and counting stays per-replica"
+                            );
+                        }
+                    } else {
+                        tracing::debug!(
+                            target: "aisix::ratelimit",
+                            %endpoint,
+                            error = %e,
+                            retry_secs = retry.as_secs(),
+                            "shared rate-limit backend still unreachable; per-replica \
+                             counting continues"
+                        );
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Bump `aisix_redis_failures_total` for one failed rate-limit store
@@ -427,7 +589,32 @@ impl RateStore for RedisStore {
             .invoke_async(&mut conn)
             .await;
         match res {
-            Ok(_) => self.mark_ok(),
+            Ok(_) => {
+                self.mark_ok();
+                // Symmetric with `release`, and for the same reason: a
+                // reservation whose `acquire` fell back to the local
+                // store still holds a local concurrency slot, and this
+                // commit went to the shared backend, whose ZSET never
+                // held the member. Without this the slot is never given
+                // back — `LocalStore` has no ttl — so the local in-flight
+                // baseline for that bucket is permanently raised by the
+                // number of requests in flight when the backend
+                // attached, and a LATER outage then fails CLOSED on a
+                // path whose whole contract is to fail open.
+                // `LocalStore::release` is non-inserting and ignores
+                // `member` — its `in_flight` is a plain counter — so
+                // this is a no-op for a bucket with no local slots at
+                // all, and otherwise gives back A slot rather than
+                // necessarily THIS member's. During a handover that can
+                // return a slot another degraded request is still
+                // holding, under-counting local in-flight by one.
+                // Accepted: it errs toward admitting traffic on a path
+                // whose contract is to fail open, `saturating_sub`
+                // bounds it, and the alternative is tracking per-member
+                // local ownership that `LocalStore` deliberately does
+                // not keep.
+                self.local.release(key, member);
+            }
             Err(e) => {
                 self.note_failure("commit", &e);
                 self.conn.note_error().await;

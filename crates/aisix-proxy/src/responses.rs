@@ -169,6 +169,9 @@ struct ResponseUsage {
     /// upstream's own id on the #825 cross-provider path. Empty when the
     /// upstream returned no id (AISIX-Cloud#1289).
     provider_request_id: String,
+    /// The upstream failure that ended a stream after its `200` went out.
+    /// `None` on the non-streaming paths, whose failures never get this far.
+    failure: Option<crate::attempt::StreamFailure>,
 }
 
 pub async fn responses(
@@ -361,7 +364,22 @@ pub async fn responses(
                     // Winning-attempt classification (#655). Direct models
                     // have no recorded attempt → AttemptInfo defaults.
                     let winner = success.routing.winner();
-                    let attempt = winner.map(AttemptInfo::from_record).unwrap_or_default();
+                    let mut attempt = winner.map(AttemptInfo::from_record).unwrap_or_default();
+                    // A held-back stream the upstream failed in-band went out
+                    // as a 200 carrying the failure; the usage records the
+                    // failure, as the live relay does. A guardrail refusal
+                    // keeps its own status.
+                    let failure = usage
+                        .failure
+                        .as_ref()
+                        .filter(|_| !success.guardrail_blocked);
+                    let usage_status = match failure {
+                        Some(f) => {
+                            f.apply_to(&mut attempt);
+                            f.status
+                        }
+                        None => status,
+                    };
                     // `latency_ms` is scoped to the winning attempt — the
                     // failed ones before it emitted their own events, so
                     // `elapsed` would double-count them. Access log keeps the
@@ -380,7 +398,7 @@ pub async fn responses(
                         crate::request_metrics::Caller::new(&auth),
                         &success.provider,
                         &success.upstream_model,
-                        status,
+                        usage_status,
                         winner_latency,
                         &usage,
                         &client,
@@ -620,6 +638,7 @@ async fn dispatch(
         let verdict = crate::redact::moderate_body(
             resolved_chain.as_ref(),
             crate::redact::Direction::Input,
+            Some(model_name.as_str()),
             verdict,
             redactions_out,
             monitor_hits_out,
@@ -1030,7 +1049,7 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
                 let text = responses_item_text(item);
                 messages.push(match responses_item_role(item) {
                     Role::Assistant => ChatMessage::assistant(text),
-                    Role::System => ChatMessage::system(text),
+                    Role::System | Role::Developer => ChatMessage::system(text),
                     Role::Tool => ChatMessage::tool(text),
                     Role::User => ChatMessage::user(text),
                 });
@@ -1642,6 +1661,7 @@ async fn responses_to_target(
             let verdict = crate::redact::moderate_body(
                 chain,
                 crate::redact::Direction::Output,
+                None,
                 verdict,
                 &mut output_redactions,
                 &mut output_monitor_hits,
@@ -1752,11 +1772,13 @@ async fn responses_to_target(
         // stall truncates the forwarded stream (no in-band error frame for
         // an opaque byte passthrough).
         let stream_budget = timeouts.stream;
+        let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
         let wrapped: std::pin::Pin<
             Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
-        > = Box::pin(crate::stream_timeout::with_read_timeout_bytes(
+        > = Box::pin(crate::stream_timeout::with_read_timeout_bytes_signalled(
             upstream_resp.bytes_stream(),
             stream_budget,
+            read_timeout.clone(),
         ));
         let body_stream: std::pin::Pin<
             Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
@@ -1854,6 +1876,7 @@ async fn responses_to_target(
         );
         let parsed_stream = build_responses_passthrough_stream(
             body_stream,
+            read_timeout,
             started,
             attempt_started,
             content_cap,
@@ -1949,17 +1972,24 @@ async fn responses_to_target(
                     // as 499, matching LiteLLM. The upstream work still
                     // happened, so the event is emitted either way — only
                     // its outcome differs.
-                    if usage.reached_end {
-                        200
-                    } else {
-                        crate::CLIENT_CLOSED_REQUEST
-                    },
+                    //
+                    // An upstream failure after the headers — a transport
+                    // error, a read timeout, an in-band `error` or
+                    // `response.failed` event — is recorded as that failure's
+                    // status and error.
+                    crate::attempt::stream_status(usage.reached_end, usage.failure.as_ref()),
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
                     attempt_started.elapsed(),
                     &usage,
                     &client_c,
-                    attempt,
+                    {
+                        let mut attempt = attempt;
+                        if let Some(f) = usage.failure.as_ref() {
+                            f.apply_to(&mut attempt);
+                        }
+                        attempt
+                    },
                     /* guardrail_blocked */ false,
                     input_redactions.clone(),
                     monitor_hits,
@@ -2061,6 +2091,7 @@ async fn responses_to_target(
             let verdict = crate::redact::moderate_body(
                 chain,
                 crate::redact::Direction::Output,
+                None,
                 verdict,
                 &mut output_seg_counts,
                 &mut output_monitor_hits,
@@ -2227,10 +2258,11 @@ async fn responses_cross_provider_to_target(
     let outbound_body = crate::effort_mapping::responses_request(body, model);
     let chat =
         crate::responses_bridge::responses_request_to_chat(requested_model, outbound_body.as_ref());
-    // A `custom` tool travels upstream as a function tool, so only the
-    // request's own tool list can tell the reply translators which of the
-    // model's calls the caller is waiting for as a `custom_tool_call` item.
-    let custom_tools = crate::responses_bridge::custom_tool_names(outbound_body.as_ref());
+    // `custom` tools and namespace sub-tools travel upstream as plain
+    // function tools, so only the request's own tool list can tell the
+    // reply translators which item each of the model's calls goes back as;
+    // the request also supplies the settings every Response object echoes.
+    let reply = crate::responses_bridge::ResponsesReplyContext::from_request(body);
 
     let is_stream = chat.is_streaming();
     let mut ctx = crate::dispatch::bridge_ctx(
@@ -2320,7 +2352,7 @@ async fn responses_cross_provider_to_target(
             response_id,
             requested_model,
             created_at,
-            custom_tools,
+            reply,
         );
         // Only an output-hook guardrail needs the streamed response text.
         // When attached with a hold-back policy (Window/BufferFull — any
@@ -2430,12 +2462,23 @@ async fn responses_cross_provider_to_target(
                     upstream_ttft_ms: comp.upstream_ttft_ms,
                     downstream_latency_ms: comp.downstream_latency_ms,
                     provider_request_id: comp.provider_request_id,
+                    failure: comp.failure.clone(),
                 };
                 // A clean stream is a committed 200; an output-guardrail block
                 // (or fail-closed overflow) bills the upstream tokens but is
                 // recorded as a 422 marked guardrail_blocked, matching the
-                // non-streaming path so the Blocked tab + ledger see it.
-                let status = if comp.guardrail_blocked { 422 } else { 200 };
+                // non-streaming path so the Blocked tab + ledger see it. An
+                // abandoned stream is a 499, one an upstream failure ended
+                // carries that failure's status and error.
+                let status = if comp.guardrail_blocked {
+                    422
+                } else {
+                    crate::attempt::stream_status(comp.reached_end, comp.failure.as_ref())
+                };
+                let mut attempt_c = attempt_c;
+                if let Some(f) = comp.failure.as_ref().filter(|_| !comp.guardrail_blocked) {
+                    f.apply_to(&mut attempt_c);
+                }
                 // Content capture (AISIX-Cloud#947): prompt captured up front,
                 // response assembled across the bridged stream into
                 // `comp.response_text` (empty when no exporter wants content
@@ -2567,6 +2610,7 @@ async fn responses_cross_provider_to_target(
             // below — that one is minted here and means nothing to the
             // provider (AISIX-Cloud#1289).
             provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
+            failure: None,
         };
         // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
         // bridged upstream never reported, and carry the SAME numbers into
@@ -2616,6 +2660,7 @@ async fn responses_cross_provider_to_target(
         let verdict = crate::redact::moderate_body(
             chain.as_ref(),
             crate::redact::Direction::Output,
+            None,
             verdict,
             &mut output_seg_counts,
             &mut output_monitor_hits,
@@ -2677,7 +2722,7 @@ async fn responses_cross_provider_to_target(
         &resp,
         requested_model,
         created_at,
-        &custom_tools,
+        &reply,
     );
     // Content capture (AISIX-Cloud#947): the client-visible Responses JSON
     // (post-redaction) is the source, so the exported text matches what the
@@ -2771,6 +2816,7 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         // id it saw on an earlier frame across this replacement, so an
         // upstream that only stamps it on `response.created` still records.
         provider_request_id: crate::usage_attr::provider_response_id(body),
+        failure: None,
     })
 }
 
@@ -2819,7 +2865,8 @@ fn has_complete_responses_sse_event(bytes: &[u8]) -> bool {
 /// already holds the whole response. Returns `None` (skip emission, matching
 /// the non-streaming gate) when no terminal event carried a usage block.
 fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
-    let mut usage = None;
+    let mut usage: Option<ResponseUsage> = None;
+    let mut failure = None;
     // Per frame, like the scan and the redaction pass (#1100): a terminal
     // event written over several `data:` lines parses only once they are
     // joined, and reading one line at a time would bill it from the token
@@ -2833,7 +2880,15 @@ fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
             if let Some(u) = parse_responses_terminal_usage(&json) {
                 usage = Some(u);
             }
+            if let Some(err) = responses_in_band_error(&json) {
+                crate::attempt::StreamFailure::record(&mut failure, &err);
+            }
         }
+    }
+    // A held-back response that failed in-band is sent as a 200 carrying the
+    // failure event, like the live relay's; its usage records the failure.
+    if failure.is_some() {
+        usage.get_or_insert_with(Default::default).failure = failure;
     }
     usage
 }
@@ -2938,13 +2993,14 @@ fn drain_responses_sse_frames(
                     // the latency figures and the id observed before it
                     // across — an upstream that stamps the id only on
                     // `response.created` would otherwise lose it here.
-                    let (ttft, down, prev_id) = acc
+                    let (ttft, down, prev_id, prev_failure) = acc
                         .as_ref()
                         .map(|a| {
                             (
                                 a.upstream_ttft_ms,
                                 a.downstream_latency_ms,
                                 a.provider_request_id.clone(),
+                                a.failure.clone(),
                             )
                         })
                         .unwrap_or_default();
@@ -2957,8 +3013,15 @@ fn drain_responses_sse_frames(
                         upstream_ttft_ms: ttft,
                         downstream_latency_ms: down,
                         provider_request_id,
+                        failure: prev_failure,
                         ..u
                     });
+                }
+                if let Some(err) = responses_in_band_error(&json) {
+                    crate::attempt::StreamFailure::record(
+                        &mut acc.get_or_insert_with(Default::default).failure,
+                        &err,
+                    );
                 }
                 if let Some(c) = capture.as_deref_mut() {
                     c.observe(&json);
@@ -2966,6 +3029,38 @@ fn drain_responses_sse_frames(
             }
         }
     }
+}
+
+/// The upstream failure a Responses-API stream event reports, if it is one:
+/// the flat `error` event (`{type, code, message, param}`) or
+/// `response.failed`, whose Response carries `error: {code, message}`. Read
+/// the way an in-band error on any other wire is, so a code that names no
+/// HTTP status maps as one with none.
+pub(crate) fn responses_in_band_error(event: &Value) -> Option<aisix_gateway::BridgeError> {
+    let error = match event.get("type").and_then(Value::as_str)? {
+        "error" => serde_json::json!({
+            "message": event.get("message"),
+            "code": event.get("code"),
+            "param": event.get("param"),
+        }),
+        "response.failed" => event
+            .pointer("/response/error")
+            .cloned()
+            .unwrap_or(Value::Null),
+        _ => return None,
+    };
+    Some(
+        aisix_gateway::capture_in_band_error(
+            &serde_json::json!({ "error": error }).to_string(),
+            aisix_gateway::UpstreamWire::OpenAI,
+        )
+        .unwrap_or_else(|| aisix_gateway::BridgeError::UpstreamInBand {
+            status: None,
+            message: "upstream reported the response failed".to_string(),
+            parsed: None,
+            wire: aisix_gateway::UpstreamWire::OpenAI,
+        }),
+    )
 }
 
 /// Streamed output-text accumulator for content-capturing exporters
@@ -3080,8 +3175,11 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> Dro
 /// `eos_scan`). Bytes forward unchanged apart from the caller-facing
 /// `model` on the snapshot frames — the client sees the exact upstream
 /// SSE wire shape.
+#[allow(clippy::too_many_arguments)]
 fn build_responses_passthrough_stream<S, F>(
     upstream: S,
+    // Set when `upstream` ended on a read timeout rather than its own end.
+    read_timeout: crate::stream_timeout::ReadTimeoutSignal,
     // Request clock — what the CALLER waited for.
     started: Instant,
     // Attempt clock — how the UPSTREAM behaved.
@@ -3192,7 +3290,21 @@ where
                 continue;
             }
             // A mid-stream Err is forwarded as-is.
+            if let Err(e) = &item {
+                let (usage_acc, _) = guard.parts();
+                crate::attempt::StreamFailure::record(
+                    &mut usage_acc.get_or_insert_with(Default::default).failure,
+                    &crate::dispatch::reqwest_error_to_bridge(e, attempt_started),
+                );
+            }
             yield item;
+        }
+        if let Some(e) = read_timeout.fired() {
+            let (usage_acc, _) = guard.parts();
+            crate::attempt::StreamFailure::record(
+                &mut usage_acc.get_or_insert_with(Default::default).failure,
+                &e,
+            );
         }
         // A non-conformant upstream can end without terminating its last
         // frame. Those bytes were never forwarded (they are still the partial
@@ -3856,6 +3968,36 @@ fn emit_access_log(
 
 #[cfg(test)]
 mod tests {
+
+    /// The two ways a Responses-API stream reports a failure in-band are
+    /// both read as an upstream error; any other event is not one. A code
+    /// naming no HTTP status maps as a status-less in-band error.
+    #[test]
+    fn responses_in_band_errors_are_read_from_both_failure_events() {
+        let flat = serde_json::json!({
+            "type": "error", "code": "server_error", "message": "boom", "param": null,
+        });
+        let failed = serde_json::json!({
+            "type": "response.failed",
+            "response": {"id": "resp_1", "error": {"code": "server_error", "message": "late boom"}},
+        });
+        for (event, message) in [(flat, "boom"), (failed, "late boom")] {
+            let err = super::responses_in_band_error(&event).expect("a failure event");
+            assert_eq!(err.http_status(), 502);
+            assert_eq!(
+                crate::attempt::routing_error_class(&err),
+                "upstream_in_band"
+            );
+            assert!(err.to_string().contains(message), "{err}");
+        }
+        for ty in [
+            "response.completed",
+            "response.incomplete",
+            "response.output_text.delta",
+        ] {
+            assert!(super::responses_in_band_error(&serde_json::json!({"type": ty})).is_none());
+        }
+    }
 
     /// The Responses API spells a model's tool call as a bare
     /// `function_call` item with no `role`, and the caller's answer as a
