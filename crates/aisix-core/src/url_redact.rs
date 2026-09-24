@@ -17,10 +17,17 @@ use std::borrow::Cow;
 /// with no scheme is treated as a bare authority. The last `@` of the
 /// authority ends the userinfo, so a password with an unencoded `@` is
 /// redacted whole.
+///
+/// A special scheme (`http`, `https`, `ws`, `wss`, `ftp`) takes any run of
+/// slashes after its colon, none included, because the URL parser does:
+/// `https:/user:pw@host` still reaches the client with `user:pw` as userinfo.
 pub fn redact_url_userinfo(url: &str) -> Cow<'_, str> {
-    let (prefix, rest) = match url.split_once("://") {
-        Some((scheme, rest)) => (&url[..scheme.len() + 3], rest),
-        None => ("", url),
+    let (prefix, rest) = match special_scheme_prefix(url) {
+        Some(len) => url.split_at(len),
+        None => match url.split_once("://") {
+            Some((scheme, rest)) => (&url[..scheme.len() + 3], rest),
+            None => ("", url),
+        },
     };
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(authority_end);
@@ -28,6 +35,19 @@ pub fn redact_url_userinfo(url: &str) -> Cow<'_, str> {
         Some(at) => Cow::Owned(format!("{prefix}***{}{tail}", &authority[at..])),
         None => Cow::Borrowed(url),
     }
+}
+
+/// Length of `scheme:` plus the slashes after it, for a special scheme.
+fn special_scheme_prefix(url: &str) -> Option<usize> {
+    let (scheme, after) = url.split_once(':')?;
+    if !["http", "https", "ws", "wss", "ftp"]
+        .iter()
+        .any(|s| scheme.eq_ignore_ascii_case(s))
+    {
+        return None;
+    }
+    let slashes = after.len() - after.trim_start_matches(['/', '\\']).len();
+    Some(scheme.len() + 1 + slashes)
 }
 
 #[cfg(test)]
@@ -47,6 +67,9 @@ mod tests {
             ),
             ("https://u:p@ss@host/x", "https://***@host/x"),
             ("user:pw@etcd.example.com:7943", "***@etcd.example.com:7943"),
+            ("https:/user:secret@host/x", "https:/***@host/x"),
+            ("HTTP:user:secret@host", "HTTP:***@host"),
+            ("https:\\\\user:secret@host", "https:\\\\***@host"),
         ] {
             assert_eq!(redact_url_userinfo(input), expected);
         }
