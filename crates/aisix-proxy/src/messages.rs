@@ -1973,6 +1973,18 @@ fn anthropic_estimation_output_text(body: &Value) -> String {
 
 /// Concatenate the text from an Anthropic response's `content` blocks — the
 /// assistant's assembled output text, for content-capturing exporters.
+/// Extend the live-forward frame copy with `frames`, dropping the copy once
+/// it would outgrow the end-of-stream scan bound.
+fn keep_live_copy(copy: &mut Option<Vec<u8>>, frames: &[u8]) {
+    if let Some(c) = copy.as_mut() {
+        if c.len() + frames.len() <= aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES {
+            c.extend_from_slice(frames);
+            return;
+        }
+    }
+    *copy = None;
+}
+
 fn anthropic_response_text(body: &Value) -> String {
     body.get("content")
         .and_then(Value::as_array)
@@ -3909,6 +3921,12 @@ where
         // The cap was hit under fail-open: `held` went out unscanned and the
         // rest of the response streams live, with no output scan.
         let mut released = false;
+        // Live-forward with an output chain (monitor-only): a bounded copy of
+        // the forwarded frames, so the end-of-stream check can judge the
+        // slots the hold-back mask walk would rewrite (#1027). `None` once
+        // it outgrows the cap; the check then falls back to the text.
+        let mut live_copy: Option<Vec<u8>> =
+            (hold_policy.is_none() && output_guardrail.is_some()).then(Vec::new);
         while let Some(item) = upstream.next().await {
             if let Ok(bytes) = &item {
                 // Accumulate, then drain every COMPLETE frame — restamped
@@ -4002,6 +4020,7 @@ where
                     guard.usage().downstream_latency_ms =
                         started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 }
+                keep_live_copy(&mut live_copy, &forward);
                 yield Ok(Bytes::from(forward));
                 continue;
             }
@@ -4109,6 +4128,9 @@ where
                     guard.usage().downstream_latency_ms =
                         started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 }
+                // The copy is walked frame by frame, so give the final frame
+                // the terminator the upstream left off.
+                keep_live_copy(&mut live_copy, &[tail.as_slice(), b"\n\n"].concat());
                 yield Ok(Bytes::from(tail));
             }
         }
@@ -4206,7 +4228,19 @@ where
             // the client, so it must not reach the captured content either.
             // Live-forward (no hold) has no held frames to walk: the
             // accumulated text is the one slot there is.
-            let live_text = hold.is_none().then(|| text.clone());
+            let live_segments: Vec<aisix_guardrails::ScanSegment> = if hold.is_some() {
+                Vec::new()
+            } else if let Some(frames) = live_copy.take() {
+                crate::redact::collect_segments(|g| {
+                    let _ = crate::redact::redact_anthropic_sse(g, &frames);
+                })
+            } else {
+                vec![aisix_guardrails::ScanSegment {
+                    text: text.clone(),
+                    role: aisix_guardrails::SegmentRole::Rewritable,
+                    in_latest_turn: true,
+                }]
+            };
             for payload in &unscanned {
                 if !text.is_empty() {
                     text.push('\n');
@@ -4234,19 +4268,13 @@ where
                 // live-forward stream never carries one).
                 let mut seg_counts = crate::redact::RedactionCounts::new();
                 let mut seg_hits = Vec::new();
-                let local_extra = live_text
+                let local_extra = live_segments
                     .into_iter()
-                    .map(|t| (t, aisix_guardrails::SegmentRole::Rewritable))
-                    .chain(
-                        unscanned
-                            .iter()
-                            .map(|t| (t.clone(), aisix_guardrails::SegmentRole::ScanOnly)),
-                    )
-                    .map(|(text, role)| aisix_guardrails::ScanSegment {
-                        text,
-                        role,
+                    .chain(unscanned.iter().map(|t| aisix_guardrails::ScanSegment {
+                        text: t.clone(),
+                        role: aisix_guardrails::SegmentRole::ScanOnly,
                         in_latest_turn: true,
-                    })
+                    }))
                     .collect();
                 let verdict = crate::redact::moderate_body_local_extra(
                     chain.as_ref(),

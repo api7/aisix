@@ -46,6 +46,12 @@ export interface McpUpstreamOptions {
    * numeric field. The mask write-back suite owns the strings.
    */
   reportContent?: { summary: string; log: string; structuredLog: string };
+  /**
+   * Also expose a `count` tool that answers with a constant text block and
+   * `structuredContent: { count: <n> }`, `n` being its numeric `n`
+   * argument — a tool result carrying a JSON number rather than a string.
+   */
+  numericTool?: boolean;
 }
 
 /**
@@ -147,6 +153,18 @@ async function handle(
               },
             ]
           : []),
+        ...(options.numericTool
+          ? [
+              {
+                name: "count",
+                description: "return the number as structured output",
+                inputSchema: {
+                  type: "object" as const,
+                  properties: { n: { type: "number" } },
+                },
+              },
+            ]
+          : []),
         ...(options.reportContent
           ? [
               {
@@ -178,6 +196,12 @@ async function handle(
             },
           ],
           structuredContent: { log: structuredLog, cells: 42 },
+        };
+      }
+      if (request.params.name === "count" && options.numericTool) {
+        return {
+          content: [{ type: "text", text: "counted" }],
+          structuredContent: { count: Number(request.params.arguments?.n ?? 0) },
         };
       }
       if (request.params.name === "lookup") {

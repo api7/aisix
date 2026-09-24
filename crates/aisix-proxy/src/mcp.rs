@@ -1084,9 +1084,9 @@ async fn moderate_selected_segments(
 /// Run the chain's local kinds (keyword, pii) over one direction of a
 /// tool call (#1027): every string leaf `pred` selects — collected by the
 /// byte-splice walker the mask write-back uses, so the judged slots and
-/// the rewritten slots are one set — plus every object key under
-/// `structured`, which has no write-back and so blocks on a mask hit.
-/// A body with no selected leaf and no key is judged whole, scan-only.
+/// the rewritten slots are one set — plus every object key and number
+/// under `structured`, which have no write-back and so block on a mask hit.
+/// A body with none of these is judged whole, scan-only.
 fn check_local_json(
     chain: &aisix_guardrails::GuardrailChain,
     body: &[u8],
@@ -1134,6 +1134,9 @@ fn check_local_json(
                         }
                         stack.push(val);
                     }
+                }
+                serde_json::Value::Number(n) => {
+                    segments.push(segment(n.to_string(), SegmentRole::Label));
                 }
                 _ => {}
             }

@@ -26,8 +26,9 @@ import {
 //     arguments and on the tool result, for both kinds;
 //   - /mcp: a monitor-mode mask rule reports `would_mask` counts equal to the
 //     counts the same rule masks when enforced, in both directions;
-//   - /mcp: a pii mask rule that matches an argument KEY blocks — a key has
-//     no rewrite channel, and forwarding it would defeat the rule;
+//   - /mcp: a pii mask rule that matches an argument KEY or a JSON number
+//     blocks — neither has a rewrite channel, and forwarding it would
+//     defeat the rule; block rules see numbers in arguments and results;
 //   - chat: an anchored block rule matching ONE message of a multi-turn
 //     request blocks;
 //   - chat `tool_calls` and responses `function_call` arguments: the rule
@@ -132,7 +133,7 @@ describe("guardrail segment parity e2e: /mcp", () => {
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
-    upstream = await startMcpUpstream("t", { structuredTool: true });
+    upstream = await startMcpUpstream("t", { structuredTool: true, numericTool: true });
     sls = await startMockSls();
     app = await spawnApp({
       extraEnv: {
@@ -164,6 +165,15 @@ describe("guardrail segment parity e2e: /mcp", () => {
         "keymask",
         { kind: "pii", hook_point: "input", detectors: [{ type: "email", action: "mask" }] },
       ],
+      [
+        "kwlitin",
+        { kind: "keyword", hook_point: "input", patterns: [{ kind: "literal", value: "1234" }] },
+      ],
+      [
+        "kwlitout",
+        { kind: "keyword", hook_point: "output", patterns: [{ kind: "literal", value: "1234" }] },
+      ],
+      ["numask", { kind: "pii", hook_point: "input", custom_patterns: pinPattern("mask") }],
       ["menfin", { kind: "pii", hook_point: "input", custom_patterns: pinPattern("mask") }],
       [
         "mmonin",
@@ -253,6 +263,50 @@ describe("guardrail segment parity e2e: /mcp", () => {
       });
     });
   }
+
+  // A JSON number cannot be rewritten without changing its type, so it is
+  // judged like a key: block rules see it, and a pii mask hit on it blocks.
+  for (const server of ["kwin", "piin", "kwlitin"]) {
+    test(`${server}: a block rule blocks a numeric argument`, async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+
+      const blocked = await callTool(`${server}__echo`, { text: "hi", pin: 1234 });
+      expect(blocked.status).toBe(200);
+      expect(blocked.json?.result?.isError).toBe(true);
+      expect(blocked.json?.result?.content?.[0]?.text).toContain(`seg-${server}`);
+
+      const passed = await callTool(`${server}__echo`, { text: "hi", pin: 12 });
+      expect(passed.json?.result?.isError).toBeFalsy();
+    });
+  }
+
+  for (const server of ["kwout", "piout", "kwlitout"]) {
+    test(`${server}: a block rule blocks a numeric tool-result value`, async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+
+      const blocked = await callTool(`${server}__count`, { n: 1234 });
+      expect(blocked.status).toBe(200);
+      expect(blocked.json?.result?.isError).toBe(true);
+      expect(blocked.json?.result?.structuredContent).toBeUndefined();
+
+      const passed = await callTool(`${server}__count`, { n: 12 });
+      expect(passed.json?.result?.isError).toBeFalsy();
+      expect(passed.json?.result?.structuredContent).toEqual({ count: 12 });
+    });
+  }
+
+  test("a pii mask rule matching a numeric argument blocks", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    const blocked = await callTool("numask__echo", { text: "hi", pin: 1234 });
+    expect(blocked.json?.result?.isError).toBe(true);
+    expect(blocked.json?.result?.content?.[0]?.text).toContain("seg-numask");
+
+    // The same value as a string is rewritable, so it is masked instead.
+    const masked = await callTool("numask__echo", { text: "1234" });
+    expect(masked.json?.result?.isError).toBeFalsy();
+    expect(masked.json?.result?.content?.[0]?.text).toBe("t:[PIN_REDACTED]");
+  });
 
   test("a pii mask rule matching an argument key blocks; the same match in a value is masked", async (ctx) => {
     if (!etcdReachable || !app || !upstream) return ctx.skip();

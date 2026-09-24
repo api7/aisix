@@ -594,7 +594,7 @@ fn apply_to_value_string(
 /// array elements). Keys and non-string scalars are untouched, so the
 /// tree stays structurally valid — a phone number stored as a JSON number
 /// is out of scope by design (rewriting it to a mask token would corrupt
-/// the document). Each object key is offered as a
+/// the document). Each object key and each number is offered as a
 /// [`aisix_guardrails::SegmentRole::Label`]: judged, never rewritten.
 pub fn redact_value_strings(
     chain: &dyn Guardrail,
@@ -614,6 +614,14 @@ pub fn redact_value_strings(
                 offer_unrewritable(chain, dir, key, aisix_guardrails::SegmentRole::Label);
                 redact_value_strings(chain, dir, val, counts);
             }
+        }
+        Value::Number(n) => {
+            offer_unrewritable(
+                chain,
+                dir,
+                &n.to_string(),
+                aisix_guardrails::SegmentRole::Label,
+            );
         }
         _ => {}
     }
@@ -3171,7 +3179,7 @@ mod tests {
     }
 
     /// #1027: a tool call's arguments are offered value by value, each key
-    /// as a label, and the tool name as a scan-only slot.
+    /// and number as a label, and the tool name as a scan-only slot.
     #[test]
     fn chat_tool_call_arguments_are_offered_as_values_keys_and_a_name() {
         use aisix_guardrails::SegmentRole;
@@ -3183,7 +3191,7 @@ mod tests {
                 "tool_calls": [{
                     "id": "c1",
                     "type": "function",
-                    "function": {"name": "unlock", "arguments": "{\"pin\":\"1234\",\"door\":{\"side\":\"front\"}}"}
+                    "function": {"name": "unlock", "arguments": "{\"pin\":\"1234\",\"door\":{\"side\":\"front\",\"floor\":2}}"}
                 }]
             }]
         }))
@@ -3200,10 +3208,12 @@ mod tests {
             ("door", SegmentRole::Label),
             ("side", SegmentRole::Label),
             ("front", SegmentRole::Rewritable),
+            ("floor", SegmentRole::Label),
+            ("2", SegmentRole::Label),
         ] {
             assert!(got.contains(&want), "missing {want:?} in {got:?}");
         }
-        assert_eq!(got.len(), 6, "{got:?}");
+        assert_eq!(got.len(), 8, "{got:?}");
     }
 
     /// The bridged encoder now emits reasoning-summary frames alongside the
