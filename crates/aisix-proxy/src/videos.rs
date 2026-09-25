@@ -2024,6 +2024,8 @@ fn group_routes_to(snapshot: &aisix_core::AisixSnapshot, group: &str, target: &s
     })
 }
 
+/// Polls a video job. Deliberately emits no usage event: polling a job is
+/// not a recorded request (see `usage_attr::emit_usage`).
 pub async fn get_video(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
@@ -2096,6 +2098,8 @@ pub async fn get_video(
     }
 }
 
+/// Retrieves a finished video. Deliberately emits no usage event, like
+/// [`get_video`].
 pub async fn video_content(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,

@@ -890,7 +890,8 @@ pub(crate) fn emit_prepared_usage_event(
 /// A usage event is the observability record of a request, not a billing
 /// line: every request that reaches dispatch emits one, at zero tokens when
 /// the upstream reported none or nothing was billable. Never skip it for
-/// lack of usage.
+/// lack of usage. The one exception is by design: polling a video job
+/// (`GET /v1/videos/:id`) and retrieving its content emit none.
 ///
 /// `trace` is the request's bundle (`ClientContext::trace`); `terminal`
 /// says whether this event ends the request — the terminal event carries
