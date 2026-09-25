@@ -245,8 +245,9 @@ pub struct AzureContentSafetyTextModerationConfig {
     pub window_overlap_size: u32,
     /// Max bytes of model-generated content held back from a streamed response
     /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
-    /// `window` mode where the stream is held whole (`/v1/messages`,
-    /// `/v1/responses`) and no output guardrail in the chain uses
+    /// `window` mode wherever output is held whole (the whole stream on
+    /// `/v1/messages` and `/v1/responses`, and tool-call arguments on
+    /// `/v1/chat/completions`) and no output guardrail in the chain uses
     /// `buffer_full`, whose rows alone then set the cap. Counts assistant
     /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
     /// counted.
@@ -361,8 +362,9 @@ pub struct AliyunTextModerationConfig {
     pub window_overlap_size: u32,
     /// Max bytes of model-generated content held back from a streamed response
     /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
-    /// `window` mode where the stream is held whole (`/v1/messages`,
-    /// `/v1/responses`) and no output guardrail in the chain uses
+    /// `window` mode wherever output is held whole (the whole stream on
+    /// `/v1/messages` and `/v1/responses`, and tool-call arguments on
+    /// `/v1/chat/completions`) and no output guardrail in the chain uses
     /// `buffer_full`, whose rows alone then set the cap. Counts assistant
     /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
     /// counted.
@@ -447,8 +449,9 @@ pub struct AliyunAiGuardrailConfig {
     pub window_overlap_size: u32,
     /// Max bytes of model-generated content held back from a streamed response
     /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
-    /// `window` mode where the stream is held whole (`/v1/messages`,
-    /// `/v1/responses`) and no output guardrail in the chain uses
+    /// `window` mode wherever output is held whole (the whole stream on
+    /// `/v1/messages` and `/v1/responses`, and tool-call arguments on
+    /// `/v1/chat/completions`) and no output guardrail in the chain uses
     /// `buffer_full`, whose rows alone then set the cap. Counts assistant
     /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
     /// counted.
@@ -1016,8 +1019,9 @@ pub struct CustomConfig {
     pub window_overlap_size: u32,
     /// Max bytes of model-generated content held back from a streamed response
     /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
-    /// `window` mode where the stream is held whole (`/v1/messages`,
-    /// `/v1/responses`) and no output guardrail in the chain uses
+    /// `window` mode wherever output is held whole (the whole stream on
+    /// `/v1/messages` and `/v1/responses`, and tool-call arguments on
+    /// `/v1/chat/completions`) and no output guardrail in the chain uses
     /// `buffer_full`, whose rows alone then set the cap. Counts assistant
     /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
     /// counted.
