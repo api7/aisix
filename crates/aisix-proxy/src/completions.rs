@@ -43,8 +43,7 @@ struct CompletionDispatchSuccess {
     /// UUID of the resolved Model row — required for UsageEvent
     /// `model_id`. Always populated on every success arm (including
     /// the 501 NotImplemented branch where no upstream call
-    /// happened); emission depends on usage or a recorded guardrail
-    /// decision, not this field.
+    /// happened); every arm emits a usage event.
     model_id: String,
     /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
     /// (AISIX-Cloud#867 parity).
@@ -61,8 +60,8 @@ struct CompletionDispatchSuccess {
     provider_request_id: String,
     /// Upstream-reported token counts. `None` on the 501
     /// NotImplemented path (provider doesn't support completions)
-    /// or on a 200 with no `usage` block (rare edge). Those paths still
-    /// emit a zero-token event when a guardrail recorded a decision.
+    /// or on a 200 with no `usage` block (rare edge). Those paths emit a
+    /// zero-token event.
     usage: Option<CompletionUsage>,
     /// Whether the request reached the provider. False only for the 501
     /// provider-unsupported branch.
@@ -1543,7 +1542,7 @@ mod tests {
     /// ONE zero-token UsageEvent so the failed request is visible in Logs
     /// (status + error class) and attributed to the api_key — instead of being
     /// dropped, as the non-chat handlers used to do. The 501 NotImplemented
-    /// path still emits nothing (no upstream call); see the test below.
+    /// path emits a zero-token event too; see the test below.
     #[tokio::test]
     async fn upstream_5xx_emits_zero_token_error_event() {
         use aisix_obs::UsageSink;

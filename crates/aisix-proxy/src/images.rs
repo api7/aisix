@@ -49,8 +49,8 @@ struct ImageDispatchSuccess {
     /// event so the request is visible + attributed.
     usage: Option<(u32, u32)>,
     /// `false` on the 501 NotImplemented branch (provider lacks image
-    /// generation → no upstream call). That path emits only when screening
-    /// already produced guardrail attribution.
+    /// generation → no upstream call). That path still emits a zero-token
+    /// event.
     upstream_called: bool,
     /// Per-detector PII mask counts (#932/#696) applied to the prompt.
     /// Attached to the emitted UsageEvent. Empty = no redaction.
