@@ -14,6 +14,7 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 
 // E2E: every model-serving request leaves a usage event — the record the
 // console Logs and budgets read — even when there is nothing to bill:
@@ -48,6 +49,7 @@ describe("a usage event for every request", () => {
   let sls: MockSls | undefined;
   let cohere: OpenAiUpstream | undefined;
   let mcp: McpUpstream | undefined;
+  let otlp: MockOtlp | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -56,6 +58,7 @@ describe("a usage event for every request", () => {
     if (!etcdReachable) return;
 
     sls = await startMockSls();
+    otlp = await startMockOtlp();
     cohere = await startOpenAiUpstream({ nonStreamBody: COHERE_RERANK });
     mcp = await startMcpUpstream("big", {
       reportContent: { summary: "done", log: "x".repeat(4 * BODY_LIMIT), structuredLog: "ok" },
@@ -77,6 +80,28 @@ describe("a usage event for every request", () => {
       logstore: LOGSTORE,
       credential_ref: CREDENTIAL_REF,
       content_mode: "metadata_only",
+    });
+
+    await seed.createObservabilityExporter({
+      name: "otlp-usage-event-every-request",
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlp.url,
+    });
+
+    // A video provider the gateway does not implement: it answers 501
+    // itself, with no upstream call.
+    const videoPk = await seed.createProviderKey({
+      display_name: "every-request-video",
+      secret: "sk-mock",
+      provider: "minimax",
+      api_base: "http://127.0.0.1:9",
+    });
+    await seed.createModel({
+      display_name: "every-request-video",
+      provider: "minimax",
+      model_name: "video-01",
+      provider_key_id: videoPk.id,
     });
 
     const coherePk = await seed.createProviderKey({
@@ -144,6 +169,7 @@ describe("a usage event for every request", () => {
     await cohere?.close();
     await mcp?.close();
     await sls?.close();
+    await otlp?.close();
   });
 
   const post = async (path: string, body: Record<string, unknown>) => {
@@ -213,5 +239,30 @@ describe("a usage event for every request", () => {
     );
     expect(event.get("status_code")).toBe("502");
     expect(event.get("mcp_server_name")).toBe("big");
+  });
+
+  test("POST /v1/videos: the gateway's own 501 records an event with no upstream span", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !otlp) return ctx.skip();
+    const res = await fetch(`${app.proxyUrl}/v1/videos`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ model: "every-request-video", prompt: "a cat" }),
+    });
+    expect(res.status, await res.text()).toBe(501);
+    const requestId = res.headers.get("x-aisix-request-id");
+    expect(requestId).toBeTruthy();
+
+    const event = await eventFor("every-request-video", "video_generation");
+    expect(event.get("status_code")).toBe("501");
+
+    // The request's SERVER span arrives; no upstream CLIENT span beside it,
+    // since nothing was dispatched.
+    const deadline = Date.now() + 10_000;
+    const spans = () => otlp!.spans.filter((s) => s.attributes["aisix.request_id"] === requestId);
+    while (Date.now() < deadline && !spans().some((s) => s.kind === 2)) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(spans().some((s) => s.kind === 2), "the SERVER span was exported").toBe(true);
+    expect(spans().filter((s) => s.kind === 3)).toEqual([]);
   });
 });

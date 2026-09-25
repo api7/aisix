@@ -1670,6 +1670,7 @@ pub async fn create_video(
                     started.elapsed(),
                     &audit,
                     routing.attempts.last(),
+                    success.upstream_called,
                 );
             }
             success.response
@@ -1738,6 +1739,9 @@ struct CreateSuccess {
     provider_key_id: String,
     applied_guardrails: Vec<AppliedGuardrail>,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// `false` on the 501 unsupported-provider branch: no upstream call
+    /// happened, so its usage event exports no upstream span.
+    upstream_called: bool,
 }
 
 async fn dispatch_create(
@@ -1781,6 +1785,7 @@ async fn dispatch_create(
                 provider_key_id: String::new(),
                 applied_guardrails: Vec::new(),
                 monitor_hits: Vec::new(),
+                upstream_called: false,
             });
         }
     } else {
@@ -1927,6 +1932,7 @@ async fn dispatch_create(
                 provider_key_id: String::new(),
                 applied_guardrails,
                 monitor_hits,
+                upstream_called: false,
             })
         }
     };
@@ -1965,6 +1971,7 @@ async fn dispatch_create(
         provider_key_id: target.pk_id.clone(),
         applied_guardrails,
         monitor_hits,
+        upstream_called: true,
     })
 }
 
@@ -2244,6 +2251,8 @@ fn emit_submit_usage_event(
     audit: &crate::usage_attr::GuardrailAudit,
     // The attempt that answered (#655).
     winner: Option<&crate::attempt::AttemptRecord>,
+    // Whether the submit reached an upstream; the route's own 501 did not.
+    dispatched: bool,
 ) {
     let mut event = UsageEvent {
         request_id: client.request_id.clone(),
@@ -2290,7 +2299,7 @@ fn emit_submit_usage_event(
         None,
         client.trace.as_ref(),
         /* terminal */ true,
-        /* dispatched */ true,
+        dispatched,
     );
 }
 
