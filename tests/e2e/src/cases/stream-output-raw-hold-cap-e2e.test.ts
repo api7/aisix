@@ -13,7 +13,7 @@ import {
 
 // E2E for the raw-byte bound on a held-back stream. `max_buffer_bytes`
 // counts generated content only (#513), but the hold-back keeps whole frames,
-// so each hold-back also bounds the raw bytes it keeps at 64 times the cap.
+// so each hold-back also bounds the raw bytes it keeps at 128 times the cap.
 //
 //  - A stream of frames that carry no content (pings, empty deltas,
 //    keep-alives, base64 image previews) past that bound is a buffer-exceeded
@@ -21,6 +21,9 @@ import {
 //    releases unscanned.
 //  - An ordinary token-by-token text stream still trips on the content cap:
 //    content exactly at the cap is scanned and released, one byte more trips.
+//  - So does one whose framing runs at ~100× its content, as OpenAI streams
+//    of CJK text do (~75×): on the routes that measure the upstream's own
+//    frames, the raw bound must not cut it before the content cap.
 //
 // Every stream ends with an email the guardrail masks whenever it scans, so a
 // masked email proves nothing tripped and a raw one proves the stream went out
@@ -29,8 +32,8 @@ import {
 const CALLER = "sk-stream-raw-hold-caller";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
 const CAP = 1_000;
-// Comfortably past the raw bound (64 × CAP = 64 000 bytes).
-const RAW_TARGET = 3 * 64 * CAP;
+// Comfortably past the raw bound (128 × CAP = 128 000 bytes).
+const RAW_TARGET = 3 * 128 * CAP;
 const EMAIL = "raw-probe@example.com";
 const MASKED = "[EMAIL_REDACTED]";
 const TAIL = `reach me at ${EMAIL}`;
@@ -76,7 +79,7 @@ const CHAT_EMPTY_TOOL_CALLS = [
 // raw bound; the terminal event the bridge adds echoes them a third time and
 // carries the stream past it.
 const CHAT_NO_FINISH = [chatChunk({ role: "assistant" }), chatChunk({ content: TAIL })];
-const LONG_INSTRUCTIONS = `Be brief. ${"i".repeat(25 * CAP)}`;
+const LONG_INSTRUCTIONS = `Be brief. ${"i".repeat(50 * CAP)}`;
 
 // Token-by-token text whose content totals `bytes`, ending with TAIL.
 const tokens = (bytes: number) => {
@@ -158,6 +161,112 @@ const RESPONSES_PARTIAL_IMAGES = [
       usage: { input_tokens: 5, output_tokens: 40, total_tokens: 45 },
     },
   }),
+];
+
+// Frames whose envelope is ~HIGH_RATIO times the content they carry: each
+// token's frame is padded with an `obfuscation` field (which OpenAI streams
+// really carry) or, on Anthropic, followed by `ping` events, until the raw
+// bytes so far reach HIGH_RATIO × the content so far.
+const HIGH_RATIO = 100;
+const sseData = (payload: string) => `data: ${payload}\n\n`;
+const obfuscated = (build: (pad: string) => string, content: number) => {
+  const bare = sseData(build("")).length;
+  return build("o".repeat(Math.max(0, HIGH_RATIO * content - bare)));
+};
+
+const responsesHighRatio = (bytes: number) => [
+  sseData(
+    JSON.stringify({
+      type: "response.created",
+      response: { id: "resp_ratio", object: "response", status: "in_progress", model: "gpt-4o-mini", output: [] },
+    }),
+  ),
+  ...tokens(bytes).map((t, i) =>
+    sseData(
+      obfuscated(
+        (pad) =>
+          JSON.stringify({
+            type: "response.output_text.delta",
+            item_id: "msg_ratio",
+            output_index: 0,
+            content_index: 0,
+            delta: t,
+            sequence_number: i,
+            obfuscation: pad,
+          }),
+        t.length,
+      ),
+    ),
+  ),
+  sseData(
+    JSON.stringify({
+      type: "response.completed",
+      response: {
+        id: "resp_ratio",
+        object: "response",
+        status: "completed",
+        model: "gpt-4o-mini",
+        output: [],
+        usage: { input_tokens: 5, output_tokens: 40, total_tokens: 45 },
+      },
+    }),
+  ),
+];
+
+const PING = anthropicFrame("ping", {});
+const anthropicHighRatio = (bytes: number) => {
+  const text = tokens(bytes);
+  const frames: string[] = [];
+  let raw = 0;
+  let content = 0;
+  for (const t of text) {
+    const f = anthropicFrame("content_block_delta", { index: 0, delta: { type: "text_delta", text: t } });
+    frames.push(f);
+    raw += f.length;
+    content += t.length;
+    while (raw < HIGH_RATIO * content) {
+      frames.push(PING);
+      raw += PING.length;
+    }
+  }
+  return [
+    anthropicFrame("message_start", {
+      message: {
+        id: "msg_ratio",
+        type: "message",
+        role: "assistant",
+        content: [],
+        model: "claude-3-5-haiku-20241022",
+        stop_reason: null,
+        usage: { input_tokens: 5, output_tokens: 1 },
+      },
+    }),
+    anthropicFrame("content_block_start", { index: 0, content_block: { type: "text", text: "" } }),
+    ...frames,
+    anthropicFrame("content_block_stop", { index: 0 }),
+    anthropicFrame("message_delta", { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 40 } }),
+    anthropicFrame("message_stop", {}),
+  ];
+};
+
+const chatHighRatio = (bytes: number) => [
+  ...tokens(bytes).map((t) =>
+    sseData(
+      obfuscated(
+        (pad) =>
+          JSON.stringify({
+            id: "chatcmpl-ratio",
+            object: "chat.completion.chunk",
+            model: "gpt-4o-mini",
+            choices: [{ index: 0, delta: { content: t }, finish_reason: null }],
+            obfuscation: pad,
+          }),
+        t.length,
+      ),
+    ),
+  ),
+  sseData(chatChunk({}, "stop")),
+  sseData("[DONE]"),
 ];
 
 // Passthrough: keep-alive chunks with no choices.
@@ -260,6 +369,23 @@ describe("held-back stream raw-byte bound", () => {
     await model("raw-chat-over-cap", "openai", chatText(CAP + 1), policies.closed);
     await model("raw-msg-at-cap", "anthropic", anthropicText(CAP), policies.closed, { raw: true });
     await model("raw-msg-over-cap", "anthropic", anthropicText(CAP + 1), policies.closed, { raw: true });
+    await model("raw-resp-ratio", "openai", responsesHighRatio(CAP), policies.closed, { raw: true });
+    await model("raw-msg-ratio", "anthropic", anthropicHighRatio(CAP), policies.closed, { raw: true });
+    const ratioBacking = await model("raw-route-ratio-backing", "openai", chatHighRatio(CAP), policies.closed, {
+      raw: true,
+    });
+    const ratioRoute = await seed.createPassthroughRoute({
+      name: "raw-route-ratio",
+      path_prefix: "/passthrough/raw-ratio",
+      target_url: String(ratioBacking.value.api_base),
+      provider_key_id: ratioBacking.id,
+    });
+    await seed.update("guardrail_attachments", randomUUID(), {
+      guardrail_id: routePolicies.closed!.id,
+      scope_type: "passthrough_route",
+      scope_id: ratioRoute.id,
+      priority: 100,
+    });
 
     // Seeded last: this key authenticating implies the whole seed set landed.
     await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"], allowed_routes: ["*"] });
@@ -351,6 +477,31 @@ describe("held-back stream raw-byte bound", () => {
       const overCap = await send(`${prefix}-over-cap`);
       expect(overCap).toContain("output_buffer_exceeded");
       expect(overCap).not.toContain(EMAIL);
+    });
+  }
+
+  // Raw frames between 64× and 128× the content: every route that measures
+  // the upstream's own bytes must hold them until the content cap binds.
+  const ratioFrames = (frames: string[]) => frames.join("").length;
+  test("high-ratio fixtures sit between 64× and 128× the content cap", () => {
+    for (const frames of [responsesHighRatio(CAP), anthropicHighRatio(CAP), chatHighRatio(CAP)]) {
+      expect(ratioFrames(frames)).toBeGreaterThan(64 * CAP);
+      expect(ratioFrames(frames)).toBeLessThan(128 * CAP);
+    }
+  });
+
+  const ratioCases: Array<[string, () => Promise<string>, string]> = [
+    ["/v1/responses (native)", () => responses("raw-resp-ratio"), MASKED],
+    ["/v1/messages (native)", () => messages("raw-msg-ratio"), MASKED],
+    ["passthrough route", () => route("ratio"), "content_filter"],
+  ];
+  for (const [surface, send, scanned] of ratioCases) {
+    test(`${surface}: content at the cap framed at ~100× is scanned, not cut by the raw bound`, async (ctx) => {
+      if (!ready(ctx)) return;
+      const body = await send();
+      expect(body).not.toContain("output_buffer_exceeded");
+      expect(body, "the guardrail scanned the whole response").toContain(scanned);
+      expect(body).not.toContain(EMAIL);
     });
   }
 });

@@ -22,10 +22,11 @@ use aisix_gateway::ChatDelta;
 use serde_json::Value;
 
 /// Raw bytes a hold-back may keep, as a multiple of `max_buffer_bytes`
-/// (16 MiB at the 256 KiB default). Far above the framing an ordinary
-/// token stream wraps around its content, so a normal response still trips
-/// on content first.
-pub(crate) const RAW_HOLD_FACTOR: usize = 64;
+/// (32 MiB at the 256 KiB default). Above the framing an ordinary token
+/// stream wraps around its content — OpenAI streams of CJK text measure
+/// about 75× their content, on Chat Completions and Responses alike — so a
+/// normal response still trips on content first.
+pub(crate) const RAW_HOLD_FACTOR: usize = 128;
 
 /// What one hold-back buffer holds: generated content (the cap
 /// `max_buffer_bytes` names) and the raw bytes kept to hold it.
@@ -71,6 +72,11 @@ impl BoundedValues {
         }
         self.bytes += len;
         self.values.push(v.clone());
+    }
+
+    /// Whether a value was refused for lack of room.
+    pub(crate) fn is_full(&self) -> bool {
+        self.full
     }
 
     /// The kept values, or `None` when there are none.
