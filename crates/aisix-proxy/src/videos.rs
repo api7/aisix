@@ -1631,10 +1631,8 @@ pub async fn create_video(
                 .unwrap_or_else(|| crate::usage_attr::UNRESOLVED_MODEL_LABEL.to_string());
             telemetry.finish_routed(status, &success.provider, &model_label, None, &routing);
             // One zero-token event per attempt that failed first (#655).
-            // The route's own 501 keeps its gated event below; when that
-            // stays silent the last failed attempt is the terminal one.
-            let (superseded, refused) = crate::usage_attr::split_route_refusal(&routing);
-            let answered = success.upstream_called;
+            // The route's own 501 is the terminal event below.
+            let superseded = crate::usage_attr::split_route_refusal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
@@ -1645,7 +1643,7 @@ pub async fn create_video(
                 &client,
                 &success.applied_guardrails,
                 superseded,
-                refused && !answered,
+                false,
                 false,
                 success.monitor_hits.clone(),
                 crate::redact::RedactionCounts::new(),
@@ -1655,9 +1653,9 @@ pub async fn create_video(
             // /logs and the budget ledger like every other endpoint.
             // Per-second cost is computed control-plane-side once the
             // per-second cost schema lands (AISIX-Cloud#1118 decision 2);
-            // token fields stay zero. Skipped when no upstream call
-            // happened (the 501 unsupported-provider branch).
-            if answered {
+            // token fields stay zero. The 501 unsupported-provider branch,
+            // which made no upstream call, emits too.
+            {
                 emit_submit_usage_event(
                     &state,
                     &snapshot,
@@ -1740,9 +1738,6 @@ struct CreateSuccess {
     provider_key_id: String,
     applied_guardrails: Vec<AppliedGuardrail>,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
-    /// `false` on the 501 unsupported-provider branch — no upstream call
-    /// happened, so no UsageEvent is attributed (embeddings convention).
-    upstream_called: bool,
 }
 
 async fn dispatch_create(
@@ -1786,7 +1781,6 @@ async fn dispatch_create(
                 provider_key_id: String::new(),
                 applied_guardrails: Vec::new(),
                 monitor_hits: Vec::new(),
-                upstream_called: false,
             });
         }
     } else {
@@ -1933,7 +1927,6 @@ async fn dispatch_create(
                 provider_key_id: String::new(),
                 applied_guardrails,
                 monitor_hits,
-                upstream_called: false,
             })
         }
     };
@@ -1972,7 +1965,6 @@ async fn dispatch_create(
         provider_key_id: target.pk_id.clone(),
         applied_guardrails,
         monitor_hits,
-        upstream_called: true,
     })
 }
 
@@ -2998,9 +2990,21 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// The route's own 501 still records the request, at zero tokens.
     #[tokio::test]
     async fn unsupported_provider_returns_501_not_implemented() {
-        let app = build_app(new_snap("http://unused", "minimax", ""));
+        use aisix_obs::UsageSink;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = crate::build_router(
+            crate::ProxyState::new(
+                SnapshotHandle::new(new_snap("http://unused", "minimax", "")),
+                Arc::new(Hub::new()),
+                &cfg(),
+            )
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx)),
+        );
         let resp = tower::ServiceExt::oneshot(
             app,
             post_videos(serde_json::json!({"model": "my-video", "prompt": "hi"})),
@@ -3010,6 +3014,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
         let v = body_json(resp).await;
         assert_eq!(v["error"]["type"], "not_implemented");
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the 501 must emit its zero-token UsageEvent")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.status_code, 501);
+        assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
     }
 
     #[tokio::test]

@@ -2819,9 +2819,9 @@ async fn responses_cross_provider_to_target(
 ///   - The `usage` block is missing entirely, OR
 ///   - `usage.input_tokens` is missing / non-numeric
 ///
-/// Those cases skip UsageEvent emission rather than attributing a
-/// zero-everything noise row to the api_key. The `input_tokens` gate
-/// distinguishes "no upstream usage at all" from a legitimate reply.
+/// The caller then estimates the counts locally (AISIX-Cloud#1074). The
+/// `input_tokens` gate distinguishes "no upstream usage at all" from a
+/// legitimate reply.
 ///
 /// `output_tokens`, by contrast, defaults to 0 when absent: a 200 that
 /// reports an input side but omits the output side is still a real

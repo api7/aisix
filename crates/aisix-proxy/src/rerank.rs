@@ -182,14 +182,10 @@ pub async fn rerank(
                 &audit,
             );
             // Issue #405: emit UsageEvent so cp-api's budget ledger
-            // and customer-facing /logs see /v1/rerank spend.
-            // Pre-#405 the rerank handler dropped the event entirely.
-            // Skip on 200 without a recognisable usage field — avoids
-            // attributing zero-everything noise rows when an
-            // upstream returns a malformed / unsupported shape.
-            let guardrail_attributed =
-                crate::usage_attr::has_guardrail_attribution(&audit, &success.monitor_hits);
-            if success.usage.is_some() || guardrail_attributed {
+            // and customer-facing /logs see /v1/rerank traffic. An upstream
+            // that reports no token count (Cohere bills search units) still
+            // gets its event, at zero tokens.
+            {
                 let usage = success
                     .usage
                     .as_ref()
@@ -680,11 +676,9 @@ async fn dispatch(
     // forward raw bytes downstream — preserves any provider-specific
     // fields (Cohere `meta.api_version`, Jina-specific fields, etc.)
     // that the JSON round-trip would otherwise re-format. A parse
-    // failure here is non-fatal: the request still succeeds, and it
-    // still leaves a usage event whenever a guardrail attributed the
-    // request — only an unattributed one goes unrecorded, which is what
-    // keeps a zero-everything noise row off the ledger. Audit HIGH: log
-    // the parse failure so a silent billing gap is visible in operator
+    // failure here is non-fatal: the request still succeeds and still
+    // leaves a usage event, at zero tokens. Audit HIGH: log the parse
+    // failure so a silent billing gap is visible in operator
     // dashboards (the upstream returned 200 + claimed JSON but the body
     // was unparseable — this is upstream-malformed, not gateway-bug, but
     // operators need to see it).
@@ -776,8 +770,9 @@ async fn dispatch(
 ///
 /// Three known wire shapes (per #213):
 /// - **OpenAI-compat** — `usage.prompt_tokens` (or `usage.input_tokens`)
-/// - **Cohere** — `meta.billed_units.input_tokens`
-///   (<https://docs.cohere.com/reference/rerank>)
+/// - **Cohere** — `meta.billed_units.input_tokens`, when present
+///   (<https://docs.cohere.com/reference/rerank>); its rerank models
+///   report only `search_units`, which yields `None`
 /// - **Jina** — `usage.total_tokens`
 ///   (<https://api.jina.ai/v1/rerank>)
 ///
@@ -1791,23 +1786,21 @@ mod tests {
         assert_eq!(event.inbound_protocol, "openai");
     }
 
-    /// Issue #405: Cohere's wire shape puts the token counter at
-    /// `meta.billed_units.input_tokens` instead of `usage.prompt_tokens`.
-    /// The extractor must handle this — without coverage, customers
-    /// running Cohere-backed rerank would see zero spend in cp-api
-    /// even though billing is happening.
+    /// Issue #405: Cohere reports `meta.billed_units.search_units` and no
+    /// token count. The request must still reach the usage-event table,
+    /// which the console Logs and budgets read, at zero tokens.
     #[tokio::test]
     async fn emits_usage_event_on_cohere_wire_shape_issue_405() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
-        // Cohere wire shape: `meta.billed_units.input_tokens`.
+        // Cohere's live wire shape: search units only, no token count.
         let upstream_body = serde_json::json!({
             "id": "rerank-cohere",
             "results": [{"index": 0, "relevance_score": 0.95}],
             "meta": {
-                "api_version": {"version": "1"},
-                "billed_units": {"input_tokens": 47, "search_units": 1}
+                "api_version": {"version": "2"},
+                "billed_units": {"search_units": 1}
             }
         });
         Mock::given(method("POST"))
@@ -1845,18 +1838,18 @@ mod tests {
             .expect("usage_sink sender dropped");
 
         assert_eq!(
-            event.prompt_tokens, 47,
-            "Cohere meta.billed_units.input_tokens must be surfaced as prompt_tokens",
+            event.prompt_tokens, 0,
+            "Cohere reports search units, not tokens: the event records zero tokens",
         );
+        assert_eq!(event.status_code, 200);
         assert_eq!(event.inbound_protocol, "openai");
     }
 
-    /// Issue #405: an upstream 200 with no recognisable usage field
-    /// (neither `usage` nor `meta.billed_units`) must NOT emit a
-    /// zero-everything noise row. Same edge-case discipline as
-    /// PR #425 audit MEDIUM-1.
+    /// An upstream 200 with no recognisable usage field (neither `usage`
+    /// nor `meta.billed_units`) still emits its usage event, at zero
+    /// tokens: every request is recorded.
     #[tokio::test]
-    async fn skips_usage_event_when_upstream_lacks_usage_fields() {
+    async fn emits_zero_token_usage_event_when_upstream_lacks_usage_fields() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -1893,14 +1886,13 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "no UsageEvent should be emitted when upstream lacks usage fields, \
-                 got prompt_tokens={}",
-                ev.prompt_tokens,
-            );
-        }
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted when upstream lacks usage fields")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.prompt_tokens, 0);
+        assert_eq!(event.completion_tokens, 0);
+        assert_eq!(event.status_code, 200);
     }
 
     #[tokio::test]
