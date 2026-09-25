@@ -123,12 +123,12 @@ const RESPONSES_STREAM = [
 
 // A passthrough stream whose last frame never ends: a short answer, then a
 // keep-alive the upstream leaves unterminated, carrying no content but past
-// the raw bound (64 × the tight cap) the hold-back also keeps.
+// the raw bound (128 × the tight cap) the hold-back also keeps.
 const TAIL_MARKER = "tail-marker";
 const UNTERMINATED_TAIL_STREAM = [
   `data: ${chatChunk({ role: "assistant" })}\n\n`,
   `data: ${chatChunk({ content: PIECES[0] })}\n\n`,
-  `data: ${JSON.stringify({ id: `${TAIL_MARKER}-${"k".repeat(100_000)}`, object: "chat.completion.chunk", choices: [] })}`,
+  `data: ${JSON.stringify({ id: `${TAIL_MARKER}-${"k".repeat(200_000)}`, object: "chat.completion.chunk", choices: [] })}`,
 ];
 
 interface EnforcedHit {

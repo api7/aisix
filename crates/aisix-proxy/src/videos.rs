@@ -1631,10 +1631,8 @@ pub async fn create_video(
                 .unwrap_or_else(|| crate::usage_attr::UNRESOLVED_MODEL_LABEL.to_string());
             telemetry.finish_routed(status, &success.provider, &model_label, None, &routing);
             // One zero-token event per attempt that failed first (#655).
-            // The route's own 501 keeps its gated event below; when that
-            // stays silent the last failed attempt is the terminal one.
-            let (superseded, refused) = crate::usage_attr::split_route_refusal(&routing);
-            let answered = success.upstream_called;
+            // The route's own 501 is the terminal event below.
+            let superseded = crate::usage_attr::split_route_refusal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
@@ -1645,7 +1643,7 @@ pub async fn create_video(
                 &client,
                 &success.applied_guardrails,
                 superseded,
-                refused && !answered,
+                false,
                 false,
                 success.monitor_hits.clone(),
                 crate::redact::RedactionCounts::new(),
@@ -1655,9 +1653,9 @@ pub async fn create_video(
             // /logs and the budget ledger like every other endpoint.
             // Per-second cost is computed control-plane-side once the
             // per-second cost schema lands (AISIX-Cloud#1118 decision 2);
-            // token fields stay zero. Skipped when no upstream call
-            // happened (the 501 unsupported-provider branch).
-            if answered {
+            // token fields stay zero. The 501 unsupported-provider branch,
+            // which made no upstream call, emits too.
+            {
                 emit_submit_usage_event(
                     &state,
                     &snapshot,
@@ -1672,6 +1670,7 @@ pub async fn create_video(
                     started.elapsed(),
                     &audit,
                     routing.attempts.last(),
+                    success.upstream_called,
                 );
             }
             success.response
@@ -1740,8 +1739,8 @@ struct CreateSuccess {
     provider_key_id: String,
     applied_guardrails: Vec<AppliedGuardrail>,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
-    /// `false` on the 501 unsupported-provider branch — no upstream call
-    /// happened, so no UsageEvent is attributed (embeddings convention).
+    /// `false` on the 501 unsupported-provider branch: no upstream call
+    /// happened, so its usage event exports no upstream span.
     upstream_called: bool,
 }
 
@@ -2032,6 +2031,8 @@ fn group_routes_to(snapshot: &aisix_core::AisixSnapshot, group: &str, target: &s
     })
 }
 
+/// Polls a video job. Deliberately emits no usage event: polling a job is
+/// not a recorded request (see `usage_attr::emit_usage`).
 pub async fn get_video(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
@@ -2104,6 +2105,8 @@ pub async fn get_video(
     }
 }
 
+/// Retrieves a finished video. Deliberately emits no usage event, like
+/// [`get_video`].
 pub async fn video_content(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
@@ -2248,6 +2251,8 @@ fn emit_submit_usage_event(
     audit: &crate::usage_attr::GuardrailAudit,
     // The attempt that answered (#655).
     winner: Option<&crate::attempt::AttemptRecord>,
+    // Whether the submit reached an upstream; the route's own 501 did not.
+    dispatched: bool,
 ) {
     let mut event = UsageEvent {
         request_id: client.request_id.clone(),
@@ -2294,7 +2299,7 @@ fn emit_submit_usage_event(
         None,
         client.trace.as_ref(),
         /* terminal */ true,
-        /* dispatched */ true,
+        dispatched,
     );
 }
 
@@ -2998,9 +3003,21 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// The route's own 501 still records the request, at zero tokens.
     #[tokio::test]
     async fn unsupported_provider_returns_501_not_implemented() {
-        let app = build_app(new_snap("http://unused", "minimax", ""));
+        use aisix_obs::UsageSink;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = crate::build_router(
+            crate::ProxyState::new(
+                SnapshotHandle::new(new_snap("http://unused", "minimax", "")),
+                Arc::new(Hub::new()),
+                &cfg(),
+            )
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx)),
+        );
         let resp = tower::ServiceExt::oneshot(
             app,
             post_videos(serde_json::json!({"model": "my-video", "prompt": "hi"})),
@@ -3010,6 +3027,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
         let v = body_json(resp).await;
         assert_eq!(v["error"]["type"], "not_implemented");
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the 501 must emit its zero-token UsageEvent")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.status_code, 501);
+        assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
     }
 
     #[tokio::test]

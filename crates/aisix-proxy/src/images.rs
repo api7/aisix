@@ -49,8 +49,8 @@ struct ImageDispatchSuccess {
     /// event so the request is visible + attributed.
     usage: Option<(u32, u32)>,
     /// `false` on the 501 NotImplemented branch (provider lacks image
-    /// generation → no upstream call). That path emits only when screening
-    /// already produced guardrail attribution.
+    /// generation → no upstream call). That path still emits a zero-token
+    /// event.
     upstream_called: bool,
     /// Per-detector PII mask counts (#932/#696) applied to the prompt.
     /// Attached to the emitted UsageEvent. Empty = no redaction.
@@ -156,11 +156,8 @@ pub async fn image_generations(
                 elapsed,
             );
             // One zero-token event per attempt that failed first (#655).
-            // The route's own 501 keeps its gated event below; when that
-            // stays silent the last failed attempt is the terminal one.
-            let (superseded, refused) = crate::usage_attr::split_route_refusal(&routing);
-            let answered = success.upstream_called
-                || crate::usage_attr::has_guardrail_attribution(&audit, &success.monitor_hits);
+            // The route's own 501 is the terminal event below.
+            let superseded = crate::usage_attr::split_route_refusal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
@@ -171,7 +168,7 @@ pub async fn image_generations(
                 &client,
                 &success.applied_guardrails,
                 superseded,
-                refused && !answered,
+                false,
                 false,
                 success.monitor_hits.clone(),
                 success.redactions.clone(),
@@ -179,14 +176,14 @@ pub async fn image_generations(
             );
             // Issue #407: emit UsageEvent so cp-api's budget ledger +
             // /logs see image-generation traffic. Pre-#407 the handler
-            // dropped the event entirely. Emit on a real upstream call
-            // (even zero tokens — request visible/attributed). A 501 emits
-            // only to preserve a guardrail decision. Tokens come from the upstream
+            // dropped the event entirely. Every request emits, the route's
+            // own 501 included, at zero tokens when there are none to
+            // report. Tokens come from the upstream
             // `usage` block when present (gpt-image-1); dall-e-3 has no
             // usage block → zero tokens (precise per-image cost is a
             // documented cross-repo follow-up — needs image-count /
             // size / quality on the wire + cp-api pricing).
-            if answered {
+            {
                 let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
                 emit_usage_event(
                     &state,
@@ -1190,9 +1187,8 @@ mod tests {
         assert_eq!(event.inbound_protocol, "openai");
     }
 
-    /// A 501 without a guardrail decision stays out of usage, while a 501
-    /// reached after a mask must preserve that attribution in a zero-token
-    /// event (#1083). Unlike completions and embeddings, /v1/images/generations
+    /// A 501 emits a zero-token event, and one reached after a mask carries
+    /// that attribution (#1083). Unlike completions and embeddings, /v1/images/generations
     /// rejects non-OpenAI providers with 400 *before* dispatch (see
     /// `non_openai_provider_returns_400_invalid_request`) and the real
     /// `OpenAiBridge` overrides `generate_image`, so the only way to reach
@@ -1200,7 +1196,7 @@ mod tests {
     /// leaves `Bridge::generate_image` at the trait default. We register a
     /// minimal stub under the "openai" key to exercise exactly that.
     #[tokio::test]
-    async fn image_501_emits_only_for_guardrail_attribution() {
+    async fn image_501_emits_a_zero_token_event() {
         use aisix_gateway::{
             Bridge, BridgeContext, BridgeError, ChatChunkStream, ChatFormat, ChatMessage,
             ChatResponse, FinishReason, UsageStats,
@@ -1265,14 +1261,13 @@ mod tests {
              (default Bridge::generate_image returns BridgeError::Config)",
         );
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "501 NotImplemented must not emit UsageEvent, \
-                 got prompt_tokens={}, status_code={}",
-                ev.prompt_tokens, ev.status_code,
-            );
-        }
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the 501 must emit its zero-token UsageEvent")
+            .expect("usage sink remains open");
+        assert_eq!(ev.status_code, 501);
+        assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
+        assert!(ev.guardrail_enforced_hits.is_empty(), "{ev:?}");
 
         let body = serde_json::json!({
             "model": "stub-image",

@@ -43,8 +43,7 @@ struct CompletionDispatchSuccess {
     /// UUID of the resolved Model row — required for UsageEvent
     /// `model_id`. Always populated on every success arm (including
     /// the 501 NotImplemented branch where no upstream call
-    /// happened); emission depends on usage or a recorded guardrail
-    /// decision, not this field.
+    /// happened); every arm emits a usage event.
     model_id: String,
     /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
     /// (AISIX-Cloud#867 parity).
@@ -61,8 +60,8 @@ struct CompletionDispatchSuccess {
     provider_request_id: String,
     /// Upstream-reported token counts. `None` on the 501
     /// NotImplemented path (provider doesn't support completions)
-    /// or on a 200 with no `usage` block (rare edge). Those paths still
-    /// emit a zero-token event when a guardrail recorded a decision.
+    /// or on a 200 with no `usage` block (rare edge). Those paths emit a
+    /// zero-token event.
     usage: Option<CompletionUsage>,
     /// Whether the request reached the provider. False only for the 501
     /// provider-unsupported branch.
@@ -209,18 +208,11 @@ pub async fn completions(
                 elapsed,
             );
             // Issue #403: emit UsageEvent so cp-api's budget ledger
-            // and customer-facing /logs see /v1/completions spend.
-            // Pre-#403 the legacy completions handler dropped the
-            // event entirely. A 501 or malformed 200 normally remains
-            // suppressed, but a guardrail decision is an audit fact rather
-            // than token-accounting noise and gets a zero-token event.
-            let guardrail_attributed =
-                crate::usage_attr::has_guardrail_attribution(&audit, &success.monitor_hits);
+            // and customer-facing /logs see /v1/completions traffic. The
+            // route's own 501 records zero tokens.
             // One zero-token event per attempt that failed first (#655).
-            // The route's own 501 keeps its gated event below; when that
-            // stays silent the last failed attempt is the terminal one.
-            let (superseded, refused) = crate::usage_attr::split_route_refusal(&routing);
-            let answered = success.usage.is_some() || guardrail_attributed;
+            // The route's own 501 is the terminal event below.
+            let superseded = crate::usage_attr::split_route_refusal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
@@ -231,13 +223,13 @@ pub async fn completions(
                 &client,
                 &success.applied_guardrails,
                 superseded,
-                refused && !answered,
+                false,
                 success.guardrail_blocked,
                 success.monitor_hits.clone(),
                 success.redactions.clone(),
                 &audit,
             );
-            if answered {
+            {
                 let usage = success.usage.as_ref().unwrap_or(&CompletionUsage {
                     prompt_tokens: 0,
                     completion_tokens: 0,
@@ -766,8 +758,7 @@ async fn dispatch(
                 provider_key_id: pk_id.clone(),
                 upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails,
-                // No upstream call → no token usage. The handler emits only
-                // if screening already produced guardrail attribution.
+                // No upstream call → no token usage; the event records zero.
                 usage: None,
                 upstream_called: false,
                 provider_request_id: String::new(),
@@ -785,9 +776,7 @@ async fn dispatch(
 ///   - The `usage` block is missing entirely (non-conformant edge), or
 ///   - `usage.prompt_tokens` is missing / non-numeric (malformed)
 ///
-/// Those cases normally skip UsageEvent emission rather than attributing a
-/// zero-everything noise row to the api_key. A guardrail decision overrides
-/// that suppression so its audit fields are not lost.
+/// The caller then estimates the counts locally (AISIX-Cloud#1074).
 ///
 /// `completion_tokens`, by contrast, defaults to 0 when absent: a 200
 /// that reports a prompt side but omits the completion side is still a
@@ -1553,7 +1542,7 @@ mod tests {
     /// ONE zero-token UsageEvent so the failed request is visible in Logs
     /// (status + error class) and attributed to the api_key — instead of being
     /// dropped, as the non-chat handlers used to do. The 501 NotImplemented
-    /// path still emits nothing (no upstream call); see the test below.
+    /// path emits a zero-token event too; see the test below.
     #[tokio::test]
     async fn upstream_5xx_emits_zero_token_error_event() {
         use aisix_obs::UsageSink;
@@ -1619,15 +1608,14 @@ mod tests {
         }
     }
 
-    /// A 501 without a guardrail decision stays out of usage, while a 501
-    /// reached after a mask must preserve that attribution in a zero-token
-    /// event (#1083). Triggers the path
+    /// A 501 emits a zero-token event, and one reached after a mask carries
+    /// that attribution (#1083). Triggers the path
     /// by routing /v1/completions at an Anthropic-backed model;
     /// `AnthropicBridge` doesn't override `Bridge::complete()`, so the trait
     /// default returns `UnsupportedCapability(TextCompletions)`, which maps to
     /// 501.
     #[tokio::test]
-    async fn provider_lacking_complete_emits_only_for_guardrail_attribution() {
+    async fn provider_lacking_complete_emits_a_zero_token_event() {
         use aisix_obs::UsageSink;
         use aisix_provider_anthropic::AnthropicBridge;
 
@@ -1670,14 +1658,13 @@ mod tests {
              (default Bridge::complete returns BridgeError::Config)",
         );
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "501 NotImplemented must not emit UsageEvent, \
-                 got prompt_tokens={}, status_code={}",
-                ev.prompt_tokens, ev.status_code,
-            );
-        }
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the 501 must emit its zero-token UsageEvent")
+            .expect("usage sink remains open");
+        assert_eq!(ev.status_code, 501);
+        assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
+        assert!(ev.guardrail_enforced_hits.is_empty(), "{ev:?}");
 
         let body = serde_json::json!({
             "model": "claude-instruct",
@@ -1698,14 +1685,9 @@ mod tests {
         assert_eq!(ev.applied_guardrails.len(), 1);
     }
 
-    /// The same 501 path, but the guardrail FAILS OPEN instead of masking.
-    ///
-    /// A bypass leaves no enforced hit and no score, so before the gate
-    /// learned about it this event was suppressed outright — the reason was
-    /// written onto a row nobody received, which is the same silence this
-    /// field exists to break, one layer further out. The unbilled paths are
-    /// where it bites: `success.usage` is `None`, so the guardrail
-    /// attribution is the only thing that can keep the row alive.
+    /// The same 501 path, but the guardrail FAILS OPEN instead of masking:
+    /// the bypass reason, which leaves no enforced hit and no score, still
+    /// lands on the unbilled event.
     #[tokio::test]
     async fn a_fail_open_bypass_alone_keeps_the_unbilled_event_alive() {
         use aisix_obs::UsageSink;

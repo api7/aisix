@@ -826,7 +826,28 @@ async fn dispatch(
         {
             Ok(bytes) => bytes,
             Err(_) => {
-                return (StatusCode::BAD_GATEWAY, "invalid upstream response").into_response()
+                // The tool call reached the upstream: record it like every
+                // other exit, with the status the caller receives.
+                if is_tool_call {
+                    emit_tool_call_usage(
+                        state,
+                        &snapshot,
+                        &auth,
+                        request_id,
+                        &mcp_server,
+                        &mcp_tool,
+                        StatusCode::BAD_GATEWAY.as_u16(),
+                        latency,
+                        false,
+                        monitor_hits,
+                        redaction_counts,
+                        guardrail_chain.as_ref(),
+                        None,
+                        trace,
+                        /* dispatched */ true,
+                    );
+                }
+                return (StatusCode::BAD_GATEWAY, "invalid upstream response").into_response();
             }
         };
         if let Some(chain) = &guardrail_chain {

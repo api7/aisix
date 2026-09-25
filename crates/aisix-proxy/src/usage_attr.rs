@@ -102,32 +102,6 @@ pub(crate) fn guardrail_scores(audit: &GuardrailAudit) -> Vec<aisix_core::Guardr
         .unwrap_or_default()
 }
 
-/// Whether a request has a guardrail decision worth preserving even when
-/// the handler has no token usage to report.
-///
-/// Merely having an attached guardrail is not enough: unsupported-provider
-/// and unparseable-usage paths historically suppress zero-value noise rows.
-/// A mask/block, monitor hit, or similarity score is an operator-visible
-/// security fact, so those paths must emit a zero-token event instead.
-///
-/// A BYPASS is one too, and it needs saying separately because it leaves no
-/// enforced hit and no score — a bypass is precisely the outcome where no
-/// policy acted. Without this arm a fail-open request whose upstream
-/// reported no parseable usage has its whole event suppressed, so the
-/// reason is written onto an event nobody ever receives: the same silence
-/// this field exists to break, one layer further out.
-pub(crate) fn has_guardrail_attribution(
-    audit: &GuardrailAudit,
-    monitor_hits: &[aisix_core::GuardrailMonitorHit],
-) -> bool {
-    !monitor_hits.is_empty()
-        || audit.as_ref().is_some_and(|log| {
-            !log.snapshot().is_empty()
-                || !log.score_snapshot().is_empty()
-                || log.bypass_reason().is_some()
-        })
-}
-
 /// [`guardrail_scores`] for the retrying families — see
 /// [`terminal_enforced_hits`].
 pub(crate) fn terminal_guardrail_scores(
@@ -762,21 +736,18 @@ pub(crate) fn failed_attempts_are_terminal(routing: &crate::attempt::RoutingTele
     !routing.attempts.is_empty() && routing.winner().is_none()
 }
 
-/// A single-shot success branch's attempts, split for emission: the ones
-/// [`emit_failed_attempts`] owns, and whether the request was answered by
-/// the route's own 501 for a provider lacking the capability — the LAST
-/// record, failed and never dispatched. That refusal keeps its own
-/// handler-emitted event, gated as it always was (no event unless a
-/// guardrail decision needs recording), so it is left out of the slice;
-/// when that gate stays shut the last superseded attempt, if any, is the
-/// terminal event instead.
+/// A single-shot success branch's attempts that [`emit_failed_attempts`]
+/// owns. When the request was answered by the route's own 501 for a
+/// provider lacking the capability — the LAST record, failed and never
+/// dispatched — that refusal is the handler's own terminal event, so it is
+/// left out of the slice.
 pub(crate) fn split_route_refusal(
     routing: &crate::attempt::RoutingTelemetry,
-) -> (&[crate::attempt::AttemptRecord], bool) {
+) -> &[crate::attempt::AttemptRecord] {
     if failed_attempts_are_terminal(routing) {
-        (&routing.attempts[..routing.attempts.len() - 1], true)
+        &routing.attempts[..routing.attempts.len() - 1]
     } else {
-        (&routing.attempts, false)
+        &routing.attempts
     }
 }
 
@@ -916,6 +887,12 @@ pub(crate) fn emit_prepared_usage_event(
 /// through here, so the CP telemetry leg and the exporter fan-out cannot
 /// drift, and the trace snapshot is taken in exactly one place.
 ///
+/// A usage event is the observability record of a request, not a billing
+/// line: every request that reaches dispatch emits one, at zero tokens when
+/// the upstream reported none or nothing was billable. Never skip it for
+/// lack of usage. The one exception is by design: polling a video job
+/// (`GET /v1/videos/:id`) and retrieving its content emit none.
+///
 /// `trace` is the request's bundle (`ClientContext::trace`); `terminal`
 /// says whether this event ends the request — the terminal event carries
 /// the SERVER + logical spans (ending the SERVER span at NOW, the real
@@ -1001,46 +978,6 @@ pub(crate) fn emit_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn similarity_score_alone_requires_a_zero_token_event() {
-        let log = Arc::new(aisix_guardrails::GuardrailAuditLog::new());
-        let audit = Some(Arc::clone(&log));
-        assert!(!has_guardrail_attribution(&audit, &[]));
-
-        log.record_score(aisix_core::GuardrailScore {
-            guardrail_name: "semantic-policy".into(),
-            hook: "input".into(),
-            direction: "deny".into(),
-            score: 0.7,
-            threshold: 0.8,
-            matched: false,
-            top_example_index: 0,
-            embedding_model: "embedder".into(),
-        });
-        assert!(has_guardrail_attribution(&audit, &[]));
-    }
-
-    /// A bypass leaves no enforced hit and no score — it is the outcome
-    /// where no policy acted — so it has to be named here explicitly.
-    /// Without it, the unbilled paths that consult this gate
-    /// (`/v1/completions`, `/v1/embeddings`, `/v1/images/*`, `/v1/rerank`)
-    /// suppress the whole event, and the reason lands on a row nobody
-    /// receives.
-    #[test]
-    fn a_bypass_alone_requires_a_zero_token_event() {
-        let log = Arc::new(aisix_guardrails::GuardrailAuditLog::new());
-        let audit = Some(Arc::clone(&log));
-        assert!(!has_guardrail_attribution(&audit, &[]));
-
-        log.record_bypass("lakera_timeout");
-        assert!(
-            log.snapshot().is_empty() && log.score_snapshot().is_empty(),
-            "premise: a bypass is not an enforced hit and not a score, so the \
-             other two arms of this gate cannot be what carries it",
-        );
-        assert!(has_guardrail_attribution(&audit, &[]));
-    }
 
     #[test]
     fn metric_model_label_three_outcomes() {

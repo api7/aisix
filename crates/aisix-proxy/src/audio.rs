@@ -871,8 +871,8 @@ struct StreamedTranscript {
 
 impl StreamedTranscript {
     /// The transcript the caller received, for the end-of-stream scan and
-    /// the content capture. Both are capped at their own limits on top of
-    /// this one.
+    /// the content capture. The capture is capped at its own limit on top
+    /// of this one.
     fn text(&self) -> &str {
         self.terminal.as_deref().unwrap_or(&self.deltas)
     }
@@ -978,9 +978,8 @@ where
 /// once the upstream ends or the caller disconnects, whichever comes
 /// first; it owns the UsageEvent for this request.
 ///
-/// `capture_cap` bounds the assembled transcript; an output chain that
-/// needs a scan raises the floor to its own scan bound, so neither
-/// consumer sees past its own limit.
+/// `content_cap` bounds the assembled transcript, unless an output chain
+/// needs the end-of-stream scan, which reads all of it.
 fn transcription_relay<S, F>(
     upstream: S,
     // Set when `upstream` ended on a read timeout rather than its own end.
@@ -997,14 +996,13 @@ where
 
     // Anchors a timed-out read's reported elapsed time.
     let started = std::time::Instant::now();
-    let text_cap = content_cap
-        .map(|cap| cap as usize)
-        .unwrap_or(0)
-        .max(if eos_scan.is_some() {
-            aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES
-        } else {
-            0
-        });
+    // The end-of-stream scan reads the whole transcript; the capture
+    // re-truncates to its own cap.
+    let text_cap = if eos_scan.is_some() {
+        usize::MAX
+    } else {
+        content_cap.map_or(0, |cap| cap as usize)
+    };
     // Re-attach the request span: the body is polled after the request-id
     // middleware returns, so anything logged from here would otherwise lose
     // its `request_id` correlation (AISIX-Cloud#1060).

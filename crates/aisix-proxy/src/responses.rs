@@ -2819,9 +2819,9 @@ async fn responses_cross_provider_to_target(
 ///   - The `usage` block is missing entirely, OR
 ///   - `usage.input_tokens` is missing / non-numeric
 ///
-/// Those cases skip UsageEvent emission rather than attributing a
-/// zero-everything noise row to the api_key. The `input_tokens` gate
-/// distinguishes "no upstream usage at all" from a legitimate reply.
+/// The caller then estimates the counts locally (AISIX-Cloud#1074). The
+/// `input_tokens` gate distinguishes "no upstream usage at all" from a
+/// legitimate reply.
 ///
 /// `output_tokens`, by contrast, defaults to 0 when absent: a 200 that
 /// reports an input side but omits the output side is still a real
@@ -3281,21 +3281,17 @@ where
     // at end-of-stream — with the estimation cap as the floor. The cap
     // bounds delta accumulation; a terminal event's full output text is
     // instead bounded by MAX_SSE_FRAME_BUF_BYTES (an oversized frame
-    // never parses) and re-truncated by each consumer —
-    // `CapturedContent::new` at the exporter cap and
-    // `EosOutputScan::observe` at the scan bound — so none sees beyond
-    // its own limit.
-    let capture_cap = Some(
+    // never parses). The end-of-stream scan reads all of it, so with one
+    // the accumulator is unbounded; `CapturedContent::new` re-truncates
+    // to the exporter cap either way.
+    let capture_cap = Some(if eos_scan.is_some() {
+        usize::MAX
+    } else {
         content_cap
             .map(|cap| cap as usize)
             .unwrap_or(0)
-            .max(if eos_scan.is_some() {
-                aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES
-            } else {
-                0
-            })
-            .max(crate::token_estimate::OUTPUT_ACCUMULATION_CAP),
-    );
+            .max(crate::token_estimate::OUTPUT_ACCUMULATION_CAP)
+    });
     // Re-attach the request span: the body is polled after the request-id
     // middleware returns, so the end-of-stream output-guardrail scan
     // (`EosOutputScan::observe`) would otherwise log without a

@@ -177,11 +177,8 @@ pub async fn embeddings(
                 elapsed,
             );
             // One zero-token event per attempt that failed first (#655).
-            // The route's own 501 keeps its gated event below; when that
-            // stays silent the last failed attempt is the terminal one.
-            let (superseded, refused) = crate::usage_attr::split_route_refusal(&routing);
-            let answered = success.upstream_called
-                || crate::usage_attr::has_guardrail_attribution(&audit, &success.monitor_hits);
+            // The route's own 501 is the terminal event below.
+            let superseded = crate::usage_attr::split_route_refusal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
@@ -192,7 +189,7 @@ pub async fn embeddings(
                 &client,
                 &success.applied_guardrails,
                 superseded,
-                refused && !answered,
+                false,
                 false,
                 success.monitor_hits.clone(),
                 success.redactions.clone(),
@@ -203,13 +200,9 @@ pub async fn embeddings(
             // spend. Pre-#226 the embedding handler dropped the
             // event entirely, so any /v1/embeddings traffic was
             // invisible to budget enforcement and billing
-            // reconciliation. A 501 normally remains suppressed because no
-            // upstream call happened; if screening recorded a guardrail
-            // decision, preserve it in a zero-token event. Distinguished from
-            // `prompt_tokens == 0` so a 200 with legitimately zero
-            // tokens (empty input, provider-specific billing
-            // convention) still emits.
-            if answered {
+            // reconciliation. The route's own 501, which made no upstream
+            // call, records zero tokens.
+            {
                 emit_usage_event(
                     &state,
                     &snapshot,
@@ -1743,17 +1736,13 @@ mod tests {
         // The `.expect(1)` on both mocks asserts exactly two upstream calls.
     }
 
-    /// A 501 without a guardrail decision stays out of usage, while a 501
-    /// reached after a mask must preserve that attribution in a zero-token
-    /// event (#1083).
+    /// A 501 emits a zero-token event, and one reached after a mask carries
+    /// that attribution (#1083).
     /// Triggers the path by routing /v1/embeddings at an Anthropic-backed
     /// model; `AnthropicBridge` doesn't override `Bridge::embed()` so the
-    /// trait default returns `BridgeError::Config(...)` → 501. Without this
-    /// test, a regression flipping `upstream_called: false` → `true` (or
-    /// `usage: None` → `Some(zero)`) on the 501 branch would silently emit
-    /// a bogus zero event.
+    /// trait default returns `BridgeError::Config(...)` → 501.
     #[tokio::test]
-    async fn provider_lacking_embed_emits_only_for_guardrail_attribution() {
+    async fn provider_lacking_embed_emits_a_zero_token_event() {
         use aisix_obs::UsageSink;
         use aisix_provider_anthropic::AnthropicBridge;
 
@@ -1796,14 +1785,13 @@ mod tests {
              (default Bridge::embed returns BridgeError::Config)",
         );
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "501 NotImplemented must not emit UsageEvent, \
-                 got prompt_tokens={}, status_code={}",
-                ev.prompt_tokens, ev.status_code,
-            );
-        }
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the 501 must emit its zero-token UsageEvent")
+            .expect("usage sink remains open");
+        assert_eq!(ev.status_code, 501);
+        assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
+        assert!(ev.guardrail_enforced_hits.is_empty(), "{ev:?}");
 
         let body = serde_json::json!({
             "model": "claude-embed",
