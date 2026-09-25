@@ -63,19 +63,12 @@ impl EosOutputScan {
         text: &str,
         local_segments: Option<Vec<aisix_guardrails::ScanSegment>>,
     ) -> Vec<aisix_core::GuardrailMonitorHit> {
-        // Bound the provider calls the same way the buffered branch's byte
-        // cap does — scan at most the cap's worth of text.
-        let mut end = text
-            .len()
-            .min(aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES);
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        let scan_text = &text[..end];
-        if scan_text.is_empty() {
+        // The whole generated text, as chat and `/v1/messages` scan it: a
+        // monitor-only chain holds nothing back, so no hold cap applies.
+        if text.is_empty() {
             return Vec::new();
         }
-        let synth = synth_chat_response(&self.upstream_model, scan_text.to_string());
+        let synth = synth_chat_response(&self.upstream_model, text.to_string());
         let (verdict, mut hits) = aisix_guardrails::Guardrail::check_output_non_segment_observed(
             self.chain.as_ref(),
             &synth,
@@ -95,7 +88,7 @@ impl EosOutputScan {
             &mut hits,
             local_segments,
             |g| {
-                let _ = g.redact_output_text(scan_text);
+                let _ = g.redact_output_text(text);
                 crate::redact::RedactionCounts::new()
             },
         )

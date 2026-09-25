@@ -5615,7 +5615,8 @@ where
         // collected). Under Window every window re-scans the whole buffer, so
         // the chain's folded hold cap bounds it, and outgrowing that cap is a
         // buffer trip like any other (#513, #1029). The live-forward monitor
-        // path bounds it at the default cap. Allocated only with a guardrail.
+        // path holds nothing back, so it collects all of it, like the content
+        // buffer above. Allocated only with a guardrail.
         let mut tool_calls_buf = if output_guardrail.is_some() {
             Some(String::new())
         } else {
@@ -5625,7 +5626,7 @@ where
         // the channels the buffered branch's mask walker reads (#1027).
         // Only the live-forward branch reads them; bounded by their own size,
         // since a delta with no name or arguments adds nothing to the buffer
-        // above.
+        // above. Past that bound the check judges the tool-call text instead.
         let mut eos_tool_calls = crate::held_content::BoundedValues::default();
         // P2 (#379) / #466: streamed-output policy folded over the output-hook
         // guardrails. EndOfStreamCheck (reached only when no output-hook
@@ -5637,12 +5638,6 @@ where
             .map(|ctx| ctx.chain.stream_output_policy())
             .unwrap_or_default();
         let hold_back = stream_policy.holds_back();
-        let tool_calls_cap = match stream_policy {
-            aisix_guardrails::StreamOutputPolicy::EndOfStreamCheck => {
-                aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES
-            }
-            _ => usize::MAX,
-        };
         let mut window_tool_calls_cap = match stream_policy {
             aisix_guardrails::StreamOutputPolicy::Window { .. } => stream_policy.hold_cap(),
             _ => None,
@@ -5802,9 +5797,6 @@ where
                         tool_calls_overflowed,
                     ) {
                         for tc in tcs {
-                            if buf.len() >= tool_calls_cap {
-                                break;
-                            }
                             let function = tc.get("function");
                             let name = function
                                 .and_then(|f| f.get("name"))
@@ -5823,10 +5815,10 @@ where
                             if !hold_back {
                                 // Serialized deltas carry their envelope, so
                                 // they get the raw guard's headroom over the
-                                // text cap the buffer above keeps.
+                                // default text cap.
                                 eos_tool_calls.push(
                                     tc,
-                                    tool_calls_cap
+                                    aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES
                                         .saturating_mul(crate::held_content::RAW_HOLD_FACTOR),
                                 );
                             }
@@ -6332,20 +6324,29 @@ where
                 let verdict = if verdict.is_block() {
                     verdict
                 } else {
+                    // Deltas past their bound: judge the tool-call text whole.
+                    let tool_calls_whole = eos_tool_calls.is_full();
                     let mut chunks = vec![aisix_gateway::ChatChunk {
                         id: String::new(),
                         model: String::new(),
                         delta: aisix_gateway::ChatDelta {
                             content: Some(content.clone()),
-                            tool_calls: eos_tool_calls.take(),
+                            tool_calls: eos_tool_calls.take().filter(|_| !tool_calls_whole),
                             ..Default::default()
                         },
                         finish_reason: None,
                         usage: None,
                     }];
-                    let segments = crate::redact::collect_segments(|g| {
+                    let mut segments = crate::redact::collect_segments(|g| {
                         let _ = crate::redact::redact_chat_chunks(g, &mut chunks);
                     });
+                    if tool_calls_whole {
+                        segments.push(aisix_guardrails::ScanSegment {
+                            text: tc_part.to_string(),
+                            role: aisix_guardrails::SegmentRole::ScanOnly,
+                            in_latest_turn: true,
+                        });
+                    }
                     let (local, hits) = ctx.chain.check_local_segments(&segments, false);
                     guard.comp().monitor_hits.extend(hits);
                     verdict.merged_with(local)
