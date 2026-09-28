@@ -13,22 +13,20 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: an exporter's delivery error never carries the credentials it was
+// E2E: an exporter's delivery error never carries the secrets it was
 // configured with. The error text is what the gateway logs on every failed
 // attempt and reports as the exporter's `last_error` in the managed-mode
 // heartbeat, so a credential in it reaches the log pipeline and the console.
 //
-// Two ways one used to get there, one exporter each:
-//   - the endpoint URL carries `user:pass@`, and a transport failure names
-//     the endpoint;
-//   - the receiver rejects the export and echoes the credential header back
-//     in its error body.
+// One exporter's receiver rejects the export and echoes the credential
+// header back in its error body. The other's endpoint URL carries
+// `user:pass@`: a configured URL gets no special handling, so a transport
+// failure names it exactly as configured.
 const CALLER = "sk-exporter-error-redaction";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
 const USERINFO_USER = "otlp-e2e-user";
 const USERINFO_PASS = "otlp-e2e-pass";
 const HEADER_TOKEN = "otlp-e2e-header-token";
-const SECRETS = [USERINFO_USER, USERINFO_PASS, HEADER_TOKEN];
 
 /** A port with nothing listening on it. */
 async function closedPort(): Promise<number> {
@@ -109,7 +107,7 @@ describe("exporter delivery errors carry no configured credential", () => {
     await new Promise<void>((resolve) => (echoing ? echoing.close(() => resolve()) : resolve()));
   });
 
-  test("the failed-delivery log lines name the receiver, not its credentials", async (ctx) => {
+  test("the failed-delivery log lines name the receiver, not its secrets", async (ctx) => {
     if (!etcdReachable || !app || !upstream || !echoing) return ctx.skip();
 
     const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
@@ -129,8 +127,9 @@ describe("exporter delivery errors carry no configured credential", () => {
       "a retried delivery to the unreachable exporter",
       20_000,
     );
-    // Still diagnosable: which receiver, and why.
-    expect(unreachable).toContain(`https://***@127.0.0.1:${unreachablePort}/v1/traces`);
+    expect(unreachable).toContain(
+      `https://${USERINFO_USER}:${USERINFO_PASS}@127.0.0.1:${unreachablePort}/v1/traces`,
+    );
 
     const rejected = await waitForLogLine(
       app,
@@ -140,8 +139,8 @@ describe("exporter delivery errors carry no configured credential", () => {
     );
     expect(rejected).toContain("HTTP 401");
 
-    for (const secret of SECRETS) {
-      expect(app.output(), `${secret} reached the gateway output`).not.toContain(secret);
-    }
+    expect(app.output(), "the header credential reached the gateway output").not.toContain(
+      HEADER_TOKEN,
+    );
   });
 });

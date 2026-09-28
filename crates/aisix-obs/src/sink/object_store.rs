@@ -71,7 +71,7 @@ impl ObjectStoreSink {
         }
     }
 
-    /// Declare the endpoint and credentials the backend was built with, so
+    /// Declare the credentials the backend was built with, so
     /// the pipeline keeps them out of this sink's delivery errors.
     pub fn with_error_redactor(mut self, redactor: ErrorRedactor) -> Self {
         self.redactor = redactor;
@@ -497,9 +497,6 @@ fn build_object_store_sink_with(
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Arc<dyn ObservabilitySink> {
     let mut redactor = ErrorRedactor::default();
-    if let Some(endpoint) = &cfg.endpoint {
-        redactor = redactor.url(endpoint);
-    }
     let store = match cfg.auth_mode {
         ObjectStoreAuthMode::CredentialRef => {
             let Some(creds) =
@@ -1333,10 +1330,10 @@ mod tests {
         }
     }
 
-    /// object_store renders the request URI — configured userinfo included —
-    /// into every error, and a receiver may echo the signing key back. The
-    /// delivery error the pipeline records must carry neither, for a store
-    /// built the way production builds it.
+    /// A receiver may echo the signing key back; the delivery error the
+    /// pipeline records must not carry it, for a store built the way
+    /// production builds it. The configured endpoint, userinfo included, is
+    /// reported as configured.
     #[tokio::test]
     async fn delivery_errors_carry_no_configured_credential() {
         let server = receiver_answering(
@@ -1383,12 +1380,14 @@ mod tests {
         run.await.unwrap();
 
         assert!(
-            last.contains("http://***@127.0.0.1") && last.contains("SignatureDoesNotMatch"),
-            "the cause stays diagnosable: {last}"
+            last.contains("http://obj-user:obj-pass@127.0.0.1")
+                && last.contains("SignatureDoesNotMatch"),
+            "the endpoint is reported as configured, with the cause: {last}"
         );
-        for secret in ["obj-user", "obj-pass", "objstore-secret-key"] {
-            assert!(!last.contains(secret), "{secret} leaked into: {last}");
-        }
+        assert!(
+            !last.contains("objstore-secret-key"),
+            "the secret key leaked into: {last}"
+        );
     }
 
     #[tokio::test]

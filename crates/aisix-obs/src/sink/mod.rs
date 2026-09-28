@@ -231,9 +231,9 @@ pub trait ObservabilitySink: Send + Sync + 'static {
     /// control-plane "test connection" affordance.
     async fn healthcheck(&self) -> SinkHealth;
 
-    /// The configured URLs and secrets the pipeline scrubs from this sink's
-    /// delivery errors before logging or reporting them. A sink configured
-    /// with a URL or a credential must declare it here.
+    /// The configured secrets the pipeline scrubs from this sink's delivery
+    /// errors before logging or reporting them. A sink configured with a
+    /// credential must declare it here.
     fn error_redactor(&self) -> ErrorRedactor {
         ErrorRedactor::default()
     }
