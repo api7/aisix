@@ -1468,6 +1468,9 @@ struct Telemetry<'a> {
     auth: &'a AuthenticatedKey,
     request_id: String,
     started: Instant,
+    /// The content route relays an open-ended body after this tail runs, so
+    /// its access-log `duration` is measured to the end of that relay.
+    duration_spans_body: bool,
 }
 
 impl Telemetry<'_> {
@@ -1502,7 +1505,7 @@ impl Telemetry<'_> {
         };
         let log_target = crate::attribution::AccessLogTarget::current();
         let summary = routing.access_log_summary();
-        AccessLog {
+        let line = AccessLog {
             method: self.method,
             path: &self.path,
             status,
@@ -1530,8 +1533,14 @@ impl Telemetry<'_> {
             error: error.as_deref(),
             mcp: None,
             cache: None,
+            request_body_bytes: None,
+            response_body_bytes: None,
+        };
+        if self.duration_spans_body {
+            crate::attribution::emit_access_log_spanning_body(line, self.started);
+        } else {
+            crate::attribution::emit_access_log(line);
         }
-        .emit();
         // AISIX-Cloud#1325: this tail never took `upstream_model` or the
         // ProviderKey pair, and its error sites pass `provider: "unknown"`.
         // All three come off the request's attribution cell, which the
@@ -1576,6 +1585,7 @@ pub async fn create_video(
         auth: &auth,
         request_id: client.request_id.clone(),
         started,
+        duration_spans_body: false,
     };
     let body = match body {
         Ok(Json(b)) => b,
@@ -2047,6 +2057,7 @@ pub async fn get_video(
         auth: &auth,
         request_id: client.request_id.clone(),
         started: Instant::now(),
+        duration_spans_body: false,
     };
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -2123,6 +2134,7 @@ pub async fn video_content(
         auth: &auth,
         request_id: client.request_id.clone(),
         started: Instant::now(),
+        duration_spans_body: true,
     };
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();

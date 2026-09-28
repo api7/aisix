@@ -182,7 +182,7 @@ pub async fn a2a_endpoint(
         );
     } else {
         let target = crate::attribution::AccessLogTarget::current();
-        AccessLog {
+        crate::attribution::emit_access_log(AccessLog {
             method: http_method.as_str(),
             path: "/a2a",
             status,
@@ -209,8 +209,9 @@ pub async fn a2a_endpoint(
             routing_fallback_count: None,
             mcp: None,
             cache: None,
-        }
-        .emit();
+            request_body_bytes: None,
+            response_body_bytes: None,
+        });
     }
     crate::request_metrics::record(
         &state,
@@ -970,7 +971,7 @@ fn emit_a2a_usage(
     // the unary, quota-rejected and failed-to-open paths are in the sample
     // too — a streaming-only series would report `/a2a` as having no failures
     // at all.
-    crate::request_metrics::record_e2e_latency(
+    crate::request_metrics::record_e2e_latency_downstream_only(
         state,
         "/a2a",
         crate::request_metrics::Caller::new(auth),

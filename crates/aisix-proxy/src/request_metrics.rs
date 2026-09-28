@@ -12,8 +12,8 @@
 //! (`record_request_e2e_latency` is called with the stream's own duration at
 //! completion instead); nothing guards the three families below.
 //!
-//! Read a streaming p99 off `aisix_request_e2e_latency_seconds`, which is
-//! recorded at stream completion. Do not read one off
+//! Read a streaming p99 off `aisix_request_e2e_latency_seconds{side="downstream"}`,
+//! which is recorded at stream completion. Do not read one off
 //! `aisix_llm_request_duration_seconds` and expect end-to-end.
 //!
 //! Three families ride on a single call:
@@ -55,7 +55,7 @@ use std::borrow::Cow;
 use std::time::Duration;
 
 use aisix_core::AisixSnapshot;
-use aisix_obs::{LlmUsage, RequestLabels, RequestOutcome, UsageLabels};
+use aisix_obs::{LatencySide, LlmUsage, RequestLabels, RequestOutcome, UsageLabels};
 
 use crate::auth::AuthenticatedKey;
 use crate::state::ProxyState;
@@ -405,6 +405,9 @@ pub(crate) fn record(
 
 /// Stream callbacks must capture bounded model labels from their dispatch
 /// snapshot: the model row may be gone by the time the stream ends.
+///
+/// Records the `downstream` side and arranges the `upstream` one — see
+/// [`record_e2e_downstream`]. `/a2a` calls [`record_e2e_latency_downstream_only`].
 pub(crate) fn record_e2e_latency(
     state: &ProxyState,
     endpoint: &'static str,
@@ -413,33 +416,143 @@ pub(crate) fn record_e2e_latency(
     status: u16,
     elapsed: Duration,
 ) {
+    record_e2e_latency_as(state, endpoint, caller, upstream, status, elapsed, true);
+}
+
+/// [`record_e2e_latency`] for a route with no model dispatch to time on its
+/// own: `/a2a` observes the `downstream` side alone.
+pub(crate) fn record_e2e_latency_downstream_only(
+    state: &ProxyState,
+    endpoint: &'static str,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    elapsed: Duration,
+) {
+    record_e2e_latency_as(state, endpoint, caller, upstream, status, elapsed, false);
+}
+
+fn record_e2e_latency_as(
+    state: &ProxyState,
+    endpoint: &'static str,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    elapsed: Duration,
+    with_upstream: bool,
+) {
     let snap = state.snapshot.load();
     let (model, upstream_model) =
         crate::usage_attr::metric_model_label_pair(&snap, upstream.model, upstream.upstream_model);
-    state.metrics.record_request_e2e_latency(
-        aisix_obs::LatencyLabels {
+    let labels = aisix_obs::LatencyLabels {
+        endpoint,
+        model: model.as_ref(),
+        provider: upstream.provider,
+        status,
+        streaming: upstream.stream,
+        details: UsageLabels {
             endpoint,
-            model: model.as_ref(),
+            inbound_protocol: crate::inbound_protocol_for_endpoint(endpoint),
+            upstream_protocol: upstream.pk.protocol(),
             provider: upstream.provider,
-            status,
-            streaming: upstream.stream,
-            details: UsageLabels {
-                endpoint,
-                inbound_protocol: crate::inbound_protocol_for_endpoint(endpoint),
-                upstream_protocol: upstream.pk.protocol(),
-                provider: upstream.provider,
-                model: model.as_ref(),
-                upstream_model: upstream_model.as_ref(),
-                provider_key_id: upstream.pk.id(),
-                provider_key_name: upstream.pk.name(),
-                api_key_id: caller.api_key_id,
-                team_id: caller.team_id,
-                user_id: caller.user_id,
-                user_name: caller.user_name,
-            },
+            model: model.as_ref(),
+            upstream_model: upstream_model.as_ref(),
+            provider_key_id: upstream.pk.id(),
+            provider_key_name: upstream.pk.name(),
+            api_key_id: caller.api_key_id,
+            team_id: caller.team_id,
+            user_id: caller.user_id,
+            user_name: caller.user_name,
         },
-        elapsed,
-    );
+    };
+    if with_upstream {
+        record_e2e_downstream(&state.metrics, labels, elapsed);
+    } else {
+        state
+            .metrics
+            .record_request_e2e_latency(labels, LatencySide::Downstream, elapsed);
+    }
+}
+
+/// Observe a request's `downstream` end-to-end latency, and note its labels
+/// on the request's cell so that its `upstream` sibling — the terminal
+/// attempt's own duration, which the terminal usage event carries — is
+/// recorded under the same labels. Recorded only when the request's
+/// terminal attempt was dispatched to an upstream; see
+/// `attribution::note_e2e_downstream`.
+pub(crate) fn record_e2e_downstream(
+    metrics: &std::sync::Arc<aisix_obs::Metrics>,
+    labels: aisix_obs::LatencyLabels<'_>,
+    elapsed: Duration,
+) {
+    metrics.record_request_e2e_latency(labels, LatencySide::Downstream, elapsed);
+    crate::attribution::note_e2e_downstream(metrics.clone(), OwnedLatencyLabels::from(labels));
+}
+
+/// An owned [`aisix_obs::LatencyLabels`], held on the request's cell
+/// between the two sides of its end-to-end observation.
+pub(crate) struct OwnedLatencyLabels {
+    endpoint: String,
+    model: String,
+    provider: String,
+    status: u16,
+    streaming: bool,
+    details: [String; 12],
+}
+
+impl From<aisix_obs::LatencyLabels<'_>> for OwnedLatencyLabels {
+    fn from(l: aisix_obs::LatencyLabels<'_>) -> Self {
+        let d = l.details;
+        Self {
+            endpoint: l.endpoint.to_owned(),
+            model: l.model.to_owned(),
+            provider: l.provider.to_owned(),
+            status: l.status,
+            streaming: l.streaming,
+            details: [
+                d.endpoint,
+                d.inbound_protocol,
+                d.upstream_protocol,
+                d.provider,
+                d.model,
+                d.upstream_model,
+                d.provider_key_id,
+                d.provider_key_name,
+                d.api_key_id,
+                d.team_id,
+                d.user_id,
+                d.user_name,
+            ]
+            .map(str::to_owned),
+        }
+    }
+}
+
+impl OwnedLatencyLabels {
+    pub(crate) fn as_labels(&self) -> aisix_obs::LatencyLabels<'_> {
+        let d = &self.details;
+        aisix_obs::LatencyLabels {
+            endpoint: &self.endpoint,
+            model: &self.model,
+            provider: &self.provider,
+            status: self.status,
+            streaming: self.streaming,
+            details: UsageLabels {
+                endpoint: &d[0],
+                inbound_protocol: &d[1],
+                upstream_protocol: &d[2],
+                provider: &d[3],
+                model: &d[4],
+                upstream_model: &d[5],
+                provider_key_id: &d[6],
+                provider_key_name: &d[7],
+                api_key_id: &d[8],
+                team_id: &d[9],
+                user_id: &d[10],
+                user_name: &d[11],
+            },
+        }
+    }
 }
 
 /// What one request consumed. Every counter below no-ops on an all-zero

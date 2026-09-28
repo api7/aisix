@@ -343,6 +343,20 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     expect(upstream.handshakes[0].openaiBeta).toBe("realtime=v1");
 
     ws.close();
+
+    // The session's line is written when it closes. A WebSocket carries no
+    // HTTP request or response body, so the line reports neither size.
+    const sessionLine = await waitForLogLine(
+      app,
+      (l) =>
+        l.includes("proxy request completed") &&
+        l.includes('path="/v1/realtime"') &&
+        l.includes('model="realtime-e2e-model"') &&
+        l.includes("status=200"),
+      "the realtime session's access-log line",
+    );
+    expect(sessionLine).not.toContain("request_body_bytes");
+    expect(sessionLine).not.toContain("response_body_bytes");
   });
 
   test("a caller that did not opt in gets NO openai-beta header upstream", async (ctx) => {

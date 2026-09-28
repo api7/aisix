@@ -205,10 +205,17 @@ nothing, and nothing errors: the caller gets a correct status while the gateway
 keeps no record of the request, which is indistinguishable from the request never
 arriving.
 
+Every line goes through `attribution::emit_access_log` (or
+`emit_access_log_spanning_body`), never `AccessLog::emit` directly: the line
+carries the request and response body sizes, which the telemetry middleware
+counts at its outermost layer and only knows once the response body is done
+with, so the cell holds the line and the middleware's guard writes it then. A
+line emitted directly is written without either size, and nothing errors.
+
 One exception, and it is the whole of it: **a STREAMED response's line is not
 the handler's to write.** Its tail runs when the head goes out, which is not
 when the request ends — so it parks the line on the attribution cell
-(`attribution::PendingAccessLog`) and the line goes out from
+(`attribution::PendingAccessLog`) and the line is completed in
 `usage_attr::emit_usage` with the request's TERMINAL usage event, whichever of
 the stream's endings produced it. That is what makes the line and the row agree
 on `status`, `error_class` and `error_message` by construction; writing the line
