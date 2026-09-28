@@ -4,6 +4,10 @@ use std::borrow::Cow;
 
 use aisix_core::redact_url_userinfo;
 
+/// Shortest trailing fragment of a secret [`ErrorRedactor::redact`] treats
+/// as that secret cut off by a cap.
+const MIN_CUT_PREFIX: usize = 4;
+
 /// The configured values one sink must never surface in its error text, and
 /// what each is rendered as instead.
 ///
@@ -17,10 +21,6 @@ use aisix_core::redact_url_userinfo;
 ///
 /// Matching is exact, on the configured value: text the receiver wrote is
 /// otherwise kept as-is.
-/// Shortest trailing fragment of a secret [`ErrorRedactor::redact`] treats
-/// as that secret cut off by a cap.
-const MIN_CUT_PREFIX: usize = 4;
-
 #[derive(Debug, Clone, Default)]
 pub struct ErrorRedactor {
     /// `(needle, replacement)`, longest needle first so a secret that
