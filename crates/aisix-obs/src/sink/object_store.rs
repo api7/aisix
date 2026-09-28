@@ -32,8 +32,8 @@ use aisix_core::models::observability_exporter::{
 };
 
 use super::{
-    BatchUnit, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope,
-    SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkResult,
+    BatchUnit, ErrorRedactor, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink,
+    OrderingScope, SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkResult,
 };
 
 /// Cap on a masked error-detail string surfaced to logs / health.
@@ -49,6 +49,7 @@ pub struct ObjectStoreSink {
     /// Key prefix the partition path is appended to.
     prefix: String,
     compression: ObjectStoreCompression,
+    redactor: ErrorRedactor,
 }
 
 impl ObjectStoreSink {
@@ -66,7 +67,15 @@ impl ObjectStoreSink {
             store,
             prefix: prefix.into(),
             compression,
+            redactor: ErrorRedactor::default(),
         }
+    }
+
+    /// Declare the endpoint and credentials the backend was built with, so
+    /// the pipeline keeps them out of this sink's delivery errors.
+    pub fn with_error_redactor(mut self, redactor: ErrorRedactor) -> Self {
+        self.redactor = redactor;
+        self
     }
 
     /// Serialize a batch to (optionally gzipped) NDJSON bytes — the object
@@ -165,11 +174,15 @@ impl ObservabilitySink for ObjectStoreSink {
         // via `SinkStats::last_error` (mirrors the other sinks).
         SinkHealth::healthy()
     }
+
+    fn error_redactor(&self) -> ErrorRedactor {
+        self.redactor.clone()
+    }
 }
 
 /// Provider-resolved cloud credentials. The plaintext key never lives in the
 /// exporter config / kine path — it is resolved DP-side from a
-/// `credential_ref` (see [`resolve_object_store_credential`]).
+/// `credential_ref` (see [`resolve_object_store_credential_with`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectStoreCredentials {
     S3 {
@@ -474,9 +487,23 @@ pub fn build_object_store_sink(
     name: String,
     cfg: &ObjectStoreConfig,
 ) -> Arc<dyn ObservabilitySink> {
+    build_object_store_sink_with(name, cfg, |k| std::env::var(k).ok())
+}
+
+/// [`build_object_store_sink`], parameterized over the credential source.
+fn build_object_store_sink_with(
+    name: String,
+    cfg: &ObjectStoreConfig,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Arc<dyn ObservabilitySink> {
+    let mut redactor = ErrorRedactor::default();
+    if let Some(endpoint) = &cfg.endpoint {
+        redactor = redactor.url(endpoint);
+    }
     let store = match cfg.auth_mode {
         ObjectStoreAuthMode::CredentialRef => {
-            let Some(creds) = resolve_object_store_credential(cfg.provider, &cfg.credential_ref)
+            let Some(creds) =
+                resolve_object_store_credential_with(cfg.provider, &cfg.credential_ref, lookup)
             else {
                 return Arc::new(BrokenSink::new(
                     name,
@@ -484,7 +511,21 @@ pub fn build_object_store_sink(
                         "object_store: no credentials resolved for credential_ref {:?}",
                         cfg.credential_ref
                     ),
+                    redactor,
                 ));
+            };
+            redactor = match &creds {
+                ObjectStoreCredentials::S3 {
+                    secret_access_key,
+                    session_token,
+                    ..
+                } => redactor
+                    .secret(secret_access_key)
+                    .secret(session_token.as_deref().unwrap_or_default()),
+                ObjectStoreCredentials::Gcs {
+                    service_account_key,
+                } => redactor.secret(service_account_key),
+                ObjectStoreCredentials::Azure { access_key, .. } => redactor.secret(access_key),
             };
             build_object_store(
                 cfg.provider,
@@ -502,13 +543,11 @@ pub fn build_object_store_sink(
         ),
     };
     match store {
-        Ok(store) => Arc::new(ObjectStoreSink::new(
-            name,
-            store,
-            cfg.prefix.clone(),
-            cfg.compression,
-        )),
-        Err(e) => Arc::new(BrokenSink::new(name, e.to_string())),
+        Ok(store) => Arc::new(
+            ObjectStoreSink::new(name, store, cfg.prefix.clone(), cfg.compression)
+                .with_error_redactor(redactor),
+        ),
+        Err(e) => Arc::new(BrokenSink::new(name, e.to_string(), redactor)),
     }
 }
 
@@ -519,13 +558,15 @@ pub fn build_object_store_sink(
 struct BrokenSink {
     name: String,
     reason: String,
+    redactor: ErrorRedactor,
 }
 
 impl BrokenSink {
-    fn new(name: impl Into<String>, reason: impl Into<String>) -> Self {
+    fn new(name: impl Into<String>, reason: impl Into<String>, redactor: ErrorRedactor) -> Self {
         Self {
             name: name.into(),
             reason: reason.into(),
+            redactor,
         }
     }
 }
@@ -552,7 +593,11 @@ impl ObservabilitySink for BrokenSink {
     }
 
     async fn healthcheck(&self) -> SinkHealth {
-        SinkHealth::unhealthy(self.reason.clone())
+        SinkHealth::unhealthy(self.redactor.redact(&self.reason))
+    }
+
+    fn error_redactor(&self) -> ErrorRedactor {
+        self.redactor.clone()
     }
 }
 
@@ -565,15 +610,9 @@ impl ObservabilitySink for BrokenSink {
 /// not `AISIX_`, which the config loader owns). Returns `None` when a required
 /// field is unset/blank — the caller surfaces a delivery-health auth error
 /// rather than building a half-credentialed client.
-pub fn resolve_object_store_credential(
-    provider: ObjectStoreProvider,
-    credential_ref: &str,
-) -> Option<ObjectStoreCredentials> {
-    resolve_object_store_credential_with(provider, credential_ref, |k| std::env::var(k).ok())
-}
-
-/// Resolution core, parameterized over the variable source so it is testable
-/// without mutating the process environment.
+///
+/// Parameterized over the variable source so it is testable without
+/// mutating the process environment.
 fn resolve_object_store_credential_with(
     provider: ObjectStoreProvider,
     credential_ref: &str,
@@ -1294,6 +1333,64 @@ mod tests {
         }
     }
 
+    /// object_store renders the request URI — configured userinfo included —
+    /// into every error, and a receiver may echo the signing key back. The
+    /// delivery error the pipeline records must carry neither, for a store
+    /// built the way production builds it.
+    #[tokio::test]
+    async fn delivery_errors_carry_no_configured_credential() {
+        let server = receiver_answering(
+            403,
+            "<Error><Code>SignatureDoesNotMatch</Code>\
+             <Message>key objstore-secret-key</Message></Error>"
+                .to_string(),
+        )
+        .await;
+        let cfg = ObjectStoreConfig {
+            provider: ObjectStoreProvider::S3,
+            bucket: "b".into(),
+            prefix: "p".into(),
+            region: None,
+            endpoint: Some(server.uri().replace("http://", "http://obj-user:obj-pass@")),
+            compression: ObjectStoreCompression::None,
+            auth_mode: ObjectStoreAuthMode::CredentialRef,
+            credential_ref: "acme".into(),
+        };
+        let sink = build_object_store_sink_with("obj-redact".into(), &cfg, |key| match key {
+            "OBJSTORE_CRED_ACME_AWS_ACCESS_KEY_ID" => Some("akid".into()),
+            "OBJSTORE_CRED_ACME_AWS_SECRET_ACCESS_KEY" => Some("objstore-secret-key".into()),
+            _ => None,
+        });
+        let (handle, worker) = crate::sink::SinkPipeline::new(
+            sink,
+            crate::sink::PipelineConfig {
+                flush_interval: std::time::Duration::from_millis(20),
+                ..Default::default()
+            },
+        );
+        let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(worker.run(cancel));
+        assert!(handle.try_enqueue(Arc::new(SinkRecord::metadata_only(event("r1")))));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let last = loop {
+            if let Some(e) = handle.stats().last_error {
+                break e;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no delivery error");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        cancel_tx.send(true).unwrap();
+        run.await.unwrap();
+
+        assert!(
+            last.contains("http://***@127.0.0.1") && last.contains("SignatureDoesNotMatch"),
+            "the cause stays diagnosable: {last}"
+        );
+        for secret in ["obj-user", "obj-pass", "objstore-secret-key"] {
+            assert!(!last.contains(secret), "{secret} leaked into: {last}");
+        }
+    }
+
     #[tokio::test]
     async fn rejected_put_drops_the_batch_on_its_first_attempt() {
         let server = rejecting_receiver(400).await;
@@ -1386,6 +1483,7 @@ mod tests {
         let s = BrokenSink::new(
             "obj-broken",
             "object_store: no credentials resolved for credential_ref \"acme\"",
+            ErrorRedactor::default(),
         );
         match s
             .append_batch(
