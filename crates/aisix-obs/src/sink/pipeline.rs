@@ -21,7 +21,9 @@ use tokio::sync::{mpsc, watch};
 // a paused-clock test drives the whole ladder rather than only its sleeps.
 use tokio::time::Instant;
 
-use super::{EventBatch, IdempotencyMarker, ObservabilitySink, SinkError, SinkRecord};
+use super::{
+    ErrorRedactor, EventBatch, IdempotencyMarker, ObservabilitySink, SinkError, SinkRecord,
+};
 use crate::metrics::Metrics;
 
 /// Tuning for a [`SinkPipeline`]. Defaults mirror the telemetry worker
@@ -234,6 +236,7 @@ pub struct SinkPipeline {
     rx: mpsc::Receiver<Arc<SinkRecord>>,
     stats: Arc<SinkStats>,
     metrics: Option<Metrics>,
+    redactor: ErrorRedactor,
 }
 
 impl SinkPipeline {
@@ -262,12 +265,14 @@ impl SinkPipeline {
             stats: Arc::clone(&stats),
             metrics: metrics.clone(),
         };
+        let redactor = sink.error_redactor();
         let worker = SinkPipeline {
             sink,
             cfg,
             rx,
             stats,
             metrics,
+            redactor,
         };
         (handle, worker)
     }
@@ -416,7 +421,7 @@ impl SinkPipeline {
                     return;
                 }
                 Err(err) => {
-                    let detail = masked(&err);
+                    let detail = masked(&err, &self.redactor);
                     // One count per failed EXPORT ATTEMPT, so a sink that
                     // only ever succeeds on its third try is visible even
                     // though it never drops a record.
@@ -566,14 +571,20 @@ fn backoff(base: Duration, cap: Duration, attempt: u32) -> Duration {
     base.checked_mul(factor).unwrap_or(cap).min(cap)
 }
 
-/// Trim a sink error to a bounded, log-safe excerpt. The sink is responsible
-/// for not embedding secrets in its error text; this only caps length so a
-/// verbose upstream body can't flood the logs. Wide enough that a sink's
-/// own 500-char detail (object URL + error source chain) survives with the
-/// enum prefix — this cap is the last one before the log line / `last_error`,
-/// so trimming tighter than the sinks re-hides the cause they now carry.
-fn masked(err: &SinkError) -> String {
-    err.to_string().chars().take(600).collect()
+/// Redact a sink error and trim it to a bounded, log-safe excerpt. This is
+/// the one place a delivery error becomes text, and every surface — the warn
+/// log, `last_error`, the heartbeat — reads the result, so the sink's
+/// configured URL userinfo and secrets are scrubbed here. Redaction runs
+/// before the cap so a secret straddling it cannot leave a prefix behind.
+/// The cap is wide enough that a sink's own 500-char detail (object URL +
+/// error source chain) survives with the enum prefix; trimming tighter than
+/// the sinks re-hides the cause they carry.
+fn masked(err: &SinkError, redactor: &ErrorRedactor) -> String {
+    redactor
+        .redact(&err.to_string())
+        .chars()
+        .take(600)
+        .collect()
 }
 
 #[cfg(test)]

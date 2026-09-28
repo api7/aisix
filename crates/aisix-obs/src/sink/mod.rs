@@ -18,6 +18,7 @@ mod manager;
 mod object_store;
 mod pipeline;
 mod record;
+mod redact;
 mod sls;
 mod truncate;
 
@@ -29,6 +30,7 @@ pub use manager::ExporterPipelines;
 pub use object_store::{build_object_store_sink, ObjectStoreSink};
 pub use pipeline::{PipelineConfig, SinkHandle, SinkPipeline, SinkStatsSnapshot};
 pub use record::{CapturedContent, EventBatch, SinkContent, SinkRecord, SCHEMA_VERSION};
+pub use redact::ErrorRedactor;
 pub use sls::{resolve_sls_credential, AliyunSlsSink};
 
 use std::time::Duration;
@@ -228,6 +230,13 @@ pub trait ObservabilitySink: Send + Sync + 'static {
     /// Cheap liveness/connectivity probe for the circuit-breaker and the
     /// control-plane "test connection" affordance.
     async fn healthcheck(&self) -> SinkHealth;
+
+    /// The configured URLs and secrets the pipeline scrubs from this sink's
+    /// delivery errors before logging or reporting them. A sink configured
+    /// with a URL or a credential must declare it here.
+    fn error_redactor(&self) -> ErrorRedactor {
+        ErrorRedactor::default()
+    }
 }
 
 #[cfg(test)]
