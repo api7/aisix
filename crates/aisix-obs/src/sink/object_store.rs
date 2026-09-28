@@ -661,13 +661,25 @@ fn map_object_store_err(e: object_store::Error) -> SinkError {
         | E::InvalidPath { .. }
         | E::UnknownConfigurationKey { .. } => SinkError::Permanent(detail),
         _ => match response_status(&chain) {
-            Some(status) if status.is_client_error() && !super::is_retryable_status(status) => {
+            Some(status)
+                if status.is_client_error()
+                    && !super::is_retryable_status(status)
+                    && !TRANSIENT_4XX_CODES.iter().any(|code| chain.contains(code)) =>
+            {
                 SinkError::Permanent(detail)
             }
             _ => SinkError::Transient(detail),
         },
     }
 }
+
+/// S3 error codes that arrive on a 4xx but clear on retry: the store timed
+/// out reading a slow upload (400), or a conflicting operation on the bucket
+/// was still in progress (409).
+const TRANSIENT_4XX_CODES: &[&str] = &[
+    "<Code>RequestTimeout</Code>",
+    "<Code>OperationAborted</Code>",
+];
 
 /// How object_store renders a non-2xx response in its error chain.
 const RESPONSE_STATUS_MARKER: &str = "Server returned non-2xx status code: ";
@@ -1192,16 +1204,45 @@ mod tests {
     /// A receiver that answers every PUT with `status` and the error body a
     /// GCS-compatible server sends for an upload it does not implement.
     async fn rejecting_receiver(status: u16) -> wiremock::MockServer {
+        receiver_answering(
+            status,
+            format!(r#"{{"error":{{"code":{status},"message":"invalid uploadType"}}}}"#),
+        )
+        .await
+    }
+
+    async fn receiver_answering(status: u16, body: String) -> wiremock::MockServer {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(status).set_body_string(format!(
-                    r#"{{"error":{{"code":{status},"message":"invalid uploadType"}}}}"#
-                )),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(status).set_body_string(body))
             .mount(&server)
             .await;
         server
+    }
+
+    #[tokio::test]
+    async fn s3_4xx_codes_that_clear_on_retry_stay_transient() {
+        for (status, code) in [(400u16, "RequestTimeout"), (409, "OperationAborted")] {
+            let server = receiver_answering(
+                status,
+                format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code><Message>try again</Message></Error>"),
+            )
+            .await;
+            let sink = ObjectStoreSink::new(
+                "obj-s3-retryable-4xx",
+                store_at(ObjectStoreProvider::S3, &server.uri()),
+                "rc",
+                ObjectStoreCompression::None,
+            );
+            let err = sink
+                .append_batch(
+                    &batch_of(vec![SinkRecord::metadata_only(event("r1"))]),
+                    &IdempotencyMarker::None,
+                )
+                .await
+                .expect_err("the receiver rejects the PUT");
+            assert!(err.is_transient(), "{status} {code} must be retried: {err}");
+        }
     }
 
     fn store_at(provider: ObjectStoreProvider, endpoint: &str) -> Arc<dyn ObjectStore> {
