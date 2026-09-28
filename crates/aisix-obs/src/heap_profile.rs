@@ -93,8 +93,12 @@ fn dump_locked(scratch_dir: &Path) -> Result<Vec<u8>, DumpError> {
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|e| DumpError::Failed(e.to_string()))?;
     // SAFETY: `prof.dump` takes a NUL-terminated path that outlives the call.
-    unsafe { tikv_jemalloc_ctl::raw::write(b"prof.dump\0", c_path.as_ptr()) }
-        .map_err(|e| DumpError::Failed(format!("prof.dump to {}: {e}", path.display())))?;
+    unsafe { tikv_jemalloc_ctl::raw::write(b"prof.dump\0", c_path.as_ptr()) }.map_err(|e| {
+        // A failed dump can still leave a partial file in what may be the
+        // persistent dump volume.
+        let _ = std::fs::remove_file(&path);
+        DumpError::Failed(format!("prof.dump to {}: {e}", path.display()))
+    })?;
     let file = std::fs::File::open(&path);
     let _ = std::fs::remove_file(&path);
     let file = file.map_err(|e| DumpError::Failed(e.to_string()))?;
