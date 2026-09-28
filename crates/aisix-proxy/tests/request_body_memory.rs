@@ -15,7 +15,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +28,7 @@ use aisix_provider_openai::OpenAiBridge;
 use aisix_proxy::{build_router, ProxyState};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::response::IntoResponse;
 use axum::Router;
 use futures::StreamExt;
 use tokio::sync::{mpsc, watch};
@@ -93,26 +94,49 @@ struct HeldUpstream {
     base: String,
     received: mpsc::UnboundedReceiver<usize>,
     hold: watch::Sender<bool>,
+    /// How many of the next calls are answered at once, without being
+    /// held or reported — the calls a request makes before the one being
+    /// measured.
+    pass: Arc<AtomicUsize>,
 }
 
 fn start_upstream() -> HeldUpstream {
     let (tx, received) = mpsc::unbounded_channel();
     let (hold, held) = watch::channel(true);
+    let pass = Arc::new(AtomicUsize::new(0));
     let app = Router::new().fallback({
+        let pass = pass.clone();
         move |req: Request<Body>| {
             let tx = tx.clone();
             let mut held = held.clone();
+            let pass = pass.clone();
             async move {
                 let path = req.uri().path().to_string();
+                let sse = req
+                    .headers()
+                    .get("accept")
+                    .is_some_and(|v| v.as_bytes() == b"text/event-stream");
                 let mut body = req.into_body().into_data_stream();
                 let mut n = 0usize;
                 while let Some(chunk) = body.next().await {
                     n += chunk.expect("upstream body chunk").len();
                 }
                 drop(body);
-                let _ = tx.send(n);
-                let _ = held.wait_for(|holding| !*holding).await;
-                axum::Json(upstream_response(&path))
+                let passed = pass
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |p| p.checked_sub(1))
+                    .is_ok();
+                if !passed {
+                    let _ = tx.send(n);
+                    let _ = held.wait_for(|holding| !*holding).await;
+                }
+                if sse {
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(SSE_CHAT_RESPONSE))
+                        .unwrap()
+                } else {
+                    axum::Json(upstream_response(&path)).into_response()
+                }
             }
         }
     });
@@ -134,8 +158,18 @@ fn start_upstream() -> HeldUpstream {
         base: format!("http://{addr}"),
         received,
         hold,
+        pass,
     }
 }
+
+const SSE_CHAT_RESPONSE: &str = concat!(
+    "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",",
+    "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",",
+    "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],",
+    "\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
+    "data: [DONE]\n\n",
+);
 
 fn upstream_response(path: &str) -> serde_json::Value {
     if path.ends_with("/messages") {
@@ -309,6 +343,21 @@ fn chat_text_blocks_body((blocks, block_bytes): (usize, usize)) -> String {
         .to_string()
 }
 
+/// A streaming request to the ensemble: the panel answers buffered, then
+/// the judge streams. Text content, since the judge's prompt renders the
+/// caller's messages as text.
+fn streaming_ensemble_body((blocks, block_bytes): (usize, usize)) -> String {
+    let content: Vec<_> = (0..blocks)
+        .map(|i| serde_json::json!({"type": "text", "text": base64_blob(block_bytes, i)}))
+        .collect();
+    serde_json::json!({
+        "model": "panel",
+        "stream": true,
+        "messages": [{"role": "user", "content": content}]
+    })
+    .to_string()
+}
+
 fn effort_mapped_chat_body(size: (usize, usize)) -> String {
     chat_body_for("effort", size)
 }
@@ -426,10 +475,11 @@ async fn held_while_pending(
     app: &Router,
     upstream: &mut HeldUpstream,
     path: &str,
-    requests: usize,
+    (passed, requests): (usize, usize),
     make_body: impl FnOnce() -> String,
 ) -> (isize, usize) {
     upstream.hold.send_replace(true);
+    upstream.pass.store(passed, Ordering::SeqCst);
     let before = live();
     let body = make_body();
     let body_len = body.len();
@@ -470,12 +520,12 @@ async fn held_while_pending(
 /// the small one's, over the difference in their lengths.
 async fn in_flight_multiplier(app: &Router, upstream: &mut HeldUpstream, family: &Family) -> f64 {
     let (small_held, small_len) =
-        held_while_pending(app, upstream, family.path, family.requests, || {
+        held_while_pending(app, upstream, family.path, family.calls(), || {
             (family.body)(SMALL)
         })
         .await;
     let (large_held, large_len) =
-        held_while_pending(app, upstream, family.path, family.requests, || {
+        held_while_pending(app, upstream, family.path, family.calls(), || {
             (family.body)(LARGE)
         })
         .await;
@@ -489,6 +539,9 @@ struct Family {
     /// Upstream calls the request makes at once — each carries its own
     /// wire copy of the body, so the bound grows by one per call.
     requests: usize,
+    /// Calls answered before the measured ones are made (an ensemble's
+    /// panel, when the judge is measured).
+    passed: usize,
 }
 
 impl Family {
@@ -498,7 +551,12 @@ impl Family {
             path,
             body,
             requests: 1,
+            passed: 0,
         }
+    }
+
+    fn calls(&self) -> (usize, usize) {
+        (self.passed, self.requests)
     }
 
     /// The parsed request the handler keeps, plus one wire body per
@@ -539,6 +597,16 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
             requests: 2,
             ..Family::new("ensemble panel", "/v1/chat/completions", ensemble_body)
         },
+        // The streamed judge, once the two panel members have answered: its
+        // prompt renders the caller's text, so its wire body is a copy.
+        Family {
+            passed: 2,
+            ..Family::new(
+                "ensemble judge (streaming)",
+                "/v1/chat/completions",
+                streaming_ensemble_body,
+            )
+        },
         Family::new("embeddings", "/v1/embeddings", embeddings_body),
         // Relayed to an Anthropic upstream as-is: the route builds the
         // outbound body itself rather than through a provider bridge.
@@ -568,7 +636,7 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
     // registries, the pooled upstream connections) so they are not charged
     // to a measurement.
     for family in &families {
-        held_while_pending(&app, &mut upstream, family.path, family.requests, || {
+        held_while_pending(&app, &mut upstream, family.path, family.calls(), || {
             (family.body)(SMALL)
         })
         .await;

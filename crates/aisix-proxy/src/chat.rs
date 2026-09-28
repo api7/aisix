@@ -3879,7 +3879,7 @@ async fn dispatch_ensemble(
         // Phases 1-2 + judge-request construction. An exhausted panel bills
         // the survivors and returns 502 (same status mapping as the
         // non-streaming `InsufficientPanel` path).
-        let (panel, _candidates, mut judge_req) =
+        let (panel, candidates, judge_req) =
             match crate::ensemble::run_ensemble_panel(req, ensemble_cfg, &caller).await {
                 Ok(triple) => triple,
                 Err(crate::ensemble::EnsembleError::InsufficientPanel { panel, .. }) => {
@@ -3900,11 +3900,10 @@ async fn dispatch_ensemble(
                 }
             };
 
-        // Stream the judge's synthesized answer. Flip the judge request to
-        // streaming (the executor built it non-streaming for the buffered
-        // path) and resolve its bridge exactly as `ProxyModelCaller::call`
-        // does for the non-streaming judge.
-        judge_req.stream = Some(true);
+        // The judge's prompt renders the caller's messages, so it is rebuilt
+        // where it is needed (`build_judge_req` below) rather than held
+        // through the judge's upstream wait.
+        drop(judge_req);
         // Resolve the judge model from the snapshot. Effectively unreachable
         // (the panel calls already resolved member names against the same
         // snapshot, and the judge is required config), but stay total: bill the
@@ -3919,7 +3918,18 @@ async fn dispatch_ensemble(
             ));
         };
         let judge_model = &judge_entry.value;
-        let judge_req = crate::effort_mapping::chat_request(&judge_req, judge_model);
+        // Stream the judge's synthesized answer: the request the executor
+        // builds, flipped to streaming (it is built non-streaming for the
+        // buffered path), with the judge's effort mapping applied.
+        let build_judge_req = || {
+            let mut judge_req =
+                crate::ensemble::judge_request(req, &ensemble_cfg.judge, &candidates);
+            judge_req.stream = Some(true);
+            match crate::effort_mapping::chat_request(&judge_req, judge_model) {
+                std::borrow::Cow::Owned(mapped) => mapped,
+                std::borrow::Cow::Borrowed(_) => judge_req,
+            }
+        };
         let judge_pk = match crate::dispatch::resolve_provider_key(snapshot, judge_model) {
             Ok(pk) => pk,
             Err(e) => {
@@ -3997,7 +4007,7 @@ async fn dispatch_ensemble(
         // additionally covers the whole panel that ran before it.
         let judge_started = Instant::now();
         let judge_stream = match judge_bridge
-            .chat_stream(judge_req.as_ref(), &judge_ctx)
+            .chat_stream_cow(std::borrow::Cow::Owned(build_judge_req()), &judge_ctx)
             .await
         {
             Ok(s) => s,
@@ -4124,7 +4134,7 @@ async fn dispatch_ensemble(
         // their usage separately).
         let judge_estimator = crate::token_estimate::Estimator::new(
             judge_model.upstream_model().unwrap_or("unknown"),
-            crate::token_estimate::PromptInput::Chat(Box::new(judge_req.into_owned())),
+            crate::token_estimate::PromptInput::Chat(Box::new(build_judge_req())),
         );
         let sse_stream = build_sse_stream(
             judge_stream,

@@ -429,7 +429,11 @@ fn panel_request(req: &ChatFormat, member: &PanelMember) -> ChatFormat {
 }
 
 /// Build the judge's request from the labeled candidate answers.
-fn judge_request(req: &ChatFormat, judge: &Judge, candidates: &[ChatResponse]) -> ChatFormat {
+pub(crate) fn judge_request(
+    req: &ChatFormat,
+    judge: &Judge,
+    candidates: &[ChatResponse],
+) -> ChatFormat {
     let template = judge
         .synthesis_prompt
         .as_deref()
