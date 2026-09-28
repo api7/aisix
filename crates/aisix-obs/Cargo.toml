@@ -44,8 +44,26 @@ http.workspace = true
 aliyun-log-sdk-protobuf.workspace = true
 aliyun-log-sdk-sign.workspace = true
 lz4_flex.workspace = true
+# `/proc`-free page size, clock ticks and fd limit for the `process_*` gauges.
+rustix.workspace = true
+# Names automatic heap dumps after the host, so replicas can share a volume.
+hostname.workspace = true
+
+# Allocator statistics and heap profiles, on the targets that run jemalloc
+# (see `aisix-server`). `pprof_util` + `mappings` are the pieces of
+# `jemalloc_pprof` 0.8 that turn a jemalloc dump into symbolized pprof,
+# used directly because that crate can only dump through the system temp
+# directory, which a read-only root filesystem does not have.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats", "profiling", "use_std"] }
+pprof_util = { version = "0.8", features = ["symbolize"] }
+mappings = "0.7"
+# The symbolizer `pprof_util` resolves through; its cache is dropped after
+# each dump (see `heap_profile::dump_locked`).
+backtrace = "0.3"
 
 [dev-dependencies]
+tempfile.workspace = true
 wiremock.workspace = true
 futures.workspace = true
 # `test-util` plays the delivery retry ladder out on a paused clock: the

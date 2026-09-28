@@ -212,6 +212,20 @@ observability:
     # buckets:
     #   request_ttft: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300]
 
+  # Diagnostics listener serving GET /debug/pprof/heap (gzipped pprof).
+  # Unauthenticated; loopback by default. See config.example.yaml.
+  debug:
+    enabled: true
+    addr: "127.0.0.1:9091"
+  # Heap profiles written automatically as resident memory nears the
+  # memory limit. See config.example.yaml for the full annotation.
+  heap_profiling:
+    auto_dump:
+      enabled: true
+      thresholds: [0.8, 0.9]
+      dir: "/var/lib/aisix/heap"
+      keep: 5
+
 managed:
   enabled: true
   # CP URL, etcd endpoint, and cert bundle come from env vars — never

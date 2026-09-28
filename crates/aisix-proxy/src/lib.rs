@@ -74,6 +74,7 @@ mod realtime;
 mod redact;
 mod reject;
 mod render;
+mod request_body_account;
 mod request_id;
 mod request_metrics;
 mod rerank;
@@ -103,6 +104,8 @@ pub use error::{ErrorEnvelope, ProxyError};
 pub use health::{
     HealthTracker, LivezState, ModelRuntimeStatusTracker, RuntimeStatus, RuntimeStatusSnapshot,
 };
+pub use held_content::holdback_bytes;
+pub use request_body_account::in_flight_request_bodies;
 pub use state::{CacheBackends, ProxyState, SemanticRedisCell};
 
 use aisix_obs::{AccessLog, CancelledLabels};
@@ -1174,7 +1177,9 @@ async fn enforce_request_body_limit(
             );
         }
     }
-    next.run(request).await
+    let (parts, body) = request.into_parts();
+    let (body, _account) = request_body_account::counted(body);
+    next.run(Request::from_parts(parts, body)).await
 }
 
 /// The id `ensure_request_id` (the outermost layer) minted for this

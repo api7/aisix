@@ -79,6 +79,12 @@ impl Default for MemoryCache {
 
 #[async_trait]
 impl Cache for MemoryCache {
+    /// moka's own count: O(1), and it trails inserts and expiries until
+    /// the cache runs its pending maintenance.
+    fn local_entry_count(&self) -> Option<u64> {
+        Some(self.inner.entry_count())
+    }
+
     async fn get(&self, key: &str) -> Result<Option<ChatResponse>, CacheError> {
         Ok(self.inner.get(key).await.map(|e| e.response))
     }

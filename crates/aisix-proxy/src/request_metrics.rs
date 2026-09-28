@@ -491,7 +491,11 @@ pub(crate) fn record_e2e_downstream(
     elapsed: Duration,
 ) {
     metrics.record_request_e2e_latency(labels, LatencySide::Downstream, elapsed);
-    crate::attribution::note_e2e_downstream(metrics.clone(), OwnedLatencyLabels::from(labels));
+    crate::attribution::note_e2e_downstream(
+        metrics.clone(),
+        OwnedLatencyLabels::from(labels),
+        elapsed,
+    );
 }
 
 /// A finished stream's request and attempt durations, both read at one

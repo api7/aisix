@@ -18,6 +18,8 @@
 //! [`RAW_HOLD_FACTOR`] times the same cap, through [`HeldBuffer`]. Crossing
 //! either bound is the same buffer-exceeded event.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use aisix_gateway::ChatDelta;
 use serde_json::Value;
 
@@ -47,6 +49,50 @@ impl HeldBuffer {
     pub(crate) fn exceeds(&self, max_buffer_bytes: usize) -> bool {
         self.content > max_buffer_bytes
             || self.raw > max_buffer_bytes.saturating_mul(RAW_HOLD_FACTOR)
+    }
+}
+
+/// Raw bytes held back right now, across every stream in the process.
+static HOLDBACK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Bytes currently held back by streamed output guardrails, process-wide.
+pub fn holdback_bytes() -> usize {
+    HOLDBACK_BYTES.load(Ordering::Relaxed)
+}
+
+/// One hold-back buffer's share of [`holdback_bytes`].
+///
+/// Owned next to the buffer it describes and dropped with it, so a stream
+/// that ends without releasing — a client that went away, a block, an
+/// error — gives its share back without a release path having to.
+#[derive(Debug, Default)]
+pub(crate) struct HeldBytes(usize);
+
+impl HeldBytes {
+    pub(crate) fn add(&mut self, n: usize) {
+        self.0 += n;
+        HOLDBACK_BYTES.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// The buffer now holds exactly `n` bytes — after a partial release,
+    /// or a rewrite in place that changed its length.
+    pub(crate) fn set(&mut self, n: usize) {
+        if n >= self.0 {
+            HOLDBACK_BYTES.fetch_add(n - self.0, Ordering::Relaxed);
+        } else {
+            HOLDBACK_BYTES.fetch_sub(self.0 - n, Ordering::Relaxed);
+        }
+        self.0 = n;
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.set(0);
+    }
+}
+
+impl Drop for HeldBytes {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 

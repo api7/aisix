@@ -33,10 +33,11 @@ pub mod version;
 pub mod wildcard;
 
 pub use config::{
-    AdminConfig, CacheBackend, CacheConfig, ClientTypeRule, Config, EtcdConfig, EtcdTlsConfig,
-    HistogramBucketsConfig, ManagedConfig, ObservabilityConfig, ProxyConfig, ProxyListener,
-    RateLimitBackend, RateLimitConfig, RealIpConfig, RedisConnConfig, RedisMode, RequestIdConfig,
-    TlsConfig, UrlRewriteRule, CREDENTIAL_HEADERS,
+    AdminConfig, AutoDumpConfig, CacheBackend, CacheConfig, ClientTypeRule, Config,
+    DebugListenerConfig, EtcdConfig, EtcdTlsConfig, HeapProfilingConfig, HistogramBucketsConfig,
+    ManagedConfig, ObservabilityConfig, ProxyConfig, ProxyListener, RateLimitBackend,
+    RateLimitConfig, RealIpConfig, RedisConnConfig, RedisMode, RequestIdConfig, TlsConfig,
+    UrlRewriteRule, CREDENTIAL_HEADERS,
 };
 pub use config_status::{
     hash_bytes, hash_entries, AppliedSnapshot, ConfigMetricsView, ConfigRejectionSnapshot,

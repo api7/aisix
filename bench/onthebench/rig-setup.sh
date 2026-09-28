@@ -7,18 +7,23 @@
 #
 # The load generator (otb) and the mock upstream are the PREBUILT, PINNED
 # instruments from the public onthebench benchmark rig release — the same
-# binaries every entrant on the public board is measured with, and the same
-# "otb loadgen" used for the api7/aisix#891 and #902 tables. The engine pin
-# behind the release tag is commit f3adbb1315b26129f5e317af5279decefb1cea8f
-# (tag engine-v1) of https://github.com/GetBusbar/benchmarking; the sha256s
-# below freeze the exact bytes so a re-provisioned rig either gets the
-# identical instrument or fails loudly.
+# binaries every entrant on the public board is measured with. That release
+# ("rig") is rolling: upstream's bench-rig workflow replaces its assets on
+# every mock/ or loadgen/ change. So both are fetched by release ASSET ID,
+# which names one upload and never another — a replacement gets a new id and
+# the old one 404s — and then checked against the sha256 of that upload. The
+# pinned assets were built from commit 2d209e76ba336c3478d3754e2bcd245b663459a3
+# of https://github.com/GetBusbar/benchmarking (2026-09-21); the #891 / #902
+# tables were measured with the earlier f3adbb13 build (tag engine-v1), so
+# numbers from before and after this pin are not directly comparable.
 set -euo pipefail
 
 TOOLS="$HOME/bench-tools"
-REL="https://github.com/GetBusbar/benchmarking/releases/download/rig"
-OTB_SHA256="913702e09392846f5eb82ca749e5fa2d86357e818c0bbb1d047913c1ded0f82e"
-MOCK_SHA256="c32b9ff470eddf87d477098dac6e19a6c75eeef6e594dfc57005310d69e9049d"
+ASSETS="https://api.github.com/repos/GetBusbar/benchmarking/releases/assets"
+OTB_ASSET=579682244
+OTB_SHA256="79a31656f5ececb82954d3dc1cc86c6fcbd3c1f46ee6fcac4a348114ca03e2a7"
+MOCK_ASSET=579682245
+MOCK_SHA256="97e76ce45fbccb87a7f123a538b107c5566331da3b260cdce918d8671f2e3d7b"
 
 echo "== apt packages (build deps + perf) =="
 sudo -n DEBIAN_FRONTEND=noninteractive apt-get update -q
@@ -72,16 +77,17 @@ inferno-flamegraph --version 2>/dev/null | grep -qF "$INFERNO_VERSION" ||
 echo "== pinned bench instruments (otb loadgen + mock upstream) =="
 mkdir -p "$TOOLS"
 fetch_pinned() {
-    local name="$1" sha="$2" path="$TOOLS/$1"
+    local name="$1" asset="$2" sha="$3" path="$TOOLS/$1"
     if [ ! -x "$path" ] || ! echo "$sha  $path" | sha256sum -c --quiet 2>/dev/null; then
-        curl -fsSL -o "$path" "$REL/${name}-arm64"
+        curl -fsSL -H 'Accept: application/octet-stream' -o "$path" "$ASSETS/$asset" ||
+            { echo "setup: $name asset $asset is gone upstream - re-pin (see the header)"; exit 1; }
         chmod +x "$path"
     fi
     echo "$sha  $path" | sha256sum -c --quiet ||
         { echo "setup: $name does not match its pinned sha256 - refusing a divergent instrument"; exit 1; }
 }
-fetch_pinned otb "$OTB_SHA256"
-fetch_pinned mock "$MOCK_SHA256"
+fetch_pinned otb "$OTB_ASSET" "$OTB_SHA256"
+fetch_pinned mock "$MOCK_ASSET" "$MOCK_SHA256"
 
 echo "== perf sampling permission (session-scoped, documented in README) =="
 sudo -n sysctl -q kernel.perf_event_paranoid=1

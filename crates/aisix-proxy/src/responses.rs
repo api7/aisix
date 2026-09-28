@@ -1433,6 +1433,8 @@ async fn responses_to_target(
             Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
         > = Box::pin(upstream_resp.bytes_stream());
         let mut buf: Vec<u8> = Vec::new();
+        // Held until this dispatch returns: the scan below still reads `buf`.
+        let mut buf_held = crate::held_content::HeldBytes::default();
         let mut upstream_ttft_ms = 0;
         // Set when the hold-back cap is exceeded under `on_buffer_exceeded:
         // fail_open`: what was held goes out unscanned, ahead of the rest of
@@ -1511,6 +1513,7 @@ async fn responses_to_target(
                     })
                     .map_err(ProxyError::Bridge)?;
                 buf.extend_from_slice(&chunk);
+                buf_held.set(buf.len());
                 if upstream_ttft_ms == 0 && has_complete_responses_sse_event(&buf) {
                     upstream_ttft_ms =
                         attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;

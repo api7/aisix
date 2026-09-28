@@ -211,6 +211,11 @@ pub fn reqwest_material() -> &'static ReqwestTlsMaterial {
 static PK_CLIENTS: OnceLock<dashmap::DashMap<UpstreamConnection, reqwest::Client>> =
     OnceLock::new();
 
+/// Clients built for Provider Key connection overrides so far.
+pub fn provider_key_client_count() -> u64 {
+    PK_CLIENTS.get().map_or(0, |clients| clients.len() as u64)
+}
+
 // ─── per-worker pools ────────────────────────────────────────────────
 
 thread_local! {

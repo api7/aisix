@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::Duration;
 
@@ -24,6 +25,14 @@ impl<S: Send + Sync> Retired for Option<Arc<S>> {
 
 type Snapshot = Box<dyn Retired>;
 
+/// Retired snapshots the reclaimer is still waiting on a reader to let go
+/// of. Each one holds a whole configuration's worth of memory.
+static PENDING: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn pending() -> usize {
+    PENDING.load(Ordering::Relaxed)
+}
+
 fn run(receiver: mpsc::Receiver<Snapshot>) {
     // Freeing a retired snapshot walks every table in it, and the 10 ms
     // poll below runs for as long as any reader still holds one — both
@@ -46,6 +55,7 @@ fn run(receiver: mpsc::Receiver<Snapshot>) {
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
         pending.retain_mut(|snapshot| !snapshot.reclaim());
+        PENDING.store(pending.len(), Ordering::Relaxed);
     }
 }
 

@@ -123,6 +123,20 @@ export interface AppOverrides {
    */
   clientTypeRules?: Array<{ pattern: string; client: string }>;
   /**
+   * `observability.debug` — the diagnostics listener. By default the
+   * harness binds it on its own picked loopback port, so parallel apps
+   * never contend for the binary's fixed default. `"binary-default"`
+   * writes no `debug` block at all, leaving the binary's own default
+   * (`127.0.0.1:9091`); only a spec whose subject is that default should
+   * ask for it.
+   */
+  debug?: { enabled?: boolean } | "binary-default";
+  /**
+   * `observability.heap_profiling` block, written as given. Omitted, the
+   * binary's defaults apply.
+   */
+  heapProfiling?: Record<string, unknown>;
+  /**
    * FILE MODE: contents of a standalone `resources.yaml`. When set, the
    * generated config carries `resources_file` (pointing at this content
    * written into the tmp dir) and NO `etcd` section — the gateway loads
@@ -195,6 +209,13 @@ export interface SpawnedApp {
    * there in that case).
    */
   metricsUrl: string;
+  /**
+   * Diagnostics listener URL (`GET /debug/pprof/heap`). Nothing listens
+   * there when `debug.enabled` is false.
+   */
+  debugUrl: string;
+  /** OS pid of the spawned binary. */
+  pid: number;
   /**
    * FILE MODE only: absolute path of the resources.yaml the gateway
    * loads. Rewrite it and `signal("SIGHUP")` to trigger a reload.
@@ -357,9 +378,11 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
         "and `proxyUrl` use the first one, and the harness has no TLS-trusting client",
     );
   }
-  const [proxyPort, adminPort, metricsPort, ...listenerPorts] = await pickFreePorts(
-    3 + (listenerSpecs?.length ?? 0),
+  const [proxyPort, adminPort, metricsPort, debugPort, ...listenerPorts] = await pickFreePorts(
+    4 + (listenerSpecs?.length ?? 0),
   );
+  const debugBinaryDefault = overrides.debug === "binary-default";
+  const debugAddr = debugBinaryDefault ? "127.0.0.1:9091" : `127.0.0.1:${debugPort}`;
   const adminKey = overrides.adminKey ?? `admin-${randomUUID()}`;
   const etcdPrefix = overrides.etcdPrefix ?? `/aisix-e2e-${randomUUID()}`;
 
@@ -422,6 +445,15 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
           ? { client_type_rules: overrides.clientTypeRules }
           : {}),
       },
+      ...(debugBinaryDefault
+        ? {}
+        : {
+            debug: {
+              enabled: (overrides.debug as { enabled?: boolean } | undefined)?.enabled ?? true,
+              addr: debugAddr,
+            },
+          }),
+      ...(overrides.heapProfiling ? { heap_profiling: overrides.heapProfiling } : {}),
     },
     cache: { backend: "memory" },
     // The gateway ships a 30s drain window so a load balancer can
@@ -568,6 +600,8 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     adminKey,
     etcdPrefix,
     metricsUrl,
+    debugUrl: `http://${debugAddr}`,
+    pid: child.pid!,
     resourcesPath,
     output() {
       return stderrBuf;

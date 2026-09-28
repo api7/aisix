@@ -23,6 +23,12 @@ use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// Retired configuration snapshots still held by an in-flight reader and
+/// so not yet freed.
+pub fn pending_reclaim() -> usize {
+    reclaim::pending()
+}
+
 /// Process-wide source of [`ResourceTable::generation`] stamps.
 ///
 /// One counter for every table of every snapshot, so a stamp is unique

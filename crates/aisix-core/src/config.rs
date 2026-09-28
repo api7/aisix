@@ -1162,6 +1162,77 @@ pub struct ObservabilityConfig {
     /// out with default values, and the boot warning has to fire only for
     /// the operator who actually carries it.
     pub tracing: Option<TracingConfig>,
+    /// The diagnostics listener serving `GET /debug/pprof/heap`.
+    pub debug: DebugListenerConfig,
+    /// Heap-profile dumps written without anyone asking for them.
+    pub heap_profiling: HeapProfilingConfig,
+}
+
+/// `observability.debug` — a listener for diagnostics that must never be
+/// reachable from outside the host by default: a heap profile names every
+/// function that holds memory. It is separate from the metrics listener,
+/// which is commonly exposed to a scraper on the pod network.
+///
+/// Bound in every deployment mode. A bind failure is logged and the
+/// gateway keeps serving: a diagnostics port another process already holds
+/// (two gateways sharing a host network) must not stop traffic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DebugListenerConfig {
+    pub enabled: bool,
+    pub addr: String,
+}
+
+impl DebugListenerConfig {
+    pub const DEFAULT_ADDR: &'static str = "127.0.0.1:9091";
+}
+
+impl Default for DebugListenerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            addr: Self::DEFAULT_ADDR.into(),
+        }
+    }
+}
+
+/// `observability.heap_profiling`. Heap sampling itself is always on in the
+/// shipped Linux build and is tuned through jemalloc's own
+/// `_RJEM_MALLOC_CONF` environment variable, not here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HeapProfilingConfig {
+    pub auto_dump: AutoDumpConfig,
+}
+
+/// `observability.heap_profiling.auto_dump` — write a heap profile to disk
+/// when resident memory crosses a fraction of the memory limit, so the
+/// evidence of a growth survives the OOM kill that usually follows it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AutoDumpConfig {
+    pub enabled: bool,
+    /// Fractions of the memory limit (the cgroup limit, or the host's
+    /// total memory when the process has none), each in `(0, 1]`. One dump
+    /// fires per threshold on each upward crossing.
+    pub thresholds: Vec<f64>,
+    /// Directory the dumps are written to, created if missing. When it
+    /// cannot be created or written, the feature logs one warning and turns
+    /// itself off.
+    pub dir: String,
+    /// How many dump files to keep; older ones are deleted.
+    pub keep: usize,
+}
+
+impl Default for AutoDumpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            thresholds: vec![0.8, 0.9],
+            dir: "/var/lib/aisix/heap".into(),
+            keep: 5,
+        }
+    }
 }
 
 impl ObservabilityConfig {
@@ -2267,6 +2338,35 @@ impl Config {
             return Err(BootstrapError::Config(format!(
                 "observability.metrics.prometheus.addr invalid socket address: {metrics_addr}"
             )));
+        }
+        let debug = &self.observability.debug;
+        if debug.enabled && debug.addr.parse::<std::net::SocketAddr>().is_err() {
+            return Err(BootstrapError::Config(format!(
+                "observability.debug.addr invalid socket address: {}",
+                debug.addr
+            )));
+        }
+        let auto_dump = &self.observability.heap_profiling.auto_dump;
+        if auto_dump.enabled {
+            if let Some(bad) = auto_dump
+                .thresholds
+                .iter()
+                .find(|t| !(**t > 0.0 && **t <= 1.0))
+            {
+                return Err(BootstrapError::Config(format!(
+                    "observability.heap_profiling.auto_dump.thresholds: {bad} is not in (0, 1]"
+                )));
+            }
+            if auto_dump.keep == 0 {
+                return Err(BootstrapError::Config(
+                    "observability.heap_profiling.auto_dump.keep must be at least 1".into(),
+                ));
+            }
+            if auto_dump.dir.is_empty() {
+                return Err(BootstrapError::Config(
+                    "observability.heap_profiling.auto_dump.dir must not be empty".into(),
+                ));
+            }
         }
         if self.ratelimit.backend == RateLimitBackend::Redis {
             match &self.ratelimit.redis {
@@ -4383,6 +4483,79 @@ observability:
             err.to_string().contains("prometheus.addr"),
             "error should name the bad field: {err}"
         );
+    }
+
+    #[test]
+    fn debug_listener_and_auto_dump_default_on() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(cfg.observability.debug.enabled);
+        assert_eq!(cfg.observability.debug.addr, "127.0.0.1:9091");
+        let auto = &cfg.observability.heap_profiling.auto_dump;
+        assert!(auto.enabled);
+        assert_eq!(auto.thresholds, vec![0.8, 0.9]);
+        assert_eq!(auto.dir, "/var/lib/aisix/heap");
+        assert_eq!(auto.keep, 5);
+    }
+
+    #[test]
+    fn rejects_heap_dump_thresholds_outside_the_unit_interval() {
+        for (bad, field) in [
+            ("thresholds: [0.8, 1.5]", "thresholds"),
+            ("thresholds: [0]", "thresholds"),
+            ("keep: 0", "keep"),
+        ] {
+            let f = write_yaml(&format!(
+                r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+observability:
+  heap_profiling:
+    auto_dump:
+      {bad}
+"#
+            ));
+            let err = Config::load_from_path(Some(f.path())).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("auto_dump.{field}")),
+                "{bad}: error should name the bad field: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_debug_addr() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+observability:
+  debug:
+    addr: "nowhere"
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(err.to_string().contains("debug.addr"), "{err}");
     }
 
     #[test]

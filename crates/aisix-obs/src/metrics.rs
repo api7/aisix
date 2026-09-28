@@ -555,6 +555,42 @@ pub const M_CONFIG_APPLY_BATCH_EVENTS: &str = "aisix_config_apply_batch_events";
 /// Log events discarded because the log sink was not draining fast
 /// enough. Above zero means the log is incomplete for that window.
 pub const M_LOG_LINES_DROPPED_TOTAL: &str = "aisix_log_lines_dropped_total";
+/// jemalloc's own byte counts, by `stat`: `allocated` (live objects),
+/// `active` (pages backing them), `resident` (allocator pages in RAM),
+/// `mapped`, `retained` (unmapped from RAM but kept reserved) and
+/// `metadata`. `resident` far above `allocated` is fragmentation or pages
+/// not yet purged; `allocated` climbing is the program holding more.
+pub const M_ALLOCATOR_BYTES: &str = "aisix_allocator_bytes";
+/// The cgroup memory limit the process runs under. Absent without one.
+pub const M_MEMORY_LIMIT_BYTES: &str = "aisix_memory_limit_bytes";
+/// Standard process-collector families, unprefixed so existing process
+/// dashboards and alerts work against the gateway unchanged.
+pub const M_PROCESS_RESIDENT_MEMORY_BYTES: &str = "process_resident_memory_bytes";
+pub const M_PROCESS_VIRTUAL_MEMORY_BYTES: &str = "process_virtual_memory_bytes";
+pub const M_PROCESS_THREADS: &str = "process_threads";
+pub const M_PROCESS_OPEN_FDS: &str = "process_open_fds";
+pub const M_PROCESS_MAX_FDS: &str = "process_max_fds";
+pub const M_PROCESS_CPU_SECONDS_TOTAL: &str = "process_cpu_seconds_total";
+pub const M_PROCESS_START_TIME_SECONDS: &str = "process_start_time_seconds";
+/// Tasks alive on one async runtime (`runtime` = `control`, or `tpc-N`
+/// for a thread-per-core proxy worker). Growing without traffic growing
+/// is tasks leaking.
+pub const M_RUNTIME_ALIVE_TASKS: &str = "aisix_runtime_alive_tasks";
+/// Tasks queued on one runtime's shared injection queue, not yet picked
+/// up by a worker.
+pub const M_RUNTIME_GLOBAL_QUEUE_DEPTH: &str = "aisix_runtime_global_queue_depth";
+/// Entries held by one in-process store, by `component`; the exporter
+/// queue additionally carries `exporter`.
+pub const M_COMPONENT_ENTRIES: &str = "aisix_component_entries";
+/// Bytes held by one in-process store, only where the store accounts
+/// them exactly. `guardrail_holdback` counts streamed responses held back
+/// for an output guardrail (chat, messages, responses, passthrough); a
+/// response read whole before it is relayed — any non-streaming response,
+/// and the buffered audio relay — is not counted there.
+pub const M_COMPONENT_BYTES: &str = "aisix_component_bytes";
+/// Heap profiles taken, by `trigger` (`auto` for a memory threshold,
+/// `manual` for `GET /debug/pprof/heap`) and `result` (`ok`, `error`).
+pub const M_HEAP_PROFILE_DUMPS_TOTAL: &str = "aisix_heap_profile_dumps_total";
 
 /// Default bucket edges for [`M_REQUEST_E2E_LATENCY_SECONDS`], spanning the
 /// full client-perceived range: a millisecond-scale rejection or cache hit
@@ -739,6 +775,11 @@ struct MetricsInner {
     /// Populated on the registration path only (a worker-cache miss), so
     /// the steady-state emit never touches this lock.
     retirable: Mutex<HashMap<Box<str>, RetirableSeries>>,
+    /// Runtimes and stores read at scrape time by [`Metrics::sync_memory`].
+    memory: crate::memory::MemoryProbes,
+    /// Exporter names reported on the previous scrape, so a removed
+    /// exporter's queue reads 0 instead of its last depth.
+    last_exporters: Mutex<Vec<String>>,
 }
 
 /// A gauge family whose label set can outlive what it describes.
@@ -1114,6 +1155,8 @@ impl Metrics {
                 },
                 config_labels: Mutex::new(ConfigLabelState::default()),
                 retirable: Mutex::new(HashMap::new()),
+                memory: crate::memory::MemoryProbes::new(),
+                last_exporters: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -1142,6 +1185,112 @@ impl Metrics {
         metrics::with_local_recorder(&self.inner.recorder, || {
             metrics::counter!(M_LOG_LINES_DROPPED_TOTAL)
                 .absolute(crate::log_writer::dropped_total());
+        });
+    }
+
+    /// Where in-process stores register to be reported by
+    /// [`Self::sync_memory`].
+    pub fn memory_probes(&self) -> &crate::memory::MemoryProbes {
+        &self.inner.memory
+    }
+
+    /// Count one heap profile taken.
+    pub fn record_heap_profile_dump(&self, trigger: &'static str, ok: bool) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::counter!(
+                M_HEAP_PROFILE_DUMPS_TOTAL,
+                "trigger" => trigger,
+                "result" => if ok { "ok" } else { "error" },
+            )
+            .increment(1);
+        });
+    }
+
+    /// Reflect memory readings into the recorder: allocator, process,
+    /// memory limit, runtimes, and every registered store. Called at scrape
+    /// time, off the async runtime — it reads files under `/proc`.
+    ///
+    /// Queue depths per exporter are the only readings whose label set
+    /// churns; a removed exporter's series is set to 0, the true depth of a
+    /// queue that no longer exists.
+    pub fn sync_memory(&self) {
+        let exporter_queues = self.inner.memory.read_exporter_queues();
+        let allocator = crate::memory::allocator_stats();
+        let process = crate::memory::process_stats();
+        let limit = crate::memory::memory_limit_bytes();
+        let components = self.inner.memory.read_components();
+        let series = self.inner.handle.series_count() as f64;
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            if let Some(stats) = allocator {
+                for (stat, bytes) in stats {
+                    metrics::gauge!(M_ALLOCATOR_BYTES, "stat" => stat).set(bytes as f64);
+                }
+                if crate::heap_profile::profiling_enabled() {
+                    for trigger in ["auto", "manual"] {
+                        for result in ["ok", "error"] {
+                            metrics::counter!(
+                                M_HEAP_PROFILE_DUMPS_TOTAL,
+                                "trigger" => trigger,
+                                "result" => result,
+                            )
+                            .increment(0);
+                        }
+                    }
+                }
+            }
+            if let Some(p) = process {
+                metrics::gauge!(M_PROCESS_RESIDENT_MEMORY_BYTES).set(p.resident_bytes as f64);
+                metrics::gauge!(M_PROCESS_VIRTUAL_MEMORY_BYTES).set(p.virtual_bytes as f64);
+                metrics::gauge!(M_PROCESS_THREADS).set(p.threads as f64);
+                metrics::gauge!(M_PROCESS_OPEN_FDS).set(p.open_fds as f64);
+                metrics::gauge!(M_PROCESS_MAX_FDS).set(p.max_fds as f64);
+                metrics::gauge!(M_PROCESS_CPU_SECONDS_TOTAL).set(p.cpu_seconds);
+                metrics::gauge!(M_PROCESS_START_TIME_SECONDS).set(p.start_time_seconds);
+            }
+            if let Some(limit) = limit {
+                metrics::gauge!(M_MEMORY_LIMIT_BYTES).set(limit as f64);
+            }
+            crate::memory::for_each_runtime(|name, handle| {
+                let m = handle.metrics();
+                metrics::gauge!(M_RUNTIME_ALIVE_TASKS, "runtime" => name.to_owned())
+                    .set(m.num_alive_tasks() as f64);
+                metrics::gauge!(M_RUNTIME_GLOBAL_QUEUE_DEPTH, "runtime" => name.to_owned())
+                    .set(m.global_queue_depth() as f64);
+            });
+            let component = |name: &'static str, entries: Option<u64>, bytes: Option<u64>| {
+                if let Some(entries) = entries {
+                    metrics::gauge!(M_COMPONENT_ENTRIES, "component" => name, "exporter" => "")
+                        .set(entries as f64);
+                }
+                if let Some(bytes) = bytes {
+                    metrics::gauge!(M_COMPONENT_BYTES, "component" => name).set(bytes as f64);
+                }
+            };
+            for (name, reading) in &components {
+                component(name, reading.entries, reading.bytes);
+            }
+            component("metric_series", Some(series as u64), None);
+            let mut last = self.inner.last_exporters.lock().expect("exporter labels");
+            for gone in last
+                .iter()
+                .filter(|name| !exporter_queues.iter().any(|(n, _)| n == *name))
+            {
+                metrics::gauge!(
+                    M_COMPONENT_ENTRIES,
+                    "component" => "exporter_queue",
+                    "exporter" => gone.clone(),
+                )
+                .set(0.0);
+            }
+            for (exporter, depth) in &exporter_queues {
+                metrics::gauge!(
+                    M_COMPONENT_ENTRIES,
+                    "component" => "exporter_queue",
+                    "exporter" => exporter.clone(),
+                )
+                .set(*depth as f64);
+            }
+            *last = exporter_queues.iter().map(|(n, _)| n.clone()).collect();
         });
     }
 
@@ -3876,6 +4025,76 @@ mod tests {
                 "{M_CONFIG_APPLY_BATCH_EVENTS}_sum{{trigger=\"watch\"}} 7"
             )),
             "the batch size is the event count, got: {rendered}",
+        );
+    }
+
+    #[test]
+    fn memory_sync_reports_components_and_retires_removed_exporters() {
+        let m = Metrics::new(false);
+        m.memory_probes()
+            .register_component("log_queue", || crate::memory::ComponentReading {
+                entries: Some(3),
+                bytes: Some(120),
+            });
+        m.memory_probes()
+            .register_component("guardrail_holdback", || crate::memory::ComponentReading {
+                entries: None,
+                bytes: Some(7),
+            });
+        let exporters = Arc::new(Mutex::new(vec![("a".to_string(), 4u64)]));
+        let read = exporters.clone();
+        m.memory_probes()
+            .register_exporter_queues(move || read.lock().unwrap().clone());
+        m.sync_memory();
+        let text = m.render();
+        for line in [
+            r#"aisix_component_entries{component="log_queue",exporter=""} 3"#,
+            r#"aisix_component_bytes{component="log_queue"} 120"#,
+            r#"aisix_component_bytes{component="guardrail_holdback"} 7"#,
+            r#"aisix_component_entries{component="exporter_queue",exporter="a"} 4"#,
+        ] {
+            assert!(text.contains(line), "missing {line} in:\n{text}");
+        }
+        assert!(
+            !text.contains(r#"component="guardrail_holdback",exporter"#),
+            "a bytes-only store must not report entries:\n{text}"
+        );
+        assert!(text.contains(r#"aisix_component_entries{component="metric_series",exporter=""}"#));
+
+        *exporters.lock().unwrap() = vec![("b".to_string(), 1)];
+        m.sync_memory();
+        let text = m.render();
+        assert!(
+            text.contains(r#"aisix_component_entries{component="exporter_queue",exporter="a"} 0"#),
+            "a removed exporter's queue must read 0:\n{text}"
+        );
+        assert!(
+            text.contains(r#"aisix_component_entries{component="exporter_queue",exporter="b"} 1"#)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn memory_sync_publishes_process_families_with_standard_types() {
+        let m = Metrics::new(false);
+        m.sync_memory();
+        let text = m.render();
+        for family in [
+            M_PROCESS_RESIDENT_MEMORY_BYTES,
+            M_PROCESS_VIRTUAL_MEMORY_BYTES,
+            M_PROCESS_THREADS,
+            M_PROCESS_OPEN_FDS,
+            M_PROCESS_MAX_FDS,
+            M_PROCESS_START_TIME_SECONDS,
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {family} gauge")),
+                "{family} missing or mistyped:\n{text}"
+            );
+        }
+        assert!(
+            text.contains("# TYPE process_cpu_seconds_total counter"),
+            "cpu seconds is a counter in the standard process collector:\n{text}"
         );
     }
 
