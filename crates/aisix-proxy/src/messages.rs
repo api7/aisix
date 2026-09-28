@@ -1601,6 +1601,8 @@ async fn anthropic_passthrough_dispatch(
                     upstream_ttft_ms: usage.upstream_ttft_ms,
                     downstream_latency_ms: usage.downstream_latency_ms,
                 };
+                let (elapsed, attempt_elapsed) =
+                    crate::request_metrics::stream_end_elapsed(started, attempt_started);
                 let snap_c = state_c.snapshot.load();
                 let pk_c = crate::usage_attr::ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 crate::request_metrics::record_e2e_latency(
@@ -1616,7 +1618,7 @@ async fn anthropic_passthrough_dispatch(
                         ..Default::default()
                     },
                     200,
-                    started.elapsed(),
+                    elapsed,
                 );
                 // A stream can outlive several config generations, so the
                 // end-of-stream emit reads a FRESH snapshot rather than the
@@ -1660,7 +1662,7 @@ async fn anthropic_passthrough_dispatch(
                     ),
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
-                    attempt_started.elapsed(),
+                    attempt_elapsed,
                     metrics,
                     &client_ctx_c,
                     anthropic_stream_attempt(
@@ -2356,6 +2358,10 @@ async fn cross_provider_dispatch(
                     upstream_ttft_ms: comp.upstream_ttft_ms,
                     downstream_latency_ms: comp.downstream_latency_ms,
                 };
+                let (elapsed, attempt_elapsed) = crate::request_metrics::stream_end_elapsed(
+                    started_for_telem,
+                    attempt_started_for_telem,
+                );
                 let snap_telem = state_for_telem.snapshot.load();
                 let pk_telem =
                     crate::usage_attr::ResolvedPk::resolve(&snap_telem, &provider_key_id_for_telem);
@@ -2372,7 +2378,7 @@ async fn cross_provider_dispatch(
                         ..Default::default()
                     },
                     200,
-                    started_for_telem.elapsed(),
+                    elapsed,
                 );
                 // Fresh snapshot at stream end — see the passthrough path.
                 emit_anthropic_usage_event(
@@ -2398,7 +2404,7 @@ async fn cross_provider_dispatch(
                         comp.failure.as_ref(),
                     ),
                     // Attempt-scoped — see the sibling passthrough path.
-                    attempt_started_for_telem.elapsed(),
+                    attempt_elapsed,
                     metrics,
                     &client_for_telem,
                     anthropic_stream_attempt(
