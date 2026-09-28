@@ -1984,6 +1984,8 @@ async fn responses_to_target(
                     }
                     _ => None,
                 };
+                let (elapsed, attempt_elapsed) =
+                    crate::request_metrics::stream_end_elapsed(started, attempt_started);
                 // SLO e2e histogram: full stream duration (verbatim path).
                 let snap_c = state_c.snapshot.load();
                 let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
@@ -2000,7 +2002,7 @@ async fn responses_to_target(
                         ..Default::default()
                     },
                     200,
-                    started.elapsed(),
+                    elapsed,
                 );
                 // Live-forward path: no output masking possible (a masking
                 // guardrail holds back → buffered branch; a monitor-mode one
@@ -2035,7 +2037,7 @@ async fn responses_to_target(
                     crate::attempt::stream_status(usage.reached_end, usage.failure.as_ref()),
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
-                    attempt_started.elapsed(),
+                    attempt_elapsed,
                     &usage,
                     &client_c,
                     {
@@ -2544,6 +2546,8 @@ async fn responses_cross_provider_to_target(
                     ),
                     _ => None,
                 };
+                let (elapsed, attempt_elapsed) =
+                    crate::request_metrics::stream_end_elapsed(started, attempt_started);
                 // SLO e2e histogram: full stream duration (bridge path).
                 // Blocked streams keep this guard's 422 status.
                 let snap_c = state_c.snapshot.load();
@@ -2561,7 +2565,7 @@ async fn responses_cross_provider_to_target(
                         ..Default::default()
                     },
                     status,
-                    started.elapsed(),
+                    elapsed,
                 );
                 // A stream can outlive several config generations, so the
                 // end-of-stream emit reads a FRESH snapshot rather than the
@@ -2579,7 +2583,7 @@ async fn responses_cross_provider_to_target(
                     &metric_upstream_model,
                     status,
                     // Attempt-scoped — see the sibling verbatim path.
-                    attempt_started.elapsed(),
+                    attempt_elapsed,
                     &usage,
                     &client_c,
                     attempt_c,

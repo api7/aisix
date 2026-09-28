@@ -494,6 +494,22 @@ pub(crate) fn record_e2e_downstream(
     crate::attribution::note_e2e_downstream(metrics.clone(), OwnedLatencyLabels::from(labels));
 }
 
+/// A finished stream's request and attempt durations, both read at one
+/// instant. Read apart, the attempt's clock — taken after the request's
+/// `downstream` observation — would count the gateway's own bookkeeping in
+/// between, and the `upstream` side could come out longer than the
+/// `downstream` side that contains it.
+pub(crate) fn stream_end_elapsed(
+    started: std::time::Instant,
+    attempt_started: std::time::Instant,
+) -> (Duration, Duration) {
+    let now = std::time::Instant::now();
+    (
+        now.saturating_duration_since(started),
+        now.saturating_duration_since(attempt_started),
+    )
+}
+
 /// An owned [`aisix_obs::LatencyLabels`], held on the request's cell
 /// between the two sides of its end-to-end observation.
 pub(crate) struct OwnedLatencyLabels {
