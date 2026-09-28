@@ -1468,8 +1468,9 @@ struct Telemetry<'a> {
     auth: &'a AuthenticatedKey,
     request_id: String,
     started: Instant,
-    /// The content route relays an open-ended body after this tail runs, so
-    /// its access-log `duration` is measured to the end of that relay.
+    /// The content route's proxied delivery relays an open-ended body after
+    /// this tail runs, so its access-log `duration` is measured to the end
+    /// of that relay.
     duration_spans_body: bool,
 }
 
@@ -2124,7 +2125,7 @@ pub async fn video_content(
     client: ClientContext,
     AisixPath(video_id): AisixPath<String>,
 ) -> Response {
-    let telemetry = Telemetry {
+    let mut telemetry = Telemetry {
         state: &state,
         method: "GET",
         path: "/v1/videos/:id/content".to_string(),
@@ -2134,12 +2135,15 @@ pub async fn video_content(
         auth: &auth,
         request_id: client.request_id.clone(),
         started: Instant::now(),
-        duration_spans_body: true,
+        // Set below for the proxied delivery only: a redirect or an error
+        // envelope is not a relay, and a slow reader must not stretch its
+        // duration.
+        duration_spans_body: false,
     };
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
-    let result: Result<(Response, String, String), ProxyError> = async {
+    let result: Result<(Response, String, String, bool), ProxyError> = async {
         let (target, task_id, _) = resolve_get_target(&snapshot, &auth, &video_id, &client)?;
         // Same model-layer exemption as the poll route (see get_video).
         let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
@@ -2147,6 +2151,7 @@ pub async fn video_content(
         reservation.commit_tokens(0).await;
         let poll = result?;
 
+        let mut relays_body = false;
         let response = match poll.status {
             // A completed task is delivered per the provider's content mode
             // (AISIX-Cloud#1118, content-proxy design):
@@ -2188,6 +2193,7 @@ pub async fn video_content(
                         resp
                     }
                     ContentDelivery::Proxy { url } => {
+                        relays_body = true;
                         proxy_content(&state, &target, &url, &client.request_id).await?
                     }
                 }
@@ -2216,12 +2222,14 @@ pub async fn video_content(
             response,
             target.provider_label.clone(),
             target.display_name().to_string(),
+            relays_body,
         ))
     }
     .await;
 
     match result {
-        Ok((resp, provider, model_label)) => {
+        Ok((resp, provider, model_label, relays_body)) => {
+            telemetry.duration_spans_body = relays_body;
             telemetry.finish(resp.status().as_u16(), &provider, &model_label, None);
             resp
         }
