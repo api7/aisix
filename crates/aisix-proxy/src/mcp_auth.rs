@@ -525,6 +525,24 @@ mod tests {
     }
 
     #[test]
+    fn a_resource_url_with_userinfo_is_published_as_configured() {
+        let snap = AisixSnapshot::new();
+        snap.mcp_auth_settings.insert(settings_entry(
+            "env-1",
+            "https://user:s3cret@gw.example.com/mcp",
+        ));
+        snap.oidc_providers.insert(provider_entry(
+            "op-1",
+            r#"{"name":"corp","issuer":"https://sso.example.com","audiences":["a"]}"#,
+        ));
+        let identity = discovery_identity(&snap).expect("active");
+        assert_eq!(
+            identity.resource_url,
+            "https://user:s3cret@gw.example.com/mcp"
+        );
+    }
+
+    #[test]
     fn non_default_port_survives_in_challenge_url() {
         let snap = AisixSnapshot::new();
         snap.mcp_auth_settings

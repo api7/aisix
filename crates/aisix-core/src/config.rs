@@ -2985,7 +2985,6 @@ managed:
             Some("https://[::1]:7944")
         );
         assert!(load_with_cp_base_url("::1:7944").is_err());
-        // An ordinary host:port is unaffected by the userinfo rule.
         let cfg = load_with_cp_base_url("https://cp.example.com:7944").unwrap();
         assert_eq!(
             cfg.managed.cp_base_url.as_deref(),

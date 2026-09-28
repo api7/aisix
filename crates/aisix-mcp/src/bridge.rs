@@ -944,11 +944,11 @@ mod tests {
         let oauth = McpAuth::OAuth2(OAuthClientConfig {
             client_id: "cid".into(),
             client_secret: "cs-LEAK".into(),
-            token_url: "https://idp.example.com/token".into(),
+            token_url: "https://cid:basic@idp.example.com/token".into(),
             scopes: vec!["read".into()],
         });
         let upstream = McpUpstream {
-            url: "https://mcp.example.com/mcp".into(),
+            url: "https://svc:pw@mcp.example.com/mcp".into(),
             auth: McpAuth::None,
             timeout: Duration::from_secs(1),
             protocol: McpProtocol::default(),
@@ -964,8 +964,9 @@ mod tests {
             "credential leaked into Debug output: {rendered}"
         );
         // The non-secret fields stay visible for operability.
-        assert!(rendered.contains("https://idp.example.com/token"));
-        assert!(rendered.contains("https://mcp.example.com/mcp"));
+        // A configured URL renders as configured, userinfo included.
+        assert!(rendered.contains("https://cid:basic@idp.example.com/token"));
+        assert!(rendered.contains("https://svc:pw@mcp.example.com/mcp"));
         assert!(rendered.contains("cid"));
     }
 

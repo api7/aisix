@@ -157,8 +157,7 @@ impl AadCredentials {
             // `resolve_api_base` check. Backslashes are rejected too: the
             // WHATWG URL parser the HTTP client uses normalizes `\` to `/` on
             // http(s) URLs, so `host\evil` injects a path exactly like
-            // `host/evil`. `host` has no `@`/`?`/`#` here, so echoing it is
-            // safe. Audit #434 LOW-1 / #435 (+ #464 audit MEDIUM).
+            // `host/evil`. `host` has no `?`/`#` here. Audit #434 LOW-1 / #435 (+ #464 audit MEDIUM).
             let after_scheme = host
                 .split_once("://")
                 .map(|(_, rest)| rest)

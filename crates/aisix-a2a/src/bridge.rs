@@ -727,6 +727,14 @@ mod tests {
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
         };
         assert!(!format!("{up:?}").contains("super-secret"));
+        // A configured URL renders as configured, userinfo included.
+        let up = A2aUpstream {
+            url: "https://agent:pw@x/a2a".into(),
+            auth: A2aAuth::None,
+            protocol_version: A2aProtocolVersion::V1_0,
+            timeout: DEFAULT_UPSTREAM_TIMEOUT,
+        };
+        assert!(format!("{up:?}").contains("https://agent:pw@x/a2a"));
     }
 
     fn bridge_at(url: &str) -> HttpBridge {

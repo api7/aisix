@@ -145,7 +145,7 @@ This repo reads its config from etcd, but users never write etcd directly — th
 
 ## A Configured URL Is Opaque
 
-**Userinfo (`user:pass@`) in any configured URL is the operator's to write, and the gateway neither validates nor redacts it.** It is not rejected, checked or masked. Logs, `Debug` output, error text and published documents render the URL exactly as configured, and it reaches the HTTP client unchanged. Whatever the client does with the userinfo is the behaviour. A URL pattern that restricts the host allows optional userinfo in front of it without inspecting it (`([^/?#]*@)?`), and it keeps the host after the last `@` on its allow-list. Configured secrets that are not part of a URL (API keys, header values, credential query parameters) keep their own redaction.
+**Userinfo (`user:pass@`) in any configured URL is the operator's to write, and the gateway neither validates nor redacts it.** This holds for every configured URL, HTTP or not (`redis://` included), resource or startup config. It is not rejected, checked or masked. Logs, `Debug` output, error text and published documents render the URL exactly as configured, and it reaches its client unchanged. Whatever the client does with the userinfo is the behaviour. A URL pattern that restricts the host allows optional userinfo in front of it without inspecting it (`([^/?#\\]*@)?` — `\` is excluded because the URL parser ends an `http` authority there), and it keeps the host after the last `@` on its allow-list. Configured secrets that are not part of a URL (API keys, header values, credential query parameters) keep their own redaction.
 
 ## A Control-Plane Response Decodes Loosely
 
