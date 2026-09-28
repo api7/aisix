@@ -380,12 +380,12 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
     // to histo-stream-model — a double observation (e.g. handler-return
     // AND stream-completion both recording) or a dropped one shifts this
     // off 1. Same for its single TTFT.
-    expect(countOf(body, E2E_SERIES, { model: "histo-stream-model" })).toBe(1);
-    // One streaming request is one observation per `side`.
+    // One streaming request is one observation per `side`, on both series.
     for (const side of SIDES) {
+      expect(countOf(body, E2E_SERIES, { model: "histo-stream-model", side })).toBe(1);
       expect(countOf(body, TTFT_SERIES, { model: "histo-stream-model", side })).toBe(1);
     }
-    expect(countOf(body, E2E_SERIES, { model: "histo-fail-model" })).toBe(1);
+    expect(countOf(body, E2E_SERIES, { model: "histo-fail-model", side: "downstream" })).toBe(1);
 
     // histogram_quantile() needs _sum/_count too.
     expect(body).toContain(`${E2E_SERIES}_sum`);

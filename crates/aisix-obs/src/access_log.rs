@@ -5,22 +5,26 @@
 //!
 //! # When the line is written, and what that costs
 //!
-//! Exactly one line per request, whatever the outcome — but WHEN it is
-//! written differs by path, and that decides which fields can be filled at
-//! all. Four cases:
+//! Exactly one line per request, whatever the outcome — but WHEN its fields
+//! are settled differs by path, and that decides which fields can be filled
+//! at all. Four cases:
 //!
-//! - **Non-streamed response** — from the handler, on its way out, with
+//! - **Non-streamed response** — built by the handler, on its way out, with
 //!   everything it resolved available.
 //! - **Streamed response** — NOT when the SSE head is handed to the server.
 //!   The handler defers the line to the request's attribution cell
-//!   (`attribution::defer_access_log`) and it goes out beside the request's
-//!   TERMINAL usage event, at the point the stream's outcome is known:
-//!   fully consumed, abandoned mid-stream, or dropped before its first
-//!   poll. It therefore reports the same `status`, `error_kind` and `error`
-//!   as that event — a stream whose consumer walked away reads `499` /
-//!   `client_disconnected` on both — and it can carry the token counts and
-//!   `provider_request_id`, which only exist once the upstream has answered
-//!   (AISIX-Cloud#1571).
+//!   (`attribution::defer_access_log`) and it is completed beside the
+//!   request's TERMINAL usage event, at the point the stream's outcome is
+//!   known: fully consumed, abandoned mid-stream, or dropped before its
+//!   first poll. It therefore reports the same `status`, `error_kind` and
+//!   `error` as that event — a stream whose consumer walked away reads
+//!   `499` / `client_disconnected` on both — and it can carry the token
+//!   counts and `provider_request_id`, which only exist once the upstream
+//!   has answered (AISIX-Cloud#1571).
+//!
+//!   The two relays of an open-ended binary body — `/v1/audio/speech` and
+//!   `/v1/videos/{id}/content` — are completed at the relay's end the same
+//!   way, so their `duration_ms` spans the relay like every other surface.
 //! - **`/v1/realtime`** — the opposite extreme. The handler returns the
 //!   WebSocket upgrade immediately; the line is written by `run_session` on
 //!   a detached task once the session closes, so it carries the close status
@@ -38,6 +42,29 @@
 //! So do not add a field whose value only exists once the upstream has
 //! responded and expect it on every line: it is silently empty on the
 //! cancelled ones, where the request never got that far.
+//!
+//! Whichever of those builds the line, it is WRITTEN once the response body
+//! is finished with — fully handed to the HTTP server, or dropped because
+//! the client went away — because that is the first moment the two body
+//! sizes below are known. `/v1/realtime` and the head-phase cancel have no
+//! response body to wait for and write theirs at once.
+//!
+//! # Body sizes
+//!
+//! - `request_body_bytes` is how many request-body bytes the gateway read
+//!   from the client. The gateway never decompresses a request body, so
+//!   this is both the size on the wire and the size it parsed. It is
+//!   absent unless the body was read to its end: a request refused before
+//!   its body was read (the `Content-Length` pre-check's `413`), a route
+//!   that never reads one (most `GET`s), a client that hung up before or
+//!   during the upload, and `/v1/realtime`, whose WebSocket has no HTTP
+//!   body.
+//! - `response_body_bytes` is every response-body byte handed to the HTTP
+//!   server for the client — SSE framing and keep-alive heartbeats
+//!   included, headers, chunked-transfer framing and TLS excluded. A
+//!   client that disconnects mid-response gets what was handed over until
+//!   then. It is absent only when no response head was written — the
+//!   head-phase cancel line — and on `/v1/realtime`.
 //!
 //! A fifth case is not about WHEN the line is written but about what
 //! happened: a **cache hit** is written from the handler like any other
@@ -76,17 +103,10 @@ pub struct AccessLog<'a> {
     /// response this is time-to-first-token, NOT how long the stream ran.
     pub latency: Duration,
     /// How long the request occupied the gateway: from arrival to the point
-    /// this line is written. Equal to `latency` on everything that is not
-    /// streamed.
-    ///
-    /// "The point this line is written" is the request's end on every
-    /// surface whose record is written at completion — which is all of them
-    /// except the two that meter at their handler tail and relay an
-    /// open-ended body afterwards (`/v1/audio/speech`, billed per input
-    /// character, and `/v1/videos/{id}/content`, metered by the
-    /// submission). Those two have no completion-time emitter to carry a
-    /// line, so theirs ends at the response head and does not span the
-    /// relay.
+    /// the request's outcome was settled — the end of the stream on a
+    /// streamed response, the end of the relay on `/v1/audio/speech` and
+    /// `/v1/videos/{id}/content`. Equal to `latency` on every other
+    /// non-streamed response.
     pub duration: Duration,
     /// Vendor id of the target that served the request. Unlike the pair
     /// below it reports the `unknown` SENTINEL rather than being omitted
@@ -165,6 +185,12 @@ pub struct AccessLog<'a> {
     /// How the response cache answered — `None` on every line that had no
     /// cache decision to report. See [`CacheAccessLog`].
     pub cache: Option<CacheAccessLog<'a>>,
+    /// Request-body bytes the gateway read — `None` unless the body was
+    /// read to its end. See the module docs.
+    pub request_body_bytes: Option<u64>,
+    /// Response-body bytes handed to the HTTP server — `None` when no
+    /// response head was written. See the module docs.
+    pub response_body_bytes: Option<u64>,
 }
 
 /// The response-cache half of an access-log line (AISIX-Cloud#1571).
@@ -242,8 +268,129 @@ impl AccessLog<'_> {
             mcp_tool = mcp.and_then(|m| m.tool),
             tools_total = mcp.and_then(|m| m.tools_total),
             tools_returned = mcp.and_then(|m| m.tools_returned),
+            request_body_bytes = self.request_body_bytes,
+            response_body_bytes = self.response_body_bytes,
             "proxy request completed",
         );
+    }
+
+    /// An owned copy, for a line whose body sizes are only known after the
+    /// code that built it has returned.
+    pub fn to_record(&self) -> AccessLogRecord {
+        let owned = |v: Option<&str>| v.map(str::to_owned);
+        AccessLogRecord {
+            method: self.method.to_owned(),
+            path: self.path.to_owned(),
+            status: self.status,
+            latency: self.latency,
+            duration: self.duration,
+            provider: owned(self.provider),
+            model: owned(self.model),
+            upstream_model: owned(self.upstream_model),
+            provider_key_id: owned(self.provider_key_id),
+            api_key_id: owned(self.api_key_id),
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+            request_id: self.request_id.to_owned(),
+            provider_request_id: owned(self.provider_request_id),
+            served_by_model: owned(self.served_by_model),
+            routing_attempt_count: self.routing_attempt_count,
+            routing_fallback_count: self.routing_fallback_count,
+            error_kind: owned(self.error_kind),
+            error: owned(self.error),
+            mcp: self.mcp.as_ref().map(|m| {
+                (
+                    owned(m.method),
+                    owned(m.tool),
+                    m.tools_total,
+                    m.tools_returned,
+                )
+            }),
+            cache: self
+                .cache
+                .as_ref()
+                .map(|c| (c.status.to_owned(), owned(c.hit_layer))),
+            request_body_bytes: self.request_body_bytes,
+            response_body_bytes: self.response_body_bytes,
+        }
+    }
+}
+
+/// An owned [`AccessLog`]. The fields the writer completes after the fact
+/// are public; the rest are fixed when the copy is taken.
+#[derive(Debug, Clone)]
+pub struct AccessLogRecord {
+    method: String,
+    path: String,
+    status: u16,
+    latency: Duration,
+    pub duration: Duration,
+    provider: Option<String>,
+    model: Option<String>,
+    upstream_model: Option<String>,
+    provider_key_id: Option<String>,
+    api_key_id: Option<String>,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    request_id: String,
+    provider_request_id: Option<String>,
+    served_by_model: Option<String>,
+    routing_attempt_count: Option<u32>,
+    routing_fallback_count: Option<u32>,
+    error_kind: Option<String>,
+    error: Option<String>,
+    #[allow(clippy::type_complexity)]
+    mcp: Option<(Option<String>, Option<String>, Option<u32>, Option<u32>)>,
+    cache: Option<(String, Option<String>)>,
+    pub request_body_bytes: Option<u64>,
+    pub response_body_bytes: Option<u64>,
+}
+
+impl AccessLogRecord {
+    pub fn emit(&self) {
+        fn borrowed(v: &Option<String>) -> Option<&str> {
+            v.as_deref()
+        }
+        AccessLog {
+            method: &self.method,
+            path: &self.path,
+            status: self.status,
+            latency: self.latency,
+            duration: self.duration,
+            provider: borrowed(&self.provider),
+            model: borrowed(&self.model),
+            upstream_model: borrowed(&self.upstream_model),
+            provider_key_id: borrowed(&self.provider_key_id),
+            api_key_id: borrowed(&self.api_key_id),
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+            request_id: &self.request_id,
+            provider_request_id: borrowed(&self.provider_request_id),
+            served_by_model: borrowed(&self.served_by_model),
+            routing_attempt_count: self.routing_attempt_count,
+            routing_fallback_count: self.routing_fallback_count,
+            error_kind: borrowed(&self.error_kind),
+            error: borrowed(&self.error),
+            mcp: self
+                .mcp
+                .as_ref()
+                .map(|(method, tool, total, returned)| McpAccessLog {
+                    method: method.as_deref(),
+                    tool: tool.as_deref(),
+                    tools_total: *total,
+                    tools_returned: *returned,
+                }),
+            cache: self.cache.as_ref().map(|(status, layer)| CacheAccessLog {
+                status,
+                hit_layer: layer.as_deref(),
+            }),
+            request_body_bytes: self.request_body_bytes,
+            response_body_bytes: self.response_body_bytes,
+        }
+        .emit();
     }
 }
 
@@ -314,12 +461,19 @@ mod tests {
                 error: None,
                 mcp: None,
                 cache: None,
+                request_body_bytes: Some(123),
+                response_body_bytes: Some(4567),
             }
+            .to_record()
             .emit();
         });
 
         let out = writer.contents();
         assert!(out.contains("proxy request completed"));
+        // Through the owned copy too, which is how a deferred line is
+        // written: the two sizes must survive it, and not be swapped.
+        assert!(out.contains("request_body_bytes=123"), "{out}");
+        assert!(out.contains("response_body_bytes=4567"), "{out}");
         assert!(out.contains("method=\"POST\"") || out.contains("method=POST"));
         assert!(out.contains("status=200"));
         assert!(out.contains("latency_ms=42"));
@@ -399,6 +553,8 @@ mod tests {
                 error: Some("upstream request timed out after 7167ms"),
                 mcp: None,
                 cache: None,
+                request_body_bytes: None,
+                response_body_bytes: None,
             }
             .emit();
         });
@@ -453,6 +609,8 @@ mod tests {
                 error: None,
                 mcp: None,
                 cache: None,
+                request_body_bytes: None,
+                response_body_bytes: None,
             }
             .emit();
         });
@@ -467,6 +625,9 @@ mod tests {
         // at all, not an empty one an operator would have to filter out.
         assert!(!out.contains("upstream_model"), "{out}");
         assert!(!out.contains("provider_key_id"), "{out}");
+        // An unknown body size is left off the line, never rendered as `0`,
+        // which is a real size.
+        assert!(!out.contains("body_bytes"), "{out}");
         // And no cache verdict: a line with no cache decision must not
         // claim one, since `cache_status` absent is how a reader tells
         // "this surface has no cache" from "the cache missed".
@@ -515,6 +676,8 @@ mod tests {
                     status: "hit",
                     hit_layer: Some("semantic"),
                 }),
+                request_body_bytes: None,
+                response_body_bytes: None,
             }
             .emit();
         });
@@ -570,6 +733,8 @@ mod tests {
                     status: "miss",
                     hit_layer: None,
                 }),
+                request_body_bytes: None,
+                response_body_bytes: None,
             }
             .emit();
         });

@@ -692,7 +692,7 @@ fn emit_access_log(
     let _ = now_ts; // only used for context; access log uses elapsed
     let target = crate::attribution::AccessLogTarget::current();
     let summary = routing.access_log_summary();
-    AccessLog {
+    crate::attribution::emit_access_log(AccessLog {
         method: "POST",
         path: "/v1/embeddings",
         status,
@@ -717,8 +717,9 @@ fn emit_access_log(
         error: error.as_deref(),
         mcp: None,
         cache: None,
-    }
-    .emit();
+        request_body_bytes: None,
+        response_body_bytes: None,
+    });
 }
 
 /// Push one `UsageEvent` onto cp-api's telemetry sink **and** fan it

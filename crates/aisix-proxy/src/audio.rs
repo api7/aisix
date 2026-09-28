@@ -2722,7 +2722,7 @@ fn emit_access_log(
     };
     let target = crate::attribution::AccessLogTarget::current();
     let summary = routing.access_log_summary();
-    AccessLog {
+    crate::attribution::emit_access_log(AccessLog {
         method,
         path,
         status,
@@ -2748,8 +2748,9 @@ fn emit_access_log(
         error: error.as_deref(),
         mcp: None,
         cache: None,
-    }
-    .emit();
+        request_body_bytes: None,
+        response_body_bytes: None,
+    });
 }
 
 // The audio handler reuses the same client as messages.rs. It's exported

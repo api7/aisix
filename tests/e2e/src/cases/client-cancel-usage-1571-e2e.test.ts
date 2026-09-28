@@ -361,7 +361,10 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
 
     const line = await waitForLogLine(
       app,
-      (l) => l.includes(`request_id="${requestId}"`) && l.includes("status=200"),
+      (l) =>
+        l.includes("proxy request completed") &&
+        l.includes(`request_id="${requestId}"`) &&
+        l.includes("status=200"),
       `the 200 access-log line for ${requestId}`,
     );
     expect(line).toContain(`upstream_model="${FAST_UPSTREAM_MODEL}"`);

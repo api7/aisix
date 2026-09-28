@@ -41,7 +41,14 @@
 //! The cell carries one more thing for the same reason: a streamed
 //! response's access-log LINE ([`PendingAccessLog`]). Its handler returns
 //! when the head goes out, minutes before the request ends, so the line is
-//! parked here and written by whichever terminal emitter ends the request.
+//! parked here and completed by whichever terminal emitter ends the request.
+//!
+//! And every request's line, streamed or not, is WRITTEN from here: the
+//! telemetry middleware counts the request and response body bytes where
+//! they cross its outermost layer, and those counts are only final once
+//! the response body is finished with. So [`emit_access_log`] holds the
+//! completed line on the cell, and the middleware's guard writes it with
+//! both sizes when it finishes the request ([`RequestAttribution::finish`]).
 //!
 //! It is kept BESIDE [`Resolved`] rather than inside it because every
 //! failed request reads `Resolved` back by value for its metric labels
@@ -49,6 +56,7 @@
 //! that clone would put the cancel path's cost on every error path.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -236,9 +244,10 @@ pub(crate) struct CancelContext {
 /// response (AISIX-Cloud#1571).
 ///
 /// So the handler parks here the fields only it can resolve, and the line
-/// goes out beside the request's TERMINAL usage event — from
+/// is completed beside the request's TERMINAL usage event — from
 /// [`crate::usage_attr::emit_usage`], the one point every terminal event of
-/// every family passes through. That is what makes the two agree on
+/// every family passes through — then written with the body sizes once the
+/// response body is done with, like every other line ([`emit_access_log`]). That is what makes the two agree on
 /// `status`, `error_kind` and `error` by construction rather than by each
 /// family remembering to.
 ///
@@ -308,8 +317,9 @@ impl PendingAccessLog {
         self
     }
 
-    /// Write the line, taking its outcome from the terminal usage event.
-    fn emit(self, target: &Resolved, event: &aisix_obs::UsageEvent) {
+    /// Complete the line, taking its outcome from the terminal usage event,
+    /// and hand it to `cell` to be written once the body sizes are known.
+    fn emit(self, cell: &RequestAttribution, target: &Resolved, event: &aisix_obs::UsageEvent) {
         let duration = self.started.elapsed();
         // What the CALLER waited for, taken VERBATIM off the event: the
         // first token forwarded downstream on a stream that delivered one.
@@ -343,7 +353,7 @@ impl PendingAccessLog {
         // the same rule the rest of this line follows for `error_kind` and
         // `provider_request_id`.
         let counted = total > 0;
-        aisix_obs::AccessLog {
+        let line = aisix_obs::AccessLog {
             method: &self.method,
             path: &self.path,
             status: event.status_code,
@@ -378,8 +388,10 @@ impl PendingAccessLog {
                 hit_layer: (!event.cache_hit_layer.is_empty())
                     .then_some(event.cache_hit_layer.as_str()),
             }),
-        }
-        .emit();
+            request_body_bytes: None,
+            response_body_bytes: None,
+        };
+        cell.park_access_log(&line, None);
     }
 }
 
@@ -392,15 +404,167 @@ struct Cell {
     pending_log: Option<PendingAccessLog>,
     /// See [`note_stream_owns_access_log`].
     stream_owns_log: bool,
+    /// See [`RequestAttribution::track`]. `None` on a cell no telemetry
+    /// middleware installed — a throwaway [`detached`] one, a unit test —
+    /// where a line is written at once because nothing would ever flush it.
+    request_span: Option<tracing::Span>,
+    /// The response head has been handed to the server.
+    head_written: bool,
+    /// [`RequestAttribution::finish`] has run: the body sizes are final and
+    /// nothing will flush a line parked after this, so it is written at
+    /// once.
+    finished: bool,
+    /// The request's completed access-log line, waiting for the body sizes.
+    ready_line: Option<ReadyLine>,
+    /// See [`note_e2e_downstream`].
+    e2e_labels: Option<(
+        Arc<aisix_obs::Metrics>,
+        crate::request_metrics::OwnedLatencyLabels,
+    )>,
+    /// See [`note_terminal_upstream`].
+    terminal_upstream: Option<Duration>,
+    /// The `upstream` end-to-end observation has been recorded.
+    e2e_upstream_recorded: bool,
+}
+
+impl Cell {
+    /// The `upstream` end-to-end observation, once both of its halves are
+    /// known and it has not been recorded yet.
+    fn take_e2e_upstream(
+        &mut self,
+    ) -> Option<(
+        Arc<aisix_obs::Metrics>,
+        crate::request_metrics::OwnedLatencyLabels,
+        Duration,
+    )> {
+        if self.e2e_upstream_recorded {
+            return None;
+        }
+        let upstream = self.terminal_upstream?;
+        let (metrics, labels) = self.e2e_labels.take()?;
+        self.e2e_upstream_recorded = true;
+        Some((metrics, labels, upstream))
+    }
+}
+
+/// A completed access-log line held until the response body is finished
+/// with, because both body sizes are only known then.
+struct ReadyLine {
+    record: aisix_obs::AccessLogRecord,
+    /// Set for a line whose `duration` must span the body relay rather than
+    /// end where the line was built — see [`emit_access_log_spanning_body`].
+    duration_from: Option<Instant>,
+}
+
+/// Body sizes, counted where the bytes cross the gateway's outermost
+/// layer. Atomics rather than the cell's lock because the request body is
+/// read on whatever task consumes it, possibly a client's connection task.
+#[derive(Default)]
+struct BodyCounters {
+    request_bytes: AtomicU64,
+    /// The request body was read to its end.
+    request_complete: AtomicBool,
+    /// The request body was read only to be thrown away, by a refusal that
+    /// decided before the body was read.
+    request_discarded: AtomicBool,
+    response_bytes: AtomicU64,
 }
 
 /// The per-request cell. Attempts within a request are sequential, so the
 /// lock is uncontended; it exists because the cancel guard may read the
 /// cell from a different point in the stack than the writer.
 #[derive(Default)]
-pub(crate) struct RequestAttribution(Mutex<Cell>);
+pub(crate) struct RequestAttribution {
+    cell: Mutex<Cell>,
+    bodies: BodyCounters,
+}
 
 impl RequestAttribution {
+    /// Mark this cell as installed by the telemetry middleware, which will
+    /// call [`Self::finish`] once the response body is done with. From here
+    /// an access-log line is held until then. `span` is the request span
+    /// the line is written in, since it is written from `Drop`.
+    pub(crate) fn track(&self, span: tracing::Span) {
+        self.lock().request_span = Some(span);
+    }
+
+    pub(crate) fn note_head_written(&self) {
+        self.lock().head_written = true;
+    }
+
+    pub(crate) fn add_request_bytes(&self, n: u64) {
+        self.bodies.request_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_request_complete(&self) {
+        self.bodies.request_complete.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_response_bytes(&self, n: u64) {
+        self.bodies.response_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// `(request_body_bytes, response_body_bytes)` as the line reports them.
+    fn body_sizes(&self, head_written: bool) -> (Option<u64>, Option<u64>) {
+        let b = &self.bodies;
+        let request = (b.request_complete.load(Ordering::Relaxed)
+            && !b.request_discarded.load(Ordering::Relaxed))
+        .then(|| b.request_bytes.load(Ordering::Relaxed));
+        let response = head_written.then(|| b.response_bytes.load(Ordering::Relaxed));
+        (request, response)
+    }
+
+    /// Hold `line` until the body sizes are known, or write it now when
+    /// nothing will ever flush it (see [`Cell::request_span`] and
+    /// [`Cell::finished`]).
+    pub(crate) fn park_access_log(
+        &self,
+        line: &aisix_obs::AccessLog<'_>,
+        duration_from: Option<Instant>,
+    ) {
+        let mut cell = self.lock();
+        let ready = ReadyLine {
+            record: line.to_record(),
+            duration_from,
+        };
+        if cell.request_span.is_none() {
+            drop(cell);
+            ready.record.emit();
+            return;
+        }
+        if cell.finished {
+            let sizes = self.body_sizes(cell.head_written);
+            let span = cell.request_span.clone();
+            drop(cell);
+            write_line(ready, sizes, span);
+            return;
+        }
+        // One line per request is the invariant; should a path ever build
+        // two, the first is written now rather than lost.
+        if let Some(earlier) = cell.ready_line.replace(ready) {
+            let sizes = self.body_sizes(false);
+            let span = cell.request_span.clone();
+            drop(cell);
+            write_line(earlier, sizes, span);
+        }
+    }
+
+    /// The request is over: its response body was fully handed to the
+    /// server or dropped, or no response head was ever produced. Writes the
+    /// held line with its final body sizes. Called once, by the telemetry
+    /// middleware's guard.
+    pub(crate) fn finish(&self) {
+        let mut cell = self.lock();
+        cell.finished = true;
+        let line = cell.ready_line.take();
+        let sizes = self.body_sizes(cell.head_written);
+        let span = cell.request_span.clone();
+        drop(cell);
+        if let Some(line) = line {
+            write_line(line, sizes, span);
+        }
+    }
+
     pub(crate) fn get(&self) -> Resolved {
         self.lock().resolved.clone()
     }
@@ -432,14 +596,26 @@ impl RequestAttribution {
         };
         let target = cell.resolved.clone();
         drop(cell);
-        pending.emit(&target, event);
+        pending.emit(self, &target, event);
         true
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Cell> {
-        self.0
+        self.cell
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn write_line(line: ReadyLine, sizes: (Option<u64>, Option<u64>), span: Option<tracing::Span>) {
+    let mut record = line.record;
+    if let Some(from) = line.duration_from {
+        record.duration = from.elapsed();
+    }
+    (record.request_body_bytes, record.response_body_bytes) = sizes;
+    match span {
+        Some(span) => span.in_scope(|| record.emit()),
+        None => record.emit(),
     }
 }
 
@@ -739,6 +915,76 @@ pub(crate) fn stream_owns_access_log() -> bool {
     CURRENT
         .try_with(|a| a.lock().stream_owns_log)
         .unwrap_or(false)
+}
+
+/// Write a request's access-log line. Every emitter in this crate goes
+/// through here rather than `AccessLog::emit`: inside a request the line is
+/// held until the response body is done with, so it can carry both body
+/// sizes; outside one it is written at once.
+pub(crate) fn emit_access_log(line: aisix_obs::AccessLog<'_>) {
+    park(line, None);
+}
+
+/// [`emit_access_log`] for a line built at the response head of a route
+/// that then relays an open-ended body (`/v1/videos/{id}/content`): its
+/// `duration` is measured from `started` to the end of that relay, as it is
+/// on every surface whose line is completed at the request's end.
+pub(crate) fn emit_access_log_spanning_body(line: aisix_obs::AccessLog<'_>, started: Instant) {
+    park(line, Some(started));
+}
+
+fn park(line: aisix_obs::AccessLog<'_>, duration_from: Option<Instant>) {
+    if CURRENT
+        .try_with(|a| a.park_access_log(&line, duration_from))
+        .is_err()
+    {
+        line.emit();
+    }
+}
+
+/// Note that the request body was read only to be discarded by a refusal
+/// decided before it was read, so the line reports no request size.
+pub(crate) fn note_request_body_discarded() {
+    let _ = CURRENT.try_with(|a| a.bodies.request_discarded.store(true, Ordering::Relaxed));
+}
+
+/// Note the labels of the request's `downstream` end-to-end latency
+/// observation, so its `upstream` sibling is recorded under the same ones.
+///
+/// The two halves of that sibling — these labels, and the terminal
+/// attempt's duration ([`note_terminal_upstream`]) — arrive in either
+/// order depending on the family, so whichever comes second records it.
+pub(crate) fn note_e2e_downstream(
+    metrics: Arc<aisix_obs::Metrics>,
+    labels: crate::request_metrics::OwnedLatencyLabels,
+) {
+    record_e2e_upstream(|cell| cell.e2e_labels = Some((metrics, labels)));
+}
+
+/// Note the upstream duration of the attempt behind the request's terminal
+/// usage event, when that attempt was dispatched. Called from the emission
+/// chokepoint, so it is the same figure as the event's
+/// `upstream_latency_ms`.
+pub(crate) fn note_terminal_upstream(upstream: Duration) {
+    record_e2e_upstream(|cell| cell.terminal_upstream = Some(upstream));
+}
+
+fn record_e2e_upstream(note: impl FnOnce(&mut Cell)) {
+    let ready = CURRENT
+        .try_with(|a| {
+            let mut cell = a.lock();
+            note(&mut cell);
+            cell.take_e2e_upstream()
+        })
+        .ok()
+        .flatten();
+    if let Some((metrics, labels, upstream)) = ready {
+        metrics.record_request_e2e_latency(
+            labels.as_labels(),
+            aisix_obs::LatencySide::Upstream,
+            upstream,
+        );
+    }
 }
 
 /// Emit the deferred line of the request running on this task, if it has
