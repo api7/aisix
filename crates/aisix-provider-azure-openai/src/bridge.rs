@@ -293,35 +293,25 @@ impl AzureUpstreamRef {
             ));
         }
 
-        // Userinfo is refused on every form — canonical host, verbatim
-        // override and bare resource name alike — before anything that
-        // could echo the value, and the value it quotes is redacted:
-        // this message reaches the API caller. Operators authenticate
-        // with the api-key / AAD credentials, never URL-embedded ones.
-        let redacted = aisix_core::redact_url_userinfo(base);
-        if redacted != base {
-            return Err(BridgeError::InvalidUpstreamConfig(format!(
-                "azure api_base {redacted:?} must not embed userinfo (@); use the \
-                 api-key / AAD credentials in `provider_key.api_key` instead"
-            )));
-        }
-
         if let Some(rest) = base
             .strip_prefix("https://")
             .or_else(|| base.strip_prefix("http://"))
         {
             // Canonical form: split off the leading host segment
             // before the first `.`. If the remainder of the host is
-            // `openai.azure.com`, extract the resource as today.
-            // Otherwise fall through to the verbatim-override path.
+            // `openai.azure.com` and the segment is a resource name,
+            // extract the resource as today. Otherwise (another host, or
+            // a URL whose authority carries more than a resource name)
+            // fall through to the verbatim-override path.
             if let Some((host_resource, host_tail)) = rest.split_once('.') {
                 let host_tail_trimmed = host_tail.trim_end_matches('/');
                 let host_tail_core = host_tail_trimmed
                     .split_once('/')
                     .map(|(host, _path)| host)
                     .unwrap_or(host_tail_trimmed);
-                if host_tail_core == "openai.azure.com" {
-                    validate_url_token("resource name", host_resource)?;
+                if host_tail_core == "openai.azure.com"
+                    && validate_url_token("resource name", host_resource).is_ok()
+                {
                     return Ok(Self {
                         resource: host_resource.to_string(),
                         deployment: deployment.to_string(),
@@ -333,9 +323,9 @@ impl AzureUpstreamRef {
 
             // Verbatim-override branch — corporate proxy / private
             // endpoint / mock service. Defence-in-depth checks mirror
-            // the Vertex sibling fix (#390): userinfo is refused above,
-            // query and fragment here, because each opens an injection /
-            // credential-leak / api-version-downgrade vector. Scheme is
+            // the Vertex sibling fix (#390): query and fragment are
+            // refused, because each opens an injection / api-version-
+            // downgrade vector. Scheme is
             // already constrained to `http://` or `https://` by the outer
             // `strip_prefix` chain.
             if base.contains('?') {
@@ -1248,36 +1238,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_override_with_userinfo() {
-        // PR #392 audit MEDIUM-defence: an operator embedding
-        // user:pass@host in the override URL would leak via logs and
-        // bypass the api-key / AAD auth path that the bridge owns.
-        // The message reaches the API caller, so it quotes the base
-        // with the userinfo redacted — on the verbatim override, the
-        // canonical `*.openai.azure.com` host and the bare resource name.
-        for (base, shown) in [
+    fn resolve_passes_userinfo_through_verbatim() {
+        for (base, expected) in [
             (
-                "https://user:hunter2@proxy.acme.internal",
-                "https://***@proxy.acme.internal",
+                "https://user:pw@proxy.acme.internal/",
+                "https://user:pw@proxy.acme.internal",
             ),
             (
-                "https://user:hunter2@acme.openai.azure.com",
-                "https://***@acme.openai.azure.com",
+                "https://user:pw@acme.openai.azure.com",
+                "https://user:pw@acme.openai.azure.com",
             ),
-            ("user:hunter2@acme", "***@acme"),
         ] {
-            let err = AzureUpstreamRef::resolve("dep", Some(base)).unwrap_err();
-            match err {
-                BridgeError::InvalidUpstreamConfig(msg) => {
-                    assert!(
-                        msg.contains("userinfo"),
-                        "must call out the userinfo rejection; got {msg}"
-                    );
-                    assert!(msg.contains(shown), "must quote {shown}; got {msg}");
-                    assert!(!msg.contains("hunter2"), "leaked userinfo: {msg}");
-                }
-                other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
-            }
+            let r = AzureUpstreamRef::resolve("dep", Some(base)).unwrap();
+            assert_eq!(r.upstream_override.as_deref(), Some(expected), "{base}");
         }
     }
 

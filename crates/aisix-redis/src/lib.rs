@@ -1411,71 +1411,16 @@ fn discovery_budget(endpoints: usize, per_attempt: Duration) -> Duration {
     per_attempt.saturating_mul(budgets)
 }
 
-/// The backend's address with the scheme, any userinfo and any path
-/// stripped, so a diagnostic can name WHICH Redis is unreachable. The
-/// configured URL itself must never be logged — it carries the password
-/// in `redis://user:pass@host` form.
+/// The configured endpoint(s), as configured, so a diagnostic can name
+/// WHICH Redis is unreachable.
 pub fn endpoint_label(cfg: &RedisConnConfig) -> String {
-    /// What a label says when the text it was given is not a URL whose
-    /// host can be identified. Never echo the input: the thing that makes
-    /// it unparseable is usually an unescaped character in the password.
-    const UNPARSEABLE: &str = "<unparseable redis endpoint>";
-
-    fn host(url: &str) -> &str {
-        let rest = url.split_once("://").map_or(url, |(_, r)| r);
-        // Authority first: an `@` can appear after the host too (in a
-        // path or a query), and only the one inside the authority is
-        // userinfo.
-        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-        // Then the LAST `@` of the authority, so a password containing
-        // one cannot leave a fragment of itself in front of the host.
-        let candidate = authority.rsplit_once('@').map_or(authority, |(_, r)| r);
-        // And finally a shape check, because the two steps above trust
-        // the input to be well formed and a password is exactly what is
-        // most likely to make it not be. `redis://user:pw/x@host:6379`
-        // has authority `user:pw` by RFC 3986 — the `@` is in the path —
-        // so slicing alone would print the password. Emitting only text
-        // that looks like `host[:port]` makes that impossible whatever
-        // the input.
-        if is_host_port(candidate) {
-            candidate
-        } else {
-            UNPARSEABLE
-        }
-    }
-
-    /// `host`, `host:port`, or `[v6]:port` — nothing else.
-    fn is_host_port(s: &str) -> bool {
-        let (host, port) = match s.rsplit_once(':') {
-            Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (h, Some(p)),
-            _ => (s, None),
-        };
-        let host = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-            // An IPv6 literal: hex groups and separators only.
-            Some(v6) => {
-                return !v6.is_empty()
-                    && v6
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
-                    && port.is_none_or(|p| p.len() <= 5);
-            }
-            None => host,
-        };
-        !host.is_empty()
-            && host
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
-    }
-    fn hosts(urls: &[String]) -> String {
-        urls.iter().map(|u| host(u)).collect::<Vec<_>>().join(",")
-    }
     match cfg.mode {
-        RedisMode::Single => host(cfg.url.as_deref().unwrap_or_default()).to_string(),
-        RedisMode::Cluster => hosts(&cfg.nodes),
+        RedisMode::Single => cfg.url.clone().unwrap_or_default(),
+        RedisMode::Cluster => cfg.nodes.join(","),
         RedisMode::Sentinel => format!(
             "master {} via {}",
             cfg.master_name.as_deref().unwrap_or_default(),
-            hosts(&cfg.sentinels)
+            cfg.sentinels.join(",")
         ),
     }
 }
@@ -2662,24 +2607,10 @@ mod boot_connect_tests {
     // (`AISIX_RATELIMIT__REDIS__URL=redis://user:pass@host`) puts in the
     // URL this is derived from.
     #[test]
-    fn strips_scheme_userinfo_and_path() {
-        assert_eq!(
-            endpoint_label(&single("redis://10.0.0.1:6379")),
-            "10.0.0.1:6379"
-        );
+    fn names_the_endpoint_as_configured() {
         assert_eq!(
             endpoint_label(&single("rediss://user:p%40ss@10.0.0.1:6379/2")),
-            "10.0.0.1:6379"
-        );
-        // A password containing '@' must not leave its tail in front of
-        // the host, which is what splitting on the FIRST '@' would do.
-        assert_eq!(
-            endpoint_label(&single("redis://user:p@ss@10.0.0.1:6379")),
-            "10.0.0.1:6379"
-        );
-        assert_eq!(
-            endpoint_label(&single("redis://10.0.0.1:6379/#insecure")),
-            "10.0.0.1:6379"
+            "rediss://user:p%40ss@10.0.0.1:6379/2"
         );
     }
 
@@ -2731,43 +2662,6 @@ mod boot_connect_tests {
     // a redis URL unparseable is an unescaped character in the password.
     // So the rule is not "slice carefully" — it is "emit nothing that is
     // not shaped like a host", whatever the input.
-    #[test]
-    fn a_url_it_cannot_read_yields_no_text_from_the_url() {
-        // RFC 3986 puts the authority at `user:secret` here — the `@` is
-        // inside the path — so slicing alone prints the password.
-        assert_eq!(
-            endpoint_label(&single("redis://user:secret/extra@redis.internal:6379")),
-            "<unparseable redis endpoint>"
-        );
-        assert_eq!(
-            endpoint_label(&single("redis://user:secret?x@redis.internal:6379")),
-            "<unparseable redis endpoint>"
-        );
-        assert_eq!(
-            endpoint_label(&single("redis://user:secret#x@redis.internal:6379")),
-            "<unparseable redis endpoint>"
-        );
-        assert_eq!(endpoint_label(&single("")), "<unparseable redis endpoint>");
-        // A port that is not a number is not a port, so the whole thing
-        // fails the shape check rather than being printed as a host.
-        assert_eq!(
-            endpoint_label(&single("redis://host:not-a-port")),
-            "<unparseable redis endpoint>"
-        );
-    }
-
-    #[test]
-    fn an_ipv6_literal_survives_the_shape_check() {
-        assert_eq!(
-            endpoint_label(&single("redis://[2001:db8::1]:6379")),
-            "[2001:db8::1]:6379"
-        );
-        assert_eq!(
-            endpoint_label(&single("redis://user:pw@[::1]:6379")),
-            "[::1]:6379"
-        );
-    }
-
     // An entry `validate` tolerates and `connect_with` then filters out
     // must not buy a budget the walk will never spend.
     #[test]
@@ -2791,7 +2685,10 @@ mod boot_connect_tests {
             nodes: vec!["redis://a:6379".into(), "redis://admin:pw@b:6380".into()],
             ..Default::default()
         };
-        assert_eq!(endpoint_label(&cluster), "a:6379,b:6380");
+        assert_eq!(
+            endpoint_label(&cluster),
+            "redis://a:6379,redis://admin:pw@b:6380"
+        );
 
         let sentinel = RedisConnConfig {
             mode: RedisMode::Sentinel,
@@ -2799,6 +2696,9 @@ mod boot_connect_tests {
             sentinels: vec!["redis://s1:26379".into()],
             ..Default::default()
         };
-        assert_eq!(endpoint_label(&sentinel), "master mymaster via s1:26379");
+        assert_eq!(
+            endpoint_label(&sentinel),
+            "master mymaster via redis://s1:26379"
+        );
     }
 }

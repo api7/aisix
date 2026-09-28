@@ -443,42 +443,14 @@ fn normalise_cp_base_url(raw: &str) -> Result<String, BootstrapError> {
     let authority_ok = qualified
         .split_once("://")
         .is_some_and(|(_, rest)| !rest.starts_with(['/', '\\']));
-    // The authority must be a host, with no credentials in front of it.
-    // dp-manager authenticates a gateway by its mTLS client certificate
-    // and nothing else, so userinfo here is never meaningful — it is
-    // either a secret about to be written to the log (the heartbeat
-    // worker reports its URL at INFO and repeats it in every failed
-    // beat's WARN) or a pasted-wrong value silently pointing the
-    // gateway elsewhere, as `mailto:user@example.com` does once it is
-    // prefixed. The sibling `cp_etcd_endpoint` rejects `@` for the same
-    // reason.
-    let parsed = url::Url::parse(&qualified).ok();
-    let host_ok = parsed
-        .as_ref()
+    let host_ok = url::Url::parse(&qualified)
+        .ok()
         .and_then(|u| u.host_str().map(|h| !h.is_empty()))
         .unwrap_or(false);
-    let has_userinfo = parsed
-        .as_ref()
-        .is_some_and(|u| !u.username().is_empty() || u.password().is_some());
-    if !scheme_ok || !authority_ok || !host_ok || has_userinfo {
-        // What to quote is decided from the INPUT, never from the parse
-        // result: `https://user:secret@dpm.example.com:abc` fails on its
-        // port, so a parse-derived answer says "no userinfo here" and
-        // echoes the secret — from the branch that exists to keep it out
-        // of the log. `redact_userinfo` hands back its input untouched
-        // when the authority carries no `@`, so comparing the two covers
-        // every rejection branch at once. A value without credentials is
-        // still quoted byte for byte: the operator has to see what they
-        // wrote to fix it.
-        let redacted = crate::redact_url_userinfo(&qualified).into_owned();
-        let shown = if redacted == qualified {
-            raw.to_string()
-        } else {
-            redacted
-        };
+    if !scheme_ok || !authority_ok || !host_ok {
         return Err(BootstrapError::Config(format!(
             "managed.cp_base_url ({CP_BASE_URL_ENV}) must be an http(s) URL such as \
-             https://dpm.example.com:7944, got {shown:?}"
+             https://dpm.example.com:7944, got {raw:?}"
         )));
     }
     // Return the qualified *input* byte for byte, never
@@ -520,30 +492,17 @@ fn normalise_cp_etcd_endpoint(raw: &str) -> Result<String, BootstrapError> {
         .or_else(|| trimmed.strip_prefix("http://"))
         .unwrap_or(trimmed);
     let bare = bare.strip_suffix('/').unwrap_or(bare);
-    // `@` would smuggle userinfo into a field the dial reads as an
-    // authority, and the rest are the separators that begin a component
-    // `host[:port]` has no room for.
+    // The separators that begin a component `host[:port]` has no room for.
     let is_bare_authority = !bare.is_empty()
-        && !bare.contains(['/', '?', '#', '@', '\\'])
+        && !bare.contains(['/', '?', '#', '\\'])
         && url::Url::parse(&format!("https://{bare}"))
             .ok()
             .and_then(|u| u.host_str().map(|h| !h.is_empty()))
             .unwrap_or(false);
     if !is_bare_authority {
-        // Same reasoning, and the same input-derived test, as the
-        // `cp_base_url` branch above: an endpoint pasted from a URL that
-        // carried credentials must not have them read back into the
-        // startup log, in any rejection branch. Everything without
-        // credentials is still quoted byte for byte.
-        let redacted = crate::redact_url_userinfo(trimmed).into_owned();
-        let shown = if redacted == trimmed {
-            raw.to_string()
-        } else {
-            redacted
-        };
         return Err(BootstrapError::Config(format!(
             "managed.cp_etcd_endpoint ({CP_ETCD_ENDPOINT_ENV}) must be a bare host:port \
-             such as etcd.example.com:7943, got {shown:?}"
+             such as etcd.example.com:7943, got {raw:?}"
         )));
     }
     Ok(bare.to_string())
@@ -3026,7 +2985,6 @@ managed:
             Some("https://[::1]:7944")
         );
         assert!(load_with_cp_base_url("::1:7944").is_err());
-        // An ordinary host:port is unaffected by the userinfo rule.
         let cfg = load_with_cp_base_url("https://cp.example.com:7944").unwrap();
         assert_eq!(
             cfg.managed.cp_base_url.as_deref(),
@@ -3151,61 +3109,11 @@ managed:
         Config::load_from_path(Some(f.path()))
     }
 
-    /// Credentials in the authority are rejected — dp-manager
-    /// authenticates a gateway by its mTLS client certificate alone, so
-    /// userinfo is never meaningful, and the heartbeat worker reports
-    /// its URL at INFO and repeats it in every failed beat's WARN.
-    ///
-    /// The rejection therefore has to break the rule every other
-    /// rejection follows: it quotes the host but not the credential,
-    /// because echoing the value verbatim would write the secret into
-    /// the log this branch exists to keep it out of.
     #[test]
-    fn cp_base_url_rejects_credentials_without_echoing_them() {
-        let err = match load_with_cp_base_url("https://user:secret@dpm.example.com:7944") {
-            Ok(cfg) => panic!(
-                "a URL carrying credentials must not load, got cp_base_url = {:?}",
-                cfg.managed.cp_base_url
-            ),
-            Err(e) => e.to_string(),
-        };
-        assert!(
-            err.contains("AISIX_MANAGED__CP_BASE_URL"),
-            "the rejection must name the variable to fix, got: {err}"
-        );
-        assert!(
-            err.contains("***@dpm.example.com:7944"),
-            "the rejection must still show which host was named, got: {err}"
-        );
-        assert!(
-            !err.contains("secret"),
-            "the rejection must not echo the credential, got: {err}"
-        );
-
-        // The credential must not survive a rejection that fires
-        // BEFORE the userinfo check: this one fails on its port, so a
-        // parse-derived answer would report no userinfo and echo the
-        // value whole.
-        let err = load_with_cp_base_url("https://user:secret@dpm.example.com:abc")
-            .expect_err("a URL with an invalid port must not load")
-            .to_string();
-        assert!(err.contains("***@dpm.example.com:abc"), "got: {err}");
-        assert!(!err.contains("secret"), "got: {err}");
-
-        // A username with no password is the same class of value.
-        let err = load_with_cp_base_url("https://user@dpm.example.com:7944")
-            .expect_err("a URL carrying a username must not load")
-            .to_string();
-        assert!(err.contains("***@dpm.example.com:7944"), "got: {err}");
-        assert!(!err.contains("user@"), "got: {err}");
-
-        // Pasted from the wrong field: no `:/`, so the prefixed form
-        // parses to userinfo `mailto:user` with host `example.com` —
-        // a gateway quietly talking to somewhere nobody chose.
-        let err = load_with_cp_base_url("mailto:user@example.com")
-            .expect_err("a mailto: address must not load")
-            .to_string();
-        assert!(err.contains("***@example.com"), "got: {err}");
+    fn cp_base_url_keeps_userinfo_as_configured() {
+        let value = "https://user:secret@dpm.example.com:7944";
+        let cfg = load_with_cp_base_url(value).unwrap();
+        assert_eq!(cfg.managed.cp_base_url.as_deref(), Some(value));
     }
 
     #[test]
@@ -3224,47 +3132,13 @@ managed:
         }
     }
 
-    /// An etcd endpoint pasted from a URL that carried credentials is
-    /// rejected — and, like its `cp_base_url` counterpart, the
-    /// rejection must not read the credential back into the startup
-    /// log it is being written to.
     #[test]
-    fn cp_etcd_endpoint_rejects_credentials_without_echoing_them() {
-        let err = match load_with_cp_etcd_endpoint("https://user:secret@etcd.example.com:7943") {
-            Ok(cfg) => panic!(
-                "an endpoint carrying credentials must not load, got cp_etcd_endpoint = {:?}",
-                cfg.managed.cp_etcd_endpoint
-            ),
-            Err(e) => e.to_string(),
-        };
-        assert!(
-            err.contains("AISIX_MANAGED__CP_ETCD_ENDPOINT"),
-            "the rejection must name the variable to fix, got: {err}"
+    fn cp_etcd_endpoint_keeps_userinfo_as_configured() {
+        let cfg = load_with_cp_etcd_endpoint("https://user:secret@etcd.example.com:7943").unwrap();
+        assert_eq!(
+            cfg.managed.cp_etcd_endpoint.as_deref(),
+            Some("user:secret@etcd.example.com:7943")
         );
-        assert!(
-            err.contains("***@etcd.example.com:7943"),
-            "the rejection must still show which host was named, got: {err}"
-        );
-        assert!(
-            !err.contains("secret"),
-            "the rejection must not echo the credential, got: {err}"
-        );
-
-        // The scheme-less form is the same value with the prefix the
-        // operator happened not to paste.
-        let err = load_with_cp_etcd_endpoint("user:secret@etcd.example.com:7943")
-            .expect_err("a bare authority carrying credentials must not load")
-            .to_string();
-        assert!(err.contains("***@etcd.example.com:7943"), "got: {err}");
-        assert!(!err.contains("secret"), "got: {err}");
-
-        // And it must survive a rejection reached on a different
-        // ground — here the port, which fails the parse first.
-        let err = load_with_cp_etcd_endpoint("https://user:secret@etcd.example.com:abc")
-            .expect_err("an endpoint with an invalid port must not load")
-            .to_string();
-        assert!(err.contains("***@etcd.example.com:abc"), "got: {err}");
-        assert!(!err.contains("secret"), "got: {err}");
     }
 
     #[test]

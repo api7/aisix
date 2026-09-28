@@ -222,9 +222,7 @@ impl ObservabilitySink for AliyunSlsSink {
     }
 
     fn error_redactor(&self) -> ErrorRedactor {
-        ErrorRedactor::default()
-            .url(&self.endpoint_url)
-            .secret(&self.access_key_secret)
+        ErrorRedactor::default().secret(&self.access_key_secret)
     }
 }
 

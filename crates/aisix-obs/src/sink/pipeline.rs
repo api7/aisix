@@ -574,7 +574,7 @@ fn backoff(base: Duration, cap: Duration, attempt: u32) -> Duration {
 /// Redact a sink error and trim it to a bounded, log-safe excerpt. This is
 /// the one place a delivery error becomes text, and every surface — the warn
 /// log, `last_error`, the heartbeat — reads the result, so the sink's
-/// configured URL userinfo and secrets are scrubbed here. Redaction runs
+/// configured secrets are scrubbed here. Redaction runs
 /// before the cap so a secret straddling it cannot leave a prefix behind.
 /// The cap is wide enough that a sink's own 500-char detail (object URL +
 /// error source chain) survives with the enum prefix; trimming tighter than

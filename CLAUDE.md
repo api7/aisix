@@ -143,6 +143,10 @@ This repo reads its config from etcd, but users never write etcd directly — th
 
 (The meta-repo `AGENTS.md` carries the same rule for cross-plane agents.)
 
+## A Configured URL Is Opaque
+
+**Userinfo (`user:pass@`) may be configured freely in any configured URL, and the gateway neither validates nor redacts it.** This holds for every configured URL, HTTP or not (`redis://` included), resource or startup config. Userinfo is never rejected, checked or masked: logs, `Debug` output, error text and published documents carry it exactly as configured, and the URL reaches its client unchanged. Whatever the client does with the userinfo is the behaviour. A URL pattern that restricts the host allows optional userinfo in front of it without inspecting it (`([^/?#\\]*@)?` — `\` is excluded because the URL parser ends an `http` authority there), and it keeps the host after the last `@` on its allow-list. The rule covers userinfo only. A credential query parameter is a separate matter: some log sites mask or drop the query string, and the OIDC `issuer`/`jwks_uri` and MCP `resource_url` checks reject one. Secrets configured outside a URL (API keys, header values) keep their own redaction.
+
 ## A Control-Plane Response Decodes Loosely
 
 **A data plane may run against a control plane many releases newer than itself, and the etcd read tolerance covers only the resources it loads — the gateway's direct HTTP channels to the control plane need the same tolerance stated for them.** Any struct that decodes a control-plane response must never carry `#[serde(deny_unknown_fields)]`, and every field except the one the decision hinges on must be `#[serde(default)]`, so a field the newer control plane added, or an optional one it stopped sending, cannot turn into a hard error on the request path. A response the gateway does not parse today — one it reads only the status of — stays unparsed unless it is decoded under the same rule. The startup `Config` and its blocks are the deliberate exception: they are `deny_unknown_fields` because they parse the gateway's own `config.yaml`, which nothing but the operator writes.

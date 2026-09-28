@@ -32,7 +32,7 @@
 # is a bare `host:port` by contract, because the gateway attaches
 # `https://` to it itself. A leading `http://` or `https://` written
 # there is stripped rather than doubled up; anything else that is not a
-# bare `host[:port]` — a path, a query, userinfo, a port that is not a
+# bare `host[:port]` — a path, a query, a port that is not a
 # number — fails the boot naming the variable.
 #
 # Plus optionally `AISIX_PROXY__ADDR`, `AISIX_OBSERVABILITY__LOG_LEVEL`,

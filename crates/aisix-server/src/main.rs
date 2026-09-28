@@ -1159,11 +1159,8 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 anyhow::bail!("redis cache connect failed (cache.redis): {e}");
             }
             Err(e) => {
-                // Deliberately no URL: redis URLs carry credentials
-                // (redis://user:pass@host) and this error lands in logs
-                // that may ship to centralized sinks. `error` is as
-                // specific as the driver allows — see the rate-limit
-                // site above.
+                // `error` is as specific as the driver allows — see the
+                // rate-limit site above.
                 let reason = aisix_redis::failure_reason(&e);
                 let endpoint = aisix_redis::endpoint_label(redis_cfg);
                 if reason == "refused" {

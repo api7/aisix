@@ -617,8 +617,7 @@ describe("a Redis unreachable at startup degrades the limiter, not the boot", ()
     expect(appA.output()).toContain("aisix listening");
 
     // 2. One WARN names the backend, WHICH Redis, and the budget it
-    //    spent — with no credentials, because a redis URL carries the
-    //    password. The budget is the discriminator for "on the
+    //    spent, naming the endpoint as configured. The budget is the discriminator for "on the
     //    operator's budget rather than the driver's schedule": it is the
     //    per-block `timeout_secs`, not the 5s default, and not a
     //    multi-minute ladder.
@@ -627,9 +626,8 @@ describe("a Redis unreachable at startup degrades the limiter, not the boot", ()
       .split("\n")
       .find((l) => l.includes("shared rate-limit backend unreachable at startup"));
     expect(warn).toBeDefined();
-    expect(warn).toContain(new URL(relay.url).host);
+    expect(warn).toContain(`endpoint=${relay.url}`);
     expect(warn).toContain(`redis.timeout_secs = ${TIMEOUT_SECS}s`);
-    expect(warn).not.toContain("redis://");
     //    The LOWER bound does hold, and fails if the connect never
     //    reached the network at all: a boot that binds without spending
     //    the budget has not been through the path under test.
@@ -782,14 +780,12 @@ describe("a Redis that refuses the credential degrades the limiter, not the boot
       .find((l) => l.includes("shared rate-limit backend REFUSED"));
     expect(warn).toBeDefined();
     expect(warn).toContain("reason=refused");
-    expect(warn).toContain(new URL(REDIS_URL).host);
+    expect(warn).toContain(`endpoint=${REDIS_URL}`);
     //    The server's own words, which are the only part that says WHICH
     //    setting it refused.
     expect(warn?.toLowerCase()).toContain("auth");
     expect(warn).not.toContain("timed out");
     expect(warn).not.toContain("unreachable");
-    //    And never the URL, which carries the credential.
-    expect(warn).not.toContain("redis://");
 
     // 3. It still refuses: the seeded key is RPM=1, and a degraded
     //    limiter that had stopped counting would serve both of these.

@@ -129,19 +129,18 @@ impl AadCredentials {
         // Optional authority_host: when present it becomes the origin
         // of the token-endpoint URL, so it must be a bare http(s)
         // origin. Mirrors the Vertex `resolve_api_base` validation
-        // (PR #392) — reject userinfo / query / fragment first (fixed
-        // message, no echo, so pasted `user:pass@host` credentials
-        // never surface in logs), then enforce the scheme.
+        // (PR #392) — reject query / fragment first, then enforce the
+        // scheme.
         if let Some(host) = self
             .authority_host
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            if host.contains('@') || host.contains('?') || host.contains('#') {
+            if host.contains('?') || host.contains('#') {
                 return Err(BridgeError::InvalidUpstreamConfig(
                     "azure aad credentials.authority_host must be a bare origin — \
-                     reject userinfo (@), query (?), fragment (#)"
+                     reject query (?), fragment (#)"
                         .into(),
                 ));
             }
@@ -158,8 +157,7 @@ impl AadCredentials {
             // `resolve_api_base` check. Backslashes are rejected too: the
             // WHATWG URL parser the HTTP client uses normalizes `\` to `/` on
             // http(s) URLs, so `host\evil` injects a path exactly like
-            // `host/evil`. `host` has no `@`/`?`/`#` here, so echoing it is
-            // safe. Audit #434 LOW-1 / #435 (+ #464 audit MEDIUM).
+            // `host/evil`. `host` has no `?`/`#` here. Audit #434 LOW-1 / #435 (+ #464 audit MEDIUM).
             let after_scheme = host
                 .split_once("://")
                 .map(|(_, rest)| rest)
@@ -320,7 +318,7 @@ impl TokenMinter {
     ///   3. Default public-cloud authority `login.microsoftonline.com`.
     ///
     /// `authority_host` is validated by [`AadCredentials::validate`]
-    /// (bare http(s) origin, no userinfo / query / fragment) before
+    /// (bare http(s) origin, no query / fragment) before
     /// this runs, so the only normalisation needed here is trimming a
     /// trailing slash to avoid a `//{tenant}` double slash.
     fn resolve_token_endpoint(&self, creds: &AadCredentials) -> String {
@@ -791,25 +789,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_authority_host_with_userinfo_without_echoing_it() {
+    fn validate_accepts_authority_host_with_userinfo() {
         let creds = AadCredentials {
             tenant_id: "t".into(),
             client_id: "app".into(),
             client_secret: "s".into(),
-            authority_host: Some("https://user:pass@evil.example.com".into()),
+            authority_host: Some("https://user:pass@login.example.com".into()),
         };
-        let err = creds.validate().err().unwrap();
-        match err {
-            BridgeError::InvalidUpstreamConfig(msg) => {
-                assert!(msg.contains("bare origin"));
-                // The pasted userinfo must NOT surface in the error.
-                assert!(!msg.contains("pass"), "error leaked userinfo: {msg}");
-                assert!(
-                    !msg.contains("evil.example.com"),
-                    "error leaked host: {msg}"
-                );
-            }
-            other => panic!("expected InvalidUpstreamConfig, got {other:?}"),
-        }
+        creds.validate().expect("userinfo is part of an opaque URL");
     }
 }

@@ -189,9 +189,7 @@ impl ObservabilitySink for DatadogSink {
     }
 
     fn error_redactor(&self) -> ErrorRedactor {
-        ErrorRedactor::default()
-            .url(&self.endpoint_url)
-            .secret(&self.api_key)
+        ErrorRedactor::default().secret(&self.api_key)
     }
 }
 

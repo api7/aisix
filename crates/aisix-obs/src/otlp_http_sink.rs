@@ -699,7 +699,7 @@ impl ObservabilitySink for OtlpSink {
     fn error_redactor(&self) -> ErrorRedactor {
         self.headers
             .values()
-            .fold(ErrorRedactor::default().url(&self.endpoint), |r, value| {
+            .fold(ErrorRedactor::default(), |r, value| {
                 // A receiver may quote only the credential of `<scheme> <credential>`.
                 let credential = value.trim().rsplit_once(' ').map_or("", |(_, c)| c).trim();
                 // Only an auth-shaped value splits; `team a` must not make
@@ -2375,10 +2375,10 @@ mod tests {
         last
     }
 
-    /// A configured endpoint may carry `user:pass@`, and the headers carry
-    /// the receiver's credential. Neither may reach `last_error` — neither
-    /// through the transport error that names the endpoint, nor through a
-    /// receiver that echoes the credential back in its error body.
+    /// The headers carry the receiver's credential, which must not reach
+    /// `last_error` through a receiver that echoes it back in its error
+    /// body. A configured endpoint is reported as configured, userinfo
+    /// included — it gets no special handling.
     #[tokio::test]
     async fn otlp_delivery_errors_carry_no_configured_credential() {
         let headers = BTreeMap::from([(
@@ -2397,8 +2397,10 @@ mod tests {
         ))
         .await;
         assert!(
-            unreachable.contains(&format!("POST http://***@127.0.0.1:{closed}/v1/traces")),
-            "the endpoint stays diagnosable: {unreachable}"
+            unreachable.contains(&format!(
+                "POST http://otlp-user:otlp-pass@127.0.0.1:{closed}/v1/traces"
+            )),
+            "the endpoint is reported as configured: {unreachable}"
         );
 
         let server = wiremock::MockServer::start().await;
@@ -2421,9 +2423,10 @@ mod tests {
         assert!(echoed.contains("HTTP 401"), "{echoed}");
 
         for last in [unreachable, echoed] {
-            for secret in ["otlp-user", "otlp-pass", "otlp-header-token"] {
-                assert!(!last.contains(secret), "{secret} leaked into: {last}");
-            }
+            assert!(
+                !last.contains("otlp-header-token"),
+                "the header credential leaked into: {last}"
+            );
         }
     }
 

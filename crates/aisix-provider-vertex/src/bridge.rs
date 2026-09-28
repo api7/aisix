@@ -180,8 +180,6 @@ impl VertexBridge {
     /// the URL template, so we reject classes of input that the
     /// bridge cannot safely concatenate or that would shadow auth:
     ///   - non-`http(s)` schemes (no `file://`, `gs://`, etc.)
-    ///   - userinfo `@` (an operator embedding `user:pass@host` would
-    ///     leak credentials via logs / SSRF-style escalation)
     ///   - `?` query string (would silently merge with the streaming
     ///     `?alt=sse` the bridge appends)
     ///   - `#` fragment (no meaningful semantic for an upstream POST)
@@ -223,17 +221,6 @@ impl VertexBridge {
                     "vertex provider_key api_base must use http:// or https:// scheme, got {b:?}",
                 )));
             }
-            if b.contains('@') {
-                // Redact userinfo before echoing the rejected value into
-                // the error string — the whole point of rejecting `@` is
-                // that operator-pasted credentials shouldn't appear in
-                // logs. Audit #392 re-audit LOW-1.
-                let redacted = aisix_core::redact_url_userinfo(b);
-                return Err(BridgeError::InvalidUpstreamConfig(format!(
-                    "vertex provider_key api_base must not embed userinfo (@); use the request's \
-                     Authorization header instead, got {redacted:?}",
-                )));
-            }
             if b.contains('?') {
                 return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "vertex provider_key api_base must not contain a query string (the bridge \
@@ -253,8 +240,7 @@ impl VertexBridge {
             // with a clear Config error. Backslashes are rejected too: the
             // WHATWG URL parser the HTTP client uses normalizes `\` to `/` on
             // http(s) URLs, so `host\evil` injects a path exactly like
-            // `host/evil`. `b` has no `@`/`?`/`#` here (rejected above), so
-            // echoing it is safe. Audit #434 LOW-1 / #435 (+ #464 audit MEDIUM).
+            // `host/evil`. Audit #434 LOW-1 / #435 (+ #464 audit MEDIUM).
             let after_scheme = b
                 .split_once("://")
                 .map(|(_, rest)| rest)
@@ -2514,9 +2500,9 @@ mod tests {
     //
     // The operator-supplied api_base is interpolated directly into
     // `format!("{base}/v1/projects/...")`. The bridge rejects classes
-    // of input that would either escalate (userinfo `@`) or silently
-    // corrupt the URL stitching (`?` / `#`). Mirrors the Azure-OpenAI
-    // sibling fix (#391) which rejects the same shapes.
+    // of input that would silently corrupt the URL stitching (`?` / `#`).
+    // Mirrors the Azure-OpenAI sibling fix (#391) which rejects the same
+    // shapes.
 
     #[test]
     fn resolve_api_base_rejects_non_http_scheme() {
@@ -2549,36 +2535,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_api_base_rejects_embedded_userinfo() {
+    fn resolve_api_base_passes_userinfo_through_verbatim() {
         let bridge = VertexBridge::new();
-        // userinfo (`user:pass@host`) is rejected because:
-        //   1. it would leak credentials via access-log URLs;
-        //   2. the bridge writes its own Authorization header from
-        //      the SA-minted Bearer; userinfo would either shadow it
-        //      or get sent to a non-Google host.
-        let err = bridge
+        let resolved = bridge
             .resolve_api_base("us-central1", Some("https://user:secret@proxy.internal"))
-            .err()
             .unwrap();
-        match err {
-            BridgeError::InvalidUpstreamConfig(msg) => {
-                assert!(msg.contains("userinfo") || msg.contains("@"));
-                // Defense-in-depth: the error message MUST NOT echo
-                // the original userinfo back into log output (re-audit
-                // LOW-1). The shared redactor replaces `user:secret`
-                // with `***` so an operator-supplied credential doesn't
-                // propagate into operational telemetry.
-                assert!(
-                    !msg.contains("user:secret"),
-                    "error message leaked operator-supplied userinfo: {msg}"
-                );
-                assert!(
-                    msg.contains("https://***@proxy.internal"),
-                    "error message should redact userinfo: {msg}"
-                );
-            }
-            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
-        }
+        assert!(
+            resolved.starts_with("https://user:secret@proxy.internal"),
+            "{resolved}"
+        );
     }
 
     #[test]
