@@ -299,16 +299,19 @@ impl AzureUpstreamRef {
         {
             // Canonical form: split off the leading host segment
             // before the first `.`. If the remainder of the host is
-            // `openai.azure.com`, extract the resource as today.
-            // Otherwise fall through to the verbatim-override path.
+            // `openai.azure.com` and the segment is a resource name,
+            // extract the resource as today. Otherwise (another host, or
+            // a URL whose authority carries more than a resource name)
+            // fall through to the verbatim-override path.
             if let Some((host_resource, host_tail)) = rest.split_once('.') {
                 let host_tail_trimmed = host_tail.trim_end_matches('/');
                 let host_tail_core = host_tail_trimmed
                     .split_once('/')
                     .map(|(host, _path)| host)
                     .unwrap_or(host_tail_trimmed);
-                if host_tail_core == "openai.azure.com" {
-                    validate_url_token("resource name", host_resource)?;
+                if host_tail_core == "openai.azure.com"
+                    && validate_url_token("resource name", host_resource).is_ok()
+                {
                     return Ok(Self {
                         resource: host_resource.to_string(),
                         deployment: deployment.to_string(),
@@ -1235,13 +1238,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_passes_override_userinfo_through_verbatim() {
-        let r =
-            AzureUpstreamRef::resolve("dep", Some("https://user:pw@proxy.acme.internal/")).unwrap();
-        assert_eq!(
-            r.upstream_override.as_deref(),
-            Some("https://user:pw@proxy.acme.internal"),
-        );
+    fn resolve_passes_userinfo_through_verbatim() {
+        for (base, expected) in [
+            (
+                "https://user:pw@proxy.acme.internal/",
+                "https://user:pw@proxy.acme.internal",
+            ),
+            (
+                "https://user:pw@acme.openai.azure.com",
+                "https://user:pw@acme.openai.azure.com",
+            ),
+        ] {
+            let r = AzureUpstreamRef::resolve("dep", Some(base)).unwrap();
+            assert_eq!(r.upstream_override.as_deref(), Some(expected), "{base}");
+        }
     }
 
     #[test]

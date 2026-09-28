@@ -57,7 +57,7 @@ pub struct OtlpHttpConfig {
     /// Full URL of the OTLP/HTTP traces endpoint. Include the receiver's
     /// expected path, such as `/v1/traces`.
     #[schemars(regex(
-        pattern = r"^https://.+|^http://([^/?#]*@)?(mock-otlp|otel-collector|127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$"
+        pattern = r"^https://.+|^http://([^/?#\\]*@)?(mock-otlp|otel-collector|127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$"
     ))]
     pub endpoint: String,
 
@@ -202,7 +202,7 @@ pub struct ObjectStoreConfig {
     /// Backend endpoint override: an S3-compatible host such as MinIO, Aliyun OSS, or Cloudflare R2, a Cloud Storage XML API base URL such as a private endpoint, or an Azure Blob endpoint. A `gcs` endpoint must implement the Cloud Storage XML API and accept the percent-encoded object names the gateway sends; the stock fake-gcs-server image does not, so it cannot receive objects. When omitted, the provider's native endpoint is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(
-        pattern = r"^https://.+|^http://([^/?#]*@)?(minio|azurite|fake-gcs-server|fake-gcs|127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$"
+        pattern = r"^https://.+|^http://([^/?#\\]*@)?(minio|azurite|fake-gcs-server|fake-gcs|127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$"
     ))]
     pub endpoint: Option<String>,
 
@@ -441,10 +441,17 @@ mod tests {
             (otlp("http://user@mock-otlp/v1/traces"), true),
             (otlp("http://localhost@evil.example/x"), false),
             (otlp("http://a@localhost@evil.example"), false),
+            // `\` ends the authority for the URL parser, so this is host
+            // `evil.example` with a path, not userinfo in front of localhost.
+            (
+                otlp(r"http://evil.example\@localhost:4318/v1/traces"),
+                false,
+            ),
             (otlp("http://user:pw@evil.example/v1/traces"), false),
             (object_store("http://ak:sk@minio:9000"), true),
             (object_store("http://localhost@evil.example/x"), false),
             (object_store("http://a@localhost@evil.example"), false),
+            (object_store(r"http://evil.example\@minio:9000"), false),
         ] {
             assert_eq!(both(&doc), (accepted, accepted), "{doc}");
         }
