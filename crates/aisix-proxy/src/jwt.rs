@@ -1221,8 +1221,8 @@ async fn resolve_jwks_url(prov: &OidcProvider) -> Result<String, String> {
 }
 
 /// True when a URL embeds a credential query parameter, which must never
-/// sit in a public JWKS endpoint. A defense-in-depth mirror of the control plane's ingestion
-/// check, for file-mode and discovery-returned URLs.
+/// sit in a public JWKS endpoint. A defense-in-depth mirror of the control
+/// plane's ingestion check, for file-mode and discovery-returned URLs.
 fn url_has_credentials(url: &str) -> bool {
     match reqwest::Url::parse(url) {
         Ok(u) => u.query_pairs().any(|(k, _)| {
@@ -1984,6 +1984,16 @@ jyxumGxNpoIV8LlzsMsaWQ==
         assert!(matches!(
             key_for_subject(&index, &snapshot, "corp", "agent-1"),
             (None, true)
+        ));
+    }
+
+    #[test]
+    fn a_jwks_url_is_refused_for_a_credential_query_not_for_userinfo() {
+        assert!(!url_has_credentials(
+            "https://user:pw@idp.example.com/certs"
+        ));
+        assert!(url_has_credentials(
+            "https://idp.example.com/certs?access_token=x"
         ));
     }
 
