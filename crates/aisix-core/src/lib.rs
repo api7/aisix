@@ -29,7 +29,6 @@ pub mod resource;
 pub mod sched;
 pub mod similarity;
 pub mod snapshot;
-pub mod url_redact;
 pub mod version;
 pub mod wildcard;
 
@@ -73,5 +72,4 @@ pub use resource::{Resource, ResourceEntry};
 pub use sched::{demote_current_thread, run_demoted};
 pub use similarity::{best_similarity, best_similarity_by, cosine_similarity};
 pub use snapshot::{ResourceTable, SnapshotHandle};
-pub use url_redact::redact_url_userinfo;
 pub use version::{BUILD_VERSION, HEARTBEAT_VERSION};

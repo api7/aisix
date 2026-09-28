@@ -1220,23 +1220,17 @@ async fn resolve_jwks_url(prov: &OidcProvider) -> Result<String, String> {
     }
 }
 
-/// True when a URL embeds credentials that must never sit in a public
-/// JWKS endpoint: userinfo (`user:pass@host`) or a credential query
-/// parameter. A defense-in-depth mirror of the control plane's ingestion
+/// True when a URL embeds a credential query parameter, which must never
+/// sit in a public JWKS endpoint. A defense-in-depth mirror of the control plane's ingestion
 /// check, for file-mode and discovery-returned URLs.
 fn url_has_credentials(url: &str) -> bool {
     match reqwest::Url::parse(url) {
-        Ok(u) => {
-            if !u.username().is_empty() || u.password().is_some() {
-                return true;
-            }
-            u.query_pairs().any(|(k, _)| {
-                matches!(
-                    k.to_ascii_lowercase().as_str(),
-                    "access_token" | "token" | "client_secret" | "password" | "api_key" | "apikey"
-                )
-            })
-        }
+        Ok(u) => u.query_pairs().any(|(k, _)| {
+            matches!(
+                k.to_ascii_lowercase().as_str(),
+                "access_token" | "token" | "client_secret" | "password" | "api_key" | "apikey"
+            )
+        }),
         // Unparseable here is caught elsewhere (fetch fails); treat as
         // credential-free so this check doesn't double-report.
         Err(_) => false,

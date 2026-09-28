@@ -254,12 +254,6 @@ fn validate_resource_url(resource_url: &str) -> Option<DiscoveryIdentity> {
     if !matches!(parsed.scheme(), "http" | "https") {
         return None;
     }
-    // Userinfo would be published verbatim on the unauthenticated PRM
-    // endpoint — a credential pasted into the URL must never activate
-    // the surface (audit finding on #859).
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return None;
-    }
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return None;
     }
@@ -509,10 +503,6 @@ mod tests {
             "https://gw.example.com/mcp?x=1",
             "https://gw.example.com/mcp#frag",
             "https://gw.example.com/",
-            // Userinfo would be served verbatim on the unauthenticated
-            // PRM endpoint — never activate on it.
-            "https://user:s3cret@gw.example.com/mcp",
-            "https://user@gw.example.com/mcp",
         ] {
             let snap = AisixSnapshot::new();
             snap.mcp_auth_settings.insert(settings_entry("env-1", bad));

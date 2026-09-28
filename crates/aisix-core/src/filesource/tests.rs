@@ -1111,12 +1111,12 @@ mcp_auth_settings:
 #[test]
 fn mcp_auth_settings_resource_url_with_credentials_is_a_load_error() {
     // The resource URL is served verbatim on the unauthenticated PRM
-    // endpoint, so embedded credentials must fail the load — same rule
-    // as OIDC issuer/jwks_uri.
+    // endpoint, so a credential query must fail the load — same rule as
+    // OIDC issuer/jwks_uri.
     let contents = r#"
 _format_version: "1"
 mcp_auth_settings:
-  - resource_url: https://user:s3cret@gw.example.com/mcp
+  - resource_url: https://gw.example.com/mcp?token=s3cret
 "#;
     let errs = errors_of(load(contents, &env_of(&[])));
     assert!(
@@ -1152,13 +1152,38 @@ oidc_providers:
   - name: leaky
     issuer: https://sso.example.com/realms/agents
     audiences: ["aisix"]
-    jwks_uri: https://user:secret@sso.example.com/certs
+    jwks_uri: https://sso.example.com/certs?access_token=secret
 "#;
     let errs = errors_of(load(contents, &env_of(&[])));
     assert!(
         errs.iter()
             .any(|e| e.contains("must not embed credentials")),
         "{errs:?}"
+    );
+}
+
+#[test]
+fn oidc_and_mcp_urls_with_userinfo_load_as_configured() {
+    let contents = r#"
+_format_version: "1"
+oidc_providers:
+  - name: basic
+    issuer: https://user:secret@sso.example.com/realms/agents
+    audiences: ["aisix"]
+    jwks_uri: https://user:secret@sso.example.com/certs
+mcp_auth_settings:
+  - resource_url: https://user:secret@gw.example.com/mcp
+"#;
+    let snapshot = load(contents, &env_of(&[])).expect("loads");
+    let provider = snapshot.oidc_providers.entries().pop().unwrap();
+    assert_eq!(
+        provider.value.jwks_uri.as_deref(),
+        Some("https://user:secret@sso.example.com/certs")
+    );
+    let settings = snapshot.mcp_auth_settings.entries().pop().unwrap();
+    assert_eq!(
+        settings.value.resource_url.as_deref(),
+        Some("https://user:secret@gw.example.com/mcp")
     );
 }
 

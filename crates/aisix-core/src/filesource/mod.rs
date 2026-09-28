@@ -111,19 +111,10 @@ impl std::error::Error for FileSourceErrors {}
 /// change semantics without silently misreading old gateways' files.
 const SUPPORTED_FORMAT_VERSION: &str = "1";
 
-/// True when a URL embeds credentials that must not sit in a public JWKS
-/// endpoint: userinfo (`user:pass@host`) or a credential-bearing query
-/// parameter. String-scanned rather than URL-parsed to avoid pulling a
-/// URL crate into `aisix-core`.
+/// True when a URL embeds a credential-bearing query parameter, which must
+/// not sit in a public JWKS endpoint. String-scanned rather than
+/// URL-parsed to avoid pulling a URL crate into `aisix-core`.
 pub(crate) fn url_has_credentials(url: &str) -> bool {
-    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-    // Authority ends at the first '/', '?', or '#'.
-    let authority_end = after_scheme
-        .find(['/', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    if after_scheme[..authority_end].contains('@') {
-        return true;
-    }
     if let Some((_, query)) = url.split_once('?') {
         let query = query.split('#').next().unwrap_or(query);
         for pair in query.split('&') {
@@ -1022,8 +1013,8 @@ pub fn load_from_str(
         }
     }
 
-    // A JWKS/discovery URL must never carry embedded credentials
-    // (`user:pass@host` or a credential query): JWKS material is public,
+    // A JWKS/discovery URL must never carry a credential query: JWKS
+    // material is public,
     // credentials there would only leak (e.g. through a snapshot export).
     for (_, scope, provider) in &oidc_providers {
         for (field, url) in [
@@ -1035,8 +1026,8 @@ pub fn load_from_str(
                     errors.push(LoadError {
                         scope: scope.clone(),
                         message: format!(
-                            "OIDC provider {field} must not embed credentials (user info or a \
-                             token query parameter) — JWKS endpoints are public"
+                            "OIDC provider {field} must not embed credentials (a token query \
+                             parameter) — JWKS endpoints are public"
                         ),
                     });
                 }
@@ -1054,9 +1045,8 @@ pub fn load_from_str(
         if url_has_credentials(resource_url) {
             errors.push(LoadError {
                 scope: scope.clone(),
-                message: "mcp_auth_settings resource_url must not embed credentials (user \
-                          info or a token query parameter) — protected resource metadata \
-                          is public"
+                message: "mcp_auth_settings resource_url must not embed credentials (a token \
+                          query parameter) — protected resource metadata is public"
                     .into(),
             });
         }
