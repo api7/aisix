@@ -88,16 +88,27 @@ const GEMINI_NO_TOTAL_BODY = {
   },
 };
 
-// Vertex's real stream shape (captured from gemini-2.5-flash): every
-// frame carries `usageMetadata`, but only the last one has token counts —
-// the earlier ones hold `trafficType` alone.
+// Vertex stamps `usageMetadata` on every streamed frame. A frame may hold
+// `trafficType` alone (the captured gemini-2.5-flash shape: only the last
+// frame has counts) or cumulative counts; the stream must record the same
+// raw row either way.
 const GEMINI_STREAM_FRAMES = [
   `data: ${JSON.stringify({
     candidates: [{ content: { role: "model", parts: [{ text: "o" }] } }],
     usageMetadata: { trafficType: "ON_DEMAND" },
   })}\n\n`,
   `data: ${JSON.stringify({
-    candidates: [{ content: { role: "model", parts: [{ text: "k" }] }, finishReason: "STOP" }],
+    candidates: [{ content: { role: "model", parts: [{ text: "k" }] } }],
+    usageMetadata: {
+      promptTokenCount: PROMPT,
+      candidatesTokenCount: 5,
+      thoughtsTokenCount: THOUGHTS,
+      totalTokenCount: PROMPT + 5 + THOUGHTS,
+      trafficType: "ON_DEMAND",
+    },
+  })}\n\n`,
+  `data: ${JSON.stringify({
+    candidates: [{ content: { role: "model", parts: [{ text: "!" }] }, finishReason: "STOP" }],
     usageMetadata: {
       promptTokenCount: PROMPT,
       candidatesTokenCount: CANDIDATES,
