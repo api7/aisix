@@ -12,6 +12,7 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { metricDelta, scrapeMetrics } from "../harness/metrics.js";
 
 // #585: an `object_store` exporter for provider `gcs` honours `endpoint`, as
 // the `s3` and `azure_blob` providers already did. It used to be ignored, so
@@ -48,8 +49,12 @@ interface GcsReceiver {
   close(): Promise<void>;
 }
 
-/** Accepts Cloud Storage XML-API object uploads and keeps each one. */
-async function startGcsReceiver(): Promise<GcsReceiver> {
+/**
+ * Records every Cloud Storage XML-API object upload and answers it with
+ * `status`: 200 accepts it; anything else rejects it the way a server
+ * without the XML upload API does.
+ */
+async function startGcsReceiver(status = 200): Promise<GcsReceiver> {
   const uploads: Upload[] = [];
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -60,9 +65,14 @@ async function startGcsReceiver(): Promise<GcsReceiver> {
         path: decodeURIComponent((req.url ?? "").split("?")[0]),
         body: Buffer.concat(chunks),
       });
-      res.statusCode = 200;
-      res.setHeader("etag", '"e2e-etag"');
-      res.end();
+      res.statusCode = status;
+      if (status === 200) {
+        res.setHeader("etag", '"e2e-etag"');
+        res.end();
+      } else {
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ error: { code: status, message: "invalid uploadType" } }));
+      }
     });
   });
   const port = await pickFreePort();
@@ -82,18 +92,23 @@ describe("object_store exporter for gcs honours endpoint (#585)", () => {
   let etcdReachable = false;
   let upstream: OpenAiUpstream | undefined;
   let gcs: GcsReceiver | undefined;
+  let rejecting: GcsReceiver | undefined;
   let app: SpawnedApp | undefined;
+  let rejectingApp: SpawnedApp | undefined;
 
   beforeAll(async () => {
     etcdReachable = await new EtcdClient().ping();
     if (!etcdReachable) return;
     upstream = await startOpenAiUpstream();
     gcs = await startGcsReceiver();
+    rejecting = await startGcsReceiver(400);
   });
 
   afterAll(async () => {
     await app?.exit();
+    await rejectingApp?.exit();
     await gcs?.close();
+    await rejecting?.close();
     await upstream?.close();
   });
 
@@ -163,6 +178,76 @@ describe("object_store exporter for gcs honours endpoint (#585)", () => {
       expect(upload!.path.startsWith(`/${BUCKET}/${PREFIX}/`)).toBe(true);
       const event = JSON.parse(upload!.body.toString("utf8").trim().split("\n")[0]);
       expect(event.request_id).toBe(requestId);
+    },
+    60_000,
+  );
+  test(
+    "an endpoint that rejects the upload with 400 drops the batch on its first attempt",
+    async (ctx) => {
+      if (!etcdReachable || !upstream || !rejecting) {
+        ctx.skip();
+        return;
+      }
+      const exporterName = "gcs-endpoint-rejecting";
+      const slug = CREDENTIAL_REF.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+      rejectingApp = await spawnApp({
+        extraEnv: { [`OBJSTORE_CRED_${slug}_GCS_SERVICE_ACCOUNT_KEY`]: SERVICE_ACCOUNT },
+      });
+      const seed = new SeedClient(new EtcdClient(), rejectingApp.etcdPrefix);
+      await seed.createObservabilityExporter({
+        name: exporterName,
+        enabled: true,
+        kind: "object_store",
+        provider: "gcs",
+        bucket: BUCKET,
+        prefix: PREFIX,
+        endpoint: rejecting.url,
+        compression: "none",
+        credential_ref: CREDENTIAL_REF,
+      });
+      const pk = await seed.createProviderKey({
+        display_name: "objstore-gcs-rejecting-pk",
+        secret: "sk-mock-objstore-gcs",
+        api_base: `${upstream.baseUrl}/v1`,
+      });
+      await seed.createModel({
+        display_name: MODEL,
+        provider: "openai",
+        model_name: "gpt-4o-mini",
+        provider_key_id: pk.id,
+      });
+      await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: [MODEL] });
+      const proxy = new ProxyClient(rejectingApp.proxyUrl, CALLER_PLAINTEXT);
+      await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
+
+      const before = await scrapeMetrics(rejectingApp.metricsUrl);
+      const res = await fetch(`${rejectingApp.proxyUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model: MODEL, messages: [{ role: "user", content: "hi" }] }),
+      });
+      await res.arrayBuffer();
+      expect(res.status).toBe(200);
+
+      // A rejected upload that were retried would hold the batch for
+      // minutes; one that is given up on is counted within seconds.
+      const deadline = Date.now() + 20_000;
+      let drops = 0;
+      while (Date.now() < deadline) {
+        const after = await scrapeMetrics(rejectingApp.metricsUrl);
+        drops = metricDelta(before, after, "aisix_otlp_fanout_drops_total", {
+          exporter: exporterName,
+          reason: "permanent_error",
+        });
+        if (drops > 0) break;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      expect(drops).toBeGreaterThan(0);
+      expect(rejecting.uploads.length).toBe(1);
+      expect(rejecting.uploads[0].method).toBe("PUT");
     },
     60_000,
   );
