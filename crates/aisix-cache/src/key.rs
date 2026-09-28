@@ -204,7 +204,33 @@ fn canonical_extras(extra: &serde_json::Map<String, serde_json::Value>) -> Vec<(
 }
 
 fn canonical_json_string(value: &serde_json::Value) -> String {
-    canonicalise(value).to_string()
+    serde_json::to_string(&Canonical(value)).unwrap_or_default()
+}
+
+/// Serializes a value with every nested object's keys in sorted order —
+/// the same text as `canonicalise(value).to_string()`, written straight
+/// from the borrowed value. A content-block array can carry megabytes of
+/// base64 images, and a canonicalised clone of it would be one more copy
+/// of the request for the sake of a hash input.
+struct Canonical<'a>(&'a serde_json::Value);
+
+impl serde::Serialize for Canonical<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self.0 {
+            serde_json::Value::Object(map) => {
+                let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                let mut out = serializer.serialize_map(Some(entries.len()))?;
+                for (k, v) in entries {
+                    out.serialize_entry(k, &Canonical(v))?;
+                }
+                out.end()
+            }
+            serde_json::Value::Array(items) => serializer.collect_seq(items.iter().map(Canonical)),
+            other => other.serialize(serializer),
+        }
+    }
 }
 
 /// Return a clone of `value` with every nested object's keys reordered
@@ -241,7 +267,8 @@ fn message_pair(m: &ChatMessage) -> (String, String) {
     // (sorted keys at every nesting level) so JSON-key-order
     // differences don't cause spurious cache misses.
     let content_repr = match m.content_blocks.as_ref() {
-        Some(blocks) => canonical_json_string(&serde_json::Value::Array(blocks.clone())),
+        Some(blocks) => serde_json::to_string(&blocks.iter().map(Canonical).collect::<Vec<_>>())
+            .unwrap_or_default(),
         None => m.content_str().to_string(),
     };
     // Message-level identity beyond the content changes what the
@@ -301,6 +328,23 @@ fn quantise_milli(v: f32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn canonical_serialization_matches_a_canonicalised_copy() {
+        // Written straight from the borrowed value, it must produce the
+        // exact text the canonicalised clone did — the fingerprint of every
+        // stored entry depends on it.
+        let v = serde_json::json!([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"}},
+            {"z": [ {"b": 1, "a": {"y": null, "x": [true, 1.5, "s"]}} ], "a": "text"}
+        ]);
+        assert_eq!(canonical_json_string(&v), canonicalise(&v).to_string());
+        let blocks = v.as_array().unwrap();
+        assert_eq!(
+            serde_json::to_string(&blocks.iter().map(Canonical).collect::<Vec<_>>()).unwrap(),
+            canonicalise(&v).to_string()
+        );
+    }
     use super::*;
 
     fn req(model: &str, messages: Vec<ChatMessage>, temp: Option<f32>) -> ChatFormat {

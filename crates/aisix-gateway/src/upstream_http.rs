@@ -231,6 +231,23 @@ pub fn send_error(err: reqwest::Error) -> BridgeError {
     }
 }
 
+/// Serialize an upstream request body into an exactly-sized buffer.
+///
+/// Send it with `.body(bytes)` instead of `RequestBuilder::json`, and build
+/// it BEFORE the request future, so whatever it was built from — a
+/// `serde_json::Value`, a translated wire struct — is dropped before the
+/// upstream is awaited. reqwest keeps the body until the response head
+/// arrives, which for a non-streaming call is the whole upstream wait, and
+/// the handler still holds its parsed request for retry and fallback; every
+/// other copy alive across that await is one more multiple of a request
+/// that can carry tens of MB of base64 images. `to_vec` grows its buffer by
+/// doubling, so the spare capacity is handed back before the buffer is held.
+pub fn json_body<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<bytes::Bytes> {
+    let mut buf = serde_json::to_vec(value)?;
+    buf.shrink_to_fit();
+    Ok(bytes::Bytes::from(buf))
+}
+
 /// Same as [`transport_error_message`] for error types that aren't
 /// `reqwest::Error` (websocket handshakes, SDK dispatch errors) — no URL
 /// is available to redact, so only the cause chain is appended.
@@ -290,6 +307,21 @@ fn redact_url(url: &reqwest::Url) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_body_is_the_serialization_in_a_buffer_of_exactly_its_length() {
+        // Large enough that `to_vec`'s doubling leaves spare capacity.
+        let value = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x".repeat(300_000)}],
+        });
+        let body = json_body(&value).unwrap();
+        assert_eq!(body, serde_json::to_vec(&value).unwrap());
+        // Converting back hands over the buffer as it is held, capacity
+        // included.
+        let len = body.len();
+        assert_eq!(Vec::from(body).capacity(), len);
+    }
 
     #[test]
     fn defaults_bound_connect_and_expire_idle_before_reqwest_would() {
@@ -463,6 +495,43 @@ mod tests {
             offenders.is_empty(),
             "these reach an external service without the deployment's outbound TLS \
              trust or its connection settings:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    /// Request bodies bound for a model upstream go out as [`json_body`]
+    /// bytes, never through `RequestBuilder::json`. The builder form keeps
+    /// whatever it serialized from alive for as long as the call site
+    /// does, which on these routes is the whole upstream wait, and it
+    /// hands reqwest a buffer with doubling slack; either one multiplies
+    /// what a request carrying tens of MB of images costs while it waits.
+    #[test]
+    fn upstream_request_bodies_are_sent_as_json_body_bytes() {
+        let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        let mut offenders = Vec::new();
+        for file in rust_sources(crates_dir) {
+            let in_scope = file.components().any(|c| {
+                let c = c.as_os_str().to_string_lossy();
+                c == "aisix-proxy" || c.starts_with("aisix-provider-")
+            });
+            if !in_scope {
+                continue;
+            }
+            let src = std::fs::read_to_string(&file).expect("read source");
+            let production = production_half(&src);
+            for (at, _) in production.match_indices(".json(") {
+                let rest = production[at + ".json(".len()..].trim_start();
+                // `resp.json()` decodes a response; only an argument sends one.
+                if !rest.starts_with(')') {
+                    let line = production[..at].lines().count();
+                    offenders.push(format!("{}:{line}", file.display()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "send upstream request bodies as `aisix_gateway::json_body` bytes built \
+             before the request future, not with `RequestBuilder::json`:\n{}",
             offenders.join("\n"),
         );
     }

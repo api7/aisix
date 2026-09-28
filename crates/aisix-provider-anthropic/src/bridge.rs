@@ -349,6 +349,14 @@ fn build_request_headers(
     Ok(headers)
 }
 
+/// The wire bytes of a translated request, built where the translation is
+/// a temporary so it is gone before the upstream is awaited — see
+/// [`aisix_gateway::json_body`].
+fn outbound_bytes<T: serde::Serialize>(body: &T) -> Result<bytes::Bytes, BridgeError> {
+    aisix_gateway::json_body(body)
+        .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))
+}
+
 #[async_trait]
 impl Bridge for AnthropicBridge {
     fn name(&self) -> &'static str {
@@ -367,14 +375,17 @@ impl Bridge for AnthropicBridge {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        let (system, messages) =
-            split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
-        let mut body = build_request(req, upstream, system, messages, false);
+        let body = {
+            let (system, messages) =
+                split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
+            let mut body = build_request(req, upstream, system, messages, false);
+            maybe_inject_cache_breakpoints(&mut body, ctx);
+            outbound_bytes(&body)?
+        };
         let synthetic_json_tool = matches!(
             structured_output_for(req, upstream),
             StructuredOutput::Tool(_)
         );
-        maybe_inject_cache_breakpoints(&mut body, ctx);
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "anthropic/messages",
@@ -396,7 +407,7 @@ impl Bridge for AnthropicBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
@@ -444,10 +455,13 @@ impl Bridge for AnthropicBridge {
             return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
         }
 
-        let (system, messages) =
-            split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
-        let mut body = build_request(req, upstream, system, messages, true);
-        maybe_inject_cache_breakpoints(&mut body, ctx);
+        let body = {
+            let (system, messages) =
+                split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
+            let mut body = build_request(req, upstream, system, messages, true);
+            maybe_inject_cache_breakpoints(&mut body, ctx);
+            outbound_bytes(&body)?
+        };
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "anthropic/messages",
@@ -468,7 +482,7 @@ impl Bridge for AnthropicBridge {
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)

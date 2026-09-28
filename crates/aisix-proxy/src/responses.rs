@@ -1228,7 +1228,6 @@ async fn responses_to_target(
             .map(|e| &e.value),
     );
     let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
-    let mut body = crate::effort_mapping::responses_request(body, model).into_owned();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     // Resolved PK id for per-PK telemetry attribution on the emitted
     // UsageEvent (AISIX-Cloud#867).
@@ -1236,27 +1235,40 @@ async fn responses_to_target(
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
-    // Rewrite model field to upstream name.
-    if let Some(m) = body.get_mut("model") {
-        *m = Value::String(upstream_model.clone());
-    }
+    // Only the outbound wire bytes outlive this block: the caller keeps its
+    // body for fail-over, and reqwest holds these until the response head,
+    // so a `Value` copy alive across the await would be a third copy of the
+    // request (see `crate::util::outbound_json`).
+    let (body_bytes, is_stream) = {
+        let mut body = crate::effort_mapping::responses_request(body, model).into_owned();
 
-    // Apply the PK's `request.*` overrides to the outbound body, matching the
-    // OpenAI bridge's chat() path and the /v1/messages passthrough. The
-    // verbatim /v1/responses path builds the request directly (bypassing the
-    // Hub), so without this the override pipeline silently no-ops for Codex
-    // traffic (AISIX-Cloud#867 follow-up). Apply order: renames → constraints
-    // → defaults; each is a no-op when its configured map is empty.
-    if let Some(r) = pk_entry.value.request.as_ref() {
-        aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
-        if let Some(constraints) = &r.param_constraints {
-            aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
+        // Rewrite model field to upstream name.
+        if let Some(m) = body.get_mut("model") {
+            *m = Value::String(upstream_model.clone());
         }
-        aisix_provider_openai::overrides::apply_default_body_fields(
-            &mut body,
-            &r.default_body_fields,
-        );
-    }
+
+        // Apply the PK's `request.*` overrides to the outbound body, matching the
+        // OpenAI bridge's chat() path and the /v1/messages passthrough. The
+        // verbatim /v1/responses path builds the request directly (bypassing the
+        // Hub), so without this the override pipeline silently no-ops for Codex
+        // traffic (AISIX-Cloud#867 follow-up). Apply order: renames → constraints
+        // → defaults; each is a no-op when its configured map is empty.
+        if let Some(r) = pk_entry.value.request.as_ref() {
+            aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
+            if let Some(constraints) = &r.param_constraints {
+                aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
+            }
+            aisix_provider_openai::overrides::apply_default_body_fields(
+                &mut body,
+                &r.default_body_fields,
+            );
+        }
+        let is_stream = body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        (crate::util::outbound_json(&body)?, is_stream)
+    };
 
     let url = aisix_gateway::url_cache::cached_endpoint_url(
         &pk_entry.id,
@@ -1277,11 +1289,6 @@ async fn responses_to_target(
             ))
         },
     )?;
-
-    let is_stream = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
 
     // Build headers explicitly so the PK's `request.default_headers` and
     // `request.forward_client_headers` can inject operator/client headers.
@@ -1317,7 +1324,10 @@ async fn responses_to_target(
     );
 
     let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
-    let mut req = url.post_on(&client).headers(headers).json(&body);
+    let mut req = url
+        .post_on(&client)
+        .headers(headers)
+        .body(body_bytes.clone());
     // #554: non-streaming gets the E2E request timeout via reqwest's
     // request-level timeout. Streaming must NOT use it (it would cap the
     // whole stream); the streaming branch below enforces the per-chunk
@@ -1660,7 +1670,9 @@ async fn responses_to_target(
             if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
                 let est = crate::token_estimate::Estimator::new(
                     &upstream_model,
-                    crate::token_estimate::PromptInput::Responses(body.clone()),
+                    crate::token_estimate::PromptInput::Responses(crate::util::outbound_value(
+                        &body_bytes,
+                    )),
                 );
                 let filled = crate::token_estimate::fill_missing(
                     &est,
@@ -1926,7 +1938,7 @@ async fn responses_to_target(
         // Tokenized only if the upstream never reports usage.
         let estimator_c = crate::token_estimate::Estimator::new(
             &upstream_model,
-            crate::token_estimate::PromptInput::Responses(body.clone()),
+            crate::token_estimate::PromptInput::Responses(crate::util::outbound_value(&body_bytes)),
         );
         let parsed_stream = build_responses_passthrough_stream(
             body_stream,
@@ -2114,7 +2126,9 @@ async fn responses_to_target(
             if u.prompt_tokens == 0 || u.completion_tokens == 0 {
                 let est = crate::token_estimate::Estimator::new(
                     &upstream_model,
-                    crate::token_estimate::PromptInput::Responses(body.clone()),
+                    crate::token_estimate::PromptInput::Responses(crate::util::outbound_value(
+                        &body_bytes,
+                    )),
                 );
                 let filled = crate::token_estimate::fill_missing(
                     &est,

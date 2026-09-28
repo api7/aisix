@@ -1133,14 +1133,20 @@ async fn dispatch_to_target(
         aisix_provider_anthropic::strip_billing_header_attribution(body)
     };
     let (mapped, mapped_effort) = crate::effort_mapping::anthropic_request(body.as_ref(), model);
-    let body = mapped.as_ref();
+    // One owned-or-borrowed body for this target: a rewrite either step
+    // made is the copy the passthrough edits in place, rather than a copy
+    // of a copy held across the upstream wait.
+    let body = match mapped {
+        std::borrow::Cow::Owned(mapped) => std::borrow::Cow::Owned(mapped),
+        std::borrow::Cow::Borrowed(_) => body,
+    };
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
 
     if !crate::dispatch::speaks_anthropic(snapshot, model) {
         return cross_provider_dispatch(
             state,
             snapshot,
-            body,
+            &body,
             mapped_effort,
             model,
             &target.id,
@@ -1203,7 +1209,7 @@ async fn dispatch_to_target(
 async fn anthropic_passthrough_dispatch(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
-    body: &Value,
+    body: std::borrow::Cow<'_, Value>,
     model: &aisix_core::Model,
     model_id: &str,
     timeouts: crate::routing::TimeoutBudget,
@@ -1229,37 +1235,51 @@ async fn anthropic_passthrough_dispatch(
     input_redactions: crate::redact::RedactionCounts,
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, ProxyError> {
-    let mut body = body.clone();
     let api_key = crate::dispatch::require_api_key(pk_value, model)?;
 
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
-    // Rewrite the `model` field to the upstream value.
-    if let Some(m) = body.get_mut("model") {
-        *m = Value::String(upstream_model.clone());
-    }
+    // The outbound body exists only as its wire bytes past this block: they
+    // are what reqwest holds for the upstream wait, next to the caller's
+    // body the handler keeps for fail-over, so an owned `Value` copy alive
+    // across the await would be a third copy of the whole request. Later
+    // readers (content capture, token estimation) work from the bytes.
+    let (body_bytes, is_stream) = {
+        let mut body = body.into_owned();
 
-    // Apply the PK's `request.*` override block to the outbound
-    // body. Mirrors the OpenAI dispatch path's `prepare_outbound_body`
-    // in `crates/aisix-provider-openai/src/bridge.rs:317-323`. The
-    // OpenAI bridge applies the same primitives via the Hub dispatch,
-    // but the Anthropic-passthrough path bypasses the Hub and builds
-    // the request directly here — without this block the override
-    // pipeline silently no-ops on `/v1/messages` (issue #302 §5
-    // contract; tracked as ai-gateway#335 for the gap-as-shipped).
-    //
-    // Apply order matches §5: renames → constraints → defaults. Each
-    // primitive is a no-op when its configured map is empty.
-    if let Some(r) = pk_value.request.as_ref() {
-        aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
-        if let Some(constraints) = &r.param_constraints {
-            aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
+        // Rewrite the `model` field to the upstream value.
+        if let Some(m) = body.get_mut("model") {
+            *m = Value::String(upstream_model.clone());
         }
-        aisix_provider_openai::overrides::apply_default_body_fields(
-            &mut body,
-            &r.default_body_fields,
-        );
-    }
+
+        // Apply the PK's `request.*` override block to the outbound
+        // body. Mirrors the OpenAI dispatch path's `prepare_outbound_body`
+        // in `crates/aisix-provider-openai/src/bridge.rs:317-323`. The
+        // OpenAI bridge applies the same primitives via the Hub dispatch,
+        // but the Anthropic-passthrough path bypasses the Hub and builds
+        // the request directly here — without this block the override
+        // pipeline silently no-ops on `/v1/messages` (issue #302 §5
+        // contract; tracked as ai-gateway#335 for the gap-as-shipped).
+        //
+        // Apply order matches §5: renames → constraints → defaults. Each
+        // primitive is a no-op when its configured map is empty.
+        if let Some(r) = pk_value.request.as_ref() {
+            aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
+            if let Some(constraints) = &r.param_constraints {
+                aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
+            }
+            aisix_provider_openai::overrides::apply_default_body_fields(
+                &mut body,
+                &r.default_body_fields,
+            );
+        }
+        // Check if the request wants streaming.
+        let is_stream = body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        (crate::util::outbound_json(&body)?, is_stream)
+    };
 
     // Build the target URL. build_anthropic_url tolerates the rare case
     // where the customer mistakenly puts `/v1` in the Anthropic
@@ -1279,12 +1299,6 @@ async fn anthropic_passthrough_dispatch(
             ))
         },
     )?;
-
-    // Check if the request wants streaming.
-    let is_stream = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
 
     // Build the outbound HeaderMap explicitly so the PK's
     // `request.default_headers` / `request.forward_client_headers` can
@@ -1321,7 +1335,10 @@ async fn anthropic_passthrough_dispatch(
     );
 
     let client = crate::http_client::client_for(pk_value.upstream_connection().as_ref());
-    let mut req_builder = url.post_on(&client).headers(headers).json(&body);
+    let mut req_builder = url
+        .post_on(&client)
+        .headers(headers)
+        .body(body_bytes.clone());
     // #554: non-streaming gets the E2E request timeout via reqwest's
     // request-level timeout. Streaming must NOT use it (it would cap the
     // whole stream); the streaming branch below enforces the per-chunk
@@ -1521,8 +1538,7 @@ async fn anthropic_passthrough_dispatch(
                 .iter()
                 .map(|e| &e.value),
         );
-        let captured_prompt_c =
-            content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
+        let captured_prompt_c = content_cap.map(|_| crate::util::outbound_text(&body_bytes));
         // #688: carry the rate-limit reservation into the end-of-stream guard.
         // The winning streaming attempt owns it now; the keys drive post-stream
         // TPM/TPD accounting and `into_stream_hold` keeps the concurrency slot(s)
@@ -1541,13 +1557,13 @@ async fn anthropic_passthrough_dispatch(
         let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
-        // Token-estimation fallback context (AISIX-Cloud#1074): the inbound
-        // Anthropic request body is cloned because the stream owns it until
-        // an end-of-stream Drop. Tokenized only if the upstream never
-        // reports usage.
+        // Token-estimation fallback context (AISIX-Cloud#1074): the stream
+        // owns the outbound request until an end-of-stream Drop, rebuilt
+        // from its wire bytes now that the upstream has answered.
+        // Tokenized only if the upstream never reports usage.
         let estimator = crate::token_estimate::Estimator::new(
             &upstream_model,
-            crate::token_estimate::PromptInput::Anthropic(body.clone()),
+            crate::token_estimate::PromptInput::Anthropic(crate::util::outbound_value(&body_bytes)),
         );
         let parsed_stream = build_anthropic_passthrough_stream(
             body_stream,
@@ -1768,9 +1784,12 @@ async fn anthropic_passthrough_dispatch(
         // Anthropic-compatible relay may omit `usage` entirely — fill
         // the missing counters locally before the emit below. The
         // response body is forwarded verbatim, untouched.
-        fill_missing_anthropic_metrics(&mut metrics, &upstream_model, &body, || {
-            anthropic_estimation_output_text(&json_body)
-        });
+        fill_missing_anthropic_metrics(
+            &mut metrics,
+            &upstream_model,
+            || crate::util::outbound_value(&body_bytes),
+            || anthropic_estimation_output_text(&json_body),
+        );
 
         // #448 (#22): run output guardrails on the passthrough response.
         // The body is forwarded verbatim, so extract its text (content
@@ -1885,7 +1904,7 @@ async fn anthropic_passthrough_dispatch(
         )
         .map(|cap| {
             CapturedContent::new(
-                &serde_json::to_string(&body).unwrap_or_default(),
+                &crate::util::outbound_text(&body_bytes),
                 &anthropic_response_text(&json_body),
                 cap as usize,
             )
@@ -1914,7 +1933,7 @@ async fn anthropic_passthrough_dispatch(
 fn fill_missing_anthropic_metrics(
     metrics: &mut AnthropicUsageMetrics,
     upstream_model: &str,
-    body: &Value,
+    prompt: impl FnOnce() -> Value,
     output_text: impl FnOnce() -> String,
 ) {
     if metrics.prompt_tokens != 0 && metrics.completion_tokens != 0 {
@@ -1922,7 +1941,7 @@ fn fill_missing_anthropic_metrics(
     }
     let est = crate::token_estimate::Estimator::new(
         upstream_model,
-        crate::token_estimate::PromptInput::Anthropic(body.clone()),
+        crate::token_estimate::PromptInput::Anthropic(prompt()),
     );
     let filled = crate::token_estimate::fill_missing(
         &est,
@@ -2555,9 +2574,12 @@ async fn cross_provider_dispatch(
     // what the dashboard bills. The estimate is reported in the ordinary
     // usage shape — there is no client-facing marker saying it was
     // estimated.
-    fill_missing_anthropic_metrics(&mut metrics, &upstream_model, body, || {
-        crate::chat::estimation_output_text(&resp)
-    });
+    fill_missing_anthropic_metrics(
+        &mut metrics,
+        &upstream_model,
+        || body.clone(),
+        || crate::chat::estimation_output_text(&resp),
+    );
     if metrics.usage_estimated {
         resp.usage.prompt_tokens = metrics.prompt_tokens;
         resp.usage.completion_tokens = metrics.completion_tokens;
@@ -6389,9 +6411,12 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
         // Both sides missing → both fill, flagged. Prompt = 8 (see the
         // floor test above for the arithmetic).
         let mut m = AnthropicUsageMetrics::default();
-        fill_missing_anthropic_metrics(&mut m, "relay-claude", &body, || {
-            anthropic_estimation_output_text(&resp)
-        });
+        fill_missing_anthropic_metrics(
+            &mut m,
+            "relay-claude",
+            || body.clone(),
+            || anthropic_estimation_output_text(&resp),
+        );
         assert_eq!(m.prompt_tokens, 8);
         assert!(m.completion_tokens > 0);
         assert!(m.usage_estimated);
@@ -6402,9 +6427,12 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
             completion_tokens: 7,
             ..Default::default()
         };
-        fill_missing_anthropic_metrics(&mut m, "relay-claude", &body, || {
-            panic!("output extractor must not run when usage is complete")
-        });
+        fill_missing_anthropic_metrics(
+            &mut m,
+            "relay-claude",
+            || body.clone(),
+            || panic!("output extractor must not run when usage is complete"),
+        );
         assert_eq!((m.prompt_tokens, m.completion_tokens), (11, 7));
         assert!(!m.usage_estimated);
     }

@@ -817,8 +817,9 @@ pub struct EmbeddingObject {
 /// caller sent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingRequest {
-    /// The public-facing model name (resolved to an upstream model by the
-    /// proxy before the Bridge sees it).
+    /// The model name the caller addressed. Bridges take the upstream model
+    /// id from the target's [`crate::BridgeContext`], never from here, so one
+    /// request can be handed to every attempt without a per-target copy.
     pub model: String,
     /// Texts to embed. A single-string input is normalised to
     /// `vec![text]` by the proxy handler; bridges consult

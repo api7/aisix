@@ -751,16 +751,19 @@ impl Bridge for VertexBridge {
             },
         )?;
 
-        let instances: Vec<serde_json::Value> = req
-            .input
-            .iter()
-            .map(|text| serde_json::json!({"content": text}))
-            .collect();
-        let mut body = serde_json::json!({"instances": instances});
-        if let Some(dims) = req.dimensions {
-            body["parameters"] = serde_json::json!({"outputDimensionality": dims});
-        }
-        apply_body_overrides(&mut body, ctx);
+        let body = {
+            let instances: Vec<serde_json::Value> = req
+                .input
+                .iter()
+                .map(|text| serde_json::json!({"content": text}))
+                .collect();
+            let mut body = serde_json::json!({"instances": instances});
+            if let Some(dims) = req.dimensions {
+                body["parameters"] = serde_json::json!({"outputDimensionality": dims});
+            }
+            apply_body_overrides(&mut body, ctx);
+            outbound_bytes(&body)?
+        };
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
@@ -772,7 +775,7 @@ impl Bridge for VertexBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
@@ -876,27 +879,31 @@ impl VertexBridge {
             },
         )?;
 
-        let typed = build_gemini_request(req, upstream_id);
-        // Audit LOW-4: Gemini requires `contents` to be a non-empty
-        // array. If the caller passed system-only messages (lifted to
-        // `systemInstruction`), `contents` ends up empty and Vertex
-        // returns a generic 400. Fail fast with a clear error so the
-        // operator can fix the request shape before the round trip.
-        if typed.contents.is_empty() {
-            return Err(BridgeError::Config(
-                "vertex chat: messages must include at least one user / \
-                 assistant turn (system-only requests are not supported by Gemini)"
-                    .into(),
-            ));
-        }
-        // Serialize to JSON, then apply the per-ProviderKey override
-        // pipeline (#339). The Gemini `contents` shape does not match the
-        // OpenAI-style top-level keys the request transforms target, so
-        // renames/clamps are usually no-ops here — but default_body_fields
-        // / default_headers still apply.
-        let mut body = serde_json::to_value(&typed)
-            .map_err(|e| BridgeError::Config(format!("serialize Gemini request body: {e}")))?;
-        apply_body_overrides(&mut body, ctx);
+        let body = {
+            let typed = build_gemini_request(req, upstream_id);
+            // Audit LOW-4: Gemini requires `contents` to be a non-empty
+            // array. If the caller passed system-only messages (lifted to
+            // `systemInstruction`), `contents` ends up empty and Vertex
+            // returns a generic 400. Fail fast with a clear error so the
+            // operator can fix the request shape before the round trip.
+            if typed.contents.is_empty() {
+                return Err(BridgeError::Config(
+                    "vertex chat: messages must include at least one user / \
+                     assistant turn (system-only requests are not supported by Gemini)"
+                        .into(),
+                ));
+            }
+            // Serialize to JSON, then apply the per-ProviderKey override
+            // pipeline (#339). The Gemini `contents` shape does not match the
+            // OpenAI-style top-level keys the request transforms target, so
+            // renames/clamps are usually no-ops here — but default_body_fields
+            // / default_headers still apply.
+            let mut body = serde_json::to_value(&typed)
+                .map_err(|e| BridgeError::Config(format!("serialize Gemini request body: {e}")))?;
+            drop(typed);
+            apply_body_overrides(&mut body, ctx);
+            outbound_bytes(&body)?
+        };
         // Resolve bearer: pre-minted token verbatim, or mint+cache
         // via the in-process token minter from SA JSON. Failure
         // surfaces as a Config error (operator-actionable).
@@ -909,7 +916,7 @@ impl VertexBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
@@ -986,28 +993,33 @@ impl VertexBridge {
         // then shape it for Vertex (strip model + stream, add the
         // Vertex `anthropic_version`). Mirrors the Bedrock `/invoke`
         // body shaping, differing only in the version string.
-        let (system, messages) =
-            split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
         let synthetic_json_tool = matches!(
             structured_output_for(req, upstream_id),
             StructuredOutput::Tool(_)
         );
-        let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, false);
-        let mut body_value = serde_json::to_value(&anthropic_req)
-            .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
-        // Apply the per-ProviderKey override pipeline (#339) before the
-        // Vertex-specific shaping below, so the `model`/`stream` strip keeps
-        // the final say and an override can never reintroduce a URL-borne
-        // `model` into the `:rawPredict` body.
-        apply_body_overrides(&mut body_value, ctx);
-        if let Some(obj) = body_value.as_object_mut() {
-            obj.remove("model");
-            obj.remove("stream");
-            obj.insert(
-                "anthropic_version".to_string(),
-                serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
-            );
-        }
+        let body_value = {
+            let (system, messages) = split_system(req)
+                .map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
+            let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, false);
+            let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
+                BridgeError::Config(format!("serialize Anthropic request body: {e}"))
+            })?;
+            drop(anthropic_req);
+            // Apply the per-ProviderKey override pipeline (#339) before the
+            // Vertex-specific shaping below, so the `model`/`stream` strip keeps
+            // the final say and an override can never reintroduce a URL-borne
+            // `model` into the `:rawPredict` body.
+            apply_body_overrides(&mut body_value, ctx);
+            if let Some(obj) = body_value.as_object_mut() {
+                obj.remove("model");
+                obj.remove("stream");
+                obj.insert(
+                    "anthropic_version".to_string(),
+                    serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
+                );
+            }
+            outbound_bytes(&body_value)?
+        };
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
@@ -1018,7 +1030,7 @@ impl VertexBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body_value)
+                .body(body_value)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
@@ -1091,22 +1103,27 @@ impl VertexBridge {
         // with stream=true and — unlike `:rawPredict` — `stream` is KEPT
         // in the body (only `model` is stripped into the URL). Add the
         // Vertex `anthropic_version`.
-        let (system, messages) =
-            split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
-        let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, true);
-        let mut body_value = serde_json::to_value(&anthropic_req)
-            .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
-        // Apply the per-ProviderKey override pipeline (#339) before the
-        // Vertex-specific shaping below (see the non-stream path). Here
-        // `stream` is intentionally KEPT in the body.
-        apply_body_overrides(&mut body_value, ctx);
-        if let Some(obj) = body_value.as_object_mut() {
-            obj.remove("model");
-            obj.insert(
-                "anthropic_version".to_string(),
-                serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
-            );
-        }
+        let body_value = {
+            let (system, messages) = split_system(req)
+                .map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
+            let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, true);
+            let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
+                BridgeError::Config(format!("serialize Anthropic request body: {e}"))
+            })?;
+            drop(anthropic_req);
+            // Apply the per-ProviderKey override pipeline (#339) before the
+            // Vertex-specific shaping below (see the non-stream path). Here
+            // `stream` is intentionally KEPT in the body.
+            apply_body_overrides(&mut body_value, ctx);
+            if let Some(obj) = body_value.as_object_mut() {
+                obj.remove("model");
+                obj.insert(
+                    "anthropic_version".to_string(),
+                    serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
+                );
+            }
+            outbound_bytes(&body_value)?
+        };
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
@@ -1118,7 +1135,7 @@ impl VertexBridge {
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
                 .headers(headers)
-                .json(&body_value)
+                .body(body_value)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)
@@ -1235,14 +1252,18 @@ impl VertexBridge {
             || self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref()),
         )?;
 
-        let messages = openai_messages_from(req, DeveloperRoleMode::MapToSystem);
-        let typed = build_openai_request(req, upstream_id, &messages, false);
-        let mut body = serde_json::to_value(&typed)
-            .map_err(|e| BridgeError::Config(format!("serialize OpenAI shim request body: {e}")))?;
-        // Apply the per-ProviderKey override pipeline (#339). The shim
-        // speaks the OpenAI wire, so renames / clamps / default fields all
-        // apply directly; the model id is kept in the body.
-        apply_body_overrides(&mut body, ctx);
+        let body = {
+            let messages = openai_messages_from(req, DeveloperRoleMode::MapToSystem);
+            let typed = build_openai_request(req, upstream_id, &messages, false);
+            let mut body = serde_json::to_value(&typed).map_err(|e| {
+                BridgeError::Config(format!("serialize OpenAI shim request body: {e}"))
+            })?;
+            // Apply the per-ProviderKey override pipeline (#339). The shim
+            // speaks the OpenAI wire, so renames / clamps / default fields all
+            // apply directly; the model id is kept in the body.
+            apply_body_overrides(&mut body, ctx);
+            outbound_bytes(&body)?
+        };
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
@@ -1253,7 +1274,7 @@ impl VertexBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
@@ -1296,13 +1317,17 @@ impl VertexBridge {
             || self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref()),
         )?;
 
-        let messages = openai_messages_from(req, DeveloperRoleMode::MapToSystem);
-        let typed = build_openai_request(req, upstream_id, &messages, true);
-        let mut body = serde_json::to_value(&typed)
-            .map_err(|e| BridgeError::Config(format!("serialize OpenAI shim request body: {e}")))?;
-        // Apply the per-ProviderKey override pipeline (#339); `stream: true`
-        // stays in the body.
-        apply_body_overrides(&mut body, ctx);
+        let body = {
+            let messages = openai_messages_from(req, DeveloperRoleMode::MapToSystem);
+            let typed = build_openai_request(req, upstream_id, &messages, true);
+            let mut body = serde_json::to_value(&typed).map_err(|e| {
+                BridgeError::Config(format!("serialize OpenAI shim request body: {e}"))
+            })?;
+            // Apply the per-ProviderKey override pipeline (#339); `stream: true`
+            // stays in the body.
+            apply_body_overrides(&mut body, ctx);
+            outbound_bytes(&body)?
+        };
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
@@ -1314,7 +1339,7 @@ impl VertexBridge {
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)
@@ -1443,13 +1468,16 @@ impl VertexBridge {
         // OpenAI chat-completions body — same serializer the OpenAI-shim
         // (Llama/MaaS) rail uses. The model is KEPT in the body (Mistral /
         // AI21 on Vertex expect it in both the URL and the body).
-        let messages = openai_messages_from(req, DeveloperRoleMode::MapToSystem);
-        let typed = build_openai_request(req, upstream_id, &messages, false);
-        let mut body = serde_json::to_value(&typed)
-            .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
-        // Apply the per-ProviderKey override pipeline (#339). The model id
-        // is kept in the body (Mistral / AI21 expect it in both URL + body).
-        apply_body_overrides(&mut body, ctx);
+        let body = {
+            let messages = openai_messages_from(req, DeveloperRoleMode::MapToSystem);
+            let typed = build_openai_request(req, upstream_id, &messages, false);
+            let mut body = serde_json::to_value(&typed)
+                .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
+            // Apply the per-ProviderKey override pipeline (#339). The model id
+            // is kept in the body (Mistral / AI21 expect it in both URL + body).
+            apply_body_overrides(&mut body, ctx);
+            outbound_bytes(&body)?
+        };
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
@@ -1460,7 +1488,7 @@ impl VertexBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
@@ -1520,13 +1548,16 @@ impl VertexBridge {
             },
         )?;
 
-        let messages = openai_messages_from(req, DeveloperRoleMode::MapToSystem);
-        let typed = build_openai_request(req, upstream_id, &messages, true);
-        let mut body = serde_json::to_value(&typed)
-            .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
-        // Apply the per-ProviderKey override pipeline (#339); `stream: true`
-        // stays in the body (model id rides in both URL + body).
-        apply_body_overrides(&mut body, ctx);
+        let body = {
+            let messages = openai_messages_from(req, DeveloperRoleMode::MapToSystem);
+            let typed = build_openai_request(req, upstream_id, &messages, true);
+            let mut body = serde_json::to_value(&typed)
+                .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
+            // Apply the per-ProviderKey override pipeline (#339); `stream: true`
+            // stays in the body (model id rides in both URL + body).
+            apply_body_overrides(&mut body, ctx);
+            outbound_bytes(&body)?
+        };
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
@@ -1538,7 +1569,7 @@ impl VertexBridge {
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)
@@ -1637,19 +1668,23 @@ impl VertexBridge {
             },
         )?;
 
-        let typed = build_gemini_request(req, upstream_id);
-        if typed.contents.is_empty() {
-            return Err(BridgeError::Config(
-                "vertex chat: messages must include at least one user / \
-                 assistant turn (system-only requests are not supported by Gemini)"
-                    .into(),
-            ));
-        }
-        // Serialize + apply the per-ProviderKey override pipeline (#339)
-        // before sending (see the non-stream path for the rail caveat).
-        let mut body = serde_json::to_value(&typed)
-            .map_err(|e| BridgeError::Config(format!("serialize Gemini request body: {e}")))?;
-        apply_body_overrides(&mut body, ctx);
+        let body = {
+            let typed = build_gemini_request(req, upstream_id);
+            if typed.contents.is_empty() {
+                return Err(BridgeError::Config(
+                    "vertex chat: messages must include at least one user / \
+                     assistant turn (system-only requests are not supported by Gemini)"
+                        .into(),
+                ));
+            }
+            // Serialize + apply the per-ProviderKey override pipeline (#339)
+            // before sending (see the non-stream path for the rail caveat).
+            let mut body = serde_json::to_value(&typed)
+                .map_err(|e| BridgeError::Config(format!("serialize Gemini request body: {e}")))?;
+            drop(typed);
+            apply_body_overrides(&mut body, ctx);
+            outbound_bytes(&body)?
+        };
         // Resolve bearer (pre-minted OR minted-from-SA) BEFORE
         // entering the stream future so token-mint errors surface
         // as a direct Err return rather than being yielded mid-stream.
@@ -1661,7 +1696,7 @@ impl VertexBridge {
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)
@@ -1856,6 +1891,14 @@ fn build_request_headers(
     headers.insert(HeaderName::from_static("x-aisix-request-id"), rid);
     apply_request_headers(&mut headers, hdr);
     Ok(headers)
+}
+
+/// The wire bytes of an outbound body. Called where the `Value` is a
+/// temporary, so it is gone before the upstream is awaited — see
+/// [`aisix_gateway::json_body`].
+fn outbound_bytes(body: &serde_json::Value) -> Result<bytes::Bytes, BridgeError> {
+    aisix_gateway::json_body(body)
+        .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))
 }
 
 /// Apply the per-`ProviderKey` request/response override pipeline to an

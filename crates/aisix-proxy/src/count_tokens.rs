@@ -729,48 +729,57 @@ async fn count_tokens_to_target(
     client: &ClientContext,
 ) -> Result<CountTokensSuccess, ProxyError> {
     let attempt_started = Instant::now();
-    // Same billing-attribution strip as `/v1/messages` (see
-    // `messages::dispatch_to_target`). This route only ever dispatches to
-    // an Anthropic-protocol upstream, but that includes third-party ones,
-    // and the count it returns must be the count for the body the sibling
-    // route would actually send.
-    let body = if crate::dispatch::is_first_party_anthropic(snapshot, model) {
-        std::borrow::Cow::Borrowed(body)
-    } else {
-        aisix_provider_anthropic::strip_billing_header_attribution(body)
-    };
-    // This route dispatches only to Anthropic-protocol upstreams, which
-    // read `output_config.effort` themselves, so the mapping outcome the
-    // cross-provider bridge needs has no consumer here.
-    let (mapped, _) = crate::effort_mapping::anthropic_request(body.as_ref(), model);
-    let mut body = mapped.into_owned();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+    // Only the outbound wire bytes outlive this block — see
+    // `crate::util::outbound_json`.
+    let body = {
+        // Same billing-attribution strip as `/v1/messages` (see
+        // `messages::dispatch_to_target`). This route only ever dispatches to
+        // an Anthropic-protocol upstream, but that includes third-party ones,
+        // and the count it returns must be the count for the body the sibling
+        // route would actually send.
+        let body = if crate::dispatch::is_first_party_anthropic(snapshot, model) {
+            std::borrow::Cow::Borrowed(body)
+        } else {
+            aisix_provider_anthropic::strip_billing_header_attribution(body)
+        };
+        // This route dispatches only to Anthropic-protocol upstreams, which
+        // read `output_config.effort` themselves, so the mapping outcome the
+        // cross-provider bridge needs has no consumer here.
+        let (mapped, _) = crate::effort_mapping::anthropic_request(body.as_ref(), model);
+        let mut body = match mapped {
+            std::borrow::Cow::Owned(mapped) => mapped,
+            std::borrow::Cow::Borrowed(_) => body.into_owned(),
+        };
 
-    // Rewrite the `model` field to the upstream value, exactly as the
-    // /v1/messages passthrough does — the caller speaks the gateway's
-    // display name; the upstream expects its own id.
-    if let Some(m) = body.get_mut("model") {
-        *m = Value::String(upstream_model.clone());
-    }
-
-    // Apply the PK's `request.*` override block to the outbound body,
-    // identically to the /v1/messages passthrough — count_tokens shares
-    // the same Anthropic ProviderKey, so operator-configured renames /
-    // constraints / defaults must reach this sibling route too. Apply
-    // order matches §5: renames → constraints → defaults; each is a
-    // no-op when its configured map is empty.
-    if let Some(r) = pk_entry.value.request.as_ref() {
-        aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
-        if let Some(constraints) = &r.param_constraints {
-            aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
+        // Rewrite the `model` field to the upstream value, exactly as the
+        // /v1/messages passthrough does — the caller speaks the gateway's
+        // display name; the upstream expects its own id.
+        if let Some(m) = body.get_mut("model") {
+            *m = Value::String(upstream_model.clone());
         }
-        aisix_provider_openai::overrides::apply_default_body_fields(
-            &mut body,
-            &r.default_body_fields,
-        );
-    }
+
+        // Apply the PK's `request.*` override block to the outbound body,
+        // identically to the /v1/messages passthrough — count_tokens shares
+        // the same Anthropic ProviderKey, so operator-configured renames /
+        // constraints / defaults must reach this sibling route too. Apply
+        // order matches §5: renames → constraints → defaults; each is a
+        // no-op when its configured map is empty.
+        if let Some(r) = pk_entry.value.request.as_ref() {
+            aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
+            if let Some(constraints) = &r.param_constraints {
+                aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
+            }
+            aisix_provider_openai::overrides::apply_default_body_fields(
+                &mut body,
+                &r.default_body_fields,
+            );
+        }
+
+        crate::util::outbound_json(&body)?
+    };
 
     // `build_anthropic_url` tolerates an api_base with or without `/v1` (the
     // Anthropic dashboard placeholder and copy-pasted full URLs both
@@ -838,7 +847,7 @@ async fn count_tokens_to_target(
     );
 
     let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
-    let mut req = url.post_on(&client).headers(headers).json(&body);
+    let mut req = url.post_on(&client).headers(headers).body(body);
     // #554: count_tokens is non-streaming; apply the E2E request timeout.
     if let Some(d) = timeouts.request {
         req = req.timeout(d);

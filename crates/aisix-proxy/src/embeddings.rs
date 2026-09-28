@@ -478,9 +478,12 @@ async fn dispatch(
     // which contradicts the docs and confuses operator-side packet
     // captures during billing reconciliation / debugging.
     let input_was_single = matches!(body.input, InputField::Single(_));
-    let base_req = EmbeddingRequest {
-        // Rewritten to each target's upstream id at dispatch.
-        model: String::new(),
+    // Shared by every attempt, never copied per target: `input` can be the
+    // bulk of a large request, and a copy per attempt is held for the
+    // whole upstream wait. Bridges take the upstream id from the target's
+    // context, like chat.
+    let req = EmbeddingRequest {
+        model: client_facing_model.clone(),
         input: body.input.into_vec(),
         input_was_single,
         encoding_format: body.encoding_format,
@@ -505,17 +508,14 @@ async fn dispatch(
             answered.as_ref().err().map(ToString::to_string)
         },
         |target, timeouts| {
-            let base_req = &base_req;
+            let req = &req;
             async move {
                 let provider =
                     crate::dispatch::require_provider(&target.model)?.to_ascii_lowercase();
                 let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &target.model)?;
                 let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
                     .ok_or(ProxyError::ProviderUnavailable)?;
-                let req = EmbeddingRequest {
-                    model: crate::dispatch::require_upstream_model(&target.model)?.to_string(),
-                    ..base_req.clone()
-                };
+                crate::dispatch::require_upstream_model(&target.model)?;
                 // #554: apply the configured request `timeout` as the upstream deadline.
                 let mut ctx = crate::dispatch::bridge_ctx(
                     request_id,
@@ -529,7 +529,7 @@ async fn dispatch(
                     ctx = ctx.with_deadline(d);
                 }
                 // #701: per-attempt cooldown accounting — see completions.rs.
-                let answered = match bridge.embed(&req, &ctx).await {
+                let answered = match bridge.embed(req, &ctx).await {
                     Ok(v) => Ok(v),
                     Err(e @ BridgeError::UnsupportedCapability(BridgeCapability::Embeddings)) => {
                         Err(e)
@@ -592,7 +592,7 @@ async fn dispatch(
                 (embed_resp.usage.total_tokens, false)
             } else {
                 let upstream_model = model.upstream_model().unwrap_or("unknown");
-                let estimated = base_req.input.iter().fold(0u32, |acc, s| {
+                let estimated = req.input.iter().fold(0u32, |acc, s| {
                     acc.saturating_add(crate::token_estimate::count_text(upstream_model, s))
                 });
                 (estimated, estimated > 0)

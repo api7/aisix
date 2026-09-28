@@ -828,13 +828,21 @@ impl Bridge for BedrockBridge {
                 });
             }
         } else if base_id.starts_with("cohere.embed") {
-            let body = serde_json::json!({
-                "texts": req.input,
-                // LiteLLM's default when the caller gives no input_type.
-                "input_type": "search_document",
-            });
-            let body_bytes = serde_json::to_vec(&body)
-                .map_err(|e| BridgeError::Config(format!("serialize Cohere embed body: {e}")))?;
+            // Borrows the texts rather than copying them into a `Value`:
+            // the body is what the SDK holds for the whole upstream wait.
+            #[derive(serde::Serialize)]
+            struct CohereEmbedRequest<'a> {
+                texts: &'a [String],
+                input_type: &'a str,
+            }
+            let body_bytes = Vec::from(
+                aisix_gateway::json_body(&CohereEmbedRequest {
+                    texts: &req.input,
+                    // LiteLLM's default when the caller gives no input_type.
+                    input_type: "search_document",
+                })
+                .map_err(|e| BridgeError::Config(format!("serialize Cohere embed body: {e}")))?,
+            );
             let resp = client
                 .invoke_model()
                 .model_id(upstream_id)
@@ -909,8 +917,6 @@ impl BedrockBridge {
     ) -> Result<ChatResponse, BridgeError> {
         let client = self.build_client_from_ctx(ctx)?;
 
-        let (system, messages) =
-            split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
         // The Anthropic request builder reads the Claude family version
         // off the model name to pick a structured-output shape, and
         // `anthropic.claude-…` is not a name it can read. Hand it the
@@ -921,25 +927,33 @@ impl BedrockBridge {
             structured_output_for(req, anthropic_model),
             StructuredOutput::Tool(_)
         );
-        let anthropic_req = build_request(req, anthropic_model, system, messages, false);
-        let mut body_value = serde_json::to_value(&anthropic_req)
-            .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
-        // Apply the per-ProviderKey body override pipeline (#340) BEFORE the
-        // Vertex-style Bedrock shaping below, so the `model`/`stream` strip
-        // keeps the final say and an override can never reintroduce a
-        // URL-borne `model` into the /invoke body.
-        apply_body_overrides(&mut body_value, ctx);
-        if let Some(obj) = body_value.as_object_mut() {
-            obj.remove("model");
-            obj.remove("stream");
-            obj.insert(
-                "anthropic_version".to_string(),
-                serde_json::Value::String(BEDROCK_ANTHROPIC_VERSION.to_string()),
-            );
-        }
-        let body_bytes = serde_json::to_vec(&body_value).map_err(|e| {
-            BridgeError::Config(format!("serialize Anthropic request body bytes: {e}"))
-        })?;
+        // Every intermediate stays inside this block, so only the wire
+        // bytes are alive while the upstream is awaited.
+        let body_bytes = {
+            let (system, messages) = split_system(req)
+                .map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
+            let anthropic_req = build_request(req, anthropic_model, system, messages, false);
+            let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
+                BridgeError::Config(format!("serialize Anthropic request body: {e}"))
+            })?;
+            drop(anthropic_req);
+            // Apply the per-ProviderKey body override pipeline (#340) BEFORE the
+            // Vertex-style Bedrock shaping below, so the `model`/`stream` strip
+            // keeps the final say and an override can never reintroduce a
+            // URL-borne `model` into the /invoke body.
+            apply_body_overrides(&mut body_value, ctx);
+            if let Some(obj) = body_value.as_object_mut() {
+                obj.remove("model");
+                obj.remove("stream");
+                obj.insert(
+                    "anthropic_version".to_string(),
+                    serde_json::Value::String(BEDROCK_ANTHROPIC_VERSION.to_string()),
+                );
+            }
+            Vec::from(aisix_gateway::json_body(&body_value).map_err(|e| {
+                BridgeError::Config(format!("serialize Anthropic request body bytes: {e}"))
+            })?)
+        };
 
         let started = Instant::now();
         let deadline = ctx.deadline;

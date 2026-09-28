@@ -2706,6 +2706,11 @@ async fn dispatch(
             _ => None,
         };
 
+    // Everything the cache needs from the full key is taken above. It
+    // carries a canonical copy of every message — base64 images included —
+    // so it must not stay alive across the upstream call below.
+    drop(cache_key_full);
+
     // Handed from the read path (L2 miss) to the write path so a full
     // miss costs exactly one embedding call.
     let mut semantic_embedding: Option<Vec<f32>> = None;
