@@ -1218,8 +1218,8 @@ async fn responses_to_target(
     let chain = chain_arc.as_ref();
     // Largest content cap any enabled content-capturing exporter wants, or
     // `None` when none do (AISIX-Cloud#947). The captured prompt is the
-    // client-facing request body (post-#932-redaction), taken BEFORE the
-    // upstream model rewrite below so the log shows what the caller sent.
+    // client-facing request body (post-#932-redaction), not the rewritten
+    // outbound one, so the log shows what the caller sent.
     let content_cap = content_capture_cap(
         snapshot
             .observability_exporters
@@ -1227,7 +1227,6 @@ async fn responses_to_target(
             .iter()
             .map(|e| &e.value),
     );
-    let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     // Resolved PK id for per-PK telemetry attribution on the emitted
     // UsageEvent (AISIX-Cloud#867).
@@ -1360,6 +1359,9 @@ async fn responses_to_target(
                 )
             })
             .map_err(ProxyError::Bridge)?;
+    // Serialized once the upstream has answered, not before: a copy made
+    // up front would be alive for the whole upstream wait.
+    let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
 
     let status = upstream_resp.status();
 

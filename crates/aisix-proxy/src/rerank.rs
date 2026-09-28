@@ -404,7 +404,6 @@ async fn dispatch(
             .iter()
             .map(|e| &e.value),
     );
-    let captured_prompt = content_cap.map(|_| serde_json::to_string(&*body).unwrap_or_default());
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
@@ -657,6 +656,9 @@ async fn dispatch(
         },
     )
     .await;
+    // Serialized once the upstream has answered, not before: a copy made
+    // up front would be alive for the whole upstream wait.
+    let captured_prompt = content_cap.map(|_| serde_json::to_string(&*body).unwrap_or_default());
     let crate::routing::Dispatched {
         value: (upstream_headers, body_bytes, provider_label, pk_id, upstream_model),
         target,

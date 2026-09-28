@@ -212,6 +212,7 @@ fn snapshot(api_base: &str) -> AisixSnapshot {
             "claude-sonnet-4-5",
             ANTHROPIC_PK_ID,
         ),
+        ("model-rerank", "reranker", "openai", "rerank-v3", PK_ID),
     ] {
         let model: Model = serde_json::from_str(&format!(
             r#"{{"display_name":"{name}","provider":"{provider}","model_name":"{upstream}","provider_key_id":"{pk_id}"}}"#
@@ -220,7 +221,7 @@ fn snapshot(api_base: &str) -> AisixSnapshot {
         snap.models.insert(ResourceEntry::new(id, model, 1));
     }
     let key: ApiKey = serde_json::from_str(&format!(
-        r#"{{"key_hash":"{}","allowed_models":["vision","embedder","claude"]}}"#,
+        r#"{{"key_hash":"{}","allowed_models":["vision","embedder","claude","reranker"]}}"#,
         ApiKey::hash_bearer("sk-caller")
     ))
     .unwrap();
@@ -342,6 +343,14 @@ fn responses_body((images, image_bytes): (usize, usize)) -> String {
     .to_string()
 }
 
+fn rerank_body((documents, document_bytes): (usize, usize)) -> String {
+    let documents: Vec<String> = (0..documents)
+        .map(|i| base64_blob(document_bytes, i))
+        .collect();
+    serde_json::json!({"model": "reranker", "query": "which one?", "documents": documents})
+        .to_string()
+}
+
 fn embeddings_body((images, image_bytes): (usize, usize)) -> String {
     let input: Vec<String> = (0..images).map(|i| base64_blob(image_bytes, i)).collect();
     serde_json::json!({"model": "embedder", "input": input}).to_string()
@@ -407,7 +416,7 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
     let mut upstream = start_upstream();
     let app = router(&upstream.base);
 
-    let families: [(&str, &str, BodyFn); 5] = [
+    let families: [(&str, &str, BodyFn); 7] = [
         ("chat -> openai", "/v1/chat/completions", chat_body),
         (
             "chat -> anthropic",
@@ -420,6 +429,13 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
         ("messages passthrough", "/v1/messages", messages_body),
         // Served natively by the OpenAI upstream, likewise built by the route.
         ("responses passthrough", "/v1/responses", responses_body),
+        (
+            "count_tokens passthrough",
+            "/v1/messages/count_tokens",
+            messages_body,
+        ),
+        // Each attempt rewrites its own copy of the body for its target.
+        ("rerank", "/v1/rerank", rerank_body),
     ];
 
     // Warm lazily-initialised statics (TLS roots, regexes, metric

@@ -518,13 +518,20 @@ mod tests {
                 continue;
             }
             let src = std::fs::read_to_string(&file).expect("read source");
-            let production = production_half(&src);
+            let production = without_test_modules(&src);
             for (at, _) in production.match_indices(".json(") {
                 let rest = production[at + ".json(".len()..].trim_start();
                 // `resp.json()` decodes a response; only an argument sends one.
                 if !rest.starts_with(')') {
-                    let line = production[..at].lines().count();
-                    offenders.push(format!("{}:{line}", file.display()));
+                    let start = production[..at].rfind('\n').map_or(0, |i| i + 1);
+                    let end = production[at..]
+                        .find('\n')
+                        .map_or(production.len(), |i| at + i);
+                    offenders.push(format!(
+                        "{}: {}",
+                        file.display(),
+                        production[start..end].trim()
+                    ));
                 }
             }
         }
@@ -534,6 +541,49 @@ mod tests {
              before the request future, not with `RequestBuilder::json`:\n{}",
             offenders.join("\n"),
         );
+    }
+
+    /// `src` with every `#[cfg(test)] mod … { … }` block removed, wherever
+    /// it sits. [`production_half`] stops at the first test module, and a
+    /// file can declare one (`#[cfg(test)] mod x;`) or nest one near the
+    /// top with production code after it.
+    fn without_test_modules(src: &str) -> String {
+        const MARKER: &str = "#[cfg(test)]";
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(at) = rest.find(MARKER) {
+            let after = &rest[at + MARKER.len()..];
+            let item = after.trim_start();
+            let block = item.starts_with("mod ")
+                && item
+                    .find(['{', ';'])
+                    .is_some_and(|i| item.as_bytes()[i] == b'{');
+            if !block {
+                out.push_str(&rest[..at + MARKER.len()]);
+                rest = after;
+                continue;
+            }
+            out.push_str(&rest[..at]);
+            let open = rest.len() - item.len() + item.find('{').unwrap();
+            let mut depth = 0usize;
+            let mut end = rest.len();
+            for (i, c) in rest[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            rest = &rest[end..];
+        }
+        out.push_str(rest);
+        out
     }
 
     /// A file-level scan cannot bind the rule above to the production
