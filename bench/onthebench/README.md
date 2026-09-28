@@ -27,13 +27,16 @@ Replicates the published onthebench setup (https://onthebench.ai/gateways/perfor
 - **Core split** — three disjoint pinned groups via `taskset`: gateway `0-3`
   (4 cores), load generator `4-9` (6), mock upstream `10-15` (6). Neither
   instrument can starve the gateway or bottleneck it.
-- **Instruments** — the prebuilt, pinned `otb` load generator and `mock`
-  upstream from the public benchmark rig release (engine pin
-  `f3adbb1315b26129f5e317af5279decefb1cea8f`, tag `engine-v1`, from
-  https://github.com/GetBusbar/benchmarking). `rig-setup.sh` verifies their
-  sha256 so a re-provisioned rig either runs the byte-identical instrument or
-  fails loudly. These are the same binaries behind the public board and the
-  same `otb loadgen` used for the api7/aisix#891 / #902 tables.
+- **Instruments** — the prebuilt `otb` load generator and `mock` upstream
+  from the public benchmark rig release
+  (https://github.com/GetBusbar/benchmarking). That release is rolling, so
+  `rig-setup.sh` fetches each by release asset id — a replaced asset gets a
+  new id instead of new bytes under the old one — and verifies its sha256, so
+  a re-provisioned rig either runs the byte-identical instrument or fails
+  loudly. The pinned build is upstream commit
+  `2d209e76ba336c3478d3754e2bcd245b663459a3` (2026-09-21); the
+  api7/aisix#891 / #902 tables used the earlier `f3adbb13` build
+  (`engine-v1`), so compare across the two pins with care.
 - **Default shipped config** — a setting may appear only if the process cannot
   run the benchmark without it. The full claim set (in `run-baseline.sh`):
   `resources_file` (boot: standalone source, else AISIX demands etcd),

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { connect } from "node:net";
-import { networkInterfaces, tmpdir } from "node:os";
+import { hostname, networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
@@ -127,6 +127,9 @@ async function cgroupLimit(pid: number): Promise<number | undefined> {
   return undefined;
 }
 
+const OTHER_HOST_DUMP = "20200101T000000.000Z-another-replica-auto-80.pb.gz";
+const HOST = hostname().replace(/[^A-Za-z0-9._]/g, "-");
+
 const chatChunk = (delta: Record<string, unknown>, finish: string | null = null) =>
   JSON.stringify({
     id: "chatcmpl-mem",
@@ -196,6 +199,9 @@ describe("memory observability", () => {
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     dumpDir = await mkdtemp(join(tmpdir(), "aisix-heap-"));
+    // A dump another replica wrote into the same volume, older than any of
+    // ours: pruning to `keep` must leave it alone.
+    await writeFile(join(dumpDir, OTHER_HOST_DUMP), "x");
     app = await spawnApp({
       threadPerCore: true,
       heapProfiling: {
@@ -333,10 +339,13 @@ describe("memory observability", () => {
     );
     expect(sumMetric(samples, "aisix_heap_profile_dumps_total", { trigger: "auto", result: "ok" })).toBe(3);
     expect(sumMetric(samples, "aisix_heap_profile_dumps_total", { trigger: "auto", result: "error" })).toBe(0);
-    const files = (await readdir(dumpDir)).filter((f) => f.endsWith(".pb.gz"));
+    const all = (await readdir(dumpDir)).filter((f) => f.endsWith(".pb.gz"));
+    expect(all, "another replica's dump is not ours to prune").toContain(OTHER_HOST_DUMP);
+    const files = all.filter((f) => f !== OTHER_HOST_DUMP);
     expect(files, "keep: 2 leaves the two newest of three").toHaveLength(2);
     for (const f of files) {
-      expect(f).toMatch(/^\d{8}T\d{6}\.\d{3}Z-auto-0\.000[23]\.pb\.gz$/);
+      expect(f.startsWith("20") && f.includes(`Z-${HOST}-auto-0.000`), f).toBe(true);
+      expect(f).toMatch(/^\d{8}T\d{6}\.\d{3}Z-.+-auto-0\.000[23]\.pb\.gz$/);
       const profile = readProfile(gunzipSync(await readFile(join(dumpDir, f))));
       expect(profile.sampleTypes).toContain("inuse_space");
     }

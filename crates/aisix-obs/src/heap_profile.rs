@@ -193,19 +193,47 @@ fn percent_label(threshold: f64) -> String {
     }
 }
 
-fn is_auto_dump(name: &str) -> bool {
-    name.contains("-auto-") && name.ends_with(".pb.gz") && !name.starts_with('.')
+/// Length of the `20260101T000000.000Z-` prefix every dump name starts with.
+const STAMP_LEN: usize = 21;
+
+/// This process's part of a dump name: the host name (a pod's name), so
+/// replicas sharing one volume neither overwrite nor prune each other's
+/// dumps. Reduced to characters that are safe in a file name.
+fn host_label() -> String {
+    let host = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "unknown".into());
+    host.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
-/// Delete the oldest auto dumps beyond `keep`. Names start with a UTC
-/// timestamp, so name order is age order.
-fn prune(dir: &Path, keep: usize) {
+/// Whether `name` is one of `host`'s automatic dumps.
+fn is_auto_dump_of(name: &str, host: &str) -> bool {
+    name.ends_with(".pb.gz")
+        && name
+            .get(STAMP_LEN..)
+            .is_some_and(|rest| rest.starts_with(host) && rest[host.len()..].starts_with("-auto-"))
+}
+
+/// Delete `host`'s oldest auto dumps beyond `keep`. Names start with a UTC
+/// timestamp, so name order is age order. Other hosts' files are theirs to
+/// prune.
+fn prune(dir: &Path, host: &str, keep: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     let mut names: Vec<String> = entries
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
-        .filter(|name| is_auto_dump(name))
+        .filter(|name| is_auto_dump_of(name, host))
         .collect();
     names.sort();
     let excess = names.len().saturating_sub(keep);
@@ -216,9 +244,9 @@ fn prune(dir: &Path, keep: usize) {
     }
 }
 
-fn write_dump(dir: &Path, threshold: f64, pprof: &[u8]) -> std::io::Result<PathBuf> {
+fn write_dump(dir: &Path, host: &str, threshold: f64, pprof: &[u8]) -> std::io::Result<PathBuf> {
     let name = format!(
-        "{}-auto-{}.pb.gz",
+        "{}-{host}-auto-{}.pb.gz",
         chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
         percent_label(threshold)
     );
@@ -262,6 +290,7 @@ pub fn spawn_auto_dump(cfg: &AutoDumpConfig, metrics: Metrics) {
         return;
     }
     let keep = cfg.keep;
+    let host = host_label();
     let mut arming = Arming::new(cfg.thresholds.clone());
     let spawned = std::thread::Builder::new()
         .name("heap-autodump".into())
@@ -279,7 +308,7 @@ pub fn spawn_auto_dump(cfg: &AutoDumpConfig, metrics: Metrics) {
                     let written = dump_pprof(&dir, true)
                         .map_err(|e| e.to_string())
                         .and_then(|pprof| {
-                            write_dump(&dir, threshold, &pprof).map_err(|e| e.to_string())
+                            write_dump(&dir, &host, threshold, &pprof).map_err(|e| e.to_string())
                         });
                     match written {
                         Ok(path) => {
@@ -290,7 +319,7 @@ pub fn spawn_auto_dump(cfg: &AutoDumpConfig, metrics: Metrics) {
                                 fraction,
                                 "resident memory crossed a heap-dump threshold; heap profile written"
                             );
-                            prune(&dir, keep);
+                            prune(&dir, &host, keep);
                         }
                         Err(error) => {
                             metrics.record_heap_profile_dump("auto", false);
@@ -333,18 +362,22 @@ mod tests {
     }
 
     #[test]
-    fn prune_keeps_the_newest_auto_dumps_only() {
+    fn prune_keeps_this_hosts_newest_dumps_and_leaves_other_hosts_alone() {
         let dir = tempfile::tempdir().unwrap();
         for name in [
-            "20260101T000000.000Z-auto-80.pb.gz",
-            "20260101T000001.000Z-auto-90.pb.gz",
-            "20260101T000002.000Z-auto-80.pb.gz",
+            "20260101T000000.000Z-pod-a-auto-80.pb.gz",
+            "20260101T000001.000Z-pod-a-auto-90.pb.gz",
+            "20260101T000002.000Z-pod-a-auto-80.pb.gz",
+            // Another replica on the same volume, older than all of ours.
+            "20250101T000000.000Z-pod-b-auto-80.pb.gz",
+            // A host whose name extends ours is still someone else.
+            "20250101T000000.000Z-pod-a2-auto-80.pb.gz",
             "unrelated.pb.gz",
-            ".20260101T000003.000Z-auto-80.pb.gz.tmp",
+            ".20260101T000003.000Z-pod-a-auto-80.pb.gz.tmp",
         ] {
             std::fs::write(dir.path().join(name), b"x").unwrap();
         }
-        prune(dir.path(), 2);
+        prune(dir.path(), "pod-a", 2);
         let mut left: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -353,12 +386,26 @@ mod tests {
         assert_eq!(
             left,
             vec![
-                ".20260101T000003.000Z-auto-80.pb.gz.tmp",
-                "20260101T000001.000Z-auto-90.pb.gz",
-                "20260101T000002.000Z-auto-80.pb.gz",
+                ".20260101T000003.000Z-pod-a-auto-80.pb.gz.tmp",
+                "20250101T000000.000Z-pod-a2-auto-80.pb.gz",
+                "20250101T000000.000Z-pod-b-auto-80.pb.gz",
+                "20260101T000001.000Z-pod-a-auto-90.pb.gz",
+                "20260101T000002.000Z-pod-a-auto-80.pb.gz",
                 "unrelated.pb.gz",
             ]
         );
+    }
+
+    #[test]
+    fn dump_names_carry_the_host_and_are_recognised_as_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_label();
+        assert!(!host.is_empty() && !host.contains('/'));
+        let path = write_dump(dir.path(), &host, 0.8, b"x").unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(name.ends_with(&format!("-{host}-auto-80.pb.gz")), "{name}");
+        assert!(is_auto_dump_of(name, &host));
+        assert!(!is_auto_dump_of(name, "some-other-host"));
     }
 
     #[test]

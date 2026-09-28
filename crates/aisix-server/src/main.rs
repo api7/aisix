@@ -30,14 +30,14 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 // Heap profiling is on from the first allocation, so a profile can be taken
 // from a gateway that is already misbehaving, and the automatic dump near
-// the memory limit has something to write. One allocation in every 512 KiB
-// (2^19 bytes) on average is sampled with its stack. jemalloc reads this
+// the memory limit has something to write. One allocation in every 2 MiB
+// (2^21 bytes) on average is sampled with its stack. jemalloc reads this
 // symbol at startup and then `_RJEM_MALLOC_CONF`, which overrides it — an
 // operator turns sampling off with `_RJEM_MALLOC_CONF=prof_active:false`.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[export_name = "_rjem_malloc_conf"]
 pub static MALLOC_CONF: Option<&'static u8> =
-    Some(&b"prof:true,prof_active:true,lg_prof_sample:19\0"[0]);
+    Some(&b"prof:true,prof_active:true,lg_prof_sample:21\0"[0]);
 
 // jemalloc parks freed pages as "dirty" and only advances their decay clock
 // on later allocator activity in the same arena, so after a burst of

@@ -245,7 +245,7 @@ observability:
   debug:
     enabled: true
     addr: "127.0.0.1:9091"
-  # Heap sampling is always on in the Linux build (one sample per 512 KiB
+  # Heap sampling is always on in the Linux build (one sample per 2 MiB
   # allocated on average). Turn it off without a rebuild with the jemalloc
   # environment variable `_RJEM_MALLOC_CONF=prof_active:false`.
   heap_profiling:
@@ -253,8 +253,8 @@ observability:
     # threshold — a fraction of the container's memory limit, or of the
     # host's memory when there is none. Each threshold fires once per
     # upward crossing and re-arms after memory falls 5 points below it.
-    # Files are named <UTC time>-auto-<percent>.pb.gz; only the newest
-    # `keep` are kept. `dir` is created if missing; one that cannot be
+    # Files are named <UTC time>-<host name>-auto-<percent>.pb.gz; only the
+    # newest `keep` of this host's files are kept. `dir` is created if missing; one that cannot be
     # created or written logs one warning and turns this off. In Kubernetes, point `dir` at a volume that survives
     # a container restart, so the profile outlives an OOM kill.
     auto_dump:

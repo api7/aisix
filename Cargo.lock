@@ -255,6 +255,7 @@ dependencies = [
  "flate2",
  "futures",
  "hex",
+ "hostname",
  "http 1.4.0",
  "lz4_flex",
  "mappings",

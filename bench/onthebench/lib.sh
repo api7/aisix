@@ -617,7 +617,7 @@ meta_cores_json() {
 meta_instruments_json() {
     cat <<EOF
 {
-    "engine_pin": "f3adbb1315b26129f5e317af5279decefb1cea8f (engine-v1)",
+    "engine_pin": "2d209e76ba336c3478d3754e2bcd245b663459a3",
     "otb_sha256": "$(sha256sum "$TOOLS/otb" | cut -d' ' -f1)",
     "mock_sha256": "$(sha256sum "$TOOLS/mock" | cut -d' ' -f1)"
   }
