@@ -336,7 +336,9 @@ impl ConfigProvider for EtcdConfigProvider {
         // an event.
         if watcher.watch_id() == INVALID_WATCH_ID {
             return Err(ProviderError::Watch(
-                "etcd cancelled the watch as it was created".to_owned(),
+                "etcd cancelled the watch as it was created (typically a permission or \
+                 auth-token refusal; etcd-client does not expose the reason)"
+                    .to_owned(),
             ));
         }
 
