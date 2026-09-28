@@ -2205,14 +2205,17 @@ async fn cross_provider_dispatch(
     let in_flight = state.runtime_status.begin_in_flight(model_id);
 
     if is_stream {
-        let upstream = bridge.chat_stream(&chat, &ctx).await.map_err(|err| {
-            if let Some((ttl, reason)) =
-                crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-            {
-                state.runtime_status.mark_cooldown(model_id, ttl, reason);
-            }
-            ProxyError::Bridge(err)
-        })?;
+        let upstream = bridge
+            .chat_stream_cow(std::borrow::Cow::Owned(chat), &ctx)
+            .await
+            .map_err(|err| {
+                if let Some((ttl, reason)) =
+                    crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                {
+                    state.runtime_status.mark_cooldown(model_id, ttl, reason);
+                }
+                ProxyError::Bridge(err)
+            })?;
         // #554: when a streaming budget is configured (`stream_timeout`,
         // falling back to `timeout`), peek the first chunk so a slow/erroring
         // first token fails over (the caller loops to the next target) before
@@ -2490,13 +2493,17 @@ async fn cross_provider_dispatch(
     }
 
     // Non-streaming.
-    let mut resp = bridge.chat(&chat, &ctx).await.map_err(|err| {
-        if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-        {
-            state.runtime_status.mark_cooldown(model_id, ttl, reason);
-        }
-        ProxyError::Bridge(err)
-    })?;
+    let mut resp = bridge
+        .chat_cow(std::borrow::Cow::Owned(chat), &ctx)
+        .await
+        .map_err(|err| {
+            if let Some((ttl, reason)) =
+                crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+            {
+                state.runtime_status.mark_cooldown(model_id, ttl, reason);
+            }
+            ProxyError::Bridge(err)
+        })?;
     state.health.record_success(&model.display_name);
     state.runtime_status.mark_healthy(model_id);
 

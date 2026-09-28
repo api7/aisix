@@ -543,6 +543,41 @@ mod tests {
         );
     }
 
+    /// A provider bridge that keeps the default `chat_cow` /
+    /// `chat_stream_cow` borrows the request for the whole call, so a
+    /// translated or rewritten request handed over by value stays alive
+    /// through the upstream wait next to its wire body.
+    #[test]
+    fn provider_bridges_drop_an_owned_request_before_the_upstream_wait() {
+        let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        let mut offenders = Vec::new();
+        for file in rust_sources(crates_dir) {
+            let in_provider = file.components().any(|c| {
+                c.as_os_str()
+                    .to_string_lossy()
+                    .starts_with("aisix-provider-")
+            });
+            if !in_provider {
+                continue;
+            }
+            let src = std::fs::read_to_string(&file).expect("read source");
+            let production = without_test_modules(&src);
+            if !production.contains("impl Bridge for ") {
+                continue;
+            }
+            for method in ["async fn chat_cow(", "async fn chat_stream_cow("] {
+                if !production.contains(method) {
+                    offenders.push(format!("{}: {method}", file.display()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "provider bridges must override the owned-request entry points:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
     /// `src` with every `#[cfg(test)] mod … { … }` block removed, wherever
     /// it sits. [`production_half`] stops at the first test module, and a
     /// file can declare one (`#[cfg(test)] mod x;`) or nest one near the

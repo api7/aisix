@@ -806,6 +806,29 @@ pub trait Bridge: Send + Sync + 'static {
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError>;
 
+    /// [`Bridge::chat`] for a caller that can hand over a request it will
+    /// not reuse — a per-attempt translation or rewrite. An owned request
+    /// is dropped as soon as the upstream body is built, so it is not
+    /// alive for the upstream wait next to the body. Every production
+    /// bridge overrides this; the default only borrows.
+    async fn chat_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
+        self.chat(&req, ctx).await
+    }
+
+    /// [`Bridge::chat_stream`] with the same ownership contract as
+    /// [`Bridge::chat_cow`].
+    async fn chat_stream_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatChunkStream, BridgeError> {
+        self.chat_stream(&req, ctx).await
+    }
+
     /// Embedding call: text(s) → float vectors. Providers that do not
     /// support embeddings keep the default, which returns
     /// [`BridgeError::UnsupportedCapability`] so `/v1/embeddings` can

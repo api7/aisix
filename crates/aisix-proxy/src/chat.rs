@@ -1252,7 +1252,7 @@ fn apply_estimated_usage(
 /// estimation fills only zeros. One helper so every sub-call emit site
 /// (non-streaming panel + judge, streaming panel) can't drift apart.
 fn estimate_subcall_tokens(
-    req: &ChatFormat,
+    req: impl FnOnce() -> ChatFormat,
     model: &str,
     usage: &aisix_gateway::chat::UsageStats,
     output_text: &str,
@@ -1262,7 +1262,7 @@ fn estimate_subcall_tokens(
     }
     let est = crate::token_estimate::Estimator::new(
         model,
-        crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
+        crate::token_estimate::PromptInput::Chat(Box::new(req())),
     );
     let filled = crate::token_estimate::fill_missing(
         &est,
@@ -1306,7 +1306,7 @@ pub(crate) struct EffectiveSubcallUsage {
 /// commit. The client-facing response still carries only upstream-reported
 /// usage; local estimates remain telemetry-only.
 pub(crate) fn effective_subcall_usage(
-    req: &ChatFormat,
+    req: impl FnOnce() -> ChatFormat,
     model: &str,
     reported: &aisix_gateway::chat::UsageStats,
     output_text: &str,
@@ -1816,7 +1816,6 @@ async fn dispatch(
 
         'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
             let model = &attempt.model;
-            let upstream_req = crate::effort_mapping::chat_request(req, model);
             let Ok(provider) = crate::dispatch::require_provider(model) else {
                 last_reserve_reject = None;
                 last_err = Some(BridgeError::Config("model has no provider".into()));
@@ -1969,7 +1968,14 @@ async fn dispatch(
                 // heartbeats cover the wait for the first token. The
                 // read-timeout wrapper is a no-op when the budget is None.
                 let attempt_stream: Result<aisix_gateway::ChatChunkStream, BridgeError> =
-                    match bridge.chat_stream(upstream_req.as_ref(), &ctx).await {
+                    // Mapped per attempt and handed over by value: a rewritten
+                    // request is a whole-request copy, which the bridge drops
+                    // once it has built the wire body rather than keeping it
+                    // for the upstream wait.
+                    match bridge
+                        .chat_stream_cow(crate::effort_mapping::chat_request(req, model), &ctx)
+                        .await
+                    {
                         Err(e) => Err(e),
                         Ok(up) => {
                             let up = crate::stream_timeout::with_read_timeout(up, stream_budget);
@@ -3050,7 +3056,6 @@ async fn dispatch(
 
     'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
         let model = &attempt.model;
-        let upstream_req = crate::effort_mapping::chat_request(req, model);
         let Some(provider) = model.provider.as_deref() else {
             last_reserve_reject = None;
             last_err = Some(BridgeError::Config("model has no provider".into()));
@@ -3197,7 +3202,11 @@ async fn dispatch(
             // once `bridge.chat` returns; the guard drops at the end of this
             // attempt's scope on both the success-break and failure paths.
             let _in_flight = state.runtime_status.begin_in_flight(&attempt.id);
-            let result = bridge.chat(upstream_req.as_ref(), &ctx).await;
+            // Mapped per attempt and handed over by value: a rewritten request
+            // is a whole-request copy, which the bridge drops once it has
+            // built the wire body rather than keeping it for the upstream wait.
+            let upstream_req = crate::effort_mapping::chat_request(req, model);
+            let result = bridge.chat_cow(upstream_req, &ctx).await;
             let attempt_latency_ms =
                 attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
             match result {
@@ -7018,8 +7027,12 @@ mod complete_on_drop_tests {
     #[test]
     fn estimate_subcall_fills_missing_usage() {
         let usage = aisix_gateway::chat::UsageStats::default();
-        let (prompt, completion, estimated) =
-            estimate_subcall_tokens(&subcall_req("Hello"), "relay-model", &usage, "Hello world");
+        let (prompt, completion, estimated) = estimate_subcall_tokens(
+            || subcall_req("Hello"),
+            "relay-model",
+            &usage,
+            "Hello world",
+        );
         assert_eq!(prompt, 8);
         assert_eq!(completion, 2);
         assert!(estimated);
@@ -7035,8 +7048,12 @@ mod complete_on_drop_tests {
             total_tokens: 40,
             ..Default::default()
         };
-        let (prompt, completion, estimated) =
-            estimate_subcall_tokens(&subcall_req("Hello"), "relay-model", &usage, "Hello world");
+        let (prompt, completion, estimated) = estimate_subcall_tokens(
+            || subcall_req("Hello"),
+            "relay-model",
+            &usage,
+            "Hello world",
+        );
         assert_eq!(prompt, 17);
         assert_eq!(completion, 23);
         assert!(!estimated);
@@ -7052,8 +7069,12 @@ mod complete_on_drop_tests {
             total_tokens: 17,
             ..Default::default()
         };
-        let (prompt, completion, estimated) =
-            estimate_subcall_tokens(&subcall_req("Hello"), "relay-model", &usage, "Hello world");
+        let (prompt, completion, estimated) = estimate_subcall_tokens(
+            || subcall_req("Hello"),
+            "relay-model",
+            &usage,
+            "Hello world",
+        );
         assert_eq!(prompt, 17, "reported prompt preserved");
         assert_eq!(completion, 2, "missing completion estimated");
         assert!(estimated);
@@ -7072,7 +7093,7 @@ mod complete_on_drop_tests {
             ..Default::default()
         };
         let effective =
-            effective_subcall_usage(&subcall_req("Hello"), "relay-model", &reported, "reply");
+            effective_subcall_usage(|| subcall_req("Hello"), "relay-model", &reported, "reply");
         assert_eq!(effective.usage.total_tokens, 26);
         assert!(!effective.estimated);
 

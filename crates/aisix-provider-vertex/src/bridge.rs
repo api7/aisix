@@ -645,6 +645,14 @@ impl Bridge for VertexBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
+        self.chat_cow(std::borrow::Cow::Borrowed(req), ctx).await
+    }
+
+    async fn chat_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
         let upstream_id = upstream_model(ctx)?;
         let publisher = VertexPublisher::from_upstream_id(upstream_id).ok_or_else(|| {
             BridgeError::Config(format!(
@@ -671,6 +679,15 @@ impl Bridge for VertexBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
+        self.chat_stream_cow(std::borrow::Cow::Borrowed(req), ctx)
+            .await
+    }
+
+    async fn chat_stream_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatChunkStream, BridgeError> {
         let upstream_id = upstream_model(ctx)?;
         let publisher = VertexPublisher::from_upstream_id(upstream_id).ok_or_else(|| {
             BridgeError::Config(format!(
@@ -689,15 +706,16 @@ impl Bridge for VertexBridge {
         // `response_format` natively.
         if publisher == VertexPublisher::Anthropic
             && matches!(
-                structured_output_for(req, upstream_id),
+                structured_output_for(&req, upstream_id),
                 StructuredOutput::Tool(_)
             )
         {
             // The leg is not streaming, so it runs under the budget a
             // non-streaming call would have got — the streaming budget
             // this context carries bounds a chunk gap, not a completion.
-            let chunks =
-                response_into_fake_stream_chunks(self.chat(req, &ctx.non_streaming_ctx()).await?);
+            let chunks = response_into_fake_stream_chunks(
+                self.chat_cow(req, &ctx.non_streaming_ctx()).await?,
+            );
             return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
         }
         match publisher {
@@ -847,7 +865,7 @@ impl VertexBridge {
     /// <https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/gemini>.
     async fn chat_gemini(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
@@ -880,7 +898,7 @@ impl VertexBridge {
         )?;
 
         let body = {
-            let typed = build_gemini_request(req, upstream_id);
+            let typed = build_gemini_request(&req, upstream_id);
             // Audit LOW-4: Gemini requires `contents` to be a non-empty
             // array. If the caller passed system-only messages (lifted to
             // `systemInstruction`), `contents` ends up empty and Vertex
@@ -904,6 +922,8 @@ impl VertexBridge {
             apply_body_overrides(&mut body, ctx);
             outbound_bytes(&body)?
         };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         // Resolve bearer: pre-minted token verbatim, or mint+cache
         // via the in-process token minter from SA JSON. Failure
         // surfaces as a Config error (operator-actionable).
@@ -959,7 +979,7 @@ impl VertexBridge {
     /// happens at the proxy render layer, not here.
     async fn chat_anthropic(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
@@ -994,13 +1014,13 @@ impl VertexBridge {
         // Vertex `anthropic_version`). Mirrors the Bedrock `/invoke`
         // body shaping, differing only in the version string.
         let synthetic_json_tool = matches!(
-            structured_output_for(req, upstream_id),
+            structured_output_for(&req, upstream_id),
             StructuredOutput::Tool(_)
         );
         let body_value = {
-            let (system, messages) = split_system(req)
+            let (system, messages) = split_system(&req)
                 .map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
-            let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, false);
+            let anthropic_req = build_anthropic_request(&req, upstream_id, system, messages, false);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
             })?;
@@ -1020,6 +1040,8 @@ impl VertexBridge {
             }
             outbound_bytes(&body_value)?
         };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
@@ -1069,7 +1091,7 @@ impl VertexBridge {
     /// alias restore are identical to the non-stream path.
     async fn chat_anthropic_stream(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatChunkStream, BridgeError> {
@@ -1104,9 +1126,9 @@ impl VertexBridge {
         // in the body (only `model` is stripped into the URL). Add the
         // Vertex `anthropic_version`.
         let body_value = {
-            let (system, messages) = split_system(req)
+            let (system, messages) = split_system(&req)
                 .map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
-            let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, true);
+            let anthropic_req = build_anthropic_request(&req, upstream_id, system, messages, true);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
             })?;
@@ -1124,6 +1146,8 @@ impl VertexBridge {
             }
             outbound_bytes(&body_value)?
         };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
@@ -1229,7 +1253,7 @@ impl VertexBridge {
     /// <https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/llama#openai>.
     async fn chat_openai_shim(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
@@ -1253,8 +1277,8 @@ impl VertexBridge {
         )?;
 
         let body = {
-            let messages = openai_messages_from(req, DeveloperRoleMode::MapToSystem);
-            let typed = build_openai_request(req, upstream_id, &messages, false);
+            let messages = openai_messages_from(&req, DeveloperRoleMode::MapToSystem);
+            let typed = build_openai_request(&req, upstream_id, &messages, false);
             let mut body = serde_json::to_value(&typed).map_err(|e| {
                 BridgeError::Config(format!("serialize OpenAI shim request body: {e}"))
             })?;
@@ -1264,6 +1288,8 @@ impl VertexBridge {
             apply_body_overrides(&mut body, ctx);
             outbound_bytes(&body)?
         };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
@@ -1298,7 +1324,7 @@ impl VertexBridge {
     /// has no `?alt=sse`-style query).
     async fn chat_openai_shim_stream(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatChunkStream, BridgeError> {
@@ -1318,8 +1344,8 @@ impl VertexBridge {
         )?;
 
         let body = {
-            let messages = openai_messages_from(req, DeveloperRoleMode::MapToSystem);
-            let typed = build_openai_request(req, upstream_id, &messages, true);
+            let messages = openai_messages_from(&req, DeveloperRoleMode::MapToSystem);
+            let typed = build_openai_request(&req, upstream_id, &messages, true);
             let mut body = serde_json::to_value(&typed).map_err(|e| {
                 BridgeError::Config(format!("serialize OpenAI shim request body: {e}"))
             })?;
@@ -1328,6 +1354,8 @@ impl VertexBridge {
             apply_body_overrides(&mut body, ctx);
             outbound_bytes(&body)?
         };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
@@ -1427,7 +1455,7 @@ impl VertexBridge {
     /// body POSTed to `publishers/{mistralai|ai21}/models/<model>:rawPredict`.
     async fn chat_mistral_ai21(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
         publisher: VertexPublisher,
@@ -1469,8 +1497,8 @@ impl VertexBridge {
         // (Llama/MaaS) rail uses. The model is KEPT in the body (Mistral /
         // AI21 on Vertex expect it in both the URL and the body).
         let body = {
-            let messages = openai_messages_from(req, DeveloperRoleMode::MapToSystem);
-            let typed = build_openai_request(req, upstream_id, &messages, false);
+            let messages = openai_messages_from(&req, DeveloperRoleMode::MapToSystem);
+            let typed = build_openai_request(&req, upstream_id, &messages, false);
             let mut body = serde_json::to_value(&typed)
                 .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
             // Apply the per-ProviderKey override pipeline (#339). The model id
@@ -1478,6 +1506,8 @@ impl VertexBridge {
             apply_body_overrides(&mut body, ctx);
             outbound_bytes(&body)?
         };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
@@ -1512,7 +1542,7 @@ impl VertexBridge {
     /// shared [`SseDecoder`] + the OpenAI stream-chunk decoder.
     async fn chat_mistral_ai21_stream(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
         publisher: VertexPublisher,
@@ -1549,8 +1579,8 @@ impl VertexBridge {
         )?;
 
         let body = {
-            let messages = openai_messages_from(req, DeveloperRoleMode::MapToSystem);
-            let typed = build_openai_request(req, upstream_id, &messages, true);
+            let messages = openai_messages_from(&req, DeveloperRoleMode::MapToSystem);
+            let typed = build_openai_request(&req, upstream_id, &messages, true);
             let mut body = serde_json::to_value(&typed)
                 .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
             // Apply the per-ProviderKey override pipeline (#339); `stream: true`
@@ -1558,6 +1588,8 @@ impl VertexBridge {
             apply_body_overrides(&mut body, ctx);
             outbound_bytes(&body)?
         };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
@@ -1638,7 +1670,7 @@ impl VertexBridge {
     /// break us.
     async fn chat_gemini_stream(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatChunkStream, BridgeError> {
@@ -1669,7 +1701,7 @@ impl VertexBridge {
         )?;
 
         let body = {
-            let typed = build_gemini_request(req, upstream_id);
+            let typed = build_gemini_request(&req, upstream_id);
             if typed.contents.is_empty() {
                 return Err(BridgeError::Config(
                     "vertex chat: messages must include at least one user / \
@@ -1685,6 +1717,8 @@ impl VertexBridge {
             apply_body_overrides(&mut body, ctx);
             outbound_bytes(&body)?
         };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         // Resolve bearer (pre-minted OR minted-from-SA) BEFORE
         // entering the stream future so token-mint errors surface
         // as a direct Err return rather than being yielded mid-stream.

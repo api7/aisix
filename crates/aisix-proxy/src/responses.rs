@@ -2307,7 +2307,6 @@ async fn responses_cross_provider_to_target(
             .iter()
             .map(|e| &e.value),
     );
-    let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
 
     let provider = model
         .provider
@@ -2329,6 +2328,9 @@ async fn responses_cross_provider_to_target(
     let outbound_body = crate::effort_mapping::responses_request(body, model);
     let chat =
         crate::responses_bridge::responses_request_to_chat(requested_model, outbound_body.as_ref());
+    // A rewritten body is a whole-request copy; the translation above is
+    // all this attempt needs from it.
+    drop(outbound_body);
     // `custom` tools and namespace sub-tools travel upstream as plain
     // function tools, so only the request's own tool list can tell the
     // reply translators which item each of the model's calls goes back as;
@@ -2368,14 +2370,20 @@ async fn responses_cross_provider_to_target(
     let in_flight = state.runtime_status.begin_in_flight(model_id);
 
     if is_stream {
-        let upstream = bridge.chat_stream(&chat, &ctx).await.map_err(|err| {
-            if let Some((ttl, reason)) =
-                crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-            {
-                state.runtime_status.mark_cooldown(model_id, ttl, reason);
-            }
-            ProxyError::Bridge(err)
-        })?;
+        let upstream = bridge
+            .chat_stream_cow(std::borrow::Cow::Owned(chat), &ctx)
+            .await
+            .map_err(|err| {
+                if let Some((ttl, reason)) =
+                    crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                {
+                    state.runtime_status.mark_cooldown(model_id, ttl, reason);
+                }
+                ProxyError::Bridge(err)
+            })?;
+        // Serialized once the upstream has answered, not before: a copy made
+        // up front would be alive for the whole upstream wait.
+        let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
         // #554: peek the first chunk so a slow/erroring first token fails
         // over before the 200 is committed (when a stream budget is set);
         // the wrapper keeps enforcing the per-chunk read timeout either way.
@@ -2652,13 +2660,20 @@ async fn responses_cross_provider_to_target(
     }
 
     // Non-streaming.
-    let mut resp = bridge.chat(&chat, &ctx).await.map_err(|err| {
-        if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-        {
-            state.runtime_status.mark_cooldown(model_id, ttl, reason);
-        }
-        ProxyError::Bridge(err)
-    })?;
+    let mut resp = bridge
+        .chat_cow(std::borrow::Cow::Owned(chat), &ctx)
+        .await
+        .map_err(|err| {
+            if let Some((ttl, reason)) =
+                crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+            {
+                state.runtime_status.mark_cooldown(model_id, ttl, reason);
+            }
+            ProxyError::Bridge(err)
+        })?;
+    // Serialized once the upstream has answered, not before: a copy made
+    // up front would be alive for the whole upstream wait.
+    let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
     state.health.record_success(&model.display_name);
     state.runtime_status.mark_healthy(model_id);
 

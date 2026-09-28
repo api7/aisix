@@ -489,12 +489,20 @@ impl Bridge for OpenAiBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
+        self.chat_cow(std::borrow::Cow::Borrowed(req), ctx).await
+    }
+
+    async fn chat_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
         let body = {
-            let messages = messages_from(req, developer_role_mode(ctx));
-            let typed = build_request(req, upstream, &messages, false);
+            let messages = messages_from(&req, developer_role_mode(ctx));
+            let typed = build_request(&req, upstream, &messages, false);
             outbound_bytes(&prepare_outbound_body(
                 &typed,
                 is_reasoning_model(ReasoningFamily::Openai, upstream),
@@ -502,6 +510,8 @@ impl Bridge for OpenAiBridge {
                 ctx.provider_key.response.as_ref(),
             )?)?
         };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
@@ -718,12 +728,21 @@ impl Bridge for OpenAiBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
+        self.chat_stream_cow(std::borrow::Cow::Borrowed(req), ctx)
+            .await
+    }
+
+    async fn chat_stream_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatChunkStream, BridgeError> {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
         let body = {
-            let messages = messages_from(req, developer_role_mode(ctx));
-            let typed = build_request(req, upstream, &messages, true);
+            let messages = messages_from(&req, developer_role_mode(ctx));
+            let typed = build_request(&req, upstream, &messages, true);
             outbound_bytes(&prepare_outbound_body(
                 &typed,
                 is_reasoning_model(ReasoningFamily::Openai, upstream),
@@ -731,6 +750,8 @@ impl Bridge for OpenAiBridge {
                 ctx.provider_key.response.as_ref(),
             )?)?
         };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         let headers = build_request_headers(key, &ctx.request_id, true, &ctx.header_ctx())?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,

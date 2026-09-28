@@ -30,7 +30,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use futures::StreamExt;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch};
 use tower::ServiceExt;
 
 struct CountingAllocator;
@@ -78,33 +78,30 @@ fn live() -> isize {
     LIVE.load(Ordering::Relaxed)
 }
 
-/// Upper bound on bytes held per byte of request body during the wait: the
-/// parsed request the handler retries from plus the wire body reqwest keeps
-/// until the response head, one body's worth each. The margin above 2 is
-/// room for bookkeeping; any third copy lands at 3.
-const MAX_MULTIPLIER: f64 = 2.1;
+/// Room above the bound for bookkeeping. Every whole extra copy of the
+/// request costs a full 1.0.
+const MARGIN: f64 = 0.1;
 
 const PK_ID: &str = "11111111-1111-1111-1111-111111111111";
 const ANTHROPIC_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
 
 /// A mock upstream that consumes each request body chunk by chunk without
-/// keeping it, reports how many bytes it read, and answers only once the
-/// test releases it. It runs on a runtime of its own whose threads the
-/// allocator does not count.
+/// keeping it, reports how many bytes it read, and — while the test holds
+/// it — answers only once released. It runs on a runtime of its own whose
+/// threads the allocator does not count.
 struct HeldUpstream {
     base: String,
     received: mpsc::UnboundedReceiver<usize>,
-    release: Arc<Notify>,
+    hold: watch::Sender<bool>,
 }
 
 fn start_upstream() -> HeldUpstream {
     let (tx, received) = mpsc::unbounded_channel();
-    let release = Arc::new(Notify::new());
+    let (hold, held) = watch::channel(true);
     let app = Router::new().fallback({
-        let release = release.clone();
         move |req: Request<Body>| {
             let tx = tx.clone();
-            let release = release.clone();
+            let mut held = held.clone();
             async move {
                 let path = req.uri().path().to_string();
                 let mut body = req.into_body().into_data_stream();
@@ -114,7 +111,7 @@ fn start_upstream() -> HeldUpstream {
                 }
                 drop(body);
                 let _ = tx.send(n);
-                release.notified().await;
+                let _ = held.wait_for(|holding| !*holding).await;
                 axum::Json(upstream_response(&path))
             }
         }
@@ -136,7 +133,7 @@ fn start_upstream() -> HeldUpstream {
     HeldUpstream {
         base: format!("http://{addr}"),
         received,
-        release,
+        hold,
     }
 }
 
@@ -213,6 +210,7 @@ fn snapshot(api_base: &str) -> AisixSnapshot {
             ANTHROPIC_PK_ID,
         ),
         ("model-rerank", "reranker", "openai", "rerank-v3", PK_ID),
+        ("model-chat-b", "vision-b", "openai", "gpt-4o-mini", PK_ID),
     ] {
         let model: Model = serde_json::from_str(&format!(
             r#"{{"display_name":"{name}","provider":"{provider}","model_name":"{upstream}","provider_key_id":"{pk_id}"}}"#
@@ -221,11 +219,33 @@ fn snapshot(api_base: &str) -> AisixSnapshot {
         snap.models.insert(ResourceEntry::new(id, model, 1));
     }
     let key: ApiKey = serde_json::from_str(&format!(
-        r#"{{"key_hash":"{}","allowed_models":["vision","embedder","claude","reranker"]}}"#,
+        r#"{{"key_hash":"{}","allowed_models":["vision","embedder","claude","reranker","effort","panel"]}}"#,
         ApiKey::hash_bearer("sk-caller")
     ))
     .unwrap();
     snap.apikeys.insert(ResourceEntry::new("key-1", key, 1));
+    // A model whose effort mapping rewrites every request it serves.
+    let effort: Model = serde_json::from_str(&format!(
+        r#"{{"display_name":"effort","provider":"openai","model_name":"gpt-4o","provider_key_id":"{PK_ID}","effort_mapping":{{"":"low"}}}}"#
+    ))
+    .unwrap();
+    snap.models
+        .insert(ResourceEntry::new("model-effort", effort, 1));
+    let panel: Model = serde_json::from_str(
+        r#"{"display_name":"panel","ensemble":{"panel":[{"model":"vision"},{"model":"vision-b"}],"judge":{"model":"vision"}}}"#,
+    )
+    .unwrap();
+    snap.models
+        .insert(ResourceEntry::new("model-panel", panel, 1));
+    // An exporter that captures full content, so every route also builds
+    // its captured prompt: that copy must not be held across the wait
+    // either. Nothing is delivered — the proxy only reads the setting.
+    let exporter: aisix_core::models::ObservabilityExporter = serde_json::from_str(
+        r#"{"name":"capture","enabled":true,"kind":"otlp_http","endpoint":"http://127.0.0.1:9/v1/traces","content_mode":"full","content_max_bytes":1048576}"#,
+    )
+    .unwrap();
+    snap.observability_exporters
+        .insert(ResourceEntry::new("exporter-1", exporter, 1));
     snap
 }
 
@@ -279,6 +299,35 @@ fn chat_body(size: (usize, usize)) -> String {
     chat_body_for("vision", size)
 }
 
+fn effort_mapped_chat_body(size: (usize, usize)) -> String {
+    chat_body_for("effort", size)
+}
+
+fn ensemble_body(size: (usize, usize)) -> String {
+    chat_body_for("panel", size)
+}
+
+/// An Anthropic request addressed to the OpenAI model: translated into
+/// the gateway's chat format for the OpenAI bridge on every attempt.
+fn messages_to_openai_body(size: (usize, usize)) -> String {
+    messages_body_for("vision", size)
+}
+
+/// A Responses request addressed to the Anthropic model, which does not
+/// serve the Responses API: translated for the Anthropic bridge. That
+/// bridge does not carry images across, so the bulk here is text.
+fn responses_to_anthropic_body((parts, part_bytes): (usize, usize)) -> String {
+    let content: Vec<_> = (0..parts)
+        .map(|i| serde_json::json!({"type": "input_text", "text": base64_blob(part_bytes, i)}))
+        .collect();
+    serde_json::json!({
+        "model": "claude",
+        "max_output_tokens": 64,
+        "input": [{"role": "user", "content": content}]
+    })
+    .to_string()
+}
+
 /// An OpenAI-shape request addressed to the Anthropic model, so the
 /// Anthropic bridge translates it into an owned Anthropic request. That
 /// bridge does not carry images across, so the bulk here is text, sent as
@@ -311,7 +360,11 @@ fn chat_body_for(model: &str, (images, image_bytes): (usize, usize)) -> String {
     .to_string()
 }
 
-fn messages_body((images, image_bytes): (usize, usize)) -> String {
+fn messages_body(size: (usize, usize)) -> String {
+    messages_body_for("claude", size)
+}
+
+fn messages_body_for(model: &str, (images, image_bytes): (usize, usize)) -> String {
     let mut content = vec![serde_json::json!({"type": "text", "text": "Describe these images."})];
     for i in 0..images {
         content.push(serde_json::json!({
@@ -320,7 +373,7 @@ fn messages_body((images, image_bytes): (usize, usize)) -> String {
         }));
     }
     serde_json::json!({
-        "model": "claude",
+        "model": model,
         "max_tokens": 64,
         "messages": [{"role": "user", "content": content}]
     })
@@ -356,15 +409,17 @@ fn embeddings_body((images, image_bytes): (usize, usize)) -> String {
     serde_json::json!({"model": "embedder", "input": input}).to_string()
 }
 
-/// Send `body` to `path` and, while the upstream withholds its answer,
-/// return the live-heap growth since before the body existed, together
-/// with the body length.
+/// Send `body` to `path` and, once `requests` upstream calls have arrived
+/// and are being withheld, return the live-heap growth since before the
+/// body existed, together with the body length.
 async fn held_while_pending(
     app: &Router,
     upstream: &mut HeldUpstream,
     path: &str,
+    requests: usize,
     make_body: impl FnOnce() -> String,
 ) -> (isize, usize) {
+    upstream.hold.send_replace(true);
     let before = live();
     let body = make_body();
     let body_len = body.len();
@@ -377,38 +432,70 @@ async fn held_while_pending(
         .unwrap();
     let call = tokio::spawn(app.clone().oneshot(req));
 
-    let received = tokio::time::timeout(Duration::from_secs(60), upstream.received.recv())
-        .await
-        .expect("upstream never received the request")
-        .unwrap();
-    assert!(
-        received >= body_len / 2,
-        "upstream read only {received} bytes"
-    );
+    for _ in 0..requests {
+        let received = tokio::time::timeout(Duration::from_secs(60), upstream.received.recv())
+            .await
+            .expect("upstream never received the request")
+            .unwrap();
+        assert!(
+            received >= body_len / 2,
+            "{path}: upstream read only {received} bytes"
+        );
+    }
     // Let anything transient from the send settle before sampling.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let held = live() - before;
 
-    upstream.release.notify_one();
+    upstream.hold.send_replace(false);
     let resp = call.await.unwrap().unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "{path}");
     let _ = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+    // Later calls of the same request (an ensemble's judge) answered
+    // without being held; drain their receipts.
+    while upstream.received.try_recv().is_ok() {}
     (held, body_len)
 }
 
 /// Bytes held per byte of request body: the large request's growth less
 /// the small one's, over the difference in their lengths.
-async fn in_flight_multiplier(
-    app: &Router,
-    upstream: &mut HeldUpstream,
-    path: &str,
-    make_body: BodyFn,
-) -> f64 {
+async fn in_flight_multiplier(app: &Router, upstream: &mut HeldUpstream, family: &Family) -> f64 {
     let (small_held, small_len) =
-        held_while_pending(app, upstream, path, || make_body(SMALL)).await;
+        held_while_pending(app, upstream, family.path, family.requests, || {
+            (family.body)(SMALL)
+        })
+        .await;
     let (large_held, large_len) =
-        held_while_pending(app, upstream, path, || make_body(LARGE)).await;
+        held_while_pending(app, upstream, family.path, family.requests, || {
+            (family.body)(LARGE)
+        })
+        .await;
     (large_held - small_held) as f64 / (large_len - small_len) as f64
+}
+
+struct Family {
+    name: &'static str,
+    path: &'static str,
+    body: BodyFn,
+    /// Upstream calls the request makes at once — each carries its own
+    /// wire copy of the body, so the bound grows by one per call.
+    requests: usize,
+}
+
+impl Family {
+    const fn new(name: &'static str, path: &'static str, body: BodyFn) -> Self {
+        Self {
+            name,
+            path,
+            body,
+            requests: 1,
+        }
+    }
+
+    /// The parsed request the handler keeps, plus one wire body per
+    /// upstream call in flight.
+    fn limit(&self) -> f64 {
+        1.0 + self.requests as f64 + MARGIN
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -416,45 +503,78 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
     let mut upstream = start_upstream();
     let app = router(&upstream.base);
 
-    let families: [(&str, &str, BodyFn); 7] = [
-        ("chat -> openai", "/v1/chat/completions", chat_body),
-        (
+    // Bound per family: the parsed request the handler keeps for retry,
+    // fail-over and Model Group routing, plus the wire body reqwest holds
+    // until the response head — 2x the body for a single upstream call.
+    let families = [
+        Family::new("chat -> openai", "/v1/chat/completions", chat_body),
+        Family::new(
             "chat -> anthropic",
             "/v1/chat/completions",
             chat_to_anthropic_body,
         ),
-        ("embeddings", "/v1/embeddings", embeddings_body),
+        // The effort mapping rewrites a copy of the request per attempt.
+        Family::new(
+            "chat, effort-mapped",
+            "/v1/chat/completions",
+            effort_mapped_chat_body,
+        ),
+        // Two panel members in flight at once, each with its own request.
+        Family {
+            requests: 2,
+            ..Family::new("ensemble panel", "/v1/chat/completions", ensemble_body)
+        },
+        Family::new("embeddings", "/v1/embeddings", embeddings_body),
         // Relayed to an Anthropic upstream as-is: the route builds the
         // outbound body itself rather than through a provider bridge.
-        ("messages passthrough", "/v1/messages", messages_body),
-        // Served natively by the OpenAI upstream, likewise built by the route.
-        ("responses passthrough", "/v1/responses", responses_body),
-        (
+        Family::new("messages passthrough", "/v1/messages", messages_body),
+        Family::new(
+            "messages -> openai (bridged)",
+            "/v1/messages",
+            messages_to_openai_body,
+        ),
+        Family::new(
             "count_tokens passthrough",
             "/v1/messages/count_tokens",
             messages_body,
         ),
+        // Served natively by the OpenAI upstream, likewise built by the route.
+        Family::new("responses passthrough", "/v1/responses", responses_body),
+        Family::new(
+            "responses -> anthropic (bridged)",
+            "/v1/responses",
+            responses_to_anthropic_body,
+        ),
         // Each attempt rewrites its own copy of the body for its target.
-        ("rerank", "/v1/rerank", rerank_body),
+        Family::new("rerank", "/v1/rerank", rerank_body),
     ];
 
     // Warm lazily-initialised statics (TLS roots, regexes, metric
-    // registries, the pooled upstream connection) so they are not charged
+    // registries, the pooled upstream connections) so they are not charged
     // to a measurement.
-    for (_, path, make_body) in families {
-        held_while_pending(&app, &mut upstream, path, || make_body(SMALL)).await;
+    for family in &families {
+        held_while_pending(&app, &mut upstream, family.path, family.requests, || {
+            (family.body)(SMALL)
+        })
+        .await;
     }
 
     let mut report = Vec::new();
-    for (family, path, make_body) in families {
-        let m = in_flight_multiplier(&app, &mut upstream, path, make_body).await;
-        eprintln!("{family}: {m:.4}x request body held while upstream is pending");
+    for family in &families {
+        let m = in_flight_multiplier(&app, &mut upstream, family).await;
+        eprintln!(
+            "{}: {m:.4}x request body held while upstream is pending (limit {:.1}x)",
+            family.name,
+            family.limit()
+        );
         report.push((family, m));
     }
     for (family, m) in report {
         assert!(
-            m <= MAX_MULTIPLIER,
-            "{family} held {m:.2}x the request body while waiting on the upstream (limit {MAX_MULTIPLIER}x)"
+            m <= family.limit(),
+            "{} held {m:.2}x the request body while waiting on the upstream (limit {:.1}x)",
+            family.name,
+            family.limit()
         );
     }
 }
