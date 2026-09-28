@@ -166,12 +166,11 @@ pub struct A2aUpstream {
 }
 
 // Manual so a `Bearer` token cannot leak through `A2aUpstream`'s `Debug`
-// (delegates to the redacting `A2aAuth` impl above), nor a Basic-auth
-// credential configured as the URL's userinfo.
+// (delegates to the redacting `A2aAuth` impl above).
 impl std::fmt::Debug for A2aUpstream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("A2aUpstream")
-            .field("url", &aisix_core::redact_url_userinfo(&self.url))
+            .field("url", &self.url)
             .field("auth", &self.auth)
             .field("protocol_version", &self.protocol_version)
             .field("timeout", &self.timeout)
@@ -206,7 +205,7 @@ fn warn_cleartext_credential(agent: &A2aAgent) {
     if warned.insert((agent.name.clone(), agent.url.clone())) {
         tracing::warn!(
             agent = %agent.name,
-            url = %aisix_core::redact_url_userinfo(&agent.url),
+            url = %agent.url,
             "the gateway-held A2A agent credential is sent over cleartext http; anyone \
              on the network path can read it — serve this agent over https"
         );
@@ -484,7 +483,7 @@ impl A2aBridge for HttpBridge {
             let budget = deadline.saturating_duration_since(Instant::now());
             if budget.is_zero() {
                 tracing::debug!(
-                    agent_url = %aisix_core::redact_url_userinfo(&self.upstream.url),
+                    agent_url = %self.upstream.url,
                     "A2A agent card fetch exhausted its deadline before trying every candidate"
                 );
                 break;
@@ -493,7 +492,7 @@ impl A2aBridge for HttpBridge {
                 Ok(card) => return Ok(card),
                 Err(err) => {
                     tracing::debug!(
-                        url = %aisix_core::redact_url_userinfo(url.as_str()),
+                        url = %url,
                         error = %err,
                         "A2A agent card candidate did not answer"
                     );
@@ -728,16 +727,6 @@ mod tests {
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
         };
         assert!(!format!("{up:?}").contains("super-secret"));
-        // Nor a Basic-auth credential configured as the URL's userinfo.
-        let up = A2aUpstream {
-            url: "https://agent:basic-secret@x/a2a".into(),
-            auth: A2aAuth::None,
-            protocol_version: A2aProtocolVersion::V1_0,
-            timeout: DEFAULT_UPSTREAM_TIMEOUT,
-        };
-        let rendered = format!("{up:?}");
-        assert!(!rendered.contains("basic-secret"), "{rendered}");
-        assert!(rendered.contains("https://***@x/a2a"), "{rendered}");
     }
 
     fn bridge_at(url: &str) -> HttpBridge {

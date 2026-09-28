@@ -575,8 +575,7 @@ fn to_ws_scheme(url: &str) -> Result<String, ProxyError> {
         Ok(url.to_string())
     } else {
         Err(ProxyError::InvalidRequest(format!(
-            "api_base {:?} has no http(s) scheme",
-            aisix_core::redact_url_userinfo(url)
+            "api_base {url:?} has no http(s) scheme"
         )))
     }
 }
