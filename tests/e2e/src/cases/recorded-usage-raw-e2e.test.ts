@@ -88,16 +88,13 @@ const GEMINI_NO_TOTAL_BODY = {
   },
 };
 
-// Gemini stamps cumulative usage on every streamed frame.
+// Vertex's real stream shape (captured from gemini-2.5-flash): every
+// frame carries `usageMetadata`, but only the last one has token counts —
+// the earlier ones hold `trafficType` alone.
 const GEMINI_STREAM_FRAMES = [
   `data: ${JSON.stringify({
     candidates: [{ content: { role: "model", parts: [{ text: "o" }] } }],
-    usageMetadata: {
-      promptTokenCount: PROMPT,
-      candidatesTokenCount: 5,
-      thoughtsTokenCount: THOUGHTS,
-      totalTokenCount: PROMPT + 5 + THOUGHTS,
-    },
+    usageMetadata: { trafficType: "ON_DEMAND" },
   })}\n\n`,
   `data: ${JSON.stringify({
     candidates: [{ content: { role: "model", parts: [{ text: "k" }] }, finishReason: "STOP" }],
@@ -106,6 +103,7 @@ const GEMINI_STREAM_FRAMES = [
       candidatesTokenCount: CANDIDATES,
       thoughtsTokenCount: THOUGHTS,
       totalTokenCount: TOTAL,
+      trafficType: "ON_DEMAND",
     },
   })}\n\n`,
 ];
