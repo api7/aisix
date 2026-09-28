@@ -93,7 +93,11 @@ describe("request latency labels survive buffering and configuration reloads", (
       const body = await response.text();
       expect(response.status, body).toBe(status);
       const samples = await scrapeMetrics(app.metricsUrl);
-      expect(sumMetric(samples, `${E2E}_count`, { model, streaming: "true" })).toBe(1);
+      // Both sides: the blocked response still came from a dispatched
+      // attempt, so it has an upstream duration to observe.
+      for (const side of ["downstream", "upstream"]) {
+        expect(sumMetric(samples, `${E2E}_count`, { model, streaming: "true", side }), side).toBe(1);
+      }
       expect(sumMetric(samples, `${E2E}_count`, { model, streaming: "false" })).toBe(0);
     }
   });
@@ -180,17 +184,23 @@ describe("request latency labels survive buffering and configuration reloads", (
     for (const response of responses) {
       expect(response.status, await response.text()).toBe(200);
     }
-    await expect.poll(async () => sumMetric(await scrapeMetrics(app.metricsUrl), `${E2E}_count`)).toBe(contexts.length);
+    await expect.poll(async () => sumMetric(await scrapeMetrics(app.metricsUrl), `${E2E}_count`, { side: "downstream" })).toBe(contexts.length);
     const samples = await scrapeMetrics(app.metricsUrl);
     for (const [index, context] of contexts.entries()) {
-      // TTFT observes each request once per `side`; both keep the labels.
-      for (const [metric, side] of [[E2E, undefined], [TTFT, "upstream"], [TTFT, "downstream"]] as const) {
+      // Each metric observes a request once per `side`, and both sides keep
+      // the same labels. The streaming ensemble has no single upstream
+      // attempt, so its end-to-end latency is observed downstream only.
+      const ensemble = context.provider === "ensemble";
+      for (const [metric, side, expected] of [
+        [E2E, "downstream", 1], [E2E, "upstream", ensemble ? 0 : 1],
+        [TTFT, "upstream", 1], [TTFT, "downstream", 1],
+      ] as const) {
         expect(sumMetric(samples, `${metric}_count`, {
           endpoint: `/v1/${context.endpoint}`, model: allowed[index],
-          upstream_model: context.provider === "ensemble" ? "unknown" : "*", streaming: "true",
+          upstream_model: ensemble ? "unknown" : "*", streaming: "true",
           api_key_id: apiKey.id, team_id: "original-team", user_id: "original-user", user_name: "Original User",
-          ...(side ? { side } : {}),
-        }), `${metric} ${side ?? ""} ${context.endpoint} ${context.provider}`).toBe(1);
+          side,
+        }), `${metric} ${side} ${context.endpoint} ${context.provider}`).toBe(expected);
       }
     }
     expect(samples.filter((s) => s.name.startsWith(`${E2E}_`)).every((s) =>

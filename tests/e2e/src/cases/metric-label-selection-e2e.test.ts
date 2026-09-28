@@ -115,16 +115,16 @@ describe("metric label configuration is applied to real request observations", (
       for (const family of [TTFT, E2E]) {
         const samples = after.filter((s) => s.name.startsWith(`${family}_`) && s.labels.provider_key_name === scenario.name);
         expect(samples.length, scenario.name).toBeGreaterThan(2);
-        for (const side of family === TTFT ? ["upstream", "downstream"] : [undefined]) {
-          const want: Record<string, string> = side ? { side } : {};
-          expect(sumMetric(samples, `${family}_count`, want), `${scenario.name} ${side ?? ""}`).toBe(2);
-          expect(sumMetric(samples, `${family}_bucket`, { le: "+Inf", ...want })).toBe(2);
+        // Both families observe every streamed request once per `side`.
+        for (const side of ["upstream", "downstream"]) {
+          expect(sumMetric(samples, `${family}_count`, { side }), `${scenario.name} ${side}`).toBe(2);
+          expect(sumMetric(samples, `${family}_bucket`, { le: "+Inf", side })).toBe(2);
         }
         expect(sumMetric(samples, `${family}_sum`)).toBeGreaterThan(0);
         for (const sample of samples) {
           const labels = Object.keys(sample.labels).filter((key) => key !== "le").sort();
-          // `side` is kept although the configured TTFT selection omits it.
-          expect(labels).toEqual((family === TTFT ? ["provider_key_name", "upstream_model", "api_key_id", "side"] : ["endpoint", "provider_key_name"]).sort());
+          // `side` is kept although neither configured selection lists it.
+          expect(labels).toEqual((family === TTFT ? ["provider_key_name", "upstream_model", "api_key_id", "side"] : ["endpoint", "provider_key_name", "side"]).sort());
           if (family === TTFT) {
             expect(sample.labels.upstream_model).toBe("upstream");
             expect(sample.labels.api_key_id).not.toBe("unknown");

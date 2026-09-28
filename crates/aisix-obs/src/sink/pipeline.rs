@@ -21,7 +21,9 @@ use tokio::sync::{mpsc, watch};
 // a paused-clock test drives the whole ladder rather than only its sleeps.
 use tokio::time::Instant;
 
-use super::{EventBatch, IdempotencyMarker, ObservabilitySink, SinkError, SinkRecord};
+use super::{
+    ErrorRedactor, EventBatch, IdempotencyMarker, ObservabilitySink, SinkError, SinkRecord,
+};
 use crate::metrics::Metrics;
 
 /// Tuning for a [`SinkPipeline`]. Defaults mirror the telemetry worker
@@ -109,8 +111,10 @@ pub struct SinkStatsSnapshot {
     pub delivered_batches: u64,
     /// Batches given up on after retries (or a permanent error).
     pub failed_batches: u64,
-    /// Masked excerpt of the most recent delivery error. Cleared on the
-    /// next successful delivery, so `Some` means "currently failing".
+    /// Masked excerpt of the most recent failed delivery attempt — one
+    /// that will be retried as well as one that dropped its batch.
+    /// Cleared on the next successful delivery, so `Some` means
+    /// "currently failing".
     pub last_error: Option<String>,
     /// Unix seconds of the most recent successful batch delivery.
     pub last_success_unix: Option<i64>,
@@ -238,6 +242,7 @@ pub struct SinkPipeline {
     rx: mpsc::Receiver<Arc<SinkRecord>>,
     stats: Arc<SinkStats>,
     metrics: Option<Metrics>,
+    redactor: ErrorRedactor,
 }
 
 impl SinkPipeline {
@@ -266,12 +271,14 @@ impl SinkPipeline {
             stats: Arc::clone(&stats),
             metrics: metrics.clone(),
         };
+        let redactor = sink.error_redactor();
         let worker = SinkPipeline {
             sink,
             cfg,
             rx,
             stats,
             metrics,
+            redactor,
         };
         (handle, worker)
     }
@@ -420,7 +427,7 @@ impl SinkPipeline {
                     return;
                 }
                 Err(err) => {
-                    let detail = masked(&err);
+                    let detail = masked(&err, &self.redactor);
                     // One count per failed EXPORT ATTEMPT, so a sink that
                     // only ever succeeds on its third try is visible even
                     // though it never drops a record.
@@ -438,6 +445,10 @@ impl SinkPipeline {
                     if let Some(delay) = self.next_delay(&err, attempt, started, deadline) {
                         attempt += 1;
                         self.stats.add_retries(1);
+                        // A batch being retried is a sink that is failing
+                        // now; waiting for the drop would keep the health
+                        // report clean for the whole retry budget.
+                        self.stats.set_error(detail.clone());
                         tracing::warn!(
                             sink = %self.sink.name(),
                             attempt,
@@ -566,14 +577,20 @@ fn backoff(base: Duration, cap: Duration, attempt: u32) -> Duration {
     base.checked_mul(factor).unwrap_or(cap).min(cap)
 }
 
-/// Trim a sink error to a bounded, log-safe excerpt. The sink is responsible
-/// for not embedding secrets in its error text; this only caps length so a
-/// verbose upstream body can't flood the logs. Wide enough that a sink's
-/// own 500-char detail (object URL + error source chain) survives with the
-/// enum prefix — this cap is the last one before the log line / `last_error`,
-/// so trimming tighter than the sinks re-hides the cause they now carry.
-fn masked(err: &SinkError) -> String {
-    err.to_string().chars().take(600).collect()
+/// Redact a sink error and trim it to a bounded, log-safe excerpt. This is
+/// the one place a delivery error becomes text, and every surface — the warn
+/// log, `last_error`, the heartbeat — reads the result, so the sink's
+/// configured URL userinfo and secrets are scrubbed here. Redaction runs
+/// before the cap so a secret straddling it cannot leave a prefix behind.
+/// The cap is wide enough that a sink's own 500-char detail (object URL +
+/// error source chain) survives with the enum prefix; trimming tighter than
+/// the sinks re-hides the cause they carry.
+fn masked(err: &SinkError, redactor: &ErrorRedactor) -> String {
+    redactor
+        .redact(&err.to_string())
+        .chars()
+        .take(600)
+        .collect()
 }
 
 #[cfg(test)]
@@ -876,6 +893,58 @@ mod tests {
         }
         worker.await.unwrap();
         started.elapsed()
+    }
+
+    /// The health report is read while a batch is still being retried —
+    /// the heartbeat samples every few seconds and the retry budget is
+    /// minutes. A sink failing every attempt must show its error for the
+    /// whole of that window, not only once the batch is finally dropped,
+    /// and the error must go away with the delivery that ends it.
+    #[tokio::test]
+    async fn a_batch_being_retried_reports_the_sink_as_failing() {
+        tokio::time::pause();
+        let sink = FakeSink::new(Mode::TransientThenOk(AtomicU32::new(3)));
+        let cfg = PipelineConfig {
+            max_batch: 1,
+            ..PipelineConfig::default()
+        };
+        let (handle, worker) = SinkPipeline::new(sink.clone(), cfg);
+        let (_keep_alive, cancel_rx) = watch::channel(false);
+        let worker = tokio::spawn(worker.run(cancel_rx));
+        assert!(handle.try_enqueue(rec(0)));
+
+        let mut observed_retrying = 0;
+        let mut stepped = 0;
+        while sink.delivered() == 0 {
+            stepped += 1;
+            assert!(stepped < 10_000, "the batch must be delivered");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if sink.attempts() == 0 {
+                continue;
+            }
+            let s = handle.stats();
+            if sink.delivered() == 0 {
+                observed_retrying += 1;
+                assert_eq!(s.failed_batches, 0, "nothing was dropped: {s:?}");
+                assert!(
+                    s.last_error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("temporary")),
+                    "a sink failing every attempt reports its error while retrying: {s:?}"
+                );
+            }
+        }
+        assert!(observed_retrying > 0, "the retry window was sampled");
+
+        let s = handle.stats();
+        assert_eq!(s.delivered_batches, 1);
+        assert_eq!(s.failed_batches, 0);
+        assert!(
+            s.last_error.is_none(),
+            "the delivery that ends the retry clears the error: {s:?}"
+        );
+        drop(handle);
+        worker.await.unwrap();
     }
 
     /// The defect: four attempts over a 3.0s ladder meant a receiver

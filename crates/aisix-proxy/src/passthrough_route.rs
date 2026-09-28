@@ -2704,7 +2704,7 @@ fn emit_access_log(
         None => (None, None),
     };
     let target = crate::attribution::AccessLogTarget::current();
-    AccessLog {
+    crate::attribution::emit_access_log(AccessLog {
         method: method.as_str(),
         path,
         status,
@@ -2729,8 +2729,9 @@ fn emit_access_log(
         error: error.as_deref(),
         mcp: None,
         cache: None,
-    }
-    .emit();
+        request_body_bytes: None,
+        response_body_bytes: None,
+    });
 }
 
 #[cfg(test)]

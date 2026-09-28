@@ -27,8 +27,8 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use super::{
-    BatchUnit, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope,
-    SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkRecord, SinkResult,
+    BatchUnit, ErrorRedactor, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink,
+    OrderingScope, SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkRecord, SinkResult,
 };
 
 /// `DD-API-KEY`: Datadog's API-key header. The resolved key rides here and
@@ -186,6 +186,12 @@ impl ObservabilitySink for DatadogSink {
         // reports healthy and its delivery errors surface via
         // `SinkStats::last_error`. (Mirrors the SLS / OTLP sinks.)
         SinkHealth::healthy()
+    }
+
+    fn error_redactor(&self) -> ErrorRedactor {
+        ErrorRedactor::default()
+            .url(&self.endpoint_url)
+            .secret(&self.api_key)
     }
 }
 
@@ -370,7 +376,7 @@ fn is_loopback_site(site: &str) -> bool {
 /// Returns `None` when the key is unset or blank — the caller then lets the
 /// misconfiguration surface as a delivery-health auth error rather than POST
 /// with an empty key. (Mirrors `resolve_sls_credential` /
-/// `resolve_object_store_credential`.)
+/// `resolve_object_store_credential_with`.)
 pub fn resolve_datadog_credential(credential_ref: &str) -> Option<String> {
     resolve_datadog_credential_with(credential_ref, |key| std::env::var(key).ok())
 }

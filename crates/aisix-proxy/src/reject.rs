@@ -64,7 +64,7 @@ pub(crate) fn reject_before_dispatch(
     let status = err.status().as_u16();
     let elapsed = started.elapsed();
     let (error_kind, error) = crate::attempt::access_log_error(&err);
-    AccessLog {
+    crate::attribution::emit_access_log(AccessLog {
         method,
         path,
         status,
@@ -89,8 +89,9 @@ pub(crate) fn reject_before_dispatch(
         error: Some(&error),
         mcp: None,
         cache: None,
-    }
-    .emit();
+        request_body_bytes: None,
+        response_body_bytes: None,
+    });
     // `path` must be normalized, not passed through: `AisixPath` below hands
     // this the RAW `parts.uri.path()` so the access log can name the
     // malformed segment, and that string is caller-controlled (#451).

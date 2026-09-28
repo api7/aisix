@@ -96,13 +96,16 @@ describe("concurrent and cancelled metric scrapes preserve request observations"
       "aisix_llm_requests_total",
       "aisix_proxy_request_duration_seconds_count",
       "aisix_llm_request_duration_seconds_count",
-      "aisix_request_e2e_latency_seconds_count",
     ]) {
       expect(metricDelta(before, after, family, { model: MODEL }), family).toBe(requests);
     }
+    // One end-to-end observation per request on each `side`.
+    for (const side of ["downstream", "upstream"]) {
+      expect(metricDelta(before, after, "aisix_request_e2e_latency_seconds_count", { model: MODEL, side }), side).toBe(requests);
+    }
     expect(metricDelta(before, after, "aisix_llm_input_tokens_total", { model: MODEL })).toBe(requests * 3);
     expect(metricDelta(before, after, "aisix_llm_output_tokens_total", { model: MODEL })).toBe(requests * 2);
-    expect(metricDelta(before, after, "aisix_request_e2e_latency_seconds_bucket", { model: MODEL, le: "+Inf" })).toBe(requests);
+    expect(metricDelta(before, after, "aisix_request_e2e_latency_seconds_bucket", { model: MODEL, le: "+Inf", side: "downstream" })).toBe(requests);
 
     const durations = after.filter((s) => s.name === "aisix_proxy_request_duration_seconds" && s.labels.model === MODEL);
     expect(new Set(durations.map((s) => s.labels.api_key_id)).size).toBe(KEYS.length);

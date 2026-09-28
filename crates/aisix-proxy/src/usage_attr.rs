@@ -941,6 +941,15 @@ pub(crate) fn emit_usage(
     if terminal {
         crate::attribution::emit_deferred_access_log(&event);
     }
+    // The `upstream` side of the request's end-to-end latency is the
+    // terminal attempt's own upstream duration — this figure, so the metric
+    // and the row cannot disagree — and only when that attempt reached an
+    // upstream at all.
+    if terminal && dispatched {
+        crate::attribution::note_terminal_upstream(std::time::Duration::from_millis(u64::from(
+            event.upstream_latency_ms,
+        )));
+    }
     // Request-level guardrail blocks are recorded from the terminal event,
     // not from an individual timed execution. Some fail-closed paths (for
     // example a streamed-output buffer overflow) reject before a guardrail

@@ -2430,7 +2430,8 @@ async fn dispatch(
                         client_type: &client_type_for_metrics,
                     },
                 );
-                metrics_for_stream.record_request_e2e_latency(
+                crate::request_metrics::record_e2e_downstream(
+                    &metrics_for_stream,
                     LatencyLabels {
                         endpoint: "/v1/chat/completions",
                         model: &bounded_model_for_metrics,
@@ -4325,6 +4326,8 @@ async fn dispatch_ensemble(
                 // SLO histograms (AISIX-Cloud#1011): the handler's
                 // record_success is stream-gated, so the ensemble stream
                 // records its e2e/TTFT here like the plain streaming path.
+                // `downstream` only: no one attempt produced an ensemble's
+                // response, so there is no upstream side to observe.
                 state_for_telem.metrics.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/chat/completions",
@@ -4349,6 +4352,7 @@ async fn dispatch_ensemble(
                             user_name: caller.user_name,
                         },
                     },
+                    aisix_obs::LatencySide::Downstream,
                     started.elapsed(),
                 );
                 state_for_telem.metrics.record_ttft(
@@ -5234,7 +5238,7 @@ fn emit_access_log(
     // routing summary. The per-attempt detail lives in telemetry only.
     let summary = routing.access_log_summary();
     let target = crate::attribution::AccessLogTarget::current();
-    AccessLog {
+    crate::attribution::emit_access_log(AccessLog {
         method,
         path,
         status,
@@ -5257,8 +5261,9 @@ fn emit_access_log(
         error: error.as_deref(),
         mcp: None,
         cache: cache.or_else(|| target.cache()),
-    }
-    .emit();
+        request_body_bytes: None,
+        response_body_bytes: None,
+    });
 }
 
 fn created_ts() -> i64 {

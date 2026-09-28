@@ -23,8 +23,8 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use serde::Deserialize;
 
 use super::{
-    BatchUnit, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope,
-    SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkRecord, SinkResult,
+    BatchUnit, ErrorRedactor, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink,
+    OrderingScope, SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkRecord, SinkResult,
 };
 
 /// `x-log-bodyrawsize`: the *uncompressed* protobuf size. SLS uses it to size
@@ -219,6 +219,12 @@ impl ObservabilitySink for AliyunSlsSink {
         // reports healthy and its delivery errors surface via
         // `SinkStats::last_error`. (Mirrors `OtlpSink`.)
         SinkHealth::healthy()
+    }
+
+    fn error_redactor(&self) -> ErrorRedactor {
+        ErrorRedactor::default()
+            .url(&self.endpoint_url)
+            .secret(&self.access_key_secret)
     }
 }
 

@@ -544,8 +544,15 @@ const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
 /// The LINE says the same, because a streaming handler does not write it
 /// at all: it parks it on the request's cell
 /// (`attribution::PendingAccessLog`) and whichever terminal emitter ends
-/// the request writes it, with that emitter's status and message. One
+/// the request completes it, with that emitter's status and message. One
 /// line per request, in every ending.
+///
+/// The layer also counts the request and response body bytes the access
+/// log reports (`RequestBodyCounter`, `TelemetryBody::poll_frame`), and the
+/// guard is what WRITES the request's line: every emitter leaves it on the
+/// cell (`attribution::emit_access_log`), and the guard writes it when it
+/// drops — the body fully handed to the server or dropped, or no head at
+/// all — which is the first moment both sizes are final.
 async fn record_request_telemetry(
     State(state): State<ProxyState>,
     request: Request<axum::body::Body>,
@@ -564,6 +571,17 @@ async fn record_request_telemetry(
     // (AISIX-Cloud#1317). Installed here because a cancelled handler
     // future never gets to hand anything back.
     let attribution = std::sync::Arc::new(attribution::RequestAttribution::default());
+    // The access-log line is held on the cell until the guard below finishes
+    // the request, which is when both body sizes are known. Written in the
+    // request span this middleware runs in, since the guard writes it from
+    // `Drop`.
+    attribution.track(tracing::Span::current());
+    let request = request.map(|body| {
+        axum::body::Body::new(RequestBodyCounter {
+            inner: body,
+            cell: attribution.clone(),
+        })
+    });
     let mut guard = ClientCancelGuard {
         phase: GuardPhase::Head,
         state: state.clone(),
@@ -619,6 +637,7 @@ async fn record_request_telemetry(
     }
     let mut response = attribution::scope(attribution, next.run(request)).await;
     // The head exists; from here the guard rides the body (see `GuardPhase`).
+    guard.attribution.note_head_written();
     guard.phase = GuardPhase::Body {
         owed: response.status().is_success()
             && http_body::Body::size_hint(response.body())
@@ -709,12 +728,21 @@ impl axum::body::HttpBody for TelemetryBody {
         // log nothing at all. `Drop` covers the abandoned endings; this
         // covers the delivered one.
         let cell = &this.guard.attribution;
-        match this.inner.as_mut() {
+        let polled = match this.inner.as_mut() {
             Some(inner) => {
                 attribution::sync_scope(cell, || std::pin::Pin::new(inner).poll_frame(cx))
             }
             None => std::task::Poll::Ready(None),
+        };
+        // The access log's `response_body_bytes`: counted here, outside every
+        // wrapper a handler puts on its body, so SSE framing and keep-alive
+        // heartbeats are in it — it is what the server was handed.
+        if let std::task::Poll::Ready(Some(Ok(frame))) = &polled {
+            if let Some(data) = frame.data_ref() {
+                cell.add_response_bytes(data.len() as u64);
+            }
         }
+        polled
     }
 
     // `size_hint` is deliberately NOT forwarded, matching the `map_frame`
@@ -728,6 +756,49 @@ impl axum::body::HttpBody for TelemetryBody {
 
     fn is_end_stream(&self) -> bool {
         self.inner.as_ref().is_none_or(|b| b.is_end_stream())
+    }
+}
+
+/// The request body, counting what the gateway reads of it for the access
+/// log's `request_body_bytes`. Wrapped outermost, so the count is the bytes
+/// taken off the wire whatever reads them — an extractor, a relay to the
+/// upstream, or a drain.
+struct RequestBodyCounter {
+    inner: axum::body::Body,
+    cell: std::sync::Arc<attribution::RequestAttribution>,
+}
+
+impl axum::body::HttpBody for RequestBodyCounter {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        match &polled {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.cell.add_request_bytes(data.len() as u64);
+                }
+                if this.inner.is_end_stream() {
+                    this.cell.note_request_complete();
+                }
+            }
+            std::task::Poll::Ready(None) => this.cell.note_request_complete(),
+            _ => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -825,9 +896,23 @@ impl Drop for ClientCancelGuard {
         // task failure and hyper drops the connection), so stay silent and
         // let that stand. Emitting here would also risk a double panic,
         // which aborts the process.
-        if std::thread::panicking() {
-            return;
+        //
+        // A line the handler already produced before panicking is still
+        // written, as it was when handlers wrote their lines themselves.
+        if !std::thread::panicking() {
+            self.record_cancel();
         }
+        // The request is over — its body fully handed to the server or
+        // dropped, or no head at all — so the body sizes are final: write
+        // the line every path above left on the cell.
+        self.attribution.finish();
+    }
+}
+
+impl ClientCancelGuard {
+    /// What a request the caller walked away from owes, if anything — see
+    /// [`GuardPhase`].
+    fn record_cancel(&mut self) {
         let phase = match self.phase {
             GuardPhase::Head => cancel::Phase::BeforeHead,
             // The body was read: whatever the response owed, its own
@@ -890,7 +975,7 @@ impl Drop for ClientCancelGuard {
         if matches!(phase, cancel::Phase::BeforeHead) && !self.attribution.has_pending_access_log()
         {
             let target = attribution::AccessLogTarget::from_resolved(resolved.clone());
-            AccessLog {
+            let line = AccessLog {
                 method: self.method.as_str(),
                 path: self.uri.path(),
                 status: CLIENT_CLOSED_REQUEST,
@@ -920,8 +1005,13 @@ impl Drop for ClientCancelGuard {
                 error: Some(phase.message()),
                 mcp: None,
                 cache: None,
-            }
-            .emit();
+                // Both filled when the request is finished below: the
+                // request size if the body had been read before the caller
+                // left, and no response size, since no head was written.
+                request_body_bytes: None,
+                response_body_bytes: None,
+            };
+            self.attribution.park_access_log(&line, None);
         }
         // The usage events the dropped handler never got to write
         // (AISIX-Cloud#1571) — and, on the body phase, the request's parked
@@ -1059,6 +1149,10 @@ async fn enforce_request_body_limit(
             // on the same HTTP/1.1 connection. Without this, hyper closes
             // the socket while the client is still writing, and the client
             // sees EPIPE/ECONNRESET instead of the 413.
+            //
+            // The refusal was decided before the body was read, so the line
+            // reports no request size even though the drain reads it.
+            attribution::note_request_body_discarded();
             let drain = drain_body(request.into_body()).await;
             record_body_limit_rejection(
                 &state,

@@ -78,7 +78,7 @@ pub static METRIC_VARIABLES: &[MetricVariable] = &[
     variable!("stat", "The allocator statistic: allocated, active, resident, mapped, retained, or metadata."),
     variable!("runtime", "The async runtime: control, or tpc-N for thread-per-core proxy worker N."),
     variable!("component", "The in-process store being measured, from a fixed set such as response_cache or log_queue."),
-    variable!("side", "Which interval a time-to-first-token observation measures: upstream (attempt start to the upstream's first frame) or downstream (request received to the first frame handed to the client). Always emitted on the metrics that carry it; it cannot be removed by a label selection."),
+    variable!("side", "Which interval a latency observation measures. On the time-to-first-token metrics: upstream (attempt start to the upstream's first frame) or downstream (request received to the first frame handed to the client). On the end-to-end latency metric: upstream (the upstream duration of the attempt that produced the response) or downstream (the whole request as the client experienced it). Always emitted on the metrics that carry it; it cannot be removed by a label selection."),
 ];
 
 #[derive(Debug)]
@@ -161,7 +161,7 @@ const LATENCY: &[&str] = &[
     "streaming",
 ];
 const DEPLOYMENT: &[&str] = &["provider", "model", "upstream_model", "provider_key_id"];
-const TTFT_ALWAYS: &[&str] = &["side"];
+const SIDE_ALWAYS: &[&str] = &["side"];
 const BUDGET: &[&str] = &["api_key_id", "team_id", "user_id", "user_name"];
 const COMPONENT: &[&str] = &["component", "exporter"];
 
@@ -234,7 +234,7 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         REQUEST_DURATION,
         extra = &["is_fallback"]
     ),
-    metric!(M_LLM_TTFT, USAGE, always = TTFT_ALWAYS),
+    metric!(M_LLM_TTFT, USAGE, always = SIDE_ALWAYS),
     metric!(
         M_LLM_TOKENS_BY_CLIENT_TOTAL,
         &["client_type", "model", "token_type"]
@@ -336,12 +336,17 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
     metric!(M_CACHE_SEMANTIC_STORE_FAILURES_TOTAL, &["policy", "op"]),
     metric!(M_OTLP_FANOUT_DROPS_TOTAL, &["exporter", "reason"]),
     metric!(M_OTLP_FANOUT_FAILURES_TOTAL, &["exporter"]),
-    metric!(M_REQUEST_E2E_LATENCY_SECONDS, LATENCY, extra = USAGE),
+    metric!(
+        M_REQUEST_E2E_LATENCY_SECONDS,
+        LATENCY,
+        extra = USAGE,
+        always = SIDE_ALWAYS
+    ),
     metric!(
         M_REQUEST_TTFT_SECONDS,
         LATENCY,
         extra = USAGE,
-        always = TTFT_ALWAYS
+        always = SIDE_ALWAYS
     ),
     metric!(M_A2A_REQUESTS_TOTAL, &["agent", "operation", "status"]),
     metric!(M_A2A_TTFB_SECONDS, &["agent", "operation"]),
@@ -660,7 +665,7 @@ mod tests {
                     },
                     ..Default::default()
                 },
-                TtftSide::Upstream,
+                LatencySide::Upstream,
                 Duration::from_millis(ms),
             );
         }
@@ -739,6 +744,42 @@ mod tests {
                 assert!(
                     rows.iter()
                         .any(|l| l.contains("side=\"downstream\"") && l.ends_with(" 1")),
+                    "{labels:?}: {out}"
+                );
+            }
+        }
+    }
+
+    /// The end-to-end histogram's two sides are two measurements, so a
+    /// selection that leaves `side` out must not merge them into one series.
+    #[test]
+    fn e2e_side_is_kept_by_every_label_selection() {
+        let selections: [&[&str]; 3] = [&[], &["provider_key_name"], &["side", "model"]];
+        for labels in selections {
+            let config = BTreeMap::from([(
+                M_REQUEST_E2E_LATENCY_SECONDS.to_owned(),
+                labels.iter().map(|l| (*l).to_owned()).collect(),
+            )]);
+            let metrics =
+                Metrics::new_with_labels("env", &HistogramBuckets::default(), &config).unwrap();
+            let latency = LatencyLabels::default();
+            metrics.record_request_e2e_latency(
+                latency,
+                LatencySide::Downstream,
+                Duration::from_millis(300),
+            );
+            metrics.record_request_e2e_latency(
+                latency,
+                LatencySide::Upstream,
+                Duration::from_millis(100),
+            );
+            let out = metrics.render();
+            let rows = sample(&out, "aisix_request_e2e_latency_seconds_count");
+            assert_eq!(rows.len(), 2, "{labels:?}: {out}");
+            for side in ["upstream", "downstream"] {
+                assert!(
+                    rows.iter()
+                        .any(|l| l.contains(&format!("side=\"{side}\"")) && l.ends_with(" 1")),
                     "{labels:?}: {out}"
                 );
             }

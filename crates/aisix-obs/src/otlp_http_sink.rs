@@ -55,9 +55,10 @@ use serde_json::{json, Value};
 use crate::metrics::Metrics;
 use crate::sink::{
     build_object_store_sink, resolve_datadog_credential, resolve_sls_credential, AliyunSlsSink,
-    BatchUnit, CapturedContent, DatadogSink, EventBatch, ExporterPipelines, IdempotencyMarker,
-    IdempotencyScheme, ObservabilitySink, OrderingScope, PipelineConfig, SinkAck, SinkCapabilities,
-    SinkContent, SinkError, SinkHealth, SinkRecord, SinkResult, SinkStatsSnapshot,
+    BatchUnit, CapturedContent, DatadogSink, ErrorRedactor, EventBatch, ExporterPipelines,
+    IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope, PipelineConfig,
+    SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHealth, SinkRecord, SinkResult,
+    SinkStatsSnapshot,
 };
 use crate::usage::UsageEvent;
 
@@ -698,6 +699,23 @@ impl ObservabilitySink for OtlpSink {
         // sink reports healthy and its delivery errors surface via
         // `SinkStats::last_error`.
         SinkHealth::healthy()
+    }
+
+    fn error_redactor(&self) -> ErrorRedactor {
+        self.headers
+            .values()
+            .fold(ErrorRedactor::default().url(&self.endpoint), |r, value| {
+                // A receiver may quote only the credential of `<scheme> <credential>`.
+                let credential = value.trim().rsplit_once(' ').map_or("", |(_, c)| c).trim();
+                // Only an auth-shaped value splits; `team a` must not make
+                // every `a` in the error a secret.
+                let credential = if credential.len() >= 8 {
+                    credential
+                } else {
+                    ""
+                };
+                r.secret(value).secret(credential)
+            })
     }
 }
 
@@ -2331,6 +2349,87 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!err.is_transient(), "4xx must be permanent: {err}");
+    }
+
+    /// The `last_error` a pipeline records for `sink`'s first failed
+    /// delivery — the text the warn log and the heartbeat carry too.
+    async fn first_last_error(sink: OtlpSink) -> String {
+        let (handle, worker) = crate::sink::SinkPipeline::new(
+            Arc::new(sink),
+            PipelineConfig {
+                flush_interval: Duration::from_millis(20),
+                ..PipelineConfig::default()
+            },
+        );
+        let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(worker.run(cancel));
+        assert!(handle.try_enqueue(Arc::new(SinkRecord::metadata_only(sample_event()))));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let last = loop {
+            if let Some(e) = handle.stats().last_error {
+                break e;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no delivery error recorded"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        cancel_tx.send(true).unwrap();
+        run.abort();
+        last
+    }
+
+    /// A configured endpoint may carry `user:pass@`, and the headers carry
+    /// the receiver's credential. Neither may reach `last_error` — neither
+    /// through the transport error that names the endpoint, nor through a
+    /// receiver that echoes the credential back in its error body.
+    #[tokio::test]
+    async fn otlp_delivery_errors_carry_no_configured_credential() {
+        let headers = BTreeMap::from([(
+            "authorization".to_string(),
+            "Bearer otlp-header-token".to_string(),
+        )]);
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let unreachable = first_last_error(OtlpSink::new(
+            "e",
+            format!("http://otlp-user:otlp-pass@127.0.0.1:{closed}/v1/traces"),
+            headers.clone(),
+            otlp_test_client(),
+        ))
+        .await;
+        assert!(
+            unreachable.contains(&format!("POST http://***@127.0.0.1:{closed}/v1/traces")),
+            "the endpoint stays diagnosable: {unreachable}"
+        );
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(401)
+                    .set_body_string("rejected token otlp-header-token"),
+            )
+            .mount(&server)
+            .await;
+        let echoed = first_last_error(OtlpSink::new(
+            "e",
+            server
+                .uri()
+                .replace("http://", "http://otlp-user:otlp-pass@"),
+            headers,
+            otlp_test_client(),
+        ))
+        .await;
+        assert!(echoed.contains("HTTP 401"), "{echoed}");
+
+        for last in [unreachable, echoed] {
+            for secret in ["otlp-user", "otlp-pass", "otlp-header-token"] {
+                assert!(!last.contains(secret), "{secret} leaked into: {last}");
+            }
+        }
     }
 
     #[test]

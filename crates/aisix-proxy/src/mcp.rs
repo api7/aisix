@@ -250,7 +250,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
         "/mcp"
     };
     let target = crate::attribution::AccessLogTarget::current();
-    AccessLog {
+    crate::attribution::emit_access_log(AccessLog {
         method: method.as_str(),
         path: endpoint,
         status,
@@ -279,8 +279,9 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
         // fully-buffered body, so `dispatch` has already read the counts.
         mcp: Some(mcp_log.fields()),
         cache: None,
-    }
-    .emit();
+        request_body_bytes: None,
+        response_body_bytes: None,
+    });
     crate::request_metrics::record(
         &state,
         endpoint,
