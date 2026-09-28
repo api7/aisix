@@ -4125,7 +4125,7 @@ mod tests {
         let seen: Vec<_> = chat
             .messages
             .iter()
-            .map(|m| (m.role, m.content_str().to_owned()))
+            .map(|m| (m.role, m.content_str().into_owned()))
             .collect();
         assert_eq!(seen.len(), 7, "{seen:?}");
         assert_eq!(seen[0].0, aisix_gateway::Role::System);
@@ -4197,7 +4197,7 @@ mod tests {
             window
                 .messages
                 .iter()
-                .map(|m| (m.role, m.content_str().to_owned()))
+                .map(|m| (m.role, m.content_str().into_owned()))
                 .collect::<Vec<_>>(),
         );
     }

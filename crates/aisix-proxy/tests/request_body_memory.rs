@@ -299,6 +299,16 @@ fn chat_body(size: (usize, usize)) -> String {
     chat_body_for("vision", size)
 }
 
+/// Content as an array of text blocks: the text is the blocks' own, not
+/// also a separate string beside them.
+fn chat_text_blocks_body((blocks, block_bytes): (usize, usize)) -> String {
+    let content: Vec<_> = (0..blocks)
+        .map(|i| serde_json::json!({"type": "text", "text": base64_blob(block_bytes, i)}))
+        .collect();
+    serde_json::json!({"model": "vision", "messages": [{"role": "user", "content": content}]})
+        .to_string()
+}
+
 fn effort_mapped_chat_body(size: (usize, usize)) -> String {
     chat_body_for("effort", size)
 }
@@ -512,6 +522,11 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
             "chat -> anthropic",
             "/v1/chat/completions",
             chat_to_anthropic_body,
+        ),
+        Family::new(
+            "chat, text-block content",
+            "/v1/chat/completions",
+            chat_text_blocks_body,
         ),
         // The effort mapping rewrites a copy of the request per attempt.
         Family::new(

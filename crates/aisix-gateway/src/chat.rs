@@ -56,11 +56,14 @@ impl Role {
 ///     (`[{type: "text", text}, {type: "image_url", image_url: {url}}]` —
 ///     used by vision/multimodal callers).
 ///
-/// We split the array form across two fields so existing call sites
-/// keep their `&str` access path:
-///   * [`Self::content`] holds the concatenated **text** of any text
-///     blocks. For non-array shapes this is the original string (or
-///     `""` for `null`). Bridges that don't speak content blocks
+/// We split the array form across two fields, and store its text once:
+///   * [`Self::content`] holds the string of the non-array shapes (`None`
+///     for `null`). For the array shape it is `None`: the text is the
+///     concatenated text of the text blocks, derived on read by
+///     [`Self::text`] / [`Self::content_str`] and emitted as `content` on
+///     serialization, so a request carrying megabytes of text blocks does
+///     not hold them twice. Read text through those accessors, never the
+///     field. Bridges that don't speak content blocks
 ///     (Anthropic / Gemini cross-provider translation today) read this
 ///     and silently skip non-text blocks (images/audio): a cross-provider
 ///     request keeps only the text. Documented for users under
@@ -71,7 +74,7 @@ impl Role {
 ///     content blocks (the OpenAI-compat bridge) forward this verbatim
 ///     to the upstream so vision input reaches OpenAI / Gemini /
 ///     DeepSeek upstreams unchanged.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(from = "ChatMessageRaw")]
 pub struct ChatMessage {
     pub role: Role,
@@ -79,10 +82,10 @@ pub struct ChatMessage {
     /// OpenAI `string | null` shape round-trips faithfully: a `tool_calls`
     /// response upstream returns `content: null` and we must surface
     /// exactly `null` to the SDK caller, not `""` (#395). On the request
-    /// path callers always send a string; `None` only arises on the
-    /// response-projection path (or an inbound `content: null` from a
-    /// history-replay assistant message).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// path callers always send a string; `None` arises on the
+    /// response-projection path, for an inbound `content: null` from a
+    /// history-replay assistant message, and whenever the text is derived
+    /// from [`Self::content_blocks`] (see the type docs).
     pub content: Option<String>,
     /// Raw content-block array when the caller sent
     /// `content: [{type, ...}, ...]`. `None` for the bare-string and
@@ -92,19 +95,45 @@ pub struct ChatMessage {
     /// block types INTO this OpenAI-shaped array (#722); bridges that
     /// don't understand blocks consult only `content` (concatenated
     /// text).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_blocks: Option<Vec<Value>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     /// Forward-compatible bag for OpenAI message fields the gateway
     /// doesn't model directly: `tool_calls`, `refusal`, `audio`, plus
     /// any future additions. Round-tripped verbatim so OpenAI
     /// conversation history replay works through the proxy without a
     /// schema bump every time OpenAI ships a new field.
-    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty", flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Serialized with the text a block-array message derives written out as
+/// `content`, exactly as when it was stored beside the blocks.
+impl Serialize for ChatMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            role: Role,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            content: Option<std::borrow::Cow<'a, str>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            content_blocks: &'a Option<Vec<Value>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            name: &'a Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tool_call_id: &'a Option<String>,
+            #[serde(skip_serializing_if = "serde_json::Map::is_empty", flatten)]
+            extra: &'a serde_json::Map<String, serde_json::Value>,
+        }
+        Wire {
+            role: self.role,
+            content: self.text(),
+            content_blocks: &self.content_blocks,
+            name: &self.name,
+            tool_call_id: &self.tool_call_id,
+            extra: &self.extra,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// Wire-shape mirror for [`ChatMessage`]. The `content` field accepts
@@ -142,15 +171,29 @@ impl From<ChatMessageRaw> for ChatMessage {
         // anything we'd derive from `content`. Otherwise use the
         // blocks extracted from the array-form of `content`.
         let content_blocks = raw.content_blocks.or(derived_blocks);
-        Self {
+        let mut message = Self {
             role: raw.role,
             content,
             content_blocks,
             name: raw.name,
             tool_call_id: raw.tool_call_id,
             extra: raw.extra,
-        }
+        };
+        // A serialized block-array message (a cache round trip) carries the
+        // derived text beside its blocks; it is not stored twice either.
+        message.drop_derived_content();
+        message
     }
+}
+
+/// The text of a content-block array: the `text` of every `text` block,
+/// concatenated.
+pub fn blocks_text(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect()
 }
 
 /// Split a wire-form `content` value into the gateway's
@@ -170,21 +213,8 @@ fn split_content(v: Value) -> (Option<String>, Option<Vec<Value>>) {
     match v {
         Value::String(s) => (Some(s), None),
         Value::Null => (None, None),
-        Value::Array(blocks) => {
-            let text = blocks
-                .iter()
-                .filter_map(|b| {
-                    let ty = b.get("type").and_then(Value::as_str)?;
-                    if ty == "text" {
-                        b.get("text").and_then(Value::as_str).map(str::to_owned)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("");
-            (Some(text), Some(blocks))
-        }
+        // The text is derived from the blocks on read.
+        Value::Array(blocks) => (None, Some(blocks)),
         _ => (None, None),
     }
 }
@@ -250,11 +280,32 @@ impl ChatMessage {
         }
     }
 
-    /// The text content as a `&str`, treating absent (`null`) content as
-    /// `""`. Use this for bridges/guardrails that need a plain string and
-    /// for which the string-vs-null distinction is irrelevant.
-    pub fn content_str(&self) -> &str {
-        self.content.as_deref().unwrap_or("")
+    /// The message text: the stored string, else the text of the content
+    /// blocks, else `None` (`content: null`).
+    pub fn text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        match (&self.content, &self.content_blocks) {
+            (Some(text), _) => Some(std::borrow::Cow::Borrowed(text)),
+            (None, Some(blocks)) => Some(std::borrow::Cow::Owned(blocks_text(blocks))),
+            (None, None) => None,
+        }
+    }
+
+    /// The message text, treating absent (`null`) content as `""`. Use this
+    /// for bridges/guardrails that need a plain string and for which the
+    /// string-vs-null distinction is irrelevant.
+    pub fn content_str(&self) -> std::borrow::Cow<'_, str> {
+        self.text().unwrap_or(std::borrow::Cow::Borrowed(""))
+    }
+
+    /// Stop storing `content` when it is exactly the text the content
+    /// blocks derive, so the text is held once. A `content` that says
+    /// something else is kept as it is.
+    pub fn drop_derived_content(&mut self) {
+        if let (Some(text), Some(blocks)) = (&self.content, &self.content_blocks) {
+            if *text == blocks_text(blocks) {
+                self.content = None;
+            }
+        }
     }
 
     /// An assistant turn whose only payload is `reasoning_content`: no
@@ -266,7 +317,7 @@ impl ChatMessage {
     /// upstreams reject.
     pub fn is_reasoning_only(&self) -> bool {
         matches!(self.role, Role::Assistant)
-            && self.content.as_deref().is_none_or(str::is_empty)
+            && self.text().is_none_or(|t| t.is_empty())
             && self.content_blocks.as_ref().is_none_or(Vec::is_empty)
             && self
                 .extra
@@ -959,7 +1010,9 @@ mod tests {
         )
         .unwrap();
         // Concatenated text from text blocks (non-text blocks skipped).
-        assert_eq!(m.content.as_deref(), Some("What's in this image?"));
+        assert_eq!(m.text().as_deref(), Some("What's in this image?"));
+        // Derived from the blocks, not stored beside them.
+        assert_eq!(m.content, None);
         // Raw blocks preserved verbatim for forwarding.
         let blocks = m.content_blocks.expect("blocks should be Some");
         assert_eq!(blocks.len(), 2);
@@ -981,7 +1034,9 @@ mod tests {
         .unwrap();
         // An array of only non-text blocks yields empty-but-present text
         // (the array form is never `null`); blocks are preserved.
-        assert_eq!(m.content.as_deref(), Some(""));
+        assert_eq!(m.text().as_deref(), Some(""));
+        // Derived from the blocks, not stored beside them.
+        assert_eq!(m.content, None);
         assert!(m.content_blocks.is_some());
     }
 
@@ -997,7 +1052,30 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(m.content.as_deref(), Some("line one\nline two"));
+        assert_eq!(m.text().as_deref(), Some("line one\nline two"));
+        // Derived from the blocks, not stored beside them.
+        assert_eq!(m.content, None);
+    }
+
+    #[test]
+    fn a_block_array_message_serializes_with_its_text_as_before() {
+        // Content capture and the cache store the serialized request, so
+        // the derived text is written out as `content` exactly where the
+        // stored copy used to be.
+        let m: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"text","text":"a"},{"type":"image_url","image_url":{"url":"u"}},{"type":"text","text":"b"}],"name":"n"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&m).unwrap(),
+            r#"{"role":"user","content":"ab","content_blocks":[{"text":"a","type":"text"},{"image_url":{"url":"u"},"type":"image_url"},{"text":"b","type":"text"}],"name":"n"}"#
+        );
+        // A stored `content` the blocks do not derive is kept as it is.
+        let explicit: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":"","content_blocks":[{"type":"text","text":"x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.content.as_deref(), Some(""));
     }
 
     #[test]

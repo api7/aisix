@@ -2855,6 +2855,52 @@ mod tests {
     }
 
     #[test]
+    fn a_text_block_array_message_counts_each_entity_once() {
+        // The text of a block array is held once, in its blocks, so a
+        // number in it is masked — and counted — once.
+        let chain = both();
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "call 13800138000"},
+                {"type": "image_url", "image_url": {"url": "http://x"}}
+            ]}]
+        }))
+        .unwrap();
+        let counts = redact_chat_format(chain.as_ref(), &mut req);
+        assert_eq!(counts.get("china_mobile"), Some(&1));
+        assert_eq!(
+            req.messages[0].content_str(),
+            "call [CHINA_MOBILE_REDACTED]"
+        );
+    }
+
+    #[test]
+    fn a_text_only_bridge_reads_the_blocks_masked_one_by_one_then_joined() {
+        // A bridge that reads only the message text sees the blocks as the
+        // block-forwarding bridges send them: each masked on its own, then
+        // joined. A number split across two blocks is therefore not a match
+        // on either path.
+        let chain = both();
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "mail a@x.com "},
+                {"type": "text", "text": "call 138001"},
+                {"type": "text", "text": "38000"}
+            ]}]
+        }))
+        .unwrap();
+        let counts = redact_chat_format(chain.as_ref(), &mut req);
+        assert_eq!(counts.get("email"), Some(&1));
+        assert_eq!(counts.get("china_mobile"), None);
+        assert_eq!(
+            req.messages[0].content_str(),
+            "mail [EMAIL_REDACTED] call 13800138000"
+        );
+    }
+
+    #[test]
     fn chat_format_masks_content_blocks_and_history_tool_args() {
         let chain = both();
         let mut req: ChatFormat = serde_json::from_value(json!({

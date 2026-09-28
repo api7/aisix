@@ -381,7 +381,7 @@ pub fn split_system<'a>(
                     .and_then(|v| v.as_array())
                     .map(Vec::as_slice);
                 messages.push(AnthropicMessage::assistant(
-                    m.content_str(),
+                    &m.content_str(),
                     m.content_blocks.as_deref(),
                     tool_calls,
                 ));
@@ -392,7 +392,7 @@ pub fn split_system<'a>(
                     .tool_call_id
                     .as_deref()
                     .ok_or(TranslateError::MissingToolCallId)?;
-                messages.push(AnthropicMessage::tool_result(tool_use_id, m.content_str()));
+                messages.push(AnthropicMessage::tool_result(tool_use_id, &m.content_str()));
             }
         }
     }
@@ -412,7 +412,8 @@ pub fn split_system<'a>(
 fn user_turn(m: &ChatMessage) -> AnthropicMessage<'_> {
     match m.content_blocks.as_deref() {
         Some(blocks) => AnthropicMessage::from_blocks("user", blocks),
-        None => AnthropicMessage::text("user", m.content_str()),
+        // No blocks: the text is the stored string.
+        None => AnthropicMessage::text("user", m.content.as_deref().unwrap_or("")),
     }
 }
 
@@ -2198,6 +2199,8 @@ fn translate_user_blocks(blocks: &[serde_json::Value], out: &mut Vec<ChatMessage
             // `content` keeps the concatenated text for guardrail scans
             // and non-block bridges.
             msg.content_blocks = Some(parts);
+            // The text is the text blocks' own; hold it once.
+            msg.drop_derived_content();
         }
         out.push(msg);
     } else if !had_tool_messages {

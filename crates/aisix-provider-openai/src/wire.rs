@@ -140,7 +140,8 @@ pub fn messages_from(
             // string. See `ChatMessage::content_blocks` doc.
             content: match m.content_blocks.as_deref() {
                 Some(blocks) => OpenAiContent::Blocks(blocks),
-                None => OpenAiContent::Text(m.content_str()),
+                // No blocks: the text is the stored string.
+                None => OpenAiContent::Text(m.content.as_deref().unwrap_or("")),
             },
             name: m.name.as_deref(),
             tool_call_id: m.tool_call_id.as_deref(),

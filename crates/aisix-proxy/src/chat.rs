@@ -1332,7 +1332,7 @@ fn last_user_message_text(req: &ChatFormat) -> Option<String> {
         .iter()
         .rev()
         .find(|m| m.role == aisix_gateway::Role::User)
-        .and_then(|m| m.content.clone())
+        .and_then(|m| m.text().map(std::borrow::Cow::into_owned))
 }
 
 /// Compute the value of [`Success::served_by_target`] for a request.

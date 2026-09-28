@@ -411,14 +411,17 @@ struct ChatContent {
 
 impl ChatContent {
     fn into_message(self, role: Role) -> ChatMessage {
-        ChatMessage {
+        let mut message = ChatMessage {
             role,
             content: Some(self.text),
             content_blocks: self.blocks,
             name: None,
             tool_call_id: None,
             extra: Map::new(),
-        }
+        };
+        // The text is the text blocks' own; hold it once.
+        message.drop_derived_content();
+        message
     }
 
     fn is_empty(&self) -> bool {

@@ -471,7 +471,7 @@ fn label_candidates(candidates: &[ChatResponse]) -> String {
             format!(
                 "Answer {}:\n{}",
                 i + 1,
-                truncate_bytes(c.message.content_str(), MAX_CANDIDATE_BYTES)
+                truncate_bytes(&c.message.content_str(), MAX_CANDIDATE_BYTES)
             )
         })
         .collect::<Vec<_>>()
