@@ -897,8 +897,11 @@ pub fn anthropic_signed_reasoning_texts(body: &Value) -> Vec<String> {
 /// Mask an Anthropic-native `/v1/messages` RESPONSE body in place (the
 /// non-streaming passthrough JSON): top-level `content` blocks (`text` +
 /// `tool_use` input). Server-tool blocks (`server_tool_use`,
-/// `mcp_tool_use`, and the `*_tool_result` blocks) are neither scanned nor
-/// masked here — unlike the stream, see [`redact_anthropic_sse`].
+/// `mcp_tool_use`, and the `*_tool_result` blocks) are not walked, so the
+/// kinds judged by this walk (`keyword`, `pii`, and the segment-moderating
+/// kinds) neither scan nor mask them; the block-only kinds that read the
+/// serialized content in `messages.rs` still see them. The stream differs,
+/// see [`redact_anthropic_sse`].
 pub fn redact_anthropic_response(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_output() {
@@ -2072,11 +2075,12 @@ pub fn responses_sse_text(raw: &[u8]) -> String {
 /// are reassembled per channel (`output_text.delta`, `function_call
 /// _arguments.delta`, `mcp_call_arguments.delta`, `custom_tool_call
 /// _input.delta`, each by item), masked once, and re-emitted on the
-/// channel's first frame; the aggregate events (`*.done`,
-/// `output_item.done`, `response.completed`) carry complete texts and are
-/// masked directly through [`redact_responses_item`], so they cover the
-/// same slots as [`redact_responses_response`] and no more —
-/// deterministic masking keeps them consistent with the delta channels.
+/// channel's first frame; the aggregate events carry complete texts and
+/// are masked directly — each channel's own `*.done` event by its own arm,
+/// and `output_item.done` / `response.completed` (`.incomplete`,
+/// `.failed`) through [`redact_responses_item`], so the latter cover the
+/// same slots as [`redact_responses_response`] and no more. Deterministic
+/// masking keeps them consistent with the delta channels.
 /// `None` = nothing matched, forward the original bytes byte-identical.
 pub fn redact_responses_sse(
     chain: &dyn Guardrail,
