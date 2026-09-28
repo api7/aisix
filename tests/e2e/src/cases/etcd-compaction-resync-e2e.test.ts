@@ -88,7 +88,6 @@ describe("etcd compaction behind a lagging watch", () => {
         model_name: "gpt-4o-mini",
         provider_key_id: pk.id,
       });
-    const doomed = await model(DELETED);
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [DELETED, WRITTEN_AFTER, WRITTEN_LATER],
@@ -105,21 +104,27 @@ describe("etcd compaction behind a lagging watch", () => {
       if (res.status !== 200) return [];
       return ((res.body as { data?: Array<{ id: string }> }).data ?? []).map((m) => m.id);
     };
+    // Written after the boot read, so seeing it served proves the watch is
+    // established and delivering before its replies are stalled.
+    const doomed = await model(DELETED);
     await waitConfigPropagation(async () => (await served()).includes(DELETED));
 
-    // Make the gateway's watch fall behind.
+    // Make the gateway's watch fall behind. The gauge is cluster-wide, and
+    // locally several forks share one etcd, so wait for it to rise above
+    // what it read before the stall rather than for it to be non-zero.
+    const slowBefore = await etcd.slowWatchers();
     relay.stallReplies();
     const filler = "x".repeat(FILLER_VALUE_BYTES);
     const fillerKey = `${prefix}/compaction_filler/${randomUUID()}`;
     let puts = 0;
-    while ((await etcd.slowWatchers()) === 0) {
+    do {
       if (puts >= MAX_FILLER_PUTS) {
         throw new Error(`etcd never reported the stalled watch as slow after ${puts} puts`);
       }
       for (let i = 0; i < 64; i++, puts++) await etcd.put(fillerKey, filler);
       // etcd refreshes the gauge on its ~100ms sync tick.
       await new Promise((r) => setTimeout(r, 150));
-    }
+    } while ((await etcd.slowWatchers()) <= slowBefore);
     await etcd.delete(fillerKey);
 
     // A deletion the lagging watch has not delivered, then a compaction
@@ -150,7 +155,7 @@ describe("etcd compaction behind a lagging watch", () => {
       model: DELETED,
       messages: [{ role: "user", content: "deleted before compaction" }],
     });
-    expect(gone.status).not.toBe(200);
+    expect(gone.status, JSON.stringify(gone.body)).toBe(404);
 
     // The watch re-established after the resync keeps applying writes.
     await model(WRITTEN_LATER);
