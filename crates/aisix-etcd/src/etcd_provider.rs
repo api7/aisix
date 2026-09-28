@@ -329,6 +329,18 @@ impl ConfigProvider for EtcdConfigProvider {
             })
             .await
             .map_err(|e| provider_error(e, "watch create", ProviderError::Watch))?;
+        // etcd-client consumes the create response itself, reason and all,
+        // and keeps only its id. A server that refuses the watch outright
+        // answers with a response that is both created and cancelled under
+        // the invalid id -1; the stream that comes back will never carry
+        // an event.
+        if watcher.watch_id() == INVALID_WATCH_ID {
+            return Err(ProviderError::Watch(
+                "etcd cancelled the watch as it was created (typically a permission or \
+                 auth-token refusal; etcd-client does not expose the reason)"
+                    .to_owned(),
+            ));
+        }
 
         Ok(Box::new(EtcdWatchStream {
             inner: stream,
@@ -350,6 +362,30 @@ pub struct EtcdWatchStream {
     // half of the gRPC stream, causing the server to tear down the watch.
     _watcher: etcd_client::Watcher,
     buf: VecDeque<WatchEvent>,
+}
+
+/// The watch id etcd (and kine) answer with when a create is refused.
+const INVALID_WATCH_ID: i64 = -1;
+
+fn is_compaction(message: &str) -> bool {
+    message.contains("required revision has been compacted")
+        || message.contains("mvcc: required revision")
+}
+
+/// A server-side cancel ends the watch while the gRPC stream stays open,
+/// so it has to end the stream here: nothing else ever will. kine cancels
+/// a watch whose consumer fell behind this way, with no compact revision
+/// and no reason.
+fn cancelled(reason: &str) -> ProviderError {
+    if is_compaction(reason) {
+        return ProviderError::Compacted;
+    }
+    let reason = if reason.is_empty() {
+        "no reason given"
+    } else {
+        reason
+    };
+    ProviderError::Watch(format!("etcd cancelled the watch: {reason}"))
 }
 
 fn convert_event(ev: &etcd_client::Event) -> Option<WatchEvent> {
@@ -381,10 +417,7 @@ impl Stream for EtcdWatchStream {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Ready(Some(Err(err))) => {
-                let shallow = err.to_string();
-                if shallow.contains("required revision has been compacted")
-                    || shallow.contains("mvcc: required revision")
-                {
+                if is_compaction(&err.to_string()) {
                     Poll::Ready(Some(Err(ProviderError::Compacted)))
                 } else {
                     // No re-authentication here: an established stream
@@ -409,6 +442,9 @@ impl Stream for EtcdWatchStream {
             Poll::Ready(Some(Ok(resp))) => {
                 if resp.compact_revision() > 0 {
                     return Poll::Ready(Some(Err(ProviderError::Compacted)));
+                }
+                if resp.canceled() {
+                    return Poll::Ready(Some(Err(cancelled(resp.cancel_reason()))));
                 }
 
                 for ev in resp.events() {
