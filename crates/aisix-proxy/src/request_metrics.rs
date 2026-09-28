@@ -465,7 +465,12 @@ fn record_e2e_latency_as(
             user_name: caller.user_name,
         },
     };
-    if with_upstream {
+    // An ensemble's response comes from no single attempt — its terminal
+    // event is the judge's own call, only the last step — so it has no
+    // upstream side to observe, on any path.
+    let ensemble =
+        crate::attribution::current().is_some_and(|r| is_ensemble(&snap, &r.requested_model));
+    if with_upstream && !ensemble {
         record_e2e_downstream(&state.metrics, labels, elapsed);
     } else {
         state

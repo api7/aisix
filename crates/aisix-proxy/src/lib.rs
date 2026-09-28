@@ -893,10 +893,12 @@ impl Drop for ClientCancelGuard {
         // task failure and hyper drops the connection), so stay silent and
         // let that stand. Emitting here would also risk a double panic,
         // which aborts the process.
-        if std::thread::panicking() {
-            return;
+        //
+        // A line the handler already produced before panicking is still
+        // written, as it was when handlers wrote their lines themselves.
+        if !std::thread::panicking() {
+            self.record_cancel();
         }
-        self.record_cancel();
         // The request is over — its body fully handed to the server or
         // dropped, or no head at all — so the body sizes are final: write
         // the line every path above left on the cell.

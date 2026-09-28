@@ -150,6 +150,10 @@ describe("aisix_request_e2e_latency_seconds splits each request by side", () => 
         provider_key_id: pk.id,
       });
     }
+    await seed.createModel({
+      display_name: "side-ensemble",
+      ensemble: { panel: [{ model: "side-chat" }], judge: { model: "side-chat" }, min_responses: 1 },
+    });
     await seed.createCachePolicy({ name: "side-cache", enabled: true, applies_to: "all" });
     await seed.createApiKey({ key_hash: sha256(KEY), allowed_models: ["*"] });
     const proxy = new ProxyClient(app.proxyUrl, KEY);
@@ -203,6 +207,22 @@ describe("aisix_request_e2e_latency_seconds splits each request by side", () => 
       expect(downstream).toBeGreaterThanOrEqual(upstream);
     });
   }
+
+  test("an ensemble observes the downstream side only", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    // Its response comes from no single upstream attempt: the judge's call
+    // is only the last of several.
+    const r = await call("/v1/chat/completions", chatBody(false)("side-ensemble"));
+    expect(r.status, r.text).toBe(200);
+    let samples: MetricSample[] = [];
+    await expect
+      .poll(async () => {
+        samples = await scrapeMetrics(app!.metricsUrl);
+        return sumMetric(samples, `${E2E}_count`, { model: "side-ensemble", side: "downstream" });
+      })
+      .toBe(1);
+    expect(sumMetric(samples, `${E2E}_count`, { model: "side-ensemble", side: "upstream" })).toBe(0);
+  });
 
   test("a cache hit observes the downstream side only", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();

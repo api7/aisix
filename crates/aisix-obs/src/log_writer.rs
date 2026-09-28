@@ -391,23 +391,33 @@ mod tests {
         let _counter = owning_the_drop_counter();
         let sink = BlockedSink::new();
         let (queue, writer) = LogWriter::start(sink.clone(), 8);
-        for n in 0..40 {
+        // Park the writer thread inside the blocked sink first. Were it free
+        // to take a line off the queue at any point of the flood below, it
+        // would open one slot at a moment the test does not control, and
+        // whichever later line landed there would be written.
+        queue.make_writer().write_all(&line(0)).expect("accepted");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while writer.queued() != 0 {
+            assert!(Instant::now() < deadline, "the writer never took line-0");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for n in 1..=40 {
             let mut w = queue.make_writer();
             w.write_all(&line(n)).expect("accepted");
         }
-        // The writer thread may have taken one line off the queue and be
-        // parked inside the blocked sink, so the bound admits at most one
-        // more than its capacity.
-        let dropped = writer.dropped();
-        assert!(
-            (31..=32).contains(&dropped),
-            "expected the 40 events minus the bound to be dropped, got {dropped}",
+        assert_eq!(
+            writer.dropped(),
+            32,
+            "the 40 events minus the bound of 8 are dropped",
         );
         sink.release();
         writer.shutdown(Duration::from_secs(5));
         let text = sink.text();
         assert!(
-            text.contains("line-0") && !text.contains("line-39"),
+            text.contains("line-0\n")
+                && text.contains("line-8\n")
+                && !text.contains("line-9\n")
+                && !text.contains("line-40\n"),
             "the NEW event is the one dropped, got: {text}",
         );
     }

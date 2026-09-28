@@ -403,8 +403,9 @@ pub const M_OTLP_FANOUT_FAILURES_TOTAL: &str = "aisix_otlp_fanout_failures_total
 ///   in an upstream error or timeout): a cache hit or a request that
 ///   failed before dispatch observes `downstream` only. Earlier failed
 ///   attempts and retry backoff are not observed on their own; they stay
-///   inside the `downstream` figure. `/a2a` and the streaming ensemble path
-///   observe `downstream` only.
+///   inside the `downstream` figure. `/a2a` and ensemble models, whose
+///   response comes from no single upstream attempt, observe `downstream`
+///   only.
 ///
 /// Both observations of one request carry identical labels apart from
 /// `side`. Gateways before `side` existed recorded the `downstream`
