@@ -11,8 +11,8 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: generated reasoning is out of the output-guardrail scope on
-// `/v1/responses`, streamed or buffered. An upstream that streams raw
+// E2E: generated reasoning is out of the output-guardrail scope on a
+// streamed `/v1/responses` reply, as it already is on a buffered one. An upstream that streams raw
 // reasoning (gpt-oss behind a native Responses endpoint does) closes the
 // reasoning item's `reasoning_text` part with `response.content_part.done`
 // — the event a message's `output_text` part closes with too. Only the
@@ -70,6 +70,10 @@ const STREAM_EVENTS = [
   },
 ].map((e) => JSON.stringify(e));
 
+// Control: the same stream with the term moved into the answer, so the
+// block rule is shown to be live on this route.
+const CONTROL_EVENTS = STREAM_EVENTS.map((e) => e.replaceAll("Write to ", `${REASONING_TERM} `));
+
 type Frame = { type?: string; part?: { type?: string; text?: string } };
 
 function frames(body: string): Frame[] {
@@ -82,6 +86,7 @@ function frames(body: string): Frame[] {
 describe("native /v1/responses stream leaves a reasoning_text content part out of output scope", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
+  let control: OpenAiUpstream | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -89,6 +94,7 @@ describe("native /v1/responses stream leaves a reasoning_text content part out o
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     upstream = await startOpenAiUpstream({ streamEvents: STREAM_EVENTS });
+    control = await startOpenAiUpstream({ streamEvents: CONTROL_EVENTS });
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
@@ -107,6 +113,17 @@ describe("native /v1/responses stream leaves a reasoning_text content part out o
       provider: "openai",
       model_name: "gpt-oss-120b",
       provider_key_id: pk.id,
+    });
+    const controlPk = await seed.createProviderKey({
+      display_name: "resp-reasoning-control-pk",
+      secret: "sk-mock",
+      api_base: `${control.baseUrl}/v1`,
+    });
+    const blockedControl = await seed.createModel({
+      display_name: "resp-reasoning-block-control",
+      provider: "openai",
+      model_name: "gpt-oss-120b",
+      provider_key_id: controlPk.id,
     });
     const mask = await seed.createGuardrail(
       {
@@ -130,10 +147,11 @@ describe("native /v1/responses stream leaves a reasoning_text content part out o
       { attach: false },
     );
     await seed.attachGuardrailToModel(block.id, blocked.id);
+    await seed.attachGuardrailToModel(block.id, blockedControl.id);
     // Seeded last: this key authenticating implies the whole seed set landed.
     await seed.createApiKey({
       key_hash: HASH,
-      allowed_models: ["resp-reasoning-mask", "resp-reasoning-block"],
+      allowed_models: ["resp-reasoning-mask", "resp-reasoning-block", "resp-reasoning-block-control"],
     });
     const proxy = new ProxyClient(app.proxyUrl, CALLER);
     await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
@@ -142,6 +160,7 @@ describe("native /v1/responses stream leaves a reasoning_text content part out o
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
+    await control?.close();
   });
 
   async function stream(model: string): Promise<Response> {
@@ -170,5 +189,13 @@ describe("native /v1/responses stream leaves a reasoning_text content part out o
     const body = await res.text();
     expect(res.status, body).toBe(200);
     expect(frames(body).some((f) => f.type === "response.completed"), body).toBe(true);
+  });
+
+  test("the same block rule refuses the stream when the answer carries the term", async (ctx) => {
+    if (!etcdReachable || !app) ctx.skip();
+    const res = await stream("resp-reasoning-block-control");
+    const body = await res.text();
+    expect(res.status, body).toBe(422);
+    expect(body).toContain("resp-reasoning-part-block");
   });
 });

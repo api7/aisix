@@ -3309,7 +3309,10 @@ mod tests {
         );
         let (out, counts) = redact_responses_sse(chain.as_ref(), raw.as_bytes()).unwrap();
         let out = String::from_utf8(out).unwrap();
-        assert!(out.contains("think a@x.com"), "reasoning part was rewritten: {out}");
+        assert!(
+            out.contains("think a@x.com"),
+            "reasoning part was rewritten: {out}"
+        );
         assert!(out.contains("mail [EMAIL_REDACTED]"), "{out}");
         assert_eq!(counts.get("email"), Some(&1));
     }
