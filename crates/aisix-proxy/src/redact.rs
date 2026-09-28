@@ -2248,8 +2248,18 @@ pub fn redact_responses_sse(
                     apply_to_value_string(chain, aggregate, text, &mut local);
                 }
             }
+            // The part union also carries `reasoning_text` (a reasoning
+            // item's content), which is generated reasoning and out of the
+            // output scope — the same part types `redact_responses_item`
+            // walks on a message, and no others.
             "response.content_part.done" => {
-                if let Some(text) = data.get_mut("part").and_then(|p| p.get_mut("text")) {
+                let part = data.get_mut("part").filter(|p| {
+                    matches!(
+                        p.get("type").and_then(Value::as_str),
+                        Some("output_text" | "text" | "input_text")
+                    )
+                });
+                if let Some(text) = part.and_then(|p| p.get_mut("text")) {
                     apply_to_value_string(chain, aggregate, text, &mut local);
                 }
             }
@@ -3282,6 +3292,28 @@ mod tests {
         let out = String::from_utf8(out).unwrap();
         assert!(!out.contains("a@"), "original fragments gone: {out}");
         assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
+        assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    /// Generated reasoning is out of the output scope. A native upstream
+    /// that streams raw reasoning (gpt-oss behind a Responses endpoint)
+    /// closes the reasoning item's `reasoning_text` part with a
+    /// `response.content_part.done`, the same event a message's
+    /// `output_text` part closes with — only the message part is masked.
+    #[test]
+    fn responses_sse_leaves_a_reasoning_text_content_part_alone() {
+        let chain = both();
+        let raw = concat!(
+            "event: response.content_part.done\ndata: {\"type\":\"response.content_part.done\",\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"reasoning_text\",\"text\":\"think a@x.com\"}}\n\n",
+            "event: response.content_part.done\ndata: {\"type\":\"response.content_part.done\",\"item_id\":\"msg_1\",\"output_index\":1,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"mail b@y.org\",\"annotations\":[]}}\n\n",
+        );
+        let (out, counts) = redact_responses_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("think a@x.com"),
+            "reasoning part was rewritten: {out}"
+        );
+        assert!(out.contains("mail [EMAIL_REDACTED]"), "{out}");
         assert_eq!(counts.get("email"), Some(&1));
     }
 
