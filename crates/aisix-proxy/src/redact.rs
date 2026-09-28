@@ -896,7 +896,12 @@ pub fn anthropic_signed_reasoning_texts(body: &Value) -> Vec<String> {
 
 /// Mask an Anthropic-native `/v1/messages` RESPONSE body in place (the
 /// non-streaming passthrough JSON): top-level `content` blocks (`text` +
-/// `tool_use` input).
+/// `tool_use` input). Server-tool blocks (`server_tool_use`,
+/// `mcp_tool_use`, and the `*_tool_result` blocks) are not walked, so the
+/// kinds judged by this walk (`keyword`, `pii`, and the segment-moderating
+/// kinds) neither scan nor mask them; the block-only kinds that read the
+/// serialized content in `messages.rs` still see them. The stream differs,
+/// see [`redact_anthropic_sse`].
 pub fn redact_anthropic_response(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_output() {
@@ -1084,6 +1089,8 @@ fn redact_responses_item(
         Some("reasoning") => return,
         _ => &[],
     };
+    // On the response side `output` is not in the list: a hosted tool's
+    // result (`mcp_call.output`) is neither scanned nor masked there.
     let scanned: &[&str] = if dir.is_input() {
         &[
             "content",
@@ -1138,9 +1145,13 @@ fn apply_to_text_slot(
     }
 }
 
-/// Mask a `/v1/responses` non-streaming RESPONSE body in place: every
-/// item in `output` (message `output_text` parts, `function_call`
-/// arguments) — the same surface the output check scans.
+/// Mask a `/v1/responses` non-streaming RESPONSE body in place — the same
+/// surface the output check scans: message `output_text`, `text` and
+/// `input_text` parts, and each item's tool-call `name` (scan-only) /
+/// `arguments` / `input`. Hosted-tool results (`mcp_call.output`,
+/// `file_search_call` results, `code_interpreter_call` logs), `refusal`
+/// parts, and hosted-tool code or action text are neither scanned nor
+/// masked.
 pub fn redact_responses_response(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_output() {
@@ -1818,9 +1829,12 @@ fn excise_unscannable_frames(buf: &mut Vec<u8>) -> (Vec<String>, usize) {
 /// passthrough hold-back). Text deltas are reassembled per content-block
 /// `index` (a masked span can cross frame boundaries), masked once, and
 /// the full masked text re-emitted on the channel's first frame;
-/// `input_json_delta` (tool-use arguments) channels are masked as complete
-/// JSON documents. `None` = nothing matched, forward the original bytes
-/// byte-identical.
+/// `input_json_delta` channels are masked as complete JSON documents — for
+/// every block that streams one, so a `server_tool_use` / `mcp_tool_use`
+/// input is masked here although the non-streaming walk
+/// ([`redact_anthropic_response`]) does not reach it. Tool-result blocks
+/// arriving in `content_block_start` are not scanned or masked. `None` =
+/// nothing matched, forward the original bytes byte-identical.
 pub fn redact_anthropic_sse(
     chain: &dyn Guardrail,
     raw: &[u8],
@@ -2059,11 +2073,16 @@ pub fn responses_sse_text(raw: &[u8]) -> String {
 
 /// Mask a fully-buffered Responses-API SSE byte stream (the `/v1/responses`
 /// verbatim hold-back and the cross-provider bridge release). Delta events
-/// are reassembled per channel (`output_text.delta` by item, `function_call
-/// _arguments.delta` by item), masked once, and re-emitted on the channel's
-/// first frame; the aggregate events (`*.done`, `output_item.done`,
-/// `response.completed`) carry complete texts and are masked directly —
-/// deterministic masking keeps them consistent with the delta channels.
+/// are reassembled per channel (`output_text.delta`,
+/// `function_call_arguments.delta`, `mcp_call_arguments.delta`,
+/// `custom_tool_call_input.delta`, each by item), masked once, and
+/// re-emitted on the channel's first frame; the aggregate events carry
+/// complete texts and are masked directly — each channel's own `*.done`
+/// event by its own arm, and `output_item.done` / `response.completed`
+/// (`.incomplete`, `.failed`) through [`redact_responses_item`], so the
+/// latter cover the same slots as [`redact_responses_response`] and no
+/// more. Deterministic masking keeps them consistent with the delta
+/// channels.
 /// `None` = nothing matched, forward the original bytes byte-identical.
 pub fn redact_responses_sse(
     chain: &dyn Guardrail,
