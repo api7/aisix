@@ -116,6 +116,15 @@ const CASES: Case[] = [
     body: chatBody(false), status: 400 },
 ];
 
+/** The failover groups' first target fails after this long… */
+const FAILING_DELAY_MS = 1_000;
+/** …and their second target answers after this long. */
+const SERVING_DELAY_MS = 250;
+const FAILOVER_GROUPS = [
+  { name: "side-failover", stream: false },
+  { name: "side-failover-stream", stream: true },
+] as const;
+
 /** The label set of one sample without `side` and `le`, as a stable string. */
 const labelsBesidesSide = (s: MetricSample) =>
   JSON.stringify(Object.entries(s.labels).filter(([k]) => k !== "side" && k !== "le").sort());
@@ -123,6 +132,7 @@ const labelsBesidesSide = (s: MetricSample) =>
 describe("aisix_request_e2e_latency_seconds splits each request by side", () => {
   let app: SpawnedApp | undefined;
   const upstreams: OpenAiUpstream[] = [];
+  const failingUpstreams = new Map<string, OpenAiUpstream>();
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -148,6 +158,31 @@ describe("aisix_request_e2e_latency_seconds splits each request by side", () => 
         provider: c.provider,
         model_name: c.modelName,
         provider_key_id: pk.id,
+      });
+    }
+    // Model groups whose first target fails slowly and whose second serves
+    // quickly: one per response shape, so the first request's failure
+    // cannot put the second group's failing target into cooldown.
+    for (const g of FAILOVER_GROUPS) {
+      const failing = await startOpenAiUpstream({
+        responseDelayMs: FAILING_DELAY_MS,
+        status: 500,
+        errorBody: { error: { message: "boom", type: "server_error" } },
+      });
+      const serving = await startOpenAiUpstream(
+        g.stream
+          ? { responseDelayMs: SERVING_DELAY_MS, streamEvents: CHAT_EVENTS }
+          : { responseDelayMs: SERVING_DELAY_MS, nonStreamBody: CHAT_COMPLETION },
+      );
+      upstreams.push(failing, serving);
+      failingUpstreams.set(g.name, failing);
+      for (const [member, up] of [[`${g.name}-fails`, failing], [`${g.name}-serves`, serving]] as const) {
+        const pk = await seed.createProviderKey({ display_name: `${member}-pk`, secret: "sk-mock", api_base: `${up.baseUrl}/v1` });
+        await seed.createModel({ display_name: member, provider: "openai", model_name: "gpt-4o-mini", provider_key_id: pk.id });
+      }
+      await seed.createModel({
+        display_name: g.name,
+        routing: { strategy: "failover", targets: [{ model: `${g.name}-fails` }, { model: `${g.name}-serves` }] },
       });
     }
     await seed.createModel({
@@ -205,6 +240,32 @@ describe("aisix_request_e2e_latency_seconds splits each request by side", () => 
       // The upstream took its delay; the caller waited for that and more.
       expect(upstream).toBeGreaterThanOrEqual(U);
       expect(downstream).toBeGreaterThanOrEqual(upstream);
+    });
+  }
+
+  for (const g of FAILOVER_GROUPS) {
+    test(`${g.name}: upstream is the serving attempt alone, downstream covers both`, async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const r = await call("/v1/chat/completions", chatBody(g.stream)(g.name));
+      expect(r.status, r.text).toBe(200);
+      // Premise: the first target really was tried and failed.
+      expect(failingUpstreams.get(g.name)!.receivedRequests).toHaveLength(1);
+      let samples: MetricSample[] = [];
+      await expect
+        .poll(async () => {
+          samples = await scrapeMetrics(app!.metricsUrl);
+          return sumMetric(samples, `${E2E}_count`, { model: g.name, side: "downstream" });
+        })
+        .toBe(1);
+      expect(sumMetric(samples, `${E2E}_count`, { model: g.name, side: "upstream" })).toBe(1);
+      const upstream = sumMetric(samples, `${E2E}_sum`, { model: g.name, side: "upstream" });
+      const downstream = sumMetric(samples, `${E2E}_sum`, { model: g.name, side: "downstream" });
+      // The serving attempt's own wait — not the failed attempt's, and not
+      // the two added together.
+      expect(upstream).toBeGreaterThanOrEqual(SERVING_DELAY_MS / 1000);
+      expect(upstream).toBeLessThan(FAILING_DELAY_MS / 1000);
+      // The caller waited through both attempts.
+      expect(downstream).toBeGreaterThanOrEqual((FAILING_DELAY_MS + SERVING_DELAY_MS) / 1000);
     });
   }
 
