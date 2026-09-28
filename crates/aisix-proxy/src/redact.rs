@@ -1146,11 +1146,12 @@ fn apply_to_text_slot(
 }
 
 /// Mask a `/v1/responses` non-streaming RESPONSE body in place — the same
-/// surface the output check scans: message `output_text` parts, and each
-/// item's tool-call `name` (scan-only) / `arguments` / `input`. Hosted-tool
-/// results (`mcp_call.output`, `file_search_call` results,
-/// `code_interpreter_call` logs), `refusal` parts, and hosted-tool code or
-/// action text are neither scanned nor masked.
+/// surface the output check scans: message `output_text`, `text` and
+/// `input_text` parts, and each item's tool-call `name` (scan-only) /
+/// `arguments` / `input`. Hosted-tool results (`mcp_call.output`,
+/// `file_search_call` results, `code_interpreter_call` logs), `refusal`
+/// parts, and hosted-tool code or action text are neither scanned nor
+/// masked.
 pub fn redact_responses_response(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_output() {
@@ -2072,15 +2073,16 @@ pub fn responses_sse_text(raw: &[u8]) -> String {
 
 /// Mask a fully-buffered Responses-API SSE byte stream (the `/v1/responses`
 /// verbatim hold-back and the cross-provider bridge release). Delta events
-/// are reassembled per channel (`output_text.delta`, `function_call
-/// _arguments.delta`, `mcp_call_arguments.delta`, `custom_tool_call
-/// _input.delta`, each by item), masked once, and re-emitted on the
-/// channel's first frame; the aggregate events carry complete texts and
-/// are masked directly — each channel's own `*.done` event by its own arm,
-/// and `output_item.done` / `response.completed` (`.incomplete`,
-/// `.failed`) through [`redact_responses_item`], so the latter cover the
-/// same slots as [`redact_responses_response`] and no more. Deterministic
-/// masking keeps them consistent with the delta channels.
+/// are reassembled per channel (`output_text.delta`,
+/// `function_call_arguments.delta`, `mcp_call_arguments.delta`,
+/// `custom_tool_call_input.delta`, each by item), masked once, and
+/// re-emitted on the channel's first frame; the aggregate events carry
+/// complete texts and are masked directly — each channel's own `*.done`
+/// event by its own arm, and `output_item.done` / `response.completed`
+/// (`.incomplete`, `.failed`) through [`redact_responses_item`], so the
+/// latter cover the same slots as [`redact_responses_response`] and no
+/// more. Deterministic masking keeps them consistent with the delta
+/// channels.
 /// `None` = nothing matched, forward the original bytes byte-identical.
 pub fn redact_responses_sse(
     chain: &dyn Guardrail,
