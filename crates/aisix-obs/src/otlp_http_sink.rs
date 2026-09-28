@@ -700,7 +700,9 @@ impl ObservabilitySink for OtlpSink {
         self.headers
             .values()
             .fold(ErrorRedactor::default().url(&self.endpoint), |r, value| {
-                r.secret(value)
+                // A receiver may quote only the credential of `<scheme> <credential>`.
+                let credential = value.trim().rsplit_once(' ').map_or("", |(_, c)| c);
+                r.secret(value).secret(credential)
             })
     }
 }
@@ -2396,7 +2398,7 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(
                 wiremock::ResponseTemplate::new(401)
-                    .set_body_string("rejected credential Bearer otlp-header-token"),
+                    .set_body_string("rejected token otlp-header-token"),
             )
             .mount(&server)
             .await;

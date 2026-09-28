@@ -78,12 +78,31 @@ impl ErrorRedactor {
     }
 
     /// `text` with every configured secret replaced.
+    ///
+    /// The sinks cap their own detail before it gets here, always by
+    /// cutting the end off, so a secret the cut went through survives only
+    /// as a prefix at the very end of `text`; that tail is replaced too.
     pub fn redact(&self, text: &str) -> String {
         let mut out = text.to_string();
         for (needle, replacement) in &self.rules {
             if out.contains(needle.as_str()) {
                 out = out.replace(needle.as_str(), replacement);
             }
+        }
+        let cut = self
+            .rules
+            .iter()
+            .filter_map(|(needle, replacement)| {
+                let longest = needle
+                    .char_indices()
+                    .map(|(i, _)| &needle[..i])
+                    .rfind(|p| !p.is_empty() && out.ends_with(p))?;
+                Some((longest.len(), *replacement))
+            })
+            .max_by_key(|(len, _)| *len);
+        if let Some((len, replacement)) = cut {
+            out.truncate(out.len() - len);
+            out.push_str(replacement);
         }
         out
     }
@@ -113,6 +132,16 @@ mod tests {
             .secret("");
         let text = "POST https://collector.example/v1/traces?tenant=a@b: HTTP 503";
         assert_eq!(r.redact(text), text);
+    }
+
+    #[test]
+    fn a_secret_cut_off_at_the_end_of_the_text_is_replaced() {
+        let r = ErrorRedactor::default().secret("otlp-header-token");
+        assert_eq!(
+            r.redact("HTTP 401: rejected otlp-hea"),
+            "HTTP 401: rejected ***"
+        );
+        assert_eq!(r.redact("HTTP 401: rejected"), "HTTP 401: rejected");
     }
 
     #[test]
