@@ -5639,13 +5639,13 @@ mod tests {
     enum Flake {
         /// The range read fails after this long: the cycle never reaches
         /// steady state.
-        LoadFailsAfter(Duration),
+        ReadFails(Duration),
         /// The read succeeds and the watch opens, then the server cancels
         /// it after this long.
-        CancelAfter(Duration),
+        Cancelled(Duration),
         /// The read succeeds and the watch create fails after this long:
         /// the cycle never reaches steady state.
-        WatchFailsAfter(Duration),
+        WatchFails(Duration),
     }
 
     /// Fails every cycle the way its script says, and records when each
@@ -5663,7 +5663,7 @@ mod tests {
             let failing = {
                 let mut script = self.script.lock().unwrap();
                 match script.front() {
-                    Some(Flake::LoadFailsAfter(after)) => {
+                    Some(Flake::ReadFails(after)) => {
                         let after = *after;
                         script.pop_front();
                         Some(after)
@@ -5691,8 +5691,8 @@ mod tests {
         > {
             let step = self.script.lock().unwrap().pop_front();
             let after = match step {
-                Some(Flake::CancelAfter(after)) => after,
-                Some(Flake::WatchFailsAfter(after)) => {
+                Some(Flake::Cancelled(after)) => after,
+                Some(Flake::WatchFails(after)) => {
                     tokio::time::sleep(after).await;
                     self.failures
                         .lock()
@@ -5748,12 +5748,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failure_after_a_healthy_run_retries_at_the_initial_delay() {
         let delays = retry_delays(vec![
-            Flake::CancelAfter(Duration::ZERO),
-            Flake::CancelAfter(Duration::ZERO),
-            Flake::CancelAfter(Duration::ZERO),
+            Flake::Cancelled(Duration::ZERO),
+            Flake::Cancelled(Duration::ZERO),
+            Flake::Cancelled(Duration::ZERO),
             // Healthy for longer than the 4s wait that preceded it, and
             // shorter than the 8s that would follow it.
-            Flake::CancelAfter(S(5)),
+            Flake::Cancelled(S(5)),
         ])
         .await;
         assert_eq!(delays, vec![S(1), S(2), S(4), S(1)]);
@@ -5765,13 +5765,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn failures_before_or_soon_after_steady_state_keep_escalating() {
         let delays = retry_delays(vec![
-            Flake::LoadFailsAfter(Duration::ZERO),
+            Flake::ReadFails(Duration::ZERO),
             // A read that takes longer than the wait before it (a range
             // timing out) is still not steady state.
-            Flake::LoadFailsAfter(S(5)),
-            Flake::CancelAfter(Duration::ZERO),
+            Flake::ReadFails(S(5)),
+            Flake::Cancelled(Duration::ZERO),
             // Healthy, but for less than the 4s wait that preceded it.
-            Flake::CancelAfter(Duration::from_millis(3_900)),
+            Flake::Cancelled(Duration::from_millis(3_900)),
         ])
         .await;
         assert_eq!(delays, vec![S(1), S(2), S(4), S(8)]);
@@ -5783,16 +5783,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn steady_state_is_not_carried_into_a_later_cycle_or_granted_before_the_watch() {
         let delays = retry_delays(vec![
-            Flake::CancelAfter(Duration::ZERO),
-            Flake::LoadFailsAfter(Duration::ZERO),
-            Flake::LoadFailsAfter(Duration::ZERO),
+            Flake::Cancelled(Duration::ZERO),
+            Flake::ReadFails(Duration::ZERO),
+            Flake::ReadFails(Duration::ZERO),
         ])
         .await;
         assert_eq!(delays, vec![S(1), S(2), S(4)]);
 
         let delays = retry_delays(vec![
-            Flake::CancelAfter(Duration::ZERO),
-            Flake::WatchFailsAfter(S(5)),
+            Flake::Cancelled(Duration::ZERO),
+            Flake::WatchFails(S(5)),
         ])
         .await;
         assert_eq!(delays, vec![S(1), S(2)]);
