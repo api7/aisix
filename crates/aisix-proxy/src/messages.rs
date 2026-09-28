@@ -4445,7 +4445,7 @@ fn emit_access_log(
     // per-attempt detail lives in telemetry.
     let summary = routing.access_log_summary();
     let target = crate::attribution::AccessLogTarget::current();
-    AccessLog {
+    crate::attribution::emit_access_log(AccessLog {
         method: "POST",
         path: "/v1/messages",
         status,
@@ -4468,8 +4468,9 @@ fn emit_access_log(
         error: error.as_deref(),
         mcp: None,
         cache: None,
-    }
-    .emit();
+        request_body_bytes: None,
+        response_body_bytes: None,
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

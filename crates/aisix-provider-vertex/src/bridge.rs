@@ -1761,8 +1761,13 @@ fn gemini_chunk_into_chat_chunks(
         .as_deref()
         .map(|s| map_gemini_finish_reason(Some(s)));
 
+    // Vertex stamps `usageMetadata` on every frame but fills the counters
+    // only on the last; the earlier ones carry `trafficType` alone. Such a
+    // frame is not a usage report: read as one, its missing
+    // `totalTokenCount` would make the whole stream's total unreported.
     let usage = raw
         .usage_metadata
+        .filter(GeminiUsageMetadata::reports_counts)
         .map(GeminiUsageMetadata::into_usage_stats);
 
     let mut chunks = Vec::with_capacity(2);
@@ -2222,6 +2227,15 @@ struct GeminiUsageMetadata {
 }
 
 impl GeminiUsageMetadata {
+    fn reports_counts(&self) -> bool {
+        self.prompt_token_count > 0
+            || self.candidates_token_count > 0
+            || self.total_token_count > 0
+            || self.cached_content_token_count > 0
+            || self.thoughts_token_count > 0
+            || self.tool_use_prompt_token_count > 0
+    }
+
     /// Project Gemini's counters onto [`UsageStats`]' OpenAI accounting
     /// shape. Shared by the streaming and non-streaming decoders so the
     /// two cannot report a different completion total for the same call.
