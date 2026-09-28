@@ -239,6 +239,47 @@ export class EtcdClient {
     }
   }
 
+  /** The store's current revision (the header of an empty range read). */
+  async currentRevision(): Promise<number> {
+    const res = await harnessRequest(`${this.endpoint}/v3/kv/range`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key: Buffer.from("\0", "utf8").toString("base64"), count_only: true }),
+    });
+    const text = await res.body.text();
+    if (res.statusCode >= 300) throw new Error(`etcd range failed (${res.statusCode}): ${text}`);
+    return Number((JSON.parse(text) as { header: { revision: string } }).header.revision);
+  }
+
+  /**
+   * Discard every revision older than `revision` (etcd v3
+   * `/v3/kv/compaction`). A watch that still has to catch up from before
+   * it is cancelled by etcd with the compaction revision.
+   */
+  async compact(revision: number): Promise<void> {
+    const res = await harnessRequest(`${this.endpoint}/v3/kv/compaction`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision: String(revision), physical: true }),
+    });
+    const text = await res.body.text();
+    if (res.statusCode >= 300) throw new Error(`etcd compaction failed (${res.statusCode}): ${text}`);
+  }
+
+  /**
+   * etcd's own count of watchers that have fallen behind the store
+   * (`etcd_debugging_mvcc_slow_watcher_total`: unsynced plus those whose
+   * delivery blocked). Refreshed by etcd every ~100ms.
+   */
+  async slowWatchers(): Promise<number> {
+    const res = await harnessRequest(`${this.endpoint}/metrics`, { method: "GET" });
+    const text = await res.body.text();
+    if (res.statusCode >= 300) throw new Error(`etcd /metrics failed (${res.statusCode})`);
+    const m = /^etcd_debugging_mvcc_slow_watcher_total (\S+)$/m.exec(text);
+    if (!m) throw new Error("etcd /metrics carries no etcd_debugging_mvcc_slow_watcher_total");
+    return Number(m[1]);
+  }
+
   /** Delete every key under `prefix` (range delete in etcd v3 semantics). */
   async deletePrefix(prefix: string): Promise<void> {
     const key = Buffer.from(prefix, "utf8").toString("base64");

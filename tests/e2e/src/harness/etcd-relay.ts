@@ -19,6 +19,12 @@ import { pickFreePort } from "./ports.js";
  * - `release()` — listening and forwarding, including every connection
  *   held since `hold()`.
  *
+ * Orthogonal to those, `stallReplies()` stops relaying etcd→gateway bytes
+ * on every forwarded connection while the gateway→etcd direction keeps
+ * flowing, until `resumeReplies()`. The gateway sees a live connection
+ * whose peer has gone quiet; etcd sees a client that stopped reading,
+ * which is how a watch falls behind.
+ *
  * The target is always `etcdEndpoint()`, so the relay stays on this
  * fork's own cluster.
  */
@@ -31,6 +37,10 @@ export interface EtcdRelay {
   refuse(): Promise<void>;
   /** Forward held and future connections to the real etcd. */
   release(): Promise<void>;
+  /** Stop delivering etcd's bytes to the gateway; requests still reach etcd. */
+  stallReplies(): void;
+  /** Deliver everything withheld since `stallReplies()`, and resume relaying. */
+  resumeReplies(): void;
   /** Tear the relay down. */
   stop(): Promise<void>;
 }
@@ -45,7 +55,9 @@ export async function startEtcdRelay(): Promise<EtcdRelay> {
   const port = await pickFreePort();
 
   let forwarding = false;
+  let stalled = false;
   const held: Socket[] = [];
+  const pairs = new Set<{ client: Socket; upstream: Socket }>();
   const open = new Set<Socket>();
 
   const track = (s: Socket) => {
@@ -62,7 +74,11 @@ export async function startEtcdRelay(): Promise<EtcdRelay> {
     upstream.on("error", () => client.destroy());
     client.on("error", () => upstream.destroy());
     client.pipe(upstream);
-    upstream.pipe(client);
+    if (stalled) upstream.pause();
+    else upstream.pipe(client);
+    const pair = { client, upstream };
+    pairs.add(pair);
+    upstream.on("close", () => pairs.delete(pair));
   };
 
   const server = createServer((client) => {
@@ -118,6 +134,19 @@ export async function startEtcdRelay(): Promise<EtcdRelay> {
       forwarding = true;
       await listen();
       for (const client of held.splice(0)) forward(client);
+    },
+    stallReplies() {
+      stalled = true;
+      // Unpiped and paused, the socket stops being read once its buffer is
+      // full, so the kernel's receive window closes on etcd.
+      for (const { client, upstream } of pairs) {
+        upstream.unpipe(client);
+        upstream.pause();
+      }
+    },
+    resumeReplies() {
+      stalled = false;
+      for (const { client, upstream } of pairs) upstream.pipe(client);
     },
     async stop() {
       await unlisten();
