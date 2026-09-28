@@ -1520,6 +1520,14 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let debug = &cfg.observability.debug;
     if debug.enabled {
         let debug_addr: std::net::SocketAddr = debug.addr.parse()?;
+        if !debug_addr.ip().is_loopback() {
+            tracing::warn!(
+                addr = %debug_addr,
+                "observability.debug.addr is not a loopback address; GET /debug/pprof/heap \
+                 is unauthenticated and costs seconds of CPU per request — restrict access \
+                 at the network layer"
+            );
+        }
         match std::net::TcpListener::bind(debug_addr) {
             Ok(probe) => {
                 drop(probe);

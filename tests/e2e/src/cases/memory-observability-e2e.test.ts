@@ -502,6 +502,56 @@ describe("memory observability: serving modes", () => {
     }
   });
 
+  test("sampling switched off leaves nothing to profile: no dumps, 501", async (ctx) => {
+    const etcd = new EtcdClient();
+    if (!(await etcd.ping())) return ctx.skip();
+    const dir = await mkdtemp(join(tmpdir(), "aisix-heap-off-"));
+    const app = await spawnApp({
+      extraEnv: { _RJEM_MALLOC_CONF: "prof_active:false" },
+      heapProfiling: { auto_dump: { enabled: true, thresholds: [0.000001], dir, keep: 2 } },
+    });
+    try {
+      const res = await fetch(`${app.debugUrl}/debug/pprof/heap`);
+      expect(res.status).toBe(501);
+      await res.arrayBuffer();
+      // The auto-dump check runs every second; give it several.
+      await new Promise((r) => setTimeout(r, 3_000));
+      expect((await readdir(dir)).filter((f) => f.endsWith(".pb.gz"))).toEqual([]);
+      const s = await scrapeMetrics(app.metricsUrl);
+      expect(sumMetric(s, "aisix_heap_profile_dumps_total")).toBe(0);
+    } finally {
+      await app.exit();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a missing dump directory is created and used with a read-only temp dir", async (ctx) => {
+    const etcd = new EtcdClient();
+    if (!(await etcd.ping())) return ctx.skip();
+    const root = await mkdtemp(join(tmpdir(), "aisix-heap-root-"));
+    const dir = join(root, "heap");
+    const app = await spawnApp({
+      // The chart's shape: the only writable path is the (empty) state
+      // volume, and the temp directory is read-only.
+      extraEnv: { TMPDIR: "/proc" },
+      heapProfiling: { auto_dump: { enabled: true, thresholds: [0.000001], dir, keep: 2 } },
+    });
+    try {
+      const manual = await fetch(`${app.debugUrl}/debug/pprof/heap`);
+      expect(manual.status, "the manual dump passes through the created dump dir").toBe(200);
+      await manual.arrayBuffer();
+      await pollMetrics(
+        app,
+        (s) => sumMetric(s, "aisix_heap_profile_dumps_total", { trigger: "auto", result: "ok" }) >= 1,
+        "an automatic dump into a directory that did not exist",
+      );
+      expect((await readdir(dir)).filter((f) => f.endsWith(".pb.gz"))).toHaveLength(1);
+    } finally {
+      await app.exit();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("the debug listener binds loopback only by default", async (ctx) => {
     const etcd = new EtcdClient();
     if (!(await etcd.ping())) return ctx.skip();

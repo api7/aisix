@@ -1257,8 +1257,9 @@ pub struct AutoDumpConfig {
     /// total memory when the process has none), each in `(0, 1]`. One dump
     /// fires per threshold on each upward crossing.
     pub thresholds: Vec<f64>,
-    /// Directory the dumps are written to. Missing or not writable, the
-    /// feature logs one warning and turns itself off.
+    /// Directory the dumps are written to, created if missing. When it
+    /// cannot be created or written, the feature logs one warning and turns
+    /// itself off.
     pub dir: String,
     /// How many dump files to keep; older ones are deleted.
     pub keep: usize,

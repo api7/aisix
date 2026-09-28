@@ -5,7 +5,9 @@
 //! Everything here is read when Prometheus asks, never on the request
 //! path. Each reading is O(1) or bounded by something small and fixed
 //! (a file under `/proc`, a runtime count, a shard count) — a probe that
-//! would have to walk a store is not added at all.
+//! would have to walk a store is not added at all. The one exception is
+//! `process_open_fds`, which counts `/proc/self/fd` entries exactly as the
+//! standard process collector does, and so grows with open connections.
 
 use std::sync::{Arc, Mutex};
 

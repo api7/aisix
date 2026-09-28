@@ -24,7 +24,7 @@ use crate::metrics::Metrics;
 pub enum DumpError {
     #[error("heap profiling is not available in this build")]
     Unsupported,
-    #[error("heap profiling is not enabled (opt.prof is false)")]
+    #[error("heap profiling is not active (opt.prof or prof.active is false)")]
     NotEnabled,
     #[error("a heap profile is already being taken")]
     Busy,
@@ -36,12 +36,20 @@ pub enum DumpError {
 /// which is seconds of CPU on a large heap; two at once only double that.
 static DUMP_LOCK: Mutex<()> = Mutex::new(());
 
-/// Whether this process can produce a heap profile at all.
+/// Whether this process is sampling heap allocations, so a profile would
+/// show something.
 pub fn profiling_enabled() -> bool {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
-        // SAFETY: `opt.prof` is a read-only boolean mallctl.
-        unsafe { tikv_jemalloc_ctl::raw::read::<bool>(b"opt.prof\0") }.unwrap_or(false)
+        // `opt.prof` says the sampler is compiled in and started;
+        // `prof.active` says it is sampling now — `prof_active:false` in
+        // `_RJEM_MALLOC_CONF` leaves the first on and turns the second off,
+        // and a profile taken then is empty.
+        // SAFETY: both are boolean mallctls, read only.
+        unsafe {
+            tikv_jemalloc_ctl::raw::read::<bool>(b"opt.prof\0").unwrap_or(false)
+                && tikv_jemalloc_ctl::raw::read::<bool>(b"prof.active\0").unwrap_or(false)
+        }
     }
     #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
     {
@@ -73,16 +81,14 @@ pub fn dump_pprof(scratch_dir: &Path, wait: bool) -> Result<Vec<u8>, DumpError> 
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn dump_locked(scratch_dir: &Path) -> Result<Vec<u8>, DumpError> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-
     if !profiling_enabled() {
         return Err(DumpError::NotEnabled);
     }
     let path = scratch_dir.join(format!(
-        ".aisix-heap-{}-{}.tmp",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
+        ".aisix-heap-{}.tmp",
+        // Unique across replicas: `dir` may be a volume several pods
+        // share, and each of them is pid 1.
+        uuid::Uuid::new_v4().simple()
     ));
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|e| DumpError::Failed(e.to_string()))?;
@@ -120,11 +126,17 @@ pub fn scratch_dir(auto_dump: &AutoDumpConfig) -> PathBuf {
     }
 }
 
+/// Whether `dir` can take a dump, creating it first when only it is
+/// missing: the default sits one level under the chart's writable
+/// `/var/lib/aisix`, which starts out empty.
 fn dir_is_writable(dir: &Path) -> bool {
-    if !dir.is_dir() {
+    if !dir.is_dir() && std::fs::create_dir_all(dir).is_err() {
         return false;
     }
-    let probe = dir.join(format!(".aisix-write-probe-{}", std::process::id()));
+    let probe = dir.join(format!(
+        ".aisix-write-probe-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
     let ok = std::fs::write(&probe, b"").is_ok();
     let _ = std::fs::remove_file(&probe);
     ok
@@ -240,8 +252,8 @@ pub fn spawn_auto_dump(cfg: &AutoDumpConfig, metrics: Metrics) {
     if !dir_is_writable(&dir) {
         tracing::warn!(
             dir = %dir.display(),
-            "observability.heap_profiling.auto_dump.dir is missing or not writable; \
-             automatic heap dumps are off"
+            "observability.heap_profiling.auto_dump.dir cannot be created or is not \
+             writable; automatic heap dumps are off"
         );
         return;
     }
@@ -347,16 +359,23 @@ mod tests {
 
     #[test]
     fn scratch_falls_back_to_temp_when_the_dump_dir_is_unusable() {
+        let root = tempfile::tempdir().unwrap();
+        // A path under a regular file can never be created.
+        let file = root.path().join("not-a-dir");
+        std::fs::write(&file, b"").unwrap();
         let cfg = AutoDumpConfig {
-            dir: "/nonexistent/aisix-heap".into(),
+            dir: file.join("heap").to_string_lossy().into_owned(),
             ..AutoDumpConfig::default()
         };
         assert_eq!(scratch_dir(&cfg), std::env::temp_dir());
-        let dir = tempfile::tempdir().unwrap();
+        // A missing leaf under a writable parent (the chart's empty
+        // `/var/lib/aisix`) is created and used.
+        let heap = root.path().join("heap");
         let cfg = AutoDumpConfig {
-            dir: dir.path().to_string_lossy().into_owned(),
+            dir: heap.to_string_lossy().into_owned(),
             ..AutoDumpConfig::default()
         };
-        assert_eq!(scratch_dir(&cfg), dir.path());
+        assert_eq!(scratch_dir(&cfg), heap);
+        assert!(heap.is_dir());
     }
 }

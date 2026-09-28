@@ -560,7 +560,10 @@ pub const M_RUNTIME_GLOBAL_QUEUE_DEPTH: &str = "aisix_runtime_global_queue_depth
 /// queue additionally carries `exporter`.
 pub const M_COMPONENT_ENTRIES: &str = "aisix_component_entries";
 /// Bytes held by one in-process store, only where the store accounts
-/// them exactly.
+/// them exactly. `guardrail_holdback` counts streamed responses held back
+/// for an output guardrail (chat, messages, responses, passthrough); a
+/// response read whole before it is relayed — any non-streaming response,
+/// and the buffered audio relay — is not counted there.
 pub const M_COMPONENT_BYTES: &str = "aisix_component_bytes";
 /// Heap profiles taken, by `trigger` (`auto` for a memory threshold,
 /// `manual` for `GET /debug/pprof/heap`) and `result` (`ok`, `error`).
