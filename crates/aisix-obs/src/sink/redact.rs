@@ -17,6 +17,10 @@ use aisix_core::redact_url_userinfo;
 ///
 /// Matching is exact, on the configured value: text the receiver wrote is
 /// otherwise kept as-is.
+/// Shortest trailing fragment of a secret [`ErrorRedactor::redact`] treats
+/// as that secret cut off by a cap.
+const MIN_CUT_PREFIX: usize = 4;
+
 #[derive(Debug, Clone, Default)]
 pub struct ErrorRedactor {
     /// `(needle, replacement)`, longest needle first so a secret that
@@ -81,7 +85,9 @@ impl ErrorRedactor {
     ///
     /// The sinks cap their own detail before it gets here, always by
     /// cutting the end off, so a secret the cut went through survives only
-    /// as a prefix at the very end of `text`; that tail is replaced too.
+    /// as a prefix at the very end of `text`; that tail is replaced too once
+    /// it is long enough to mean anything, so an error that merely ends in
+    /// a secret's first character keeps it.
     pub fn redact(&self, text: &str) -> String {
         let mut out = text.to_string();
         for (needle, replacement) in &self.rules {
@@ -96,7 +102,7 @@ impl ErrorRedactor {
                 let longest = needle
                     .char_indices()
                     .map(|(i, _)| &needle[..i])
-                    .rfind(|p| !p.is_empty() && out.ends_with(p))?;
+                    .rfind(|p| p.len() >= MIN_CUT_PREFIX && out.ends_with(p))?;
                 Some((longest.len(), *replacement))
             })
             .max_by_key(|(len, _)| *len);
@@ -142,6 +148,7 @@ mod tests {
             "HTTP 401: rejected ***"
         );
         assert_eq!(r.redact("HTTP 401: rejected"), "HTTP 401: rejected");
+        assert_eq!(r.redact("HTTP 401: invalid o"), "HTTP 401: invalid o");
     }
 
     #[test]

@@ -58,7 +58,9 @@ describe("exporter delivery errors carry no configured credential", () => {
       req.resume();
       req.on("end", () => {
         res.writeHead(401, { "content-type": "text/plain" });
-        res.end(`rejected credential ${req.headers.authorization ?? ""}`);
+        // Only the token, not the `Bearer` scheme in front of it.
+        const token = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+        res.end(`invalid token ${token}`);
       });
     });
     await new Promise<void>((resolve) => echoing!.listen(0, "127.0.0.1", resolve));

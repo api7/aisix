@@ -701,7 +701,14 @@ impl ObservabilitySink for OtlpSink {
             .values()
             .fold(ErrorRedactor::default().url(&self.endpoint), |r, value| {
                 // A receiver may quote only the credential of `<scheme> <credential>`.
-                let credential = value.trim().rsplit_once(' ').map_or("", |(_, c)| c);
+                let credential = value.trim().rsplit_once(' ').map_or("", |(_, c)| c).trim();
+                // Only an auth-shaped value splits; `team a` must not make
+                // every `a` in the error a secret.
+                let credential = if credential.len() >= 8 {
+                    credential
+                } else {
+                    ""
+                };
                 r.secret(value).secret(credential)
             })
     }
