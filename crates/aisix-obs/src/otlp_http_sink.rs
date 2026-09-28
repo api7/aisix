@@ -375,6 +375,11 @@ impl OtlpHttpFanOut {
         self.inner.exporters.stats()
     }
 
+    /// Records queued per exporter, keyed by exporter name.
+    pub fn exporter_queue_depths(&self) -> Vec<(String, u64)> {
+        self.inner.exporters.queue_depths()
+    }
+
     /// Drain every exporter pipeline at graceful shutdown.
     pub async fn shutdown(&self) {
         self.inner.exporters.shutdown().await;

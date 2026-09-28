@@ -27,7 +27,7 @@
 //! `main`, so a graceful exit empties the queue before the process goes.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -61,6 +61,8 @@ const IDLE_POLL: Duration = Duration::from_millis(100);
 
 struct Shared {
     queue: ArrayQueue<Vec<u8>>,
+    /// Bytes of the lines in `queue`.
+    queued_bytes: AtomicUsize,
     /// Events dropped and not yet named in a warning.
     unwarned: AtomicU64,
     /// Whether the writer is between taking work and finishing it. An
@@ -89,7 +91,12 @@ impl Shared {
             DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        let len = line.len();
+        // Counted before the push so the writer, which subtracts on pop,
+        // can never take the total below zero.
+        self.queued_bytes.fetch_add(len, Ordering::Relaxed);
         if self.queue.push(line).is_err() {
+            self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
             // Counted here rather than by the writer thread, because the
             // writer is parked inside the stuck sink for exactly as long
             // as the drops are happening — folding them in from there
@@ -168,6 +175,14 @@ pub(crate) struct LogWriter {
 }
 
 impl LogWriter {
+    /// Lines waiting to be written, and their bytes.
+    pub(crate) fn depth(&self) -> (u64, u64) {
+        (
+            self.shared.queue.len() as u64,
+            self.shared.queued_bytes.load(Ordering::Relaxed) as u64,
+        )
+    }
+
     /// Start the writer thread draining into `sink`.
     pub(crate) fn start(
         mut sink: impl Write + Send + 'static,
@@ -175,6 +190,7 @@ impl LogWriter {
     ) -> (LogQueue, LogWriter) {
         let shared = Arc::new(Shared {
             queue: ArrayQueue::new(capacity),
+            queued_bytes: AtomicUsize::new(0),
             unwarned: AtomicU64::new(0),
             writing: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
@@ -195,6 +211,7 @@ impl LogWriter {
                     worker.writing.store(true, Ordering::Release);
                     let mut wrote = false;
                     while let Some(line) = worker.queue.pop() {
+                        worker.queued_bytes.fetch_sub(line.len(), Ordering::Relaxed);
                         let _ = sink.write_all(&line);
                         wrote = true;
                     }
@@ -421,11 +438,18 @@ mod tests {
             w.write_all(&line(n)).expect("accepted");
         }
         assert!(writer.queued() > 0, "the sink has not drained anything yet");
+        let (lines, bytes) = writer.depth();
+        assert_eq!(lines as usize, writer.queued());
+        assert!(
+            bytes >= lines * line(0).len() as u64,
+            "every queued line's bytes are counted: {lines} lines, {bytes} bytes"
+        );
         sink.release();
         assert!(
             writer.shutdown(Duration::from_secs(5)),
             "shutdown reports a completed drain",
         );
+        assert_eq!(writer.depth(), (0, 0), "a drained queue holds no bytes");
         let text = sink.text();
         for n in [0, 250, 499] {
             assert!(text.contains(&format!("line-{n}\n")), "missing line-{n}");

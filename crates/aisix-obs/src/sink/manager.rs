@@ -154,6 +154,17 @@ impl ExporterPipelines {
             .collect()
     }
 
+    /// Records waiting in each running pipeline's queue, keyed by exporter
+    /// name. A pipeline already stopped by a config change drains outside
+    /// this map and is not counted.
+    pub fn queue_depths(&self) -> Vec<(String, u64)> {
+        self.running
+            .lock()
+            .iter()
+            .map(|(key, pipeline)| (key.clone(), pipeline.handle.queued()))
+            .collect()
+    }
+
     /// Stop every pipeline and await its worker (graceful shutdown). Each
     /// pipeline performs a final drain before exiting.
     pub async fn shutdown(&self) {

@@ -14,7 +14,9 @@
 #![deny(rust_2018_idioms)]
 
 pub mod access_log;
+pub mod heap_profile;
 mod log_writer;
+pub mod memory;
 pub mod metric_labels;
 pub mod metrics;
 pub mod otlp_http_sink;
@@ -142,6 +144,14 @@ pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
 
 /// The process-wide writer thread, once [`init_tracing`] has installed one.
 static LOG_WRITER: OnceLock<log_writer::LogWriter> = OnceLock::new();
+
+/// Log lines waiting for the writer thread, and their bytes; zero before
+/// [`init_tracing`] has run.
+pub fn log_queue_depth() -> (u64, u64) {
+    LOG_WRITER
+        .get()
+        .map_or((0, 0), log_writer::LogWriter::depth)
+}
 
 /// Drain the log queue and retire the writer thread.
 ///

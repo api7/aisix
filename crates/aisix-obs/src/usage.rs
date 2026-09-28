@@ -919,6 +919,14 @@ fn log_provider_call(handler: &'static str, event: &UsageEvent) {
 }
 
 impl UsageSink {
+    /// Events waiting in the queue to the control plane, not counting a
+    /// batch the reporter has already taken off it.
+    pub fn queued(&self) -> u64 {
+        self.tx
+            .as_ref()
+            .map_or(0, |tx| (tx.max_capacity() - tx.capacity()) as u64)
+    }
+
     /// Build a real sink backed by an mpsc::Sender. The receiving end
     /// is owned by the worker spawned in aisix-server. No prometheus
     /// counter wiring until `with_metrics` is also called.

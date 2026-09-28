@@ -261,6 +261,11 @@ async fn metrics_handler(
     };
     state.metrics.sync_config_status(&config);
     state.metrics.sync_log_status();
+    // Reads files under /proc (and walks the fd table): off the runtime.
+    let metrics = state.metrics.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || metrics.sync_memory()).await {
+        tracing::error!(%error, "reading memory metrics failed");
+    }
     let body = axum::body::Body::from_stream(receiver_stream(state.metrics.render_stream()));
     (
         StatusCode::OK,
@@ -268,6 +273,65 @@ async fn metrics_handler(
         body,
     )
         .into_response()
+}
+
+/// Build the router for the diagnostics listener
+/// (`observability.debug.addr`): `GET /debug/pprof/heap` returns a heap
+/// profile as gzipped pprof, with function names resolved in-process.
+///
+/// Unauthenticated; the listener binds loopback by default and is meant to
+/// be reached from the host or through `kubectl port-forward`.
+pub fn debug_router(metrics: Arc<Metrics>, scratch_dir: std::path::PathBuf) -> Router {
+    Router::new()
+        .route("/debug/pprof/heap", get(heap_profile_handler))
+        .with_state(DebugState {
+            metrics,
+            scratch_dir: Arc::new(scratch_dir),
+        })
+}
+
+#[derive(Clone)]
+struct DebugState {
+    metrics: Arc<Metrics>,
+    scratch_dir: Arc<std::path::PathBuf>,
+}
+
+async fn heap_profile_handler(
+    axum::extract::State(state): axum::extract::State<DebugState>,
+) -> Response {
+    use aisix_obs::heap_profile::{dump_pprof, DumpError};
+    use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
+    use axum::response::IntoResponse;
+
+    let scratch = state.scratch_dir.clone();
+    let dumped = tokio::task::spawn_blocking(move || dump_pprof(&scratch, false))
+        .await
+        .unwrap_or_else(|e| Err(DumpError::Failed(e.to_string())));
+    match dumped {
+        Ok(pprof) => {
+            state.metrics.record_heap_profile_dump("manual", true);
+            (
+                StatusCode::OK,
+                [
+                    (CONTENT_TYPE, "application/octet-stream"),
+                    (CONTENT_DISPOSITION, "attachment; filename=\"heap.pb.gz\""),
+                ],
+                pprof,
+            )
+                .into_response()
+        }
+        Err(DumpError::Busy) => {
+            (StatusCode::TOO_MANY_REQUESTS, DumpError::Busy.to_string()).into_response()
+        }
+        Err(e @ (DumpError::Unsupported | DumpError::NotEnabled)) => {
+            (StatusCode::NOT_IMPLEMENTED, e.to_string()).into_response()
+        }
+        Err(e) => {
+            state.metrics.record_heap_profile_dump("manual", false);
+            tracing::error!(error = %e, "heap profile request failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
 }
 
 /// Read a configuration digest off the runtime's own threads.

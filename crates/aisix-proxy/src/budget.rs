@@ -157,6 +157,11 @@ impl std::fmt::Debug for BudgetClient {
 }
 
 impl BudgetClient {
+    /// Budget answers cached in this process.
+    pub fn cached_entries(&self) -> u64 {
+        self.cache.len() as u64
+    }
+
     /// Live client that asks cp-api per request via mTLS. `base_url` is
     /// the same dpmgr origin the heartbeat worker hits (e.g.
     /// `https://cp.aisix.cloud:9101`); `http` must be a reqwest client

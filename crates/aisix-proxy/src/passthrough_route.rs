@@ -2032,6 +2032,7 @@ fn stream_response(
         let mut splitter = SseFrameSplitter::new();
         // Held-back frames (Window / BufferFull) not yet released.
         let mut pending: Vec<Bytes> = Vec::new();
+        let mut pending_held = crate::held_content::HeldBytes::default();
         // Frame bytes held under Window (a memory bound for delta-free runs).
         let mut held_bytes: usize = 0;
         // What BufferFull holds (#513): content, which `max_buffer_bytes`
@@ -2106,6 +2107,7 @@ fn stream_response(
                     StreamOutputPolicy::Window { size_chars, overlap_chars, .. } => {
                         scan_buf.push_str(&delta);
                         held_bytes += frame.len();
+                        pending_held.add(frame.len());
                         pending.push(frame);
                         // The char threshold only advances on extracted delta
                         // text, so a run of delta-free frames (role-only,
@@ -2137,6 +2139,7 @@ fn stream_response(
                                         telemetry.mark_first_delivery();
                                         yield Ok(f);
                                     }
+                                    pending_held.clear();
                                     held_bytes = 0;
                                     let combined = format!("{overlap_tail}{scan_buf}");
                                     overlap_tail = tail_chars(&combined, *overlap_chars);
@@ -2148,6 +2151,7 @@ fn stream_response(
                     StreamOutputPolicy::BufferFull { max_buffer_bytes, on_exceeded_fail_open } => {
                         scan_buf.push_str(&delta);
                         held_content.hold(held, frame.len());
+                        pending_held.add(frame.len());
                         pending.push(frame);
                         if held_content.exceeds(*max_buffer_bytes) {
                             if *on_exceeded_fail_open {
@@ -2155,6 +2159,7 @@ fn stream_response(
                                     telemetry.mark_first_delivery();
                                     yield Ok(f);
                                 }
+                                pending_held.clear();
                                 fail_opened = true;
                                 chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
                             } else {
@@ -2212,6 +2217,7 @@ fn stream_response(
                         );
                         chain.record_output_buffer_exceeded();
                         pending.clear();
+                        pending_held.clear();
                         yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
                         telemetry.guardrail_blocked = true;
                         telemetry.stream_reached_end = true;
@@ -2223,11 +2229,15 @@ fn stream_response(
                             telemetry.mark_first_delivery();
                             yield Ok(f);
                         }
+                        pending_held.clear();
                         chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
                         telemetry.mark_first_delivery();
                         yield Ok(rest);
                     }
-                    None if policy.holds_back() && !fail_opened => pending.push(rest),
+                    None if policy.holds_back() && !fail_opened => {
+                        pending_held.add(rest.len());
+                        pending.push(rest)
+                    }
                     None => {
                         telemetry.mark_first_delivery();
                         yield Ok(rest);
@@ -2253,6 +2263,7 @@ fn stream_response(
                     // forwarded under EndOfStreamCheck cannot be unsent —
                     // the error frame is the caller-visible signal either way.
                     pending.clear();
+                    pending_held.clear();
                     yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), guardrail_name.as_deref(), unavailable.as_deref()));
                     telemetry.guardrail_blocked = true;
                     telemetry.stream_reached_end = true;
@@ -2264,6 +2275,7 @@ fn stream_response(
                 telemetry.mark_first_delivery();
                 yield Ok(f);
             }
+            pending_held.clear();
         } else {
             telemetry.guardrail_blocked = true;
         }

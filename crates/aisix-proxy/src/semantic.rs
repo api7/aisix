@@ -108,6 +108,11 @@ pub struct SemanticVectorCache {
 }
 
 impl SemanticVectorCache {
+    /// Embeddings cached; nothing is ever evicted.
+    pub fn entry_count(&self) -> u64 {
+        self.vectors.len() as u64
+    }
+
     pub(crate) fn get(
         &self,
         embedding_model_id: &str,

@@ -295,6 +295,12 @@ struct Series {
     distributions: Arc<Vec<Arc<DistributionSeries>>>,
 }
 
+/// Counters whose value is not a whole number. `metrics` counters are
+/// integers, so these are stored as gauges — set to the running total read
+/// from the kernel — and only typed as counters in the exposition, which
+/// is what the standard process collector publishes them as.
+const FLOAT_COUNTERS: &[&str] = &[crate::metrics::M_PROCESS_CPU_SECONDS_TOTAL];
+
 pub(crate) struct Recorder {
     registry: Registry<Key, Storage>,
     descriptions: Mutex<HashMap<String, SharedString>>,
@@ -370,6 +376,13 @@ impl Recorder {
         series
     }
 
+    /// Registered series — each label set of each family once, however many
+    /// exposition lines a distribution renders into.
+    pub(crate) fn series_count(&self) -> usize {
+        let series = self.series();
+        series.counters.len() + series.gauges.len() + series.distributions.len()
+    }
+
     pub(crate) fn run_upkeep(&self) {
         for value in self.series().distributions.iter() {
             value.upkeep();
@@ -418,7 +431,11 @@ impl Recorder {
                 &descriptions,
                 &mut previous,
                 &value.labels.name,
-                "gauge",
+                if FLOAT_COUNTERS.contains(&value.labels.name.as_str()) {
+                    "counter"
+                } else {
+                    "gauge"
+                },
             );
             value.labels.write(
                 &mut chunks.buffer,

@@ -83,6 +83,12 @@ pub trait SemanticCacheStore: Send + Sync + 'static {
         ttl: Duration,
         max_entries: u32,
     ) -> Result<(), CacheError>;
+
+    /// Entries held in this process, for an in-process store; `None` for
+    /// a shared backend whose contents live elsewhere.
+    fn local_entry_count(&self) -> Option<u64> {
+        None
+    }
 }
 
 struct SemanticEntry {
@@ -125,6 +131,12 @@ impl MemorySemanticCache {
 
 #[async_trait]
 impl SemanticCacheStore for MemorySemanticCache {
+    /// A walk over the policies, not the entries: bounded by how many
+    /// semantic policies are configured.
+    fn local_entry_count(&self) -> Option<u64> {
+        Some(self.policies.iter().map(|p| p.entries.len() as u64).sum())
+    }
+
     async fn lookup(
         &self,
         policy_id: &str,

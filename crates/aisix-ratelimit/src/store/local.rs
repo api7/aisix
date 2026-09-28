@@ -241,6 +241,11 @@ impl<C: Clock> RateStore for LocalStore<C> {
         s.tpd.add(now, tokens);
     }
 
+    /// Never shrinks: a key's state is kept for the life of the process.
+    fn local_key_count(&self) -> Option<u64> {
+        Some(self.states.len() as u64)
+    }
+
     async fn peek(&self, key: &str, limits: &RateLimit) -> Option<RateLimitStatus> {
         let now = self.clock.unix_secs();
         let state = self.states.get(key)?;

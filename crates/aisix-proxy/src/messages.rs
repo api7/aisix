@@ -2662,6 +2662,7 @@ fn build_anthropic_sse_stream(
         // clears them (hold-back policies only). Held PRE-encode so the
         // mask rewrite can run on the normalised chunks.
         let mut held_chunks: Vec<aisix_gateway::ChatChunk> = Vec::new();
+        let mut held_chunk_bytes = crate::held_content::HeldBytes::default();
         // What is held (#513): content, which `max_buffer_bytes` caps, and
         // the raw bytes it bounds too.
         let mut held_bytes = crate::held_content::HeldBuffer::default();
@@ -2756,10 +2757,9 @@ fn build_anthropic_sse_stream(
                     if let (Some((max_hold, fail_open)), false) = (hold_policy, released) {
                         // Hold-back: withhold the chunk until the end-of-
                         // stream scan clears it.
-                        held_bytes.hold(
-                            crate::held_content::chat_delta(&chunk.delta),
-                            crate::held_content::chat_chunk_raw(&chunk),
-                        );
+                        let raw = crate::held_content::chat_chunk_raw(&chunk);
+                        held_bytes.hold(crate::held_content::chat_delta(&chunk.delta), raw);
+                        held_chunk_bytes.add(raw);
                         held_chunks.push(chunk);
                         if !held_bytes.exceeds(max_hold) {
                             continue;
@@ -2782,6 +2782,7 @@ fn build_anthropic_sse_stream(
                                 break;
                             }
                         }
+                        held_chunk_bytes.clear();
                         if encoder.is_finished() {
                             break;
                         }
@@ -2952,6 +2953,7 @@ fn build_anthropic_sse_stream(
                     break;
                 }
             }
+            held_chunk_bytes.clear();
         }
         // Token-estimation fallback (AISIX-Cloud#1074), run HERE rather than
         // only from the Drop guard below: the closing `message_delta` this
@@ -3942,6 +3944,7 @@ where
         let mut first_token_seen = false;
         // Whole-response hold-back buffer (BufferFull policies only).
         let mut held: Vec<u8> = Vec::new();
+        let mut held_len = crate::held_content::HeldBytes::default();
         // `None` once the stream is live: no policy, or the cap was hit under
         // `on_buffer_exceeded: fail_open`.
         let mut hold = hold_policy;
@@ -4030,6 +4033,7 @@ where
                         forward.len(),
                     );
                     held.extend_from_slice(&forward);
+                    held_len.set(held.len());
                     if !held_content.exceeds(max_hold) {
                         continue;
                     }
@@ -4045,6 +4049,7 @@ where
                         chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
                     }
                     forward = std::mem::take(&mut held);
+                    held_len.clear();
                 }
                 // Nothing completed yet — keep reading rather than yielding
                 // an empty chunk.
@@ -4129,6 +4134,7 @@ where
                     tail.len(),
                 );
                 held.extend_from_slice(&tail);
+                held_len.set(held.len());
                 if held_content.exceeds(max_hold) {
                     if fail_open {
                         hold = None;
@@ -4141,6 +4147,7 @@ where
                                 started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                         }
                         yield Ok(Bytes::from(std::mem::take(&mut held)));
+                        held_len.clear();
                     } else {
                         overflowed = true;
                     }
@@ -4404,6 +4411,7 @@ where
                             started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     }
                     yield Ok(Bytes::from(std::mem::take(&mut held)));
+                    held_len.clear();
                 }
             }
         }

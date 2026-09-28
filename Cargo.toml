@@ -142,7 +142,7 @@ hostname = "0.4"
 # `setpriority`/`gettid` for the background-priority threads in
 # `aisix_core::sched`. rustix rather than raw `libc` because that crate
 # forbids unsafe code and these are its only two syscalls.
-rustix = { version = "1", features = ["process", "thread"] }
+rustix = { version = "1", features = ["param", "process", "thread"] }
 
 # Observability
 tracing = "0.1"

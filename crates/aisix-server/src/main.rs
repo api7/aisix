@@ -28,6 +28,17 @@ use std::sync::Arc;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Heap profiling is on from the first allocation, so a profile can be taken
+// from a gateway that is already misbehaving, and the automatic dump near
+// the memory limit has something to write. One allocation in every 512 KiB
+// (2^19 bytes) on average is sampled with its stack. jemalloc reads this
+// symbol at startup and then `_RJEM_MALLOC_CONF`, which overrides it — an
+// operator turns sampling off with `_RJEM_MALLOC_CONF=prof_active:false`.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: Option<&'static u8> =
+    Some(&b"prof:true,prof_active:true,lg_prof_sample:19\0"[0]);
+
 // jemalloc parks freed pages as "dirty" and only advances their decay clock
 // on later allocator activity in the same arena, so after a burst of
 // large-payload traffic an idle gateway keeps its peak RSS indefinitely
@@ -245,6 +256,7 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
     // returned outcome is already logged inside.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     let _ = enable_jemalloc_background_thread();
+    aisix_obs::memory::register_runtime("control", tokio::runtime::Handle::current());
 
     // Everything from here on is inside the drained scope, because
     // everything from here on can log and then fail: `?` would otherwise
@@ -1350,6 +1362,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         // config as always freshly applied.
         None => proxy_state.with_config_apply_age(Arc::new(|| Some(std::time::Duration::ZERO))),
     };
+    register_memory_probes(&metrics, &proxy_state);
+    aisix_obs::heap_profile::spawn_auto_dump(
+        &cfg.observability.heap_profiling.auto_dump,
+        (*metrics).clone(),
+    );
     let proxy_router = aisix_proxy::build_router(proxy_state);
 
     let background_check_task = tokio::spawn(async move {
@@ -1496,6 +1513,48 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         }
     };
 
+    // Diagnostics listener (`GET /debug/pprof/heap`), loopback by default.
+    // Unlike the metrics listener a bind failure is not fatal: a second
+    // gateway on the same host network would otherwise refuse to start
+    // over a port it may never use.
+    let debug = &cfg.observability.debug;
+    if debug.enabled {
+        let debug_addr: std::net::SocketAddr = debug.addr.parse()?;
+        match std::net::TcpListener::bind(debug_addr) {
+            Ok(probe) => {
+                drop(probe);
+                let router = aisix_admin::debug_router(
+                    metrics.clone(),
+                    aisix_obs::heap_profile::scratch_dir(
+                        &cfg.observability.heap_profiling.auto_dump,
+                    ),
+                );
+                let shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = serve_http(
+                        debug_addr,
+                        router,
+                        None,
+                        downstream_idle_timeout,
+                        shutdown,
+                        "debug",
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        tracing::error!(%error, "debug listener stopped");
+                    }
+                });
+            }
+            Err(error) => tracing::error!(
+                %error,
+                addr = %debug_addr,
+                "debug listener bind failed; heap profiles are unavailable over HTTP"
+            ),
+        }
+    }
+
     // Step 9: bind + serve the proxy, once a configuration has been
     // applied. Admin is handled above.
     // `proxy.listeners`, when set, IS the listener set; `proxy.addr` +
@@ -1622,6 +1681,67 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let _ = background_check_task.await;
     tracing::info!("aisix shut down cleanly");
     Ok(())
+}
+
+/// Report each in-process store's size on the Prometheus scrape. Every
+/// reading here is O(1) or bounded by configuration, never by traffic.
+fn register_memory_probes(metrics: &aisix_obs::Metrics, state: &ProxyState) {
+    use aisix_obs::memory::ComponentReading;
+    fn entries(n: u64) -> ComponentReading {
+        ComponentReading {
+            entries: Some(n),
+            bytes: None,
+        }
+    }
+    let probes = metrics.memory_probes();
+
+    let usage = state.usage_sink.clone();
+    probes.register_component("usage_event_queue", move || entries(usage.queued()));
+    let fan_out = state.otlp_fan_out.clone();
+    probes.register_exporter_queues(move || fan_out.exporter_queue_depths());
+    probes.register_component("log_queue", || {
+        let (lines, bytes) = aisix_obs::log_queue_depth();
+        ComponentReading {
+            entries: Some(lines),
+            bytes: Some(bytes),
+        }
+    });
+    if let Some(cache) = state.cache.clone() {
+        let response = cache.clone();
+        probes.register_component("response_cache", move || {
+            entries(response.response_cache_entries())
+        });
+        probes.register_component("semantic_cache", move || {
+            entries(cache.semantic_cache_entries())
+        });
+    }
+    let budgets = state.budgets.clone();
+    probes.register_component("budget_cache", move || entries(budgets.cached_entries()));
+    let vectors = state.semantic_cache.clone();
+    probes.register_component("route_embedding_cache", move || {
+        entries(vectors.entry_count())
+    });
+    let limiter = state.limiter.clone();
+    probes.register_component("ratelimit_local_keys", move || {
+        entries(limiter.local_key_count())
+    });
+    probes.register_component("snapshot_pending_reclaim", || {
+        entries(aisix_core::snapshot::pending_reclaim() as u64)
+    });
+    probes.register_component("upstream_clients", || {
+        entries(aisix_gateway::upstream_tls::provider_key_client_count())
+    });
+    probes.register_component("in_flight_request_bodies", || {
+        let (bodies, bytes) = aisix_proxy::in_flight_request_bodies();
+        ComponentReading {
+            entries: Some(bodies as u64),
+            bytes: Some(bytes as u64),
+        }
+    });
+    probes.register_component("guardrail_holdback", || ComponentReading {
+        entries: None,
+        bytes: Some(aisix_proxy::holdback_bytes() as u64),
+    });
 }
 
 /// Build the etcd-client `ConnectOptions` from `cfg.etcd`, wiring in
@@ -3138,6 +3258,7 @@ fn run_tpc_worker(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    aisix_obs::memory::register_runtime(format!("tpc-{worker}"), rt.handle().clone());
     // Every dispatch from this thread now uses this thread's pool, so an
     // upstream response is read by the same runtime that is waiting for
     // it. Marked inside the worker because the marker is per thread.

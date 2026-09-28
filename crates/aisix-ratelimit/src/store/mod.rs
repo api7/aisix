@@ -130,4 +130,10 @@ pub trait RateStore: Send + Sync + 'static {
     /// Read-only snapshot for the `x-ratelimit-*` headers. Returns `None`
     /// when there is nothing meaningful to report for the bucket.
     async fn peek(&self, key: &str, limits: &RateLimit) -> Option<RateLimitStatus>;
+
+    /// Keys this process holds counters for; `None` for a shared store
+    /// whose counters live elsewhere.
+    fn local_key_count(&self) -> Option<u64> {
+        None
+    }
 }

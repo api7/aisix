@@ -119,6 +119,16 @@ impl CacheBackends {
         }
     }
 
+    /// Entries held by the in-process exact-match response cache.
+    pub fn response_cache_entries(&self) -> u64 {
+        self.memory.local_entry_count().unwrap_or(0)
+    }
+
+    /// Entries held by the in-process semantic cache.
+    pub fn semantic_cache_entries(&self) -> u64 {
+        self.semantic_memory.local_entry_count().unwrap_or(0)
+    }
+
     /// True the first time the exact-KV cache fails in an outage, false
     /// for the rest of it — the caller logs only when it is true.
     pub fn note_exact_failure(&self) -> bool {

@@ -85,6 +85,12 @@ impl Limiter {
         Self::with_store(Arc::new(LocalStore::with_clock(clock)))
     }
 
+    /// Rate-limit keys counted in this process (the in-memory backend);
+    /// `0` when a shared store holds the counters.
+    pub fn local_key_count(&self) -> u64 {
+        self.store.local_key_count().unwrap_or(0)
+    }
+
     fn next_member(&self) -> String {
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
         format!("{}{n}", self.member_prefix)

@@ -186,6 +186,12 @@ pub struct SinkHandle {
 }
 
 impl SinkHandle {
+    /// Records waiting in the queue, not counting a batch the worker has
+    /// already taken off it.
+    pub fn queued(&self) -> u64 {
+        (self.tx.max_capacity() - self.tx.capacity()) as u64
+    }
+
     /// Non-blocking enqueue. Returns `false` (and counts a drop) when the
     /// bounded queue is full or the worker has stopped — never blocks the
     /// request hot path.

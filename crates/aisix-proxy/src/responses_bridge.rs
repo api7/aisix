@@ -2419,6 +2419,7 @@ pub fn build_responses_bridge_stream(
         // Held SSE events when an output guardrail is attached; empty (and
         // unused) on the live-forward path.
         let mut held: Vec<bytes::Bytes> = Vec::new();
+        let mut held_bytes = crate::held_content::HeldBytes::default();
         // What `held` holds (#513): content, which `max_buffer_bytes` caps,
         // and the raw bytes it bounds too.
         let mut held_content = crate::held_content::HeldBuffer::default();
@@ -2512,6 +2513,7 @@ pub fn build_responses_bridge_stream(
                         let b = bytes::Bytes::from(ev.to_sse_string());
                         if buffering {
                             held_content.hold(0, b.len());
+                            held_bytes.add(b.len());
                             held.push(b);
                         } else {
                             downstream_mark!();
@@ -2534,6 +2536,7 @@ pub fn build_responses_bridge_stream(
                             downstream_mark!();
                             yield Ok(b);
                         }
+                        held_bytes.clear();
                     }
                     if encoder.is_finished() {
                         break;
@@ -2625,6 +2628,7 @@ pub fn build_responses_bridge_stream(
                 let b = bytes::Bytes::from(ev.to_sse_string());
                 if buffering {
                     held_content.hold(0, b.len());
+                    held_bytes.add(b.len());
                     held.push(b);
                 } else {
                     downstream_mark!();
@@ -2644,6 +2648,7 @@ pub fn build_responses_bridge_stream(
                         downstream_mark!();
                         yield Ok(b);
                     }
+                    held_bytes.clear();
                 } else {
                     overflowed = true;
                 }
@@ -2843,6 +2848,7 @@ pub fn build_responses_bridge_stream(
             downstream_mark!();
             yield Ok(b);
         }
+        held_bytes.clear();
     };
     // Re-attach the request span: the body is polled after the request-id
     // middleware returns, so the end-of-stream output-guardrail check

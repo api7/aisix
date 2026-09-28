@@ -33,7 +33,7 @@ macro_rules! variable {
 
 pub static METRIC_VARIABLES: &[MetricVariable] = &[
     variable!("env_id", "The gateway's AISIX Cloud environment ID; unknown when not connected to AISIX Cloud. Available on every metric."),
-    variable!("trigger", "What caused a configuration apply: watch for a coalesced batch of watch events, full for a (re)load of every prefix."),
+    variable!("trigger", "What caused a configuration apply: watch for a coalesced batch of watch events, full for a (re)load of every prefix. On heap-profile dumps: auto for a memory threshold, manual for a request to the debug listener."),
     variable!("endpoint", "The matched route template, without caller-supplied path parameters."),
     variable!("inbound_protocol", "The protocol used by the caller, derived from the matched endpoint."),
     variable!("upstream_protocol", "The wire protocol of the selected provider credential; unknown before upstream selection or for non-LLM traffic."),
@@ -61,7 +61,7 @@ pub static METRIC_VARIABLES: &[MetricVariable] = &[
     variable!("policy_id", "The rate-limit policy identifier, or the metric's missing-policy value."),
     variable!("reason", "The bounded reason code defined by the emitting authentication, guardrail, configuration, or exporter metric."),
     variable!("method", "The authentication method used for the credential decision."),
-    variable!("result", "The authentication or guardrail execution result, as defined by the metric."),
+    variable!("result", "The authentication, guardrail execution, or heap-profile dump result, as defined by the metric."),
     variable!("guardrail", "The configured guardrail name."),
     variable!("kind", "The guardrail kind on guardrail metrics, or the resource kind on configuration metrics."),
     variable!("phase", "The guardrail execution phase."),
@@ -71,10 +71,13 @@ pub static METRIC_VARIABLES: &[MetricVariable] = &[
     variable!("cause", "The bounded semantic-cache embedding failure cause."),
     variable!("op", "The semantic-cache storage operation."),
     variable!("operation", "The Redis operation or A2A operation, as defined by the metric."),
-    variable!("exporter", "The configured observability exporter name."),
+    variable!("exporter", "The configured observability exporter name. Empty on component metrics other than the exporter queue."),
     variable!("agent", "The registered A2A agent name."),
     variable!("state", "The A2A task state reported by the upstream agent."),
     variable!("hash", "The hash of the applied gateway resource configuration."),
+    variable!("stat", "The allocator statistic: allocated, active, resident, mapped, retained, or metadata."),
+    variable!("runtime", "The async runtime: control, or tpc-N for thread-per-core proxy worker N."),
+    variable!("component", "The in-process store being measured, from a fixed set such as response_cache or log_queue."),
     variable!("side", "Which interval a time-to-first-token observation measures: upstream (attempt start to the upstream's first frame) or downstream (request received to the first frame handed to the client). Always emitted on the metrics that carry it; it cannot be removed by a label selection."),
 ];
 
@@ -160,6 +163,7 @@ const LATENCY: &[&str] = &[
 const DEPLOYMENT: &[&str] = &["provider", "model", "upstream_model", "provider_key_id"];
 const TTFT_ALWAYS: &[&str] = &["side"];
 const BUDGET: &[&str] = &["api_key_id", "team_id", "user_id", "user_name"];
+const COMPONENT: &[&str] = &["component", "exporter"];
 
 macro_rules! metric {
     ($name:ident, $defaults:expr) => {
@@ -378,6 +382,28 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         required = &["trigger"]
     ),
     metric!(M_LOG_LINES_DROPPED_TOTAL, &[]),
+    metric!(M_ALLOCATOR_BYTES, &["stat"], required = &["stat"]),
+    metric!(M_MEMORY_LIMIT_BYTES, &[]),
+    metric!(M_PROCESS_RESIDENT_MEMORY_BYTES, &[]),
+    metric!(M_PROCESS_VIRTUAL_MEMORY_BYTES, &[]),
+    metric!(M_PROCESS_THREADS, &[]),
+    metric!(M_PROCESS_OPEN_FDS, &[]),
+    metric!(M_PROCESS_MAX_FDS, &[]),
+    metric!(M_PROCESS_CPU_SECONDS_TOTAL, &[]),
+    metric!(M_PROCESS_START_TIME_SECONDS, &[]),
+    metric!(M_RUNTIME_ALIVE_TASKS, &["runtime"], required = &["runtime"]),
+    metric!(
+        M_RUNTIME_GLOBAL_QUEUE_DEPTH,
+        &["runtime"],
+        required = &["runtime"]
+    ),
+    metric!(M_COMPONENT_ENTRIES, COMPONENT, required = COMPONENT),
+    metric!(M_COMPONENT_BYTES, &["component"], required = &["component"]),
+    metric!(
+        M_HEAP_PROFILE_DUMPS_TOTAL,
+        &["trigger", "result"],
+        required = &["trigger", "result"]
+    ),
 ];
 
 #[derive(Debug)]

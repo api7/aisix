@@ -5653,6 +5653,7 @@ where
         // (#932): the BufferFull release rewrites masked spans across the
         // held chunks before they are rendered + serialised at drain time.
         let mut pending: Vec<aisix_gateway::ChatChunk> = Vec::new();
+        let mut pending_bytes = crate::held_content::HeldBytes::default();
         // Content accumulated since the last window flush (Window mode);
         // bounded to ~window_size, unlike content_buffer (whole response).
         let mut window_buf = String::new();
@@ -5945,6 +5946,7 @@ where
                 // whole response) scans clean.
                 let chunk_content = crate::held_content::chat_delta(&chunk.delta);
                 let chunk_raw = crate::held_content::chat_chunk_raw(&chunk);
+                pending_bytes.add(chunk_raw);
                 pending.push(chunk);
                 match &stream_policy {
                     aisix_guardrails::StreamOutputPolicy::Window {
@@ -6031,6 +6033,7 @@ where
                                     let ev = chunk_event!(chunk);
                                     yield Ok::<_, Infallible>(ev);
                                 }
+                                pending_bytes.clear();
                                 // Clamp the retained overlap to cc-1 so a
                                 // misconfigured overlap >= window can't keep
                                 // the whole buffer and re-scan every
@@ -6073,6 +6076,7 @@ where
                                     let ev = chunk_event!(chunk);
                                     yield Ok::<_, Infallible>(ev);
                                 }
+                                pending_bytes.clear();
                             } else {
                                 tracing::warn!(
                                     guardrail_hook = "output",
@@ -6131,6 +6135,7 @@ where
                 let ev = chunk_event!(chunk);
                 yield Ok::<_, Infallible>(ev);
             } else {
+                pending_bytes.add(crate::held_content::chat_chunk_raw(&chunk));
                 pending.push(chunk);
             }
         }
@@ -6289,6 +6294,7 @@ where
                             let ev = chunk_event!(chunk);
                             yield Ok::<_, Infallible>(ev);
                         }
+                        pending_bytes.clear();
                     }
                 }
             } else if let (Some(content), Some(ctx)) =
