@@ -142,10 +142,10 @@ describe("etcd compaction behind a lagging watch", () => {
       "the compaction resync warning",
       30_000,
     );
-    await waitConfigPropagation(async () => {
-      const ids = await served();
-      return ids.includes(WRITTEN_AFTER) && !ids.includes(DELETED);
-    });
+    // Retrying assertions rather than a propagation gate: this IS the
+    // behaviour under test, and a failure should name the models served.
+    await expect.poll(served, { timeout: 30_000, interval: 200 }).toContain(WRITTEN_AFTER);
+    await expect.poll(served, { timeout: 30_000, interval: 200 }).not.toContain(DELETED);
     const chat = await proxy.chat({
       model: WRITTEN_AFTER,
       messages: [{ role: "user", content: "after compaction" }],
@@ -159,7 +159,7 @@ describe("etcd compaction behind a lagging watch", () => {
 
     // The watch re-established after the resync keeps applying writes.
     await model(WRITTEN_LATER);
-    await waitConfigPropagation(async () => (await served()).includes(WRITTEN_LATER));
+    await expect.poll(served, { timeout: 30_000, interval: 200 }).toContain(WRITTEN_LATER);
 
     // Compaction is not a failure: the supervisor re-reads immediately
     // instead of backing off.

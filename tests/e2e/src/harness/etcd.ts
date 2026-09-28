@@ -170,6 +170,9 @@ export class EtcdClient {
       const body = await res.body.text();
       throw new Error(`etcd put failed (${res.statusCode}): ${body}`);
     }
+    // An unread body holds its connection; a spec that writes in a loop
+    // would run the pool dry.
+    await res.body.dump();
   }
 
   /**
@@ -237,6 +240,9 @@ export class EtcdClient {
       const body = await res.body.text();
       throw new Error(`etcd deleterange failed (${res.statusCode}): ${body}`);
     }
+    // An unread body holds its connection; a spec that writes in a loop
+    // would run the pool dry.
+    await res.body.dump();
   }
 
   /** The store's current revision (the header of an empty range read). */
@@ -293,6 +299,9 @@ export class EtcdClient {
       const body = await res.body.text();
       throw new Error(`etcd deleterange failed (${res.statusCode}): ${body}`);
     }
+    // An unread body holds its connection; a spec that writes in a loop
+    // would run the pool dry.
+    await res.body.dump();
   }
 }
 
