@@ -420,6 +420,7 @@ struct Cell {
     e2e_labels: Option<(
         Arc<aisix_obs::Metrics>,
         crate::request_metrics::OwnedLatencyLabels,
+        Duration,
     )>,
     /// See [`note_terminal_upstream`].
     terminal_upstream: Option<Duration>,
@@ -441,9 +442,12 @@ impl Cell {
             return None;
         }
         let upstream = self.terminal_upstream?;
-        let (metrics, labels) = self.e2e_labels.take()?;
+        let (metrics, labels, downstream) = self.e2e_labels.take()?;
         self.e2e_upstream_recorded = true;
-        Some((metrics, labels, upstream))
+        // The attempt ran inside the request, but the two durations are read
+        // off the clock a moment apart — the downstream one first on some
+        // stream ends — so the later read can come out a millisecond longer.
+        Some((metrics, labels, upstream.min(downstream)))
     }
 }
 
@@ -957,8 +961,9 @@ pub(crate) fn note_request_body_discarded() {
 pub(crate) fn note_e2e_downstream(
     metrics: Arc<aisix_obs::Metrics>,
     labels: crate::request_metrics::OwnedLatencyLabels,
+    downstream: Duration,
 ) {
-    record_e2e_upstream(|cell| cell.e2e_labels = Some((metrics, labels)));
+    record_e2e_upstream(|cell| cell.e2e_labels = Some((metrics, labels, downstream)));
 }
 
 /// Note the upstream duration of the attempt behind the request's terminal
@@ -1014,6 +1019,48 @@ mod tests {
             "provider_key_id": "pk-1",
         }))
         .unwrap()
+    }
+
+    /// The two sides are read off the clock a moment apart, downstream
+    /// first on some stream ends; the recorded upstream side must still
+    /// never exceed the request it ran inside.
+    #[tokio::test]
+    async fn the_upstream_side_never_exceeds_the_downstream_side() {
+        let metrics = Arc::new(aisix_obs::Metrics::new(false));
+        let labels = aisix_obs::LatencyLabels {
+            endpoint: "/v1/messages",
+            model: "m",
+            provider: "anthropic",
+            status: 200,
+            streaming: true,
+            ..Default::default()
+        };
+        scope(Arc::new(RequestAttribution::default()), async {
+            crate::request_metrics::record_e2e_downstream(
+                &metrics,
+                labels,
+                Duration::from_millis(306),
+            );
+            note_terminal_upstream(Duration::from_millis(307));
+        })
+        .await;
+        let text = metrics.render();
+        let sum = |side: &str| -> f64 {
+            text.lines()
+                .find(|l| {
+                    l.starts_with("aisix_request_e2e_latency_seconds_sum")
+                        && l.contains(&format!("side=\"{side}\""))
+                })
+                .and_then(|l| l.rsplit(' ').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("no {side} sum in:\n{text}"))
+        };
+        assert!(
+            sum("upstream") <= sum("downstream"),
+            "upstream {} > downstream {}",
+            sum("upstream"),
+            sum("downstream")
+        );
     }
 
     /// A write with no request scope must not panic — `resolve_provider_key`
