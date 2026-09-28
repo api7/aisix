@@ -111,6 +111,36 @@ impl SinkError {
     }
 }
 
+/// Whether a receiver's HTTP status is worth retrying: 5xx, 408 and 429.
+/// Every other failure status is a config / auth / payload error that the
+/// same batch meets again on retry. Shared by every HTTP-speaking sink so
+/// the family cannot drift apart again.
+pub(crate) fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+/// The [`SinkError`] for a non-success HTTP response: [`SinkError::Throttled`]
+/// when a retryable status carried a `Retry-After`, [`SinkError::Transient`]
+/// for any other retryable status, [`SinkError::Permanent`] otherwise.
+pub(crate) fn http_status_error(
+    status: reqwest::StatusCode,
+    retry_after: Option<Duration>,
+    detail: String,
+) -> SinkError {
+    if !is_retryable_status(status) {
+        return SinkError::Permanent(detail);
+    }
+    match retry_after {
+        Some(retry_after) => SinkError::Throttled {
+            retry_after,
+            detail,
+        },
+        None => SinkError::Transient(detail),
+    }
+}
+
 /// The `Retry-After` on a throttled or overloaded response, as the HTTP
 /// spec allows it: delta-seconds, or an HTTP date to wait until.
 ///
@@ -205,6 +235,45 @@ mod tests {
     use super::*;
     use crate::usage::UsageEvent;
     use std::sync::Arc;
+
+    #[test]
+    fn http_status_error_retries_only_5xx_408_429() {
+        use reqwest::StatusCode;
+        for s in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(
+                http_status_error(s, None, String::new()).is_transient(),
+                "{s} should be retried"
+            );
+        }
+        for s in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::METHOD_NOT_ALLOWED,
+            StatusCode::CONFLICT,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert!(
+                !http_status_error(s, None, String::new()).is_transient(),
+                "{s} should be permanent"
+            );
+        }
+        let throttled = http_status_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(Duration::from_secs(7)),
+            String::new(),
+        );
+        assert_eq!(throttled.retry_after(), Some(Duration::from_secs(7)));
+    }
 
     /// A trivial at-least-once sink that records what it was handed —
     /// proves the trait is object-safe (`Arc<dyn ObservabilitySink>`) and

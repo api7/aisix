@@ -203,21 +203,14 @@ impl ObservabilitySink for AliyunSlsSink {
         // 5xx / 408 / 429 are always worth retrying; SLS also signals back-
         // pressure (quota / busy / clock skew) on a 4xx with a code whose plain
         // meaning is transient, so promote those rather than drop a log batch.
-        if status.is_server_error()
-            || status == reqwest::StatusCode::REQUEST_TIMEOUT
-            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-            || is_transient_error_code(&error_code)
-        {
-            Err(match retry_after {
-                Some(retry_after) => SinkError::Throttled {
-                    retry_after,
-                    detail,
-                },
-                None => SinkError::Transient(detail),
-            })
-        } else {
-            Err(SinkError::Permanent(detail))
-        }
+        Err(
+            match super::http_status_error(status, retry_after, detail) {
+                SinkError::Permanent(detail) if is_transient_error_code(&error_code) => {
+                    SinkError::Transient(detail)
+                }
+                err => err,
+            },
+        )
     }
 
     async fn healthcheck(&self) -> SinkHealth {

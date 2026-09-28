@@ -199,7 +199,7 @@ pub struct ObjectStoreConfig {
     #[schemars(length(min = 1))]
     pub region: Option<String>,
 
-    /// Backend endpoint override: an S3-compatible host such as MinIO, Aliyun OSS, or Cloudflare R2, a Cloud Storage base URL, or an Azure Blob endpoint. When omitted, the provider's native endpoint is used.
+    /// Backend endpoint override: an S3-compatible host such as MinIO, Aliyun OSS, or Cloudflare R2, a Cloud Storage XML API base URL such as a private endpoint, or an Azure Blob endpoint. A `gcs` endpoint must implement the Cloud Storage XML API and accept the percent-encoded object names the gateway sends; the stock fake-gcs-server image does not, so it cannot receive objects. When omitted, the provider's native endpoint is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(
         pattern = r"^https://.+|^http://(minio|azurite|fake-gcs-server|fake-gcs|127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$"

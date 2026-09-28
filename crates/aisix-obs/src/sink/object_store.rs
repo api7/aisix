@@ -332,9 +332,11 @@ pub fn build_object_store(
                 .with_retry(export_retry_config())
                 .with_bucket_name(bucket)
                 .with_service_account_key(service_account_key);
-            // `endpoint` is the base URL (fake-gcs-server, a private
-            // endpoint) and takes precedence over a `gcs_base_url` in the
-            // service-account JSON. GCS's builder has no `with_allow_http`,
+            // `endpoint` is the XML API base URL (a private endpoint) and
+            // takes precedence over a `gcs_base_url` in the service-account
+            // JSON. object_store uploads through the XML API, which the stock
+            // fake-gcs-server image does not implement (fsouza/fake-gcs-server#331):
+            // it rejects every upload, encoded object name or not. GCS's builder has no `with_allow_http`,
             // so plaintext loopback is enabled through its client config.
             if let Some(ep) = endpoint {
                 b = b.with_base_url(ep);
@@ -639,15 +641,17 @@ fn partition(occurred_at: &str) -> (String, String) {
 
 /// Map an `object_store` error to the pipeline's retry/permanent decision.
 /// Auth, missing-bucket and unsupported-operation errors are permanent (a
-/// retry fails the same way); transport / throttle / 5xx surface as
-/// `Error::Generic` and are transient. The detail is length-capped; the crate
-/// does not echo secrets in error text.
+/// retry fails the same way), and so is any other 4xx the store answered
+/// except 408 / 429 — the classification every HTTP sink shares. Transport
+/// failures, 5xx, 408 and 429 are transient. The detail is length-capped; the
+/// crate does not echo secrets in error text.
 fn map_object_store_err(e: object_store::Error) -> SinkError {
     use object_store::Error as E;
     // The full source chain, not just the outer Display: object_store's
     // retry error stops at "Error performing PUT <url>" and keeps the
-    // connect/DNS/TLS cause in `source()`.
-    let detail = truncate(&super::error_chain(&e));
+    // connect/DNS/TLS cause — and the response status — in `source()`.
+    let chain = super::error_chain(&e);
+    let detail = truncate(&chain);
     match e {
         E::PermissionDenied { .. }
         | E::Unauthenticated { .. }
@@ -656,8 +660,41 @@ fn map_object_store_err(e: object_store::Error) -> SinkError {
         | E::NotImplemented { .. }
         | E::InvalidPath { .. }
         | E::UnknownConfigurationKey { .. } => SinkError::Permanent(detail),
-        _ => SinkError::Transient(detail),
+        _ => match response_status(&chain) {
+            Some(status)
+                if status.is_client_error()
+                    && !super::is_retryable_status(status)
+                    && !TRANSIENT_4XX_CODES.iter().any(|code| chain.contains(code)) =>
+            {
+                SinkError::Permanent(detail)
+            }
+            _ => SinkError::Transient(detail),
+        },
     }
+}
+
+/// S3 error codes that arrive on a 4xx but clear on retry: the store timed
+/// out reading a slow upload (400), or a conflicting operation on the bucket
+/// was still in progress (409).
+const TRANSIENT_4XX_CODES: &[&str] = &[
+    "<Code>RequestTimeout</Code>",
+    "<Code>OperationAborted</Code>",
+];
+
+/// How object_store renders a non-2xx response in its error chain.
+const RESPONSE_STATUS_MARKER: &str = "Server returned non-2xx status code: ";
+
+/// The HTTP status an object_store error chain reports, if it reports one.
+///
+/// Read from the text because the status lives in a retry error type that
+/// object_store does not export. The `rejected_put_*` tests drive a real store
+/// against a receiver answering 400, so an object_store upgrade that renders
+/// the status differently fails them rather than silently turning every 4xx
+/// back into a retry.
+fn response_status(chain: &str) -> Option<reqwest::StatusCode> {
+    let rest = &chain[chain.find(RESPONSE_STATUS_MARKER)? + RESPONSE_STATUS_MARKER.len()..];
+    let code = rest.get(..3)?.parse::<u16>().ok()?;
+    reqwest::StatusCode::from_u16(code).ok()
 }
 
 /// Truncate a masked detail string to a bounded length for logs / health.
@@ -1164,6 +1201,157 @@ mod tests {
         );
     }
 
+    /// A receiver that answers every PUT with `status` and the error body a
+    /// GCS-compatible server sends for an upload it does not implement.
+    async fn rejecting_receiver(status: u16) -> wiremock::MockServer {
+        receiver_answering(
+            status,
+            format!(r#"{{"error":{{"code":{status},"message":"invalid uploadType"}}}}"#),
+        )
+        .await
+    }
+
+    async fn receiver_answering(status: u16, body: String) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(status).set_body_string(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn s3_4xx_codes_that_clear_on_retry_stay_transient() {
+        for (status, code) in [(400u16, "RequestTimeout"), (409, "OperationAborted")] {
+            let server = receiver_answering(
+                status,
+                format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code><Message>try again</Message></Error>"),
+            )
+            .await;
+            let sink = ObjectStoreSink::new(
+                "obj-s3-retryable-4xx",
+                store_at(ObjectStoreProvider::S3, &server.uri()),
+                "rc",
+                ObjectStoreCompression::None,
+            );
+            let err = sink
+                .append_batch(
+                    &batch_of(vec![SinkRecord::metadata_only(event("r1"))]),
+                    &IdempotencyMarker::None,
+                )
+                .await
+                .expect_err("the receiver rejects the PUT");
+            assert!(err.is_transient(), "{status} {code} must be retried: {err}");
+        }
+    }
+
+    fn store_at(provider: ObjectStoreProvider, endpoint: &str) -> Arc<dyn ObjectStore> {
+        let creds = match provider {
+            ObjectStoreProvider::S3 => ObjectStoreCredentials::S3 {
+                access_key_id: "akid".into(),
+                secret_access_key: "secret".into(),
+                session_token: None,
+            },
+            ObjectStoreProvider::Gcs => ObjectStoreCredentials::Gcs {
+                service_account_key: r#"{"disable_oauth":true,"client_email":"e@example.iam.gserviceaccount.com","private_key_id":"","private_key":""}"#.into(),
+            },
+            ObjectStoreProvider::AzureBlob => ObjectStoreCredentials::Azure {
+                account: "devstoreaccount1".into(),
+                access_key: "a2V5".into(),
+            },
+        };
+        build_object_store(provider, "qabucket", None, Some(endpoint), creds)
+            .expect("build store against the mock endpoint")
+    }
+
+    #[tokio::test]
+    async fn rejected_put_4xx_is_permanent_for_every_provider() {
+        for provider in [
+            ObjectStoreProvider::S3,
+            ObjectStoreProvider::Gcs,
+            ObjectStoreProvider::AzureBlob,
+        ] {
+            for status in [400u16, 405, 413] {
+                let server = rejecting_receiver(status).await;
+                let sink = ObjectStoreSink::new(
+                    "obj-4xx",
+                    store_at(provider, &server.uri()),
+                    "rc",
+                    ObjectStoreCompression::None,
+                );
+                let err = sink
+                    .append_batch(
+                        &batch_of(vec![SinkRecord::metadata_only(event("r1"))]),
+                        &IdempotencyMarker::None,
+                    )
+                    .await
+                    .expect_err("the receiver rejects the PUT");
+                assert!(
+                    matches!(err, SinkError::Permanent(_)),
+                    "{provider:?} {status} must not be retried: {err}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_put_drops_the_batch_on_its_first_attempt() {
+        let server = rejecting_receiver(400).await;
+        let sink: Arc<dyn ObservabilitySink> = Arc::new(ObjectStoreSink::new(
+            "gcs-rc",
+            store_at(ObjectStoreProvider::Gcs, &server.uri()),
+            "rc",
+            ObjectStoreCompression::None,
+        ));
+        let (handle, worker) = crate::sink::SinkPipeline::new(
+            sink,
+            crate::sink::PipelineConfig {
+                flush_interval: std::time::Duration::from_millis(20),
+                ..Default::default()
+            },
+        );
+        let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(worker.run(cancel));
+        assert!(handle.try_enqueue(Arc::new(SinkRecord::metadata_only(event("r1")))));
+
+        // The default budget retries a transient batch for minutes, so a
+        // drop inside this window can only be the permanent path.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while handle.stats().failed_batches == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a 400 batch was not dropped: {:?}",
+                handle.stats()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let stats = handle.stats();
+        assert_eq!(stats.retries, 0, "a 400 must not be retried: {stats:?}");
+        assert_eq!(stats.dropped, 1);
+        assert!(
+            stats
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("400")),
+            "the first failed batch reports its error: {stats:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        cancel_tx.send(true).unwrap();
+        run.await.unwrap();
+    }
+
+    #[test]
+    fn response_status_reads_object_stores_status_text() {
+        assert_eq!(
+            response_status(
+                "Error performing PUT http://h/b/k in 1ms - Server returned non-2xx status code: 400 Bad Request: {}"
+            ),
+            Some(reqwest::StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(response_status("connection reset by peer"), None);
+    }
+
     #[test]
     fn maps_object_store_errors_to_retry_decision() {
         let perm = map_object_store_err(object_store::Error::PermissionDenied {
@@ -1538,9 +1726,9 @@ mod smoke {
 
     #[tokio::test]
     #[ignore = "GCS round-trip — set AISIX_E2E_OBJSTORE_GCS_* against REAL GCS or a \
-                conformant emulator. NOTE: fake-gcs-server's XML API does not round-trip \
-                object_store's percent-encoded object names (the `/` in partition keys → \
-                %2F), so build + auth verify there but the PUT only greens on real GCS. \
+                XML-API emulator. NOTE: the stock fake-gcs-server image implements no \
+                XML API upload (fsouza/fake-gcs-server#331) and rejects every PUT, so \
+                build + auth verify there but the PUT only greens on real GCS. \
                 cargo test -p aisix-obs -- --ignored objstore_smoke_gcs"]
     async fn objstore_smoke_gcs_roundtrip() {
         let (Some(bucket), Some(service_account_key)) = (
@@ -1550,8 +1738,8 @@ mod smoke {
             eprintln!("objstore_smoke_gcs: AISIX_E2E_OBJSTORE_GCS_* not set — skipping");
             return;
         };
-        // endpoint optional: set it for an emulator (fake-gcs-server);
-        // omit it for native GCS.
+        // endpoint optional: set it for an XML API endpoint (a private
+        // endpoint, an XML-API-capable emulator); omit it for native GCS.
         let endpoint = env("AISIX_E2E_OBJSTORE_GCS_ENDPOINT");
         let store = build_object_store(
             ObjectStoreProvider::Gcs,
