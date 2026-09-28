@@ -143,6 +143,10 @@ This repo reads its config from etcd, but users never write etcd directly — th
 
 (The meta-repo `AGENTS.md` carries the same rule for cross-plane agents.)
 
+## A Configured URL Is Opaque
+
+**Userinfo (`user:pass@`) in any configured URL is the operator's to write, and the gateway neither validates nor redacts it.** It is not rejected, checked or masked. Logs, `Debug` output, error text and published documents render the URL exactly as configured, and it reaches the HTTP client unchanged. Whatever the client does with the userinfo is the behaviour. A URL pattern that restricts the host allows optional userinfo in front of it without inspecting it (`([^/?#]*@)?`), and it keeps the host after the last `@` on its allow-list. Configured secrets that are not part of a URL (API keys, header values, credential query parameters) keep their own redaction.
+
 ## A Control-Plane Response Decodes Loosely
 
 **A data plane may run against a control plane many releases newer than itself, and the etcd read tolerance covers only the resources it loads — the gateway's direct HTTP channels to the control plane need the same tolerance stated for them.** Any struct that decodes a control-plane response must never carry `#[serde(deny_unknown_fields)]`, and every field except the one the decision hinges on must be `#[serde(default)]`, so a field the newer control plane added, or an optional one it stopped sending, cannot turn into a hard error on the request path. A response the gateway does not parse today — one it reads only the status of — stays unparsed unless it is decoded under the same rule. The startup `Config` and its blocks are the deliberate exception: they are `deny_unknown_fields` because they parse the gateway's own `config.yaml`, which nothing but the operator writes.
