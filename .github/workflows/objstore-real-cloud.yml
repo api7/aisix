@@ -6,7 +6,7 @@
 # → assert exactly one object under the prefix → re-deliver the same batch →
 # assert no duplicate key → clean up) against the actual cloud APIs. These
 # complement the emulator smoke in ci.yml's unit job, which cannot exercise real
-# S3 auth or (for GCS) the real PUT path that fake-gcs-server can't round-trip.
+# S3 auth or (for GCS) the XML API upload that fake-gcs-server does not implement.
 #
 # Gated: never runs on a normal push. Triggered manually (workflow_dispatch),
 # on the schedule below, or on a same-repo PR labeled `objstore real cloud`.

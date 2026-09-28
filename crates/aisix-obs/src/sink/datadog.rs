@@ -175,20 +175,9 @@ impl ObservabilitySink for DatadogSink {
         let retry_after = super::retry_after_of(status, resp.headers());
         let body = resp.text().await.unwrap_or_default();
         let detail = parse_datadog_error(status, &body);
-        // 429 (rate limit) and 5xx (502/503/504, transient server faults) are
-        // worth retrying; other 4xx (400 malformed / 401/403 auth / 413 too
-        // large) are config/auth/payload errors that fail identically on retry.
-        if is_transient_status(status) {
-            Err(match retry_after {
-                Some(retry_after) => SinkError::Throttled {
-                    retry_after,
-                    detail,
-                },
-                None => SinkError::Transient(detail),
-            })
-        } else {
-            Err(SinkError::Permanent(detail))
-        }
+        // 408 / 429 / 5xx are retried; other 4xx (400 malformed / 401/403
+        // auth / 413 too large) fail identically on retry.
+        Err(super::http_status_error(status, retry_after, detail))
     }
 
     async fn healthcheck(&self) -> SinkHealth {
@@ -330,16 +319,6 @@ fn parse_datadog_error(status: reqwest::StatusCode, body: &str) -> String {
     truncate(&format!("HTTP {status}: {body}"))
 }
 
-/// Whether a Datadog intake HTTP status means "retry with backoff".
-///
-/// Datadog returns `429 Too Many Requests` on rate-limit and `5xx`
-/// (`502`/`503`/`504`) on transient server faults; both are retried. Other
-/// `4xx` (`400` malformed payload, `401`/`403` bad API key, `413` payload too
-/// large) are permanent — a retry of the same batch fails identically.
-fn is_transient_status(status: reqwest::StatusCode) -> bool {
-    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-}
-
 /// gzip a byte slice (RFC 1952). Permanent on the rare encode failure.
 fn gzip(data: &[u8]) -> Result<Vec<u8>, SinkError> {
     let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -422,8 +401,7 @@ fn resolve_datadog_credential_with(
 #[cfg(test)]
 mod tests {
     use super::{
-        intake_url_for, is_transient_status, parse_datadog_error, resolve_datadog_credential_with,
-        DatadogSink,
+        intake_url_for, parse_datadog_error, resolve_datadog_credential_with, DatadogSink,
     };
     use crate::sink::{EventBatch, IdempotencyMarker, ObservabilitySink, SinkContent, SinkRecord};
     use crate::usage::UsageEvent;
@@ -686,25 +664,25 @@ mod tests {
         assert!(!err.is_transient(), "auth error must not be retried: {err}");
     }
 
-    #[test]
-    fn transient_status_classification() {
-        use reqwest::StatusCode;
-        for s in [
-            StatusCode::TOO_MANY_REQUESTS,
-            StatusCode::BAD_GATEWAY,
-            StatusCode::SERVICE_UNAVAILABLE,
-            StatusCode::GATEWAY_TIMEOUT,
-        ] {
-            assert!(is_transient_status(s), "{s} should be transient");
-        }
-        for s in [
-            StatusCode::BAD_REQUEST,
-            StatusCode::UNAUTHORIZED,
-            StatusCode::FORBIDDEN,
-            StatusCode::PAYLOAD_TOO_LARGE,
-        ] {
-            assert!(!is_transient_status(s), "{s} should be permanent");
-        }
+    #[tokio::test]
+    async fn request_timeout_408_is_retried() {
+        // The intake timing out on its side says nothing about the batch —
+        // retry it, as every other HTTP sink does.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(408))
+            .mount(&server)
+            .await;
+
+        let err = sink_for(&server, &[])
+            .append_batch(
+                &batch_of(vec![SinkRecord::metadata_only(UsageEvent::default())]),
+                &IdempotencyMarker::None,
+            )
+            .await
+            .expect_err("408 fails this attempt");
+        assert!(err.is_transient(), "408 must be retried: {err}");
     }
 
     #[test]

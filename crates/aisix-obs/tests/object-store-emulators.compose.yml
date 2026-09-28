@@ -57,8 +57,8 @@ services:
 
   # ── GCS (fake-gcs-server) ────────────────────────────────────────────────
   # NOTE: build + auth (service-account `gcs_base_url` + disable_oauth) verify
-  # against fake-gcs, but its XML API does not round-trip object_store's
-  # percent-encoded object names (the `/` in partition keys → %2F), so the
+  # against fake-gcs, but it implements no XML API upload (fsouza/fake-gcs-server#331)
+  # and object_store uploads through the XML API, so the
   # `objstore_smoke_gcs_roundtrip` PUT only greens against REAL GCS. S3 (MinIO)
   # and Azure (Azurite) are the round-trip-capable local emulators.
   fake-gcs:
