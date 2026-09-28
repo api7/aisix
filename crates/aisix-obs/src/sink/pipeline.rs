@@ -897,8 +897,10 @@ mod tests {
         assert!(handle.try_enqueue(rec(0)));
 
         let mut observed_retrying = 0;
+        let mut stepped = 0;
         while sink.delivered() == 0 {
-            assert!(observed_retrying < 10_000, "the batch must be delivered");
+            stepped += 1;
+            assert!(stepped < 10_000, "the batch must be delivered");
             tokio::time::sleep(Duration::from_millis(10)).await;
             if sink.attempts() == 0 {
                 continue;
