@@ -1405,8 +1405,8 @@ async fn multipart_dispatch(
                 // Rebuild the multipart form with `model` rewritten. A `multipart::Form`
                 // is single-use (sending consumes it), so this is a closure rather than a
                 // value: each retry attempt below builds a fresh one. That is only
-                // possible because every part is `Part::bytes` over an in-memory `Bytes`
-                // — a streamed part could not be replayed.
+                // possible because every part is built over an in-memory `Bytes` — a
+                // streamed part could not be replayed.
                 let build_form = || {
                     let mut form = multipart::Form::new();
                     for (name, file_name, content_type, data) in fields {
@@ -1416,13 +1416,16 @@ async fn multipart_dispatch(
                             data.clone()
                         };
 
-                        let data_vec = field_data.to_vec();
+                        // Over the refcounted `Bytes` itself: `Part::bytes` would
+                        // copy each file into a `Vec` that the form holds for the
+                        // whole upstream wait, next to the request's own copy.
+                        let len = field_data.len() as u64;
+                        let new_part =
+                            || multipart::Part::stream_with_length(field_data.clone(), len);
                         let mut part = if let Some(ct) = content_type {
-                            multipart::Part::bytes(data_vec.clone())
-                                .mime_str(ct)
-                                .unwrap_or_else(|_| multipart::Part::bytes(data_vec))
+                            new_part().mime_str(ct).unwrap_or_else(|_| new_part())
                         } else {
-                            multipart::Part::bytes(data_vec)
+                            new_part()
                         };
                         if let Some(fname) = file_name {
                             part = part.file_name(fname.clone());
@@ -2156,8 +2159,6 @@ async fn speech_dispatch(
         |_| None,
         |target, timeouts| async move {
             let model = &target.model;
-            let mut attempt_body = base_body.clone();
-            let body = &mut attempt_body;
             let provider = crate::dispatch::require_provider(model)?;
             let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
             let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -2165,24 +2166,34 @@ async fn speech_dispatch(
 
             let provider_label = provider.to_ascii_lowercase();
 
-            // Rewrite model field.
-            if let Some(m) = body.get_mut("model") {
-                *m = Value::String(upstream_model.clone());
-            }
-
-            // Apply the PK's `request.*` overrides (body + headers) like the OpenAI
-            // bridge's chat() path — /v1/audio/speech is a JSON passthrough that builds
-            // the request directly (AISIX-Cloud#867 follow-up). No-op when none set.
-            if let Some(r) = pk_entry.value.request.as_ref() {
-                aisix_provider_openai::overrides::apply_param_renames(body, &r.param_renames);
-                if let Some(constraints) = &r.param_constraints {
-                    aisix_provider_openai::overrides::apply_param_constraints(body, constraints);
+            // This attempt's body exists only as its wire bytes past this block
+            // (see `crate::util::outbound_json`).
+            let body = {
+                let mut attempt_body = base_body.clone();
+                let body = &mut attempt_body;
+                // Rewrite model field.
+                if let Some(m) = body.get_mut("model") {
+                    *m = Value::String(upstream_model.clone());
                 }
-                aisix_provider_openai::overrides::apply_default_body_fields(
-                    body,
-                    &r.default_body_fields,
-                );
-            }
+
+                // Apply the PK's `request.*` overrides (body + headers) like the OpenAI
+                // bridge's chat() path — /v1/audio/speech is a JSON passthrough that builds
+                // the request directly (AISIX-Cloud#867 follow-up). No-op when none set.
+                if let Some(r) = pk_entry.value.request.as_ref() {
+                    aisix_provider_openai::overrides::apply_param_renames(body, &r.param_renames);
+                    if let Some(constraints) = &r.param_constraints {
+                        aisix_provider_openai::overrides::apply_param_constraints(
+                            body,
+                            constraints,
+                        );
+                    }
+                    aisix_provider_openai::overrides::apply_default_body_fields(
+                        body,
+                        &r.default_body_fields,
+                    );
+                }
+                crate::util::outbound_json(body)?
+            };
 
             let mut headers = axum::http::HeaderMap::new();
             let auth_hv =
@@ -2250,7 +2261,7 @@ async fn speech_dispatch(
                     .clone()
                     .post_on(&client)
                     .headers(headers.clone())
-                    .json(&*body);
+                    .body(body.clone());
                 // #554/#911: reqwest's request-level timeout would bound the
                 // body read too and cut a long synthesis off mid-file, so the
                 // stream budget bounds the connect phase and each chunk

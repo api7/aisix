@@ -81,8 +81,19 @@ pub struct ModelCallOutcome {
 
 #[async_trait]
 pub trait ModelCaller: Send + Sync {
-    async fn call(&self, target: &str, req: &ChatFormat) -> Result<ModelCallOutcome, BridgeError>;
+    /// `req` builds the sub-call's request. It is called once per upstream
+    /// attempt and the result handed to the bridge by value, so a panel
+    /// member's copy of the caller's request is not held across the
+    /// upstream wait — the member's wire body is its only copy then.
+    async fn call(
+        &self,
+        target: &str,
+        req: &RequestBuilder<'_>,
+    ) -> Result<ModelCallOutcome, BridgeError>;
 }
+
+/// Builds one sub-call's request on demand; see [`ModelCaller::call`].
+pub type RequestBuilder<'a> = dyn Fn() -> ChatFormat + Send + Sync + 'a;
 
 /// Production [`ModelCaller`] used by the chat dispatch layer. Resolves
 /// a panel/judge member's `display_name` to its Bridge + ProviderKey
@@ -107,7 +118,11 @@ pub(crate) struct ProxyModelCaller<'a> {
 
 #[async_trait]
 impl ModelCaller for ProxyModelCaller<'_> {
-    async fn call(&self, target: &str, req: &ChatFormat) -> Result<ModelCallOutcome, BridgeError> {
+    async fn call(
+        &self,
+        target: &str,
+        req: &RequestBuilder<'_>,
+    ) -> Result<ModelCallOutcome, BridgeError> {
         // Resolve the member's display_name against the live snapshot.
         // A missing entry is a misconfigured ensemble (a panel/judge name
         // that no longer points at a real Model) → 400 InvalidUpstreamConfig.
@@ -192,9 +207,13 @@ impl ModelCaller for ProxyModelCaller<'_> {
         // `ctx`'s deadline is per attempt while the ensemble's own
         // `config.timeout()` — applied by the caller — remains the ceiling on
         // the whole attempt sequence.
-        let upstream_req = crate::effort_mapping::chat_request(req, model);
         let response = crate::routing::retrying_dispatch(self.state, model, "ensemble", || {
-            bridge.chat(upstream_req.as_ref(), &ctx)
+            let attempt_req = req();
+            let upstream_req = match crate::effort_mapping::chat_request(&attempt_req, model) {
+                std::borrow::Cow::Owned(mapped) => mapped,
+                std::borrow::Cow::Borrowed(_) => attempt_req,
+            };
+            bridge.chat_cow(std::borrow::Cow::Owned(upstream_req), &ctx)
         })
         .await?;
         let effective = crate::chat::effective_subcall_usage(
@@ -303,8 +322,8 @@ pub(crate) async fn run_ensemble_panel(
     // Phase 1: fan out to every panel member concurrently.
     let calls = config.panel.iter().map(|member| {
         let model = member.model.clone();
-        let member_req = panel_request(req, member);
         async move {
+            let member_req = || panel_request(req, member);
             let result =
                 call_with_optional_timeout(caller, &model, &member_req, per_call_timeout).await;
             (model, result)
@@ -356,7 +375,10 @@ pub async fn run_ensemble(
     caller: &dyn ModelCaller,
 ) -> Result<EnsembleOutcome, EnsembleError> {
     // Phases 1-2 + judge-request construction.
-    let (panel, _candidates, judge_req) = run_ensemble_panel(req, config, caller).await?;
+    let (panel, candidates, judge_req) = run_ensemble_panel(req, config, caller).await?;
+    // The judge's prompt renders the caller's messages, so it is rebuilt per
+    // attempt like a panel member's request rather than held for the wait.
+    drop(judge_req);
 
     // Phase 3: synthesize via the judge. The judge call gets the same
     // per-call timeout as each panel member (`config.timeout()`), so the
@@ -366,15 +388,19 @@ pub async fn run_ensemble(
     // the judge model's own retry budget — it used to be a hardcoded single
     // retry here, which both ignored the operator's configuration and would
     // have stacked on top of the caller-level budget.
-    let judge =
-        match call_with_optional_timeout(caller, &config.judge.model, &judge_req, config.timeout())
-            .await
-        {
-            Ok(r) => r,
-            // Carry the (already-billed) panel survivors out on the judge
-            // failure so the dispatch layer commits + emits them too.
-            Err(source) => return Err(EnsembleError::Judge { source, panel }),
-        };
+    let judge = match call_with_optional_timeout(
+        caller,
+        &config.judge.model,
+        &|| judge_request(req, &config.judge, &candidates),
+        config.timeout(),
+    )
+    .await
+    {
+        Ok(r) => r,
+        // Carry the (already-billed) panel survivors out on the judge
+        // failure so the dispatch layer commits + emits them too.
+        Err(source) => return Err(EnsembleError::Judge { source, panel }),
+    };
 
     Ok(EnsembleOutcome {
         response: judge.response,
@@ -403,7 +429,11 @@ fn panel_request(req: &ChatFormat, member: &PanelMember) -> ChatFormat {
 }
 
 /// Build the judge's request from the labeled candidate answers.
-fn judge_request(req: &ChatFormat, judge: &Judge, candidates: &[ChatResponse]) -> ChatFormat {
+pub(crate) fn judge_request(
+    req: &ChatFormat,
+    judge: &Judge,
+    candidates: &[ChatResponse],
+) -> ChatFormat {
     let template = judge
         .synthesis_prompt
         .as_deref()
@@ -445,7 +475,7 @@ fn label_candidates(candidates: &[ChatResponse]) -> String {
             format!(
                 "Answer {}:\n{}",
                 i + 1,
-                truncate_bytes(c.message.content_str(), MAX_CANDIDATE_BYTES)
+                truncate_bytes(&c.message.content_str(), MAX_CANDIDATE_BYTES)
             )
         })
         .collect::<Vec<_>>()
@@ -477,7 +507,7 @@ fn truncate_bytes(s: &str, max: usize) -> Cow<'_, str> {
 async fn call_with_optional_timeout(
     caller: &dyn ModelCaller,
     target: &str,
-    req: &ChatFormat,
+    req: &RequestBuilder<'_>,
     timeout: Option<Duration>,
 ) -> Result<ModelCallOutcome, BridgeError> {
     match timeout {
@@ -543,12 +573,9 @@ mod tests {
         async fn call(
             &self,
             target: &str,
-            req: &ChatFormat,
+            req: &RequestBuilder<'_>,
         ) -> Result<ModelCallOutcome, BridgeError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((target.to_string(), req.clone()));
+            self.calls.lock().unwrap().push((target.to_string(), req()));
             let mut scripted = self.scripted.lock().unwrap();
             let queue = scripted
                 .get_mut(target)

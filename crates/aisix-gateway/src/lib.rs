@@ -63,6 +63,7 @@ pub use upstream_headers::{
     UpstreamHeaderContext,
 };
 pub use upstream_http::{
-    client_builder, error_with_causes, send_error, transport_error_message, UpstreamHttpConfig,
+    client_builder, error_with_causes, json_body, send_error, transport_error_message,
+    UpstreamHttpConfig,
 };
 pub use upstream_tls::TlsSettings;

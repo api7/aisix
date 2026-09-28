@@ -1252,7 +1252,7 @@ fn apply_estimated_usage(
 /// estimation fills only zeros. One helper so every sub-call emit site
 /// (non-streaming panel + judge, streaming panel) can't drift apart.
 fn estimate_subcall_tokens(
-    req: &ChatFormat,
+    req: impl FnOnce() -> ChatFormat,
     model: &str,
     usage: &aisix_gateway::chat::UsageStats,
     output_text: &str,
@@ -1262,7 +1262,7 @@ fn estimate_subcall_tokens(
     }
     let est = crate::token_estimate::Estimator::new(
         model,
-        crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
+        crate::token_estimate::PromptInput::Chat(Box::new(req())),
     );
     let filled = crate::token_estimate::fill_missing(
         &est,
@@ -1306,7 +1306,7 @@ pub(crate) struct EffectiveSubcallUsage {
 /// commit. The client-facing response still carries only upstream-reported
 /// usage; local estimates remain telemetry-only.
 pub(crate) fn effective_subcall_usage(
-    req: &ChatFormat,
+    req: impl FnOnce() -> ChatFormat,
     model: &str,
     reported: &aisix_gateway::chat::UsageStats,
     output_text: &str,
@@ -1332,7 +1332,7 @@ fn last_user_message_text(req: &ChatFormat) -> Option<String> {
         .iter()
         .rev()
         .find(|m| m.role == aisix_gateway::Role::User)
-        .and_then(|m| m.content.clone())
+        .and_then(|m| m.text().map(std::borrow::Cow::into_owned))
 }
 
 /// Compute the value of [`Success::served_by_target`] for a request.
@@ -1816,7 +1816,6 @@ async fn dispatch(
 
         'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
             let model = &attempt.model;
-            let upstream_req = crate::effort_mapping::chat_request(req, model);
             let Ok(provider) = crate::dispatch::require_provider(model) else {
                 last_reserve_reject = None;
                 last_err = Some(BridgeError::Config("model has no provider".into()));
@@ -1969,7 +1968,14 @@ async fn dispatch(
                 // heartbeats cover the wait for the first token. The
                 // read-timeout wrapper is a no-op when the budget is None.
                 let attempt_stream: Result<aisix_gateway::ChatChunkStream, BridgeError> =
-                    match bridge.chat_stream(upstream_req.as_ref(), &ctx).await {
+                    // Mapped per attempt and handed over by value: a rewritten
+                    // request is a whole-request copy, which the bridge drops
+                    // once it has built the wire body rather than keeping it
+                    // for the upstream wait.
+                    match bridge
+                        .chat_stream_cow(crate::effort_mapping::chat_request(req, model), &ctx)
+                        .await
+                    {
                         Err(e) => Err(e),
                         Ok(up) => {
                             let up = crate::stream_timeout::with_read_timeout(up, stream_budget);
@@ -2707,6 +2713,11 @@ async fn dispatch(
             _ => None,
         };
 
+    // Everything the cache needs from the full key is taken above. It
+    // carries a canonical copy of every message — base64 images included —
+    // so it must not stay alive across the upstream call below.
+    drop(cache_key_full);
+
     // Handed from the read path (L2 miss) to the write path so a full
     // miss costs exactly one embedding call.
     let mut semantic_embedding: Option<Vec<f32>> = None;
@@ -3046,7 +3057,6 @@ async fn dispatch(
 
     'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
         let model = &attempt.model;
-        let upstream_req = crate::effort_mapping::chat_request(req, model);
         let Some(provider) = model.provider.as_deref() else {
             last_reserve_reject = None;
             last_err = Some(BridgeError::Config("model has no provider".into()));
@@ -3193,7 +3203,11 @@ async fn dispatch(
             // once `bridge.chat` returns; the guard drops at the end of this
             // attempt's scope on both the success-break and failure paths.
             let _in_flight = state.runtime_status.begin_in_flight(&attempt.id);
-            let result = bridge.chat(upstream_req.as_ref(), &ctx).await;
+            // Mapped per attempt and handed over by value: a rewritten request
+            // is a whole-request copy, which the bridge drops once it has
+            // built the wire body rather than keeping it for the upstream wait.
+            let upstream_req = crate::effort_mapping::chat_request(req, model);
+            let result = bridge.chat_cow(upstream_req, &ctx).await;
             let attempt_latency_ms =
                 attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
             match result {
@@ -3866,7 +3880,7 @@ async fn dispatch_ensemble(
         // Phases 1-2 + judge-request construction. An exhausted panel bills
         // the survivors and returns 502 (same status mapping as the
         // non-streaming `InsufficientPanel` path).
-        let (panel, _candidates, mut judge_req) =
+        let (panel, candidates, judge_req) =
             match crate::ensemble::run_ensemble_panel(req, ensemble_cfg, &caller).await {
                 Ok(triple) => triple,
                 Err(crate::ensemble::EnsembleError::InsufficientPanel { panel, .. }) => {
@@ -3887,11 +3901,10 @@ async fn dispatch_ensemble(
                 }
             };
 
-        // Stream the judge's synthesized answer. Flip the judge request to
-        // streaming (the executor built it non-streaming for the buffered
-        // path) and resolve its bridge exactly as `ProxyModelCaller::call`
-        // does for the non-streaming judge.
-        judge_req.stream = Some(true);
+        // The judge's prompt renders the caller's messages, so it is rebuilt
+        // where it is needed (`build_judge_req` below) rather than held
+        // through the judge's upstream wait.
+        drop(judge_req);
         // Resolve the judge model from the snapshot. Effectively unreachable
         // (the panel calls already resolved member names against the same
         // snapshot, and the judge is required config), but stay total: bill the
@@ -3906,7 +3919,18 @@ async fn dispatch_ensemble(
             ));
         };
         let judge_model = &judge_entry.value;
-        let judge_req = crate::effort_mapping::chat_request(&judge_req, judge_model);
+        // Stream the judge's synthesized answer: the request the executor
+        // builds, flipped to streaming (it is built non-streaming for the
+        // buffered path), with the judge's effort mapping applied.
+        let build_judge_req = || {
+            let mut judge_req =
+                crate::ensemble::judge_request(req, &ensemble_cfg.judge, &candidates);
+            judge_req.stream = Some(true);
+            match crate::effort_mapping::chat_request(&judge_req, judge_model) {
+                std::borrow::Cow::Owned(mapped) => mapped,
+                std::borrow::Cow::Borrowed(_) => judge_req,
+            }
+        };
         let judge_pk = match crate::dispatch::resolve_provider_key(snapshot, judge_model) {
             Ok(pk) => pk,
             Err(e) => {
@@ -3984,7 +4008,7 @@ async fn dispatch_ensemble(
         // additionally covers the whole panel that ran before it.
         let judge_started = Instant::now();
         let judge_stream = match judge_bridge
-            .chat_stream(judge_req.as_ref(), &judge_ctx)
+            .chat_stream_cow(std::borrow::Cow::Owned(build_judge_req()), &judge_ctx)
             .await
         {
             Ok(s) => s,
@@ -4111,7 +4135,7 @@ async fn dispatch_ensemble(
         // their usage separately).
         let judge_estimator = crate::token_estimate::Estimator::new(
             judge_model.upstream_model().unwrap_or("unknown"),
-            crate::token_estimate::PromptInput::Chat(Box::new(judge_req.into_owned())),
+            crate::token_estimate::PromptInput::Chat(Box::new(build_judge_req())),
         );
         let sse_stream = build_sse_stream(
             judge_stream,
@@ -7018,8 +7042,12 @@ mod complete_on_drop_tests {
     #[test]
     fn estimate_subcall_fills_missing_usage() {
         let usage = aisix_gateway::chat::UsageStats::default();
-        let (prompt, completion, estimated) =
-            estimate_subcall_tokens(&subcall_req("Hello"), "relay-model", &usage, "Hello world");
+        let (prompt, completion, estimated) = estimate_subcall_tokens(
+            || subcall_req("Hello"),
+            "relay-model",
+            &usage,
+            "Hello world",
+        );
         assert_eq!(prompt, 8);
         assert_eq!(completion, 2);
         assert!(estimated);
@@ -7035,8 +7063,12 @@ mod complete_on_drop_tests {
             total_tokens: 40,
             ..Default::default()
         };
-        let (prompt, completion, estimated) =
-            estimate_subcall_tokens(&subcall_req("Hello"), "relay-model", &usage, "Hello world");
+        let (prompt, completion, estimated) = estimate_subcall_tokens(
+            || subcall_req("Hello"),
+            "relay-model",
+            &usage,
+            "Hello world",
+        );
         assert_eq!(prompt, 17);
         assert_eq!(completion, 23);
         assert!(!estimated);
@@ -7052,8 +7084,12 @@ mod complete_on_drop_tests {
             total_tokens: 17,
             ..Default::default()
         };
-        let (prompt, completion, estimated) =
-            estimate_subcall_tokens(&subcall_req("Hello"), "relay-model", &usage, "Hello world");
+        let (prompt, completion, estimated) = estimate_subcall_tokens(
+            || subcall_req("Hello"),
+            "relay-model",
+            &usage,
+            "Hello world",
+        );
         assert_eq!(prompt, 17, "reported prompt preserved");
         assert_eq!(completion, 2, "missing completion estimated");
         assert!(estimated);
@@ -7072,7 +7108,7 @@ mod complete_on_drop_tests {
             ..Default::default()
         };
         let effective =
-            effective_subcall_usage(&subcall_req("Hello"), "relay-model", &reported, "reply");
+            effective_subcall_usage(|| subcall_req("Hello"), "relay-model", &reported, "reply");
         assert_eq!(effective.usage.total_tokens, 26);
         assert!(!effective.estimated);
 

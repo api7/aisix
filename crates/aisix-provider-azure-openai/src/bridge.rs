@@ -718,6 +718,14 @@ impl Bridge for AzureOpenAiBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
+        self.chat_cow(std::borrow::Cow::Borrowed(req), ctx).await
+    }
+
+    async fn chat_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
         let deployment = upstream_model(ctx)?;
         let upstream = AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
         // Keep reserved-config helpers reachable from the public surface
@@ -734,14 +742,19 @@ impl Bridge for AzureOpenAiBridge {
         // body's `model` field is ignored by Azure (or echoed back).
         // We still set it to the deployment name for log-trace clarity
         // and to mirror the upstream OpenAI SDK convention.
-        let messages = messages_from(req, AZURE_DEVELOPER_ROLE_MODE);
-        let typed = build_request(req, deployment, &messages, false);
-        let body = prepare_outbound_body(
-            &typed,
-            is_reasoning_model(ReasoningFamily::AzureOpenai, deployment),
-            ctx.provider_key.request.as_ref(),
-            ctx.provider_key.response.as_ref(),
-        )?;
+        let body = {
+            let messages = messages_from(&req, AZURE_DEVELOPER_ROLE_MODE);
+            let typed = build_request(&req, deployment, &messages, false);
+            aisix_gateway::json_body(&prepare_outbound_body(
+                &typed,
+                is_reasoning_model(ReasoningFamily::AzureOpenai, deployment),
+                ctx.provider_key.request.as_ref(),
+                ctx.provider_key.response.as_ref(),
+            )?)
+            .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         let headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = self.resolve_url(ctx, &upstream);
         let client = self.client_for(ctx);
@@ -751,7 +764,7 @@ impl Bridge for AzureOpenAiBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
@@ -780,6 +793,15 @@ impl Bridge for AzureOpenAiBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
+        self.chat_stream_cow(std::borrow::Cow::Borrowed(req), ctx)
+            .await
+    }
+
+    async fn chat_stream_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatChunkStream, BridgeError> {
         let deployment = upstream_model(ctx)?;
         let upstream = AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
         let _ = wire::reserved_query_params();
@@ -787,14 +809,19 @@ impl Bridge for AzureOpenAiBridge {
 
         // See chat() — resolve auth before the request future.
         let auth = self.resolve_auth(ctx).await?;
-        let messages = messages_from(req, AZURE_DEVELOPER_ROLE_MODE);
-        let typed = build_request(req, deployment, &messages, true);
-        let body = prepare_outbound_body(
-            &typed,
-            is_reasoning_model(ReasoningFamily::AzureOpenai, deployment),
-            ctx.provider_key.request.as_ref(),
-            ctx.provider_key.response.as_ref(),
-        )?;
+        let body = {
+            let messages = messages_from(&req, AZURE_DEVELOPER_ROLE_MODE);
+            let typed = build_request(&req, deployment, &messages, true);
+            aisix_gateway::json_body(&prepare_outbound_body(
+                &typed,
+                is_reasoning_model(ReasoningFamily::AzureOpenai, deployment),
+                ctx.provider_key.request.as_ref(),
+                ctx.provider_key.response.as_ref(),
+            )?)
+            .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         let headers = build_request_headers(&auth, &ctx.request_id, true, &ctx.header_ctx())?;
         let url = self.resolve_url(ctx, &upstream);
         let client = self.client_for(ctx);
@@ -803,7 +830,7 @@ impl Bridge for AzureOpenAiBridge {
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)

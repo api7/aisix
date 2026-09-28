@@ -2318,7 +2318,7 @@ mod tests {
         let seen: Vec<_> = view
             .messages
             .iter()
-            .map(|m| (m.role, m.content_str().to_owned()))
+            .map(|m| (m.role, m.content_str().into_owned()))
             .collect();
         assert_eq!(
             seen,
@@ -2347,7 +2347,7 @@ mod tests {
         let seen: Vec<_> = crate::latest_turn_view(&req)
             .messages
             .iter()
-            .map(|m| (m.role, m.content_str().to_owned()))
+            .map(|m| (m.role, m.content_str().into_owned()))
             .collect();
         assert_eq!(
             seen,

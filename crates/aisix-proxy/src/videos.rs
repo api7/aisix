@@ -1241,7 +1241,7 @@ fn provider_call_once<'a>(
     if let Some(b) = body {
         builder = builder
             .header(header::CONTENT_TYPE, "application/json")
-            .json(b);
+            .body(aisix_gateway::json_body(b).expect("a serde_json::Value always serializes"));
     }
     if let Some(d) = timeout {
         builder = builder.timeout(d);

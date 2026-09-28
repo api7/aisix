@@ -90,6 +90,7 @@ dependencies = [
  "dashmap",
  "moka",
  "redis",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",

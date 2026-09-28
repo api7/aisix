@@ -404,7 +404,6 @@ async fn dispatch(
             .iter()
             .map(|e| &e.value),
     );
-    let captured_prompt = content_cap.map(|_| serde_json::to_string(&*body).unwrap_or_default());
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
@@ -430,8 +429,6 @@ async fn dispatch(
             let model_name = &model_name;
             async move {
                 let model = &target.model;
-                let mut attempt_body = base_body.clone();
-                let body = &mut attempt_body;
 
                 // Provider routing key, derived from `Model.provider` as a
                 // lowercase string. Per #302 Phase A this dispatch path
@@ -479,28 +476,38 @@ async fn dispatch(
                 let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
                 let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
-                // Rewrite model field.
-                if let Some(m) = body.get_mut("model") {
-                    *m = Value::String(upstream_model.clone());
-                }
+                // This attempt's body exists only as its wire bytes past this
+                // block (see `crate::util::outbound_json`).
+                let body = {
+                    let mut attempt_body = base_body.clone();
+                    let body = &mut attempt_body;
+                    // Rewrite model field.
+                    if let Some(m) = body.get_mut("model") {
+                        *m = Value::String(upstream_model.clone());
+                    }
 
-                // Apply the PK's `request.*` body overrides, matching the OpenAI bridge's
-                // chat() path and /v1/messages passthrough (AISIX-Cloud#867 follow-up). The
-                // /v1/rerank path builds the request directly, so without this the override
-                // pipeline silently no-ops here. No-op when the PK carries none.
-                if let Some(r) = pk_entry.value.request.as_ref() {
-                    aisix_provider_openai::overrides::apply_param_renames(body, &r.param_renames);
-                    if let Some(constraints) = &r.param_constraints {
-                        aisix_provider_openai::overrides::apply_param_constraints(
+                    // Apply the PK's `request.*` body overrides, matching the OpenAI bridge's
+                    // chat() path and /v1/messages passthrough (AISIX-Cloud#867 follow-up). The
+                    // /v1/rerank path builds the request directly, so without this the override
+                    // pipeline silently no-ops here. No-op when the PK carries none.
+                    if let Some(r) = pk_entry.value.request.as_ref() {
+                        aisix_provider_openai::overrides::apply_param_renames(
                             body,
-                            constraints,
+                            &r.param_renames,
+                        );
+                        if let Some(constraints) = &r.param_constraints {
+                            aisix_provider_openai::overrides::apply_param_constraints(
+                                body,
+                                constraints,
+                            );
+                        }
+                        aisix_provider_openai::overrides::apply_default_body_fields(
+                            body,
+                            &r.default_body_fields,
                         );
                     }
-                    aisix_provider_openai::overrides::apply_default_body_fields(
-                        body,
-                        &r.default_body_fields,
-                    );
-                }
+                    crate::util::outbound_json(body)?
+                };
 
                 // The provider arm of `default_base_for_provider` is guaranteed to
                 // return `Some` here because the gate above already rejected any
@@ -587,7 +594,7 @@ async fn dispatch(
                         .clone()
                         .post_on(&client)
                         .headers(headers.clone())
-                        .json(body);
+                        .body(body.clone());
                     // #554: rerank is non-streaming; apply the E2E request timeout.
                     if let Some(d) = timeouts.request {
                         req = req.timeout(d);
@@ -649,6 +656,9 @@ async fn dispatch(
         },
     )
     .await;
+    // Serialized once the upstream has answered, not before: a copy made
+    // up front would be alive for the whole upstream wait.
+    let captured_prompt = content_cap.map(|_| serde_json::to_string(&*body).unwrap_or_default());
     let crate::routing::Dispatched {
         value: (upstream_headers, body_bytes, provider_label, pk_id, upstream_model),
         target,

@@ -44,6 +44,37 @@ pub struct EmbeddingRequestBody {
     pub dimensions: Option<u32>,
 }
 
+/// The client-facing request body as content capture records it: the text
+/// `serde_json::to_string` of the [`EmbeddingRequestBody`] gave, written
+/// from the shared request once the upstream has answered instead of
+/// serialized up front and held across the upstream wait.
+fn captured_embeddings_prompt(req: &EmbeddingRequest) -> String {
+    #[derive(serde::Serialize)]
+    #[serde(untagged)]
+    enum Input<'a> {
+        Single(&'a str),
+        Multi(&'a [String]),
+    }
+    #[derive(serde::Serialize)]
+    struct Body<'a> {
+        model: &'a str,
+        input: Input<'a>,
+        encoding_format: &'a Option<String>,
+        dimensions: Option<u32>,
+    }
+    let input = match req.input.as_slice() {
+        [single] if req.input_was_single => Input::Single(single),
+        all => Input::Multi(all),
+    };
+    serde_json::to_string(&Body {
+        model: &req.model,
+        input,
+        encoding_format: &req.encoding_format,
+        dimensions: req.dimensions,
+    })
+    .unwrap_or_default()
+}
+
 /// Deserialises both `"text"` and `["text", ...]` forms of the
 /// OpenAI embeddings `input` field.
 #[derive(Debug, Deserialize, serde::Serialize)]
@@ -460,8 +491,6 @@ async fn dispatch(
             .iter()
             .map(|e| &e.value),
     );
-    let captured_prompt = content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
-
     // The name the caller addressed, kept before `body` is consumed below —
     // the response echoes it rather than the id the provider reports (the
     // `model_echo` contract).
@@ -478,9 +507,12 @@ async fn dispatch(
     // which contradicts the docs and confuses operator-side packet
     // captures during billing reconciliation / debugging.
     let input_was_single = matches!(body.input, InputField::Single(_));
-    let base_req = EmbeddingRequest {
-        // Rewritten to each target's upstream id at dispatch.
-        model: String::new(),
+    // Shared by every attempt, never copied per target: `input` can be the
+    // bulk of a large request, and a copy per attempt is held for the
+    // whole upstream wait. Bridges take the upstream id from the target's
+    // context, like chat.
+    let req = EmbeddingRequest {
+        model: client_facing_model.clone(),
         input: body.input.into_vec(),
         input_was_single,
         encoding_format: body.encoding_format,
@@ -505,17 +537,14 @@ async fn dispatch(
             answered.as_ref().err().map(ToString::to_string)
         },
         |target, timeouts| {
-            let base_req = &base_req;
+            let req = &req;
             async move {
                 let provider =
                     crate::dispatch::require_provider(&target.model)?.to_ascii_lowercase();
                 let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &target.model)?;
                 let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
                     .ok_or(ProxyError::ProviderUnavailable)?;
-                let req = EmbeddingRequest {
-                    model: crate::dispatch::require_upstream_model(&target.model)?.to_string(),
-                    ..base_req.clone()
-                };
+                crate::dispatch::require_upstream_model(&target.model)?;
                 // #554: apply the configured request `timeout` as the upstream deadline.
                 let mut ctx = crate::dispatch::bridge_ctx(
                     request_id,
@@ -529,7 +558,7 @@ async fn dispatch(
                     ctx = ctx.with_deadline(d);
                 }
                 // #701: per-attempt cooldown accounting — see completions.rs.
-                let answered = match bridge.embed(&req, &ctx).await {
+                let answered = match bridge.embed(req, &ctx).await {
                     Ok(v) => Ok(v),
                     Err(e @ BridgeError::UnsupportedCapability(BridgeCapability::Embeddings)) => {
                         Err(e)
@@ -592,7 +621,7 @@ async fn dispatch(
                 (embed_resp.usage.total_tokens, false)
             } else {
                 let upstream_model = model.upstream_model().unwrap_or("unknown");
-                let estimated = base_req.input.iter().fold(0u32, |acc, s| {
+                let estimated = req.input.iter().fold(0u32, |acc, s| {
                     acc.saturating_add(crate::token_estimate::count_text(upstream_model, s))
                 });
                 (estimated, estimated > 0)
@@ -612,6 +641,7 @@ async fn dispatch(
             // Content capture (#700): the full response JSON, vectors
             // included (LiteLLM parity); CapturedContent::new truncates to
             // the cap.
+            let captured_prompt = content_cap.map(|_| captured_embeddings_prompt(&req));
             let captured_content = match (&captured_prompt, content_cap) {
                 (Some(prompt), Some(cap)) => Some(CapturedContent::new(
                     prompt,
@@ -873,6 +903,26 @@ fn emit_usage_event(
 }
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn captured_prompt_is_the_request_body_as_the_caller_sent_it() {
+        for raw in [
+            r#"{"model":"e","input":"one"}"#,
+            r#"{"model":"e","input":["one"]}"#,
+            r#"{"model":"e","input":["one","two"],"encoding_format":"base64","dimensions":8}"#,
+        ] {
+            let body: super::EmbeddingRequestBody = serde_json::from_str(raw).unwrap();
+            let expected = serde_json::to_string(&body).unwrap();
+            let req = aisix_gateway::EmbeddingRequest {
+                model: body.model.clone(),
+                input_was_single: matches!(body.input, super::InputField::Single(_)),
+                input: body.input.into_vec(),
+                encoding_format: body.encoding_format,
+                dimensions: body.dimensions,
+            };
+            assert_eq!(super::captured_embeddings_prompt(&req), expected, "{raw}");
+        }
+    }
 
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;

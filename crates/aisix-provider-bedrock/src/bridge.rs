@@ -699,6 +699,14 @@ impl Bridge for BedrockBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
+        self.chat_cow(std::borrow::Cow::Borrowed(req), ctx).await
+    }
+
+    async fn chat_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
         let publisher = BedrockPublisher::from_model_id(upstream_id).ok_or_else(|| {
@@ -738,6 +746,15 @@ impl Bridge for BedrockBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
+        self.chat_stream_cow(std::borrow::Cow::Borrowed(req), ctx)
+            .await
+    }
+
+    async fn chat_stream_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatChunkStream, BridgeError> {
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
         let publisher = BedrockPublisher::from_model_id(upstream_id).ok_or_else(|| {
@@ -756,14 +773,15 @@ impl Bridge for BedrockBridge {
         // and usage rides its own terminal chunk exactly as on a real
         // stream.
         if matches!(
-            bedrock_structured_output(req, upstream_id),
+            bedrock_structured_output(&req, upstream_id),
             StructuredOutput::Tool(_)
         ) {
             // The leg is not streaming, so it runs under the budget a
             // non-streaming call would have got — the streaming budget
             // this context carries bounds a chunk gap, not a completion.
-            let chunks =
-                response_into_fake_stream_chunks(self.chat(req, &ctx.non_streaming_ctx()).await?);
+            let chunks = response_into_fake_stream_chunks(
+                self.chat_cow(req, &ctx.non_streaming_ctx()).await?,
+            );
             return Ok(Box::pin(async_stream::stream! {
                 for chunk in chunks {
                     yield Ok(chunk);
@@ -828,13 +846,21 @@ impl Bridge for BedrockBridge {
                 });
             }
         } else if base_id.starts_with("cohere.embed") {
-            let body = serde_json::json!({
-                "texts": req.input,
-                // LiteLLM's default when the caller gives no input_type.
-                "input_type": "search_document",
-            });
-            let body_bytes = serde_json::to_vec(&body)
-                .map_err(|e| BridgeError::Config(format!("serialize Cohere embed body: {e}")))?;
+            // Borrows the texts rather than copying them into a `Value`:
+            // the body is what the SDK holds for the whole upstream wait.
+            #[derive(serde::Serialize)]
+            struct CohereEmbedRequest<'a> {
+                texts: &'a [String],
+                input_type: &'a str,
+            }
+            let body_bytes = Vec::from(
+                aisix_gateway::json_body(&CohereEmbedRequest {
+                    texts: &req.input,
+                    // LiteLLM's default when the caller gives no input_type.
+                    input_type: "search_document",
+                })
+                .map_err(|e| BridgeError::Config(format!("serialize Cohere embed body: {e}")))?,
+            );
             let resp = client
                 .invoke_model()
                 .model_id(upstream_id)
@@ -903,14 +929,12 @@ impl BedrockBridge {
     /// updated to assert the Converse envelope instead.
     async fn chat_anthropic(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
         let client = self.build_client_from_ctx(ctx)?;
 
-        let (system, messages) =
-            split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
         // The Anthropic request builder reads the Claude family version
         // off the model name to pick a structured-output shape, and
         // `anthropic.claude-…` is not a name it can read. Hand it the
@@ -918,29 +942,39 @@ impl BedrockBridge {
         // in is stripped below, since /invoke keys the model off the URL.
         let anthropic_model = bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id);
         let synthetic_json_tool = matches!(
-            structured_output_for(req, anthropic_model),
+            structured_output_for(&req, anthropic_model),
             StructuredOutput::Tool(_)
         );
-        let anthropic_req = build_request(req, anthropic_model, system, messages, false);
-        let mut body_value = serde_json::to_value(&anthropic_req)
-            .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
-        // Apply the per-ProviderKey body override pipeline (#340) BEFORE the
-        // Vertex-style Bedrock shaping below, so the `model`/`stream` strip
-        // keeps the final say and an override can never reintroduce a
-        // URL-borne `model` into the /invoke body.
-        apply_body_overrides(&mut body_value, ctx);
-        if let Some(obj) = body_value.as_object_mut() {
-            obj.remove("model");
-            obj.remove("stream");
-            obj.insert(
-                "anthropic_version".to_string(),
-                serde_json::Value::String(BEDROCK_ANTHROPIC_VERSION.to_string()),
-            );
-        }
-        let body_bytes = serde_json::to_vec(&body_value).map_err(|e| {
-            BridgeError::Config(format!("serialize Anthropic request body bytes: {e}"))
-        })?;
+        // Every intermediate stays inside this block, so only the wire
+        // bytes are alive while the upstream is awaited.
+        let body_bytes = {
+            let (system, messages) = split_system(&req)
+                .map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
+            let anthropic_req = build_request(&req, anthropic_model, system, messages, false);
+            let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
+                BridgeError::Config(format!("serialize Anthropic request body: {e}"))
+            })?;
+            drop(anthropic_req);
+            // Apply the per-ProviderKey body override pipeline (#340) BEFORE the
+            // Vertex-style Bedrock shaping below, so the `model`/`stream` strip
+            // keeps the final say and an override can never reintroduce a
+            // URL-borne `model` into the /invoke body.
+            apply_body_overrides(&mut body_value, ctx);
+            if let Some(obj) = body_value.as_object_mut() {
+                obj.remove("model");
+                obj.remove("stream");
+                obj.insert(
+                    "anthropic_version".to_string(),
+                    serde_json::Value::String(BEDROCK_ANTHROPIC_VERSION.to_string()),
+                );
+            }
+            Vec::from(aisix_gateway::json_body(&body_value).map_err(|e| {
+                BridgeError::Config(format!("serialize Anthropic request body bytes: {e}"))
+            })?)
+        };
 
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         let started = Instant::now();
         let deadline = ctx.deadline;
         let resp = client
@@ -1005,12 +1039,12 @@ impl BedrockBridge {
     /// Reference: <https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html>
     async fn chat_converse(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
         let client = self.build_client_from_ctx(ctx)?;
-        let (system_blocks, message_blocks) = build_converse_inputs(req)?;
+        let (system_blocks, message_blocks) = build_converse_inputs(&req)?;
         if message_blocks.is_empty() {
             return Err(BridgeError::Config(
                 "bedrock converse: messages must include at least one user / \
@@ -1038,20 +1072,20 @@ impl BedrockBridge {
         // only the /invoke body path runs apply_param_constraints otherwise,
         // so without this a Bedrock-wide temperature ceiling silently no-ops
         // for every Converse (non-Anthropic) publisher.
-        if let Some(cfg) = build_inference_config(req, pk_param_constraints(ctx)) {
+        if let Some(cfg) = build_inference_config(&req, pk_param_constraints(ctx)) {
             call = call.inference_config(cfg);
         }
-        if let Some(fields) = build_converse_additional_model_request_fields(req, upstream_id) {
+        if let Some(fields) = build_converse_additional_model_request_fields(&req, upstream_id) {
             call = call.additional_model_request_fields(fields);
         }
         // A caller's `response_format` becomes one of two request shapes
         // here, picked by whether the model constrains its own decoding.
-        let structured = bedrock_structured_output(req, upstream_id);
+        let structured = bedrock_structured_output(&req, upstream_id);
         let mut json_tool_schema = None;
         match &structured {
             StructuredOutput::None => {}
             StructuredOutput::Native(schema) => {
-                if let Some(cfg) = build_output_config(req, schema) {
+                if let Some(cfg) = build_output_config(&req, schema) {
                     call = call.output_config(cfg);
                 }
             }
@@ -1062,13 +1096,15 @@ impl BedrockBridge {
         // drops tool calling and improvises the call as prose
         // (finish_reason=stop, tool_calls=[]).
         if let Some(tc) = build_tool_config(
-            req,
+            &req,
             json_tool_schema,
             BedrockPublisher::from_model_id(upstream_id),
         ) {
             call = call.tool_config(tc);
         }
 
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         let resp = call
             .send()
             .await
@@ -1107,12 +1143,12 @@ impl BedrockBridge {
     /// Reference: <https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html>
     async fn chat_converse_stream(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatChunkStream, BridgeError> {
         let client = self.build_client_from_ctx(ctx)?;
-        let (system_blocks, message_blocks) = build_converse_inputs(req)?;
+        let (system_blocks, message_blocks) = build_converse_inputs(&req)?;
         if message_blocks.is_empty() {
             return Err(BridgeError::Config(
                 "bedrock converse: messages must include at least one user / \
@@ -1132,27 +1168,30 @@ impl BedrockBridge {
         }
         // Mirror chat_converse on the stream path — same audit fix +
         // the #463 param_constraints temperature clamp.
-        if let Some(cfg) = build_inference_config(req, pk_param_constraints(ctx)) {
+        if let Some(cfg) = build_inference_config(&req, pk_param_constraints(ctx)) {
             call = call.inference_config(cfg);
         }
-        if let Some(fields) = build_converse_additional_model_request_fields(req, upstream_id) {
+        if let Some(fields) = build_converse_additional_model_request_fields(&req, upstream_id) {
             call = call.additional_model_request_fields(fields);
         }
         // Only the native structured-output shape reaches this path —
         // `chat_stream` diverts the tool route before it gets here,
         // because a tool call cannot be streamed before it is complete.
-        if let StructuredOutput::Native(schema) = bedrock_structured_output(req, upstream_id) {
-            if let Some(cfg) = build_output_config(req, &schema) {
+        if let StructuredOutput::Native(schema) = bedrock_structured_output(&req, upstream_id) {
+            if let Some(cfg) = build_output_config(&req, &schema) {
                 call = call.output_config(cfg);
             }
         }
         // #560: forward tools on the stream path too (all publishers,
         // incl. Anthropic, stream through Converse).
-        if let Some(tc) = build_tool_config(req, None, BedrockPublisher::from_model_id(upstream_id))
+        if let Some(tc) =
+            build_tool_config(&req, None, BedrockPublisher::from_model_id(upstream_id))
         {
             call = call.tool_config(tc);
         }
 
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         let mut resp = call
             .send()
             .await

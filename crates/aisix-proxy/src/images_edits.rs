@@ -555,7 +555,7 @@ async fn dispatch(
                 // Rebuild the multipart form with `model` rewritten. A `multipart::Form`
                 // is single-use (sending consumes it), so this is a closure: each retry
                 // attempt below builds a fresh one. That is only possible because every
-                // part is `Part::bytes` over an in-memory `Bytes`.
+                // part is built over an in-memory `Bytes`.
                 let build_form = || {
                     let mut form = multipart::Form::new();
                     for (name, file_name, content_type, data) in fields {
@@ -565,13 +565,16 @@ async fn dispatch(
                             data.clone()
                         };
 
-                        let data_vec = field_data.to_vec();
+                        // Over the refcounted `Bytes` itself: `Part::bytes` would
+                        // copy each file into a `Vec` that the form holds for the
+                        // whole upstream wait, next to the request's own copy.
+                        let len = field_data.len() as u64;
+                        let new_part =
+                            || multipart::Part::stream_with_length(field_data.clone(), len);
                         let mut part = if let Some(ct) = content_type {
-                            multipart::Part::bytes(data_vec.clone())
-                                .mime_str(ct)
-                                .unwrap_or_else(|_| multipart::Part::bytes(data_vec))
+                            new_part().mime_str(ct).unwrap_or_else(|_| new_part())
                         } else {
-                            multipart::Part::bytes(data_vec)
+                            new_part()
                         };
                         if let Some(fname) = file_name {
                             part = part.file_name(fname.clone());

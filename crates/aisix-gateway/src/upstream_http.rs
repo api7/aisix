@@ -231,6 +231,23 @@ pub fn send_error(err: reqwest::Error) -> BridgeError {
     }
 }
 
+/// Serialize an upstream request body into an exactly-sized buffer.
+///
+/// Send it with `.body(bytes)` instead of `RequestBuilder::json`, and build
+/// it BEFORE the request future, so whatever it was built from — a
+/// `serde_json::Value`, a translated wire struct — is dropped before the
+/// upstream is awaited. reqwest keeps the body until the response head
+/// arrives, which for a non-streaming call is the whole upstream wait, and
+/// the handler still holds its parsed request for retry and fallback; every
+/// other copy alive across that await is one more multiple of a request
+/// that can carry tens of MB of base64 images. `to_vec` grows its buffer by
+/// doubling, so the spare capacity is handed back before the buffer is held.
+pub fn json_body<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<bytes::Bytes> {
+    let mut buf = serde_json::to_vec(value)?;
+    buf.shrink_to_fit();
+    Ok(bytes::Bytes::from(buf))
+}
+
 /// Same as [`transport_error_message`] for error types that aren't
 /// `reqwest::Error` (websocket handshakes, SDK dispatch errors) — no URL
 /// is available to redact, so only the cause chain is appended.
@@ -290,6 +307,21 @@ fn redact_url(url: &reqwest::Url) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_body_is_the_serialization_in_a_buffer_of_exactly_its_length() {
+        // Large enough that `to_vec`'s doubling leaves spare capacity.
+        let value = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x".repeat(300_000)}],
+        });
+        let body = json_body(&value).unwrap();
+        assert_eq!(body, serde_json::to_vec(&value).unwrap());
+        // Converting back hands over the buffer as it is held, capacity
+        // included.
+        let len = body.len();
+        assert_eq!(Vec::from(body).capacity(), len);
+    }
 
     #[test]
     fn defaults_bound_connect_and_expire_idle_before_reqwest_would() {
@@ -465,6 +497,128 @@ mod tests {
              trust or its connection settings:\n{}",
             offenders.join("\n"),
         );
+    }
+
+    /// Request bodies bound for a model upstream go out as [`json_body`]
+    /// bytes, never through `RequestBuilder::json`. The builder form keeps
+    /// whatever it serialized from alive for as long as the call site
+    /// does, which on these routes is the whole upstream wait, and it
+    /// hands reqwest a buffer with doubling slack; either one multiplies
+    /// what a request carrying tens of MB of images costs while it waits.
+    #[test]
+    fn upstream_request_bodies_are_sent_as_json_body_bytes() {
+        let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        let mut offenders = Vec::new();
+        for file in rust_sources(crates_dir) {
+            let in_scope = file.components().any(|c| {
+                let c = c.as_os_str().to_string_lossy();
+                c == "aisix-proxy" || c.starts_with("aisix-provider-")
+            });
+            if !in_scope {
+                continue;
+            }
+            let src = std::fs::read_to_string(&file).expect("read source");
+            let production = without_test_modules(&src);
+            for (at, _) in production.match_indices(".json(") {
+                let rest = production[at + ".json(".len()..].trim_start();
+                // `resp.json()` decodes a response; only an argument sends one.
+                if !rest.starts_with(')') {
+                    let start = production[..at].rfind('\n').map_or(0, |i| i + 1);
+                    let end = production[at..]
+                        .find('\n')
+                        .map_or(production.len(), |i| at + i);
+                    offenders.push(format!(
+                        "{}: {}",
+                        file.display(),
+                        production[start..end].trim()
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "send upstream request bodies as `aisix_gateway::json_body` bytes built \
+             before the request future, not with `RequestBuilder::json`:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    /// A provider bridge that keeps the default `chat_cow` /
+    /// `chat_stream_cow` borrows the request for the whole call, so a
+    /// translated or rewritten request handed over by value stays alive
+    /// through the upstream wait next to its wire body.
+    #[test]
+    fn provider_bridges_drop_an_owned_request_before_the_upstream_wait() {
+        let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        let mut offenders = Vec::new();
+        for file in rust_sources(crates_dir) {
+            let in_provider = file.components().any(|c| {
+                c.as_os_str()
+                    .to_string_lossy()
+                    .starts_with("aisix-provider-")
+            });
+            if !in_provider {
+                continue;
+            }
+            let src = std::fs::read_to_string(&file).expect("read source");
+            let production = without_test_modules(&src);
+            if !production.contains("impl Bridge for ") {
+                continue;
+            }
+            for method in ["async fn chat_cow(", "async fn chat_stream_cow("] {
+                if !production.contains(method) {
+                    offenders.push(format!("{}: {method}", file.display()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "provider bridges must override the owned-request entry points:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    /// `src` with every `#[cfg(test)] mod … { … }` block removed, wherever
+    /// it sits. [`production_half`] stops at the first test module, and a
+    /// file can declare one (`#[cfg(test)] mod x;`) or nest one near the
+    /// top with production code after it.
+    fn without_test_modules(src: &str) -> String {
+        const MARKER: &str = "#[cfg(test)]";
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(at) = rest.find(MARKER) {
+            let after = &rest[at + MARKER.len()..];
+            let item = after.trim_start();
+            let block = item.starts_with("mod ")
+                && item
+                    .find(['{', ';'])
+                    .is_some_and(|i| item.as_bytes()[i] == b'{');
+            if !block {
+                out.push_str(&rest[..at + MARKER.len()]);
+                rest = after;
+                continue;
+            }
+            out.push_str(&rest[..at]);
+            let open = rest.len() - item.len() + item.find('{').unwrap();
+            let mut depth = 0usize;
+            let mut end = rest.len();
+            for (i, c) in rest[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            rest = &rest[end..];
+        }
+        out.push_str(rest);
+        out
     }
 
     /// A file-level scan cannot bind the rule above to the production

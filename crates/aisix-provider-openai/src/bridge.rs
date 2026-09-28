@@ -28,6 +28,7 @@ use aisix_gateway::{
     UpstreamHeaderContext,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::StreamExt;
 use http::{
     header::{HeaderName, HeaderValue},
@@ -350,29 +351,48 @@ fn prepare_outbound_body<T: serde::Serialize>(
 ) -> Result<Value, BridgeError> {
     let mut body = serde_json::to_value(typed)
         .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
-    close_strict_response_format_schema(&mut body);
+    apply_outbound_overrides(&mut body, reasoning_model, request, response);
+    Ok(body)
+}
+
+/// The override pipeline [`prepare_outbound_body`] runs, on a body the
+/// caller already owns as a `Value`.
+fn apply_outbound_overrides(
+    body: &mut Value,
+    reasoning_model: bool,
+    request: Option<&RequestOverrides>,
+    response: Option<&ResponseOverrides>,
+) {
+    close_strict_response_format_schema(body);
     // Before `param_renames`, so an operator's explicit rename wins.
     if reasoning_model {
-        crate::reasoning::apply_reasoning_token_cap(&mut body);
+        crate::reasoning::apply_reasoning_token_cap(body);
     }
     if let Some(r) = request {
-        apply_param_renames(&mut body, &r.param_renames);
+        apply_param_renames(body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
-            apply_param_constraints(&mut body, constraints);
+            apply_param_constraints(body, constraints);
         }
         // A default `max_tokens` fills a cap the caller did not send, so a
         // reasoning model needs it converted as well; a `max_tokens` already
         // present here was put back by the operator's own rename and stays.
         let had_max_tokens = body.get("max_tokens").is_some();
-        apply_default_body_fields(&mut body, &r.default_body_fields);
+        apply_default_body_fields(body, &r.default_body_fields);
         if reasoning_model && !had_max_tokens {
-            crate::reasoning::apply_reasoning_token_cap(&mut body);
+            crate::reasoning::apply_reasoning_token_cap(body);
         }
     }
     if response.is_some_and(|r| r.content_list_to_string) {
-        apply_content_list_to_string(&mut body);
+        apply_content_list_to_string(body);
     }
-    Ok(body)
+}
+
+/// The wire bytes of an outbound body. Called where the `Value` is a
+/// temporary, so it is gone before the upstream is awaited — see
+/// [`aisix_gateway::json_body`].
+fn outbound_bytes(body: &Value) -> Result<Bytes, BridgeError> {
+    aisix_gateway::json_body(body)
+        .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))
 }
 
 /// Apply OpenAI strict mode's schema rule at the edge that declares it:
@@ -469,17 +489,29 @@ impl Bridge for OpenAiBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
+        self.chat_cow(std::borrow::Cow::Borrowed(req), ctx).await
+    }
+
+    async fn chat_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        let messages = messages_from(req, developer_role_mode(ctx));
-        let typed = build_request(req, upstream, &messages, false);
-        let body = prepare_outbound_body(
-            &typed,
-            is_reasoning_model(ReasoningFamily::Openai, upstream),
-            ctx.provider_key.request.as_ref(),
-            ctx.provider_key.response.as_ref(),
-        )?;
+        let body = {
+            let messages = messages_from(&req, developer_role_mode(ctx));
+            let typed = build_request(&req, upstream, &messages, false);
+            outbound_bytes(&prepare_outbound_body(
+                &typed,
+                is_reasoning_model(ReasoningFamily::Openai, upstream),
+                ctx.provider_key.request.as_ref(),
+                ctx.provider_key.response.as_ref(),
+            )?)?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
@@ -497,7 +529,7 @@ impl Bridge for OpenAiBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
@@ -528,12 +560,12 @@ impl Bridge for OpenAiBridge {
         // default_body_fields / default_headers) just like `chat()` — operators
         // expect them on every endpoint that key serves, not chat only (#867
         // consistency follow-up). No-op when the PK carries no overrides.
-        let body = prepare_outbound_body(
+        let body = outbound_bytes(&prepare_outbound_body(
             &embed_request_body(req, upstream),
             false,
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
-        )?;
+        )?)?;
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
@@ -550,7 +582,7 @@ impl Bridge for OpenAiBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
@@ -577,22 +609,25 @@ impl Bridge for OpenAiBridge {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        // Replace the `model` field with the upstream provider id.
-        let mut outbound = body.clone();
-        if let Some(obj) = outbound.as_object_mut() {
-            obj.insert(
-                "model".to_string(),
-                serde_json::Value::String(upstream.to_string()),
+        let outbound = {
+            // Replace the `model` field with the upstream provider id.
+            let mut outbound = body.clone();
+            if let Some(obj) = outbound.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(upstream.to_string()),
+                );
+            }
+            // Apply the PK's request overrides like `chat()` (#867 consistency
+            // follow-up); no-op when none are configured.
+            apply_outbound_overrides(
+                &mut outbound,
+                false,
+                ctx.provider_key.request.as_ref(),
+                ctx.provider_key.response.as_ref(),
             );
-        }
-        // Apply the PK's request overrides like `chat()` (#867 consistency
-        // follow-up); no-op when none are configured.
-        let outbound = prepare_outbound_body(
-            &outbound,
-            false,
-            ctx.provider_key.request.as_ref(),
-            ctx.provider_key.response.as_ref(),
-        )?;
+            outbound_bytes(&outbound)?
+        };
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
 
         let url = cached_endpoint_url(
@@ -610,7 +645,7 @@ impl Bridge for OpenAiBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&outbound)
+                .body(outbound)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
@@ -635,22 +670,25 @@ impl Bridge for OpenAiBridge {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        // Replace the `model` field with the upstream provider id.
-        let mut outbound = body.clone();
-        if let Some(obj) = outbound.as_object_mut() {
-            obj.insert(
-                "model".to_string(),
-                serde_json::Value::String(upstream.to_string()),
+        let outbound = {
+            // Replace the `model` field with the upstream provider id.
+            let mut outbound = body.clone();
+            if let Some(obj) = outbound.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(upstream.to_string()),
+                );
+            }
+            // Apply the PK's request overrides like `chat()` (#867 consistency
+            // follow-up); no-op when none are configured.
+            apply_outbound_overrides(
+                &mut outbound,
+                false,
+                ctx.provider_key.request.as_ref(),
+                ctx.provider_key.response.as_ref(),
             );
-        }
-        // Apply the PK's request overrides like `chat()` (#867 consistency
-        // follow-up); no-op when none are configured.
-        let outbound = prepare_outbound_body(
-            &outbound,
-            false,
-            ctx.provider_key.request.as_ref(),
-            ctx.provider_key.response.as_ref(),
-        )?;
+            outbound_bytes(&outbound)?
+        };
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
 
         let url = cached_endpoint_url(
@@ -668,7 +706,7 @@ impl Bridge for OpenAiBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&outbound)
+                .body(outbound)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
@@ -690,17 +728,30 @@ impl Bridge for OpenAiBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
+        self.chat_stream_cow(std::borrow::Cow::Borrowed(req), ctx)
+            .await
+    }
+
+    async fn chat_stream_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatChunkStream, BridgeError> {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        let messages = messages_from(req, developer_role_mode(ctx));
-        let typed = build_request(req, upstream, &messages, true);
-        let body = prepare_outbound_body(
-            &typed,
-            is_reasoning_model(ReasoningFamily::Openai, upstream),
-            ctx.provider_key.request.as_ref(),
-            ctx.provider_key.response.as_ref(),
-        )?;
+        let body = {
+            let messages = messages_from(&req, developer_role_mode(ctx));
+            let typed = build_request(&req, upstream, &messages, true);
+            outbound_bytes(&prepare_outbound_body(
+                &typed,
+                is_reasoning_model(ReasoningFamily::Openai, upstream),
+                ctx.provider_key.request.as_ref(),
+                ctx.provider_key.response.as_ref(),
+            )?)?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         let headers = build_request_headers(key, &ctx.request_id, true, &ctx.header_ctx())?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
@@ -717,7 +768,7 @@ impl Bridge for OpenAiBridge {
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)

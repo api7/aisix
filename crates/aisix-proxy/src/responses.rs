@@ -1218,8 +1218,8 @@ async fn responses_to_target(
     let chain = chain_arc.as_ref();
     // Largest content cap any enabled content-capturing exporter wants, or
     // `None` when none do (AISIX-Cloud#947). The captured prompt is the
-    // client-facing request body (post-#932-redaction), taken BEFORE the
-    // upstream model rewrite below so the log shows what the caller sent.
+    // client-facing request body (post-#932-redaction), not the rewritten
+    // outbound one, so the log shows what the caller sent.
     let content_cap = content_capture_cap(
         snapshot
             .observability_exporters
@@ -1227,8 +1227,6 @@ async fn responses_to_target(
             .iter()
             .map(|e| &e.value),
     );
-    let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
-    let mut body = crate::effort_mapping::responses_request(body, model).into_owned();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     // Resolved PK id for per-PK telemetry attribution on the emitted
     // UsageEvent (AISIX-Cloud#867).
@@ -1236,27 +1234,40 @@ async fn responses_to_target(
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
-    // Rewrite model field to upstream name.
-    if let Some(m) = body.get_mut("model") {
-        *m = Value::String(upstream_model.clone());
-    }
+    // Only the outbound wire bytes outlive this block: the caller keeps its
+    // body for fail-over, and reqwest holds these until the response head,
+    // so a `Value` copy alive across the await would be a third copy of the
+    // request (see `crate::util::outbound_json`).
+    let (body_bytes, is_stream) = {
+        let mut body = crate::effort_mapping::responses_request(body, model).into_owned();
 
-    // Apply the PK's `request.*` overrides to the outbound body, matching the
-    // OpenAI bridge's chat() path and the /v1/messages passthrough. The
-    // verbatim /v1/responses path builds the request directly (bypassing the
-    // Hub), so without this the override pipeline silently no-ops for Codex
-    // traffic (AISIX-Cloud#867 follow-up). Apply order: renames → constraints
-    // → defaults; each is a no-op when its configured map is empty.
-    if let Some(r) = pk_entry.value.request.as_ref() {
-        aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
-        if let Some(constraints) = &r.param_constraints {
-            aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
+        // Rewrite model field to upstream name.
+        if let Some(m) = body.get_mut("model") {
+            *m = Value::String(upstream_model.clone());
         }
-        aisix_provider_openai::overrides::apply_default_body_fields(
-            &mut body,
-            &r.default_body_fields,
-        );
-    }
+
+        // Apply the PK's `request.*` overrides to the outbound body, matching the
+        // OpenAI bridge's chat() path and the /v1/messages passthrough. The
+        // verbatim /v1/responses path builds the request directly (bypassing the
+        // Hub), so without this the override pipeline silently no-ops for Codex
+        // traffic (AISIX-Cloud#867 follow-up). Apply order: renames → constraints
+        // → defaults; each is a no-op when its configured map is empty.
+        if let Some(r) = pk_entry.value.request.as_ref() {
+            aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
+            if let Some(constraints) = &r.param_constraints {
+                aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
+            }
+            aisix_provider_openai::overrides::apply_default_body_fields(
+                &mut body,
+                &r.default_body_fields,
+            );
+        }
+        let is_stream = body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        (crate::util::outbound_json(&body)?, is_stream)
+    };
 
     let url = aisix_gateway::url_cache::cached_endpoint_url(
         &pk_entry.id,
@@ -1277,11 +1288,6 @@ async fn responses_to_target(
             ))
         },
     )?;
-
-    let is_stream = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
 
     // Build headers explicitly so the PK's `request.default_headers` and
     // `request.forward_client_headers` can inject operator/client headers.
@@ -1317,7 +1323,10 @@ async fn responses_to_target(
     );
 
     let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
-    let mut req = url.post_on(&client).headers(headers).json(&body);
+    let mut req = url
+        .post_on(&client)
+        .headers(headers)
+        .body(body_bytes.clone());
     // #554: non-streaming gets the E2E request timeout via reqwest's
     // request-level timeout. Streaming must NOT use it (it would cap the
     // whole stream); the streaming branch below enforces the per-chunk
@@ -1350,6 +1359,9 @@ async fn responses_to_target(
                 )
             })
             .map_err(ProxyError::Bridge)?;
+    // Serialized once the upstream has answered, not before: a copy made
+    // up front would be alive for the whole upstream wait.
+    let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
 
     let status = upstream_resp.status();
 
@@ -1660,7 +1672,9 @@ async fn responses_to_target(
             if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
                 let est = crate::token_estimate::Estimator::new(
                     &upstream_model,
-                    crate::token_estimate::PromptInput::Responses(body.clone()),
+                    crate::token_estimate::PromptInput::Responses(crate::util::outbound_value(
+                        &body_bytes,
+                    )),
                 );
                 let filled = crate::token_estimate::fill_missing(
                     &est,
@@ -1926,7 +1940,7 @@ async fn responses_to_target(
         // Tokenized only if the upstream never reports usage.
         let estimator_c = crate::token_estimate::Estimator::new(
             &upstream_model,
-            crate::token_estimate::PromptInput::Responses(body.clone()),
+            crate::token_estimate::PromptInput::Responses(crate::util::outbound_value(&body_bytes)),
         );
         let parsed_stream = build_responses_passthrough_stream(
             body_stream,
@@ -2116,7 +2130,9 @@ async fn responses_to_target(
             if u.prompt_tokens == 0 || u.completion_tokens == 0 {
                 let est = crate::token_estimate::Estimator::new(
                     &upstream_model,
-                    crate::token_estimate::PromptInput::Responses(body.clone()),
+                    crate::token_estimate::PromptInput::Responses(crate::util::outbound_value(
+                        &body_bytes,
+                    )),
                 );
                 let filled = crate::token_estimate::fill_missing(
                     &est,
@@ -2293,7 +2309,6 @@ async fn responses_cross_provider_to_target(
             .iter()
             .map(|e| &e.value),
     );
-    let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
 
     let provider = model
         .provider
@@ -2315,6 +2330,9 @@ async fn responses_cross_provider_to_target(
     let outbound_body = crate::effort_mapping::responses_request(body, model);
     let chat =
         crate::responses_bridge::responses_request_to_chat(requested_model, outbound_body.as_ref());
+    // A rewritten body is a whole-request copy; the translation above is
+    // all this attempt needs from it.
+    drop(outbound_body);
     // `custom` tools and namespace sub-tools travel upstream as plain
     // function tools, so only the request's own tool list can tell the
     // reply translators which item each of the model's calls goes back as;
@@ -2354,14 +2372,20 @@ async fn responses_cross_provider_to_target(
     let in_flight = state.runtime_status.begin_in_flight(model_id);
 
     if is_stream {
-        let upstream = bridge.chat_stream(&chat, &ctx).await.map_err(|err| {
-            if let Some((ttl, reason)) =
-                crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-            {
-                state.runtime_status.mark_cooldown(model_id, ttl, reason);
-            }
-            ProxyError::Bridge(err)
-        })?;
+        let upstream = bridge
+            .chat_stream_cow(std::borrow::Cow::Owned(chat), &ctx)
+            .await
+            .map_err(|err| {
+                if let Some((ttl, reason)) =
+                    crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                {
+                    state.runtime_status.mark_cooldown(model_id, ttl, reason);
+                }
+                ProxyError::Bridge(err)
+            })?;
+        // Serialized once the upstream has answered, not before: a copy made
+        // up front would be alive for the whole upstream wait.
+        let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
         // #554: peek the first chunk so a slow/erroring first token fails
         // over before the 200 is committed (when a stream budget is set);
         // the wrapper keeps enforcing the per-chunk read timeout either way.
@@ -2640,13 +2664,20 @@ async fn responses_cross_provider_to_target(
     }
 
     // Non-streaming.
-    let mut resp = bridge.chat(&chat, &ctx).await.map_err(|err| {
-        if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-        {
-            state.runtime_status.mark_cooldown(model_id, ttl, reason);
-        }
-        ProxyError::Bridge(err)
-    })?;
+    let mut resp = bridge
+        .chat_cow(std::borrow::Cow::Owned(chat), &ctx)
+        .await
+        .map_err(|err| {
+            if let Some((ttl, reason)) =
+                crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+            {
+                state.runtime_status.mark_cooldown(model_id, ttl, reason);
+            }
+            ProxyError::Bridge(err)
+        })?;
+    // Serialized once the upstream has answered, not before: a copy made
+    // up front would be alive for the whole upstream wait.
+    let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
     state.health.record_success(&model.display_name);
     state.runtime_status.mark_healthy(model_id);
 
@@ -4099,7 +4130,7 @@ mod tests {
         let seen: Vec<_> = chat
             .messages
             .iter()
-            .map(|m| (m.role, m.content_str().to_owned()))
+            .map(|m| (m.role, m.content_str().into_owned()))
             .collect();
         assert_eq!(seen.len(), 7, "{seen:?}");
         assert_eq!(seen[0].0, aisix_gateway::Role::System);
@@ -4171,7 +4202,7 @@ mod tests {
             window
                 .messages
                 .iter()
-                .map(|m| (m.role, m.content_str().to_owned()))
+                .map(|m| (m.role, m.content_str().into_owned()))
                 .collect::<Vec<_>>(),
         );
     }

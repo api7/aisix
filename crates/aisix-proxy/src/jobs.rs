@@ -980,7 +980,10 @@ pub(crate) async fn create_file(
                         "failed to read file field",
                     )
                 })?;
-                let mut part = reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(file_name);
+                // Over the `Bytes` itself, not a `Vec` copy of the file.
+                let len = bytes.len() as u64;
+                let mut part =
+                    reqwest::multipart::Part::stream_with_length(bytes, len).file_name(file_name);
                 if let Some(ct) = content_type {
                     part = part.mime_str(&ct).map_err(|e| {
                         ProxyError::InvalidRequest(format!("invalid file content-type: {e}"))
