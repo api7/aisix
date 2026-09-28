@@ -178,6 +178,10 @@ const MAX_RETAINED_PARTIAL_ROWS: usize = 1024;
 /// here, and a knob would only offer a way to make shutdown hang longer.
 const CACHE_WRITE_DRAIN: Duration = Duration::from_secs(5);
 
+/// The pause before re-entering the cycle after a graceful stream end
+/// (compaction, a server-initiated close), so reconnecting never spins.
+const GRACEFUL_RECONNECT_DELAY: Duration = Duration::from_millis(100);
+
 /// One key whose latest etcd bytes are rejected while its last
 /// successfully loaded value keeps serving (#871, xDS-NACK style).
 /// `entry` pins the last-known-good raw document with the revision it
@@ -1745,19 +1749,24 @@ impl<P: ConfigProvider> Supervisor<P> {
 
     async fn watch_loop(&self, mut cancel: tokio::sync::watch::Receiver<bool>) {
         let mut backoff = ExpBackoff::default();
+        // The wait that preceded the current cycle, and when that cycle
+        // reached steady state (applied its read and opened its watches).
+        let mut preceding_delay = Duration::ZERO;
+        let mut steady_since = None;
         loop {
             if *cancel.borrow() {
                 return;
             }
 
-            match self.cycle(&cancel).await {
+            match self.cycle(&cancel, &mut steady_since).await {
                 Ok(()) => {
                     // Graceful stream end (compaction or server-initiated
                     // close). Reset backoff, but still yield a short
                     // interval before reconnecting so we never spin.
                     backoff.reset();
+                    preceding_delay = GRACEFUL_RECONNECT_DELAY;
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        _ = tokio::time::sleep(GRACEFUL_RECONNECT_DELAY) => {}
                         _ = cancel.changed() => {
                             if *cancel.borrow() { return; }
                         }
@@ -1769,7 +1778,21 @@ impl<P: ConfigProvider> Supervisor<P> {
                     // flips false and a fetch-reason reload failure is counted.
                     // The last-good applied snapshot keeps serving.
                     self.config_status.record_fetch_failure();
+                    // A cycle that stayed healthy for at least as long as
+                    // the wait before it earned a fresh start: an
+                    // occasional failure after a long healthy run (kine
+                    // dropping a watcher that fell behind a bulk edit)
+                    // must not inherit every earlier one's escalation. A
+                    // cycle that failed before steady state, or soon after
+                    // reaching it, keeps escalating, so a server that
+                    // fails us at once cannot drive a fast loop.
+                    if steady_since.is_some_and(|since: tokio::time::Instant| {
+                        since.elapsed() >= preceding_delay
+                    }) {
+                        backoff.reset();
+                    }
                     let delay = backoff.next_delay();
+                    preceding_delay = delay;
                     // A refusal is not a transport hiccup: etcd answered
                     // and said no, and no amount of backing off changes
                     // that. The boot path exits on one, but by here the
@@ -1824,7 +1847,9 @@ impl<P: ConfigProvider> Supervisor<P> {
     async fn cycle(
         &self,
         cancel: &tokio::sync::watch::Receiver<bool>,
+        steady_since: &mut Option<tokio::time::Instant>,
     ) -> Result<(), SupervisorError> {
+        *steady_since = None;
         let load = tokio::select! {
             biased;
             _ = wait_for_cancel(cancel.clone()) => return Err(SupervisorError::Cancelled),
@@ -1864,6 +1889,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                 Err(err) => return Err(SupervisorError::Provider(err)),
             }
         }
+        *steady_since = Some(tokio::time::Instant::now());
         // Each stream is tagged so its END is delivered as an item
         // rather than absorbed by `select_all`. See [`Watched`].
         let mut stream = futures::stream::select_all(streams.into_iter().map(|s| {
@@ -3415,7 +3441,7 @@ mod tests {
         );
         let (_tx, rx) = tokio::sync::watch::channel(false);
 
-        let cycle = tokio::time::timeout(Duration::from_secs(5), sup.cycle(&rx)).await;
+        let cycle = tokio::time::timeout(Duration::from_secs(5), sup.cycle(&rx, &mut None)).await;
         assert!(
             matches!(cycle, Ok(Ok(()))),
             "the environment watch ended, so the cycle must return and let \
@@ -3442,7 +3468,7 @@ mod tests {
         let sup = scoped_supervisor(Arc::clone(&env), Arc::clone(&global));
 
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        sup.cycle(&rx).await.expect("cycle completes");
+        sup.cycle(&rx, &mut None).await.expect("cycle completes");
 
         assert_eq!(
             *env.watched_from.lock().unwrap(),
@@ -3470,7 +3496,9 @@ mod tests {
         // The environment stream is empty, so the cycle drains it and
         // returns Ok — a refusal on the catalog would have surfaced here
         // as SupervisorError::Provider.
-        sup.cycle(&rx).await.expect("cycle survives the refusal");
+        sup.cycle(&rx, &mut None)
+            .await
+            .expect("cycle survives the refusal");
         assert_eq!(sup.handle().load().models.len(), 1);
     }
 
@@ -3700,7 +3728,7 @@ mod tests {
 
         let (_tx, rx) = tokio::sync::watch::channel(false);
         // One cycle: load_all, then drain the whole prepared stream.
-        let _ = sup.cycle(&rx).await;
+        let _ = sup.cycle(&rx, &mut None).await;
 
         let snap = sup.handle().load();
         assert_eq!(snap.models.len(), 6);
@@ -3744,7 +3772,7 @@ mod tests {
         let provider = Arc::new(FakeProvider::new(vec![], 0).with_events(events));
         let sup = Arc::new(Supervisor::new(provider, "/aisix"));
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        let _ = sup.cycle(&rx).await;
+        let _ = sup.cycle(&rx, &mut None).await;
 
         let snap = sup.handle().load();
         assert_eq!(snap.models.len(), 1, "the put after the delete survived");
@@ -3896,7 +3924,7 @@ mod tests {
         let provider = Arc::new(FakeProvider::new(vec![], 0).with_events(events));
         let sup = Arc::new(Supervisor::new(provider, "/aisix"));
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        let _ = sup.cycle(&rx).await;
+        let _ = sup.cycle(&rx, &mut None).await;
 
         let snap = sup.handle().load();
         assert_eq!(snap.models.len(), 1, "the pinned last known good serves");
@@ -4001,7 +4029,7 @@ mod tests {
         let watcher = tokio::spawn({
             let sup = sup.clone();
             async move {
-                let _ = sup.cycle(&cancel_rx).await;
+                let _ = sup.cycle(&cancel_rx, &mut None).await;
             }
         });
 
@@ -4068,7 +4096,7 @@ mod tests {
         let watcher = tokio::spawn({
             let sup = sup.clone();
             async move {
-                let _ = sup.cycle(&cancel_rx).await;
+                let _ = sup.cycle(&cancel_rx, &mut None).await;
             }
         });
 
@@ -4129,7 +4157,7 @@ mod tests {
 
         let watcher = tokio::spawn({
             let sup = sup.clone();
-            async move { sup.cycle(&cancel_rx).await }
+            async move { sup.cycle(&cancel_rx, &mut None).await }
         });
         let load_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while sup.handle().version() == 0 {
@@ -4182,7 +4210,7 @@ mod tests {
 
         let watcher = tokio::spawn({
             let sup = sup.clone();
-            async move { sup.cycle(&cancel_rx).await }
+            async move { sup.cycle(&cancel_rx, &mut None).await }
         });
         let load_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while sup.handle().version() == 0 {
@@ -5604,5 +5632,134 @@ mod tests {
             Some(applied.config_hash.as_str()),
             view.source.source_hash.as_deref(),
         );
+    }
+
+    /// One cycle of [`FlakyProvider`]'s script.
+    #[derive(Clone, Copy)]
+    enum Flake {
+        /// The range read fails after this long: the cycle never reaches
+        /// steady state.
+        LoadFailsAfter(Duration),
+        /// The read succeeds and the watch opens, then the server cancels
+        /// it after this long.
+        CancelAfter(Duration),
+    }
+
+    /// Fails every cycle the way its script says, and records when each
+    /// failure landed and when the next read began.
+    struct FlakyProvider {
+        script: Mutex<std::collections::VecDeque<Flake>>,
+        reads: Mutex<Vec<tokio::time::Instant>>,
+        failures: Arc<Mutex<Vec<tokio::time::Instant>>>,
+    }
+
+    #[async_trait]
+    impl ConfigProvider for FlakyProvider {
+        async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
+            self.reads.lock().unwrap().push(tokio::time::Instant::now());
+            let failing = {
+                let mut script = self.script.lock().unwrap();
+                match script.front() {
+                    Some(Flake::LoadFailsAfter(after)) => {
+                        let after = *after;
+                        script.pop_front();
+                        Some(after)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(after) = failing {
+                tokio::time::sleep(after).await;
+                self.failures
+                    .lock()
+                    .unwrap()
+                    .push(tokio::time::Instant::now());
+                return Err(ProviderError::Connect("connection refused".into()));
+            }
+            Ok((Vec::new(), 1))
+        }
+
+        async fn watch(
+            &self,
+            _start_revision: i64,
+        ) -> Result<
+            Box<dyn futures::Stream<Item = Result<WatchEvent, ProviderError>> + Send + Unpin>,
+            ProviderError,
+        > {
+            let Some(Flake::CancelAfter(after)) = self.script.lock().unwrap().pop_front() else {
+                return Ok(Box::new(stream::pending()));
+            };
+            let failures = self.failures.clone();
+            Ok(Box::new(stream::once(Box::pin(async move {
+                tokio::time::sleep(after).await;
+                failures.lock().unwrap().push(tokio::time::Instant::now());
+                Err(ProviderError::Watch(
+                    "etcd cancelled the watch: no reason given".into(),
+                ))
+            }))))
+        }
+    }
+
+    /// Runs the supervisor over `script` on virtual time and returns the
+    /// wait between each failure and the read that followed it.
+    async fn retry_delays(script: Vec<Flake>) -> Vec<Duration> {
+        let cycles = script.len();
+        let provider = Arc::new(FlakyProvider {
+            script: Mutex::new(script.into()),
+            reads: Mutex::new(Vec::new()),
+            failures: Arc::new(Mutex::new(Vec::new())),
+        });
+        let sup = Arc::new(Supervisor::new(provider.clone(), "/aisix"));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(sup.run(cancel_rx));
+        while provider.reads.lock().unwrap().len() <= cycles {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        cancel_tx.send(true).unwrap();
+        run.await.unwrap();
+        let reads = provider.reads.lock().unwrap();
+        let failures = provider.failures.lock().unwrap();
+        failures
+            .iter()
+            .zip(reads.iter().skip(1))
+            .map(|(failed, next)| *next - *failed)
+            .collect()
+    }
+
+    const S: fn(u64) -> Duration = Duration::from_secs;
+
+    /// A failure after a long healthy run starts over at the initial
+    /// delay instead of inheriting every earlier failure's escalation —
+    /// the shape of kine dropping a watcher that fell behind a bulk edit,
+    /// once in a while, over a process's lifetime.
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_after_a_healthy_run_retries_at_the_initial_delay() {
+        let delays = retry_delays(vec![
+            Flake::CancelAfter(Duration::ZERO),
+            Flake::CancelAfter(Duration::ZERO),
+            Flake::CancelAfter(Duration::ZERO),
+            // Healthy for longer than the 4s wait that preceded it.
+            Flake::CancelAfter(S(10)),
+        ])
+        .await;
+        assert_eq!(delays, vec![S(1), S(2), S(4), S(1)]);
+    }
+
+    /// Failures that come before steady state, or sooner after reaching
+    /// it than the wait that preceded the cycle, keep escalating: a
+    /// server that fails the gateway at once cannot drive a fast loop.
+    #[tokio::test(start_paused = true)]
+    async fn failures_before_or_soon_after_steady_state_keep_escalating() {
+        let delays = retry_delays(vec![
+            Flake::LoadFailsAfter(Duration::ZERO),
+            // A read that takes longer than the wait before it (a range
+            // timing out) is still not steady state.
+            Flake::LoadFailsAfter(S(5)),
+            Flake::CancelAfter(Duration::ZERO),
+            // Healthy, but for less than the 4s wait that preceded it.
+            Flake::CancelAfter(Duration::from_millis(3_900)),
+        ])
+        .await;
+        assert_eq!(delays, vec![S(1), S(2), S(4), S(8)]);
     }
 }
