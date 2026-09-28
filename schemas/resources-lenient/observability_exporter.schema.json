@@ -97,7 +97,7 @@
         },
         "endpoint": {
           "description": "Full URL of the OTLP/HTTP traces endpoint. Include the receiver's expected path, such as `/v1/traces`.",
-          "pattern": "^https://.+|^http://(mock-otlp|otel-collector|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$",
+          "pattern": "^https://.+|^http://([^/?#]*@)?(mock-otlp|otel-collector|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$",
           "type": "string"
         },
         "headers": {
@@ -267,7 +267,7 @@
         },
         "endpoint": {
           "description": "Backend endpoint override: an S3-compatible host such as MinIO, Aliyun OSS, or Cloudflare R2, a Cloud Storage XML API base URL such as a private endpoint, or an Azure Blob endpoint. A `gcs` endpoint must implement the Cloud Storage XML API and accept the percent-encoded object names the gateway sends; the stock fake-gcs-server image does not, so it cannot receive objects. When omitted, the provider's native endpoint is used.",
-          "pattern": "^https://.+|^http://(minio|azurite|fake-gcs-server|fake-gcs|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$",
+          "pattern": "^https://.+|^http://([^/?#]*@)?(minio|azurite|fake-gcs-server|fake-gcs|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$",
           "type": "string"
         },
         "kind": {

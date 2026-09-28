@@ -57,7 +57,7 @@ pub struct OtlpHttpConfig {
     /// Full URL of the OTLP/HTTP traces endpoint. Include the receiver's
     /// expected path, such as `/v1/traces`.
     #[schemars(regex(
-        pattern = r"^https://.+|^http://(mock-otlp|otel-collector|127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$"
+        pattern = r"^https://.+|^http://([^/?#]*@)?(mock-otlp|otel-collector|127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$"
     ))]
     pub endpoint: String,
 
@@ -202,7 +202,7 @@ pub struct ObjectStoreConfig {
     /// Backend endpoint override: an S3-compatible host such as MinIO, Aliyun OSS, or Cloudflare R2, a Cloud Storage XML API base URL such as a private endpoint, or an Azure Blob endpoint. A `gcs` endpoint must implement the Cloud Storage XML API and accept the percent-encoded object names the gateway sends; the stock fake-gcs-server image does not, so it cannot receive objects. When omitted, the provider's native endpoint is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(
-        pattern = r"^https://.+|^http://(minio|azurite|fake-gcs-server|fake-gcs|127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$"
+        pattern = r"^https://.+|^http://([^/?#]*@)?(minio|azurite|fake-gcs-server|fake-gcs|127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$"
     ))]
     pub endpoint: Option<String>,
 
@@ -419,6 +419,35 @@ mod tests {
         assert!(crate::models::validate_observability_exporter_lenient(&v).is_ok());
         let e: ObservabilityExporter = serde_json::from_value(v).unwrap();
         assert!(matches!(e.kind, ExporterKind::OtlpHttp(_)));
+    }
+
+    #[test]
+    fn a_loopback_http_endpoint_may_carry_userinfo_but_not_hide_its_host() {
+        let otlp = |endpoint: &str| serde_json::json!({"name": "x", "kind": "otlp_http", "endpoint": endpoint});
+        let object_store = |endpoint: &str| {
+            serde_json::json!({
+                "name": "x", "kind": "object_store", "provider": "s3", "bucket": "b", "prefix": "p",
+                "credential_ref": "c", "endpoint": endpoint,
+            })
+        };
+        let both = |v: &serde_json::Value| {
+            (
+                crate::models::validate_observability_exporter(v).is_ok(),
+                crate::models::validate_observability_exporter_lenient(v).is_ok(),
+            )
+        };
+        for (doc, accepted) in [
+            (otlp("http://user:pw@localhost:4318/v1/traces"), true),
+            (otlp("http://user@mock-otlp/v1/traces"), true),
+            (otlp("http://localhost@evil.example/x"), false),
+            (otlp("http://a@localhost@evil.example"), false),
+            (otlp("http://user:pw@evil.example/v1/traces"), false),
+            (object_store("http://ak:sk@minio:9000"), true),
+            (object_store("http://localhost@evil.example/x"), false),
+            (object_store("http://a@localhost@evil.example"), false),
+        ] {
+            assert_eq!(both(&doc), (accepted, accepted), "{doc}");
+        }
     }
 
     #[test]
