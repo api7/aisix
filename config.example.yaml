@@ -173,6 +173,10 @@ admin:
 observability:
   service_name: "aisix"
   log_level: "info"
+  # One access-log line ("proxy request completed") per request, written at
+  # `info`, so the effective log filter (`RUST_LOG` when set, else `log_level`)
+  # must allow `info` for it to appear. false turns the access log off whatever
+  # the filter; every other log line is unaffected.
   access_log: true
   metrics:
     # Complete label lists per metric. Omitted metrics retain their defaults.

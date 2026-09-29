@@ -135,6 +135,7 @@ pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
         return Err(ObsError::AlreadyInitialised);
     }
     let _ = LOG_WRITER.set(writer);
+    access_log::set_enabled(cfg.access_log);
 
     tracing::info!(
         service = %cfg.service_name,

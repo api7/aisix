@@ -567,7 +567,6 @@ async function spawnPointedAtDeadEtcd(): Promise<MinimalApp> {
     observability: {
       service_name: "aisix-status-nl",
       log_level: "warn",
-      access_log: false,
       metrics: {
         prometheus: { enabled: true, path: "/metrics", addr: `127.0.0.1:${metricsPort}` },
         // Retired blocks, kept here on purpose: they were placeholders no
