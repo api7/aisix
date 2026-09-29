@@ -18,7 +18,8 @@ import {
 // An operator auditing who hit the gateway with a bad credential reads the
 // access log, so every denial shape — no credential, an unknown key, a
 // disabled or expired key, a rejected JWT — is one line there, on every
-// proxy surface, carrying the status the caller saw and never the
+// proxy surface (a JWT short of a required scope is a 403, the rest 401),
+// carrying the status the caller saw and never the
 // credential itself. `observability.access_log: false` suppresses these
 // lines like every other.
 
@@ -71,12 +72,18 @@ async function send(
   return { status: res.status, id: res.headers.get("x-aisix-request-id") ?? "" };
 }
 
-async function drive(app: SpawnedApp, idp: MockIdp): Promise<Sent[]> {
+async function drive(app: SpawnedApp, idp: MockIdp, scopedIdp: MockIdp): Promise<Sent[]> {
   const jwtExpired = idp.sign(
     agentClaims(idp.url, { exp: Math.floor(Date.now() / 1000) - 3600 }),
   );
   const jwtUnmapped = idp.sign(agentClaims(idp.url, { sub: "nobody-bound" }));
-  const credentials: ReadonlyArray<{ label: string; headers: Record<string, string>; secret?: string }> = [
+  const jwtUnscoped = scopedIdp.sign(agentClaims(scopedIdp.url));
+  const credentials: ReadonlyArray<{
+    label: string;
+    headers: Record<string, string>;
+    secret?: string;
+    status?: number;
+  }> = [
     { label: "no credential", headers: {} },
     { label: "unknown key", headers: { authorization: `Bearer ${UNKNOWN}` }, secret: UNKNOWN },
     { label: "unknown x-api-key", headers: { "x-api-key": UNKNOWN }, secret: UNKNOWN },
@@ -84,13 +91,19 @@ async function drive(app: SpawnedApp, idp: MockIdp): Promise<Sent[]> {
     { label: "expired key", headers: { authorization: `Bearer ${EXPIRED}` }, secret: EXPIRED },
     { label: "expired jwt", headers: { authorization: `Bearer ${jwtExpired}` }, secret: jwtExpired },
     { label: "unmapped jwt", headers: { authorization: `Bearer ${jwtUnmapped}` }, secret: jwtUnmapped },
+    {
+      label: "jwt missing a required scope",
+      headers: { authorization: `Bearer ${jwtUnscoped}` },
+      secret: jwtUnscoped,
+      status: 403,
+    },
   ];
   const sent: Sent[] = [];
   for (const { method, path } of SURFACES) {
     for (const cred of credentials) {
       const { status, id } = await send(app, method, path, cred.headers);
       const label = `${cred.label} on ${method} ${path}`;
-      expect(status, label).toBe(401);
+      expect(status, label).toBe(cred.status ?? 401);
       expect(id, `${label} carries x-aisix-request-id`).toBeTruthy();
       sent.push({ id, status, secret: cred.secret, label });
     }
@@ -107,6 +120,7 @@ async function drainedLines(app: SpawnedApp): Promise<string[]> {
 
 describe("an authentication denial writes its access-log line", () => {
   let idp: MockIdp | undefined;
+  let scopedIdp: MockIdp | undefined;
   let on: SpawnedApp | undefined;
   let off: SpawnedApp | undefined;
   let etcdReachable = false;
@@ -116,6 +130,7 @@ describe("an authentication denial writes its access-log line", () => {
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     idp = await startMockIdp();
+    scopedIdp = await startMockIdp();
     on = await spawnApp({ logLevel: "info" });
     off = await spawnApp({ logLevel: "info", accessLog: false });
     for (const app of [on, off]) {
@@ -125,6 +140,13 @@ describe("an authentication denial writes its access-log line", () => {
         issuer: idp.url,
         audiences: ["aisix-gateway"],
         jwks_uri: idp.jwksUrl,
+      });
+      await seed.createOidcProvider({
+        name: "auth-denial-scoped-idp",
+        issuer: scopedIdp.url,
+        audiences: ["aisix-gateway"],
+        jwks_uri: scopedIdp.jwksUrl,
+        required_scopes: ["ai.access"],
       });
       await seed.createApiKey({ key_hash: sha(DISABLED), allowed_models: ["*"], disabled: true });
       await seed.createApiKey({
@@ -143,19 +165,22 @@ describe("an authentication denial writes its access-log line", () => {
     await on?.exit();
     await off?.exit();
     await idp?.close();
+    await scopedIdp?.close();
   });
 
   test("each denial is exactly one line with its status and without the credential", async (ctx) => {
-    if (!etcdReachable || !on || !idp) {
+    if (!etcdReachable || !on || !idp || !scopedIdp) {
       ctx.skip();
       return;
     }
-    const sent = await drive(on, idp);
+    const sent = await drive(on, idp, scopedIdp);
     const lines = (await drainedLines(on)).filter((l) => l.includes(ACCESS_LINE));
     for (const s of sent) {
       const mine = lines.filter((l) => l.includes(`request_id="${s.id}"`));
       expect(mine, `one access-log line for ${s.label}`).toHaveLength(1);
       expect(mine[0], s.label).toContain(`status=${s.status}`);
+      // Nothing about the caller is established by a refused credential.
+      expect(mine[0], s.label).not.toContain("api_key_id=");
       if (s.secret) {
         expect(mine[0].includes(s.secret), `${s.label}: credential not logged`).toBe(false);
       }
@@ -163,11 +188,11 @@ describe("an authentication denial writes its access-log line", () => {
   });
 
   test("access_log: false suppresses them", async (ctx) => {
-    if (!etcdReachable || !off || !idp) {
+    if (!etcdReachable || !off || !idp || !scopedIdp) {
       ctx.skip();
       return;
     }
-    await drive(off, idp);
+    await drive(off, idp, scopedIdp);
     const lines = await drainedLines(off);
     expect(lines.filter((l) => l.includes(ACCESS_LINE))).toEqual([]);
     // Only the access log is off: the gateway's other `info` lines remain.
