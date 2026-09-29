@@ -137,6 +137,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             &mut diag,
             |doc, identity, diag| {
                 resugar_provider_key(doc, identity, &provider_key_names, diag);
+                resugar_classifier_provider_key(doc, identity, &provider_key_names, diag);
                 resugar_model_refs(doc, "models", "model", identity, &model_names, diag);
                 drop_pricing_key(doc, identity, diag);
             },
@@ -675,6 +676,37 @@ fn resugar_provider_key(
             "model {model:?} references provider_key_id {id:?}, which is not among the exported \
              provider keys — kept as a raw id (dangling reference in the source data; the file \
              will not load until it is resolved)"
+        )),
+    }
+}
+
+/// `semantic.classifier.provider_key_id` → `provider_key: <name>`, the
+/// same file sugar a model's own key reference gets.
+fn resugar_classifier_provider_key(
+    doc: &mut Value,
+    model: &str,
+    provider_key_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    let Some(Value::Object(classifier)) = doc.pointer_mut("/semantic/classifier") else {
+        return;
+    };
+    let Some(id) = classifier
+        .get("provider_key_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    match provider_key_names.get(&id) {
+        Some(name) => {
+            classifier.remove("provider_key_id");
+            classifier.insert("provider_key".into(), Value::String(name.clone()));
+        }
+        None => diag.blocking.push(format!(
+            "model {model:?} has a semantic classifier referencing provider_key_id {id:?}, \
+             which is not among the exported provider keys — kept as a raw id (the file will \
+             not load until it is resolved)"
         )),
     }
 }

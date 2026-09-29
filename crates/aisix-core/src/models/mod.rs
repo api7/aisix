@@ -103,7 +103,7 @@ pub use schema::{
     validate_rate_limit_policy_lenient, SchemaError,
 };
 pub use semantic::{
-    Aggregation, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticMatch,
-    SemanticRoute,
+    Aggregation, ClassifierType, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure,
+    Semantic, SemanticClassifier, SemanticMatch, SemanticRoute, TYPESAFE_PROVIDER,
 };
 pub use snapshot::AisixSnapshot;

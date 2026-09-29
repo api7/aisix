@@ -33,7 +33,9 @@ use std::time::Duration;
 use aisix_core::ObservabilityConfig;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-pub use access_log::{AccessLog, AccessLogRecord, CacheAccessLog, McpAccessLog};
+pub use access_log::{
+    AccessLog, AccessLogRecord, CacheAccessLog, McpAccessLog, SemanticAccessLog, SemanticFallback,
+};
 pub use metrics::{
     client_type_from_user_agent, A2aCallOutcome, A2aLabels, BudgetGauges, BudgetLabels,
     CancelledLabels, ClientTypeClassifier, DeploymentLabels, DeploymentState, GaugeFamily,

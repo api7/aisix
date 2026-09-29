@@ -1009,6 +1009,59 @@ models:
     assert_eq!(errs.len(), 6, "{errs:?}");
 }
 
+/// A classifier router names no embedding model, so the check that one
+/// exists must not fire on it — while its own failure target and its
+/// Provider Key are still checked like every other reference.
+#[test]
+fn cross_ref_checks_a_classifier_router_without_an_embedding_model() {
+    let ts_id = crate::filesource::derive_id("provider_keys", "ts");
+    let with_key = |pk_id: &str| CLASSIFIER_FILE.replace("PK_ID", pk_id);
+    let errs = errors_of(load(&with_key(&ts_id), &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].contains("ghost-failure"), "{errs:?}");
+
+    // The name form a model's `provider_key` takes works here too.
+    let by_name = CLASSIFIER_FILE.replace("provider_key_id: PK_ID", "provider_key: ts");
+    let errs = errors_of(load(&by_name, &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].contains("ghost-failure"), "{errs:?}");
+
+    let errs = errors_of(load(&with_key("some-id"), &env_of(&[])));
+    assert_eq!(errs.len(), 2, "{errs:?}");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("classifier provider_key_id \"some-id\"")),
+        "{errs:?}"
+    );
+}
+
+const CLASSIFIER_FILE: &str = r#"
+_format_version: "1"
+provider_keys:
+  - display_name: pk
+    api_key: sk-1
+  - display_name: ts
+    api_key: ts-1
+    provider: typesafe
+models:
+  - display_name: real
+    provider: openai
+    model_name: x
+    provider_key: pk
+  - display_name: sem
+    semantic:
+      classifier:
+        type: jev
+        provider_key_id: PK_ID
+        on_failure:
+          target: ghost-failure
+      default: real
+      routes:
+        - name: r1
+          target: real
+          description: anything
+"#;
+
 #[test]
 fn duplicate_key_hash_across_api_keys_is_a_load_error_without_hash_leak() {
     // The runtime credential index is keyed by key_hash — a duplicate

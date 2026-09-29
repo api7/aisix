@@ -91,9 +91,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// `observability.access_log`, installed once by [`crate::init_tracing`].
-/// Checked in [`AccessLog::emit`] rather than expressed as a filter
-/// directive, so no `RUST_LOG` spelling can bring the lines back and no
-/// other event is affected.
+/// Checked where every access-log line is written rather than expressed
+/// as a filter directive, so no `RUST_LOG` spelling can bring the lines
+/// back and no other event is affected.
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
 pub(crate) fn set_enabled(enabled: bool) {
@@ -227,6 +227,62 @@ pub struct CacheAccessLog<'a> {
     pub hit_layer: Option<&'a str>,
 }
 
+/// Why a request addressed to a semantic router was not served by a
+/// matched route. Rendered as `semantic_fallback`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticFallback {
+    /// Embedding decision: no route reached its threshold.
+    NoMatch,
+    /// Classifier decision: the model picked a route with a confidence
+    /// below `min_confidence`.
+    LowConfidence,
+    /// The request carried no user text to decide on.
+    EmptyPrompt,
+    /// The embedding or decision call failed or timed out, and the
+    /// router's failure policy applied.
+    DecisionFailed,
+    /// A route matched, but its target could not serve this caller (its
+    /// client-IP allowlist excluded the caller, or it was unavailable while
+    /// `default` was not), so `default` served instead.
+    TargetUnavailable,
+}
+
+impl SemanticFallback {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoMatch => "no_match",
+            Self::LowConfidence => "low_confidence",
+            Self::EmptyPrompt => "empty_prompt",
+            Self::DecisionFailed => "decision_failed",
+            Self::TargetUnavailable => "target_unavailable",
+        }
+    }
+}
+
+/// The semantic-router half of an access-log line: how the router the
+/// caller addressed decided. Present only on requests addressed to a
+/// semantic router, whichever way the request ended.
+///
+/// Owned rather than borrowed like the other halves, because it is not
+/// built with the line: the router decides long before the line exists,
+/// and publishes the decision where every writer of the request's line can
+/// read it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SemanticAccessLog {
+    /// `semantic_route`: the route that served the request. `None` when
+    /// `default` or a failure target served it.
+    pub route: Option<String>,
+    /// `semantic_score`: the deciding route's cosine similarity (embedding
+    /// routers) or the decision model's confidence in its pick (classifier
+    /// routers). Present whenever a decision was computed, including one
+    /// that fell back because the score was too low; `None` when no
+    /// decision was computed.
+    pub score: Option<f64>,
+    /// `semantic_fallback`: set only when no matched route served the
+    /// request.
+    pub fallback: Option<SemanticFallback>,
+}
+
 /// The `/mcp` half of an access-log line: which JSON-RPC method the single
 /// `POST` carried, and enough of its outcome to tell the three ways a
 /// `tools/list` can come back empty apart.
@@ -250,6 +306,10 @@ impl AccessLog<'_> {
     /// `observability.access_log` is off. When on, the line is filtered by
     /// the log level like any other `info` event.
     pub fn emit(&self) {
+        self.emit_with(None);
+    }
+
+    fn emit_with(&self, semantic: Option<&SemanticAccessLog>) {
         if !ENABLED.load(Ordering::Relaxed) {
             return;
         }
@@ -283,6 +343,9 @@ impl AccessLog<'_> {
             tools_returned = mcp.and_then(|m| m.tools_returned),
             request_body_bytes = self.request_body_bytes,
             response_body_bytes = self.response_body_bytes,
+            semantic_route = semantic.and_then(|s| s.route.as_deref()),
+            semantic_score = semantic.and_then(|s| s.score),
+            semantic_fallback = semantic.and_then(|s| s.fallback.map(SemanticFallback::as_str)),
             "proxy request completed",
         );
     }
@@ -326,6 +389,7 @@ impl AccessLog<'_> {
                 .map(|c| (c.status.to_owned(), owned(c.hit_layer))),
             request_body_bytes: self.request_body_bytes,
             response_body_bytes: self.response_body_bytes,
+            semantic: None,
         }
     }
 }
@@ -359,6 +423,9 @@ pub struct AccessLogRecord {
     cache: Option<(String, Option<String>)>,
     pub request_body_bytes: Option<u64>,
     pub response_body_bytes: Option<u64>,
+    /// Completed by the writer from what the request published, never by
+    /// the code that built the line — see [`SemanticAccessLog`].
+    pub semantic: Option<SemanticAccessLog>,
 }
 
 impl AccessLogRecord {
@@ -403,7 +470,7 @@ impl AccessLogRecord {
             request_body_bytes: self.request_body_bytes,
             response_body_bytes: self.response_body_bytes,
         }
-        .emit();
+        .emit_with(self.semantic.as_ref());
     }
 }
 
@@ -757,5 +824,75 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("cache_hit_layer"), "{out}");
+    }
+
+    /// The semantic half is completed on the owned record, after the line
+    /// was built — and only the halves the router actually decided are
+    /// written: a line with no decision carries none of the three keys.
+    #[test]
+    fn record_writes_the_semantic_decision_it_was_completed_with() {
+        let writer = VecWriter::default();
+        let subscriber = fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_target(false)
+            .with_env_filter(EnvFilter::new("info"))
+            .finish();
+        let line = AccessLog {
+            method: "POST",
+            path: "/v1/chat/completions",
+            status: 200,
+            latency: Duration::from_millis(1),
+            duration: Duration::from_millis(1),
+            provider: None,
+            model: Some("router"),
+            upstream_model: None,
+            provider_key_id: None,
+            api_key_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            request_id: "req-sem",
+            provider_request_id: None,
+            served_by_model: None,
+            routing_attempt_count: None,
+            routing_fallback_count: None,
+            error_kind: None,
+            error: None,
+            mcp: None,
+            cache: None,
+            request_body_bytes: None,
+            response_body_bytes: None,
+        };
+        with_default(subscriber, || {
+            let mut matched = line.to_record();
+            matched.semantic = Some(SemanticAccessLog {
+                route: Some("code".into()),
+                score: Some(0.81),
+                fallback: None,
+            });
+            matched.emit();
+            let mut fell_back = line.to_record();
+            fell_back.semantic = Some(SemanticAccessLog {
+                route: None,
+                score: Some(0.2),
+                fallback: Some(SemanticFallback::LowConfidence),
+            });
+            fell_back.emit();
+            line.to_record().emit();
+        });
+        let out = writer.contents();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(lines[0].contains("semantic_route=\"code\""), "{out}");
+        assert!(lines[0].contains("semantic_score=0.81"), "{out}");
+        assert!(!lines[0].contains("semantic_fallback"), "{out}");
+        assert!(!lines[1].contains("semantic_route"), "{out}");
+        assert!(lines[1].contains("semantic_score=0.2"), "{out}");
+        assert!(
+            lines[1].contains("semantic_fallback=\"low_confidence\""),
+            "{out}"
+        );
+        assert!(!lines[2].contains("semantic_"), "{out}");
     }
 }
