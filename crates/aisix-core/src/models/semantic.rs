@@ -14,7 +14,7 @@
 //!
 //! A router that carries a `classifier` block decides differently: the
 //! latest user message is sent once to a hosted decision model, which
-//! picks one route by its `description` (or none of them). The embedding
+//! picks one of the configured routes by its `description`. The embedding
 //! fields, `match`, and the per-route `examples` / `threshold` do not
 //! apply in that mode and are rejected there.
 //!

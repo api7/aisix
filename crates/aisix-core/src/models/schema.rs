@@ -1050,11 +1050,11 @@ pub fn apply_model_ref_alternatives(schema: &mut Value) {
 ///
 /// Classifier mode refuses every embedding-only knob rather than ignoring
 /// it — a knob that is accepted and never read looks configured — and
-/// requires the `description` the decision model reads. The route name the
-/// gateway adds as its own option is refused too, since a route of that
-/// name could never be told apart from "no route fits". An explicit `null`
-/// `embedding_model_id` means "no id", as it does everywhere else, so it
-/// is not refused.
+/// requires the `description` the decision model reads. No route name is
+/// reserved: the decision model chooses among exactly the configured
+/// routes, and a catch-all is a route the operator configures. An explicit
+/// `null` `embedding_model_id` means "no id", as it does everywhere else,
+/// so it is not refused.
 ///
 /// Applied to both validator sets alike: a classifier row carrying an
 /// embedding knob is not a row an older build wrote, so there is nothing
