@@ -151,9 +151,26 @@
       "client_key_file": null,
       "domain_name": null
     },
+    "observability.metrics.client_type_rules[]": {
+      "client": null,
+      "pattern": null
+    },
+    "proxy.listeners[]": {
+      "addr": null,
+      "tls": {
+        "cert_file": null,
+        "key_file": null
+      }
+    },
     "proxy.tls": {
       "cert_file": null,
       "key_file": null
+    },
+    "proxy.url_rewrites[]": {
+      "hosts": null,
+      "match": null,
+      "name": null,
+      "rewrite": null
     },
     "ratelimit.redis": {
       "database": null,

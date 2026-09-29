@@ -4887,8 +4887,9 @@ observability:
     }
 
     /// Every block the defaults leave `null` because it is off unless written
-    /// (`cache.redis`, `ratelimit.redis`, the `tls` blocks), keyed by its
-    /// dotted path and spelled out with its sub-keys: each one's default, or
+    /// (`cache.redis`, `ratelimit.redis`, `proxy.tls`, `admin.tls`,
+    /// `etcd.tls`), keyed by its dotted path, and the element of every list of
+    /// structs (`proxy.url_rewrites[]`), each spelled out with its sub-keys: each one's default, or
     /// `null` for a key the block requires. Taken from the schema so a new
     /// optional block or sub-key shows up without editing this test.
     fn optional_blocks(defaults: &serde_json::Value) -> serde_json::Value {
@@ -4946,6 +4947,12 @@ observability:
                 }
                 serde_json::Value::Null if schema.get("properties").is_some() => {
                     out.insert(path.to_string(), expand(schema, defs));
+                }
+                serde_json::Value::Array(_) => {
+                    let items = resolve(&schema["items"], defs);
+                    if items.get("properties").is_some() {
+                        out.insert(format!("{path}[]"), expand(items, defs));
+                    }
                 }
                 _ => {}
             }
