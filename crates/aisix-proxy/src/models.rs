@@ -55,7 +55,26 @@ pub struct ModelList {
 pub async fn list_models(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
-) -> impl IntoResponse {
+    method: axum::http::Method,
+    request_id: Option<axum::Extension<crate::request_id::RequestId>>,
+) -> axum::response::Response {
+    let started = std::time::Instant::now();
+    let response = model_list(&state, &auth).into_response();
+    crate::reject::emit_unrouted_access_log(
+        method.as_str(),
+        "/v1/models",
+        request_id
+            .as_ref()
+            .map(|r| r.0 .0.as_str())
+            .unwrap_or_default(),
+        Some(&auth.entry.id),
+        response.status().as_u16(),
+        started,
+    );
+    response
+}
+
+fn model_list(state: &ProxyState, auth: &AuthenticatedKey) -> Json<ModelList> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

@@ -291,6 +291,14 @@ pub async fn entry(
         // Every unmatched path, `/passthrough/*` included, takes the
         // router's ordinary miss path: the namespace is entirely the
         // operator's to claim with explicit `passthrough_route` resources.
+        crate::reject::emit_unrouted_access_log(
+            method.as_str(),
+            &path,
+            &request_id,
+            None,
+            StatusCode::NOT_FOUND.as_u16(),
+            started,
+        );
         return StatusCode::NOT_FOUND.into_response();
     };
 

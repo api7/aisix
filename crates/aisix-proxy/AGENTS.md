@@ -243,6 +243,13 @@ must not emit again for an auth failure (`/v1/messages` re-renders the error,
 it does not log it). A surface that authenticates without the extractor
 (`/v1/realtime`, passthrough routes) writes its line in its own error arm.
 
+A route that answers without dispatching at all — `/v1/models`, the A2A
+agent card, the OAuth discovery documents, the unrouted-path 404, the router's
+405 (`method_not_allowed_fallback`, which must stay the LAST call before the
+layers or later routes miss it) — writes its line through
+`reject::emit_unrouted_access_log`. `/livez` and `/readyz` deliberately write
+none: they are platform probes, not client traffic.
+
 A handler that instead wraps its whole dispatch and logs the wrapper's status
 (`/mcp`, `/a2a`, `/passthrough`, `/v1/videos`, `/v1/files`) is already covered —
 don't add a second emit to those, or the request logs twice.

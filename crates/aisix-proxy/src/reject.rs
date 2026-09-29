@@ -116,6 +116,67 @@ pub(crate) fn reject_before_dispatch(
     }
 }
 
+/// Write the access-log line for a request answered without dispatch and
+/// without a typed error: a discovery document, the model list, an
+/// unrouted path's 404, the router's 405. Only what is known is written —
+/// no upstream, no model, no error class.
+pub(crate) fn emit_unrouted_access_log(
+    method: &str,
+    path: &str,
+    request_id: &str,
+    api_key_id: Option<&str>,
+    status: u16,
+    started: Instant,
+) {
+    let elapsed = started.elapsed();
+    crate::attribution::emit_access_log(AccessLog {
+        method,
+        path,
+        status,
+        latency: elapsed,
+        duration: elapsed,
+        provider: None,
+        model: None,
+        upstream_model: None,
+        provider_key_id: None,
+        api_key_id,
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        request_id,
+        provider_request_id: None,
+        served_by_model: None,
+        routing_attempt_count: None,
+        routing_fallback_count: None,
+        error_kind: None,
+        error: None,
+        mcp: None,
+        cache: None,
+        request_body_bytes: None,
+        response_body_bytes: None,
+    });
+}
+
+/// The router's answer to a known path with a method it does not serve.
+/// axum's own 405 (it still adds `Allow`), plus the request's access-log
+/// line, which the built-in fallback never wrote.
+pub(crate) async fn method_not_allowed(request: axum::extract::Request) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .map(|r| r.0.clone())
+        .unwrap_or_default();
+    emit_unrouted_access_log(
+        request.method().as_str(),
+        request.uri().path(),
+        &request_id,
+        None,
+        axum::http::StatusCode::METHOD_NOT_ALLOWED.as_u16(),
+        Instant::now(),
+    );
+    axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response()
+}
+
 /// `axum::extract::Path` with the rejection routed through
 /// [`reject_before_dispatch`].
 ///

@@ -51,6 +51,8 @@ const SURFACES: ReadonlyArray<{ method: string; path: string }> = [
 ];
 
 interface Sent {
+  method: string;
+  path: string;
   id: string;
   status: number;
   secret?: string;
@@ -105,7 +107,7 @@ async function drive(app: SpawnedApp, idp: MockIdp, scopedIdp: MockIdp): Promise
       const label = `${cred.label} on ${method} ${path}`;
       expect(status, label).toBe(cred.status ?? 401);
       expect(id, `${label} carries x-aisix-request-id`).toBeTruthy();
-      sent.push({ id, status, secret: cred.secret, label });
+      sent.push({ method, path, id, status, secret: cred.secret, label });
     }
   }
   return sent;
@@ -179,6 +181,8 @@ describe("an authentication denial writes its access-log line", () => {
       const mine = lines.filter((l) => l.includes(`request_id="${s.id}"`));
       expect(mine, `one access-log line for ${s.label}`).toHaveLength(1);
       expect(mine[0], s.label).toContain(`status=${s.status}`);
+      expect(mine[0], s.label).toMatch(new RegExp(`method="?${s.method}"?\\s`));
+      expect(mine[0], s.label).toMatch(new RegExp(`path="?${s.path}"?\\s`));
       // Nothing about the caller is established by a refused credential.
       expect(mine[0], s.label).not.toContain("api_key_id=");
       if (s.secret) {
