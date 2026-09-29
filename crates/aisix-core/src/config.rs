@@ -31,6 +31,7 @@ use crate::error::BootstrapError;
 
 /// Root config struct. Construct via [`Config::load_from_path`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Dynamic-resource source A: etcd. Required unless `resources_file`
@@ -103,6 +104,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct EtcdConfig {
     pub endpoints: Vec<String>,
@@ -194,6 +196,7 @@ pub struct EtcdConfig {
 /// first endpoint's hostname so the tonic TLS layer knows what SNI /
 /// cert-subject-alt-name to match against.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct EtcdTlsConfig {
     /// PEM-encoded CA bundle used to verify the etcd server cert.
@@ -219,6 +222,7 @@ pub struct EtcdTlsConfig {
 /// All configuration is read from etcd via the TLS channel (see
 /// [`EtcdTlsConfig`]).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct ManagedConfig {
     pub enabled: bool,
@@ -654,6 +658,7 @@ impl EtcdConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     /// The single proxy listener's address — the shorthand form, and the
@@ -790,6 +795,7 @@ impl ProxyConfig {
 
 /// One entry-level URL rewrite rule (see [`ProxyConfig::url_rewrites`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct UrlRewriteRule {
     /// Optional name, used in logs when the rule fires.
@@ -942,6 +948,7 @@ fn validate_rewrite_template_refs(regex: &regex::Regex, template: &str) -> Resul
 /// the downstream client IP for usage logs (#492) from a forwarded
 /// header, trusting only addresses inside `trusted_proxies`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct RealIpConfig {
     /// Trusted upstream proxy CIDRs (e.g. `["10.0.0.0/8", "127.0.0.1/32"]`).
@@ -1022,6 +1029,7 @@ pub const CREDENTIAL_HEADERS: &[&str] = &[
 /// lets a caller find a gateway request by an id its own business logs
 /// already carry, instead of maintaining a second mapping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct RequestIdConfig {
     /// Inbound headers consulted, in order; the first one carrying an
@@ -1083,6 +1091,7 @@ impl RequestIdConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     /// When `false`, the admin listener is not bound even in standalone
@@ -1129,6 +1138,7 @@ impl Default for AdminConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     pub cert_file: String,
@@ -1137,6 +1147,7 @@ pub struct TlsConfig {
 
 /// One entry of [`ProxyConfig::listeners`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ProxyListener {
     /// Socket address this listener binds, e.g. `0.0.0.0:3000`.
@@ -1148,6 +1159,7 @@ pub struct ProxyListener {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct ObservabilityConfig {
     #[serde(default = "ObservabilityConfig::default_service_name")]
@@ -1177,6 +1189,7 @@ pub struct ObservabilityConfig {
 /// gateway keeps serving: a diagnostics port another process already holds
 /// (two gateways sharing a host network) must not stop traffic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct DebugListenerConfig {
     pub enabled: bool,
@@ -1200,6 +1213,7 @@ impl Default for DebugListenerConfig {
 /// shipped Linux build and is tuned through jemalloc's own
 /// `_RJEM_MALLOC_CONF` environment variable, not here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct HeapProfilingConfig {
     pub auto_dump: AutoDumpConfig,
@@ -1209,6 +1223,7 @@ pub struct HeapProfilingConfig {
 /// when resident memory crosses a fraction of the memory limit, so the
 /// evidence of a growth survives the OOM kill that usually follows it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct AutoDumpConfig {
     pub enabled: bool,
@@ -1274,6 +1289,7 @@ impl ObservabilityConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct MetricsConfig {
     pub prometheus: PrometheusConfig,
@@ -1335,6 +1351,7 @@ where
 /// recording rules that hardcode an `le` value break, and previously
 /// recorded series are not comparable across the change.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct HistogramBucketsConfig {
     /// `aisix_request_e2e_latency_seconds`
@@ -1358,6 +1375,7 @@ pub struct HistogramBucketsConfig {
 /// becomes the Prometheus `client_type` value, so cardinality stays capped
 /// by the rule count.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ClientTypeRule {
     pub pattern: String,
@@ -1365,6 +1383,7 @@ pub struct ClientTypeRule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct PrometheusConfig {
     pub enabled: bool,
@@ -1401,6 +1420,7 @@ impl Default for PrometheusConfig {
 /// nothing. Do not read it. AISIX-Cloud#1071 tracks the real feature,
 /// which will arrive under its own configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct OtlpConfig {
     pub enabled: bool,
@@ -1408,6 +1428,7 @@ pub struct OtlpConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct TracingConfig {
     pub otlp: OtlpTracingConfig,
@@ -1421,6 +1442,7 @@ pub struct TracingConfig {
 /// gone from the shipped example files and stays parseable only so a
 /// config written against them still loads. Do not read it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct OtlpTracingConfig {
     pub enabled: bool,
@@ -1450,6 +1472,7 @@ impl Default for OtlpTracingConfig {
 /// effect is fail-fast validation — `backend = "redis"` without a
 /// `redis` block is rejected at boot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct CacheConfig {
     pub backend: CacheBackend,
@@ -1466,6 +1489,7 @@ impl Default for CacheConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum CacheBackend {
     Memory,
@@ -1474,6 +1498,7 @@ pub enum CacheBackend {
 
 /// Connection topology for a shared Redis backend (cache + rate-limit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum RedisMode {
     /// One Redis endpoint (`url`). The historical default.
@@ -1508,6 +1533,7 @@ pub enum RedisMode {
 /// through the environment is no use if a stale credential left in `url`
 /// quietly outranks it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct RedisConnConfig {
     pub mode: RedisMode,
@@ -1644,6 +1670,7 @@ impl RedisConnConfig {
 /// modes too; may point at the same Redis as `cache` (keys are namespaced
 /// `aisix:rl:`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct RateLimitConfig {
     pub backend: RateLimitBackend,
@@ -1665,6 +1692,7 @@ impl Default for RateLimitConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum RateLimitBackend {
     Memory,
@@ -1687,6 +1715,7 @@ pub enum RateLimitBackend {
 ///
 /// Every duration accepts `0` to disable that individual knob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct UpstreamConfig {
     /// Deployment-wide default for `Model.timeout`: the end-to-end deadline
@@ -1783,6 +1812,7 @@ impl Default for UpstreamConfig {
 /// additive, but they are process-wide and cannot be expressed per
 /// peer class, which is what `ca_file` is for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct OutboundTlsConfig {
     /// Path to a PEM file holding one or more certificates to trust as
@@ -1848,6 +1878,7 @@ pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 6_000_000;
 /// Both matter in a multi-hop chain, where the rule is that every node's
 /// client-side idle timeout must stay below the next node's server-side one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct DownstreamConfig {
     /// How long an accepted connection may sit idle — response fully
@@ -1898,6 +1929,7 @@ impl Default for DownstreamConfig {
 /// `terminationGracePeriodSeconds`, systemd `TimeoutStopSec`), which is
 /// the only hard bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct ShutdownConfig {
     /// Minimum seconds to keep accepting new connections after the
@@ -2046,6 +2078,31 @@ impl EnvOverrides {
     }
 }
 
+/// Every sequence field whose elements are scalars, as the dotted key the
+/// `AISIX_*` environment source produces. The deployed chart injects gateway
+/// config purely through env vars, and an unregistered sequence key does not
+/// fall back to its default — the value fails to deserialize and the gateway
+/// does not start. A `Vec<Struct>` cannot be expressed by comma-splitting;
+/// those fields carry `deserialize_seq_or_json_string` and take one JSON
+/// array instead. The test `env_only_deployments_can_set_every_sequence_field`
+/// derives the sequence fields from the config types and fails on any that
+/// neither mechanism covers.
+const ENV_LIST_PARSE_KEYS: &[&str] = &[
+    "etcd.endpoints",
+    "admin.admin_keys",
+    "proxy.real_ip.trusted_proxies",
+    "proxy.request_id.accept_headers",
+    "observability.metrics.buckets.request_e2e_latency",
+    "observability.metrics.buckets.request_ttft",
+    "observability.metrics.buckets.guardrail_latency",
+    "observability.metrics.buckets.a2a_ttfb",
+    "observability.heap_profiling.auto_dump.thresholds",
+    "cache.redis.nodes",
+    "cache.redis.sentinels",
+    "ratelimit.redis.nodes",
+    "ratelimit.redis.sentinels",
+];
+
 impl Config {
     /// Warnings about `AISIX_*` environment variables that name no
     /// setting and were left out of the load.
@@ -2070,6 +2127,22 @@ impl Config {
     /// - Basic invariants are checked (non-empty etcd endpoints, at least one
     ///   admin key, bind addresses parse).
     pub fn load_from_path(path: Option<&Path>) -> Result<Self, BootstrapError> {
+        let mut cfg = Self::deserialize_sources(path)?;
+
+        if let Some(raw_base) = cfg.managed.cp_base_url.as_deref() {
+            cfg.managed.cp_base_url = Some(normalise_cp_base_url(raw_base)?);
+        }
+        if let Some(raw_endpoint) = cfg.managed.cp_etcd_endpoint.as_deref() {
+            cfg.managed.cp_etcd_endpoint = Some(normalise_cp_etcd_endpoint(raw_endpoint)?);
+        }
+
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// File + env merge and deserialization, without normalisation or
+    /// validation.
+    fn deserialize_sources(path: Option<&Path>) -> Result<Self, BootstrapError> {
         use ::config::{Config as CConfig, Environment, File};
 
         let mut builder = CConfig::builder();
@@ -2089,8 +2162,7 @@ impl Config {
         // Pin prefix_separator explicitly so the two shapes are
         // distinct: `AISIX_` strips the prefix, `__` splits keys.
         let overrides = EnvOverrides::from_env();
-        builder = builder.add_source(
-            Environment::with_prefix("AISIX")
+        let mut env = Environment::with_prefix("AISIX")
                 .prefix_separator("_")
                 .separator("__")
                 // Only the variables `EnvOverrides` kept. Handing the
@@ -2098,54 +2170,23 @@ impl Config {
                 // process did not name be dropped before config-rs turns
                 // it into a key the root struct has to recognise.
                 .source(Some(overrides.source))
-                // Per-key list parsing. Setting `list_separator`
-                // without explicit `with_list_parse_key` would force
-                // EVERY string env override through comma-splitting,
-                // which blows up secrets that happen to contain a
-                // comma with a serde "invalid type: sequence, expected
-                // a string" error. Opt in only for fields that are
-                // actually sequences.
-                //
-                // EVERY sequence field belongs on this list: the deployed
-                // chart injects gateway config purely through AISIX_* env
-                // vars, so an unregistered key is not merely awkward from
-                // the environment — it fails to deserialize, leaving the
-                // field unreachable in Kubernetes.
-                // A `Vec<Struct>` cannot be expressed by comma-splitting;
-                // those fields carry `deserialize_seq_or_json_string`
-                // instead and take one JSON array. Between the two
-                // mechanisms every sequence field must be covered —
-                // `env_only_deployments_can_set_every_sequence_field` is
-                // the guard.
+                // Per-key list parsing: setting `list_separator` without
+                // `with_list_parse_key` would comma-split EVERY string env
+                // override, breaking secrets that contain a comma. See
+                // `ENV_LIST_PARSE_KEYS`.
                 .list_separator(",")
-                .with_list_parse_key("etcd.endpoints")
-                .with_list_parse_key("admin.admin_keys")
-                .with_list_parse_key("proxy.real_ip.trusted_proxies")
-                .with_list_parse_key("proxy.request_id.accept_headers")
-                .with_list_parse_key("observability.metrics.buckets.request_e2e_latency")
-                .with_list_parse_key("observability.metrics.buckets.request_ttft")
-                .with_list_parse_key("observability.metrics.buckets.guardrail_latency")
-                .with_list_parse_key("observability.metrics.buckets.a2a_ttfb")
-                .try_parsing(true),
-        );
+                .try_parsing(true);
+        for key in ENV_LIST_PARSE_KEYS {
+            env = env.with_list_parse_key(key);
+        }
+        builder = builder.add_source(env);
 
         let raw = builder
             .build()
             .map_err(|e| BootstrapError::Config(format!("build: {e}")))?;
 
-        let mut cfg: Self = raw
-            .try_deserialize()
-            .map_err(|e| BootstrapError::Config(format!("deserialize: {e}")))?;
-
-        if let Some(raw_base) = cfg.managed.cp_base_url.as_deref() {
-            cfg.managed.cp_base_url = Some(normalise_cp_base_url(raw_base)?);
-        }
-        if let Some(raw_endpoint) = cfg.managed.cp_etcd_endpoint.as_deref() {
-            cfg.managed.cp_etcd_endpoint = Some(normalise_cp_etcd_endpoint(raw_endpoint)?);
-        }
-
-        cfg.validate()?;
-        Ok(cfg)
+        raw.try_deserialize()
+            .map_err(|e| BootstrapError::Config(format!("deserialize: {e}")))
     }
 
     fn validate(&self) -> Result<(), BootstrapError> {
@@ -3589,17 +3630,200 @@ admin:
         );
     }
 
+    /// Every sequence field reachable from [`Config`], as `(dotted key,
+    /// element schema)`, read off the config types themselves so a field
+    /// added later is covered without anyone listing it. Sequences nested
+    /// inside a sequence element (`proxy.url_rewrites[].hosts`) travel
+    /// inside that element's JSON and are not env keys of their own; map
+    /// values (`observability.metrics.labels`) are not sequence fields.
+    fn sequence_fields() -> Vec<(String, serde_json::Value)> {
+        fn resolve<'a>(
+            v: &'a serde_json::Value,
+            defs: &'a serde_json::Value,
+        ) -> &'a serde_json::Value {
+            match v.get("$ref").and_then(|r| r.as_str()) {
+                Some(r) => resolve(&defs[r.trim_start_matches("#/definitions/")], defs),
+                None => match v.get("allOf").and_then(|a| a.as_array()) {
+                    Some(all) if all.len() == 1 => resolve(&all[0], defs),
+                    _ => v,
+                },
+            }
+        }
+        fn walk(
+            v: &serde_json::Value,
+            path: &str,
+            defs: &serde_json::Value,
+            out: &mut Vec<(String, serde_json::Value)>,
+        ) {
+            let v = resolve(v, defs);
+            for key in ["anyOf", "oneOf"] {
+                for variant in v.get(key).and_then(|a| a.as_array()).into_iter().flatten() {
+                    walk(variant, path, defs, out);
+                }
+            }
+            let is_array = match &v["type"] {
+                serde_json::Value::String(t) => t == "array",
+                serde_json::Value::Array(ts) => ts.iter().any(|t| t == "array"),
+                _ => false,
+            };
+            if is_array {
+                out.push((path.to_string(), resolve(&v["items"], defs).clone()));
+                return;
+            }
+            for (name, sub) in v
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .into_iter()
+                .flatten()
+            {
+                let child = if path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{path}.{name}")
+                };
+                walk(sub, &child, defs, out);
+            }
+        }
+        let root = serde_json::to_value(schemars::schema_for!(Config)).unwrap();
+        let mut out = Vec::new();
+        walk(&root, "", &root["definitions"], &mut out);
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.dedup_by(|a, b| a.0 == b.0);
+        out
+    }
+
+    /// The env value that sets a two-element (scalar) or one-element
+    /// (struct) sequence, and the serialized value it must produce.
+    fn env_sample(key: &str, item: &serde_json::Value) -> (String, serde_json::Value) {
+        match item["type"].as_str() {
+            Some("string") => ("a,b".into(), serde_json::json!(["a", "b"])),
+            Some("number") => ("0.25,0.5".into(), serde_json::json!([0.25, 0.5])),
+            Some("integer") => ("1,2".into(), serde_json::json!([1, 2])),
+            Some("object") => {
+                // Only the required fields, so the element is the smallest
+                // one serde accepts; every required field here is a string.
+                let mut element = serde_json::Map::new();
+                for field in item["required"].as_array().into_iter().flatten() {
+                    let field = field.as_str().unwrap();
+                    let ty = &item["properties"][field]["type"];
+                    assert_eq!(
+                        ty, "string",
+                        "{key}: extend env_sample for required field {field}: {ty}"
+                    );
+                    element.insert(field.into(), "x".into());
+                }
+                let element = serde_json::Value::Object(element);
+                (
+                    serde_json::json!([element]).to_string(),
+                    serde_json::json!([element]),
+                )
+            }
+            other => panic!("{key}: extend env_sample for sequence elements of type {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_sequence_fields_are_exactly_the_list_parse_keys() {
+        let scalar: std::collections::BTreeSet<String> = sequence_fields()
+            .into_iter()
+            .filter(|(_, item)| item["type"] != "object")
+            .map(|(key, _)| key)
+            .collect();
+        let registered: std::collections::BTreeSet<String> =
+            ENV_LIST_PARSE_KEYS.iter().map(|k| k.to_string()).collect();
+        assert_eq!(
+            scalar, registered,
+            "ENV_LIST_PARSE_KEYS must name every scalar sequence field and nothing else"
+        );
+    }
+
     #[test]
     fn env_only_deployments_can_set_every_sequence_field() {
         // The chart and the dashboard's `docker run` snippet configure the
         // gateway purely through AISIX_* env vars, so a sequence field that
         // the env source cannot express is unreachable in those deployments
         // — it does not fall back to a default, the whole load fails.
-        //
-        // The YAML-scalar tests above do NOT cover this: they exercise the
-        // deserializer, not the `Environment` source's list-parse
-        // registration. `proxy.real_ip.trusted_proxies` was registered
-        // nowhere and shipped unreachable behind exactly that gap.
+        // `proxy.real_ip.trusted_proxies` and later
+        // `observability.heap_profiling.auto_dump.thresholds` shipped
+        // unreachable behind exactly that gap, so the fields are derived
+        // from the config types rather than listed here.
+        const CHILD_MARKER: &str = "TEST_ENV_EVERY_SEQUENCE_FIELD_CHILD";
+        let fields = sequence_fields();
+        assert!(
+            fields.iter().any(|(k, _)| k == "etcd.endpoints"),
+            "the schema walk found no sequence fields: {fields:?}"
+        );
+        let samples: Vec<(String, String, serde_json::Value)> = fields
+            .iter()
+            .map(|(key, item)| {
+                let (env, expected) = env_sample(key, item);
+                (key.clone(), env, expected)
+            })
+            .collect();
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .arg("config::tests::env_only_deployments_can_set_every_sequence_field")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env(CHILD_MARKER, "1");
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("AISIX_") {
+                    child.env_remove(key);
+                }
+            }
+            child.env("AISIX_PROXY__ADDR", "0.0.0.0:3000");
+            for (key, env, _) in &samples {
+                child.env(
+                    format!("AISIX_{}", key.to_uppercase().replace('.', "__")),
+                    env,
+                );
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "child config test failed: {}",
+                String::from_utf8_lossy(&output.stdout),
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "the child ran no test: {}",
+                String::from_utf8_lossy(&output.stdout),
+            );
+            return;
+        }
+
+        // Deserialization only: the samples are shapes, not a valid
+        // deployment, and what is under test is whether the env source
+        // can express each field at all.
+        let cfg = Config::deserialize_sources(None).unwrap_or_else(|e| panic!("{e}"));
+        let got = serde_json::to_value(&cfg).unwrap();
+        for (key, _, expected) in &samples {
+            let pointer = format!("/{}", key.replace('.', "/"));
+            let value = got.pointer(&pointer).unwrap_or(&serde_json::Value::Null);
+            let matches = match (value, expected) {
+                (serde_json::Value::Array(g), serde_json::Value::Array(e))
+                    if g.len() == e.len() =>
+                {
+                    g.iter().zip(e).all(|(g, e)| match (g, e) {
+                        (serde_json::Value::Object(g), serde_json::Value::Object(e)) => {
+                            e.iter().all(|(k, v)| g.get(k) == Some(v))
+                        }
+                        _ => g == e,
+                    })
+                }
+                _ => false,
+            };
+            assert!(matches, "{key}: expected {expected}, got {value}");
+        }
+    }
+
+    #[test]
+    fn env_sequence_values_reach_the_typed_fields() {
+        // Content-level companion to the structural guard above: real
+        // values for the struct-typed sequences, read back through the
+        // typed accessors.
         const CHILD_MARKER: &str = "TEST_ENV_SEQUENCE_FIELDS_CHILD";
         const ENV: [(&str, &str); 10] = [
             ("AISIX_ETCD__ENDPOINTS", "http://127.0.0.1:2379"),
@@ -3637,7 +3861,8 @@ admin:
             // tests neither observe nor overwrite these variables.
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child
-                .arg("env_only_deployments_can_set_every_sequence_field")
+                .arg("config::tests::env_sequence_values_reach_the_typed_fields")
+                .arg("--exact")
                 .arg("--test-threads=1")
                 .env(CHILD_MARKER, "1");
             for (key, _) in std::env::vars_os() {
