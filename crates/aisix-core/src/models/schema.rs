@@ -1024,6 +1024,85 @@ pub fn apply_model_ref_alternatives(schema: &mut Value) {
             require_name_or_id(node, name, id);
         }
     }
+    if root_title.as_deref() == Some("Semantic") {
+        if let Some(root) = schema.as_object_mut() {
+            split_semantic_modes(root);
+        }
+    }
+    if let Some(node) = schema
+        .pointer_mut("/definitions/Semantic")
+        .and_then(Value::as_object_mut)
+    {
+        split_semantic_modes(node);
+    }
+}
+
+/// State what each of a semantic router's two decision modes requires and
+/// refuses. `schemars` renders the struct both modes share, so every
+/// mode-specific field comes out optional; this puts the requirements back
+/// behind an `if classifier` / `else`.
+///
+/// Embedding mode (no `classifier`) keeps exactly the contract it always
+/// had: an embedding model under either spelling, `match`, and `examples`
+/// on every route. The name-or-id clause for the embedding model, which
+/// [`apply_model_ref_alternatives`] has just added unconditionally, is
+/// moved into that branch.
+///
+/// Classifier mode refuses every embedding-only knob rather than ignoring
+/// it — a knob that is accepted and never read looks configured — and
+/// requires the `description` the decision model reads. The route name the
+/// gateway adds as its own option is refused too, since a route of that
+/// name could never be told apart from "no route fits". An explicit `null`
+/// `embedding_model_id` means "no id", as it does everywhere else, so it
+/// is not refused.
+///
+/// Applied to both validator sets alike: a classifier row carrying an
+/// embedding knob is not a row an older build wrote, so there is nothing
+/// to keep loading.
+fn split_semantic_modes(node: &mut serde_json::Map<String, Value>) {
+    let embedder_clause = json!({
+        "anyOf": [
+            {"required": ["embedding_model"], "properties": {"embedding_model": {"type": "string"}}},
+            {"required": ["embedding_model_id"], "properties": {"embedding_model_id": {"type": "string"}}},
+        ]
+    });
+    if let Some(list) = node.get_mut("allOf").and_then(Value::as_array_mut) {
+        list.retain(|clause| *clause != embedder_clause);
+        if list.is_empty() {
+            node.remove("allOf");
+        }
+    }
+    let modes = json!({
+        "if": {"required": ["classifier"]},
+        "then": {
+            "not": {"anyOf": [
+                {"required": ["embedding_model"]},
+                {"required": ["embedding_model_id"], "properties": {"embedding_model_id": {"type": "string"}}},
+                {"required": ["embedding_timeout_ms"]},
+                {"required": ["on_embedding_failure"]},
+                {"required": ["match"]}
+            ]},
+            "properties": {"routes": {"items": {
+                "required": ["description"],
+                "not": {"anyOf": [
+                    {"required": ["examples"]},
+                    {"required": ["threshold"]}
+                ]},
+                "properties": {"name": {"not": {"const": super::semantic::NONE_OF_THE_ABOVE}}}
+            }}}
+        },
+        "else": {
+            "allOf": [embedder_clause],
+            "required": ["match"],
+            "properties": {"routes": {"items": {"required": ["examples"]}}}
+        }
+    });
+    match node.get_mut("allOf").and_then(Value::as_array_mut) {
+        Some(list) => list.push(modes),
+        None => {
+            node.insert("allOf".to_string(), json!([modes]));
+        }
+    }
 }
 
 /// Canonical JSON Schema for the `api_key` resource, derived from the
@@ -2857,6 +2936,161 @@ mod tests {
             }
         });
         assert!(validate_model(&v).is_err());
+    }
+
+    // ---- semantic router, classifier mode ----
+
+    fn jev_router(semantic_extra: Value, route: Value) -> Value {
+        let mut semantic = json!({
+            "classifier": {"type": "jev", "provider_key_id": "pk-ts"},
+            "routes": [route],
+            "default": "d"
+        });
+        for (k, v) in semantic_extra.as_object().unwrap() {
+            semantic[k] = v.clone();
+        }
+        json!({"display_name": "r", "semantic": semantic})
+    }
+
+    fn jev_route() -> Value {
+        json!({"name": "code", "target": "m", "description": "programming questions"})
+    }
+
+    /// Both sets must agree, because a classifier row is never one an
+    /// older build wrote: whatever the write path refuses, the loader
+    /// refuses too.
+    fn assert_rejected_on_both(v: &Value, why: &str) {
+        assert!(validate_model(v).is_err(), "strict accepted {why}: {v}");
+        assert!(
+            validate_model_lenient(v).is_err(),
+            "lenient accepted {why}: {v}"
+        );
+    }
+
+    #[test]
+    fn model_semantic_classifier_form_passes_both_sets() {
+        let minimal = jev_router(json!({}), jev_route());
+        validate_model(&minimal).unwrap();
+        validate_model_lenient(&minimal).unwrap();
+        let m: Model = serde_json::from_value(minimal).unwrap();
+        let c = m.semantic.unwrap().classifier.unwrap();
+        assert_eq!(c.model, "jev-latest");
+        assert_eq!(c.min_confidence, 0.5);
+        assert_eq!(c.timeout_ms, 3000);
+        assert_eq!(c.on_failure, crate::models::OnEmbeddingFailure::default());
+
+        let full = json!({"display_name": "r", "semantic": {
+            "classifier": {
+                "type": "jev", "provider_key_id": "pk-ts", "model": "jev-1.13.0",
+                "min_confidence": 0.7, "timeout_ms": 1500,
+                "on_failure": {"target_id": "m-safe"}
+            },
+            "routes": [{"name": "code", "target_id": "m-1", "description": "code"}],
+            "default_id": "m-2",
+            "embedding_model_id": null
+        }});
+        validate_model(&full).unwrap();
+        validate_model_lenient(&full).unwrap();
+        for mode in ["default", "fail"] {
+            let v = jev_router(json!({}), jev_route());
+            let mut v = v;
+            v["semantic"]["classifier"]["on_failure"] = json!(mode);
+            validate_model(&v).unwrap();
+        }
+    }
+
+    #[test]
+    fn model_semantic_classifier_refuses_every_embedding_knob() {
+        for (field, value) in [
+            ("embedding_model", json!("e")),
+            ("embedding_model_id", json!("m-e")),
+            ("embedding_timeout_ms", json!(500)),
+            ("on_embedding_failure", json!("fail")),
+            ("match", json!({"threshold": 0.5})),
+        ] {
+            let v = jev_router(json!({ field: value }), jev_route());
+            assert_rejected_on_both(&v, field);
+        }
+        for (field, value) in [("examples", json!(["x"])), ("threshold", json!(0.5))] {
+            let mut route = jev_route();
+            route[field] = value;
+            assert_rejected_on_both(&jev_router(json!({}), route), field);
+        }
+    }
+
+    #[test]
+    fn model_semantic_classifier_route_needs_a_description_and_a_free_name() {
+        let mut route = jev_route();
+        route.as_object_mut().unwrap().remove("description");
+        assert_rejected_on_both(&jev_router(json!({}), route), "a route with no description");
+
+        let mut route = jev_route();
+        route["name"] = json!("none_of_the_above");
+        assert_rejected_on_both(&jev_router(json!({}), route), "the reserved route name");
+    }
+
+    #[test]
+    fn model_semantic_classifier_block_is_closed_and_typed() {
+        let bad = [
+            json!({"provider_key_id": "pk"}),
+            json!({"type": "jev"}),
+            json!({"type": "other", "provider_key_id": "pk"}),
+            json!({"type": "jev", "provider_key_id": "pk", "min_confidence": 1.5}),
+            json!({"type": "jev", "provider_key_id": "pk", "timeout_ms": 0}),
+            json!({"type": "jev", "provider_key_id": "pk", "on_failure": "skip"}),
+        ];
+        for classifier in bad {
+            let mut v = jev_router(json!({}), jev_route());
+            v["semantic"]["classifier"] = classifier.clone();
+            assert_rejected_on_both(&v, &classifier.to_string());
+        }
+        // A typo is a write-path error; the loader tolerates it like any
+        // unknown field.
+        let mut v = jev_router(json!({}), jev_route());
+        v["semantic"]["classifier"]["min_confidnce"] = json!(0.9);
+        assert!(validate_model(&v).is_err());
+        validate_model_lenient(&v).unwrap();
+    }
+
+    /// Embedding mode keeps the contract it had before a classifier
+    /// existed, on the READ path too: `match`, the embedding model and
+    /// each route's `examples` used to be required by the type itself, and
+    /// are now required by the schema instead.
+    #[test]
+    fn model_semantic_embedding_mode_requirements_hold_on_both_sets() {
+        let base = || {
+            json!({"display_name": "x", "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 0.5}
+            }})
+        };
+        validate_model(&base()).unwrap();
+        validate_model_lenient(&base()).unwrap();
+        for field in ["match", "embedding_model"] {
+            let mut v = base();
+            v["semantic"].as_object_mut().unwrap().remove(field);
+            assert_rejected_on_both(&v, field);
+        }
+        let mut v = base();
+        v["semantic"]["routes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("examples");
+        assert_rejected_on_both(&v, "a route with no examples");
+    }
+
+    #[test]
+    fn a_typesafe_provider_key_validates() {
+        let pk = json!({"display_name": "ts", "api_key": "k", "provider": "typesafe"});
+        validate_provider_key(&pk).unwrap();
+        validate_provider_key_lenient(&pk).unwrap();
+        let with_base = json!({
+            "display_name": "ts", "api_key": "k", "provider": "typesafe",
+            "api_base": "https://typesafe.internal"
+        });
+        validate_provider_key(&with_base).unwrap();
     }
 
     #[test]

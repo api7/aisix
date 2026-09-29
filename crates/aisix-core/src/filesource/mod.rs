@@ -344,6 +344,12 @@ pub fn for_each_model_ref_node(
                 if let Some(Value::Object(on_failure)) = semantic.get_mut("on_embedding_failure") {
                     f(on_failure);
                 }
+                if let Some(Value::Object(on_failure)) = semantic
+                    .get_mut("classifier")
+                    .and_then(|c| c.get_mut("on_failure"))
+                {
+                    f(on_failure);
+                }
                 if let Some(semantic) = semantic.as_object_mut() {
                     f(semantic);
                 }
@@ -848,7 +854,9 @@ pub fn load_from_str(
             check_model_ref(scope, "ensemble judge", &ensemble.judge.model);
         }
         if let Some(semantic) = &model.semantic {
-            check_model_ref(scope, "semantic embedding_model", &semantic.embedding_model);
+            if semantic.classifier.is_none() {
+                check_model_ref(scope, "semantic embedding_model", &semantic.embedding_model);
+            }
             check_model_ref(scope, "semantic default", &semantic.default);
             for route in &semantic.routes {
                 check_model_ref(
@@ -861,6 +869,11 @@ pub fn load_from_str(
                 &semantic.on_embedding_failure
             {
                 check_model_ref(scope, "semantic on_embedding_failure target", target);
+            }
+            if let Some(crate::models::OnEmbeddingFailure::Target { target, .. }) =
+                semantic.classifier.as_ref().map(|c| &c.on_failure)
+            {
+                check_model_ref(scope, "semantic classifier on_failure target", target);
             }
         }
     }

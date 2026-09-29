@@ -1009,6 +1009,42 @@ models:
     assert_eq!(errs.len(), 6, "{errs:?}");
 }
 
+/// A classifier router names no embedding model, so the check that one
+/// exists must not fire on it — while its own failure target is still
+/// checked like every other model reference.
+#[test]
+fn cross_ref_checks_a_classifier_router_without_an_embedding_model() {
+    let contents = r#"
+_format_version: "1"
+provider_keys:
+  - display_name: pk
+    api_key: sk-1
+  - display_name: ts
+    api_key: ts-1
+    provider: typesafe
+models:
+  - display_name: real
+    provider: openai
+    model_name: x
+    provider_key: pk
+  - display_name: sem
+    semantic:
+      classifier:
+        type: jev
+        provider_key_id: some-id
+        on_failure:
+          target: ghost-failure
+      default: real
+      routes:
+        - name: r1
+          target: real
+          description: anything
+"#;
+    let errs = errors_of(load(contents, &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].contains("ghost-failure"), "{errs:?}");
+}
+
 #[test]
 fn duplicate_key_hash_across_api_keys_is_a_load_error_without_hash_leak() {
     // The runtime credential index is keyed by key_hash — a duplicate

@@ -5,30 +5,6 @@
       "anyOf": [
         {
           "properties": {
-            "embedding_model": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "embedding_model"
-          ]
-        },
-        {
-          "properties": {
-            "embedding_model_id": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "embedding_model_id"
-          ]
-        }
-      ]
-    },
-    {
-      "anyOf": [
-        {
-          "properties": {
             "default": {
               "type": "string"
             }
@@ -48,6 +24,119 @@
           ]
         }
       ]
+    },
+    {
+      "else": {
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "properties": {
+                  "embedding_model": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "embedding_model"
+                ]
+              },
+              {
+                "properties": {
+                  "embedding_model_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "embedding_model_id"
+                ]
+              }
+            ]
+          }
+        ],
+        "properties": {
+          "routes": {
+            "items": {
+              "required": [
+                "examples"
+              ]
+            }
+          }
+        },
+        "required": [
+          "match"
+        ]
+      },
+      "if": {
+        "required": [
+          "classifier"
+        ]
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "embedding_model"
+              ]
+            },
+            {
+              "properties": {
+                "embedding_model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "embedding_model_id"
+              ]
+            },
+            {
+              "required": [
+                "embedding_timeout_ms"
+              ]
+            },
+            {
+              "required": [
+                "on_embedding_failure"
+              ]
+            },
+            {
+              "required": [
+                "match"
+              ]
+            }
+          ]
+        },
+        "properties": {
+          "routes": {
+            "items": {
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "examples"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "threshold"
+                    ]
+                  }
+                ]
+              },
+              "properties": {
+                "name": {
+                  "not": {
+                    "const": "none_of_the_above"
+                  }
+                }
+              },
+              "required": [
+                "description"
+              ]
+            }
+          }
+        }
+      }
     }
   ],
   "definitions": {
@@ -58,6 +147,18 @@
           "description": "Route score = the highest cosine across its examples.",
           "enum": [
             "max"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ClassifierType": {
+      "description": "Hosted decision model a semantic router can use in place of embeddings.",
+      "oneOf": [
+        {
+          "description": "TypeSafe's jev decision model.",
+          "enum": [
+            "jev"
           ],
           "type": "string"
         }
@@ -126,6 +227,58 @@
       ],
       "description": "What the router does when the embedding call errors or times out. Use `\"default\"` to route to the router's default model, `\"fail\"` to reject the request with `503`, or `{ \"target\": \"<direct alias>\" }` to route to a specific fallback model."
     },
+    "SemanticClassifier": {
+      "description": "Route selection by a hosted decision model. For each request the latest user message is sent to the model together with every route's `name` and `description`, plus a \"none of the above\" option; the model picks one. A request goes to the picked route's target, or to the router's `default` when the model picks \"none of the above\" or its confidence is below `min_confidence`.",
+      "properties": {
+        "min_confidence": {
+          "default": 0.5,
+          "description": "Lowest confidence at which the picked route is used. A decision below it sends the request to `default`.",
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "model": {
+          "default": "jev-latest",
+          "description": "Decision model to call.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "on_failure": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OnEmbeddingFailure"
+            }
+          ],
+          "description": "Behavior when the decision call fails, times out, or returns an answer that names no route. Same values as `on_embedding_failure`."
+        },
+        "provider_key_id": {
+          "description": "Resource id of the Provider Key that authenticates the decision calls. The key's `provider` must be `typesafe`; its API key is sent as the bearer token, and its `api_base`, when set, replaces the default endpoint `https://api.typesafe.ai`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 3000,
+          "description": "Deadline for the decision call, in milliseconds.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "type": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ClassifierType"
+            }
+          ],
+          "description": "Decision model family. `jev` is the only supported value."
+        }
+      },
+      "required": [
+        "provider_key_id",
+        "type"
+      ],
+      "type": "object"
+    },
     "SemanticMatch": {
       "description": "Matching parameters shared across every route in a semantic router.",
       "properties": {
@@ -190,7 +343,7 @@
       "description": "One semantic route: a labeled set of example utterances whose embeddings define the route. A request that scores high enough against them dispatches to `target`.",
       "properties": {
         "description": {
-          "description": "Human-facing description. Documentation only — v1 matches on `examples`, not on this field.",
+          "description": "What requests this route handles. With a `classifier`, this is the text the decision model reads to pick the route, and it is required. Without one, it is documentation only: routes are matched on `examples`.",
           "minLength": 1,
           "type": [
             "string",
@@ -198,7 +351,7 @@
           ]
         },
         "examples": {
-          "description": "Example utterances that define this route. AISIX embeds each example when applying the configuration and caches the vector. A request is matched against these examples. At least one example is required.",
+          "description": "Example utterances that define this route. AISIX embeds each example when applying the configuration and caches the vector. A request is matched against these examples. Required, with at least one example, when the router has no `classifier`; not accepted when it has one.",
           "items": {
             "minLength": 1,
             "type": "string"
@@ -225,7 +378,7 @@
           ]
         },
         "threshold": {
-          "description": "Per-route similarity threshold. A request matches this route only when its aggregated score is `>=` this value. When omitted, the router-level threshold applies.",
+          "description": "Per-route similarity threshold. A request matches this route only when its aggregated score is `>=` this value. When omitted, the router-level threshold applies. Not accepted with a `classifier`.",
           "format": "float",
           "maximum": 1.0,
           "minimum": 0.0,
@@ -236,7 +389,6 @@
         }
       },
       "required": [
-        "examples",
         "name"
       ],
       "type": "object"
@@ -244,6 +396,17 @@
   },
   "description": "Semantic-routing config: pick a target by request meaning.",
   "properties": {
+    "classifier": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SemanticClassifier"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Route selection by a hosted decision model instead of embeddings. When set, `embedding_model`, `embedding_model_id`, `embedding_timeout_ms`, `on_embedding_failure` and `match` are not accepted, every route needs a `description` and takes no `examples` or `threshold`, and no route may be named `none_of_the_above`. When omitted, routes are matched by embedding similarity."
+    },
     "default": {
       "description": "Direct model alias used when no route clears its threshold. Read only when `default_id` is absent.",
       "minLength": 1,
@@ -258,7 +421,7 @@
       ]
     },
     "embedding_model": {
-      "description": "Alias of an `embedding`-modality Model used to embed the request and (at apply time) the route examples. Read only when `embedding_model_id` is absent.",
+      "description": "Alias of an `embedding`-modality Model used to embed the request and (at apply time) the route examples. Read only when `embedding_model_id` is absent. Required, under this name or as `embedding_model_id`, when there is no `classifier`.",
       "minLength": 1,
       "type": "string"
     },
@@ -280,12 +443,15 @@
       ]
     },
     "match": {
-      "allOf": [
+      "anyOf": [
         {
           "$ref": "#/definitions/SemanticMatch"
+        },
+        {
+          "type": "null"
         }
       ],
-      "description": "Shared matching parameters (metric, aggregation, default threshold)."
+      "description": "Shared matching parameters (metric, aggregation, default threshold). Required when there is no `classifier`."
     },
     "on_embedding_failure": {
       "allOf": [
@@ -305,7 +471,6 @@
     }
   },
   "required": [
-    "match",
     "routes"
   ],
   "title": "Semantic",

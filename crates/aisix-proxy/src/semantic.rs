@@ -7,20 +7,28 @@
 //! so semantic routing reuses all of the streaming / failover / telemetry
 //! machinery and only adds the "which target" decision on top.
 //!
-//! The scoring core ([`decide`],
-//! [`embedding_failure_target`]) and the example-vector cache
-//! ([`SemanticVectorCache`]) are pure and unit-tested in isolation; the
-//! async embedding call lives in [`resolve`].
+//! A router with a `classifier` block makes the same decision a different
+//! way: one call to a hosted decision model ([`classify`]) picks a route by
+//! its description. Everything after the pick — the member gates, the
+//! failure policy, the served-route attribution — is shared.
+//!
+//! The scoring core ([`decide`], [`failure_target`]) and the
+//! example-vector cache ([`SemanticVectorCache`]) are pure and unit-tested
+//! in isolation; the async embedding call lives in [`resolve`].
 
 use std::borrow::Cow;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 
-use aisix_core::models::{resolve_model_ref, EmbeddingFailureMode, OnEmbeddingFailure, Semantic};
+use aisix_core::models::{
+    resolve_model_ref, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticClassifier,
+    SemanticRoute, NONE_OF_THE_ABOVE, TYPESAFE_PROVIDER,
+};
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, Model};
 use aisix_gateway::{EmbeddingRequest, EmbeddingVector};
+use aisix_obs::{SemanticAccessLog, SemanticFallback};
 
 use crate::error::ProxyError;
 use crate::routing::AttemptModel;
@@ -73,19 +81,24 @@ pub(crate) fn decide(
     RouteDecision { winner, scores }
 }
 
-/// Direct-model alias to dispatch to when the embedding call fails, per
-/// `on_embedding_failure`. `None` means the policy is `fail` — the caller
-/// returns `503`.
+/// Direct-model alias to dispatch to when the router cannot decide — the
+/// embedding call failed (`on_embedding_failure`), or the classifier call
+/// did (`classifier.on_failure`). `None` means the policy is `fail` — the
+/// caller returns `503`.
 ///
 /// Each of the two aliases it can return is a model reference in its own
 /// right, so both are resolved against the snapshot: an id spelling follows
 /// a rename, and an id that resolves to nothing comes back as itself and
 /// dispatches nowhere, exactly as a dangling alias does.
-pub(crate) fn embedding_failure_target<'a>(
+pub(crate) fn failure_target<'a>(
     snapshot: &AisixSnapshot,
     semantic: &'a Semantic,
 ) -> Option<Cow<'a, str>> {
-    match &semantic.on_embedding_failure {
+    let policy = match &semantic.classifier {
+        Some(classifier) => &classifier.on_failure,
+        None => &semantic.on_embedding_failure,
+    };
+    match policy {
         OnEmbeddingFailure::Mode(EmbeddingFailureMode::Default) => {
             Some(semantic.default_ref(snapshot))
         }
@@ -138,10 +151,25 @@ impl SemanticVectorCache {
     }
 }
 
+/// What a router's decision step produced, before the member gates run.
+struct Pick {
+    /// Index into `Semantic::routes` of the chosen route; `None` sends the
+    /// request to `default`.
+    winner: Option<usize>,
+    /// The deciding score: the winning (or, with no winner, the best)
+    /// route's cosine similarity, or the classifier's confidence.
+    score: Option<f64>,
+    /// Why there is no winner.
+    miss: Option<SemanticFallback>,
+}
+
 /// Resolve a semantic router to a single direct-model attempt + the name
 /// of the route that matched (`None` when the request fell through to
 /// `default`). The returned `Vec<AttemptModel>` always has exactly one
 /// element; the chat dispatch loop drives it like any routing target.
+///
+/// How it decided is published for the request's access-log line
+/// ([`crate::attribution::note_semantic_decision`]).
 pub(crate) async fn resolve(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
@@ -164,14 +192,106 @@ pub(crate) async fn resolve(
     let default_target = semantic.default_ref(snapshot);
 
     // No user text to classify (e.g. a system-only or tool-only request):
-    // route to `default` without an embedding call rather than embedding an
-    // empty string, which could spuriously match a route.
+    // route to `default` without a decision call rather than deciding on
+    // an empty string, which could spuriously match a route.
     if prompt.trim().is_empty() {
+        note_decision(None, None, Some(SemanticFallback::EmptyPrompt));
         let (attempt, _) =
             select_eligible(state, snapshot, router, source_ip, &default_target, None)?;
         return Ok((vec![attempt], None));
     }
 
+    let pick = match &semantic.classifier {
+        Some(classifier) => match classify(snapshot, &semantic.routes, classifier, prompt).await {
+            Ok((choice, confidence)) => {
+                let winner = semantic.routes.iter().position(|r| r.name == choice);
+                let miss = if winner.is_none() {
+                    Some(SemanticFallback::NoneOfTheAbove)
+                } else if confidence < classifier.min_confidence {
+                    Some(SemanticFallback::LowConfidence)
+                } else {
+                    None
+                };
+                Some(Pick {
+                    winner: winner.filter(|_| miss.is_none()),
+                    score: Some(confidence),
+                    miss,
+                })
+            }
+            Err(error) => {
+                tracing::warn!(
+                    router = %router.display_name,
+                    error = %error,
+                    "semantic classifier call failed; applying classifier.on_failure",
+                );
+                None
+            }
+        },
+        None => {
+            decide_by_embedding(state, snapshot, router_entry, semantic, prompt, request_id).await
+        }
+    };
+    let Some(pick) = pick else {
+        note_decision(None, None, Some(SemanticFallback::DecisionFailed));
+        return fallback(state, snapshot, router, source_ip, semantic);
+    };
+
+    let (attempt, route_name): (AttemptModel, Option<String>) = match pick.winner {
+        Some(i) => {
+            let (attempt, fell_back) = select_eligible(
+                state,
+                snapshot,
+                router,
+                source_ip,
+                &semantic.routes[i].target_ref(snapshot),
+                Some(&default_target),
+            )?;
+            // `x-aisix-route` reports the route that actually served the
+            // request: a winner displaced by its target's gates is a
+            // fall-through to `default`, not a served route.
+            let name = (!fell_back).then(|| semantic.routes[i].name.clone());
+            note_decision(
+                name.clone(),
+                pick.score,
+                fell_back.then_some(SemanticFallback::TargetUnavailable),
+            );
+            (attempt, name)
+        }
+        None => {
+            note_decision(None, pick.score, pick.miss);
+            let (attempt, _) =
+                select_eligible(state, snapshot, router, source_ip, &default_target, None)?;
+            (attempt, None)
+        }
+    };
+    tracing::debug!(
+        router = %router_entry.value.display_name,
+        resolved_route = ?route_name,
+        target = %attempt.model.display_name,
+        "semantic routing decision",
+    );
+    Ok((vec![attempt], route_name))
+}
+
+fn note_decision(route: Option<String>, score: Option<f64>, fallback: Option<SemanticFallback>) {
+    crate::attribution::note_semantic_decision(SemanticAccessLog {
+        route,
+        score,
+        fallback,
+    });
+}
+
+/// The embedding decision: embed the prompt, score it against every
+/// route's examples. `None` when the embedding could not be computed, which
+/// the caller answers with `on_embedding_failure`.
+async fn decide_by_embedding(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    router_entry: &ResourceEntry<Model>,
+    semantic: &Semantic,
+    prompt: &str,
+    request_id: &str,
+) -> Option<Pick> {
     // Resolve the embedding model + its modality metadata. A dangling or
     // wrong-kind reference is a config error; degrade via the failure
     // policy rather than 500.
@@ -186,7 +306,7 @@ pub(crate) async fn resolve(
                 "semantic router references a missing or non-embedding embedding_model; \
                  applying on_embedding_failure",
             );
-            return fallback(state, snapshot, router, source_ip, semantic);
+            return None;
         }
     };
     let dims = embed_entry
@@ -239,7 +359,7 @@ pub(crate) async fn resolve(
                 error = %e,
                 "semantic embedding call failed; applying on_embedding_failure",
             );
-            return fallback(state, snapshot, router, source_ip, semantic);
+            return None;
         }
     };
 
@@ -268,39 +388,31 @@ pub(crate) async fn resolve(
         .collect();
 
     let decision = decide(semantic, &prompt_vec, &route_vecs);
-    let (attempt, route_name): (AttemptModel, Option<String>) = match decision.winner {
-        Some(i) => {
-            let (attempt, fell_back) = select_eligible(
-                state,
-                snapshot,
-                router,
-                source_ip,
-                &semantic.routes[i].target_ref(snapshot),
-                Some(&default_target),
-            )?;
-            // `x-aisix-route` reports the route that actually served the
-            // request: a winner displaced by its target's gates is a
-            // fall-through to `default`, not a served route.
-            let name = (!fell_back).then(|| semantic.routes[i].name.clone());
-            (attempt, name)
-        }
-        None => {
-            let (attempt, _) =
-                select_eligible(state, snapshot, router, source_ip, &default_target, None)?;
-            (attempt, None)
-        }
+    // The winner's score, or with no winner the closest miss: the number an
+    // operator tunes a threshold against.
+    let score = match decision.winner {
+        Some(i) => decision.scores.get(i).copied(),
+        None => decision.scores.iter().copied().reduce(f32::max),
     };
-    tracing::debug!(
-        router = %router_entry.value.display_name,
-        resolved_route = ?route_name,
-        target = %attempt.model.display_name,
-        "semantic routing decision",
-    );
-    Ok((vec![attempt], route_name))
+    Some(Pick {
+        winner: decision.winner,
+        score: score.map(log_score),
+        miss: decision
+            .winner
+            .is_none()
+            .then_some(SemanticFallback::NoMatch),
+    })
 }
 
-/// Apply the `on_embedding_failure` policy: route to the fallback target,
-/// or surface `503` when the policy is `fail`.
+/// A cosine score as the access log writes it. Widening an `f32` exposes
+/// its binary representation (`0.8` becomes `0.800000011920929`), which
+/// reads as precision the score does not have.
+fn log_score(score: f32) -> f64 {
+    (f64::from(score) * 1e6).round() / 1e6
+}
+
+/// Apply the router's failure policy: route to the fallback target, or
+/// surface `503` when the policy is `fail`.
 fn fallback(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
@@ -308,13 +420,170 @@ fn fallback(
     source_ip: &str,
     semantic: &Semantic,
 ) -> Result<(Vec<AttemptModel>, Option<String>), ProxyError> {
-    match embedding_failure_target(snapshot, semantic) {
+    match failure_target(snapshot, semantic) {
         Some(alias) => {
             let (attempt, _) = select_eligible(state, snapshot, router, source_ip, &alias, None)?;
             Ok((vec![attempt], None))
         }
         None => Err(ProxyError::ProviderUnavailable),
     }
+}
+
+/// Endpoint a `typesafe` Provider Key reaches when it sets no `api_base`.
+const TYPESAFE_DEFAULT_API_BASE: &str = "https://api.typesafe.ai";
+
+/// The one question every classifier call asks, and the wording of the
+/// option the gateway adds to it. Both are the wording the classifier mode
+/// was validated with; change them only against a fresh evaluation.
+const CLASSIFIER_QUESTION: &str = "route";
+const CLASSIFIER_INSTRUCTIONS: &str =
+    "Which route should handle this user request to an AI assistant?";
+const NONE_OF_THE_ABOVE_DESCRIPTION: &str = "anything not covered by the routes above \
+     (e.g. weather, travel booking, medical advice, image generation, news)";
+
+#[derive(serde::Serialize)]
+struct ClassifierRequest<'a> {
+    state: &'a str,
+    model: &'a str,
+    questions: ClassifierQuestions<'a>,
+}
+
+struct ClassifierQuestions<'a>(&'a [SemanticRoute]);
+
+impl serde::Serialize for ClassifierQuestions<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        #[derive(serde::Serialize)]
+        struct Choice<'a> {
+            r#type: &'static str,
+            instructions: &'static str,
+            criteria: Criteria<'a>,
+        }
+        let mut map = s.serialize_map(Some(1))?;
+        map.serialize_entry(
+            CLASSIFIER_QUESTION,
+            &Choice {
+                r#type: "choice",
+                instructions: CLASSIFIER_INSTRUCTIONS,
+                criteria: Criteria(self.0),
+            },
+        )?;
+        map.end()
+    }
+}
+
+/// The options, in the order the routes are configured and with the
+/// gateway's own option last — the order the mode was validated in, which
+/// a `serde_json::Map` (sorted by key) would not keep.
+struct Criteria<'a>(&'a [SemanticRoute]);
+
+impl serde::Serialize for Criteria<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(Some(self.0.len() + 1))?;
+        for route in self.0 {
+            map.serialize_entry(
+                &route.name,
+                route.description.as_deref().unwrap_or_default(),
+            )?;
+        }
+        map.serialize_entry(NONE_OF_THE_ABOVE, NONE_OF_THE_ABOVE_DESCRIPTION)?;
+        map.end()
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ClassifierResponse {
+    #[serde(default)]
+    answers: std::collections::HashMap<String, ClassifierAnswer>,
+}
+
+#[derive(serde::Deserialize)]
+struct ClassifierAnswer {
+    choice: String,
+    confidence: f64,
+}
+
+/// Ask the classifier which route fits `prompt`. Returns the option it
+/// picked — a route name or [`NONE_OF_THE_ABOVE`] — and its confidence.
+/// Every way the call can fail comes back as `Err` with a reason for the
+/// log, and the caller applies `classifier.on_failure`.
+///
+/// Detached, like the embedding sub-call: it is a call the GATEWAY decided
+/// to make, not one the caller addressed, and it is not metered as one.
+async fn classify(
+    snapshot: &AisixSnapshot,
+    routes: &[SemanticRoute],
+    classifier: &SemanticClassifier,
+    prompt: &str,
+) -> Result<(String, f64), String> {
+    crate::attribution::detached(classify_inner(snapshot, routes, classifier, prompt)).await
+}
+
+async fn classify_inner(
+    snapshot: &AisixSnapshot,
+    routes: &[SemanticRoute],
+    classifier: &SemanticClassifier,
+    prompt: &str,
+) -> Result<(String, f64), String> {
+    let pk = snapshot
+        .provider_keys
+        .get_by_id(&classifier.provider_key_id)
+        .ok_or_else(|| {
+            format!(
+                "classifier provider_key_id {:?} matches no provider key",
+                classifier.provider_key_id
+            )
+        })?;
+    if pk.value.provider != TYPESAFE_PROVIDER {
+        return Err(format!(
+            "classifier provider key {:?} has provider {:?}, not {TYPESAFE_PROVIDER:?}",
+            pk.value.display_name, pk.value.provider
+        ));
+    }
+    let base = pk
+        .value
+        .api_base
+        .as_deref()
+        .filter(|b| !b.is_empty())
+        .unwrap_or(TYPESAFE_DEFAULT_API_BASE)
+        .trim_end_matches('/');
+    let body = serde_json::to_vec(&ClassifierRequest {
+        state: prompt,
+        model: &classifier.model,
+        questions: ClassifierQuestions(routes),
+    })
+    .map_err(|e| format!("encoding the classifier request: {e}"))?;
+    let resp = crate::http_client::client_for(pk.value.upstream_connection().as_ref())
+        .post(format!("{base}/v1/systemone"))
+        .bearer_auth(&pk.value.api_key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .timeout(classifier.timeout())
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| aisix_gateway::transport_error_message(&e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("classifier returned HTTP {}", status.as_u16()));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| aisix_gateway::transport_error_message(&e))?;
+    let mut parsed: ClassifierResponse = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("classifier response is not the expected shape: {e}"))?;
+    let answer = parsed
+        .answers
+        .remove(CLASSIFIER_QUESTION)
+        .ok_or("classifier response carries no answer to the routing question")?;
+    if answer.choice != NONE_OF_THE_ABOVE && !routes.iter().any(|r| r.name == answer.choice) {
+        return Err(format!(
+            "classifier picked {:?}, which is not one of the offered options",
+            answer.choice
+        ));
+    }
+    Ok((answer.choice, answer.confidence))
 }
 
 /// Resolve a direct-model alias to the single `AttemptModel` the dispatch
@@ -682,11 +951,11 @@ mod tests {
     }
 
     #[test]
-    fn embedding_failure_target_maps_each_policy() {
+    fn failure_target_maps_each_policy() {
         let snap = AisixSnapshot::default();
         let default_policy = router();
         assert_eq!(
-            embedding_failure_target(&snap, &default_policy).as_deref(),
+            failure_target(&snap, &default_policy).as_deref(),
             Some("gpt-4o")
         );
 
@@ -694,23 +963,20 @@ mod tests {
             r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
                 "default":"d","match":{"threshold":0.5},"on_embedding_failure":"fail"}"#,
         );
-        assert!(embedding_failure_target(&snap, &fail).is_none());
+        assert!(failure_target(&snap, &fail).is_none());
 
         let target = semantic(
             r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
                 "default":"d","match":{"threshold":0.5},"on_embedding_failure":{"target":"safe"}}"#,
         );
-        assert_eq!(
-            embedding_failure_target(&snap, &target).as_deref(),
-            Some("safe")
-        );
+        assert_eq!(failure_target(&snap, &target).as_deref(), Some("safe"));
     }
 
     /// The id spelling decides at both `on_embedding_failure` shapes, and
     /// resolves against the live table — so a rename of the fallback model
     /// needs no edit to the router.
     #[test]
-    fn embedding_failure_target_follows_the_id_spelling() {
+    fn failure_target_follows_the_id_spelling() {
         let snap = AisixSnapshot::default();
         snap.models.insert(ResourceEntry::new(
             "m-safe",
@@ -727,17 +993,14 @@ mod tests {
                 "default":"d","match":{"threshold":0.5},
                 "on_embedding_failure":{"target":"stale","target_id":"m-safe"}}"#,
         );
-        assert_eq!(
-            embedding_failure_target(&snap, &explicit).as_deref(),
-            Some("safe-v2")
-        );
+        assert_eq!(failure_target(&snap, &explicit).as_deref(), Some("safe-v2"));
 
         let by_default = semantic(
             r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
                 "default":"stale","default_id":"m-safe","match":{"threshold":0.5}}"#,
         );
         assert_eq!(
-            embedding_failure_target(&snap, &by_default).as_deref(),
+            failure_target(&snap, &by_default).as_deref(),
             Some("safe-v2")
         );
 
@@ -747,7 +1010,7 @@ mod tests {
             r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
                 "default":"d","default_id":"m-gone","match":{"threshold":0.5}}"#,
         );
-        let resolved = embedding_failure_target(&snap, &dangling).unwrap();
+        let resolved = failure_target(&snap, &dangling).unwrap();
         assert_eq!(resolved, "m-gone");
         assert!(snap.models.get_by_name(&resolved).is_none());
     }

@@ -424,6 +424,8 @@ struct Cell {
     )>,
     /// See [`note_terminal_upstream`].
     terminal_upstream: Option<Duration>,
+    /// See [`note_semantic_decision`].
+    semantic: Option<aisix_obs::SemanticAccessLog>,
     /// The `upstream` end-to-end observation has been recorded.
     e2e_upstream_recorded: bool,
 }
@@ -527,8 +529,10 @@ impl RequestAttribution {
         duration_from: Option<Instant>,
     ) {
         let mut cell = self.lock();
+        let mut record = line.to_record();
+        record.semantic = cell.semantic.clone();
         let ready = ReadyLine {
-            record: line.to_record(),
+            record,
             duration_from,
         };
         if cell.request_span.is_none() {
@@ -944,6 +948,18 @@ fn park(line: aisix_obs::AccessLog<'_>, duration_from: Option<Instant>) {
     {
         line.emit();
     }
+}
+
+/// Note how the semantic router this request addressed decided, for its
+/// access-log line.
+///
+/// Published here rather than threaded to the line, because the line has
+/// several writers — the handler's buffered exit, a stream's terminal
+/// emitter, the cancel guard — and the decision is made before any of them
+/// exists. Every one of them parks its line on this cell, which is where
+/// it is attached ([`RequestAttribution::park_access_log`]).
+pub(crate) fn note_semantic_decision(decision: aisix_obs::SemanticAccessLog) {
+    let _ = CURRENT.try_with(|a| a.lock().semantic = Some(decision));
 }
 
 /// Note that the request body was read only to be discarded by a refusal
