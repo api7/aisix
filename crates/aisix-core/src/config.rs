@@ -221,7 +221,7 @@ pub struct EtcdTlsConfig {
 ///
 /// All configuration is read from etcd via the TLS channel (see
 /// [`EtcdTlsConfig`]).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct ManagedConfig {
@@ -343,6 +343,28 @@ pub struct ManagedConfig {
     /// tests aren't bound by the interval.
     #[serde(default = "ManagedConfig::default_heartbeat_interval_secs")]
     pub heartbeat_interval_secs: u64,
+}
+
+impl Default for ManagedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cp_base_url: None,
+            cp_etcd_endpoint: None,
+            cp_ca_cert_file: None,
+            cp_cert_pem: None,
+            cp_key_pem: None,
+            cp_ca_pem: None,
+            cp_cert_file: None,
+            cp_key_file: None,
+            cp_ca_file: None,
+            mtls_dir: Self::default_mtls_dir(),
+            dp_id_file: Self::default_dp_id_file(),
+            snapshot_cache_enabled: false,
+            snapshot_cache_path: None,
+            heartbeat_interval_secs: Self::default_heartbeat_interval_secs(),
+        }
+    }
 }
 
 impl ManagedConfig {
@@ -1158,7 +1180,7 @@ pub struct ProxyListener {
     pub tls: Option<TlsConfig>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct ObservabilityConfig {
@@ -1246,6 +1268,20 @@ impl Default for AutoDumpConfig {
             thresholds: vec![0.8, 0.9],
             dir: "/var/lib/aisix/heap".into(),
             keep: 5,
+        }
+    }
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            service_name: Self::default_service_name(),
+            log_level: Self::default_log_level(),
+            access_log: Self::default_access_log(),
+            metrics: MetricsConfig::default(),
+            tracing: None,
+            debug: DebugListenerConfig::default(),
+            heap_profiling: HeapProfilingConfig::default(),
         }
     }
 }
@@ -4971,10 +5007,9 @@ observability:
     #[test]
     fn config_reference_matches_the_defaults() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.reference.json");
-        // Every block is written out empty: a block that is absent falls
-        // back to its derived `Default`, which for some blocks
-        // (`observability`, `managed`) is not the per-key default a file
-        // that writes the block gets. `proxy.addr` and `etcd.endpoints`
+        // Every block is written out empty, which is the definition of the
+        // reference (`an_omitted_block_equals_the_block_written_empty` keeps
+        // an omitted block equal to it). `proxy.addr` and `etcd.endpoints`
         // are the keys without a default; `proxy.addr` takes the value
         // both shipped example configs use.
         let cfg: Config = serde_json::from_value(serde_json::json!({
@@ -5023,6 +5058,139 @@ observability:
             committed, expected,
             "config.reference.json is stale: regenerate it with \
              UPDATE_CONFIG_REFERENCE=1 cargo test -p aisix-core config_reference"
+        );
+    }
+
+    /// The quick-start config writes no `observability` block, and the
+    /// gateway it started logged nothing: the level came out empty.
+    #[test]
+    fn omitted_observability_and_managed_blocks_take_the_documented_defaults() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.observability.log_level, "info");
+        assert_eq!(cfg.observability.service_name, "aisix");
+        assert!(cfg.observability.access_log);
+        assert_eq!(cfg.managed.mtls_dir, "/var/lib/aisix/mtls");
+        assert_eq!(cfg.managed.dp_id_file, "/var/lib/aisix/dp_id");
+        assert_eq!(cfg.managed.heartbeat_interval_secs, 15);
+    }
+
+    /// A config that omits a block must get exactly what it gets by writing
+    /// that block with every key omitted. The two go through different code:
+    /// an omitted block is the struct's `Default`, a written one takes each
+    /// missing key from its field-level `#[serde(default = "…")]`, so a
+    /// derived `Default` next to those functions silently disagrees
+    /// (`observability.log_level` came out empty and the gateway logged
+    /// nothing). Every non-optional block outside an `Option<…>` one is found
+    /// from the schema, so a new block is checked without editing this test.
+    #[test]
+    fn an_omitted_block_equals_the_block_written_empty() {
+        fn block_def<'a>(
+            prop: &'a serde_json::Value,
+            defs: &'a serde_json::Value,
+        ) -> Option<&'a serde_json::Value> {
+            let mut v = prop;
+            loop {
+                if let Some(r) = v.get("$ref").and_then(|r| r.as_str()) {
+                    v = &defs[r.trim_start_matches("#/definitions/")];
+                } else if let Some([only]) = v
+                    .get("allOf")
+                    .and_then(|a| a.as_array())
+                    .map(|a| a.as_slice())
+                {
+                    v = only;
+                } else {
+                    // `Option<…>` (`anyOf` with `null`) is off unless
+                    // written: absent and `{}` legitimately differ.
+                    return v.get("properties").map(|_| v);
+                }
+            }
+        }
+        fn collect(
+            schema: &serde_json::Value,
+            defs: &serde_json::Value,
+            path: &[String],
+            out: &mut Vec<(Vec<String>, Vec<String>)>,
+        ) {
+            let required: Vec<&str> = schema["required"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.as_str())
+                .collect();
+            for (name, prop) in schema["properties"].as_object().into_iter().flatten() {
+                let Some(def) = block_def(prop, defs) else {
+                    continue;
+                };
+                let mut child = path.to_vec();
+                child.push(name.clone());
+                if !required.contains(&name.as_str()) {
+                    let keys = def["required"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|r| r.as_str().map(str::to_owned))
+                        .collect();
+                    out.push((child.clone(), keys));
+                }
+                collect(def, defs, &child, out);
+            }
+        }
+        fn at<'a>(v: &'a mut serde_json::Value, path: &[String]) -> &'a mut serde_json::Value {
+            path.iter().fold(v, |v, k| {
+                v.as_object_mut()
+                    .unwrap()
+                    .entry(k.clone())
+                    .or_insert_with(|| serde_json::json!({}))
+            })
+        }
+        fn load(v: &serde_json::Value) -> serde_json::Value {
+            let cfg: Config = serde_json::from_value(v.clone())
+                .unwrap_or_else(|e| panic!("{v} must deserialize: {e}"));
+            serde_json::to_value(cfg).unwrap()
+        }
+
+        let root = serde_json::to_value(schemars::schema_for!(Config)).unwrap();
+        let mut blocks = Vec::new();
+        collect(&root, &root["definitions"], &[], &mut blocks);
+        assert!(
+            blocks.len() > 10,
+            "schema walk found too few blocks: {blocks:?}"
+        );
+
+        let base = serde_json::json!({"proxy": {"addr": "0.0.0.0:3000"}});
+        let mut disagreements = Vec::new();
+        for (path, required) in &blocks {
+            let (parent, _) = path.split_at(path.len() - 1);
+            let mut omitted = base.clone();
+            at(&mut omitted, parent);
+            let omitted_value = load(&omitted);
+            // A key the block requires cannot be left out when writing it,
+            // so it carries the value the omitted block resolved to.
+            let mut written = omitted.clone();
+            let block = at(&mut written, path);
+            let resolved = path.iter().fold(&omitted_value, |v, k| &v[k]);
+            for key in required {
+                block[key] = resolved[key].clone();
+            }
+            if load(&written) != omitted_value {
+                disagreements.push(path.join("."));
+            }
+        }
+        assert!(
+            disagreements.is_empty(),
+            "omitting these blocks does not equal writing them empty — make \
+             the struct's `Default` use its field-level default functions: \
+             {disagreements:?}"
         );
     }
 
