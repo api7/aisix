@@ -68,15 +68,13 @@
       },
       "client_type_rules": [],
       "labels": {},
-      "otlp": null,
       "prometheus": {
         "addr": "0.0.0.0:9090",
         "enabled": true,
         "path": "/metrics"
       }
     },
-    "service_name": "aisix",
-    "tracing": null
+    "service_name": "aisix"
   },
   "proxy": {
     "addr": "0.0.0.0:3000",

@@ -4917,7 +4917,17 @@ observability:
             "managed": {},
         }))
         .expect("defaults must deserialize");
-        let expected = serde_json::to_value(&cfg).unwrap();
+        let mut expected = serde_json::to_value(&cfg).unwrap();
+        // Retired keys (`ObservabilityConfig::retired_settings`) are left out
+        // so the chart does not advertise a setting that does nothing.
+        expected["observability"]["metrics"]
+            .as_object_mut()
+            .unwrap()
+            .remove("otlp");
+        expected["observability"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tracing");
         if std::env::var_os("UPDATE_CONFIG_REFERENCE").is_some() {
             let mut text = serde_json::to_string_pretty(&expected).unwrap();
             text.push('\n');
