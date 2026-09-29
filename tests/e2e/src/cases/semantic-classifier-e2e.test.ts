@@ -254,6 +254,40 @@ describe("semantic classifier e2e", () => {
     await direct("code-model");
     await direct("default-model");
     await direct("safe-model");
+    // Streams its answer, so a routed request's line is written by the
+    // stream's terminal emitter rather than by the handler.
+    const streaming = await startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({
+          id: "cmpl-stream",
+          object: "chat.completion.chunk",
+          created: 0,
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, delta: { role: "assistant", content: "streamed" }, finish_reason: null }],
+        }),
+        JSON.stringify({
+          id: "cmpl-stream",
+          object: "chat.completion.chunk",
+          created: 0,
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+        "[DONE]",
+      ],
+    });
+    closers.push(() => streaming.close());
+    const streamPk = await seed.createProviderKey({
+      display_name: "stream-model-pk",
+      secret: "sk-mock",
+      api_base: `${streaming.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "stream-model",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: streamPk.id,
+    });
     // Reachable from nowhere the suite calls from, so a route to it is
     // displaced to `default` by the member gate.
     await direct("fenced-model", { allowed_cidrs: ["10.255.255.0/24"] });
@@ -298,6 +332,14 @@ describe("semantic classifier e2e", () => {
         },
       });
     await jevRouter("jev-router", {});
+    await seed.createModel({
+      display_name: "jev-stream",
+      semantic: {
+        classifier: { type: "jev", provider_key_id: typesafe.id },
+        routes: [{ name: "code", target: "stream-model", description: "programming questions" }],
+        default: "default-model",
+      },
+    });
     await jevRouter("jev-fail", { on_failure: "fail" });
     await jevRouter("jev-target", { on_failure: { target: "safe-model" } });
     await jevRouter("jev-wrong-key", { provider_key_id: wrongProvider.id });
@@ -433,6 +475,28 @@ describe("semantic classifier e2e", () => {
       ["math", "math problems"],
       ["none_of_the_above", NONE_DESCRIPTION],
     ]);
+  });
+
+  test("a streamed response's line carries the decision too", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+      },
+      body: JSON.stringify({
+        model: "jev-stream",
+        stream: true,
+        messages: [{ role: "user", content: "fix my python script" }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("streamed");
+    await expectDecision(
+      { status: 200, content: undefined, route: null, requestId: res.headers.get("x-aisix-request-id") ?? "" },
+      { route: "code", score: "0.93" },
+    );
   });
 
   test("none_of_the_above and a low-confidence pick both go to default", async (ctx) => {

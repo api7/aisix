@@ -45,6 +45,56 @@ fn provider_key_ref_resugars_to_name() {
     assert_eq!(models[0]["provider_key"], json!("openai-prod"));
 }
 
+/// A classifier's key reference has no file name form, so it is carried
+/// as the id the file will derive for the same key — the source id would
+/// match nothing once loaded.
+#[test]
+fn classifier_provider_key_is_rewritten_to_the_file_derived_id() {
+    let snap = AisixSnapshot::new();
+    snap.provider_keys.insert(ResourceEntry::new(
+        "pk-uuid-ts",
+        provider_key("typesafe-prod", "ts-live"),
+        1,
+    ));
+    let router = |pk: &str| {
+        model_value(json!({
+            "display_name": "jev-router",
+            "semantic": {
+                "classifier": {"type": "jev", "provider_key_id": pk},
+                "routes": [{"name": "code", "target": "m", "description": "code"}],
+                "default": "m"
+            }
+        }))
+    };
+    snap.models
+        .insert(ResourceEntry::new("m-uuid-r", router("pk-uuid-ts"), 1));
+    let doc = build_export_document(&snap, false);
+    assert_eq!(
+        find(&doc, "models")[0]["semantic"]["classifier"]["provider_key_id"],
+        json!(aisix_core::filesource::derive_id(
+            "provider_keys",
+            "typesafe-prod"
+        ))
+    );
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+
+    let snap = AisixSnapshot::new();
+    snap.models
+        .insert(ResourceEntry::new("m-uuid-r", router("pk-gone"), 1));
+    let doc = build_export_document(&snap, false);
+    assert_eq!(
+        find(&doc, "models")[0]["semantic"]["classifier"]["provider_key_id"],
+        json!("pk-gone")
+    );
+    assert!(
+        doc.blocking
+            .iter()
+            .any(|w| w.contains("jev-router") && w.contains("pk-gone")),
+        "{:?}",
+        doc.blocking
+    );
+}
+
 #[test]
 fn dangling_provider_key_ref_is_kept_and_warned() {
     let snap = AisixSnapshot::new();

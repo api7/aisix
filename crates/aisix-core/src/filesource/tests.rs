@@ -1010,11 +1010,26 @@ models:
 }
 
 /// A classifier router names no embedding model, so the check that one
-/// exists must not fire on it — while its own failure target is still
-/// checked like every other model reference.
+/// exists must not fire on it — while its own failure target and its
+/// Provider Key are still checked like every other reference.
 #[test]
 fn cross_ref_checks_a_classifier_router_without_an_embedding_model() {
-    let contents = r#"
+    let ts_id = crate::filesource::derive_id("provider_keys", "ts");
+    let with_key = |pk_id: &str| CLASSIFIER_FILE.replace("PK_ID", pk_id);
+    let errs = errors_of(load(&with_key(&ts_id), &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].contains("ghost-failure"), "{errs:?}");
+
+    let errs = errors_of(load(&with_key("some-id"), &env_of(&[])));
+    assert_eq!(errs.len(), 2, "{errs:?}");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("classifier provider_key_id \"some-id\"")),
+        "{errs:?}"
+    );
+}
+
+const CLASSIFIER_FILE: &str = r#"
 _format_version: "1"
 provider_keys:
   - display_name: pk
@@ -1031,7 +1046,7 @@ models:
     semantic:
       classifier:
         type: jev
-        provider_key_id: some-id
+        provider_key_id: PK_ID
         on_failure:
           target: ghost-failure
       default: real
@@ -1040,10 +1055,6 @@ models:
           target: real
           description: anything
 "#;
-    let errs = errors_of(load(contents, &env_of(&[])));
-    assert_eq!(errs.len(), 1, "{errs:?}");
-    assert!(errs[0].contains("ghost-failure"), "{errs:?}");
-}
 
 #[test]
 fn duplicate_key_hash_across_api_keys_is_a_load_error_without_hash_leak() {

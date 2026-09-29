@@ -137,6 +137,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             &mut diag,
             |doc, identity, diag| {
                 resugar_provider_key(doc, identity, &provider_key_names, diag);
+                rederive_classifier_provider_key(doc, identity, &provider_key_names, diag);
                 resugar_model_refs(doc, "models", "model", identity, &model_names, diag);
                 drop_pricing_key(doc, identity, diag);
             },
@@ -675,6 +676,32 @@ fn resugar_provider_key(
             "model {model:?} references provider_key_id {id:?}, which is not among the exported \
              provider keys — kept as a raw id (dangling reference in the source data; the file \
              will not load until it is resolved)"
+        )),
+    }
+}
+
+/// `semantic.classifier.provider_key_id` → the id the file will derive
+/// for that key.
+///
+/// The classifier names its key by id only, and a file-mode key's id is
+/// derived from its name, so the source id would be dangling once
+/// loaded. Rewriting it to the derived id keeps the reference pointing at
+/// the same key without a file-only name form.
+fn rederive_classifier_provider_key(
+    doc: &mut Value,
+    model: &str,
+    provider_key_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    let Some(Value::String(id)) = doc.pointer_mut("/semantic/classifier/provider_key_id") else {
+        return;
+    };
+    match provider_key_names.get(id.as_str()) {
+        Some(name) => *id = aisix_core::filesource::derive_id("provider_keys", name),
+        None => diag.blocking.push(format!(
+            "model {model:?} has a semantic classifier referencing provider_key_id {id:?}, \
+             which is not among the exported provider keys — kept as a raw id (the file will \
+             not load until it is resolved)"
         )),
     }
 }

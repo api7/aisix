@@ -1087,6 +1087,18 @@ pub fn load_from_str(
                 });
             }
         }
+        let classifier = model.semantic.as_ref().and_then(|s| s.classifier.as_ref());
+        if let Some(pk_id) = classifier.map(|c| c.provider_key_id.as_str()) {
+            if !pk_ids.contains(pk_id) {
+                errors.push(LoadError {
+                    scope: scope.clone(),
+                    message: format!(
+                        "semantic classifier provider_key_id {pk_id:?} does not match any \
+                         provider key defined in this file"
+                    ),
+                });
+            }
+        }
     }
 
     if !errors.is_empty() {
