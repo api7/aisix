@@ -87,7 +87,18 @@
 //!   last byte out. On a non-streamed request the two coincide; on a
 //!   streamed one they differ by the whole length of the stream.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// `observability.access_log`, installed once by [`crate::init_tracing`].
+/// Checked in [`AccessLog::emit`] rather than expressed as a filter
+/// directive, so no `RUST_LOG` spelling can bring the lines back and no
+/// other event is affected.
+static ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub(crate) fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, Ordering::Relaxed);
+}
 
 /// Canonical access-log fields, passed to [`log_access`].
 ///
@@ -235,11 +246,13 @@ pub struct McpAccessLog<'a> {
 }
 
 impl AccessLog<'_> {
-    /// Emit a single `tracing::info!` event carrying every field. The
-    /// subscriber's configured format (text or JSON) determines the
-    /// wire shape — operators choose via `cfg.observability.log_level`
-    /// and (later) a JSON/text knob.
+    /// Emit a single `tracing::info!` event carrying every field, unless
+    /// `observability.access_log` is off. When on, the line is filtered by
+    /// the log level like any other `info` event.
     pub fn emit(&self) {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
         let mcp = self.mcp.as_ref();
         tracing::info!(
             method = self.method,

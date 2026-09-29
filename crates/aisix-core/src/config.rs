@@ -1188,6 +1188,8 @@ pub struct ObservabilityConfig {
     pub service_name: String,
     #[serde(default = "ObservabilityConfig::default_log_level")]
     pub log_level: String,
+    /// Write one access-log line per request. Off, no access-log line is
+    /// written whatever the log level; every other log line is unaffected.
     #[serde(default = "ObservabilityConfig::default_access_log")]
     pub access_log: bool,
     pub metrics: MetricsConfig,

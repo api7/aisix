@@ -116,6 +116,11 @@ export interface AppOverrides {
    */
   logLevel?: string;
   /**
+   * `observability.access_log`. Defaults to `true`, the binary's own
+   * default; only a spec whose subject is the switch turns it off.
+   */
+  accessLog?: boolean;
+  /**
    * `observability.metrics.client_type_rules` (AISIX-Cloud#1045): operator
    * UA→client_type regex rules, tried before the built-in allowlist.
    * A dedicated override because `extra` replaces whole top-level blocks
@@ -434,7 +439,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     observability: {
       service_name: "aisix-e2e",
       log_level: overrides.logLevel ?? "warn",
-      access_log: false,
+      access_log: overrides.accessLog ?? true,
       metrics: {
         prometheus: {
           enabled: prometheusEnabled,
