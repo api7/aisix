@@ -2257,6 +2257,7 @@ fn add_variant_titles(doc: &mut Value) {
         ),
         ("/components/schemas/DistanceMetric/oneOf", &["Cosine"]),
         ("/components/schemas/Aggregation/oneOf", &["Max"]),
+        ("/components/schemas/ClassifierType/oneOf", &["Jev"]),
         (
             "/components/schemas/EmbeddingFailureMode/oneOf",
             &["Default", "Fail"],
