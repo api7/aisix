@@ -171,10 +171,6 @@ impl Default for OnEmbeddingFailure {
 /// classifier.
 pub const TYPESAFE_PROVIDER: &str = "typesafe";
 
-/// The option the gateway adds to every classifier decision, meaning "no
-/// route fits". A route may not use this name.
-pub const NONE_OF_THE_ABOVE: &str = "none_of_the_above";
-
 /// Hosted decision model a semantic router can use in place of embeddings.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
@@ -200,10 +196,10 @@ fn default_classifier_timeout_ms() -> u64 {
 
 /// Route selection by a hosted decision model. For each request the
 /// latest user message is sent to the model together with every route's
-/// `name` and `description`, plus a "none of the above" option; the model
-/// picks one. A request goes to the picked route's target, or to the
-/// router's `default` when the model picks "none of the above" or its
-/// confidence is below `min_confidence`.
+/// `name` and `description`, and the model picks one route. A request goes
+/// to the picked route's target, or to the router's `default` when the
+/// model's confidence in its pick is below `min_confidence`. To catch
+/// requests that fit none of the routes, configure a route for them.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct SemanticClassifier {
     /// Decision model family. `jev` is the only supported value.
@@ -247,8 +243,8 @@ pub struct Semantic {
     /// When set, `embedding_model`, `embedding_model_id`,
     /// `embedding_timeout_ms`, `on_embedding_failure` and `match` are not
     /// accepted, every route needs a `description` and takes no `examples`
-    /// or `threshold`, and no route may be named `none_of_the_above`. When
-    /// omitted, routes are matched by embedding similarity.
+    /// or `threshold`. When omitted, routes are matched by embedding
+    /// similarity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classifier: Option<SemanticClassifier>,
     /// Alias of an `embedding`-modality Model used to embed the request

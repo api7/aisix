@@ -1087,8 +1087,7 @@ fn split_semantic_modes(node: &mut serde_json::Map<String, Value>) {
                 "not": {"anyOf": [
                     {"required": ["examples"]},
                     {"required": ["threshold"]}
-                ]},
-                "properties": {"name": {"not": {"const": super::semantic::NONE_OF_THE_ABOVE}}}
+                ]}
             }}}
         },
         "else": {
@@ -3022,14 +3021,10 @@ mod tests {
     }
 
     #[test]
-    fn model_semantic_classifier_route_needs_a_description_and_a_free_name() {
+    fn model_semantic_classifier_route_needs_a_description() {
         let mut route = jev_route();
         route.as_object_mut().unwrap().remove("description");
         assert_rejected_on_both(&jev_router(json!({}), route), "a route with no description");
-
-        let mut route = jev_route();
-        route["name"] = json!("none_of_the_above");
-        assert_rejected_on_both(&jev_router(json!({}), route), "the reserved route name");
     }
 
     #[test]

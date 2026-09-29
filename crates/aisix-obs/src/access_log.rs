@@ -222,9 +222,6 @@ pub struct CacheAccessLog<'a> {
 pub enum SemanticFallback {
     /// Embedding decision: no route reached its threshold.
     NoMatch,
-    /// Classifier decision: the model picked the gateway's "none of the
-    /// above" option.
-    NoneOfTheAbove,
     /// Classifier decision: the model picked a route with a confidence
     /// below `min_confidence`.
     LowConfidence,
@@ -243,7 +240,6 @@ impl SemanticFallback {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NoMatch => "no_match",
-            Self::NoneOfTheAbove => "none_of_the_above",
             Self::LowConfidence => "low_confidence",
             Self::EmptyPrompt => "empty_prompt",
             Self::DecisionFailed => "decision_failed",

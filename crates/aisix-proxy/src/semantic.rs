@@ -23,7 +23,7 @@ use dashmap::DashMap;
 
 use aisix_core::models::{
     resolve_model_ref, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticClassifier,
-    SemanticRoute, NONE_OF_THE_ABOVE, TYPESAFE_PROVIDER,
+    SemanticRoute, TYPESAFE_PROVIDER,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, Model};
@@ -203,19 +203,12 @@ pub(crate) async fn resolve(
 
     let pick = match &semantic.classifier {
         Some(classifier) => match classify(snapshot, &semantic.routes, classifier, prompt).await {
-            Ok((choice, confidence)) => {
-                let winner = semantic.routes.iter().position(|r| r.name == choice);
-                let miss = if winner.is_none() {
-                    Some(SemanticFallback::NoneOfTheAbove)
-                } else if confidence < classifier.min_confidence {
-                    Some(SemanticFallback::LowConfidence)
-                } else {
-                    None
-                };
+            Ok((picked, confidence)) => {
+                let confident = confidence >= classifier.min_confidence;
                 Some(Pick {
-                    winner: winner.filter(|_| miss.is_none()),
+                    winner: confident.then_some(picked),
                     score: Some(confidence),
-                    miss,
+                    miss: (!confident).then_some(SemanticFallback::LowConfidence),
                 })
             }
             Err(error) => {
@@ -432,14 +425,12 @@ fn fallback(
 /// Endpoint a `typesafe` Provider Key reaches when it sets no `api_base`.
 const TYPESAFE_DEFAULT_API_BASE: &str = "https://api.typesafe.ai";
 
-/// The one question every classifier call asks, and the wording of the
-/// option the gateway adds to it. Both are the wording the classifier mode
-/// was validated with; change them only against a fresh evaluation.
+/// The one question every classifier call asks. The wording is the one the
+/// classifier mode was validated with; change it only against a fresh
+/// evaluation.
 const CLASSIFIER_QUESTION: &str = "route";
 const CLASSIFIER_INSTRUCTIONS: &str =
     "Which route should handle this user request to an AI assistant?";
-const NONE_OF_THE_ABOVE_DESCRIPTION: &str = "anything not covered by the routes above \
-     (e.g. weather, travel booking, medical advice, image generation, news)";
 
 #[derive(serde::Serialize)]
 struct ClassifierRequest<'a> {
@@ -472,22 +463,21 @@ impl serde::Serialize for ClassifierQuestions<'_> {
     }
 }
 
-/// The options, in the order the routes are configured and with the
-/// gateway's own option last — the order the mode was validated in, which
-/// a `serde_json::Map` (sorted by key) would not keep.
+/// The options: exactly the configured routes, in configured order — which
+/// a `serde_json::Map` (sorted by key) would not keep. The gateway adds no
+/// option of its own; a catch-all is a route the operator configures.
 struct Criteria<'a>(&'a [SemanticRoute]);
 
 impl serde::Serialize for Criteria<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
-        let mut map = s.serialize_map(Some(self.0.len() + 1))?;
+        let mut map = s.serialize_map(Some(self.0.len()))?;
         for route in self.0 {
             map.serialize_entry(
                 &route.name,
                 route.description.as_deref().unwrap_or_default(),
             )?;
         }
-        map.serialize_entry(NONE_OF_THE_ABOVE, NONE_OF_THE_ABOVE_DESCRIPTION)?;
         map.end()
     }
 }
@@ -504,8 +494,8 @@ struct ClassifierAnswer {
     confidence: f64,
 }
 
-/// Ask the classifier which route fits `prompt`. Returns the option it
-/// picked — a route name or [`NONE_OF_THE_ABOVE`] — and its confidence.
+/// Ask the classifier which route fits `prompt`. Returns the index of the
+/// route it picked and its confidence.
 /// Every way the call can fail comes back as `Err` with a reason for the
 /// log, and the caller applies `classifier.on_failure`.
 ///
@@ -516,7 +506,7 @@ async fn classify(
     routes: &[SemanticRoute],
     classifier: &SemanticClassifier,
     prompt: &str,
-) -> Result<(String, f64), String> {
+) -> Result<(usize, f64), String> {
     crate::attribution::detached(classify_inner(snapshot, routes, classifier, prompt)).await
 }
 
@@ -525,7 +515,7 @@ async fn classify_inner(
     routes: &[SemanticRoute],
     classifier: &SemanticClassifier,
     prompt: &str,
-) -> Result<(String, f64), String> {
+) -> Result<(usize, f64), String> {
     let pk = snapshot
         .provider_keys
         .get_by_id(&classifier.provider_key_id)
@@ -577,13 +567,16 @@ async fn classify_inner(
         .answers
         .remove(CLASSIFIER_QUESTION)
         .ok_or("classifier response carries no answer to the routing question")?;
-    if answer.choice != NONE_OF_THE_ABOVE && !routes.iter().any(|r| r.name == answer.choice) {
-        return Err(format!(
-            "classifier picked {:?}, which is not one of the offered options",
-            answer.choice
-        ));
-    }
-    Ok((answer.choice, answer.confidence))
+    let picked = routes
+        .iter()
+        .position(|r| r.name == answer.choice)
+        .ok_or_else(|| {
+            format!(
+                "classifier picked {:?}, which is not one of the offered routes",
+                answer.choice
+            )
+        })?;
+    Ok((picked, answer.confidence))
 }
 
 /// Resolve a direct-model alias to the single `AttemptModel` the dispatch

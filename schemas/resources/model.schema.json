@@ -861,13 +861,6 @@
                       }
                     ]
                   },
-                  "properties": {
-                    "name": {
-                      "not": {
-                        "const": "none_of_the_above"
-                      }
-                    }
-                  },
                   "required": [
                     "description"
                   ]
@@ -885,7 +878,7 @@
               "$ref": "#/definitions/SemanticClassifier"
             }
           ],
-          "description": "Route selection by a hosted decision model instead of embeddings. When set, `embedding_model`, `embedding_model_id`, `embedding_timeout_ms`, `on_embedding_failure` and `match` are not accepted, every route needs a `description` and takes no `examples` or `threshold`, and no route may be named `none_of_the_above`. When omitted, routes are matched by embedding similarity."
+          "description": "Route selection by a hosted decision model instead of embeddings. When set, `embedding_model`, `embedding_model_id`, `embedding_timeout_ms`, `on_embedding_failure` and `match` are not accepted, every route needs a `description` and takes no `examples` or `threshold`. When omitted, routes are matched by embedding similarity."
         },
         "default": {
           "description": "Direct model alias used when no route clears its threshold. Read only when `default_id` is absent.",
@@ -951,7 +944,7 @@
     },
     "SemanticClassifier": {
       "additionalProperties": false,
-      "description": "Route selection by a hosted decision model. For each request the latest user message is sent to the model together with every route's `name` and `description`, plus a \"none of the above\" option; the model picks one. A request goes to the picked route's target, or to the router's `default` when the model picks \"none of the above\" or its confidence is below `min_confidence`.",
+      "description": "Route selection by a hosted decision model. For each request the latest user message is sent to the model together with every route's `name` and `description`, and the model picks one route. A request goes to the picked route's target, or to the router's `default` when the model's confidence in its pick is below `min_confidence`. To catch requests that fit none of the routes, configure a route for them.",
       "properties": {
         "min_confidence": {
           "default": 0.5,

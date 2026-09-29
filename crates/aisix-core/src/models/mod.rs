@@ -104,7 +104,6 @@ pub use schema::{
 };
 pub use semantic::{
     Aggregation, ClassifierType, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure,
-    Semantic, SemanticClassifier, SemanticMatch, SemanticRoute, NONE_OF_THE_ABOVE,
-    TYPESAFE_PROVIDER,
+    Semantic, SemanticClassifier, SemanticMatch, SemanticRoute, TYPESAFE_PROVIDER,
 };
 pub use snapshot::AisixSnapshot;

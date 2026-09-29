@@ -24,7 +24,6 @@ import { pickFreePort } from "../harness/ports.js";
 // prompt, so every decision is fixed:
 //   "python"   -> code, confidence 0.93
 //   "integral" -> math, confidence 0.9   (math's target excludes the caller)
-//   "weather"  -> none_of_the_above, 0.88
 //   "maybe"    -> code, confidence 0.3   (below min_confidence 0.5)
 //   "boom"     -> HTTP 500
 //   "slow"     -> answers after 2s        (timeout_ms is 500)
@@ -38,8 +37,6 @@ const TYPESAFE_SECRET = "ts-secret-e2e";
 
 const INSTRUCTIONS =
   "Which route should handle this user request to an AI assistant?";
-const NONE_DESCRIPTION =
-  "anything not covered by the routes above (e.g. weather, travel booking, medical advice, image generation, news)";
 
 interface DecisionCall {
   path: string;
@@ -99,8 +96,6 @@ async function startDecisionMock(): Promise<DecisionMock> {
         answer("code", 0.93);
       } else if (state.includes("integral")) {
         answer("math", 0.9);
-      } else if (state.includes("weather")) {
-        answer("none_of_the_above", 0.88);
       } else if (state.includes("maybe")) {
         answer("code", 0.3);
       } else {
@@ -384,10 +379,6 @@ describe("semantic classifier e2e", () => {
         routes: [{ name: "code", target: "code-model", description: "c", threshold: 0.5 }],
       },
       no_description: { ...valid(), routes: [{ name: "code", target: "code-model" }] },
-      reserved_name: {
-        ...valid(),
-        routes: [{ name: "none_of_the_above", target: "code-model", description: "c" }],
-      },
     };
     for (const [why, semantic] of Object.entries(bad)) {
       const row = await seed.createModel({ display_name: `bad-${why}`, semantic });
@@ -468,12 +459,11 @@ describe("semantic classifier e2e", () => {
     expect(questions).toHaveLength(1);
     expect(questions[0].type).toBe("choice");
     expect(questions[0].instructions).toBe(INSTRUCTIONS);
-    // Every route by name, in configured order, then the gateway's own
-    // option last.
+    // Exactly the configured routes, in configured order: the gateway
+    // adds no option of its own.
     expect(Object.entries(questions[0].criteria ?? {})).toEqual([
       ["code", "programming questions"],
       ["math", "math problems"],
-      ["none_of_the_above", NONE_DESCRIPTION],
     ]);
   });
 
@@ -499,14 +489,8 @@ describe("semantic classifier e2e", () => {
     );
   });
 
-  test("none_of_the_above and a low-confidence pick both go to default", async (ctx) => {
+  test("a low-confidence pick goes to default", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
-    const none = await chat("jev-router", "what is the weather in Paris");
-    expect(none.status).toBe(200);
-    expect(none.content).toBe("served-by-default-model");
-    expect(none.route).toBeNull();
-    await expectDecision(none, { score: "0.88", fallback: "none_of_the_above" });
-
     const low = await chat("jev-router", "maybe something about code");
     expect(low.status).toBe(200);
     expect(low.content).toBe("served-by-default-model");
