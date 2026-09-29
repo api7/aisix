@@ -5090,8 +5090,8 @@ admin:
     /// missing key from its field-level `#[serde(default = "…")]`, so a
     /// derived `Default` next to those functions silently disagrees
     /// (`observability.log_level` came out empty and the gateway logged
-    /// nothing). Every non-optional block is found from the schema, so a new
-    /// block is checked without editing this test.
+    /// nothing). Every non-optional block outside an `Option<…>` one is found
+    /// from the schema, so a new block is checked without editing this test.
     #[test]
     fn an_omitted_block_equals_the_block_written_empty() {
         fn block_def<'a>(
