@@ -54,6 +54,9 @@
           }
         ],
         "properties": {
+          "match": {
+            "type": "object"
+          },
           "routes": {
             "items": {
               "required": [
@@ -67,6 +70,11 @@
         ]
       },
       "if": {
+        "properties": {
+          "classifier": {
+            "type": "object"
+          }
+        },
         "required": [
           "classifier"
         ]

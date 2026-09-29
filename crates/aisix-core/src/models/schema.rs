@@ -1073,7 +1073,7 @@ fn split_semantic_modes(node: &mut serde_json::Map<String, Value>) {
         }
     }
     let modes = json!({
-        "if": {"required": ["classifier"]},
+        "if": {"required": ["classifier"], "properties": {"classifier": {"type": "object"}}},
         "then": {
             "not": {"anyOf": [
                 {"required": ["embedding_model"]},
@@ -1094,7 +1094,10 @@ fn split_semantic_modes(node: &mut serde_json::Map<String, Value>) {
         "else": {
             "allOf": [embedder_clause],
             "required": ["match"],
-            "properties": {"routes": {"items": {"required": ["examples"]}}}
+            "properties": {
+                "match": {"type": "object"},
+                "routes": {"items": {"required": ["examples"]}}
+            }
         }
     });
     match node.get_mut("allOf").and_then(Value::as_array_mut) {
@@ -3079,6 +3082,30 @@ mod tests {
             .unwrap()
             .remove("examples");
         assert_rejected_on_both(&v, "a route with no examples");
+    }
+
+    /// The standalone `semantic` file renders every `Option` as nullable,
+    /// so an explicit `null` must not satisfy the mode switch or `match`:
+    /// serde reads it as absent.
+    #[test]
+    fn semantic_mode_switch_ignores_explicit_nulls() {
+        let mut schema =
+            serde_json::to_value(schemars::schema_for!(crate::models::Semantic)).unwrap();
+        apply_model_ref_alternatives(&mut schema);
+        let validator = jsonschema::options().build(&schema).unwrap();
+        let null_classifier = json!({
+            "classifier": null,
+            "routes": [{"name": "a", "target": "m", "description": "d"}],
+            "default": "d"
+        });
+        assert!(!validator.is_valid(&null_classifier));
+        let null_match = json!({
+            "embedding_model": "e",
+            "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
+            "default": "d",
+            "match": null
+        });
+        assert!(!validator.is_valid(&null_match));
     }
 
     #[test]
