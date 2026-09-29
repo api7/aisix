@@ -1094,7 +1094,8 @@ pub fn load_from_str(
                     scope: scope.clone(),
                     message: format!(
                         "semantic classifier provider_key_id {pk_id:?} does not match any \
-                         provider key defined in this file"
+                         provider key defined in this file — reference it by name with \
+                         `provider_key` instead"
                     ),
                 });
             }

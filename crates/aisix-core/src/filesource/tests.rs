@@ -1020,6 +1020,12 @@ fn cross_ref_checks_a_classifier_router_without_an_embedding_model() {
     assert_eq!(errs.len(), 1, "{errs:?}");
     assert!(errs[0].contains("ghost-failure"), "{errs:?}");
 
+    // The name form a model's `provider_key` takes works here too.
+    let by_name = CLASSIFIER_FILE.replace("provider_key_id: PK_ID", "provider_key: ts");
+    let errs = errors_of(load(&by_name, &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].contains("ghost-failure"), "{errs:?}");
+
     let errs = errors_of(load(&with_key("some-id"), &env_of(&[])));
     assert_eq!(errs.len(), 2, "{errs:?}");
     assert!(

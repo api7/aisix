@@ -135,24 +135,41 @@ fn known_names(maps: &IdentityMaps, kind: &str) -> String {
     }
 }
 
-/// `models[].provider_key` (name) → `provider_key_id` (derived id).
+/// `models[].provider_key` (name) → `provider_key_id` (derived id), and
+/// the same sugar on a semantic router's `classifier`, which references its
+/// Provider Key exactly the way a model does.
 pub(crate) fn desugar_model(doc: &mut Value, maps: &IdentityMaps) -> Result<(), String> {
-    let obj = match doc.as_object_mut() {
-        Some(o) => o,
-        None => return Ok(()), // non-object entries error upstream
+    let Some(obj) = doc.as_object_mut() else {
+        return Ok(()); // non-object entries error upstream
     };
+    desugar_provider_key_ref(obj, maps, "")?;
+    if let Some(Value::Object(classifier)) = obj
+        .get_mut("semantic")
+        .and_then(|s| s.get_mut("classifier"))
+    {
+        desugar_provider_key_ref(classifier, maps, "semantic.classifier.")?;
+    }
+    Ok(())
+}
+
+fn desugar_provider_key_ref(
+    obj: &mut serde_json::Map<String, Value>,
+    maps: &IdentityMaps,
+    at: &str,
+) -> Result<(), String> {
     let Some(name_value) = obj.get("provider_key") else {
         return Ok(());
     };
     let Some(name) = name_value.as_str() else {
-        return Err("`provider_key` must be a string (a provider key display_name)".into());
+        return Err(format!(
+            "`{at}provider_key` must be a string (a provider key display_name)"
+        ));
     };
     if obj.contains_key("provider_key_id") {
-        return Err(
-            "`provider_key` (a name reference) and `provider_key_id` are mutually \
+        return Err(format!(
+            "`{at}provider_key` (a name reference) and `{at}provider_key_id` are mutually \
              exclusive — set exactly one"
-                .into(),
-        );
+        ));
     }
     let resolved = maps
         .get("provider_keys")
@@ -160,7 +177,7 @@ pub(crate) fn desugar_model(doc: &mut Value, maps: &IdentityMaps) -> Result<(), 
         .cloned()
         .ok_or_else(|| {
             format!(
-                "`provider_key` references unknown provider key {name:?} ({})",
+                "`{at}provider_key` references unknown provider key {name:?} ({})",
                 known_names(maps, "provider_keys")
             )
         })?;
@@ -521,6 +538,33 @@ mod tests {
             doc["provider_key_id"],
             json!(derive_id("provider_keys", "openai-prod"))
         );
+    }
+
+    #[test]
+    fn classifier_provider_key_name_resolves_like_a_model_s() {
+        let maps = maps_with("provider_keys", &["ts"]);
+        let mut doc = json!({
+            "display_name": "r",
+            "semantic": {"classifier": {"type": "jev", "provider_key": "ts"}}
+        });
+        desugar_model(&mut doc, &maps).unwrap();
+        let classifier = &doc["semantic"]["classifier"];
+        assert!(classifier.get("provider_key").is_none());
+        assert_eq!(
+            classifier["provider_key_id"],
+            json!(derive_id("provider_keys", "ts"))
+        );
+
+        let mut unknown = json!({"semantic": {"classifier": {"provider_key": "nope"}}});
+        let err = desugar_model(&mut unknown, &maps).unwrap_err();
+        assert!(err.contains("semantic.classifier.provider_key"), "{err}");
+        assert!(err.contains("\"nope\""), "{err}");
+
+        let mut both = json!({"semantic": {"classifier": {
+            "provider_key": "ts", "provider_key_id": "x"
+        }}});
+        let err = desugar_model(&mut both, &maps).unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
     }
 
     #[test]

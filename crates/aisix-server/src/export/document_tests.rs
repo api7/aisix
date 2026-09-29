@@ -45,11 +45,9 @@ fn provider_key_ref_resugars_to_name() {
     assert_eq!(models[0]["provider_key"], json!("openai-prod"));
 }
 
-/// A classifier's key reference has no file name form, so it is carried
-/// as the id the file will derive for the same key — the source id would
-/// match nothing once loaded.
+/// A classifier's key reference resugars to a name, like a model's.
 #[test]
-fn classifier_provider_key_is_rewritten_to_the_file_derived_id() {
+fn classifier_provider_key_ref_resugars_to_name() {
     let snap = AisixSnapshot::new();
     snap.provider_keys.insert(ResourceEntry::new(
         "pk-uuid-ts",
@@ -69,13 +67,9 @@ fn classifier_provider_key_is_rewritten_to_the_file_derived_id() {
     snap.models
         .insert(ResourceEntry::new("m-uuid-r", router("pk-uuid-ts"), 1));
     let doc = build_export_document(&snap, false);
-    assert_eq!(
-        find(&doc, "models")[0]["semantic"]["classifier"]["provider_key_id"],
-        json!(aisix_core::filesource::derive_id(
-            "provider_keys",
-            "typesafe-prod"
-        ))
-    );
+    let classifier = &find(&doc, "models")[0]["semantic"]["classifier"];
+    assert!(classifier.get("provider_key_id").is_none());
+    assert_eq!(classifier["provider_key"], json!("typesafe-prod"));
     assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
 
     let snap = AisixSnapshot::new();
