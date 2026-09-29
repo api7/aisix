@@ -1,124 +1,176 @@
 {
-  "admin": {
-    "addr": "127.0.0.1:0",
-    "admin_keys": [],
-    "enabled": true,
-    "tls": null
-  },
-  "bedrock_endpoint_url": null,
-  "cache": {
-    "backend": "memory",
-    "redis": null
-  },
-  "downstream": {
-    "idle_timeout_secs": 0,
-    "sse_keepalive_interval_secs": 15
-  },
-  "etcd": {
-    "dial_timeout_ms": 5000,
-    "endpoints": [],
-    "env_id": "",
-    "password_env": null,
-    "prefix": "/aisix",
-    "request_timeout_ms": null,
-    "tls": null,
-    "user": null
-  },
-  "managed": {
-    "cp_base_url": null,
-    "cp_ca_cert_file": null,
-    "cp_ca_file": null,
-    "cp_ca_pem": null,
-    "cp_cert_file": null,
-    "cp_cert_pem": null,
-    "cp_etcd_endpoint": null,
-    "cp_key_file": null,
-    "cp_key_pem": null,
-    "dp_id_file": "/var/lib/aisix/dp_id",
-    "enabled": false,
-    "heartbeat_interval_secs": 15,
-    "mtls_dir": "/var/lib/aisix/mtls",
-    "snapshot_cache_enabled": false,
-    "snapshot_cache_path": null
-  },
-  "observability": {
-    "access_log": true,
-    "debug": {
-      "addr": "127.0.0.1:9091",
-      "enabled": true
+  "defaults": {
+    "admin": {
+      "addr": "127.0.0.1:0",
+      "admin_keys": [],
+      "enabled": true,
+      "tls": null
     },
-    "heap_profiling": {
-      "auto_dump": {
-        "dir": "/var/lib/aisix/heap",
-        "enabled": true,
-        "keep": 5,
-        "thresholds": [
-          0.8,
-          0.9
-        ]
-      }
+    "bedrock_endpoint_url": null,
+    "cache": {
+      "backend": "memory",
+      "redis": null
     },
-    "log_level": "info",
-    "metrics": {
-      "buckets": {
-        "a2a_ttfb": null,
-        "guardrail_latency": null,
-        "request_e2e_latency": null,
-        "request_ttft": null
+    "downstream": {
+      "idle_timeout_secs": 0,
+      "sse_keepalive_interval_secs": 15
+    },
+    "etcd": {
+      "dial_timeout_ms": 5000,
+      "endpoints": [],
+      "env_id": "",
+      "password_env": null,
+      "prefix": "/aisix",
+      "request_timeout_ms": null,
+      "tls": null,
+      "user": null
+    },
+    "managed": {
+      "cp_base_url": null,
+      "cp_ca_cert_file": null,
+      "cp_ca_file": null,
+      "cp_ca_pem": null,
+      "cp_cert_file": null,
+      "cp_cert_pem": null,
+      "cp_etcd_endpoint": null,
+      "cp_key_file": null,
+      "cp_key_pem": null,
+      "dp_id_file": "/var/lib/aisix/dp_id",
+      "enabled": false,
+      "heartbeat_interval_secs": 15,
+      "mtls_dir": "/var/lib/aisix/mtls",
+      "snapshot_cache_enabled": false,
+      "snapshot_cache_path": null
+    },
+    "observability": {
+      "access_log": true,
+      "debug": {
+        "addr": "127.0.0.1:9091",
+        "enabled": true
       },
-      "client_type_rules": [],
-      "labels": {},
-      "prometheus": {
-        "addr": "0.0.0.0:9090",
-        "enabled": true,
-        "path": "/metrics"
+      "heap_profiling": {
+        "auto_dump": {
+          "dir": "/var/lib/aisix/heap",
+          "enabled": true,
+          "keep": 5,
+          "thresholds": [
+            0.8,
+            0.9
+          ]
+        }
+      },
+      "log_level": "info",
+      "metrics": {
+        "buckets": {
+          "a2a_ttfb": null,
+          "guardrail_latency": null,
+          "request_e2e_latency": null,
+          "request_ttft": null
+        },
+        "client_type_rules": [],
+        "labels": {},
+        "prometheus": {
+          "addr": "0.0.0.0:9090",
+          "enabled": true,
+          "path": "/metrics"
+        }
+      },
+      "service_name": "aisix"
+    },
+    "proxy": {
+      "addr": "0.0.0.0:3000",
+      "listeners": [],
+      "real_ip": {
+        "header": "x-forwarded-for",
+        "recursive": false,
+        "trusted_proxies": []
+      },
+      "request_body_limit_bytes": 0,
+      "request_id": {
+        "accept_headers": [
+          "x-aisix-request-id"
+        ]
+      },
+      "thread_per_core": null,
+      "tls": null,
+      "url_rewrites": [],
+      "workers": null
+    },
+    "ratelimit": {
+      "backend": "memory",
+      "concurrency_ttl_secs": 300,
+      "redis": null
+    },
+    "resources_file": null,
+    "shutdown": {
+      "min_drain_secs": 30
+    },
+    "upstream": {
+      "connect_timeout_ms": 5000,
+      "pool_idle_timeout_secs": 30,
+      "pool_max_idle_per_host": null,
+      "retries": 2,
+      "stream_timeout_ms": 0,
+      "tcp_keepalive_interval_secs": 30,
+      "tcp_keepalive_retries": 5,
+      "tcp_keepalive_secs": 60,
+      "timeout_ms": 6000000,
+      "tls": {
+        "ca_file": null,
+        "client_cert_file": null,
+        "client_key_file": null,
+        "verify": true
       }
+    }
+  },
+  "optional_blocks": {
+    "admin.tls": {
+      "cert_file": null,
+      "key_file": null
     },
-    "service_name": "aisix"
-  },
-  "proxy": {
-    "addr": "0.0.0.0:3000",
-    "listeners": [],
-    "real_ip": {
-      "header": "x-forwarded-for",
-      "recursive": false,
-      "trusted_proxies": []
+    "cache.redis": {
+      "database": null,
+      "master_name": null,
+      "mode": "single",
+      "nodes": [],
+      "password": null,
+      "sentinels": [],
+      "timeout_secs": 5,
+      "tls": {
+        "ca_file": null,
+        "client_cert_file": null,
+        "client_key_file": null,
+        "verify": true
+      },
+      "url": null,
+      "username": null
     },
-    "request_body_limit_bytes": 0,
-    "request_id": {
-      "accept_headers": [
-        "x-aisix-request-id"
-      ]
-    },
-    "thread_per_core": null,
-    "tls": null,
-    "url_rewrites": [],
-    "workers": null
-  },
-  "ratelimit": {
-    "backend": "memory",
-    "concurrency_ttl_secs": 300,
-    "redis": null
-  },
-  "resources_file": null,
-  "shutdown": {
-    "min_drain_secs": 30
-  },
-  "upstream": {
-    "connect_timeout_ms": 5000,
-    "pool_idle_timeout_secs": 30,
-    "pool_max_idle_per_host": null,
-    "retries": 2,
-    "stream_timeout_ms": 0,
-    "tcp_keepalive_interval_secs": 30,
-    "tcp_keepalive_retries": 5,
-    "tcp_keepalive_secs": 60,
-    "timeout_ms": 6000000,
-    "tls": {
-      "ca_file": null,
+    "etcd.tls": {
+      "ca_cert_file": null,
       "client_cert_file": null,
       "client_key_file": null,
-      "verify": true
+      "domain_name": null
+    },
+    "proxy.tls": {
+      "cert_file": null,
+      "key_file": null
+    },
+    "ratelimit.redis": {
+      "database": null,
+      "master_name": null,
+      "mode": "single",
+      "nodes": [],
+      "password": null,
+      "sentinels": [],
+      "timeout_secs": 5,
+      "tls": {
+        "ca_file": null,
+        "client_cert_file": null,
+        "client_key_file": null,
+        "verify": true
+      },
+      "url": null,
+      "username": null
     }
   }
 }

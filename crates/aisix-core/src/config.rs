@@ -4886,6 +4886,76 @@ observability:
         assert_eq!(cfg.observability.metrics.prometheus.addr, "0.0.0.0:9090");
     }
 
+    /// Every block the defaults leave `null` because it is off unless written
+    /// (`cache.redis`, `ratelimit.redis`, the `tls` blocks), keyed by its
+    /// dotted path and spelled out with its sub-keys: each one's default, or
+    /// `null` for a key the block requires. Taken from the schema so a new
+    /// optional block or sub-key shows up without editing this test.
+    fn optional_blocks(defaults: &serde_json::Value) -> serde_json::Value {
+        fn resolve<'a>(
+            mut v: &'a serde_json::Value,
+            defs: &'a serde_json::Value,
+        ) -> &'a serde_json::Value {
+            loop {
+                if let Some(r) = v.get("$ref").and_then(|r| r.as_str()) {
+                    v = &defs[r.trim_start_matches("#/definitions/")];
+                    continue;
+                }
+                let variants = ["anyOf", "oneOf", "allOf"]
+                    .iter()
+                    .find_map(|k| v.get(*k).and_then(|a| a.as_array()));
+                match variants.map(|a| a.iter().filter(|x| x["type"] != "null").collect::<Vec<_>>())
+                {
+                    Some(non_null) if non_null.len() == 1 => v = non_null[0],
+                    _ => return v,
+                }
+            }
+        }
+        fn expand(schema: &serde_json::Value, defs: &serde_json::Value) -> serde_json::Value {
+            let mut block = serde_json::Map::new();
+            for (name, prop) in schema["properties"].as_object().into_iter().flatten() {
+                let default = prop.get("default").cloned().unwrap_or_default();
+                let sub = resolve(prop, defs);
+                let value = if default.is_null() && sub.get("properties").is_some() {
+                    expand(sub, defs)
+                } else {
+                    default
+                };
+                block.insert(name.clone(), value);
+            }
+            serde_json::Value::Object(block)
+        }
+        fn walk(
+            value: &serde_json::Value,
+            schema: &serde_json::Value,
+            defs: &serde_json::Value,
+            path: &str,
+            out: &mut serde_json::Map<String, serde_json::Value>,
+        ) {
+            let schema = resolve(schema, defs);
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (name, v) in map {
+                        let child = if path.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{path}.{name}")
+                        };
+                        walk(v, &schema["properties"][name], defs, &child, out);
+                    }
+                }
+                serde_json::Value::Null if schema.get("properties").is_some() => {
+                    out.insert(path.to_string(), expand(schema, defs));
+                }
+                _ => {}
+            }
+        }
+        let root = serde_json::to_value(schemars::schema_for!(Config)).unwrap();
+        let mut out = serde_json::Map::new();
+        walk(defaults, &root, &root["definitions"], "", &mut out);
+        serde_json::Value::Object(out)
+    }
+
     /// `config.reference.json` is every startup setting with the value the
     /// gateway uses when the key is absent — what the public Helm chart's
     /// drift check compares its `config:` block against at the chart's
@@ -4928,6 +4998,10 @@ observability:
             .as_object_mut()
             .unwrap()
             .remove("tracing");
+        let expected = serde_json::json!({
+            "defaults": expected,
+            "optional_blocks": optional_blocks(&expected),
+        });
         if std::env::var_os("UPDATE_CONFIG_REFERENCE").is_some() {
             let mut text = serde_json::to_string_pretty(&expected).unwrap();
             text.push('\n');
