@@ -219,6 +219,8 @@ observability:
     addr: "127.0.0.1:9091"
   # Heap profiles written automatically as resident memory nears the
   # memory limit. See config.example.yaml for the full annotation.
+  # Override the thresholds with a comma-separated list, e.g.
+  # AISIX_OBSERVABILITY__HEAP_PROFILING__AUTO_DUMP__THRESHOLDS=0.8,0.9
   heap_profiling:
     auto_dump:
       enabled: true

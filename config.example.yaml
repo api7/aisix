@@ -258,6 +258,8 @@ observability:
     # newest `keep` of this host's files are kept. `dir` is created if missing; one that cannot be
     # created or written logs one warning and turns this off. In Kubernetes, point `dir` at a volume that survives
     # a container restart, so the profile outlives an OOM kill.
+    # Env-only deployments set the thresholds comma-separated:
+    # AISIX_OBSERVABILITY__HEAP_PROFILING__AUTO_DUMP__THRESHOLDS=0.8,0.9
     auto_dump:
       enabled: true
       thresholds: [0.8, 0.9]
@@ -306,6 +308,8 @@ cache:
   #   # out of this file.
   #   # sentinels: ["redis://10.0.0.1:26379", "redis://10.0.0.2:26379"]
   #   # master_name: "mymaster"
+  #   # Env-only deployments set nodes / sentinels comma-separated, e.g.
+  #   # AISIX_CACHE__REDIS__NODES=redis://10.0.0.1:6379,redis://10.0.0.2:6379
   #   # Applied in every mode, and they OVERRIDE a credential embedded in
   #   # the URL — a value injected through the environment is no use if a
   #   # stale one left in `url` outranks it.

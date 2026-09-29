@@ -534,6 +534,30 @@ describe("memory observability: serving modes", () => {
     }
   });
 
+  test("dump thresholds set through the environment replace the file's", async (ctx) => {
+    // The Helm chart configures the gateway only through AISIX_* env vars.
+    const etcd = new EtcdClient();
+    if (!(await etcd.ping())) return ctx.skip();
+    const dir = await mkdtemp(join(tmpdir(), "aisix-heap-env-"));
+    const app = await spawnApp({
+      extraEnv: { AISIX_OBSERVABILITY__HEAP_PROFILING__AUTO_DUMP__THRESHOLDS: "0.000001,0.000002" },
+      heapProfiling: { auto_dump: { enabled: true, thresholds: [0.000001], dir, keep: 5 } },
+    });
+    try {
+      await pollMetrics(
+        app,
+        (s) => sumMetric(s, "aisix_heap_profile_dumps_total", { trigger: "auto", result: "ok" }) >= 2,
+        "one automatic dump per env-configured threshold",
+      );
+      const files = (await readdir(dir)).filter((f) => f.endsWith(".pb.gz"));
+      expect(files).toHaveLength(2);
+      expect(files.some((f) => f.includes("-auto-0.0002")), files.join(",")).toBe(true);
+    } finally {
+      await app.exit();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("a missing dump directory is created and used with a read-only temp dir", async (ctx) => {
     const etcd = new EtcdClient();
     if (!(await etcd.ping())) return ctx.skip();
