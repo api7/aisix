@@ -178,7 +178,7 @@ pub struct EtcdConfig {
     /// enough to be useful on a small deployment aborts the read on a
     /// large one, and the supervisor then re-issues the identical read
     /// forever without the instance ever serving traffic.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub request_timeout_ms: Option<u64>,
     /// Optional TLS / mTLS bundle used to authenticate to the etcd
     /// endpoint. Required when talking to an aisix.cloud DP Manager
@@ -4884,6 +4884,65 @@ observability:
             Config::load_from_path(Some(Path::new(path))).expect("config.example.yaml must load");
         assert!(cfg.observability.metrics.prometheus.enabled);
         assert_eq!(cfg.observability.metrics.prometheus.addr, "0.0.0.0:9090");
+    }
+
+    /// `config.reference.json` is every startup setting with the value the
+    /// gateway uses when the key is absent — what the public Helm chart's
+    /// drift check compares its `config:` block against at the chart's
+    /// `appVersion`. Regenerate with
+    /// `UPDATE_CONFIG_REFERENCE=1 cargo test -p aisix-core config_reference`.
+    #[test]
+    fn config_reference_matches_the_defaults() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.reference.json");
+        // Every block is written out empty: a block that is absent falls
+        // back to its derived `Default`, which for some blocks
+        // (`observability`, `managed`) is not the per-key default a file
+        // that writes the block gets. `proxy.addr` and `etcd.endpoints`
+        // are the keys without a default; `proxy.addr` takes the value
+        // both shipped example configs use.
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "proxy": {"addr": "0.0.0.0:3000", "real_ip": {}, "request_id": {}},
+            "etcd": {"endpoints": []},
+            "admin": {},
+            "observability": {
+                "metrics": {"prometheus": {}, "buckets": {}},
+                "debug": {},
+                "heap_profiling": {"auto_dump": {}},
+            },
+            "cache": {},
+            "ratelimit": {},
+            "upstream": {"tls": {}},
+            "downstream": {},
+            "shutdown": {},
+            "managed": {},
+        }))
+        .expect("defaults must deserialize");
+        let mut expected = serde_json::to_value(&cfg).unwrap();
+        // Retired keys (`ObservabilityConfig::retired_settings`) are left out
+        // so the chart does not advertise a setting that does nothing.
+        expected["observability"]["metrics"]
+            .as_object_mut()
+            .unwrap()
+            .remove("otlp");
+        expected["observability"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tracing");
+        if std::env::var_os("UPDATE_CONFIG_REFERENCE").is_some() {
+            let mut text = serde_json::to_string_pretty(&expected).unwrap();
+            text.push('\n');
+            std::fs::write(path, text).unwrap();
+            return;
+        }
+        let committed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(path).expect("config.reference.json must exist"),
+        )
+        .expect("config.reference.json must be JSON");
+        assert_eq!(
+            committed, expected,
+            "config.reference.json is stale: regenerate it with \
+             UPDATE_CONFIG_REFERENCE=1 cargo test -p aisix-core config_reference"
+        );
     }
 
     /// The block the issue reports as missing. `AISIX_UPSTREAM_SSL_VERIFY`
