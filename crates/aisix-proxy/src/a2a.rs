@@ -673,6 +673,31 @@ pub async fn a2a_agent_card(
     State(state): State<ProxyState>,
     uri: axum::http::Uri,
     headers: HeaderMap,
+    method: axum::http::Method,
+    request_id: Option<axum::Extension<crate::request_id::RequestId>>,
+) -> Response {
+    let started = Instant::now();
+    let response = agent_card(&auth, &agent, &state, &uri, &headers).await;
+    crate::reject::emit_unrouted_access_log(
+        method.as_str(),
+        uri.path(),
+        request_id
+            .as_ref()
+            .map(|r| r.0 .0.as_str())
+            .unwrap_or_default(),
+        Some(&auth.entry.id),
+        response.status().as_u16(),
+        started,
+    );
+    response
+}
+
+async fn agent_card(
+    auth: &AuthenticatedKey,
+    agent: &str,
+    state: &ProxyState,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
 ) -> Response {
     // Discovery files no usage row on any outcome, and it normalizes to the
     // same `/a2a` label the calls do — so it has to say so, or a caller that
@@ -680,11 +705,11 @@ pub async fn a2a_agent_card(
     // filed as an abandoned agent call (AISIX-Cloud#1571).
     crate::attribution::note_unmetered_route();
     let snapshot = state.snapshot.load();
-    let entry = match snapshot.a2a_agents.get_by_name(&agent) {
+    let entry = match snapshot.a2a_agents.get_by_name(agent) {
         Some(entry) if entry.value.enabled => entry,
         _ => return (StatusCode::NOT_FOUND, format!("unknown A2A agent: {agent}")).into_response(),
     };
-    if !auth.key().can_access_agent(&agent) {
+    if !auth.key().can_access_agent(agent) {
         return (
             StatusCode::FORBIDDEN,
             format!("this key may not reach A2A agent: {agent}"),
@@ -694,7 +719,7 @@ pub async fn a2a_agent_card(
     // Resolved BEFORE the upstream is contacted: without a public base there is
     // no card this gateway can serve, and finding that out after the fetch only
     // wastes an upstream round trip.
-    let Some(base) = gateway_base(&uri, &headers) else {
+    let Some(base) = gateway_base(uri, headers) else {
         tracing::warn!(
             agent = %agent,
             "cannot derive the gateway's public base for an A2A agent card; refusing to serve one"
@@ -709,7 +734,7 @@ pub async fn a2a_agent_card(
     let upstream = upstream_from_a2a_agent(&entry.value);
 
     let bridge = HttpBridge::new(upstream).with_forwarded_client_headers(
-        aisix_a2a::forwarded_client_headers(&entry.value, Some(&headers)),
+        aisix_a2a::forwarded_client_headers(&entry.value, Some(headers)),
     );
     let mut card = match bridge.fetch_agent_card().await {
         Ok(card) => card,

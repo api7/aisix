@@ -237,7 +237,10 @@ pub fn build_router(state: ProxyState) -> Router {
         // the handler.
         // Registered before the layers so fallback traffic gets the same
         // body-limit / telemetry / Server-header treatment as the routes.
-        .fallback(passthrough_route::entry);
+        .fallback(passthrough_route::entry)
+        // After every route is added: it applies only to the routes that
+        // exist when it is called.
+        .method_not_allowed_fallback(reject::method_not_allowed);
     let router = apply_shared_proxy_layers(router, &state, body_limit).with_state(state.clone());
 
     // The host-dispatch target: the same fallback handler behind the SAME

@@ -318,7 +318,26 @@ fn prm_document(snapshot: &AisixSnapshot, identity: &DiscoveryIdentity) -> serde
 pub(crate) async fn protected_resource_metadata(
     method: axum::http::Method,
     State(state): State<ProxyState>,
+    uri: axum::http::Uri,
+    request_id: Option<axum::Extension<crate::request_id::RequestId>>,
 ) -> Response {
+    let started = std::time::Instant::now();
+    let response = protected_resource_response(&method, &state);
+    crate::reject::emit_unrouted_access_log(
+        method.as_str(),
+        uri.path(),
+        request_id
+            .as_ref()
+            .map(|r| r.0 .0.as_str())
+            .unwrap_or_default(),
+        None,
+        response.status().as_u16(),
+        started,
+    );
+    response
+}
+
+fn protected_resource_response(method: &axum::http::Method, state: &ProxyState) -> Response {
     // Discovery files no usage row on any outcome, and an unrecognised path
     // normalizes to the passthrough family's own label — so it says so,
     // rather than resting on being unauthenticated today
@@ -328,7 +347,7 @@ pub(crate) async fn protected_resource_metadata(
     let Some(identity) = discovery_identity(&snapshot) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
+    if *method != axum::http::Method::GET && *method != axum::http::Method::HEAD {
         let mut response = StatusCode::METHOD_NOT_ALLOWED.into_response();
         response
             .headers_mut()
@@ -348,7 +367,7 @@ pub(crate) async fn protected_resource_metadata(
     Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CONTENT_LENGTH, length)
-        .body(if method == axum::http::Method::HEAD {
+        .body(if *method == axum::http::Method::HEAD {
             axum::body::Body::empty()
         } else {
             axum::body::Body::from(body)
