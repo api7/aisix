@@ -202,6 +202,12 @@ Say what omitting the block means in `cp-admin.yaml` — the spec the published 
 
 Retire it instead: drop the block from `config.example.yaml` / `config.managed.yaml` so nobody discovers it again; keep the field parsing, with a doc comment saying it is consumed and ignored; make it `Option<…>`, because serde cannot otherwise tell a config that omits the block from one that wrote it out with default values; and name it in the block's `retired_settings` (see `ObservabilityConfig`) so boot warns once per key the operator actually wrote, pointing at where the capability really lives. Warn on the key being **present**, not on `enabled: true` — the copied-in disabled block is precisely the one to delete. Parsed-and-ignored is fine; parsed-and-silent is the bug.
 
+## A Startup-Config Key Ships With the Helm Chart
+
+**A new or changed startup-config key — a field of `Config` in `crates/aisix-core/src/config.rs`, or a changed default of one — is not delivered until the public gateway chart carries it, in the same effort.** The chart is `charts/aisix` in `api7/api7-helm-chart`. Its `values.yaml` `config:` block mirrors the startup file one-to-one — same sections, same key names, every key listed with the gateway's own default — and is rendered into the config file the gateway boots from. So a key the chart does not list is a key Kubernetes users can only reach through ad-hoc environment variables. Open the chart PR alongside the gateway PR, with the key under the same path and the same default.
+
+`config.reference.json` at the repository root is the machine-readable half of that contract: every startup key with the value the gateway uses when the file writes its block but not the key. `config_reference_matches_the_defaults` fails when it is stale; regenerate it with `UPDATE_CONFIG_REFERENCE=1 cargo test -p aisix-core config_reference` and commit it. The chart's CI compares its `config:` block against this file at the chart's `appVersion` tag, so the chart is held to what the release actually ships. A key holding a secret (a password, a credential-bearing URL) is the exception: the chart wires it from a Kubernetes Secret through `configSecrets` rather than listing it in `config:`, so add it to that allow-list instead.
+
 ## AISIX Product Terminology
 
 Use the following terms in public prose, generated API descriptions, release
