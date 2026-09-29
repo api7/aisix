@@ -237,6 +237,12 @@ telemetry, so the two can't drift apart):
   `Result<Json<T>, JsonRejection>` / `Result<Bytes, BytesRejection>` parameters.
   Auth already ran here, so pass the key id.
 
+Authentication denials are the one early exit that writes its own line: the
+`AuthenticatedKey` extractor emits it on every `Err` it returns, so a handler
+must not emit again for an auth failure (`/v1/messages` re-renders the error,
+it does not log it). A surface that authenticates without the extractor
+(`/v1/realtime`, passthrough routes) writes its line in its own error arm.
+
 A handler that instead wraps its whole dispatch and logs the wrapper's status
 (`/mcp`, `/a2a`, `/passthrough`, `/v1/videos`, `/v1/files`) is already covered —
 don't add a second emit to those, or the request logs twice.

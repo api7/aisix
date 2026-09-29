@@ -73,15 +73,9 @@ impl std::fmt::Debug for JwtIdentity {
     }
 }
 
-/// Per-request context carried onto an authentication denial.
-///
-/// A 401 short-circuits ahead of every handler, so the request never
-/// reaches an access-log emit; AISIX-Cloud#1081 deliberately kept these out
-/// of the access log because an internet-facing DP would drown in scanner
-/// probes, leaving `aisix_auth_decisions_total` as the only record. That
-/// metric answers "how many" but not "who, when, against what" — so the
-/// denial log line, which an operator turns on precisely when investigating,
-/// carries the identifying detail instead.
+/// Per-request context carried onto an authentication denial's
+/// `aisix::auth` log line, beside the access-log line the extractor writes
+/// for the same request (see [`emit_denial_access_log`]).
 #[derive(Clone, Copy)]
 pub(crate) struct DenialContext<'a> {
     pub method: &'a str,
@@ -132,55 +126,113 @@ where
     type Rejection = ProxyError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let proxy_state = ProxyState::from_ref(state);
-        let request_id = parts
-            .extensions
-            .get::<crate::request_id::RequestId>()
-            .map(|r| r.0.as_str())
-            .unwrap_or_default();
-        let ctx = DenialContext {
-            method: parts.method.as_str(),
-            path: parts.uri.path(),
-            request_id,
-            // Deferred: only a denial resolves the source IP.
-            source_ip: LazySourceIp::Deferred(&*parts, proxy_state.real_ip.as_ref()),
-        };
-        let token = match extract_bearer(parts) {
-            Ok(t) => t,
-            Err(e) => {
-                // No credential at all: metric + a debug line, never the
-                // access log — logging every scanner probe at the default
-                // level would be noise (AISIX-Cloud#1081).
-                proxy_state
-                    .metrics
-                    .record_auth_decision("none", false, "missing_credentials");
-                tracing::debug!(
-                    target: "aisix::auth",
-                    method = "none",
-                    reason = "missing_credentials",
-                    http_method = %ctx.method,
-                    path = %ctx.path,
-                    request_id = %ctx.request_id,
-                    source_ip = %ctx.source_ip.resolve(),
-                    "rejected inbound request without a credential",
-                );
-                return Err(e);
-            }
-        };
-        let authed = authenticate_token(&proxy_state, &token, ctx).await?;
-        // Publish the resolved key so extractors that run after this one can
-        // see who is calling without re-authenticating. `ClientContext` reads
-        // it for the `${request.api_key.*}` header templates
-        // (AISIX-Cloud#1112) — which is why every handler declares
-        // `auth: AuthenticatedKey` before `client: ClientContext`.
-        parts.extensions.insert(authed.entry.clone());
-        // Same for the JWT identity: `ClientContext` carries it to each
-        // handler's usage-event emitter for attribution.
-        if let Some(jwt) = &authed.jwt {
-            parts.extensions.insert(jwt.clone());
+        let started = std::time::Instant::now();
+        let result = extract_authenticated_key(parts, state).await;
+        if let Err(err) = &result {
+            emit_denial_access_log(parts, started, err);
         }
-        Ok(authed)
+        result
     }
+}
+
+/// Write the access-log line for a request the extractor refused.
+///
+/// The refusal short-circuits ahead of the handler, which is where every
+/// other line is written, so without this an authentication denial left no
+/// access-log record at all. Nothing about the caller is resolved yet: the
+/// line carries no key id (a disabled or expired key's id is on the
+/// `aisix::auth` warn line), and never any part of the presented credential.
+fn emit_denial_access_log(parts: &Parts, started: std::time::Instant, err: &ProxyError) {
+    let request_id = parts
+        .extensions
+        .get::<crate::request_id::RequestId>()
+        .map(|r| r.0.as_str())
+        .unwrap_or_default();
+    let elapsed = started.elapsed();
+    let (error_kind, error) = crate::attempt::access_log_error(err);
+    crate::attribution::emit_access_log(aisix_obs::AccessLog {
+        method: parts.method.as_str(),
+        path: parts.uri.path(),
+        status: err.status().as_u16(),
+        latency: elapsed,
+        duration: elapsed,
+        provider: None,
+        model: None,
+        upstream_model: None,
+        provider_key_id: None,
+        api_key_id: None,
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        request_id,
+        provider_request_id: None,
+        served_by_model: None,
+        routing_attempt_count: None,
+        routing_fallback_count: None,
+        error_kind: Some(error_kind),
+        error: Some(&error),
+        mcp: None,
+        cache: None,
+        request_body_bytes: None,
+        response_body_bytes: None,
+    });
+}
+
+async fn extract_authenticated_key<S>(
+    parts: &mut Parts,
+    state: &S,
+) -> Result<AuthenticatedKey, ProxyError>
+where
+    S: Send + Sync,
+    ProxyState: FromRef<S>,
+{
+    let proxy_state = ProxyState::from_ref(state);
+    let request_id = parts
+        .extensions
+        .get::<crate::request_id::RequestId>()
+        .map(|r| r.0.as_str())
+        .unwrap_or_default();
+    let ctx = DenialContext {
+        method: parts.method.as_str(),
+        path: parts.uri.path(),
+        request_id,
+        // Deferred: only a denial resolves the source IP.
+        source_ip: LazySourceIp::Deferred(&*parts, proxy_state.real_ip.as_ref()),
+    };
+    let token = match extract_bearer(parts) {
+        Ok(t) => t,
+        Err(e) => {
+            // No credential at all: the scanner-probe shape, so the
+            // `aisix::auth` line stays at debug.
+            proxy_state
+                .metrics
+                .record_auth_decision("none", false, "missing_credentials");
+            tracing::debug!(
+                target: "aisix::auth",
+                method = "none",
+                reason = "missing_credentials",
+                http_method = %ctx.method,
+                path = %ctx.path,
+                request_id = %ctx.request_id,
+                source_ip = %ctx.source_ip.resolve(),
+                "rejected inbound request without a credential",
+            );
+            return Err(e);
+        }
+    };
+    let authed = authenticate_token(&proxy_state, &token, ctx).await?;
+    // Publish the resolved key so extractors that run after this one can
+    // see who is calling without re-authenticating. `ClientContext` reads
+    // it for the `${request.api_key.*}` header templates
+    // (AISIX-Cloud#1112) — which is why every handler declares
+    // `auth: AuthenticatedKey` before `client: ClientContext`.
+    parts.extensions.insert(authed.entry.clone());
+    // Same for the JWT identity: `ClientContext` carries it to each
+    // handler's usage-event emitter for attribution.
+    if let Some(jwt) = &authed.jwt {
+        parts.extensions.insert(jwt.clone());
+    }
+    Ok(authed)
 }
 
 /// Authenticate a plaintext bearer and enforce key lifecycle. The single
@@ -273,11 +325,8 @@ async fn authenticate_token_inner(
     })
 }
 
-/// Record an API-key denial on the decision metric + log
-/// (AISIX-Cloud#1081 — before this, a 401 was invisible: the extractor
-/// short-circuits ahead of every handler, so neither the request
-/// counter nor the access log ever fired). The token itself is never
-/// logged.
+/// Record an API-key denial on the decision metric + log. The token itself
+/// is never logged.
 ///
 /// `unknown_key` is the scanner-probe shape (`Bearer <junk>`), so it logs
 /// at `debug` and an internet-facing DP is not flooded at the default
@@ -285,10 +334,8 @@ async fn authenticate_token_inner(
 /// provisioned, so they stay at `warn` and carry `api_key_id`.
 ///
 /// Every line carries the [`DenialContext`] — the caller's address, the
-/// route it hit, and the request id. Without it the record was
-/// unactionable: the metric has no such dimensions, and the 401 never
-/// reaches the access log, so "who is hammering us with a bad key" had no
-/// answer anywhere.
+/// route it hit, and the request id — which the metric has no dimensions
+/// for and the access-log line does not carry (it has no source address).
 fn deny_key(
     state: &ProxyState,
     reason: &'static str,
