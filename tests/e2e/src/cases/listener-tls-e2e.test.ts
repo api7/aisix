@@ -91,7 +91,6 @@ describe("listener TLS (#473)", () => {
       observability: {
         service_name: "aisix-e2e-tls",
         log_level: "warn",
-        access_log: false,
         // Explicit free port so concurrent test files never collide on
         // the default 0.0.0.0:9090 metrics listener.
         metrics: {
