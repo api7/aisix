@@ -1796,10 +1796,10 @@ fn join_target_url(base: &str, rest: &str, query: Option<&str>) -> Result<String
 }
 
 /// Query key comparison examines each bounded whole-query decoded form. A
-/// backend may decode before splitting on `&`, so checking only keys from the
-/// original form would miss `safe=1%26tenant%3Dcaller` becoming a `tenant`
-/// key downstream. Query sets here are tiny, so a simple vector keeps the
-/// parser behavior explicit without adding a dependency.
+/// backend may decode before splitting on `&` or `;`, so checking only keys
+/// from the original form would miss `safe=1%26tenant%3Dcaller` becoming a
+/// `tenant` key downstream. Query sets here are tiny, so a simple vector
+/// keeps the parser behavior explicit without adding a dependency.
 fn query_keys_overlap(base: &str, inbound: &str) -> bool {
     let Some(base_keys) = query_keys_at_all_decode_levels(base) else {
         return true;
@@ -1816,10 +1816,12 @@ fn query_keys_at_all_decode_levels(query: &str) -> Option<Vec<Vec<u8>>> {
     let mut decoded = query.as_bytes().to_vec();
     let mut keys = Vec::new();
     for _ in 0..=MAX_PERCENT_DECODE_PASSES {
-        for (key, _) in url::form_urlencoded::parse(&decoded) {
-            let key = key.into_owned().into_bytes();
-            if !keys.iter().any(|existing| existing == &key) {
-                keys.push(key);
+        for field in decoded.split(|byte| matches!(*byte, b'&' | b';')) {
+            for (key, _) in url::form_urlencoded::parse(field) {
+                let key = key.into_owned().into_bytes();
+                if !keys.iter().any(|existing| existing == &key) {
+                    keys.push(key);
+                }
             }
         }
         let next = percent_decode(&decoded).collect::<Vec<_>>();
@@ -1842,7 +1844,13 @@ fn has_path_traversal_segment(path: &str) -> bool {
     for _ in 0..=MAX_PERCENT_DECODE_PASSES {
         if decoded
             .split(|byte| matches!(*byte, b'/' | b'\\'))
-            .any(|segment| segment == b"." || segment == b"..")
+            .any(|segment| {
+                let path_part = segment
+                    .split(|byte| *byte == b';')
+                    .next()
+                    .unwrap_or_default();
+                path_part == b"." || path_part == b".."
+            })
         {
             return true;
         }
@@ -3285,6 +3293,21 @@ mod tests {
             .is_err(),
             "a nested-encoded query delimiter must not recreate an operator-owned key"
         );
+        for query in [
+            "safe=1;tenant=caller",
+            "safe=1%3Btenant%3Dcaller",
+            "safe=1%253Btenant%253Dcaller",
+        ] {
+            assert!(
+                join_target_url(
+                    "https://upstream.example/provider/v1?tenant=operator",
+                    "models",
+                    Some(query),
+                )
+                .is_err(),
+                "{query} must not recreate an operator-owned key through a semicolon delimiter"
+            );
+        }
 
         // Test raw, percent-encoded, and encoded-separator spellings. The
         // gateway must reject them before a ProviderKey can be sent outside
@@ -3300,6 +3323,10 @@ mod tests {
             "%252e%252e/models",
             "%252e%252e%252fmodels",
             "%252e%252e%255cmodels",
+            "..;ignored/models",
+            "%2e%2e%3bignored/models",
+            "%252e%252e%253bignored/models",
+            "%2e%2e%3bignored/%2e%2e%3bignored/admin",
         ] {
             assert!(
                 join_target_url("https://upstream.example/provider/v1", remainder, None).is_err(),

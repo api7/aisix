@@ -225,7 +225,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     expect(await res.text()).toBe("");
   });
 
-  test("a nested-encoded route remainder never reaches the configured upstream", async (ctx) => {
+  test("route boundary traversal and query conflicts never reach the configured upstream", async (ctx) => {
     if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
@@ -277,13 +277,21 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     const baseline = upstream.receivedRequests.length;
     // Use undici's raw request helper: fetch implementations are allowed to
     // normalize URL escapes before the gateway receives the wire path.
-    const rejected = await harnessRequest(
-      `${app.proxyUrl}/ptr-boundary/%252e%252e%252fmodels`,
-      { headers },
-    );
-    expect(rejected.statusCode).toBe(400);
-    await rejected.body.text();
-    expect(upstream.receivedRequests).toHaveLength(baseline);
+    for (const remainder of [
+      "%252e%252e%252fmodels",
+      "..;ignored/models",
+      "%2e%2e%3bignored/models",
+      "%252e%252e%253bignored/models",
+      "%2e%2e%3bignored/%2e%2e%3bignored/admin",
+    ]) {
+      const rejected = await harnessRequest(
+        `${app.proxyUrl}/ptr-boundary/${remainder}`,
+        { headers },
+      );
+      expect(rejected.statusCode, remainder).toBe(400);
+      await rejected.body.text();
+      expect(upstream.receivedRequests, remainder).toHaveLength(baseline);
+    }
 
     const conflictingQuery = await harnessRequest(
       `${app.proxyUrl}/ptr-boundary/models?tenant=caller`,
@@ -316,6 +324,20 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     expect(nestedEncodedQueryDelimiter.statusCode).toBe(400);
     await nestedEncodedQueryDelimiter.body.text();
     expect(upstream.receivedRequests).toHaveLength(baseline);
+
+    for (const query of [
+      "safe=1;tenant=caller",
+      "safe=1%3Btenant%3Dcaller",
+      "safe=1%253Btenant%253Dcaller",
+    ]) {
+      const semicolonQueryDelimiter = await harnessRequest(
+        `${app.proxyUrl}/ptr-boundary/models?${query}`,
+        { headers },
+      );
+      expect(semicolonQueryDelimiter.statusCode, query).toBe(400);
+      await semicolonQueryDelimiter.body.text();
+      expect(upstream.receivedRequests, query).toHaveLength(baseline);
+    }
   });
 
   test("forward-proxy BYO: host match beats typed routes; Authorization forwarded verbatim", async (ctx) => {
