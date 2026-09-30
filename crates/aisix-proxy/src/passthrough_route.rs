@@ -4283,11 +4283,17 @@ mod tests {
 
     #[test]
     fn request_text_extraction_per_protocol() {
-        let chat = br#"{"model":"m","messages":[{"role":"system","content":"s"},{"role":"user","content":[{"type":"text","text":"part"}]}]}"#;
+        let chat = br#"{"model":"routing-model-only","messages":[{"role":"system","content":"s"},{"role":"user","content":[{"type":"text","text":"part"}]}],"forwarded_extra":"supplement"}"#;
         let scanned = request_guardrail_text(PassthroughProtocol::OpenaiChat, chat);
-        for text in ["s", "part", "m"] {
+        for text in ["s", "part", "supplement"] {
             assert!(scanned.contains(text), "{text} missing from {scanned:?}");
         }
+        // `model` selects the protocol target rather than supplying caller
+        // content. Arbitrary forwarded extras must still be scanned.
+        assert!(
+            !scanned.contains("routing-model-only"),
+            "protocol routing metadata leaked into guardrail text: {scanned:?}"
+        );
         let fim = br#"{"prompt":"def f(","suffix":"return"}"#;
         assert_eq!(
             request_guardrail_text(PassthroughProtocol::OpenaiCompletions, fim),
