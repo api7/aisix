@@ -226,7 +226,7 @@ impl MultiReservation {
     #[must_use = "dropping the returned guard immediately releases the concurrency \
                   slot, recreating the early-release bug this fixes"]
     pub fn into_stream_hold(mut self) -> StreamConcurrencyGuard {
-        let mut refresh_interval = None;
+        let mut refresh_interval: Option<std::time::Duration> = None;
         let mut refresh_holds = Vec::new();
         let holds = self
             .reservations
