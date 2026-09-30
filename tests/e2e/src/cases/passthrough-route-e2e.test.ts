@@ -261,6 +261,19 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
       }
     });
 
+    expect(upstream.receivedRequests.at(-1)?.path).toBe(
+      "/provider/v1/models?tenant=operator",
+    );
+    const allowedQuery = await harnessRequest(
+      `${app.proxyUrl}/ptr-boundary/models?limit=3`,
+      { headers },
+    );
+    expect(allowedQuery.statusCode).toBe(200);
+    await allowedQuery.body.text();
+    expect(upstream.receivedRequests.at(-1)?.path).toBe(
+      "/provider/v1/models?tenant=operator&limit=3",
+    );
+
     const baseline = upstream.receivedRequests.length;
     // Use undici's raw request helper: fetch implementations are allowed to
     // normalize URL escapes before the gateway receives the wire path.
@@ -286,6 +299,22 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     );
     expect(nestedConflictingQuery.statusCode).toBe(400);
     await nestedConflictingQuery.body.text();
+    expect(upstream.receivedRequests).toHaveLength(baseline);
+
+    const encodedQueryDelimiter = await harnessRequest(
+      `${app.proxyUrl}/ptr-boundary/models?safe=1%26tenant%3Dcaller`,
+      { headers },
+    );
+    expect(encodedQueryDelimiter.statusCode).toBe(400);
+    await encodedQueryDelimiter.body.text();
+    expect(upstream.receivedRequests).toHaveLength(baseline);
+
+    const nestedEncodedQueryDelimiter = await harnessRequest(
+      `${app.proxyUrl}/ptr-boundary/models?safe=1%2526tenant%253Dcaller`,
+      { headers },
+    );
+    expect(nestedEncodedQueryDelimiter.statusCode).toBe(400);
+    await nestedEncodedQueryDelimiter.body.text();
     expect(upstream.receivedRequests).toHaveLength(baseline);
   });
 
@@ -578,13 +607,11 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     ];
     const upstream = await startOpenAiUpstream({
       // The propagation probe does not reach this upstream. The first real
-      // stream ends normally; the second stalls for far longer than the
-      // bounded cancellation assertion, so a natural upstream close cannot
-      // make a leaked concurrency reservation look released.
+      // stream stalls until the client cancels it. The second ends naturally,
+      // so this test covers both lifetime boundaries of the same reservation.
       scriptedResponses: [
-        { streamEvents },
-        { streamEvents, firstEventDelayMs: 900, eventDelayMs: 600 },
         { streamEvents, firstEventDelayMs: 10_000 },
+        { streamEvents, firstEventDelayMs: 25, eventDelayMs: 25 },
         { streamEvents },
       ],
     });
@@ -650,27 +677,28 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     await second.text();
     expect(upstream.receivedRequests).toHaveLength(upstreamCallsWhileStreaming);
 
-    await first.text();
-    const afterEnd = await call();
-    expect(afterEnd.status).toBe(200);
-
-    // Keep a second stream open to exercise cancellation separately.
-    expect(afterEnd.body).not.toBeNull();
-    const secondStream = afterEnd;
-
-    // A cancelled client must release the same hold. The next caller should
-    // not wait for the upstream's delayed frames to finish naturally.
-    await secondStream.body!.cancel();
+    // A cancelled client must release the same hold. The admitted follow-up
+    // is deliberately a separate, naturally ending stream.
+    expect(first.body).not.toBeNull();
+    await first.body!.cancel();
+    let naturallyEnding: Response | undefined;
     await waitConfigPropagation(async () => {
       try {
         const afterCancel = await call();
         const admitted = afterCancel.status === 200;
-        await afterCancel.body?.cancel();
+        if (admitted) naturallyEnding = afterCancel;
+        else await afterCancel.text();
         return admitted;
       } catch {
         return false;
       }
     }, 3_000);
+    expect(naturallyEnding).toBeDefined();
+    await naturallyEnding!.text();
+
+    const afterEnd = await call();
+    expect(afterEnd.status).toBe(200);
+    await afterEnd.text();
 
     expect(upstream.receivedRequests).toHaveLength(upstreamCallsWhileStreaming + 2);
   });

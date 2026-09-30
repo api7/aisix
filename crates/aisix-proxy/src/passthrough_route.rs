@@ -1795,32 +1795,36 @@ fn join_target_url(base: &str, rest: &str, query: Option<&str>) -> Result<String
     Ok(target.into())
 }
 
-/// Query key comparison first uses form decoding, then a bounded number of
-/// percent-decoding passes. That matches the path guard: a backend must not
-/// be able to turn a nested encoding into an operator-owned key downstream.
-/// Query sets here are tiny, so a simple vector keeps the parser behavior
-/// explicit without adding a dependency.
+/// Query key comparison examines each bounded whole-query decoded form. A
+/// backend may decode before splitting on `&`, so checking only keys from the
+/// original form would miss `safe=1%26tenant%3Dcaller` becoming a `tenant`
+/// key downstream. Query sets here are tiny, so a simple vector keeps the
+/// parser behavior explicit without adding a dependency.
 fn query_keys_overlap(base: &str, inbound: &str) -> bool {
-    let base_keys = url::form_urlencoded::parse(base.as_bytes())
-        .map(|(key, _)| normalize_query_key(&key))
-        .collect::<Option<Vec<_>>>();
-    let Some(base_keys) = base_keys else {
+    let Some(base_keys) = query_keys_at_all_decode_levels(base) else {
         return true;
     };
-    url::form_urlencoded::parse(inbound.as_bytes()).any(|(key, _)| {
-        let Some(key) = normalize_query_key(&key) else {
-            return true;
-        };
-        base_keys.iter().any(|base_key| base_key == &key)
-    })
+    let Some(inbound_keys) = query_keys_at_all_decode_levels(inbound) else {
+        return true;
+    };
+    inbound_keys
+        .iter()
+        .any(|key| base_keys.iter().any(|base_key| base_key == key))
 }
 
-fn normalize_query_key(key: &str) -> Option<Vec<u8>> {
-    let mut decoded = key.as_bytes().to_vec();
+fn query_keys_at_all_decode_levels(query: &str) -> Option<Vec<Vec<u8>>> {
+    let mut decoded = query.as_bytes().to_vec();
+    let mut keys = Vec::new();
     for _ in 0..=MAX_PERCENT_DECODE_PASSES {
+        for (key, _) in url::form_urlencoded::parse(&decoded) {
+            let key = key.into_owned().into_bytes();
+            if !keys.iter().any(|existing| existing == &key) {
+                keys.push(key);
+            }
+        }
         let next = percent_decode(&decoded).collect::<Vec<_>>();
         if next == decoded {
-            return Some(decoded);
+            return Some(keys);
         }
         decoded = next;
     }
@@ -3262,6 +3266,24 @@ mod tests {
             )
             .is_err(),
             "nested-encoded query keys must not bypass the operator-owned key"
+        );
+        assert!(
+            join_target_url(
+                "https://upstream.example/provider/v1?tenant=operator",
+                "models",
+                Some("safe=1%26tenant%3Dcaller"),
+            )
+            .is_err(),
+            "an encoded query delimiter must not recreate an operator-owned key"
+        );
+        assert!(
+            join_target_url(
+                "https://upstream.example/provider/v1?tenant=operator",
+                "models",
+                Some("safe=1%2526tenant%253Dcaller"),
+            )
+            .is_err(),
+            "a nested-encoded query delimiter must not recreate an operator-owned key"
         );
 
         // Test raw, percent-encoded, and encoded-separator spellings. The
