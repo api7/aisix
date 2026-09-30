@@ -1358,268 +1358,450 @@ fn append_scan_text(out: &mut String, text: &str) {
     out.push_str(text);
 }
 
-/// A duplicate-preserving JSON value walker. `serde_json::Value` is right for
-/// typed envelope extraction but keeps only the final value for a repeated
-/// object key; passthrough forwards the original bytes, so guardrail scanning
-/// must see every decoded string value the upstream can see. Object keys are
-/// structural metadata and deliberately stay out of the guardrail text.
-struct JsonStringCollector<'a> {
-    out: &'a mut String,
-}
-
-struct JsonStringVisitor<'a> {
-    out: &'a mut String,
-}
-
-struct OtherTopLevelJsonStringsVisitor<'out, 'excluded> {
-    out: &'out mut String,
-    excluded: &'excluded [&'excluded str],
-}
-
-impl<'de, 'a, 'b> serde::de::DeserializeSeed<'de> for &'a mut JsonStringCollector<'b> {
-    type Value = ();
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_any(JsonStringVisitor { out: self.out })
-    }
-}
-
-impl<'de> serde::de::Visitor<'de> for JsonStringVisitor<'_> {
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a JSON value")
-    }
-
-    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(())
-    }
-
-    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(())
-    }
-
-    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(())
-    }
-
-    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(())
-    }
-
-    fn visit_str<E>(self, text: &str) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        append_scan_text(self.out, text);
-        Ok(())
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(())
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(())
-    }
-
-    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_any(self)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: serde::de::SeqAccess<'de>,
-    {
-        let mut collector = JsonStringCollector { out: self.out };
-        while sequence.next_element_seed(&mut collector)?.is_some() {}
-        Ok(())
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: serde::de::MapAccess<'de>,
-    {
-        let mut collector = JsonStringCollector { out: self.out };
-        while map.next_key::<serde::de::IgnoredAny>()?.is_some() {
-            map.next_value_seed(&mut collector)?;
-        }
-        Ok(())
-    }
-}
-
-impl<'de> serde::de::Visitor<'de> for OtherTopLevelJsonStringsVisitor<'_, '_> {
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a JSON object")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: serde::de::MapAccess<'de>,
-    {
-        let mut collector = JsonStringCollector { out: self.out };
-        while let Some(key) = map.next_key::<String>()? {
-            if self.excluded.iter().any(|excluded| *excluded == key) {
-                map.next_value::<serde::de::IgnoredAny>()?;
-            } else {
-                map.next_value_seed(&mut collector)?;
-            }
-        }
-        Ok(())
-    }
-}
-
 fn decoded_json_string_values(body: &[u8]) -> Option<String> {
     crate::json_splice::collect_string_values(body)
         .ok()
         .filter(|out| !out.is_empty())
 }
 
-/// All occurrences of every non-envelope top-level value, preserving
-/// duplicate keys in the source document. The caller's known envelope fields
-/// stay on the existing typed extraction path.
-fn decoded_other_top_level_json_string_values(body: &[u8], excluded: &[&str]) -> Option<String> {
-    let mut out = String::new();
+fn decoded_json_string_values_where(
+    body: &[u8],
+    include: impl FnMut(&[crate::json_splice::PathSeg]) -> bool,
+) -> Option<String> {
+    crate::json_splice::collect_string_values_where(body, include)
+        .ok()
+        .filter(|out| !out.is_empty())
+}
+
+fn decoded_json_string_values_vec_where(
+    body: &[u8],
+    include: impl FnMut(&[crate::json_splice::PathSeg]) -> bool,
+) -> Option<Vec<String>> {
+    crate::json_splice::collect_string_values_where_vec(body, include)
+        .ok()
+        .filter(|out| !out.is_empty())
+}
+
+fn is_root_key(path: &[crate::json_splice::PathSeg], key: &str) -> bool {
+    path.first().is_some_and(|segment| segment.is_key(key))
+}
+
+/// A detected envelope still forwards raw bytes, including duplicate keys and
+/// arbitrary nested fields. Scan every decoded string the upstream can read;
+/// the root `model` alone is routing metadata rather than caller content.
+fn decoded_non_model_json_string_values(body: &[u8]) -> Option<String> {
+    decoded_json_string_values_where(body, |path| !is_root_key(path, "model"))
+}
+
+fn decoded_json_string_values_including_empty(body: &[u8]) -> Option<String> {
+    crate::json_splice::collect_string_values(body).ok()
+}
+
+fn decoded_json_string_values_except_root_keys(body: &[u8], excluded: &[&str]) -> Option<String> {
+    crate::json_splice::collect_string_values_where(body, |path| {
+        !excluded.iter().any(|key| is_root_key(path, key))
+    })
+    .ok()
+}
+
+/// Source values of all occurrences of one top-level key. `RawValue` keeps
+/// repeated keys separate, unlike `serde_json::Value`.
+fn raw_top_level_values(
+    body: &[u8],
+    wanted_key: &str,
+) -> Option<Vec<Box<serde_json::value::RawValue>>> {
+    struct Values<'a> {
+        wanted_key: &'a str,
+    }
+
+    impl<'de> serde::de::Visitor<'de> for Values<'_> {
+        type Value = Vec<Box<serde_json::value::RawValue>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON object")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut values = Vec::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if key == self.wanted_key {
+                    values.push(map.next_value::<Box<serde_json::value::RawValue>>()?);
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+            Ok(values)
+        }
+    }
+
     let mut deserializer = serde_json::Deserializer::from_slice(body);
-    serde::de::Deserializer::deserialize_map(
-        &mut deserializer,
-        OtherTopLevelJsonStringsVisitor {
-            out: &mut out,
-            excluded,
-        },
-    )
-    .ok()?;
+    let values =
+        serde::de::Deserializer::deserialize_map(&mut deserializer, Values { wanted_key }).ok()?;
     deserializer.end().ok()?;
-    (!out.is_empty()).then_some(out)
+    Some(values)
+}
+
+fn raw_array_items(
+    raw: &serde_json::value::RawValue,
+) -> Option<Vec<Box<serde_json::value::RawValue>>> {
+    serde_json::from_str(raw.get()).ok()
+}
+
+/// `true` only for an unambiguous typed item. Conflicting or non-string
+/// duplicate `type` fields stay in the output scan rather than becoming a
+/// way to hide content.
+fn raw_object_has_only_types(raw: &serde_json::value::RawValue, allowed: &[&str]) -> bool {
+    let Some(values) = raw_top_level_values(raw.get().as_bytes(), "type") else {
+        return false;
+    };
+    let mut types = values
+        .into_iter()
+        .map(|value| serde_json::from_str::<String>(value.get()).ok());
+    let Some(Some(first)) = types.next() else {
+        return false;
+    };
+    allowed.iter().any(|allowed| first == *allowed)
+        && types.all(|kind| kind.as_deref() == Some(first.as_str()))
+}
+
+fn raw_top_level_unique_type(body: &[u8]) -> Option<String> {
+    let mut types = raw_top_level_values(body, "type")
+        .into_iter()
+        .flatten()
+        .map(|value| serde_json::from_str::<String>(value.get()).ok());
+    let first = types.next()??;
+    types
+        .all(|kind| kind.as_deref() == Some(first.as_str()))
+        .then_some(first)
+}
+
+fn raw_top_level_has_any_type(body: &[u8], wanted: &[&str]) -> bool {
+    raw_top_level_values(body, "type")
+        .into_iter()
+        .flatten()
+        .filter_map(|value| serde_json::from_str::<String>(value.get()).ok())
+        .any(|kind| wanted.iter().any(|wanted| kind == *wanted))
+}
+
+fn raw_top_level_items_have_only_types(body: &[u8], key: &str, allowed: &[&str]) -> Option<bool> {
+    let values = raw_top_level_values(body, key)?;
+    Some(
+        !values.is_empty()
+            && values
+                .iter()
+                .all(|value| raw_object_has_only_types(value, allowed)),
+    )
+}
+
+fn append_raw_array_item_strings(
+    out: &mut String,
+    body: &[u8],
+    key: &str,
+    mut skip: impl FnMut(&serde_json::value::RawValue) -> bool,
+) -> Option<()> {
+    for array in raw_top_level_values(body, key)? {
+        for item in raw_array_items(&array)? {
+            if !skip(&item) {
+                append_scan_text(
+                    out,
+                    &decoded_json_string_values_including_empty(item.get().as_bytes())?,
+                );
+            }
+        }
+    }
+    Some(())
+}
+
+fn append_raw_string_value(out: &mut String, raw: &serde_json::value::RawValue) -> Option<()> {
+    append_scan_text(out, &serde_json::from_str::<String>(raw.get()).ok()?);
+    Some(())
+}
+
+fn append_raw_top_level_strings(out: &mut String, body: &[u8], key: &str) -> Option<()> {
+    for value in raw_top_level_values(body, key)? {
+        append_raw_string_value(out, &value)?;
+    }
+    Some(())
+}
+
+fn raw_top_level_string_values(body: &[u8], key: &str) -> Option<Vec<String>> {
+    raw_top_level_values(body, key)?
+        .into_iter()
+        .map(|value| serde_json::from_str::<String>(value.get()).ok())
+        .collect()
+}
+
+/// The typed content extractors inspect a bare string or the direct `text`
+/// field of typed parts. Keep that boundary when walking raw source, so image
+/// and document payloads never reach external guardrails as text.
+fn append_raw_text_value(out: &mut String, raw: &serde_json::value::RawValue) -> Option<()> {
+    let value = raw.get().trim_start();
+    if value.starts_with('"') {
+        return append_raw_string_value(out, raw);
+    }
+    if !value.starts_with('[') {
+        return Some(());
+    }
+    for part in raw_array_items(raw)? {
+        append_raw_top_level_strings(out, part.get().as_bytes(), "text")?;
+    }
+    Some(())
+}
+
+/// Source-preserving request text from Anthropic-compatible content blocks.
+/// It mirrors [`request_content_text`]: `text`, nested `tool_result`, a
+/// `tool_use` input, and plaintext `thinking` are input; image/document and
+/// signed `redacted_thinking` payloads are deliberately opaque. An ambiguous
+/// duplicate `type` is scanned as source rather than becoming a bypass.
+fn append_chat_request_content_strings(
+    out: &mut String,
+    content: &serde_json::value::RawValue,
+) -> Option<()> {
+    let value = content.get().trim_start();
+    if value.starts_with('"') {
+        return append_raw_string_value(out, content);
+    }
+    if !value.starts_with('[') {
+        return Some(());
+    }
+    for block in raw_array_items(content)? {
+        let block_body = block.get().as_bytes();
+        let types = raw_top_level_values(block_body, "type")?;
+        let kind = raw_top_level_unique_type(block_body);
+        if !types.is_empty() && kind.is_none() {
+            append_scan_text(
+                out,
+                &decoded_json_string_values_including_empty(block_body)?,
+            );
+            continue;
+        }
+        match kind.as_deref() {
+            Some("redacted_thinking") => {}
+            Some("tool_result") => {
+                for nested in raw_top_level_values(block_body, "content")? {
+                    append_chat_request_content_strings(out, &nested)?;
+                }
+            }
+            Some("tool_use") => {
+                for input in raw_top_level_values(block_body, "input")? {
+                    append_scan_text(
+                        out,
+                        &decoded_json_string_values_including_empty(input.get().as_bytes())?,
+                    );
+                }
+            }
+            Some("thinking") => append_raw_top_level_strings(out, block_body, "thinking")?,
+            _ => append_raw_top_level_strings(out, block_body, "text")?,
+        }
+    }
+    Some(())
+}
+
+fn append_chat_request_message_strings(
+    out: &mut String,
+    message: &serde_json::value::RawValue,
+) -> Option<()> {
+    let message_body = message.get().as_bytes();
+    append_scan_text(
+        out,
+        &decoded_json_string_values_except_root_keys(
+            message_body,
+            &["content", "tool_calls", "reasoning_content", "reasoning"],
+        )?,
+    );
+    for content in raw_top_level_values(message_body, "content")? {
+        append_chat_request_content_strings(out, &content)?;
+    }
+    for tool_calls in raw_top_level_values(message_body, "tool_calls")? {
+        append_scan_text(
+            out,
+            &decoded_json_string_values_including_empty(tool_calls.get().as_bytes())?,
+        );
+    }
+    append_raw_top_level_strings(out, message_body, "reasoning_content")?;
+    Some(())
+}
+
+fn decoded_chat_request_string_values(body: &[u8]) -> Option<String> {
+    let mut out =
+        decoded_json_string_values_except_root_keys(body, &["model", "system", "messages"])?;
+    for system in raw_top_level_values(body, "system")? {
+        append_chat_request_content_strings(&mut out, &system)?;
+    }
+    for array in raw_top_level_values(body, "messages")? {
+        for message in raw_array_items(&array)? {
+            append_chat_request_message_strings(&mut out, &message)?;
+        }
+    }
+    Some(out)
+}
+
+fn append_responses_item_strings(
+    out: &mut String,
+    item: &serde_json::value::RawValue,
+) -> Option<()> {
+    let item_body = item.get().as_bytes();
+    let text_keys = [
+        "content",
+        "output",
+        "reason",
+        "summary",
+        "name",
+        "arguments",
+        "input",
+    ];
+    append_scan_text(
+        out,
+        &decoded_json_string_values_except_root_keys(item_body, &text_keys)?,
+    );
+    for key in text_keys {
+        for value in raw_top_level_values(item_body, key)? {
+            append_raw_text_value(out, &value)?;
+        }
+    }
+    Some(())
+}
+
+fn decoded_responses_request_string_values(body: &[u8]) -> Option<String> {
+    let mut out = decoded_json_string_values_except_root_keys(body, &["model", "input"])?;
+    for input in raw_top_level_values(body, "input")? {
+        let value = input.get().trim_start();
+        if value.starts_with('"') {
+            append_raw_string_value(&mut out, &input)?;
+        } else if value.starts_with('[') {
+            for item in raw_array_items(&input)? {
+                append_responses_item_strings(&mut out, &item)?;
+            }
+        }
+    }
+    Some(out)
+}
+
+fn decoded_completions_request_string_values(body: &[u8]) -> Option<String> {
+    let mut out =
+        decoded_json_string_values_except_root_keys(body, &["model", "prompt", "suffix"])?;
+    for prompt in raw_top_level_values(body, "prompt")? {
+        let value = prompt.get().trim_start();
+        if value.starts_with('"') {
+            append_raw_string_value(&mut out, &prompt)?;
+        } else if value.starts_with('[') {
+            for part in raw_array_items(&prompt)? {
+                if part.get().trim_start().starts_with('"') {
+                    append_raw_string_value(&mut out, &part)?;
+                }
+            }
+        }
+    }
+    append_raw_top_level_strings(&mut out, body, "suffix")?;
+    Some(out)
 }
 
 /// The request text a guardrail scans, per the detected envelope.
-/// Extraction is best-effort: a shape that yields no typed content falls back
-/// to all decoded JSON strings, then to the raw lossy-UTF-8 body when parsing
-/// is impossible, so detection never loses audit coverage.
+///
+/// The route relays source bytes verbatim, while `serde_json::Value` drops
+/// duplicate keys and stops at its default nesting limit. Scan decoded source
+/// values while preserving typed opaque boundaries: signed Anthropic
+/// `redacted_thinking`, image, and document payloads are not caller text.
 fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
     let raw = || String::from_utf8_lossy(body).into_owned();
-    if matches!(protocol, PassthroughProtocol::Raw) {
-        return decoded_json_string_values(body).unwrap_or_else(raw);
-    }
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return decoded_json_string_values(body).unwrap_or_else(raw);
-    };
-    let (mut extracted, envelope_keys): (String, &[&str]) = match protocol {
-        PassthroughProtocol::Raw => unreachable!("handled before typed envelope parsing"),
-        // An Anthropic Messages body carries its system prompt top-level.
-        PassthroughProtocol::OpenaiChat => (
-            v.get("system")
-                .map(request_content_text)
-                .into_iter()
-                .chain(
-                    v.get("messages")
-                        .and_then(|m| m.as_array())
-                        .into_iter()
-                        .flatten()
-                        .map(|m| message_scan_text(m, true)),
-                )
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            &["model", "system", "messages"],
-        ),
-        // Responses API: `input` is either a bare string or an array of
-        // items, read exactly as the typed route reads them
-        // (`responses::responses_item_text`) — message content, tool
-        // results, approval reasons, replayed reasoning summaries, and a
-        // replayed tool call's name, arguments and input. Every item, not
-        // only the common one: the raw-body fallback below fires only when
-        // the WHOLE extraction came back empty, so a slot left out here is
-        // never scanned while `/v1/responses` blocks the same body.
-        PassthroughProtocol::OpenaiResponses => (
-            match v.get("input") {
-                Some(serde_json::Value::String(t)) => t.clone(),
-                Some(serde_json::Value::Array(items)) => items
-                    .iter()
-                    .map(crate::responses::responses_item_text)
-                    .filter(|t| !t.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                _ => String::new(),
-            },
-            &["model", "input"],
-        ),
-        PassthroughProtocol::OpenaiCompletions => {
-            let prompt = v.get("prompt").map(|p| match p {
-                serde_json::Value::Array(items) => items
-                    .iter()
-                    .filter_map(|i| i.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                other => content_text(other),
-            });
-            let suffix = v.get("suffix").and_then(|s| s.as_str());
-            let mut out = prompt.unwrap_or_default();
-            if let Some(s) = suffix {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(s);
-            }
-            (out, &["model", "prompt", "suffix"])
+    match protocol {
+        PassthroughProtocol::Raw => decoded_json_string_values(body).unwrap_or_else(raw),
+        PassthroughProtocol::OpenaiChat => {
+            decoded_chat_request_string_values(body).unwrap_or_else(raw)
         }
+        PassthroughProtocol::OpenaiCompletions => {
+            decoded_completions_request_string_values(body).unwrap_or_else(raw)
+        }
+        PassthroughProtocol::OpenaiResponses => {
+            decoded_responses_request_string_values(body).unwrap_or_else(raw)
+        }
+    }
+}
+
+fn is_hidden_chat_reasoning_path(path: &[crate::json_splice::PathSeg]) -> bool {
+    use crate::json_splice::PathSeg;
+
+    let path = match path {
+        [PathSeg::Key(choices), PathSeg::Index(_), rest @ ..] if choices == "choices" => rest,
+        _ => path,
     };
-    if extracted.is_empty() {
-        return decoded_json_string_values(body).unwrap_or_else(raw);
+    matches!(
+        path,
+        [
+            PathSeg::Key(message_or_delta),
+            PathSeg::Key(reasoning),
+            ..
+        ] if matches!(message_or_delta.as_str(), "message" | "delta")
+            && matches!(reasoning.as_str(), "reasoning_content" | "reasoning")
+    )
+}
+
+fn decoded_chat_response_string_values(body: &[u8]) -> Option<String> {
+    let mut out =
+        decoded_json_string_values_except_root_keys(body, &["model", "content", "choices"])?;
+    append_raw_array_item_strings(&mut out, body, "content", |item| {
+        raw_object_has_only_types(item, &["thinking", "redacted_thinking"])
+    })?;
+    for array in raw_top_level_values(body, "choices")? {
+        for item in raw_array_items(&array)? {
+            let text =
+                crate::json_splice::collect_string_values_where(item.get().as_bytes(), |path| {
+                    !is_hidden_chat_reasoning_path(path)
+                })
+                .ok()?;
+            append_scan_text(&mut out, &text);
+        }
     }
-    if let Some(other) = decoded_other_top_level_json_string_values(body, envelope_keys) {
-        append_scan_text(&mut extracted, &other);
-    }
-    extracted
+    Some(out)
+}
+
+fn decoded_responses_response_string_values(body: &[u8]) -> Option<String> {
+    let mut out = decoded_json_string_values_except_root_keys(body, &["model", "output"])?;
+    append_raw_array_item_strings(&mut out, body, "output", |item| {
+        raw_object_has_only_types(item, &["reasoning"])
+    })?;
+    Some(out)
 }
 
 /// The response text a guardrail scans, per the route's protocol hint.
-/// Best-effort like the request side.
+///
+/// This deliberately reads raw source values rather than `Value`: a
+/// passthrough upstream may send duplicate or deeply nested fields which the
+/// client receives verbatim. Generated reasoning remains out of scope only
+/// for an unambiguous standard reasoning item.
 fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
     let raw = || String::from_utf8_lossy(body).into_owned();
+    match protocol {
+        PassthroughProtocol::Raw => decoded_json_string_values(body).unwrap_or_else(raw),
+        PassthroughProtocol::OpenaiChat => {
+            decoded_chat_response_string_values(body).unwrap_or_else(raw)
+        }
+        PassthroughProtocol::OpenaiCompletions => {
+            decoded_non_model_json_string_values(body).unwrap_or_else(raw)
+        }
+        PassthroughProtocol::OpenaiResponses => {
+            decoded_responses_response_string_values(body).unwrap_or_else(raw)
+        }
+    }
+}
+
+/// The typed visible-response extraction used for telemetry capture. It is
+/// intentionally separate from the broader guardrail source scan above.
+fn response_visible_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
+    let raw = || String::from_utf8_lossy(body).into_owned();
     if matches!(protocol, PassthroughProtocol::Raw) {
-        return decoded_json_string_values(body).unwrap_or_else(raw);
+        return raw();
     }
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
         return decoded_json_string_values(body).unwrap_or_else(raw);
     };
-    // Responses answers with `output` items, not `choices`: read them as
-    // the typed route does (`responses::responses_output_text`) — message
-    // text plus each tool call's name, arguments and input, with generated
-    // reasoning items left out of the output scope.
     if matches!(protocol, PassthroughProtocol::OpenaiResponses) {
         let joined = crate::responses::responses_output_text(&v);
         return if joined.is_empty() { raw() } else { joined };
     }
-    // An Anthropic Messages response on the chat envelope carries
-    // `content` blocks rather than `choices`.
     if matches!(protocol, PassthroughProtocol::OpenaiChat) && v.get("choices").is_none() {
         let text = anthropic_message_output_text(&v);
         if !text.is_empty() {
@@ -1637,7 +1819,6 @@ fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String
             PassthroughProtocol::OpenaiCompletions => {
                 c.get("text").and_then(|t| t.as_str()).map(str::to_string)
             }
-            // Unreachable: handled above by the `output` branch.
             PassthroughProtocol::OpenaiResponses | PassthroughProtocol::Raw => None,
         })
         .filter(|t| !t.is_empty())
@@ -1649,14 +1830,10 @@ fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String
     }
 }
 
-/// Captures preserve raw passthrough responses for the existing telemetry
-/// contract; guardrail scanning may use a decoded representation instead.
+/// Captures preserve the existing typed visible-content contract; guardrail
+/// scanning may include additional raw fields that are forwarded downstream.
 fn response_capture_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
-    if matches!(protocol, PassthroughProtocol::Raw) {
-        String::from_utf8_lossy(body).into_owned()
-    } else {
-        response_guardrail_text(protocol, body)
-    }
+    response_visible_text(protocol, body)
 }
 
 /// Every token dimension a passthrough exchange can report, mirroring the
@@ -2216,6 +2393,301 @@ fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<P
     (parts.scan, usage)
 }
 
+fn is_hidden_chat_stream_reasoning_path(path: &[crate::json_splice::PathSeg]) -> bool {
+    is_hidden_chat_reasoning_path(path)
+}
+
+/// Whether one unambiguous Anthropic stream event carries only generated
+/// reasoning. `None` means the source shape was not safely inspectable, so
+/// callers must preserve it rather than treating it as hidden.
+fn hidden_chat_stream_reasoning_frame(body: &[u8]) -> Option<bool> {
+    match raw_top_level_unique_type(body).as_deref() {
+        Some("content_block_delta") => raw_top_level_items_have_only_types(
+            body,
+            "delta",
+            &["thinking_delta", "signature_delta"],
+        ),
+        Some("content_block_start") => raw_top_level_items_have_only_types(
+            body,
+            "content_block",
+            &["thinking", "redacted_thinking"],
+        ),
+        _ => Some(false),
+    }
+}
+
+fn decoded_chat_frame_string_values(body: &[u8]) -> Option<String> {
+    match raw_top_level_unique_type(body).as_deref() {
+        Some("content_block_delta")
+            if raw_top_level_items_have_only_types(
+                body,
+                "delta",
+                &["thinking_delta", "signature_delta"],
+            )? =>
+        {
+            return decoded_json_string_values_except_root_keys(body, &["model", "delta"]);
+        }
+        Some("content_block_start")
+            if raw_top_level_items_have_only_types(
+                body,
+                "content_block",
+                &["thinking", "redacted_thinking"],
+            )? =>
+        {
+            return decoded_json_string_values_except_root_keys(body, &["model", "content_block"]);
+        }
+        _ => {}
+    }
+    crate::json_splice::collect_string_values_where(body, |path| {
+        !is_root_key(path, "model") && !is_hidden_chat_stream_reasoning_path(path)
+    })
+    .ok()
+}
+
+fn decoded_responses_frame_string_values(body: &[u8]) -> Option<String> {
+    match raw_top_level_unique_type(body).as_deref() {
+        Some("response.reasoning_text.delta" | "response.reasoning_summary_text.delta") => {
+            return decoded_json_string_values_except_root_keys(body, &["model", "delta"]);
+        }
+        Some("response.reasoning_text.done" | "response.reasoning_summary_text.done") => {
+            return decoded_json_string_values_except_root_keys(body, &["model", "text"]);
+        }
+        Some("response.reasoning_summary_part.added" | "response.reasoning_summary_part.done") => {
+            return decoded_json_string_values_except_root_keys(body, &["model", "part"]);
+        }
+        Some("response.output_item.added" | "response.output_item.done")
+            if raw_top_level_items_have_only_types(body, "item", &["reasoning"])? =>
+        {
+            return decoded_json_string_values_except_root_keys(body, &["model", "item"]);
+        }
+        Some("response.content_part.added" | "response.content_part.done")
+            if raw_top_level_items_have_only_types(
+                body,
+                "part",
+                &["reasoning_text", "reasoning_summary"],
+            )? =>
+        {
+            return decoded_json_string_values_except_root_keys(body, &["model", "part"]);
+        }
+        _ => {}
+    }
+
+    let responses = raw_top_level_values(body, "response")?;
+    if responses.is_empty() {
+        return decoded_non_model_json_string_values(body);
+    }
+    let mut out = decoded_json_string_values_except_root_keys(body, &["model", "response"])?;
+    for response in responses {
+        append_scan_text(
+            &mut out,
+            &response_guardrail_text(
+                PassthroughProtocol::OpenaiResponses,
+                response.get().as_bytes(),
+            ),
+        );
+    }
+    Some(out)
+}
+
+fn decoded_chat_frame_continuations(body: &[u8]) -> Option<Vec<String>> {
+    use crate::json_splice::PathSeg;
+
+    if hidden_chat_stream_reasoning_frame(body) == Some(true) {
+        return None;
+    }
+    if raw_top_level_has_any_type(body, &["content_block_delta"]) {
+        return decoded_json_string_values_vec_where(body, |path| {
+            matches!(
+                path,
+                [PathSeg::Key(delta), PathSeg::Key(field)]
+                    if delta == "delta" && matches!(field.as_str(), "text" | "partial_json")
+            )
+        });
+    }
+    if raw_top_level_has_any_type(body, &["content_block_start"]) {
+        let mut out = Vec::new();
+        for block in raw_top_level_values(body, "content_block")? {
+            out.extend(raw_top_level_string_values(block.get().as_bytes(), "text")?);
+            for input in raw_top_level_values(block.get().as_bytes(), "input")? {
+                out.extend(
+                    crate::json_splice::collect_string_values_where_vec(
+                        input.get().as_bytes(),
+                        |_| true,
+                    )
+                    .ok()?,
+                );
+            }
+        }
+        return (!out.is_empty()).then_some(out);
+    }
+    decoded_json_string_values_vec_where(body, |path| {
+        matches!(
+            path,
+            [PathSeg::Key(choices), PathSeg::Index(_), PathSeg::Key(delta), PathSeg::Key(field)]
+                if choices == "choices"
+                    && delta == "delta"
+                    && field == "content"
+        ) || matches!(
+            path,
+            [PathSeg::Key(choices), PathSeg::Index(_), PathSeg::Key(delta), PathSeg::Key(content), PathSeg::Index(_), PathSeg::Key(text)]
+                if choices == "choices"
+                    && delta == "delta"
+                    && content == "content"
+                    && text == "text"
+        ) || matches!(
+            path,
+            [PathSeg::Key(choices), PathSeg::Index(_), PathSeg::Key(delta), PathSeg::Key(tool_calls), PathSeg::Index(_), PathSeg::Key(kind), PathSeg::Key(value)]
+                if choices == "choices"
+                    && delta == "delta"
+                    && tool_calls == "tool_calls"
+                    && ((kind == "function" && value == "arguments")
+                        || (kind == "custom" && value == "input"))
+        )
+    })
+}
+
+fn decoded_completions_frame_continuations(body: &[u8]) -> Option<Vec<String>> {
+    use crate::json_splice::PathSeg;
+
+    decoded_json_string_values_vec_where(body, |path| {
+        matches!(
+            path,
+            [PathSeg::Key(choices), PathSeg::Index(_), PathSeg::Key(text)]
+                if choices == "choices" && text == "text"
+        )
+    })
+}
+
+fn decoded_responses_frame_continuations(body: &[u8]) -> Option<Vec<String>> {
+    const VISIBLE_DELTA_EVENTS: &[&str] = &[
+        "response.output_text.delta",
+        "response.function_call_arguments.delta",
+        "response.mcp_call_arguments.delta",
+        "response.custom_tool_call_input.delta",
+    ];
+    if !raw_top_level_has_any_type(body, VISIBLE_DELTA_EVENTS) {
+        return None;
+    }
+    raw_top_level_string_values(body, "delta").filter(|values| !values.is_empty())
+}
+
+fn frame_source_continuations(
+    protocol: PassthroughProtocol,
+    payload: &[u8],
+) -> Option<Vec<String>> {
+    match protocol {
+        PassthroughProtocol::Raw => decoded_json_string_values(payload).map(|text| vec![text]),
+        PassthroughProtocol::OpenaiChat => decoded_chat_frame_continuations(payload),
+        PassthroughProtocol::OpenaiCompletions => decoded_completions_frame_continuations(payload),
+        PassthroughProtocol::OpenaiResponses => decoded_responses_frame_continuations(payload),
+    }
+}
+
+/// Guardrail-only text for a streamed frame. Capture and hold-back retain
+/// their typed visible-content extraction in [`frame_parts`], while this
+/// source-preserving pass also sees duplicate and arbitrary forwarded fields.
+fn frame_guardrail_text(protocol: PassthroughProtocol, frame: &[u8]) -> String {
+    let Some(payload) = crate::redact::frame_payload(frame) else {
+        return String::new();
+    };
+    let payload = payload.trim();
+    if payload.is_empty() || payload == "[DONE]" {
+        return String::new();
+    }
+    let raw = || payload.to_string();
+    match protocol {
+        PassthroughProtocol::Raw => {
+            decoded_json_string_values(payload.as_bytes()).unwrap_or_else(raw)
+        }
+        PassthroughProtocol::OpenaiChat => {
+            decoded_chat_frame_string_values(payload.as_bytes()).unwrap_or_else(raw)
+        }
+        PassthroughProtocol::OpenaiCompletions => {
+            decoded_non_model_json_string_values(payload.as_bytes()).unwrap_or_else(raw)
+        }
+        PassthroughProtocol::OpenaiResponses => {
+            decoded_responses_frame_string_values(payload.as_bytes()).unwrap_or_else(raw)
+        }
+    }
+}
+
+/// The independent channels scanned for one stream frame. The first
+/// continuation is the typed visible-output sequence; later channels retain
+/// source output-carrier occurrences across frames. `supplemental` preserves
+/// every additional decoded source value (including duplicate or nested
+/// fields). Keeping them separate prevents frame metadata from interrupting a
+/// sensitive literal split across output deltas.
+struct StreamGuardrailText {
+    continuations: Vec<String>,
+    supplemental: String,
+}
+
+fn stream_guardrail_text(
+    protocol: PassthroughProtocol,
+    frame: &[u8],
+    continuation: String,
+) -> StreamGuardrailText {
+    // Keep the typed continuation in a stable first channel even when source
+    // extraction finds raw carriers. A provider can add or remove duplicate
+    // carrier fields between frames; only the typed last-wins sequence then
+    // follows what a normal JSON client sees across that boundary.
+    let payload = crate::redact::frame_payload(frame);
+    let hidden_reasoning = matches!(protocol, PassthroughProtocol::OpenaiChat)
+        && payload.as_ref().is_some_and(|payload| {
+            hidden_chat_stream_reasoning_frame(payload.trim().as_bytes()) == Some(true)
+        });
+    let mut continuations = vec![(!hidden_reasoning)
+        .then_some(continuation)
+        .unwrap_or_default()];
+    if let Some(source) =
+        payload.and_then(|payload| frame_source_continuations(protocol, payload.trim().as_bytes()))
+    {
+        continuations.extend(source);
+    }
+    StreamGuardrailText {
+        continuations,
+        supplemental: frame_guardrail_text(protocol, frame),
+    }
+}
+
+fn append_stream_guardrail_text(
+    continuations: &mut Vec<String>,
+    supplemental: &mut String,
+    text: &StreamGuardrailText,
+) {
+    if continuations.len() < text.continuations.len() {
+        continuations.resize(text.continuations.len(), String::new());
+    }
+    for (index, continuation) in text.continuations.iter().enumerate() {
+        continuations[index].push_str(continuation);
+    }
+    append_scan_text(supplemental, &text.supplemental);
+}
+
+fn stream_guardrail_scan_text(
+    continuation_tails: &[String],
+    continuations: &[String],
+    supplemental_tail: &str,
+    supplemental: &str,
+) -> String {
+    let mut text = String::new();
+    for (index, continuation) in continuations.iter().enumerate() {
+        let tail = continuation_tails
+            .get(index)
+            .map(String::as_str)
+            .unwrap_or_default();
+        append_scan_text(&mut text, &format!("{tail}{continuation}"));
+    }
+    let supplemental = match (supplemental_tail.is_empty(), supplemental.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => supplemental_tail.to_string(),
+        (true, false) => supplemental.to_string(),
+        (false, false) => format!("{supplemental_tail}\n{supplemental}"),
+    };
+    append_scan_text(&mut text, &supplemental);
+    text
+}
+
 /// One frame's generated content, split by [`crate::held_content::Parts`]
 /// into what the output guardrails scan and what only counts toward the
 /// hold-back cap, plus any usage it reports. The scan and the cap read the
@@ -2231,7 +2703,7 @@ fn frame_parts(
     let mut merge = |found: PassthroughUsage| {
         merge_usage(&mut usage, found);
     };
-    // ONE read and ONE parse per frame: a payload spread over several
+    // This typed extraction reads and parses one complete payload per frame: a payload spread over several
     // `data:` lines is one document joined with `\n`, so parsing each line
     // independently produced N unparseable fragments — no usage read, and
     // on a `Raw` stream the JSON source text pushed into the guardrail
@@ -2445,10 +2917,14 @@ fn stream_response(
         // caps (the SSE framing is not counted), and the raw frame bytes it
         // bounds too.
         let mut held_content = crate::held_content::HeldBuffer::default();
-        // Unscanned delta text for the CURRENT window / buffer.
-        let mut scan_buf = String::new();
-        // Overlap carried between Window scans.
-        let mut overlap_tail = String::new();
+        // The semantic delta channel stays contiguous across frames. Raw
+        // supplementary values are scanned separately so metadata cannot
+        // break a literal split over two output deltas.
+        let mut continuation_bufs: Vec<String> = Vec::new();
+        let mut supplemental_buf = String::new();
+        // Overlap carried between Window scans, one per channel.
+        let mut continuation_tails: Vec<String> = Vec::new();
+        let mut supplemental_tail = String::new();
         // Degrades BufferFull to live forwarding after a fail-open cap hit.
         let mut fail_opened = false;
         let mut blocked = false;
@@ -2493,6 +2969,8 @@ fn stream_response(
                 let (parts, usage) = frame_parts(protocol, &frame);
                 let held = parts.held();
                 let delta = parts.scan;
+                let guardrail_text = (!chain.is_empty())
+                    .then(|| stream_guardrail_text(protocol, &frame, delta.clone()));
                 if let Some(u) = usage {
                     merge_usage(&mut telemetry.usage, u);
                 }
@@ -2510,12 +2988,24 @@ fn stream_response(
                         yield Ok::<_, std::convert::Infallible>(frame);
                     }
                     StreamOutputPolicy::EndOfStreamCheck => {
-                        scan_buf.push_str(&delta);
+                        if let Some(text) = guardrail_text.as_ref() {
+                            append_stream_guardrail_text(
+                                &mut continuation_bufs,
+                                &mut supplemental_buf,
+                                text,
+                            );
+                        }
                         telemetry.mark_first_delivery();
                         yield Ok(frame);
                     }
                     StreamOutputPolicy::Window { size_chars, overlap_chars, .. } => {
-                        scan_buf.push_str(&delta);
+                        if let Some(text) = guardrail_text.as_ref() {
+                            append_stream_guardrail_text(
+                                &mut continuation_bufs,
+                                &mut supplemental_buf,
+                                text,
+                            );
+                        }
                         held_bytes += frame.len();
                         pending_held.add(frame.len());
                         pending.push(frame);
@@ -2524,10 +3014,18 @@ fn stream_response(
                         // keep-alives, usage-only) would hold frames without
                         // bound — force the scan once the held BYTES cross
                         // the cap, mirroring BufferFull's self-bound.
-                        if scan_buf.chars().count() >= *size_chars
+                        if continuation_bufs
+                            .iter()
+                            .any(|continuation| continuation.chars().count() >= *size_chars)
+                            || supplemental_buf.chars().count() >= *size_chars
                             || held_bytes > MAX_HELD_STREAM_BYTES
                         {
-                            let text = format!("{overlap_tail}{scan_buf}");
+                            let text = stream_guardrail_scan_text(
+                                &continuation_tails,
+                                &continuation_bufs,
+                                &supplemental_tail,
+                                &supplemental_buf,
+                            );
                             match scan_output(&chain, &route_name, &text, &mut telemetry).await {
                                 GuardrailVerdict::Block {
                                     reason,
@@ -2551,15 +3049,44 @@ fn stream_response(
                                     }
                                     pending_held.clear();
                                     held_bytes = 0;
-                                    let combined = format!("{overlap_tail}{scan_buf}");
-                                    overlap_tail = tail_chars(&combined, *overlap_chars);
-                                    scan_buf.clear();
+                                    if continuation_tails.len() < continuation_bufs.len() {
+                                        continuation_tails.resize(
+                                            continuation_bufs.len(),
+                                            String::new(),
+                                        );
+                                    }
+                                    for (index, continuation) in continuation_bufs.iter_mut().enumerate() {
+                                        let combined = format!(
+                                            "{}{}",
+                                            continuation_tails[index],
+                                            continuation.as_str(),
+                                        );
+                                        continuation_tails[index] =
+                                            tail_chars(&combined, *overlap_chars);
+                                        continuation.clear();
+                                    }
+                                    let combined_supplemental = if supplemental_tail.is_empty() {
+                                        supplemental_buf.clone()
+                                    } else if supplemental_buf.is_empty() {
+                                        supplemental_tail.clone()
+                                    } else {
+                                        format!("{supplemental_tail}\n{supplemental_buf}")
+                                    };
+                                    supplemental_tail =
+                                        tail_chars(&combined_supplemental, *overlap_chars);
+                                    supplemental_buf.clear();
                                 }
                             }
                         }
                     }
                     StreamOutputPolicy::BufferFull { max_buffer_bytes, on_exceeded_fail_open } => {
-                        scan_buf.push_str(&delta);
+                        if let Some(text) = guardrail_text.as_ref() {
+                            append_stream_guardrail_text(
+                                &mut continuation_bufs,
+                                &mut supplemental_buf,
+                                text,
+                            );
+                        }
                         held_content.hold(held, frame.len());
                         pending_held.add(frame.len());
                         pending.push(frame);
@@ -2599,6 +3126,8 @@ fn stream_response(
                 let (parts, usage) = frame_parts(protocol, &rest);
                 let held = parts.held();
                 let delta = parts.scan;
+                let guardrail_text = (!chain.is_empty())
+                    .then(|| stream_guardrail_text(protocol, &rest, delta.clone()));
                 if let Some(u) = usage {
                     merge_usage(&mut telemetry.usage, u);
                 }
@@ -2609,7 +3138,13 @@ fn stream_response(
                         capture_cap,
                     );
                 }
-                scan_buf.push_str(&delta);
+                if let Some(text) = guardrail_text.as_ref() {
+                    append_stream_guardrail_text(
+                        &mut continuation_bufs,
+                        &mut supplemental_buf,
+                        text,
+                    );
+                }
                 let rest = Bytes::from(rest);
                 // The tail is held like any frame, under the same cap.
                 let tripped = match &policy {
@@ -2658,7 +3193,12 @@ fn stream_response(
                     }
                 }
             }
-            let text = format!("{overlap_tail}{scan_buf}");
+            let text = stream_guardrail_scan_text(
+                &continuation_tails,
+                &continuation_bufs,
+                &supplemental_tail,
+                &supplemental_buf,
+            );
             if !chain.is_empty() && !text.is_empty() {
                 if let GuardrailVerdict::Block {
                 reason,
@@ -4068,6 +4608,11 @@ mod tests {
                 "{protocol:?} must still offer the forwarded bytes to the scan, got {text:?}",
             );
         }
+
+        let anthropic = b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"\\u0042LOCKME\"}}\n\n";
+        assert!(
+            !frame_guardrail_text(PassthroughProtocol::OpenaiChat, anthropic).contains("BLOCKME")
+        );
     }
 
     /// The `[DONE]` sentinel is not content, on either framing. A stream
@@ -4305,14 +4850,29 @@ mod tests {
             request_guardrail_text(PassthroughProtocol::OpenaiChat, not_chat),
             "x"
         );
-        // A detected envelope whose items carry no typed text ALSO degrades
-        // to every decoded JSON string value — detection must never scan
-        // less than the forwarded request carries.
-        let empty_chat = br#"{"messages":[{"role":"tool","tool_call_id":"1"}]}"#;
+        // Envelope metadata alone is not input text, but a forwarded
+        // supplementary field still is scanned.
+        let empty_chat = br#"{"messages":[{"role":"tool","tool_call_id":"1"}],"state":"fallback"}"#;
         let scanned = request_guardrail_text(PassthroughProtocol::OpenaiChat, empty_chat);
-        for text in ["tool", "1"] {
-            assert!(scanned.contains(text), "{text} missing from {scanned:?}");
-        }
+        assert!(scanned.contains("fallback"), "{scanned:?}");
+    }
+
+    #[test]
+    fn request_source_scan_keeps_opaque_media_out_of_guardrail_text() {
+        let chat = br#"{"messages":[{"role":"user","content":[{"type":"image","source":{"data":"\u0042LOCKME"}},{"type":"document","source":{"data":"\u0042LOCKME"}},{"type":"text","text":"clean"}]}]}"#;
+        let scanned = request_guardrail_text(PassthroughProtocol::OpenaiChat, chat);
+        assert!(scanned.contains("clean"), "{scanned:?}");
+        assert!(!scanned.contains("BLOCKME"), "{scanned:?}");
+
+        let responses = br#"{"input":[{"type":"message","content":[{"type":"input_image","image_url":"\u0042LOCKME"},{"type":"input_text","text":"clean"}]}]}"#;
+        let scanned = request_guardrail_text(PassthroughProtocol::OpenaiResponses, responses);
+        assert!(scanned.contains("clean"), "{scanned:?}");
+        assert!(!scanned.contains("BLOCKME"), "{scanned:?}");
+
+        let completions = br#"{"prompt":[{"type":"image","data":"\u0042LOCKME"},"clean"]}"#;
+        let scanned = request_guardrail_text(PassthroughProtocol::OpenaiCompletions, completions);
+        assert!(scanned.contains("clean"), "{scanned:?}");
+        assert!(!scanned.contains("BLOCKME"), "{scanned:?}");
     }
 
     #[test]
@@ -4354,6 +4914,195 @@ mod tests {
             response_guardrail_text(PassthroughProtocol::Raw, &deep).contains("BLOCKME"),
             "a valid deep Raw response must not fall back to escaped source"
         );
+    }
+
+    #[test]
+    fn known_request_envelopes_scan_duplicate_and_nested_source_strings() {
+        let cases = [
+            (
+                PassthroughProtocol::OpenaiChat,
+                br#"{"model":"routing-only","messages":[{"role":"user","content":"\u0069nputleakliteral"}],"messages":[{"role":"user","content":"clean","metadata":{"note":"NESTED"}}]}"#
+                    .as_slice(),
+            ),
+            (
+                PassthroughProtocol::OpenaiResponses,
+                br#"{"model":"routing-only","input":"\u0069nputleakliteral","input":"clean","metadata":{"note":"NESTED"}}"#
+                    .as_slice(),
+            ),
+            (
+                PassthroughProtocol::OpenaiCompletions,
+                br#"{"model":"routing-only","prompt":"\u0069nputleakliteral","prompt":"clean","metadata":{"note":"NESTED"}}"#
+                    .as_slice(),
+            ),
+        ];
+        for (protocol, body) in cases {
+            let scanned = request_guardrail_text(protocol, body);
+            for expected in ["inputleakliteral", "clean", "NESTED"] {
+                assert!(scanned.contains(expected), "{protocol:?}: {scanned:?}");
+            }
+            assert!(
+                !scanned.contains("routing-only"),
+                "{protocol:?}: {scanned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_redacted_thinking_is_not_request_guardrail_text() {
+        let redacted = br#"{"messages":[{"role":"assistant","content":[{"type":"redacted_thinking","data":"\u0042LOCKME","signature":"signed"},{"type":"text","text":"clean"}]}]}"#;
+        let scanned = request_guardrail_text(PassthroughProtocol::OpenaiChat, redacted);
+        assert!(scanned.contains("clean"), "{scanned:?}");
+        assert!(!scanned.contains("BLOCKME"), "{scanned:?}");
+
+        let ambiguous = br#"{"messages":[{"role":"assistant","content":[{"type":"redacted_thinking","type":"text","data":"\u0042LOCKME"}]}]}"#;
+        assert!(
+            request_guardrail_text(PassthroughProtocol::OpenaiChat, ambiguous).contains("BLOCKME")
+        );
+    }
+
+    #[test]
+    fn known_response_envelopes_scan_duplicate_and_nested_source_strings() {
+        let chat = br#"{"model":"routing-only","choices":[{"message":{"content":"\u0042LOCKME","metadata":{"note":"NESTED"}}}],"choices":[{"message":{"content":"clean"}}]}"#;
+        let scanned = response_guardrail_text(PassthroughProtocol::OpenaiChat, chat);
+        for expected in ["BLOCKME", "NESTED", "clean"] {
+            assert!(scanned.contains(expected), "{scanned:?}");
+        }
+        assert!(!scanned.contains("routing-only"), "{scanned:?}");
+
+        let responses = br#"{"output":[{"type":"message","content":[{"type":"output_text","text":"\u0042LOCKME","metadata":{"note":"NESTED"}}]}],"output":[{"type":"message","content":[{"type":"output_text","text":"clean"}]}]}"#;
+        let scanned = response_guardrail_text(PassthroughProtocol::OpenaiResponses, responses);
+        for expected in ["BLOCKME", "NESTED", "clean"] {
+            assert!(scanned.contains(expected), "{scanned:?}");
+        }
+
+        let conflicting_type = br#"{"output":[{"type":"reasoning","type":"message","content":[{"text":"\u0042LOCKME"}]}]}"#;
+        assert!(
+            response_guardrail_text(PassthroughProtocol::OpenaiResponses, conflicting_type)
+                .contains("BLOCKME")
+        );
+
+        let same_hidden_type = br#"{"output":[{"type":"reasoning","type":"reasoning","summary":[{"text":"\u0042LOCKME"}]}]}"#;
+        assert!(
+            !response_guardrail_text(PassthroughProtocol::OpenaiResponses, same_hidden_type)
+                .contains("BLOCKME")
+        );
+
+        let deep = format!(
+            r#"{{"output":[{{"type":"message","content":[{{"type":"output_text","nested":{}}}]}}]}}"#,
+            String::from_utf8(deeply_nested_escaped_block_json()).expect("valid test JSON")
+        );
+        assert!(
+            response_guardrail_text(PassthroughProtocol::OpenaiResponses, deep.as_bytes())
+                .contains("BLOCKME"),
+            "a known deep response must retain its decoded source leaf"
+        );
+    }
+
+    #[test]
+    fn generated_reasoning_stays_out_of_the_source_preserving_output_scan() {
+        let buffered = br#"{"output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"\u0042LOCKME"}]}]}"#;
+        assert!(
+            !response_guardrail_text(PassthroughProtocol::OpenaiResponses, buffered)
+                .contains("BLOCKME")
+        );
+
+        for frame in [
+            b"data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"\\u0042LOCKME\"}\n\n".as_slice(),
+            b"data: {\"type\":\"response.reasoning_text.done\",\"text\":\"\\u0042LOCKME\"}\n\n".as_slice(),
+            b"data: {\"type\":\"response.reasoning_summary_part.done\",\"part\":{\"type\":\"summary_text\",\"text\":\"\\u0042LOCKME\"}}\n\n".as_slice(),
+            b"data: {\"type\":\"response.content_part.done\",\"part\":{\"type\":\"reasoning_text\",\"text\":\"\\u0042LOCKME\"}}\n\n".as_slice(),
+            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"summary\":[{\"text\":\"\\u0042LOCKME\"}]}}\n\n".as_slice(),
+        ] {
+            assert!(
+                !frame_guardrail_text(PassthroughProtocol::OpenaiResponses, frame)
+                    .contains("BLOCKME")
+            );
+        }
+    }
+
+    #[test]
+    fn known_sse_envelopes_scan_duplicate_and_nested_source_strings() {
+        let chat = b"data: {\"choices\":[{\"delta\":{\"content\":\"\\u0042LOCKME\",\"metadata\":{\"note\":\"NESTED\"}}}],\"choices\":[{\"delta\":{\"content\":\"clean\"}}]}\n\n";
+        let scanned = frame_guardrail_text(PassthroughProtocol::OpenaiChat, chat);
+        for expected in ["BLOCKME", "NESTED", "clean"] {
+            assert!(scanned.contains(expected), "{scanned:?}");
+        }
+
+        let responses = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"\\u0042LOCKME\",\"delta\":\"clean\",\"metadata\":{\"note\":\"NESTED\"}}\n\n";
+        let scanned = frame_guardrail_text(PassthroughProtocol::OpenaiResponses, responses);
+        for expected in ["BLOCKME", "NESTED", "clean"] {
+            assert!(scanned.contains(expected), "{scanned:?}");
+        }
+
+        let conflicting = b"data: {\"type\":\"response.content_part.done\",\"part\":{\"type\":\"reasoning_text\",\"type\":\"output_text\",\"text\":\"\\u0042LOCKME\"}}\n\n";
+        assert!(
+            frame_guardrail_text(PassthroughProtocol::OpenaiResponses, conflicting)
+                .contains("BLOCKME")
+        );
+
+        let conflicting_item = b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"type\":\"message\",\"content\":[{\"text\":\"\\u0042LOCKME\"}]}}\n\n";
+        assert!(
+            frame_guardrail_text(PassthroughProtocol::OpenaiResponses, conflicting_item)
+                .contains("BLOCKME")
+        );
+        let hidden_item = b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"type\":\"reasoning\",\"summary\":[{\"text\":\"\\u0042LOCKME\"}]}}\n\n";
+        assert!(
+            !frame_guardrail_text(PassthroughProtocol::OpenaiResponses, hidden_item)
+                .contains("BLOCKME")
+        );
+
+        let conflicting_anthropic = b"data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"thinking\",\"type\":\"text\",\"text\":\"\\u0042LOCKME\"}}\n\n";
+        assert!(
+            frame_guardrail_text(PassthroughProtocol::OpenaiChat, conflicting_anthropic)
+                .contains("BLOCKME")
+        );
+        let hidden_anthropic = b"data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"thinking\",\"type\":\"thinking\",\"thinking\":\"\\u0042LOCKME\"}}\n\n";
+        assert!(
+            !frame_guardrail_text(PassthroughProtocol::OpenaiChat, hidden_anthropic)
+                .contains("BLOCKME")
+        );
+    }
+
+    #[test]
+    fn stream_guardrail_text_keeps_visible_deltas_contiguous() {
+        let first = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"one\",\"delta\":\"FOR\"}\n\n";
+        let second = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"two\",\"delta\":\"noise\",\"delta\":\"BIDDEN\"}\n\n";
+        let first_parts = frame_parts(PassthroughProtocol::OpenaiResponses, first).0;
+        let second_parts = frame_parts(PassthroughProtocol::OpenaiResponses, second).0;
+        let first = stream_guardrail_text(
+            PassthroughProtocol::OpenaiResponses,
+            first,
+            first_parts.scan,
+        );
+        let second = stream_guardrail_text(
+            PassthroughProtocol::OpenaiResponses,
+            second,
+            second_parts.scan,
+        );
+        let mut continuations = Vec::new();
+        let mut supplemental = String::new();
+        append_stream_guardrail_text(&mut continuations, &mut supplemental, &first);
+        append_stream_guardrail_text(&mut continuations, &mut supplemental, &second);
+        let scanned = stream_guardrail_scan_text(&[], &continuations, "", &supplemental);
+        assert!(scanned.starts_with("FORBIDDEN"), "{scanned:?}");
+    }
+
+    #[test]
+    fn stream_guardrail_text_excludes_unambiguous_anthropic_reasoning() {
+        let frame = b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"text\":\"BLOCKME\"}}\n\n";
+        let typed = frame_parts(PassthroughProtocol::OpenaiChat, frame).0.scan;
+        assert!(typed.contains("BLOCKME"), "{typed:?}");
+        let text = stream_guardrail_text(PassthroughProtocol::OpenaiChat, frame, typed);
+        let scanned = stream_guardrail_scan_text(&[], &text.continuations, "", &text.supplemental);
+        assert!(!scanned.contains("BLOCKME"), "{scanned:?}");
+
+        let signature = b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"signature_delta\",\"signature\":\"BLOCKME\"}}\n\n";
+        let typed = frame_parts(PassthroughProtocol::OpenaiChat, signature)
+            .0
+            .scan;
+        let text = stream_guardrail_text(PassthroughProtocol::OpenaiChat, signature, typed);
+        let scanned = stream_guardrail_scan_text(&[], &text.continuations, "", &text.supplemental);
+        assert!(!scanned.contains("BLOCKME"), "{scanned:?}");
     }
 
     #[test]
@@ -4410,9 +5159,9 @@ mod tests {
         let req = br#"{"model":"gpt-5","input":[
             {"role":"user","content":[{"type":"input_text","text":"list the files"}]}
         ]}"#;
-        assert_eq!(
-            request_guardrail_text(PassthroughProtocol::OpenaiResponses, req),
-            "list the files"
+        assert!(
+            request_guardrail_text(PassthroughProtocol::OpenaiResponses, req)
+                .contains("list the files")
         );
         // A bare-string input is equally valid.
         let req_str = br#"{"model":"gpt-5","input":"hello there"}"#;
@@ -4424,9 +5173,8 @@ mod tests {
         let resp = br#"{"output":[
             {"type":"message","content":[{"type":"output_text","text":"done"}]}
         ],"usage":{"input_tokens":11,"output_tokens":3}}"#;
-        assert_eq!(
-            response_guardrail_text(PassthroughProtocol::OpenaiResponses, resp),
-            "done"
+        assert!(
+            response_guardrail_text(PassthroughProtocol::OpenaiResponses, resp).contains("done")
         );
         assert_eq!(
             response_usage(PassthroughProtocol::OpenaiResponses, None, resp),

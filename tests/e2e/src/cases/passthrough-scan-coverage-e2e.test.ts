@@ -42,6 +42,24 @@ const deepEscapedBlockJSON = (depth: number) =>
 // provider receives it verbatim, so Raw guardrails must still decode the leaf.
 const DEEP_ESCAPED_BLOCK_JSON = deepEscapedBlockJSON(160);
 const CAP = 1_000;
+const SPLIT_BLOCK = "FORBIDDEN";
+const KNOWN_CHAT_OUTPUT = String.raw`{"model":"routing-only","choices":[{"message":{"content":"\u0042LOCKME","metadata":{"note":"${OUT_LIT}"}}}],"choices":[{"message":{"content":"clean"}}]}`;
+const KNOWN_RESPONSES_OUTPUT = String.raw`{"output":[{"type":"message","content":[{"type":"output_text","text":"\u0042LOCKME","metadata":{"note":"${OUT_LIT}"}}]}],"output":[{"type":"message","content":[{"type":"output_text","text":"clean"}]}]}`;
+const KNOWN_CHAT_STREAM = `${String.raw`data: {"choices":[{"delta":{"content":"\u0042LOCKME","metadata":{"note":"${OUT_LIT}"}}}],"choices":[{"delta":{"content":"clean"}}]}`}\n\n`;
+const KNOWN_RESPONSES_STREAM = `${String.raw`data: {"type":"response.output_text.delta","delta":"\u0042LOCKME","delta":"clean","metadata":{"note":"${OUT_LIT}"}}`}\n\n`;
+const SPLIT_RESPONSES_STREAM = [
+  `data: {"type":"response.output_text.delta","item_id":"first","delta":"FOR"}\n\n`,
+  `data: {"type":"response.output_text.delta","item_id":"second","delta":"noise","delta":"BIDDEN"}\n\n`,
+  "data: [DONE]\n\n",
+];
+const RESPONSES_REASONING_STREAM = [
+  `data: ${JSON.stringify({ type: "response.reasoning_text.done", text: OUT_LIT })}\n\n`,
+  `data: ${JSON.stringify({ type: "response.content_part.done", part: { type: "reasoning_text", text: OUT_LIT } })}\n\n`,
+  `data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "reasoning", summary: [{ type: "summary_text", text: OUT_LIT }] } })}\n\n`,
+  `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "clean" })}\n\n`,
+  `data: ${JSON.stringify({ type: "response.completed", response: { output: [{ type: "reasoning", summary: [{ type: "summary_text", text: OUT_LIT }] }, { type: "message", content: [{ type: "output_text", text: "clean" }] }] } })}\n\n`,
+  "data: [DONE]\n\n",
+];
 
 const anthropicEvents = (blocks: Array<Record<string, unknown>>) => [
   JSON.stringify({
@@ -131,6 +149,26 @@ describe("passthrough guardrail scan coverage", () => {
     upstreams["raw-safe-stream"] = await startOpenAiUpstream({
       rawStreamFrames: [`data: ${SAFE_ESCAPED_JSON}\n\n`],
     });
+    upstreams["known-chat-buffered-output"] = await startOpenAiUpstream({
+      rawBody: KNOWN_CHAT_OUTPUT,
+      rawContentType: "application/json",
+    });
+    upstreams["known-responses-buffered-output"] = await startOpenAiUpstream({
+      rawBody: KNOWN_RESPONSES_OUTPUT,
+      rawContentType: "application/json",
+    });
+    upstreams["known-chat-stream-output"] = await startOpenAiUpstream({
+      rawStreamFrames: [KNOWN_CHAT_STREAM],
+    });
+    upstreams["known-responses-stream-output"] = await startOpenAiUpstream({
+      rawStreamFrames: [KNOWN_RESPONSES_STREAM],
+    });
+    upstreams["split-responses-stream-output"] = await startOpenAiUpstream({
+      rawStreamFrames: SPLIT_RESPONSES_STREAM,
+    });
+    upstreams["known-responses-reasoning-stream"] = await startOpenAiUpstream({
+      rawStreamFrames: RESPONSES_REASONING_STREAM,
+    });
     const pk = await seed.createProviderKey({
       display_name: "pt-scan-pk",
       secret: "sk-mock",
@@ -152,6 +190,7 @@ describe("passthrough guardrail scan coverage", () => {
       patterns: [
         { kind: "literal", value: OUT_LIT },
         { kind: "literal", value: ESCAPED_BLOCK },
+        { kind: "literal", value: SPLIT_BLOCK },
       ],
     });
     await seed.createGuardrail({
@@ -236,6 +275,90 @@ describe("passthrough guardrail scan coverage", () => {
     expect(body).not.toContain("event: error");
     expect(body).toContain("visible answer");
   });
+  test.for([
+    [
+      "chat",
+      "known-chat-buffered-output",
+      `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"go"}]}`,
+    ],
+    [
+      "Responses",
+      "known-responses-buffered-output",
+      `{"model":"gpt-4o-mini","input":"go"}`,
+    ],
+  ] as const)("output: known %s envelope is source-scanned when buffered", async ([, route, body], ctx) => {
+    if (!ready(ctx)) return;
+    const upstream = upstreams[route];
+    if (!upstream) throw new Error(`missing ${route} upstream`);
+    const before = upstream.receivedRequests.length;
+    const res = await callRaw(route, "/v1/any", body);
+    expect(res.status).toBe(422);
+    const response = await res.text();
+    expect(response).toContain("pt-scan-output");
+    expect(response).not.toContain(ESCAPED_BLOCK);
+    expect(response).not.toContain(String.raw`\u0042LOCKME`);
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+  });
+
+  test.for([
+    [
+      "chat",
+      "known-chat-stream-output",
+      `{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"go"}]}`,
+    ],
+    [
+      "Responses",
+      "known-responses-stream-output",
+      `{"model":"gpt-4o-mini","stream":true,"input":"go"}`,
+    ],
+  ] as const)("output: known %s envelope is source-scanned when streamed", async ([, route, body], ctx) => {
+    if (!ready(ctx)) return;
+    const upstream = upstreams[route];
+    if (!upstream) throw new Error(`missing ${route} upstream`);
+    const before = upstream.receivedRequests.length;
+    const res = await callRaw(route, "/v1/any", body);
+    expect(res.status).toBe(200);
+    const response = await res.text();
+    expect(response).toContain("event: error");
+    expect(response).toContain("content_filter");
+    expect(response).not.toContain(ESCAPED_BLOCK);
+    expect(response).not.toContain(String.raw`\u0042LOCKME`);
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("output: visible deltas remain contiguous across stream metadata", async (ctx) => {
+    if (!ready(ctx)) return;
+    const route = "split-responses-stream-output";
+    const upstream = upstreams[route];
+    if (!upstream) throw new Error(`missing ${route} upstream`);
+    const before = upstream.receivedRequests.length;
+    const res = await callRaw(route, "/v1/any", `{"model":"gpt-4o-mini","stream":true,"input":"go"}`);
+    expect(res.status).toBe(200);
+    const response = await res.text();
+    expect(response).toContain("event: error");
+    expect(response).toContain("content_filter");
+    expect(response).not.toContain(SPLIT_BLOCK);
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("output: generated Responses reasoning frames stay out of scope", async (ctx) => {
+    if (!ready(ctx)) return;
+    const route = "known-responses-reasoning-stream";
+    const upstream = upstreams[route];
+    if (!upstream) throw new Error(`missing ${route} upstream`);
+    const before = upstream.receivedRequests.length;
+    const res = await callRaw(
+      route,
+      "/v1/any",
+      `{"model":"gpt-4o-mini","stream":true,"input":"go"}`,
+    );
+    expect(res.status).toBe(200);
+    const response = await res.text();
+    expect(response).not.toContain("event: error");
+    expect(response).toContain(OUT_LIT);
+    expect(response).toContain("clean");
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+  });
 
   test("hold-back cap: frames over the cap, content under it, is released", async (ctx) => {
     if (!ready(ctx)) return;
@@ -314,6 +437,23 @@ describe("passthrough guardrail scan coverage", () => {
     if (!ready(ctx)) return;
     const before = upstreams.input!.receivedRequests.length;
     const body = String.raw`{"messages":[{"role":"user","content":"clean"}],"state":{"query":"${IN_LIT}"},"state":"clean"}`;
+    const res = await callRaw("input", "/v1/any", body);
+    expect(res.status).toBe(422);
+    expect(await res.text()).toContain("pt-scan-input");
+    expect(upstreams.input!.receivedRequests.length).toBe(before);
+  });
+  test.for([
+    [
+      "duplicate chat messages",
+      String.raw`{"model":"gpt-4o-mini","messages":[{"role":"user","content":"\u0069nputleakliteral","metadata":{"note":"${IN_LIT}"}}],"messages":[{"role":"user","content":"clean"}]}`,
+    ],
+    [
+      "duplicate Responses input",
+      String.raw`{"model":"gpt-4o-mini","input":"\u0069nputleakliteral","input":"clean","metadata":{"note":"${IN_LIT}"}}`,
+    ],
+  ] as const)("input: known envelope %s is source-scanned", async ([, body], ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams.input!.receivedRequests.length;
     const res = await callRaw("input", "/v1/any", body);
     expect(res.status).toBe(422);
     expect(await res.text()).toContain("pt-scan-input");

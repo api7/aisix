@@ -48,7 +48,7 @@ http-body-util.workspace = true
 bytes.workspace = true
 regex.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 # Token-estimation fallback for usage telemetry (token_estimate.rs).
 tiktoken-rs.workspace = true
 futures.workspace = true

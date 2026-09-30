@@ -237,15 +237,48 @@ pub fn rewrite_string_values(
 /// container-recursion limit. Object keys are decoded only to maintain the
 /// scanner's structure and are never included in the returned text.
 pub fn collect_string_values(input: &[u8]) -> Result<String, SpliceError> {
+    collect_string_values_where(input, |_| true)
+}
+
+/// Decode and collect selected JSON string **values** in source order.
+///
+/// Like [`collect_string_values`], this preserves duplicate keys and stays
+/// stack-safe for deeply nested documents. The predicate sees the decoded
+/// path of each string value, never an object key.
+pub fn collect_string_values_where(
+    input: &[u8],
+    mut include: impl FnMut(&[PathSeg]) -> bool,
+) -> Result<String, SpliceError> {
     let mut out = String::new();
     rewrite_string_values(
         input,
-        |_| true,
+        |path| include(path),
         |value| {
             if !out.is_empty() {
                 out.push('\n');
             }
             out.push_str(value);
+            None
+        },
+    )?;
+    Ok(out)
+}
+
+/// Decode selected JSON string values as separate source-order entries.
+///
+/// Stream guardrails use this form to keep separate repeated carrier fields
+/// in independent continuation channels rather than inserting separators
+/// into a literal split across frames.
+pub fn collect_string_values_where_vec(
+    input: &[u8],
+    mut include: impl FnMut(&[PathSeg]) -> bool,
+) -> Result<Vec<String>, SpliceError> {
+    let mut out = Vec::new();
+    rewrite_string_values(
+        input,
+        |path| include(path),
+        |value| {
+            out.push(value.to_string());
             None
         },
     )?;
@@ -338,6 +371,30 @@ mod tests {
         doc.push_str(&"}".repeat(depth));
 
         assert_eq!(collect_string_values(doc.as_bytes()).unwrap(), "BLOCKME");
+    }
+
+    #[test]
+    fn collects_selected_paths_with_duplicate_keys_and_nested_values() {
+        let doc = r#"{"model":"routing-only","messages":[{"content":"first","metadata":{"note":"nested"}}],"messages":[{"content":"second"}]}"#;
+        assert_eq!(
+            collect_string_values_where(doc.as_bytes(), |path| {
+                !path.first().is_some_and(|segment| segment.is_key("model"))
+            })
+            .unwrap(),
+            "first\nnested\nsecond"
+        );
+    }
+
+    #[test]
+    fn collects_selected_values_as_separate_source_ordered_entries() {
+        let doc = r#"{"type":"response.output_text.delta","delta":"FOR","delta":"ok"}"#;
+        assert_eq!(
+            collect_string_values_where_vec(doc.as_bytes(), |path| {
+                path.first().is_some_and(|segment| segment.is_key("delta"))
+            })
+            .unwrap(),
+            vec!["FOR", "ok"]
+        );
     }
 
     #[test]
