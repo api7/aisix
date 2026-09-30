@@ -2028,7 +2028,9 @@ async fn attribute_batch_usage(
     }
     let body = resp.bytes().await.map_err(|e| e.to_string())?;
 
-    // Aggregate per provider-billed model (`response.body.model`).
+    // Keep the provider-reported model only as diagnostic version data.
+    // A batch completion has no persisted per-line dispatch identity, so an
+    // upstream response field must not select a wildcard catalog price.
     #[derive(Default)]
     struct Agg {
         prompt: u64,
@@ -2529,11 +2531,18 @@ mod tests {
 
         let snap = AisixSnapshot::new();
         snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
-        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        let wildcard: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "jobs/*",
+            "provider": "openai",
+            "model_name": "*",
+            "provider_key_id": PK_A,
+        }))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-a", wildcard, 1));
         snap.apikeys.insert(apikey_entry(&["*"]));
         let (app, mut rx) = build_app_with_sink(snap);
 
-        let encoded = encode_routed_id("batch_1", "jobs-a");
+        let encoded = encode_routed_id("batch_1", "jobs/*");
         let mk_req = || {
             Request::builder()
                 .method("GET")
@@ -2550,7 +2559,7 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             decode_routed_id(v["output_file_id"].as_str().unwrap()),
-            Some(("file-out".to_string(), "jobs-a".to_string()))
+            Some(("file-out".to_string(), "jobs/*".to_string()))
         );
 
         // Two events expected: the zero-token management event plus ONE
@@ -2585,7 +2594,11 @@ mod tests {
         assert_eq!(agg.completion_tokens, 8);
         assert_eq!(agg.cached_prompt_tokens, 2);
         assert_eq!(agg.provider_model_version, "gpt-4o-2024-08-06");
-        assert_eq!(agg.requested_model, "jobs-a");
+        assert_eq!(agg.requested_model, "jobs/*");
+        assert!(
+            agg.resolved_pricing_model.is_empty(),
+            "an upstream batch output model must not select wildcard pricing"
+        );
 
         // Second retrieve: management event only — the attribution is
         // process-deduped.

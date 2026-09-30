@@ -439,6 +439,53 @@ pub(crate) fn metric_model_label_pair<'a>(
     }
 }
 
+/// The actual upstream model name a wildcard upstream template resolved for
+/// this request, if that row still exists in the same snapshot as the emitted
+/// event.
+///
+/// `model_id` deliberately stays on the configured row: rate limits,
+/// policy, and historical attribution all key on it. Pricing is the one
+/// consumer that needs the concrete provider model name, and only a row whose
+/// configured `model_name` is a template may use it. A wildcard display alias
+/// over one fixed upstream still prices by that fixed configuration. The name
+/// comes from request-local dispatch attribution, never from the
+/// caller-controlled `requested_model` or an upstream response field.
+pub(crate) fn wildcard_resolved_pricing_model<'a>(
+    snap: &AisixSnapshot,
+    model_id: &str,
+    upstream_model: &'a str,
+) -> Option<&'a str> {
+    if upstream_model.is_empty() {
+        return None;
+    }
+    let entry = snap.models.get_by_id(model_id)?;
+    let model = &entry.value;
+    model
+        .model_name
+        .as_deref()
+        .is_some_and(|name| name.contains('*'))
+        .then_some(upstream_model)
+}
+
+/// Fill the optional DP-to-CP wildcard-pricing identity at the one usage
+/// emission chokepoint. A cache hit has no dispatched target; its
+/// `upstream_model` is the cached entry's static mapping, not a concrete
+/// pricing identity. Detached gateway work has no caller attribution and
+/// therefore cannot accidentally price itself as the parent request.
+fn apply_wildcard_pricing_model(snap: &AisixSnapshot, event: &mut UsageEvent) {
+    let Some(resolved) = crate::attribution::current() else {
+        return;
+    };
+    if resolved.cache_hit_layer.is_some() {
+        return;
+    }
+    if let Some(model) =
+        wildcard_resolved_pricing_model(snap, &event.model_id, &resolved.upstream_model)
+    {
+        event.resolved_pricing_model = model.to_string();
+    }
+}
+
 /// Stamp the five per-PK attribution fields onto an in-progress UsageEvent,
 /// sanitising the operator-controlled tag strings (control-char strip + length
 /// cap) before they hit the wire. One source of truth for the mapping so the
@@ -958,6 +1005,7 @@ pub(crate) fn emit_usage(
     if terminal && event.guardrail_blocked {
         state.metrics.record_guardrail_blocked_request();
     }
+    apply_wildcard_pricing_model(snap, &mut event);
     let emission = trace.map(|bundle| {
         event.trace_id = bundle.trace_id_hex();
         bundle.emission(
@@ -1038,6 +1086,123 @@ mod tests {
         }
         let (m, u) = metric_model_label_pair(&snap, "no-such/model", "raw-upstream");
         assert_eq!((m.as_ref(), u.as_ref()), ("no-such/model", "raw-upstream"));
+    }
+
+    #[test]
+    fn wildcard_pricing_model_uses_only_the_configured_wildcard_row() {
+        use aisix_core::resource::ResourceEntry;
+        use aisix_core::snapshot::ResourceTable;
+
+        let table = ResourceTable::default();
+        let wildcard: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "openrouter/*",
+            "provider": "openai",
+            "model_name": "*",
+            "provider_key_id": "pk-1",
+        }))
+        .unwrap();
+        let exact: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "exact-model",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+        }))
+        .unwrap();
+        let wildcard_alias_fixed_upstream: aisix_core::Model =
+            serde_json::from_value(serde_json::json!({
+                "display_name": "fixed/*",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "pk-1",
+            }))
+            .unwrap();
+        table.insert(ResourceEntry::new("wildcard", wildcard, 1));
+        table.insert(ResourceEntry::new("exact", exact, 1));
+        table.insert(ResourceEntry::new(
+            "fixed",
+            wildcard_alias_fixed_upstream,
+            1,
+        ));
+        let snap = AisixSnapshot {
+            models: table,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            wildcard_resolved_pricing_model(&snap, "wildcard", "gpt-4o-2024-08-06"),
+            Some("gpt-4o-2024-08-06")
+        );
+        assert_eq!(
+            wildcard_resolved_pricing_model(&snap, "exact", "forged-price-name"),
+            None
+        );
+        assert_eq!(
+            wildcard_resolved_pricing_model(&snap, "fixed", "forged-price-name"),
+            None
+        );
+        assert_eq!(wildcard_resolved_pricing_model(&snap, "wildcard", ""), None);
+    }
+
+    #[tokio::test]
+    async fn request_attribution_stamps_only_concrete_wildcard_pricing_models() {
+        use aisix_core::resource::ResourceEntry;
+        use aisix_core::snapshot::ResourceTable;
+
+        let table = ResourceTable::default();
+        let configured: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "openrouter/*",
+            "provider": "openai",
+            "model_name": "*",
+            "provider_key_id": "pk-1",
+        }))
+        .unwrap();
+        let cache_entry = configured.clone();
+        table.insert(ResourceEntry::new("wildcard", configured, 1));
+        let snap = AisixSnapshot {
+            models: table,
+            ..Default::default()
+        };
+        let served: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "openrouter/*",
+            "provider": "openai",
+            "model_name": "gpt-4o-2024-08-06",
+            "provider_key_id": "pk-1",
+        }))
+        .unwrap();
+
+        crate::attribution::scope(
+            Arc::new(crate::attribution::RequestAttribution::default()),
+            async {
+                crate::attribution::note_target(&served, "pk-1");
+                let mut event = UsageEvent {
+                    // NO-GUARDRAIL-CHAIN: this focused unit test constructs
+                    // a synthetic pricing event, not a gateway request.
+                    model_id: "wildcard".to_string(),
+                    guardrail_bypassed_reason: String::new(),
+                    applied_guardrails: Vec::new(),
+                    ..Default::default()
+                };
+                apply_wildcard_pricing_model(&snap, &mut event);
+                assert_eq!(event.resolved_pricing_model, "gpt-4o-2024-08-06");
+
+                crate::attribution::note_cache_hit_entry(&cache_entry, "exact");
+                let cached_attribution =
+                    crate::attribution::current().expect("in request attribution scope");
+                assert_eq!(cached_attribution.cache_hit_layer, Some("exact"));
+                assert_eq!(cached_attribution.upstream_model, "*");
+                let mut cached_event = UsageEvent {
+                    // NO-GUARDRAIL-CHAIN: this focused unit test constructs
+                    // a synthetic pricing event, not a gateway request.
+                    model_id: "wildcard".to_string(),
+                    guardrail_bypassed_reason: String::new(),
+                    applied_guardrails: Vec::new(),
+                    ..Default::default()
+                };
+                apply_wildcard_pricing_model(&snap, &mut cached_event);
+                assert!(cached_event.resolved_pricing_model.is_empty());
+            },
+        )
+        .await;
     }
 
     /// AISIX-Cloud#1289: the id is upstream-controlled and reaches a log line

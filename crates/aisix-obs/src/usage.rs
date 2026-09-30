@@ -112,6 +112,17 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub requested_model: String,
 
+    /// Concrete upstream model selected through a wildcard upstream template.
+    ///
+    /// `model_id` remains the configured wildcard row so policy and
+    /// attribution remain stable, while this value is the provider model name
+    /// that was actually dispatched. The control plane uses it only when the
+    /// configured row's `model_name` contains `*`, to look up its catalog
+    /// price; it is otherwise absent so an alias over a fixed upstream can
+    /// never override its configured pricing identity through telemetry.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resolved_pricing_model: String,
+
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
 
@@ -1596,6 +1607,7 @@ mod tests {
             model_id: "mod-uuid".into(),
             api_key_id: "ak-uuid".into(),
             requested_model: "smart-group".into(),
+            resolved_pricing_model: "gpt-4o-2024-08-06".into(),
             prompt_tokens: 12,
             completion_tokens: 34,
             upstream_latency_ms: 56,
@@ -1610,6 +1622,7 @@ mod tests {
         // AISIX-Cloud#790: the client-sent alias rides next to model_id
         // so the dashboard can show the group a routed request used.
         assert!(json.contains(r#""requested_model":"smart-group""#));
+        assert!(json.contains(r#""resolved_pricing_model":"gpt-4o-2024-08-06""#));
         assert!(json.contains(r#""prompt_tokens":12"#));
         assert!(json.contains(r#""completion_tokens":34"#));
         assert!(json.contains(r#""guardrail_blocked":false"#));
