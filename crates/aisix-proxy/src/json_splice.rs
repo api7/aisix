@@ -419,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn depth_cap_errors() {
+    fn deep_nesting_is_stack_safe() {
         let mut doc = String::new();
         for _ in 0..300 {
             doc.push('[');
@@ -427,6 +427,8 @@ mod tests {
         for _ in 0..300 {
             doc.push(']');
         }
-        assert!(rewrite_string_values(doc.as_bytes(), |_| true, |_| None).is_err());
+        assert!(rewrite_string_values(doc.as_bytes(), |_| true, |_| None)
+            .expect("valid deep JSON")
+            .is_none());
     }
 }

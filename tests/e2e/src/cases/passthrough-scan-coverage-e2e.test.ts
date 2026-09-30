@@ -416,12 +416,21 @@ describe("passthrough guardrail scan coverage", () => {
       content_mode: "full",
       content_max_bytes: 4_096,
     });
-    const proxy = new ProxyClient(app!.proxyUrl, CALLER);
-    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
-
-    const completionFor = async (route: string) => {
-      const deadline = Date.now() + 10_000;
+    const requestUntilCaptured = async (route: string, expectedBody: string) => {
+      // A healthy `/v1/models` reply proves only caller authentication. It
+      // does not prove this newly added exporter has reached the snapshot, so
+      // retry the real route until its real completion reaches the OTLP
+      // receiver. Each attempt must still preserve the exact client bytes.
+      const deadline = Date.now() + 30_000;
+      let last = "no response";
       while (Date.now() < deadline) {
+        const response = await callRaw(route, "/v1/any", SAFE_ESCAPED_JSON);
+        const body = await response.text();
+        last = `${response.status}: ${body}`;
+        if (response.status !== 200 || body !== expectedBody) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          continue;
+        }
         const span = otlp.spans.find(
           (candidate) =>
             candidate.attributes["aisix.passthrough.route_name"] === `pt-scan-${route}` &&
@@ -430,18 +439,11 @@ describe("passthrough guardrail scan coverage", () => {
         if (span) return span;
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
-      throw new Error(`no raw-source OTLP completion for ${route}`);
+      throw new Error(`no raw-source OTLP completion for ${route}; last response ${last}`);
     };
 
-    const buffered = await callRaw("raw-safe-output", "/v1/any", SAFE_ESCAPED_JSON);
-    expect(buffered.status).toBe(200);
-    expect(await buffered.text()).toBe(SAFE_ESCAPED_JSON);
-    await completionFor("raw-safe-output");
-
-    const streamed = await callRaw("raw-safe-stream", "/v1/any", SAFE_ESCAPED_JSON);
-    expect(streamed.status).toBe(200);
-    expect(await streamed.text()).toBe(`data: ${SAFE_ESCAPED_JSON}\n\n`);
-    await completionFor("raw-safe-stream");
+    await requestUntilCaptured("raw-safe-output", SAFE_ESCAPED_JSON);
+    await requestUntilCaptured("raw-safe-stream", `data: ${SAFE_ESCAPED_JSON}\n\n`);
     expect(otlp.parseFailures).toEqual([]);
   });
 

@@ -3,7 +3,6 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { harnessRequest } from "../harness/http.js";
 import {
   EtcdClient,
-  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -597,15 +596,22 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
       return;
     }
 
+    const streamEvents = [
+      JSON.stringify({ choices: [{ delta: { content: "hel" } }] }),
+      JSON.stringify({ choices: [{ delta: { content: "lo" } }] }),
+      JSON.stringify({
+        choices: [],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      "[DONE]",
+    ];
     const upstream = await startOpenAiUpstream({
-      streamEvents: [
-        JSON.stringify({ choices: [{ delta: { content: "hel" } }] }),
-        JSON.stringify({ choices: [{ delta: { content: "lo" } }] }),
-        JSON.stringify({
-          choices: [],
-          usage: { prompt_tokens: 5, completion_tokens: 2 },
-        }),
-        "[DONE]",
+      // The propagation probe below reaches the same passthrough route but
+      // receives this complete unary response, leaving the first stream for
+      // the journey asserted by the test.
+      scriptedResponses: [
+        { nonStreamBody: { ready: true } },
+        { streamEvents },
       ],
     });
     upstreams.push(upstream);
@@ -637,9 +643,18 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
         }),
       });
 
-    // Readiness must not exercise the streaming journey this test asserts.
-    const readiness = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
-    await waitConfigPropagation(async () => (await readiness.listModels()).status === 200);
+    await waitConfigPropagation(async () => {
+      try {
+        const probe = await call();
+        const ready =
+          probe.status === 200 &&
+          !(probe.headers.get("content-type") ?? "").includes("text/event-stream");
+        await probe.text();
+        return ready;
+      } catch {
+        return false;
+      }
+    });
 
     const res = await call();
     expect(res.status).toBe(200);
@@ -666,10 +681,11 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
       "[DONE]",
     ];
     const upstream = await startOpenAiUpstream({
-      // The propagation probe does not reach this upstream. The first real
-      // stream stalls until the client cancels it. The second ends naturally,
-      // so this test covers both lifetime boundaries of the same reservation.
       scriptedResponses: [
+        // A complete probe establishes propagation on this route without
+        // retaining a streaming concurrency slot. The first real stream
+        // then stalls until the client cancels it; the second ends naturally.
+        { nonStreamBody: { ready: true } },
         { streamEvents, firstEventDelayMs: 10_000 },
         { streamEvents, firstEventDelayMs: 25, eventDelayMs: 25 },
         { streamEvents },
@@ -688,9 +704,9 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
       target_url: upstream.baseUrl,
       provider_key_id: pk.id,
     });
-    // Write the constrained principal last. A successful authenticated
-    // readiness probe proves the preceding route has reached the same
-    // snapshot without spending its concurrency slot.
+    // Write the constrained principal last. A completed unary probe proves
+    // the preceding route has reached the same snapshot and released its
+    // slot before this test starts the first real stream.
     await seed.createApiKey({
       key_hash: STREAM_LIMITED_KEY_HASH,
       allowed_models: ["*"],
@@ -713,8 +729,18 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
         }),
       });
 
-    const readiness = new ProxyClient(app.proxyUrl, STREAM_LIMITED_PLAINTEXT);
-    await waitConfigPropagation(async () => (await readiness.listModels()).status === 200);
+    await waitConfigPropagation(async () => {
+      try {
+        const probe = await call();
+        const ready =
+          probe.status === 200 &&
+          !(probe.headers.get("content-type") ?? "").includes("text/event-stream");
+        await probe.text();
+        return ready;
+      } catch {
+        return false;
+      }
+    });
 
     // Fetch resolves as soon as the upstream headers are relayed. Keep this
     // body unread while issuing the second request: it is the real caller
@@ -722,7 +748,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     const first = await call();
     expect(first.status).toBe(200);
     const upstreamCallsWhileStreaming = upstream.receivedRequests.length;
-    expect(upstreamCallsWhileStreaming).toBe(1);
+    expect(upstreamCallsWhileStreaming).toBe(2);
 
     const second = await call();
     expect(second.status).toBe(429);

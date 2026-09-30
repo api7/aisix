@@ -1548,7 +1548,7 @@ fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String 
                 .filter(|t| !t.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n"),
-            &["system", "messages"],
+            &["model", "system", "messages"],
         ),
         // Responses API: `input` is either a bare string or an array of
         // items, read exactly as the typed route reads them
@@ -1569,7 +1569,7 @@ fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String 
                     .join("\n"),
                 _ => String::new(),
             },
-            &["input"],
+            &["model", "input"],
         ),
         PassthroughProtocol::OpenaiCompletions => {
             let prompt = v.get("prompt").map(|p| match p {
@@ -1588,7 +1588,7 @@ fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String 
                 }
                 out.push_str(s);
             }
-            (out, &["prompt", "suffix"])
+            (out, &["model", "prompt", "suffix"])
         }
     };
     if extracted.is_empty() {
@@ -2247,13 +2247,19 @@ fn frame_parts(
             break 'payload;
         }
         if matches!(protocol, PassthroughProtocol::Raw) {
-            // Raw payloads have no typed content/usage envelope to extract.
+            // Raw payloads have no typed content envelope to extract.
             // Scan them with the iterative value walker before touching
             // serde_json::Value: its default recursion limit would otherwise
             // turn a valid deeply nested escaped string into raw source text
             // and let it bypass an output guardrail.
-            if usage_labelled {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                // An explicit `usage` object is self-describing even for an
+                // opaque stream. A server-labelled event additionally
+                // permits the flat agent-backend usage shape below.
+                if let Some(u) = v.get("usage").and_then(usage_of) {
+                    merge(u);
+                }
+                if usage_labelled {
                     if let Some(u) = usage_of(&v) {
                         merge(u);
                     }
@@ -3988,10 +3994,7 @@ mod tests {
         // parses — never the raw JSON source, which is what a per-line read
         // fell back to for each fragment.
         let (text, _) = frame_delta(PassthroughProtocol::Raw, frame);
-        assert_eq!(
-            text,
-            "{\"type\":\"message_delta\",\n\"usage\":{\"output_tokens\":7,\"input_tokens\":12}}",
-        );
+        assert_eq!(text, "message_delta");
     }
 
     /// Framing varies per ENDPOINT, not per vendor: on one host
