@@ -42,6 +42,8 @@ const EMBED_MODEL = "seu-1747-embed";
 const ROUTER_MODEL = "seu-1747-router";
 const ROUTE_TARGET = "seu-1747-route-target";
 const ROUTE_DEFAULT = "seu-1747-route-default";
+const STREAM_ROUTER_MODEL = "seu-1747-router-stream";
+const STREAM_ROUTE_TARGET = "seu-1747-route-target-stream";
 const GUARDRAIL_MODEL = "seu-1747-guardrail-chat";
 const GUARDRAIL_OVERFLOW_MODEL = "seu-1747-guardrail-overflow-chat";
 const CACHE_MODEL = "seu-1747-cache-chat";
@@ -55,6 +57,44 @@ const GUARDRAIL_OVERFLOW_COUNT = 33;
 
 const ROUTE_EXAMPLE = "route-topic prototype";
 const ROUTE_PROMPT = "route-topic caller question";
+const STREAM_RESPONSE_TEXT = "streamed semantic route answer";
+const STREAM_USAGE = {
+  prompt_tokens: 13,
+  completion_tokens: 5,
+  total_tokens: 18,
+};
+const STREAM_EVENTS = [
+  JSON.stringify({
+    id: "cmpl-semantic-embedding-stream",
+    object: "chat.completion.chunk",
+    created: 1_700_000_000,
+    model: "gpt-4o-mini",
+    choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+  }),
+  JSON.stringify({
+    id: "cmpl-semantic-embedding-stream",
+    object: "chat.completion.chunk",
+    created: 1_700_000_000,
+    model: "gpt-4o-mini",
+    choices: [{ index: 0, delta: { content: STREAM_RESPONSE_TEXT }, finish_reason: null }],
+  }),
+  JSON.stringify({
+    id: "cmpl-semantic-embedding-stream",
+    object: "chat.completion.chunk",
+    created: 1_700_000_000,
+    model: "gpt-4o-mini",
+    choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+  }),
+  JSON.stringify({
+    id: "cmpl-semantic-embedding-stream",
+    object: "chat.completion.chunk",
+    created: 1_700_000_000,
+    model: "gpt-4o-mini",
+    choices: [],
+    usage: STREAM_USAGE,
+  }),
+  "[DONE]",
+];
 const GUARDRAIL_EXAMPLES = [
   "guardrail-prototype-first",
   "guardrail-prototype-second",
@@ -226,11 +266,13 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
   let sls: MockSls | undefined;
   let embed: EmbeddingMock | undefined;
   let upstream: OpenAiUpstream | undefined;
+  let streamUpstream: OpenAiUpstream | undefined;
   let etcdReachable = false;
   let embeddingModelID = "";
   let unavailableUsageEmbeddingModelID = "";
   let cancelledEmbeddingModelID = "";
   let routeTargetModelID = "";
+  let streamRouteTargetModelID = "";
   let guardrailModelID = "";
   let overflowGuardrailModelID = "";
   let cacheModelID = "";
@@ -305,6 +347,10 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
         usage: { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 },
       },
     });
+    streamUpstream = await startOpenAiUpstream({
+      eventDelayMs: 2,
+      streamEvents: STREAM_EVENTS,
+    });
     app = await spawnApp({
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
@@ -359,6 +405,11 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
       secret: "sk-chat-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
+    const streamChatKey = await seed.createProviderKey({
+      display_name: "semantic-embedding-usage-stream-chat-pk",
+      secret: "sk-stream-chat-mock",
+      api_base: `${streamUpstream.baseUrl}/v1`,
+    });
     const createChatModel = (displayName: string) =>
       seed.createModel({
         display_name: displayName,
@@ -369,6 +420,13 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
 
     const routeTarget = await createChatModel(ROUTE_TARGET);
     routeTargetModelID = routeTarget.id;
+    const streamRouteTarget = await seed.createModel({
+      display_name: STREAM_ROUTE_TARGET,
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: streamChatKey.id,
+    });
+    streamRouteTargetModelID = streamRouteTarget.id;
     await createChatModel(ROUTE_DEFAULT);
     const guardrailModel = await createChatModel(GUARDRAIL_MODEL);
     guardrailModelID = guardrailModel.id;
@@ -385,6 +443,22 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
           {
             name: "route-topic",
             target: ROUTE_TARGET,
+            examples: [ROUTE_EXAMPLE],
+            threshold: 0.9,
+          },
+        ],
+        default: ROUTE_DEFAULT,
+        match: { threshold: 0.9 },
+      },
+    });
+    await seed.createModel({
+      display_name: STREAM_ROUTER_MODEL,
+      semantic: {
+        embedding_model: EMBED_MODEL,
+        routes: [
+          {
+            name: "route-topic",
+            target: STREAM_ROUTE_TARGET,
             examples: [ROUTE_EXAMPLE],
             threshold: 0.9,
           },
@@ -484,6 +558,7 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
+    await streamUpstream?.close();
     await embed?.close();
     await sls?.close();
   });
@@ -512,6 +587,68 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     // parent event's pricing and attempt attribution.
     expect(row.get("model_id")).toBe(routeTargetModelID);
     expect(row.get("attempt_model")).toBe(ROUTE_TARGET);
+    expect(row.get("attempt_model")).not.toBe(EMBED_MODEL);
+  });
+
+  test("a streamed semantic route keeps its terminal child audit on one parent", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !embed || !streamUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    const embeddingCallsBefore = embed.callCount();
+    const upstreamCallsBefore = streamUpstream.receivedRequests.length;
+    const response = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+      },
+      body: JSON.stringify({
+        model: STREAM_ROUTER_MODEL,
+        messages: [{ role: "user", content: ROUTE_PROMPT }],
+        stream: true,
+      }),
+    });
+    const streamBody = await response.text();
+    const requestId = response.headers.get("x-aisix-request-id") ?? "";
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    expect(response.headers.get("x-aisix-route")).toBe("route-topic");
+    expect(response.headers.get("x-aisix-served-by")).toBe(STREAM_ROUTE_TARGET);
+    expect(streamBody).toContain(STREAM_RESPONSE_TEXT);
+    expect(streamBody).toContain("data: [DONE]");
+    expect(requestId, "the DP stamps the streamed parent request id").not.toBe("");
+    expect(embed.callCount()).toBe(embeddingCallsBefore + 1);
+
+    // This proves the real DP streamed from the dedicated upstream rather
+    // than merely turning a buffered semantic response into SSE locally.
+    expect(streamUpstream.receivedRequests).toHaveLength(upstreamCallsBefore + 1);
+    const upstreamRequest = streamUpstream.receivedRequests.at(-1)!;
+    expect(upstreamRequest.path).toBe("/v1/chat/completions");
+    expect(JSON.parse(upstreamRequest.body)).toMatchObject({
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+
+    const row = await usageRow(requestId);
+    expect(rowsForRequest(sls, requestId)).toHaveLength(1);
+    const calls = embeddingCalls(row);
+    expect(calls).toHaveLength(1);
+    expectSucceededCall(calls[0]!, "semantic_route", embeddingModelID, 20);
+    expect(row.has("gateway_embedding_calls_dropped")).toBe(false);
+
+    // These are the streamed target's terminal usage values, not the
+    // semantic embedding's values. Chat streaming intentionally leaves the
+    // DP-provided cost at zero: the control plane prices it on ingestion.
+    expect(row.get("prompt_tokens")).toBe(String(STREAM_USAGE.prompt_tokens));
+    expect(row.get("completion_tokens")).toBe(String(STREAM_USAGE.completion_tokens));
+    expect(row.get("total_tokens")).toBe(String(STREAM_USAGE.total_tokens));
+    expect(Number(row.get("cost_usd"))).toBe(0);
+    expect(streamRouteTargetModelID).not.toBe("");
+    expect(row.get("model_id")).toBe(streamRouteTargetModelID);
+    expect(row.get("attempt_model")).toBe(STREAM_ROUTE_TARGET);
     expect(row.get("attempt_model")).not.toBe(EMBED_MODEL);
   });
 
