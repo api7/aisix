@@ -75,6 +75,8 @@ use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use percent_encoding::percent_decode;
+use url::Url;
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{PassthroughAuthMode, PassthroughCredentialMode, PassthroughRoute};
@@ -521,15 +523,8 @@ async fn dispatch(
     } else {
         rest_raw
     };
-    let url = if rest.is_empty() {
-        base.clone()
-    } else {
-        format!("{base}/{rest}")
-    };
-    let url = match &query {
-        Some(q) => format!("{url}?{q}"),
-        None => url,
-    };
+    let url =
+        join_target_url(&base, rest, query.as_deref()).map_err(|e| RouteError::of(e, &auth))?;
 
     // End-user identity injected by the upstream device, captured before
     // the strip pass and recorded on the usage event.
@@ -649,7 +644,7 @@ async fn dispatch(
         .map(|pk| pk.value.provider.to_ascii_lowercase())
         .filter(|prov| !prov.is_empty())
         .and_then(|prov| body_model_rate_limit(snapshot, &prov, &body_bytes));
-    let _reservation = crate::quota::enforce(state, snapshot, &auth, model_rl.as_ref())
+    let reservation = crate::quota::enforce(state, snapshot, &auth, model_rl.as_ref())
         .await
         .map_err(|e| RouteError::of(e, &auth))?;
 
@@ -924,6 +919,7 @@ async fn dispatch(
             status,
             telemetry,
             &client.request_id,
+            reservation.into_stream_hold(),
         ));
     }
 
@@ -1719,7 +1715,14 @@ fn is_api_version_segment(seg: &str) -> bool {
 /// `target_url` ending in `/v1` joined with a caller path starting `v1/`
 /// would otherwise produce `/v1/v1/...`.
 fn strip_redundant_version_segment<'a>(base: &str, rest: &'a str) -> &'a str {
-    let base_tail = base.rsplit('/').next().unwrap_or("");
+    let base_path = Url::parse(base)
+        .map(|url| url.path().to_owned())
+        .unwrap_or_else(|_| base.to_owned());
+    let base_tail = base_path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
     if !is_api_version_segment(base_tail) {
         return rest;
     }
@@ -1732,6 +1735,135 @@ fn strip_redundant_version_segment<'a>(base: &str, rest: &'a str) -> &'a str {
         }
     }
     rest
+}
+
+/// Join a caller-controlled route remainder below the operator-configured
+/// target URL. Parsing the candidate before the prefix check is deliberate:
+/// the URL implementation canonicalises both literal and percent-encoded dot
+/// segments, so the check observes the path reqwest will actually send.
+fn join_target_url(base: &str, rest: &str, query: Option<&str>) -> Result<String, ProxyError> {
+    if has_path_traversal_segment(rest) {
+        return Err(ProxyError::InvalidRequest(
+            "passthrough path is outside the configured target URL".into(),
+        ));
+    }
+
+    let mut base_url = Url::parse(base).map_err(|_| {
+        ProxyError::InvalidRequest("passthrough route has an invalid target URL".into())
+    })?;
+    // A configured query is part of the operator-owned target. Preserve it
+    // and append a non-conflicting caller query after it, while keeping it
+    // out of the URL string used for path joining. A caller must not be able
+    // to override an operator-owned key through a last-value query parser.
+    let base_query = base_url
+        .query()
+        .filter(|query| !query.is_empty())
+        .map(str::to_owned);
+    base_url.set_query(None);
+    base_url.set_fragment(None);
+    let base_for_join = base_url.as_str().trim_end_matches('/');
+    let joined = if rest.is_empty() {
+        base_for_join.to_string()
+    } else {
+        format!("{base_for_join}/{rest}")
+    };
+    let mut target = Url::parse(&joined).map_err(|_| {
+        ProxyError::InvalidRequest("passthrough path is outside the configured target URL".into())
+    })?;
+    let inbound_query = query.filter(|query| !query.is_empty());
+    if let (Some(base), Some(inbound)) = (base_query.as_deref(), inbound_query) {
+        if query_keys_overlap(base, inbound) {
+            return Err(ProxyError::InvalidRequest(
+                "passthrough query conflicts with the configured target URL".into(),
+            ));
+        }
+    }
+    let merged_query = match (base_query.as_deref(), inbound_query) {
+        (Some(base), Some(inbound)) => Some(format!("{base}&{inbound}")),
+        (Some(base), _) => Some(base.to_owned()),
+        (_, Some(inbound)) => Some(inbound.to_owned()),
+        (None, None) => None,
+    };
+    target.set_query(merged_query.as_deref());
+
+    if target.origin() != base_url.origin() || !path_is_within_base(target.path(), base_url.path())
+    {
+        return Err(ProxyError::InvalidRequest(
+            "passthrough path is outside the configured target URL".into(),
+        ));
+    }
+    Ok(target.into())
+}
+
+/// Query key comparison first uses form decoding, then a bounded number of
+/// percent-decoding passes. That matches the path guard: a backend must not
+/// be able to turn a nested encoding into an operator-owned key downstream.
+/// Query sets here are tiny, so a simple vector keeps the parser behavior
+/// explicit without adding a dependency.
+fn query_keys_overlap(base: &str, inbound: &str) -> bool {
+    let base_keys = url::form_urlencoded::parse(base.as_bytes())
+        .map(|(key, _)| normalize_query_key(&key))
+        .collect::<Option<Vec<_>>>();
+    let Some(base_keys) = base_keys else {
+        return true;
+    };
+    url::form_urlencoded::parse(inbound.as_bytes()).any(|(key, _)| {
+        let Some(key) = normalize_query_key(&key) else {
+            return true;
+        };
+        base_keys.iter().any(|base_key| base_key == &key)
+    })
+}
+
+fn normalize_query_key(key: &str) -> Option<Vec<u8>> {
+    let mut decoded = key.as_bytes().to_vec();
+    for _ in 0..=MAX_PERCENT_DECODE_PASSES {
+        let next = percent_decode(&decoded).collect::<Vec<_>>();
+        if next == decoded {
+            return Some(decoded);
+        }
+        decoded = next;
+    }
+    None
+}
+
+/// A backend may decode percent escapes before routing. Decode a bounded
+/// number of times, so nested encoding cannot turn a harmless-looking
+/// segment into `..` downstream. Inputs that keep changing beyond the bound
+/// are rejected rather than delegated to an upstream with unknown decoding.
+const MAX_PERCENT_DECODE_PASSES: usize = 4;
+
+fn has_path_traversal_segment(path: &str) -> bool {
+    let mut decoded = path.as_bytes().to_vec();
+    for _ in 0..=MAX_PERCENT_DECODE_PASSES {
+        if decoded
+            .split(|byte| matches!(*byte, b'/' | b'\\'))
+            .any(|segment| segment == b"." || segment == b"..")
+        {
+            return true;
+        }
+
+        let next = percent_decode(&decoded).collect::<Vec<_>>();
+        if next == decoded {
+            return false;
+        }
+        decoded = next;
+    }
+
+    true
+}
+
+/// `candidate` must remain at `base` itself or below it on a path-segment
+/// boundary. A root target intentionally permits every absolute path.
+fn path_is_within_base(candidate: &str, base: &str) -> bool {
+    let base = base.trim_end_matches('/');
+    if base.is_empty() {
+        return candidate.starts_with('/');
+    }
+    candidate == base
+        || candidate
+            .strip_prefix(base)
+            .is_some_and(|remainder| remainder.starts_with('/'))
 }
 
 // ---------------------------------------------------------------------------
@@ -2023,6 +2155,7 @@ fn stream_response(
     status: reqwest::StatusCode,
     mut telemetry: RouteTelemetry,
     request_id: &str,
+    stream_hold: aisix_ratelimit::StreamConcurrencyGuard,
 ) -> Response {
     use aisix_guardrails::{Guardrail as _, GuardrailVerdict, StreamOutputPolicy};
     use futures::StreamExt;
@@ -2036,6 +2169,10 @@ fn stream_response(
     let capture_cap = telemetry.content_cap;
 
     let stream = async_stream::stream! {
+        // The rate limiter's reservation becomes an owned hold at the handoff
+        // from handler to body. It drops only when this body completes or the
+        // client cancels it, rather than when the response headers are built.
+        let _stream_hold = stream_hold;
         let mut upstream = upstream_resp.bytes_stream();
         let mut splitter = SseFrameSplitter::new();
         // Held-back frames (Window / BufferFull) not yet released.
@@ -3066,6 +3203,120 @@ mod tests {
         assert!(path_under_prefix("/copilot", "/copilot"));
         assert!(path_under_prefix("/copilot/chat", "/copilot"));
         assert!(!path_under_prefix("/copilotx", "/copilot"));
+    }
+
+    #[test]
+    fn joined_target_url_stays_under_its_configured_path() {
+        let joined = join_target_url(
+            "https://upstream.example/provider/v1",
+            "models",
+            Some("limit=3"),
+        )
+        .unwrap();
+        assert_eq!(
+            joined,
+            "https://upstream.example/provider/v1/models?limit=3"
+        );
+
+        let joined = join_target_url(
+            "https://upstream.example/provider/v1?fixed=1",
+            "models",
+            Some("limit=3"),
+        )
+        .unwrap();
+        assert_eq!(
+            joined,
+            "https://upstream.example/provider/v1/models?fixed=1&limit=3"
+        );
+        assert_eq!(
+            strip_redundant_version_segment(
+                "https://upstream.example/provider/v1?fixed=1",
+                "v1/models",
+            ),
+            "models"
+        );
+
+        assert!(
+            join_target_url(
+                "https://upstream.example/provider/v1?tenant=operator",
+                "models",
+                Some("tenant=caller"),
+            )
+            .is_err(),
+            "a caller must not override an operator-owned query key"
+        );
+        assert!(
+            join_target_url(
+                "https://upstream.example/provider/v1?tenant=operator",
+                "models",
+                Some("%74enant=caller"),
+            )
+            .is_err(),
+            "encoded query keys must not bypass the operator-owned key"
+        );
+        assert!(
+            join_target_url(
+                "https://upstream.example/provider/v1?tenant=operator",
+                "models",
+                Some("%2574enant=caller"),
+            )
+            .is_err(),
+            "nested-encoded query keys must not bypass the operator-owned key"
+        );
+
+        // Test raw, percent-encoded, and encoded-separator spellings. The
+        // gateway must reject them before a ProviderKey can be sent outside
+        // the route's configured target path.
+        for remainder in [
+            "../models",
+            "%2e%2e/models",
+            "%2E%2E/models",
+            ".%2e/models",
+            "%2e./models",
+            "%2e%2e%2fmodels",
+            "%2e%2e%5cmodels",
+            "%252e%252e/models",
+            "%252e%252e%252fmodels",
+            "%252e%252e%255cmodels",
+        ] {
+            assert!(
+                join_target_url("https://upstream.example/provider/v1", remainder, None).is_err(),
+                "{remainder} must not escape the configured target URL path"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsafe_remainder_is_rejected_before_contacting_the_upstream() {
+        let upstream = MockServer::start().await;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry("http://unused"));
+        snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+        snap.passthrough_routes
+            .insert(inject_route(&format!("{}/provider/v1", upstream.uri())));
+        let app = build_app(snap);
+
+        for remainder in [
+            "../models",
+            "%2e%2e/models",
+            "%2e%2e%2fmodels",
+            "%252e%252e/models",
+            "%252e%252e%252fmodels",
+        ] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!("/passthrough/openai/{remainder}"))
+                .header("authorization", "Bearer sk-caller")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{remainder}");
+        }
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "an invalid joined path must not send the ProviderKey upstream"
+        );
     }
 
     #[test]

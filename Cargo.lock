@@ -417,6 +417,7 @@ dependencies = [
  "ipnet",
  "jsonwebtoken",
  "lofty",
+ "percent-encoding",
  "rand 0.8.7",
  "regex",
  "reqwest 0.12.28",

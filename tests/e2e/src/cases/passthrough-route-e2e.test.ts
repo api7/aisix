@@ -46,6 +46,10 @@ const CALLER_PLAINTEXT = "sk-ptr-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
+const STREAM_LIMITED_PLAINTEXT = "sk-ptr-e2e-stream-limit";
+const STREAM_LIMITED_KEY_HASH = createHash("sha256")
+  .update(STREAM_LIMITED_PLAINTEXT)
+  .digest("hex");
 
 describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed paths", () => {
   let app: SpawnedApp | undefined;
@@ -219,6 +223,70 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     );
     expect(res.status).toBe(404);
     expect(await res.text()).toBe("");
+  });
+
+  test("a nested-encoded route remainder never reaches the configured upstream", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    const upstream = await startOpenAiUpstream({
+      nonStreamBody: { object: "safe-route-target" },
+    });
+    upstreams.push(upstream);
+
+    const pk = await seed.createProviderKey({
+      display_name: "ptr-boundary-pk",
+      secret: "sk-mock",
+      api_base: "http://unused-on-routes",
+    });
+    await seed.createPassthroughRoute({
+      name: "ptr-boundary",
+      path_prefix: "/ptr-boundary",
+      target_url: `${upstream.baseUrl}/provider/v1?tenant=operator`,
+      provider_key_id: pk.id,
+    });
+
+    const headers = { authorization: `Bearer ${CALLER_PLAINTEXT}` };
+    await waitConfigPropagation(async () => {
+      try {
+        const ready = await fetch(`${app!.proxyUrl}/ptr-boundary/models`, {
+          headers,
+        });
+        await ready.text();
+        return ready.status === 200;
+      } catch {
+        return false;
+      }
+    });
+
+    const baseline = upstream.receivedRequests.length;
+    // Use undici's raw request helper: fetch implementations are allowed to
+    // normalize URL escapes before the gateway receives the wire path.
+    const rejected = await harnessRequest(
+      `${app.proxyUrl}/ptr-boundary/%252e%252e%252fmodels`,
+      { headers },
+    );
+    expect(rejected.statusCode).toBe(400);
+    await rejected.body.text();
+    expect(upstream.receivedRequests).toHaveLength(baseline);
+
+    const conflictingQuery = await harnessRequest(
+      `${app.proxyUrl}/ptr-boundary/models?tenant=caller`,
+      { headers },
+    );
+    expect(conflictingQuery.statusCode).toBe(400);
+    await conflictingQuery.body.text();
+    expect(upstream.receivedRequests).toHaveLength(baseline);
+
+    const nestedConflictingQuery = await harnessRequest(
+      `${app.proxyUrl}/ptr-boundary/models?%2574enant=caller`,
+      { headers },
+    );
+    expect(nestedConflictingQuery.statusCode).toBe(400);
+    await nestedConflictingQuery.body.text();
+    expect(upstream.receivedRequests).toHaveLength(baseline);
   });
 
   test("forward-proxy BYO: host match beats typed routes; Authorization forwarded verbatim", async (ctx) => {
@@ -492,6 +560,119 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     expect(text).toContain('"content":"hel"');
     expect(text).toContain('"content":"lo"');
     expect(text).toContain("[DONE]");
+  });
+
+  test("an SSE passthrough holds its concurrency slot until the body ends or cancels", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    // Headers arrive immediately but the body remains open long enough to
+    // make the second request observe the in-flight stream, rather than a
+    // short unary exchange that happened to have already finished.
+    const streamEvents = [
+      JSON.stringify({ choices: [{ delta: { content: "one" } }] }),
+      JSON.stringify({ choices: [{ delta: { content: "two" } }] }),
+      "[DONE]",
+    ];
+    const upstream = await startOpenAiUpstream({
+      // The propagation probe does not reach this upstream. The first real
+      // stream ends normally; the second stalls for far longer than the
+      // bounded cancellation assertion, so a natural upstream close cannot
+      // make a leaked concurrency reservation look released.
+      scriptedResponses: [
+        { streamEvents },
+        { streamEvents, firstEventDelayMs: 900, eventDelayMs: 600 },
+        { streamEvents, firstEventDelayMs: 10_000 },
+        { streamEvents },
+      ],
+    });
+    upstreams.push(upstream);
+
+    const pk = await seed.createProviderKey({
+      display_name: "ptr-sse-concurrency-pk",
+      secret: "sk-mock",
+      api_base: "http://unused-on-routes",
+    });
+    await seed.createPassthroughRoute({
+      name: "ptr-sse-concurrency",
+      path_prefix: "/sse-concurrency",
+      target_url: upstream.baseUrl,
+      provider_key_id: pk.id,
+    });
+    // Write the constrained principal last. A successful authenticated
+    // readiness probe proves the preceding route has reached the same
+    // snapshot without spending its concurrency slot.
+    await seed.createApiKey({
+      key_hash: STREAM_LIMITED_KEY_HASH,
+      allowed_models: ["*"],
+      allowed_routes: ["ptr-sse-concurrency"],
+      rate_limit: { concurrency: 1 },
+    });
+
+    const headers = {
+      authorization: `Bearer ${STREAM_LIMITED_PLAINTEXT}`,
+      "content-type": "application/json",
+    };
+    const call = () =>
+      fetch(`${app!.proxyUrl}/sse-concurrency/chat/completions`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "hi" }],
+          stream: true,
+        }),
+      });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const ready = await fetch(`${app!.proxyUrl}/v1/models`, { headers });
+        await ready.text();
+        return ready.status === 200;
+      } catch {
+        return false;
+      }
+    });
+
+    // Fetch resolves as soon as the upstream headers are relayed. Keep this
+    // body unread while issuing the second request: it is the real caller
+    // journey that used to release the slot at handler return.
+    const first = await call();
+    expect(first.status).toBe(200);
+    const upstreamCallsWhileStreaming = upstream.receivedRequests.length;
+    expect(upstreamCallsWhileStreaming).toBe(1);
+
+    const second = await call();
+    expect(second.status).toBe(429);
+    expect(second.headers.get("x-ratelimit-scope")).toBe("concurrency");
+    await second.text();
+    expect(upstream.receivedRequests).toHaveLength(upstreamCallsWhileStreaming);
+
+    await first.text();
+    const afterEnd = await call();
+    expect(afterEnd.status).toBe(200);
+
+    // Keep a second stream open to exercise cancellation separately.
+    expect(afterEnd.body).not.toBeNull();
+    const secondStream = afterEnd;
+
+    // A cancelled client must release the same hold. The next caller should
+    // not wait for the upstream's delayed frames to finish naturally.
+    await secondStream.body!.cancel();
+    await waitConfigPropagation(async () => {
+      try {
+        const afterCancel = await call();
+        const admitted = afterCancel.status === 200;
+        await afterCancel.body?.cancel();
+        return admitted;
+      } catch {
+        return false;
+      }
+    }, 3_000);
+
+    expect(upstream.receivedRequests).toHaveLength(upstreamCallsWhileStreaming + 2);
   });
 
   test("envelope auto-detection: usage follows the request body, never the config", async (ctx) => {
