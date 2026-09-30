@@ -52,19 +52,24 @@ const UNAVAILABLE_USAGE_ROUTER_MODEL = "seu-1747-router-usage-unavailable";
 const UNAVAILABLE_USAGE_UPSTREAM_MODEL = "embedding-usage-unavailable-mock";
 const FAILED_USAGE_EMBED_MODEL = "seu-1747-embed-usage-failed";
 const FAILED_USAGE_ROUTER_MODEL = "seu-1747-router-usage-failed";
+const FALLBACK_USAGE_ROUTER_MODEL = "seu-1747-router-usage-fallback";
 const FAILED_USAGE_UPSTREAM_MODEL = "embedding-usage-failed-mock";
 const CANCELLED_EMBED_MODEL = "seu-1747-embed-cancelled";
 const CANCELLED_ROUTER_MODEL = "seu-1747-router-cancelled";
 const CANCELLED_USAGE_UPSTREAM_MODEL = "embedding-usage-cancelled-mock";
+const OUTPUT_GUARDRAIL_ROUTER_MODEL = "seu-1747-output-guardrail-router";
+const OUTPUT_GUARDRAIL_TARGET = "seu-1747-output-guardrail-target";
 const GUARDRAIL_OVERFLOW_COUNT = 33;
 
 const ROUTE_EXAMPLE = "route-topic prototype";
+const OUTPUT_ROUTE_EXAMPLE = "output-route-topic prototype";
 // Keep the streaming router's prototype distinct from the buffered router's.
 // Semantic prototype embeddings are cached across requests, and sharing this
 // value would turn the second scenario into a one-input call depending on test
 // order rather than proving its own two-input bridge usage.
 const STREAM_ROUTE_EXAMPLE = "stream-route-topic prototype";
 const ROUTE_PROMPT = "route-topic caller question";
+const OUTPUT_ROUTE_PROMPT = "output-route-topic caller question";
 const STREAM_RESPONSE_TEXT = "streamed semantic route answer";
 const STREAM_USAGE = {
   prompt_tokens: 13,
@@ -107,6 +112,7 @@ const GUARDRAIL_EXAMPLES = [
   "guardrail-prototype-first",
   "guardrail-prototype-second",
 ];
+const OUTPUT_GUARDRAIL_EXAMPLES = ["output-guardrail-prototype"];
 const GUARDRAIL_PROMPT = "guardrail-candidate-allowed";
 const GUARDRAIL_OVERFLOW_PROMPT = "guardrail-prototype-overflow-candidate";
 const GUARDRAIL_OVERFLOW_PROTOTYPES = Array.from(
@@ -284,9 +290,12 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
   let embeddingModelID = "";
   let unavailableUsageEmbeddingModelID = "";
   let failedUsageEmbeddingModelID = "";
+  let failedUsageRouterModelID = "";
   let cancelledEmbeddingModelID = "";
   let routeTargetModelID = "";
+  let routeDefaultModelID = "";
   let streamRouteTargetModelID = "";
+  let outputGuardrailTargetModelID = "";
   let guardrailModelID = "";
   let overflowGuardrailModelID = "";
   let cacheModelID = "";
@@ -461,13 +470,16 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
       provider_key_id: streamChatKey.id,
     });
     streamRouteTargetModelID = streamRouteTarget.id;
-    await createChatModel(ROUTE_DEFAULT);
+    const routeDefault = await createChatModel(ROUTE_DEFAULT);
+    routeDefaultModelID = routeDefault.id;
     const guardrailModel = await createChatModel(GUARDRAIL_MODEL);
     guardrailModelID = guardrailModel.id;
     const overflowGuardrailModel = await createChatModel(GUARDRAIL_OVERFLOW_MODEL);
     overflowGuardrailModelID = overflowGuardrailModel.id;
     const cacheModel = await createChatModel(CACHE_MODEL);
     cacheModelID = cacheModel.id;
+    const outputGuardrailTarget = await createChatModel(OUTPUT_GUARDRAIL_TARGET);
+    outputGuardrailTargetModelID = outputGuardrailTarget.id;
 
     await seed.createModel({
       display_name: ROUTER_MODEL,
@@ -485,7 +497,7 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
         match: { threshold: 0.9 },
       },
     });
-    await seed.createModel({
+    const failedUsageRouter = await seed.createModel({
       display_name: FAILED_USAGE_ROUTER_MODEL,
       semantic: {
         embedding_model: FAILED_USAGE_EMBED_MODEL,
@@ -500,6 +512,39 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
         default: ROUTE_DEFAULT,
         match: { threshold: 0.9 },
         on_embedding_failure: "fail",
+      },
+    });
+    failedUsageRouterModelID = failedUsageRouter.id;
+    await seed.createModel({
+      display_name: FALLBACK_USAGE_ROUTER_MODEL,
+      semantic: {
+        embedding_model: FAILED_USAGE_EMBED_MODEL,
+        routes: [
+          {
+            name: "route-topic",
+            target: ROUTE_TARGET,
+            examples: [ROUTE_EXAMPLE],
+            threshold: 0.9,
+          },
+        ],
+        default: ROUTE_DEFAULT,
+        match: { threshold: 0.9 },
+      },
+    });
+    await seed.createModel({
+      display_name: OUTPUT_GUARDRAIL_ROUTER_MODEL,
+      semantic: {
+        embedding_model: EMBED_MODEL,
+        routes: [
+          {
+            name: "output-route-topic",
+            target: OUTPUT_GUARDRAIL_TARGET,
+            examples: [OUTPUT_ROUTE_EXAMPLE],
+            threshold: 0.9,
+          },
+        ],
+        default: ROUTE_DEFAULT,
+        match: { threshold: 0.9 },
       },
     });
     await seed.createModel({
@@ -570,6 +615,25 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
       scope_id: guardrailModelID,
       priority: 100,
     });
+
+    const outputSemanticGuardrail = await seed.createGuardrail(
+      {
+        enabled: true,
+        name: "semantic-embedding-usage-output-guardrail",
+        hook_point: "output",
+        enforcement_mode: "monitor",
+        kind: "semantic",
+        embedding_model: EMBED_MODEL,
+        deny_examples: OUTPUT_GUARDRAIL_EXAMPLES,
+        deny_threshold: 0.99,
+      },
+      { attach: false },
+    );
+    await seed.attachGuardrailToModel(
+      outputSemanticGuardrail.id,
+      outputGuardrailTargetModelID,
+      100,
+    );
 
     // Each distinct prototype is cold, while the candidate is intentionally
     // uncached request data. Monitor mode lets every row run even though this
@@ -754,17 +818,57 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     expect(call.usage_source).toBe("unavailable");
     expect(call.outcome).toBe("failed");
 
-    // The bridge selected no target, so its zero usage is child-only and
-    // cannot turn into a billable or attributed parent attempt.
+    // The bridge selected no target, so its zero usage is child-only. The
+    // parent identifies the resolved semantic router, never the embedding or
+    // a direct target attempt.
     expect(row.get("prompt_tokens") ?? "0").toBe("0");
     expect(row.get("completion_tokens") ?? "0").toBe("0");
     expect(row.get("total_tokens") ?? "0").toBe("0");
     expect(Number(row.get("cost_usd") ?? "0")).toBe(0);
     expect(row.get("requested_model")).toBe(FAILED_USAGE_ROUTER_MODEL);
-    expect(row.get("model_id") ?? "").toBe("");
+    expect(failedUsageRouterModelID).not.toBe("");
+    expect(row.get("model_id")).toBe(failedUsageRouterModelID);
     expect(row.get("attempt_model") ?? "").toBe("");
     expect(row.get("model_id") ?? "").not.toBe(failedUsageEmbeddingModelID);
     expect(row.get("attempt_model") ?? "").not.toBe(FAILED_USAGE_EMBED_MODEL);
+  });
+
+  test("a failed semantic embedding remains child work after its default target succeeds", async () => {
+    const { sls, embed, upstream } = requireRuntime();
+
+    const failedEmbeddingCallsBefore = embed.callCountFor(FAILED_USAGE_UPSTREAM_MODEL);
+    const upstreamCallsBefore = upstream.receivedRequests.length;
+    const response = await chat(FALLBACK_USAGE_ROUTER_MODEL, ROUTE_PROMPT);
+    expect(response.status).toBe(200);
+    expect(response.servedBy).toBe(ROUTE_DEFAULT);
+    expect(embed.callCountFor(FAILED_USAGE_UPSTREAM_MODEL)).toBe(failedEmbeddingCallsBefore + 1);
+    expect(upstream.receivedRequests.length).toBe(upstreamCallsBefore + 1);
+
+    const row = await usageRow(response.requestId);
+    expect(rowsForRequest(sls, response.requestId)).toHaveLength(1);
+    expect(row.get("status_code")).toBe("200");
+    const calls = embeddingCalls(row);
+    expect(calls).toHaveLength(1);
+    const call = calls[0]!;
+    expect(call.count).toBe(1);
+    expect(call.purpose).toBe("semantic_route");
+    expect(call.embedding_model_id).toBe(failedUsageEmbeddingModelID);
+    expect(call.prompt_tokens).toBe(0);
+    expect(call.total_tokens).toBe(0);
+    expect(call.usage_source).toBe("unavailable");
+    expect(call.outcome).toBe("failed");
+    expect(call.latency_ms).toBeGreaterThan(0);
+    expect(row.has("gateway_embedding_calls_dropped")).toBe(false);
+    expectUnchangedParentUsage(row);
+
+    // The failed bridge belongs to the completed parent event, while target
+    // attribution remains the direct fallback the client actually received.
+    expect(row.get("requested_model")).toBe(FALLBACK_USAGE_ROUTER_MODEL);
+    expect(routeDefaultModelID).not.toBe("");
+    expect(row.get("model_id")).toBe(routeDefaultModelID);
+    expect(row.get("attempt_model")).toBe(ROUTE_DEFAULT);
+    expect(row.get("model_id")).not.toBe(failedUsageEmbeddingModelID);
+    expect(row.get("attempt_model")).not.toBe(FAILED_USAGE_EMBED_MODEL);
   });
 
   test(
@@ -895,6 +999,41 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     for (const text of [...GUARDRAIL_EXAMPLES, GUARDRAIL_PROMPT]) {
       expect(childAudit).not.toContain(text);
     }
+  });
+
+  test("an output semantic guardrail keeps post-target child work on the routed parent", async () => {
+    const { sls, embed } = requireRuntime();
+
+    const callsBefore = embed.callCount();
+    const response = await chat(OUTPUT_GUARDRAIL_ROUTER_MODEL, OUTPUT_ROUTE_PROMPT);
+    expect(response.status).toBe(200);
+    expect(response.route).toBe("output-route-topic");
+    expect(response.servedBy).toBe(OUTPUT_GUARDRAIL_TARGET);
+    // One routing bridge, then one prototype and one response-text bridge
+    // after the direct target has completed.
+    expect(embed.callCount()).toBe(callsBefore + 3);
+
+    const row = await usageRow(response.requestId);
+    expect(rowsForRequest(sls, response.requestId)).toHaveLength(1);
+    const calls = embeddingCalls(row);
+    expect(calls).toHaveLength(3);
+    const routeCalls = calls.filter((call) => call.purpose === "semantic_route");
+    const guardrailCalls = calls.filter((call) => call.purpose === "guardrail");
+    expect(routeCalls).toHaveLength(1);
+    expectSucceededCall(routeCalls[0]!, "semantic_route", embeddingModelID, 20);
+    expect(guardrailCalls).toHaveLength(2);
+    for (const call of guardrailCalls) {
+      expectSucceededCall(call, "guardrail", embeddingModelID, 10);
+    }
+    expectUnchangedParentUsage(row);
+
+    // The post-target child work cannot rewrite the semantic route's actual
+    // target attribution.
+    expect(outputGuardrailTargetModelID).not.toBe("");
+    expect(row.get("model_id")).toBe(outputGuardrailTargetModelID);
+    expect(row.get("attempt_model")).toBe(OUTPUT_GUARDRAIL_TARGET);
+    expect(row.get("model_id")).not.toBe(embeddingModelID);
+    expect(row.get("attempt_model")).not.toBe(EMBED_MODEL);
   });
 
   test("semantic guardrail child audit caps real bridge work without leaking text", async () => {

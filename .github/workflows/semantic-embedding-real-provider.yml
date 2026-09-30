@@ -1,0 +1,76 @@
+# Real-provider semantic-embedding smoke for AISIX-Cloud#1747.
+#
+# This job deliberately has no push or pull_request trigger. Configure the
+# `real-provider-e2e` GitHub Environment with required reviewers and place
+# AISIX_E2E_OPENAI_API_KEY there; that keeps a fork or routine PR from ever
+# receiving a credential capable of making upstream requests.
+#
+# Optional environment variables (not secrets) select models when the default
+# account cannot use text-embedding-3-small or gpt-4o-mini. Keep the
+# embedding dimension aligned with the chosen embedding model:
+#   AISIX_E2E_OPENAI_EMBEDDING_MODEL
+#   AISIX_E2E_OPENAI_EMBEDDING_DIMENSIONS
+#   AISIX_E2E_OPENAI_CHAT_MODEL
+name: semantic-embedding-real-provider
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: semantic-embedding-real-provider-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: real OpenAI semantic-embedding child audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: real-provider-e2e
+    services:
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.18
+        ports: ["2379:2379"]
+        env:
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://0.0.0.0:2379
+    env:
+      AISIX_E2E_OPENAI_API_KEY: ${{ secrets.AISIX_E2E_OPENAI_API_KEY }}
+      AISIX_E2E_OPENAI_EMBEDDING_MODEL: ${{ vars.AISIX_E2E_OPENAI_EMBEDDING_MODEL || 'text-embedding-3-small' }}
+      AISIX_E2E_OPENAI_EMBEDDING_DIMENSIONS: ${{ vars.AISIX_E2E_OPENAI_EMBEDDING_DIMENSIONS || '1536' }}
+      AISIX_E2E_OPENAI_CHAT_MODEL: ${{ vars.AISIX_E2E_OPENAI_CHAT_MODEL || 'gpt-4o-mini' }}
+      AISIX_E2E_ETCD_ENDPOINTS: http://127.0.0.1:2379
+      AISIX_E2E_MAX_FORKS: "1"
+      E2E_THREAD_PER_CORE: "false"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: require protected provider credential
+        run: |
+          if [ -z "$AISIX_E2E_OPENAI_API_KEY" ]; then
+            echo "::error::AISIX_E2E_OPENAI_API_KEY is absent from the real-provider-e2e environment."
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@v2
+      - name: build gateway for the smoke
+        run: cargo build -p aisix-server --bin aisix
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11
+      - name: install e2e harness
+        working-directory: tests/e2e
+        run: pnpm install --no-frozen-lockfile
+      - name: typecheck e2e harness and real-provider smoke
+        working-directory: tests/e2e
+        run: pnpm exec tsc --noEmit
+      - name: run real OpenAI semantic-embedding smoke
+        working-directory: tests/e2e
+        run: pnpm exec vitest run --config vitest.real-provider.config.ts
