@@ -1607,7 +1607,7 @@ fn raw_top_level_unique_object(
         0 => Ok(None),
         1 => {
             let value = values.pop().expect("one value");
-            raw_is_object(&value).then_some(value).ok_or(())
+            raw_is_object(&value).then_some(value).map(Some).ok_or(())
         }
         _ => Err(()),
     }
@@ -1627,6 +1627,7 @@ fn raw_top_level_unique_array(
                 .trim_start()
                 .starts_with('[')
                 .then_some(value)
+                .map(Some)
                 .ok_or(())
         }
         _ => Err(()),
@@ -2479,14 +2480,9 @@ fn path_is_within_base(candidate: &str, base: &str) -> bool {
 // Streaming relay
 // ---------------------------------------------------------------------------
 
-/// Cap on bytes buffered while waiting for one SSE frame terminator, and on
-/// bytes held back by the `Window` policy while its char threshold has not
-/// been reached. Both accumulators would otherwise grow without bound on an
-/// upstream that never terminates a frame (or streams only delta-free
-/// frames) — and a streaming route carries no reqwest-level timeout to end
-/// the read. On overflow the oversized run is handed on as if it were a
-/// complete frame (splitter) or force-scanned (window), so memory stays
-/// bounded while the policy semantics degrade gracefully.
+/// Default cap on bytes buffered while waiting for one SSE frame terminator.
+/// A hold-back policy instead derives its splitter cap from its own raw-byte
+/// limit, so an unterminated frame cannot outgrow the bytes it may hold.
 const MAX_HELD_STREAM_BYTES: usize = 1024 * 1024;
 
 /// Bound independently scanned output candidates even when an upstream never
@@ -2512,9 +2508,11 @@ struct SseFrameSplitter(aisix_gateway::sse::SseFrameSplitter);
 
 impl SseFrameSplitter {
     fn new() -> Self {
-        Self(aisix_gateway::sse::SseFrameSplitter::new(
-            MAX_HELD_STREAM_BYTES,
-        ))
+        Self::with_max_frame_bytes(MAX_HELD_STREAM_BYTES)
+    }
+
+    fn with_max_frame_bytes(max_frame_bytes: usize) -> Self {
+        Self(aisix_gateway::sse::SseFrameSplitter::new(max_frame_bytes))
     }
 
     fn push(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
@@ -4005,6 +4003,10 @@ fn stream_response(
     };
     let route_name = telemetry.route_name.clone();
     let capture_cap = telemetry.content_cap;
+    let splitter_cap = policy
+        .hold_cap()
+        .map(|(cap, _)| cap.saturating_mul(crate::held_content::RAW_HOLD_FACTOR))
+        .unwrap_or(MAX_HELD_STREAM_BYTES);
 
     let stream = async_stream::stream! {
         // The rate limiter's reservation becomes an owned hold at the handoff
@@ -4012,13 +4014,11 @@ fn stream_response(
         // client cancels it, rather than when the response headers are built.
         let _stream_hold = stream_hold;
         let mut upstream = upstream_resp.bytes_stream();
-        let mut splitter = SseFrameSplitter::new();
+        let mut splitter = SseFrameSplitter::with_max_frame_bytes(splitter_cap);
         // Held-back frames (Window / BufferFull) not yet released.
         let mut pending: Vec<Bytes> = Vec::new();
         let mut pending_held = crate::held_content::HeldBytes::default();
-        // Frame bytes held under Window (a memory bound for delta-free runs).
-        let mut held_bytes: usize = 0;
-        // What BufferFull holds (#513): content, which `max_buffer_bytes`
+        // What Window and BufferFull hold (#513): content, which `max_buffer_bytes`
         // caps (the SSE framing is not counted), and the raw frame bytes it
         // bounds too.
         let mut held_content = crate::held_content::HeldBuffer::default();
@@ -4038,7 +4038,7 @@ fn stream_response(
         let mut sealed_guardrail_epochs: Vec<Vec<String>> = Vec::new();
         let mut queued_guardrail_candidates = 0;
         let mut scan_budget_exhausted = false;
-        // Degrades BufferFull to live forwarding after a fail-open cap hit.
+        // Degrades a hold-back policy to live forwarding after a fail-open cap hit.
         let mut fail_opened = false;
         let mut blocked = false;
         // The chat envelope also carries Anthropic Messages streams; the
@@ -4082,7 +4082,7 @@ fn stream_response(
                 let (parts, usage) = frame_parts(protocol, &frame);
                 let held = parts.held();
                 let delta = parts.scan;
-                let guardrail_text = (!chain.is_empty() && !scan_budget_exhausted)
+                let guardrail_text = (!chain.is_empty() && !scan_budget_exhausted && !fail_opened)
                     .then(|| stream_guardrail_text(protocol, &frame, delta.clone()));
                 if let Some(u) = usage {
                     merge_usage(&mut telemetry.usage, u);
@@ -4162,7 +4162,12 @@ fn stream_response(
                         telemetry.mark_first_delivery();
                         yield Ok(frame);
                     }
-                    StreamOutputPolicy::Window { size_chars, overlap_chars, .. } => {
+                    StreamOutputPolicy::Window {
+                        size_chars,
+                        overlap_chars,
+                        max_buffer_bytes,
+                        on_exceeded_fail_open,
+                    } => {
                         if let Some(text) = guardrail_text.as_ref().filter(|_| !unevaluable_output) {
                             append_stream_guardrail_text(
                                 &mut continuation_bufs,
@@ -4172,15 +4177,32 @@ fn stream_response(
                                 text,
                             );
                         }
-                        held_bytes += frame.len();
+                        held_content.hold(held, frame.len());
                         pending_held.add(frame.len());
                         pending.push(frame);
-                        // The char threshold only advances on extracted delta
-                        // text, so a run of delta-free frames (role-only,
-                        // keep-alives, usage-only) would hold frames without
-                        // bound — force the scan once the held BYTES cross
-                        // the cap, mirroring BufferFull's self-bound.
-                        if continuation_bufs
+                        if held_content.exceeds(*max_buffer_bytes) {
+                            if *on_exceeded_fail_open {
+                                fail_opened = true;
+                                chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                                for f in pending.drain(..) {
+                                    telemetry.mark_first_delivery();
+                                    yield Ok(f);
+                                }
+                                pending_held.clear();
+                                held_content = crate::held_content::HeldBuffer::default();
+                            } else {
+                                tracing::warn!(
+                                    route = %route_name,
+                                    "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
+                                );
+                                blocked = true;
+                                chain.record_output_buffer_exceeded();
+                                pending.clear();
+                                pending_held.clear();
+                                yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
+                                break 'outer;
+                            }
+                        } else if continuation_bufs
                             .iter()
                             .any(|continuation| continuation.text.chars().count() >= *size_chars)
                             || supplemental_buf
@@ -4188,7 +4210,6 @@ fn stream_response(
                                 .map(|value| value.chars().count())
                                 .sum::<usize>()
                                 >= *size_chars
-                            || held_bytes > MAX_HELD_STREAM_BYTES
                         {
                             let candidates = stream_guardrail_scan_text(
                                 &continuation_tails,
@@ -4224,7 +4245,7 @@ fn stream_response(
                                         yield Ok(f);
                                     }
                                     pending_held.clear();
-                                    held_bytes = 0;
+                                    held_content = crate::held_content::HeldBuffer::default();
                                     for continuation in &mut continuation_bufs {
                                         let tail = continuation_tails
                                             .iter()
@@ -4275,13 +4296,14 @@ fn stream_response(
                         pending.push(frame);
                         if held_content.exceeds(*max_buffer_bytes) {
                             if *on_exceeded_fail_open {
+                                fail_opened = true;
+                                chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
                                 for f in pending.drain(..) {
                                     telemetry.mark_first_delivery();
                                     yield Ok(f);
                                 }
                                 pending_held.clear();
-                                fail_opened = true;
-                                chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                                held_content = crate::held_content::HeldBuffer::default();
                             } else {
                                 tracing::warn!(
                                     route = %route_name,
@@ -4309,7 +4331,7 @@ fn stream_response(
                 let (parts, usage) = frame_parts(protocol, &rest);
                 let held = parts.held();
                 let delta = parts.scan;
-                let guardrail_text = (!chain.is_empty() && !scan_budget_exhausted)
+                let guardrail_text = (!chain.is_empty() && !scan_budget_exhausted && !fail_opened)
                     .then(|| stream_guardrail_text(protocol, &rest, delta.clone()));
                 if let Some(u) = usage {
                     merge_usage(&mut telemetry.usage, u);
@@ -4383,9 +4405,15 @@ fn stream_response(
                 let rest = Bytes::from(rest);
                 // The tail is held like any frame, under the same cap.
                 let tripped = match &policy {
-                    StreamOutputPolicy::BufferFull { max_buffer_bytes, on_exceeded_fail_open }
-                        if !fail_opened =>
-                    {
+                    StreamOutputPolicy::Window {
+                        max_buffer_bytes,
+                        on_exceeded_fail_open,
+                        ..
+                    }
+                    | StreamOutputPolicy::BufferFull {
+                        max_buffer_bytes,
+                        on_exceeded_fail_open,
+                    } if !fail_opened => {
                         held_content.hold(held, rest.len());
                         held_content
                             .exceeds(*max_buffer_bytes)
@@ -4409,12 +4437,13 @@ fn stream_response(
                         return;
                     }
                     Some(true) => {
+                        fail_opened = true;
+                        chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
                         for f in pending.drain(..) {
                             telemetry.mark_first_delivery();
                             yield Ok(f);
                         }
                         pending_held.clear();
-                        chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
                         telemetry.mark_first_delivery();
                         yield Ok(rest);
                     }
@@ -4428,46 +4457,48 @@ fn stream_response(
                     }
                 }
             }
-            if !scan_budget_exhausted {
-                let candidates = stream_guardrail_scan_text(
-                    &continuation_tails,
-                    &continuation_bufs,
-                    &supplemental_buf,
-                );
-                if (!candidates.is_empty() || sealed_guardrail_epochs.is_empty())
-                    && !try_queue_stream_guardrail_epoch(
-                        &mut sealed_guardrail_epochs,
-                        &mut queued_guardrail_candidates,
-                        candidates,
-                    )
-                {
-                    chain.record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
-                }
-            }
-            for candidates in sealed_guardrail_epochs {
-                if !chain.is_empty() {
-                    if let GuardrailVerdict::Block {
-                        reason,
-                        guardrail_name,
-                        unavailable,
-                    } = scan_output_candidates(&chain, &route_name, &candidates, &mut telemetry).await
+            if !fail_opened {
+                if !scan_budget_exhausted {
+                    let candidates = stream_guardrail_scan_text(
+                        &continuation_tails,
+                        &continuation_bufs,
+                        &supplemental_buf,
+                    );
+                    if (!candidates.is_empty() || sealed_guardrail_epochs.is_empty())
+                        && !try_queue_stream_guardrail_epoch(
+                            &mut sealed_guardrail_epochs,
+                            &mut queued_guardrail_candidates,
+                            candidates,
+                        )
                     {
-                        tracing::warn!(
-                            guardrail_hook = "output",
-                            route = %route_name,
-                            reason = %reason,
-                            "guardrail blocked passthrough-route stream (end)",
-                        );
-                        // Held frames are dropped (fail closed); content already
-                        // forwarded under EndOfStreamCheck cannot be unsent —
-                        // the error frame is the caller-visible signal either way.
-                        pending.clear();
-                        pending_held.clear();
-                        yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), guardrail_name.as_deref(), unavailable.as_deref()));
-                        telemetry.guardrail_blocked = true;
-                        telemetry.stream_reached_end = true;
-                        telemetry.emit();
-                        return;
+                        chain.record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+                    }
+                }
+                for candidates in sealed_guardrail_epochs {
+                    if !chain.is_empty() {
+                        if let GuardrailVerdict::Block {
+                            reason,
+                            guardrail_name,
+                            unavailable,
+                        } = scan_output_candidates(&chain, &route_name, &candidates, &mut telemetry).await
+                        {
+                            tracing::warn!(
+                                guardrail_hook = "output",
+                                route = %route_name,
+                                reason = %reason,
+                                "guardrail blocked passthrough-route stream (end)",
+                            );
+                            // Held frames are dropped (fail closed); content already
+                            // forwarded under EndOfStreamCheck cannot be unsent —
+                            // the error frame is the caller-visible signal either way.
+                            pending.clear();
+                            pending_held.clear();
+                            yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), guardrail_name.as_deref(), unavailable.as_deref()));
+                            telemetry.guardrail_blocked = true;
+                            telemetry.stream_reached_end = true;
+                            telemetry.emit();
+                            return;
+                        }
                     }
                 }
             }
@@ -6919,7 +6950,10 @@ mod tests {
     fn responses_index_identity_cannot_switch_mid_stream() {
         let indexed = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"one\",\"output_index\":0,\"content_index\":0,\"delta\":\"FOR\"}\n\n";
         let missing_indexes = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"one\",\"delta\":\"BIDDEN\"}\n\n";
-        for (first, second) in [(indexed, missing_indexes), (missing_indexes, indexed)] {
+        for (first, second) in [
+            (&indexed[..], &missing_indexes[..]),
+            (&missing_indexes[..], &indexed[..]),
+        ] {
             let first = stream_guardrail_text(
                 PassthroughProtocol::OpenaiResponses,
                 first,
@@ -7624,6 +7658,13 @@ mod tests {
             "oversized unterminated run must be flushed ({emitted} emitted)"
         );
         assert!(s.take_rest().len() <= MAX_HELD_STREAM_BYTES);
+    }
+
+    #[test]
+    fn sse_splitter_honors_a_route_specific_frame_cap() {
+        let mut s = SseFrameSplitter::with_max_frame_bytes(4);
+        assert_eq!(s.push(b"12345"), vec![b"12345".to_vec()]);
+        assert!(s.take_rest().is_empty());
     }
 
     #[test]

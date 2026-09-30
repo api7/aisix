@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
@@ -18,7 +18,8 @@ import {
 
 // E2E: an Azure text-moderation OUTPUT guardrail in its default `window`
 // streaming mode, on the routes that hold a streamed response whole —
-// /v1/messages and /v1/responses, each native and through the Chat bridge.
+// /v1/messages and /v1/responses, each native and through the Chat bridge,
+// plus passthrough Chat routes.
 //
 // A block-capable output guardrail has to judge the content before any of it
 // reaches the caller, so on each route:
@@ -54,9 +55,18 @@ const FOLD_OPEN_ROW = "window-azure-fold-open";
 const FOLD_CLOSED_ROW = "window-azure-fold-closed";
 const MIXED_FULL_ROW = "mixed-azure-buffer-full";
 const MIXED_WINDOW_ROW = "mixed-azure-window-default";
+const PASSTHROUGH_AT_CAP_ROUTE = "window-pt-cap-equal";
+const PASSTHROUGH_CLOSED_ROUTE = "window-pt-cap-closed";
+const PASSTHROUGH_OPEN_ROUTE = "window-pt-cap-open";
+const PASSTHROUGH_OPEN_TAIL_ROUTE = "window-pt-cap-open-tail";
+const PASSTHROUGH_CLOSED_TAIL_ROUTE = "window-pt-cap-closed-tail";
+const PASSTHROUGH_RAW_CLOSED_ROUTE = "window-pt-raw-cap-closed";
+const PASSTHROUGH_RAW_OPEN_ROUTE = "window-pt-raw-cap-open";
+const PASSTHROUGH_FRAGMENT_CLOSED_ROUTE = "window-pt-fragment-cap-closed";
 
 // 30 pieces of 100 bytes: three times the rows' cap, far under the window.
 const CAP = 1_000;
+const RAW_HOLD_FACTOR = 128;
 const BIG = Array.from({ length: 30 }, (_, i) => `${String(i).padStart(2, "0")}${"w".repeat(98)}`);
 // 300 pieces of 1,000 bytes: past the window default (256 KiB), under the
 // buffer_full row's 1 MiB.
@@ -75,6 +85,25 @@ const chatEvents = (pieces: string[]) => [
   chatChunk({}, "stop"),
   "[DONE]",
 ];
+const WINDOW_OPEN_MARKER = "window-open-marker";
+const WINDOW_OPEN_EVENTS = chatEvents([
+  ...BIG.slice(0, 5),
+  `${WINDOW_OPEN_MARKER}${FLAGGED}${BIG[5]}`,
+  ...BIG.slice(6),
+]);
+const WINDOW_AT_CAP_MARKER = "window-at-cap-marker";
+const WINDOW_AT_CAP_EVENTS = chatEvents([
+  ...BIG.slice(0, 9),
+  `${WINDOW_AT_CAP_MARKER}${"e".repeat(BIG[9]!.length - WINDOW_AT_CAP_MARKER.length)}`,
+]);
+const WINDOW_TAIL_MARKER = "window-tail-marker";
+const WINDOW_TAIL_FRAME = `data: ${chatChunk({ content: `${WINDOW_TAIL_MARKER}${FLAGGED}${"z".repeat(CAP)}` })}`;
+const WINDOW_CLOSED_TAIL_MARKER = "window-closed-tail-marker";
+const WINDOW_CLOSED_TAIL_FRAME = `data: ${chatChunk({ content: `${WINDOW_CLOSED_TAIL_MARKER}${"z".repeat(CAP)}` })}`;
+const WINDOW_RAW_MARKER = "window-raw-keepalive-marker";
+const WINDOW_RAW_FRAME = `:${WINDOW_RAW_MARKER}${"k".repeat(RAW_HOLD_FACTOR * CAP)}\n\n`;
+const WINDOW_FRAGMENT_MARKER = "window-fragment-marker";
+const WINDOW_UNTERMINATED_FRAME = `:${WINDOW_FRAGMENT_MARKER}${"u".repeat(RAW_HOLD_FACTOR * CAP)}`;
 
 const anthropicEvents = (pieces: string[]) => [
   JSON.stringify({
@@ -169,6 +198,7 @@ describe("a window-mode output guardrail holds a streamed response it cannot rel
   let sls: MockSls | undefined;
   let azure: { url: string; close: () => Promise<void> } | undefined;
   const upstreams: OpenAiUpstream[] = [];
+  const passthroughUpstreams = new Map<string, OpenAiUpstream>();
   let etcdReachable = false;
 
   const routes = [
@@ -264,8 +294,86 @@ describe("a window-mode output guardrail holds a streamed response it cannot rel
       }
     }
 
+    const addPassthrough = async (
+      name: string,
+      path_prefix: string,
+      upstream: OpenAiUpstream,
+      guardrail_id: string,
+    ) => {
+      upstreams.push(upstream);
+      passthroughUpstreams.set(name, upstream);
+      const providerKey = await seed.createProviderKey({
+        display_name: `${name}-pk`,
+        secret: "sk-mock",
+        api_base: `${upstream.baseUrl}/v1`,
+      });
+      const route = await seed.createPassthroughRoute({
+        name,
+        path_prefix,
+        target_url: `${upstream.baseUrl}/v1`,
+        provider_key_id: providerKey.id,
+      });
+      await seed.update("guardrail_attachments", randomUUID(), {
+        guardrail_id,
+        scope_type: "passthrough_route",
+        scope_id: route.id,
+        priority: 100,
+      });
+    };
+    await addPassthrough(
+      PASSTHROUGH_AT_CAP_ROUTE,
+      "/passthrough/window-cap-equal",
+      await startOpenAiUpstream({ streamEvents: WINDOW_AT_CAP_EVENTS }),
+      rows.closed[0]!.id,
+    );
+    await addPassthrough(
+      PASSTHROUGH_CLOSED_ROUTE,
+      "/passthrough/window-cap-closed",
+      await startOpenAiUpstream({ streamEvents: chatEvents(BIG) }),
+      rows.closed[0]!.id,
+    );
+    await addPassthrough(
+      PASSTHROUGH_OPEN_ROUTE,
+      "/passthrough/window-cap-open",
+      await startOpenAiUpstream({ streamEvents: WINDOW_OPEN_EVENTS }),
+      rows.open[0]!.id,
+    );
+    await addPassthrough(
+      PASSTHROUGH_OPEN_TAIL_ROUTE,
+      "/passthrough/window-cap-open-tail",
+      await startOpenAiUpstream({ rawStreamFrames: [WINDOW_TAIL_FRAME] }),
+      rows.open[0]!.id,
+    );
+    await addPassthrough(
+      PASSTHROUGH_CLOSED_TAIL_ROUTE,
+      "/passthrough/window-cap-closed-tail",
+      await startOpenAiUpstream({ rawStreamFrames: [WINDOW_CLOSED_TAIL_FRAME] }),
+      rows.closed[0]!.id,
+    );
+    await addPassthrough(
+      PASSTHROUGH_RAW_CLOSED_ROUTE,
+      "/passthrough/window-raw-cap-closed",
+      await startOpenAiUpstream({ rawStreamFrames: [WINDOW_RAW_FRAME] }),
+      rows.closed[0]!.id,
+    );
+    await addPassthrough(
+      PASSTHROUGH_RAW_OPEN_ROUTE,
+      "/passthrough/window-raw-cap-open",
+      await startOpenAiUpstream({ rawStreamFrames: [WINDOW_RAW_FRAME] }),
+      rows.open[0]!.id,
+    );
+    await addPassthrough(
+      PASSTHROUGH_FRAGMENT_CLOSED_ROUTE,
+      "/passthrough/window-fragment-cap-closed",
+      await startOpenAiUpstream({
+        rawStreamFrames: [WINDOW_UNTERMINATED_FRAME, "\n\n"],
+        eventDelayMs: 3_000,
+      }),
+      rows.closed[0]!.id,
+    );
+
     // Caller key LAST: it authenticating implies every row above is live.
-    await seed.createApiKey({ key_hash: hash(CALLER), allowed_models: ["*"] });
+    await seed.createApiKey({ key_hash: hash(CALLER), allowed_models: ["*"], allowed_routes: ["*"] });
     const proxy = new ProxyClient(app.proxyUrl, CALLER);
     await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
   }, 120_000);
@@ -297,6 +405,72 @@ describe("a window-mode output guardrail holds a streamed response it cannot rel
     return res.text();
   };
   const byModel = (model: string) => (l: Map<string, string>) => l.get("requested_model") === model;
+  const sendPassthrough = async (path: string) => {
+    const res = await fetch(`${app!.proxyUrl}${path}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${CALLER}`,
+        "x-api-key": CALLER,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: "go" }],
+        stream: true,
+      }),
+    });
+    return res.text();
+  };
+  const beforeTimeout = <T>(promise: Promise<T>, timeoutMs: number) =>
+    new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`passthrough response did not arrive within ${timeoutMs}ms`)),
+        timeoutMs,
+      );
+      void promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error: unknown) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  const passthroughUpstream = (name: string) => {
+    const upstream = passthroughUpstreams.get(name);
+    if (!upstream) throw new Error(`missing passthrough upstream for ${name}`);
+    return upstream;
+  };
+  const waitForPassthroughRequest = async (name: string, timeoutMs = 5_000) => {
+    const upstream = passthroughUpstream(name);
+    await new Promise<void>((resolve, reject) => {
+      const deadline = Date.now() + timeoutMs;
+      const poll = () => {
+        if (upstream.receivedRequests.length > 0) {
+          resolve();
+          return;
+        }
+        if (Date.now() >= deadline) {
+          reject(new Error(`upstream ${name} did not receive a request`));
+          return;
+        }
+        setTimeout(poll, 10);
+      };
+      poll();
+    });
+  };
+  const expectPassthroughRequest = (name: string) => {
+    const request = passthroughUpstream(name).receivedRequests[0];
+    expect(passthroughUpstream(name).receivedRequests).toHaveLength(1);
+    expect(request).toMatchObject({ method: "POST", path: "/v1/chat/completions" });
+    expect(JSON.parse(request!.body)).toMatchObject({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: "go" }],
+      stream: true,
+    });
+  };
 
   for (const r of routes) {
     test(`${r.route}: a default window row does not tighten a 1 MiB fail_open buffer_full sibling`, async (ctx) => {
@@ -370,4 +544,151 @@ describe("a window-mode output guardrail holds a streamed response it cannot rel
       );
     });
   }
+
+  test("passthrough route: a Window cap does not trip at exactly its configured content limit", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const body = await sendPassthrough("/passthrough/window-cap-equal");
+    expectPassthroughRequest(PASSTHROUGH_AT_CAP_ROUTE);
+    expect(body).toContain(WINDOW_AT_CAP_MARKER);
+    expect(body).not.toContain("output_buffer_exceeded");
+    const log = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (l) => l.get("passthrough_route_name") === PASSTHROUGH_AT_CAP_ROUTE,
+      "passthrough Window at-cap control",
+    );
+    expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
+    expect(log.get("guardrail_bypassed_reason") ?? "").toBe("");
+    expect(JSON.parse(log.get("guardrail_enforced_hits") ?? "[]")).toEqual([]);
+  });
+
+  test("passthrough route: a Window cap refuses regular SSE frames before the window closes", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const body = await sendPassthrough("/passthrough/window-cap-closed");
+    expectPassthroughRequest(PASSTHROUGH_CLOSED_ROUTE);
+    expect(body).toContain("output_buffer_exceeded");
+    expect(body, "a Window cap must not release its held prefix before refusing").not.toContain(BIG[0]);
+    expect(body).not.toContain(BIG[29]);
+    const log = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (l) => l.get("passthrough_route_name") === PASSTHROUGH_CLOSED_ROUTE && l.get("guardrail_blocked") === "true",
+      "passthrough Window fail-closed cap",
+    );
+    const hits = JSON.parse(log.get("guardrail_enforced_hits") ?? "[]") as EnforcedHit[];
+    expect(hits.map(({ guardrail_name, hook, action }) => ({ guardrail_name, hook, action }))).toEqual([
+      { guardrail_name: CLOSED_ROW, hook: "output", action: "blocked_buffer_exceeded" },
+    ]);
+  });
+
+  test("passthrough route: a Window fail-open cap does not rescan regular frames at EOF", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const body = await sendPassthrough("/passthrough/window-cap-open");
+    expectPassthroughRequest(PASSTHROUGH_OPEN_ROUTE);
+    expect(body, "fail_open releases the held regular frames").toContain(WINDOW_OPEN_MARKER);
+    expect(body, "a later EOF scan must not retract fail-open content").toContain(FLAGGED);
+    expect(body).not.toContain("output_buffer_exceeded");
+    const log = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (l) => l.get("passthrough_route_name") === PASSTHROUGH_OPEN_ROUTE,
+      "passthrough Window regular-frame fail-open cap",
+    );
+    expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
+    expect(log.get("guardrail_bypassed_reason")).toBe("output_buffer_exceeded");
+    expect(JSON.parse(log.get("guardrail_enforced_hits") ?? "[]")).toEqual([]);
+  });
+
+  test("passthrough route: a Window cap fails open for an unterminated final SSE frame", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const body = await sendPassthrough("/passthrough/window-cap-open-tail");
+    expectPassthroughRequest(PASSTHROUGH_OPEN_TAIL_ROUTE);
+    expect(body, "fail_open releases the held final frame").toContain(WINDOW_TAIL_MARKER);
+    expect(body, "the final frame is not rescanned after it is released").toContain(FLAGGED);
+    expect(body).not.toContain("output_buffer_exceeded");
+    const log = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (l) => l.get("passthrough_route_name") === PASSTHROUGH_OPEN_TAIL_ROUTE,
+      "passthrough Window unterminated-tail fail-open cap",
+    );
+    expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
+    expect(log.get("guardrail_bypassed_reason")).toBe("output_buffer_exceeded");
+    expect(JSON.parse(log.get("guardrail_enforced_hits") ?? "[]")).toEqual([]);
+  });
+
+  test("passthrough route: a Window cap refuses an unterminated final SSE frame under fail_closed", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const body = await sendPassthrough("/passthrough/window-cap-closed-tail");
+    expectPassthroughRequest(PASSTHROUGH_CLOSED_TAIL_ROUTE);
+    expect(body).toContain("output_buffer_exceeded");
+    expect(body, "the terminal frame remains held when the cap fails closed").not.toContain(WINDOW_CLOSED_TAIL_MARKER);
+    const log = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (l) => l.get("passthrough_route_name") === PASSTHROUGH_CLOSED_TAIL_ROUTE && l.get("guardrail_blocked") === "true",
+      "passthrough Window unterminated-tail fail-closed cap",
+    );
+    const hits = JSON.parse(log.get("guardrail_enforced_hits") ?? "[]") as EnforcedHit[];
+    expect(hits.map(({ guardrail_name, hook, action }) => ({ guardrail_name, hook, action }))).toEqual([
+      { guardrail_name: CLOSED_ROW, hook: "output", action: "blocked_buffer_exceeded" },
+    ]);
+  });
+
+  test("passthrough route: a Window raw-byte cap refuses a delta-free keepalive frame", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const body = await sendPassthrough("/passthrough/window-raw-cap-closed");
+    expectPassthroughRequest(PASSTHROUGH_RAW_CLOSED_ROUTE);
+    expect(body).toContain("output_buffer_exceeded");
+    expect(body, "a delta-free frame still counts toward the raw held-byte cap").not.toContain(WINDOW_RAW_MARKER);
+    const log = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (l) => l.get("passthrough_route_name") === PASSTHROUGH_RAW_CLOSED_ROUTE && l.get("guardrail_blocked") === "true",
+      "passthrough Window raw-byte fail-closed cap",
+    );
+    const hits = JSON.parse(log.get("guardrail_enforced_hits") ?? "[]") as EnforcedHit[];
+    expect(hits.map(({ guardrail_name, hook, action }) => ({ guardrail_name, hook, action }))).toEqual([
+      { guardrail_name: CLOSED_ROW, hook: "output", action: "blocked_buffer_exceeded" },
+    ]);
+  });
+
+  test("passthrough route: a Window raw-byte cap releases a delta-free keepalive frame under fail_open", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const body = await sendPassthrough("/passthrough/window-raw-cap-open");
+    expectPassthroughRequest(PASSTHROUGH_RAW_OPEN_ROUTE);
+    expect(body, "fail_open releases the raw keepalive frame").toContain(WINDOW_RAW_MARKER);
+    expect(body).not.toContain("output_buffer_exceeded");
+    const log = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (l) => l.get("passthrough_route_name") === PASSTHROUGH_RAW_OPEN_ROUTE,
+      "passthrough Window raw-byte fail-open cap",
+    );
+    expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
+    expect(log.get("guardrail_bypassed_reason")).toBe("output_buffer_exceeded");
+    expect(JSON.parse(log.get("guardrail_enforced_hits") ?? "[]")).toEqual([]);
+  });
+
+  test("passthrough route: a Window frame cap applies before an unterminated upstream frame reaches EOF", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const response = sendPassthrough("/passthrough/window-fragment-cap-closed");
+    await waitForPassthroughRequest(PASSTHROUGH_FRAGMENT_CLOSED_ROUTE);
+    const body = await beforeTimeout(response, 1_500);
+    expectPassthroughRequest(PASSTHROUGH_FRAGMENT_CLOSED_ROUTE);
+    expect(body).toContain("output_buffer_exceeded");
+    expect(body, "the oversized partial frame remains held when the cap fails closed").not.toContain(
+      WINDOW_FRAGMENT_MARKER,
+    );
+    const log = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (l) => l.get("passthrough_route_name") === PASSTHROUGH_FRAGMENT_CLOSED_ROUTE && l.get("guardrail_blocked") === "true",
+      "passthrough Window unterminated-frame fail-closed cap",
+    );
+    const hits = JSON.parse(log.get("guardrail_enforced_hits") ?? "[]") as EnforcedHit[];
+    expect(hits.map(({ guardrail_name, hook, action }) => ({ guardrail_name, hook, action }))).toEqual([
+      { guardrail_name: CLOSED_ROW, hook: "output", action: "blocked_buffer_exceeded" },
+    ]);
+  });
 });

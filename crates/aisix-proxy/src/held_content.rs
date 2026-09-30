@@ -1,7 +1,7 @@
 //! What a streamed output guardrail's `max_buffer_bytes` measures (#513).
 //!
-//! While a stream is held back for output inspection
-//! ([`aisix_guardrails::StreamOutputPolicy::BufferFull`]), the cap bounds
+//! While a stream is held back for output inspection (a hold-back
+//! [`aisix_guardrails::StreamOutputPolicy`]), the cap bounds
 //! the model-generated content held: assistant text, reasoning, and
 //! tool-call arguments. SSE and JSON framing — event names, ids, indexes,
 //! the envelope around each delta — is never counted, so the same response
