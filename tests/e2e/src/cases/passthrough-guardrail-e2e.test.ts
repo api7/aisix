@@ -102,8 +102,8 @@ describe("passthrough guardrail (#911 [6])", () => {
 
     sseUpstream = await startOpenAiUpstream({
       streamEvents: [
-        JSON.stringify({ choices: [{ delta: { content: "prelude " } }] }),
-        JSON.stringify({ choices: [{ delta: { content: FORBIDDEN_OUTPUT } }] }),
+        JSON.stringify({ choices: [{ index: 0, delta: { content: "prelude " } }] }),
+        JSON.stringify({ choices: [{ index: 0, delta: { content: FORBIDDEN_OUTPUT } }] }),
         "[DONE]",
       ],
     });

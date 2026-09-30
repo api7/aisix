@@ -1399,6 +1399,15 @@ fn decoded_json_string_values_except_root_keys(body: &[u8], excluded: &[&str]) -
     .ok()
 }
 
+fn decoded_json_string_values_except_root_keys_vec(
+    body: &[u8],
+    excluded: &[&str],
+) -> Option<Vec<String>> {
+    decoded_json_string_values_vec_where(body, |path| {
+        !excluded.iter().any(|key| is_root_key(path, key))
+    })
+}
+
 /// Source values of all occurrences of one top-level key. `RawValue` keeps
 /// repeated keys separate, unlike `serde_json::Value`.
 fn raw_top_level_values(
@@ -1565,6 +1574,63 @@ fn raw_top_level_string_values(body: &[u8], key: &str) -> Option<Vec<String>> {
         .into_iter()
         .map(|value| serde_json::from_str::<String>(value.get()).ok())
         .collect()
+}
+
+fn raw_top_level_unique_string(body: &[u8], key: &str) -> Result<Option<String>, ()> {
+    let mut values = raw_top_level_values(body, key).ok_or(())?;
+    match values.len() {
+        0 => Ok(None),
+        1 => serde_json::from_str(values.pop().expect("one value").get())
+            .map(Some)
+            .map_err(|_| ()),
+        _ => Err(()),
+    }
+}
+
+fn raw_top_level_unique_index(body: &[u8], key: &str) -> Result<Option<usize>, ()> {
+    let mut values = raw_top_level_values(body, key).ok_or(())?;
+    match values.len() {
+        0 => Ok(None),
+        1 => serde_json::from_str(values.pop().expect("one value").get())
+            .map(Some)
+            .map_err(|_| ()),
+        _ => Err(()),
+    }
+}
+
+fn raw_top_level_unique_object(
+    body: &[u8],
+    key: &str,
+) -> Result<Option<Box<serde_json::value::RawValue>>, ()> {
+    let mut values = raw_top_level_values(body, key).ok_or(())?;
+    match values.len() {
+        0 => Ok(None),
+        1 => {
+            let value = values.pop().expect("one value");
+            raw_is_object(&value).then_some(value).ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+fn raw_top_level_unique_array(
+    body: &[u8],
+    key: &str,
+) -> Result<Option<Box<serde_json::value::RawValue>>, ()> {
+    let mut values = raw_top_level_values(body, key).ok_or(())?;
+    match values.len() {
+        0 => Ok(None),
+        1 => {
+            let value = values.pop().expect("one value");
+            value
+                .get()
+                .trim_start()
+                .starts_with('[')
+                .then_some(value)
+                .ok_or(())
+        }
+        _ => Err(()),
+    }
 }
 
 /// The typed content extractors inspect a bare string or the direct `text`
@@ -2423,6 +2489,21 @@ fn path_is_within_base(candidate: &str, base: &str) -> bool {
 /// bounded while the policy semantics degrade gracefully.
 const MAX_HELD_STREAM_BYTES: usize = 1024 * 1024;
 
+/// Bound independently scanned output candidates even when an upstream never
+/// emits its terminal item event. Two source branches (first/last) are kept
+/// for each identity; supplemental values consume the same budget so one
+/// frame cannot fan out into an unbounded number of guardrail calls.
+const MAX_STREAM_GUARDRAIL_CHANNELS: usize = 64;
+
+/// Empty epochs still occupy bookkeeping and eventually trigger a custom
+/// guardrail scan, so cap them separately from their text candidates.
+const MAX_STREAM_GUARDRAIL_EPOCHS: usize = 64;
+
+/// Source identities are bookkeeping only, never output text. Bound them
+/// separately so a few large provider item ids cannot dominate the relay's
+/// memory while the content-channel cap still sees only 64 branches.
+const MAX_STREAM_GUARDRAIL_SOURCE_ID_BYTES: usize = 256;
+
 /// The gateway's shared frame splitter, with this relay's overflow policy:
 /// an oversized unterminated run is handed on as a frame. Bytes after the
 /// last complete frame stay buffered until more arrive; `take_rest` drains
@@ -2560,6 +2641,7 @@ fn hidden_chat_stream_reasoning_frame(body: &[u8]) -> Option<bool> {
     }
 }
 
+#[cfg(test)]
 fn decoded_chat_frame_string_values(body: &[u8]) -> Option<String> {
     match raw_top_level_unique_type(body).as_deref() {
         Some("content_block_delta")
@@ -2592,6 +2674,7 @@ fn decoded_chat_frame_string_values(body: &[u8]) -> Option<String> {
 /// `.done`, output-item, and terminal response snapshots repeat those
 /// carriers. Keep the raw source pass on that same boundary, both to avoid
 /// duplicate external moderation and to keep any opaque terminal media out.
+#[cfg(test)]
 fn decoded_responses_frame_string_values(body: &[u8]) -> Option<String> {
     let mut out = String::new();
     if raw_top_level_has_only_types(body, RESPONSES_VISIBLE_DELTA_EVENTS) {
@@ -2732,11 +2815,11 @@ fn is_completions_continuation_path(path: &[crate::json_splice::PathSeg]) -> boo
 /// fields. Supplementary scan text therefore excludes those same paths: a
 /// normal frame must not send one visible value to a guardrail as typed,
 /// source, and supplementary text at once.
-fn decoded_chat_frame_supplemental_string_values(body: &[u8]) -> Option<String> {
+fn decoded_chat_frame_supplemental_values(body: &[u8]) -> Option<Vec<String>> {
     let anthropic_delta = raw_top_level_has_any_type(body, &["content_block_delta"]);
     let anthropic_start =
         !anthropic_delta && raw_top_level_has_any_type(body, &["content_block_start"]);
-    decoded_json_string_values_where(body, |path| {
+    decoded_json_string_values_vec_where(body, |path| {
         !is_root_key(path, "model")
             && !is_hidden_chat_stream_reasoning_path(path)
             && !(if anthropic_delta {
@@ -2749,67 +2832,634 @@ fn decoded_chat_frame_supplemental_string_values(body: &[u8]) -> Option<String> 
     })
 }
 
-fn decoded_completions_frame_supplemental_string_values(body: &[u8]) -> Option<String> {
-    decoded_json_string_values_where(body, |path| {
+fn decoded_completions_frame_supplemental_values(body: &[u8]) -> Option<Vec<String>> {
+    decoded_json_string_values_vec_where(body, |path| {
         !is_root_key(path, "model") && !is_completions_continuation_path(path)
     })
 }
 
-fn decoded_responses_frame_continuations(body: &[u8]) -> Option<Vec<String>> {
-    if !raw_top_level_has_only_types(body, RESPONSES_VISIBLE_DELTA_EVENTS) {
-        return None;
-    }
-    raw_top_level_string_values(body, "delta").filter(|values| !values.is_empty())
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StreamContinuation {
+    key: String,
+    /// A semantic carrier family. A source form that has no durable carrier
+    /// identity is never allowed to merge with a different member of this
+    /// family on a later frame.
+    family: String,
+    identity: String,
+    identity_is_ambiguous: bool,
+    text: String,
 }
 
-fn frame_source_continuations(
+enum SourceContinuations {
+    Absent,
+    Ready(Vec<StreamContinuation>),
+    Unevaluable,
+}
+
+fn valid_stream_source_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_STREAM_GUARDRAIL_SOURCE_ID_BYTES
+}
+
+fn bounded_stream_source_id(id: String) -> Result<String, ()> {
+    if !valid_stream_source_id(&id) {
+        Err(())
+    } else {
+        Ok(id)
+    }
+}
+
+fn append_source_branches(
+    out: &mut Vec<StreamContinuation>,
+    seen_keys: &mut std::collections::HashSet<String>,
+    source_values: &mut Vec<String>,
+    family: String,
+    identity: String,
+    identity_is_ambiguous: bool,
+    values: Vec<String>,
+) -> Result<(), ()> {
+    let (first, last) = match values.as_slice() {
+        [] => return Ok(()),
+        [only] => (only, only),
+        [first, last] => (first, last),
+        _ => return Err(()),
+    };
+    source_values.extend(values.iter().cloned());
+    for (branch, value) in [("first", first), ("last", last)] {
+        let key = format!("{family}:{identity}:{branch}");
+        if !seen_keys.insert(key.clone()) {
+            return Err(());
+        }
+        out.push(StreamContinuation {
+            key,
+            family: family.clone(),
+            identity: identity.clone(),
+            identity_is_ambiguous,
+            text: value.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn source_values_match_expected(mut source_values: Vec<String>, mut expected: Vec<String>) -> bool {
+    // Object member order is not semantic. Keep duplicate counts, but do not
+    // reject a valid source frame merely because a provider serialised its
+    // tool fields before its text field.
+    source_values.sort_unstable();
+    expected.sort_unstable();
+    source_values == expected
+}
+
+fn responses_source_continuations(payload: &[u8]) -> SourceContinuations {
+    let kind = match raw_top_level_unique_string(payload, "type") {
+        Ok(Some(kind)) if RESPONSES_VISIBLE_DELTA_EVENTS.contains(&kind.as_str()) => kind,
+        Ok(Some(_)) | Ok(None) => return SourceContinuations::Absent,
+        Err(()) => return SourceContinuations::Unevaluable,
+    };
+    let item_id = match raw_top_level_unique_string(payload, "item_id") {
+        Ok(Some(item_id)) => match bounded_stream_source_id(item_id) {
+            Ok(item_id) => item_id,
+            Err(()) => return SourceContinuations::Unevaluable,
+        },
+        Ok(None) | Err(()) => return SourceContinuations::Unevaluable,
+    };
+    let output_index = match raw_top_level_unique_index(payload, "output_index") {
+        Ok(Some(index)) => index.to_string(),
+        Ok(None) | Err(()) => return SourceContinuations::Unevaluable,
+    };
+    let content_index = if kind == "response.output_text.delta" {
+        match raw_top_level_unique_index(payload, "content_index") {
+            Ok(Some(index)) => index.to_string(),
+            Ok(None) | Err(()) => return SourceContinuations::Unevaluable,
+        }
+    } else {
+        // Tool-argument deltas have no content part. Their stable identity is
+        // the item plus output index and event kind; an incidental content
+        // field must not create a second source channel.
+        String::new()
+    };
+    let values = match raw_top_level_string_values(payload, "delta") {
+        Some(values) => values,
+        None => return SourceContinuations::Unevaluable,
+    };
+    if values.is_empty() {
+        return SourceContinuations::Absent;
+    }
+    let mut out = Vec::new();
+    let mut keys = std::collections::HashSet::new();
+    let mut source_values = Vec::new();
+    let family = format!("responses:{item_id:?}");
+    let identity = format!("{kind:?}:{output_index}:{content_index}:delta");
+    if append_source_branches(
+        &mut out,
+        &mut keys,
+        &mut source_values,
+        family,
+        identity,
+        false,
+        values,
+    )
+    .is_err()
+    {
+        return SourceContinuations::Unevaluable;
+    }
+    SourceContinuations::Ready(out)
+}
+
+fn append_raw_string_carrier(
+    out: &mut Vec<StreamContinuation>,
+    keys: &mut std::collections::HashSet<String>,
+    source_values: &mut Vec<String>,
+    family: String,
+    identity: String,
+    identity_is_ambiguous: bool,
+    body: &[u8],
+    key: &str,
+) -> Result<(), ()> {
+    append_source_branches(
+        out,
+        keys,
+        source_values,
+        family,
+        identity,
+        identity_is_ambiguous,
+        raw_top_level_string_values(body, key).ok_or(())?,
+    )
+}
+
+fn raw_part_identity(body: &[u8]) -> Result<String, ()> {
+    // Content arrays can repeat a visible `text` field. Their numeric index
+    // is the only canonical identity that remains stable when a provider
+    // later adds an optional `id`; id-only arrays use the unevaluable policy
+    // rather than silently switching source channels.
+    raw_top_level_unique_index(body, "index")?
+        .map(|index| format!("index:{index}"))
+        .ok_or(())
+}
+
+fn anthropic_source_continuations(
+    payload: &[u8],
+    kind: &str,
+    expected: Vec<String>,
+) -> SourceContinuations {
+    let index = match raw_top_level_unique_index(payload, "index") {
+        Ok(Some(index)) => index.to_string(),
+        _ => return SourceContinuations::Unevaluable,
+    };
+    let family = format!("anthropic:{index}");
+    let mut out = Vec::new();
+    let mut keys = std::collections::HashSet::new();
+    let mut source_values = Vec::new();
+    let result = match kind {
+        "content_block_delta" => {
+            let delta = match raw_top_level_unique_object(payload, "delta") {
+                Ok(Some(delta)) => delta,
+                _ => return SourceContinuations::Unevaluable,
+            };
+            let delta_body = delta.get().as_bytes();
+            append_raw_string_carrier(
+                &mut out,
+                &mut keys,
+                &mut source_values,
+                family.clone(),
+                "text".to_owned(),
+                false,
+                delta_body,
+                "text",
+            )
+            .and_then(|()| {
+                append_raw_string_carrier(
+                    &mut out,
+                    &mut keys,
+                    &mut source_values,
+                    family.clone(),
+                    "partial_json".to_owned(),
+                    false,
+                    delta_body,
+                    "partial_json",
+                )
+            })
+        }
+        "content_block_start" => {
+            let block = match raw_top_level_unique_object(payload, "content_block") {
+                Ok(Some(block)) => block,
+                _ => return SourceContinuations::Unevaluable,
+            };
+            let block_body = block.get().as_bytes();
+            append_raw_string_carrier(
+                &mut out,
+                &mut keys,
+                &mut source_values,
+                family.clone(),
+                "text".to_owned(),
+                false,
+                block_body,
+                "text",
+            )
+            .and_then(|()| {
+                let mut inputs = raw_top_level_values(block_body, "input").ok_or(())?;
+                let Some(input) = inputs.pop() else {
+                    return Ok(());
+                };
+                if !inputs.is_empty() {
+                    return Err(());
+                }
+                if input.get().trim_start().starts_with('"') {
+                    return append_raw_string_carrier(
+                        &mut out,
+                        &mut keys,
+                        &mut source_values,
+                        family.clone(),
+                        "input".to_owned(),
+                        false,
+                        block_body,
+                        "input",
+                    );
+                }
+                // A nested tool input can have many source leaves but no
+                // durable leaf identity on this envelope. An empty object is
+                // harmless; a visible value must use the bounded policy.
+                let text = crate::json_splice::collect_string_values(input.get().as_bytes())
+                    .map_err(|_| ())?;
+                if text.is_empty() {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            })
+        }
+        _ => return SourceContinuations::Absent,
+    };
+    if result.is_err() {
+        SourceContinuations::Unevaluable
+    } else if !source_values_match_expected(source_values, expected) {
+        SourceContinuations::Unevaluable
+    } else if out.is_empty() {
+        SourceContinuations::Absent
+    } else {
+        SourceContinuations::Ready(out)
+    }
+}
+
+fn chat_choice_source_continuations(payload: &[u8]) -> SourceContinuations {
+    let Some(expected) = decoded_chat_frame_continuations(payload) else {
+        return SourceContinuations::Absent;
+    };
+    let kind = match raw_top_level_unique_string(payload, "type") {
+        Ok(Some(kind)) => Some(kind),
+        Ok(None) => None,
+        Err(()) => return SourceContinuations::Unevaluable,
+    };
+    if let Some(kind @ ("content_block_delta" | "content_block_start")) = kind.as_deref() {
+        return anthropic_source_continuations(payload, kind, expected);
+    }
+    let choices = match raw_top_level_unique_array(payload, "choices") {
+        Ok(Some(choices)) => match raw_array_items(&choices) {
+            Some(choices) => choices,
+            None => return SourceContinuations::Unevaluable,
+        },
+        Ok(None) | Err(()) => return SourceContinuations::Unevaluable,
+    };
+    let mut out = Vec::new();
+    let mut keys = std::collections::HashSet::new();
+    let mut source_values = Vec::new();
+    let mut choice_indexes = std::collections::HashSet::new();
+    for choice in choices {
+        if !raw_is_object(&choice) {
+            return SourceContinuations::Unevaluable;
+        }
+        let choice_body = choice.get().as_bytes();
+        let choice_index = match raw_top_level_unique_index(choice_body, "index") {
+            Ok(Some(index)) if choice_indexes.insert(index) => index.to_string(),
+            _ => return SourceContinuations::Unevaluable,
+        };
+        let delta = match raw_top_level_unique_object(choice_body, "delta") {
+            Ok(Some(delta)) => delta,
+            Ok(None) => continue,
+            Err(()) => return SourceContinuations::Unevaluable,
+        };
+        let delta_body = delta.get().as_bytes();
+        let mut content = match raw_top_level_values(delta_body, "content") {
+            Some(content) => content,
+            None => return SourceContinuations::Unevaluable,
+        };
+        if content.len() > 1 {
+            return SourceContinuations::Unevaluable;
+        }
+        if let Some(content) = content.pop() {
+            match content.get().trim_start().as_bytes().first() {
+                Some(b'"') => {
+                    let value = match serde_json::from_str::<String>(content.get()) {
+                        Ok(value) => value,
+                        Err(_) => return SourceContinuations::Unevaluable,
+                    };
+                    if append_source_branches(
+                        &mut out,
+                        &mut keys,
+                        &mut source_values,
+                        format!("chat:{choice_index}:content"),
+                        "scalar".to_owned(),
+                        true,
+                        vec![value],
+                    )
+                    .is_err()
+                    {
+                        return SourceContinuations::Unevaluable;
+                    }
+                }
+                Some(b'[') => {
+                    let Some(parts) = raw_array_items(&content) else {
+                        return SourceContinuations::Unevaluable;
+                    };
+                    let mut part_ids = std::collections::HashSet::new();
+                    for part in parts {
+                        if !raw_is_object(&part) {
+                            return SourceContinuations::Unevaluable;
+                        }
+                        let text_values =
+                            match raw_top_level_string_values(part.get().as_bytes(), "text") {
+                                Some(text_values) => text_values,
+                                None => return SourceContinuations::Unevaluable,
+                            };
+                        if text_values.is_empty() {
+                            continue;
+                        }
+                        let part_id = match raw_part_identity(part.get().as_bytes()) {
+                            Ok(part_id) if part_ids.insert(part_id.clone()) => part_id,
+                            _ => return SourceContinuations::Unevaluable,
+                        };
+                        if append_source_branches(
+                            &mut out,
+                            &mut keys,
+                            &mut source_values,
+                            format!("chat:{choice_index}:content"),
+                            format!("part:{part_id}:text"),
+                            false,
+                            text_values,
+                        )
+                        .is_err()
+                        {
+                            return SourceContinuations::Unevaluable;
+                        }
+                    }
+                }
+                Some(b'n') => {}
+                _ => return SourceContinuations::Unevaluable,
+            }
+        }
+        let tool_calls = match raw_top_level_unique_array(delta_body, "tool_calls") {
+            Ok(tool_calls) => tool_calls,
+            Err(()) => return SourceContinuations::Unevaluable,
+        };
+        if let Some(tool_calls) = tool_calls {
+            let Some(tool_calls) = raw_array_items(&tool_calls) else {
+                return SourceContinuations::Unevaluable;
+            };
+            let mut tool_indexes = std::collections::HashSet::new();
+            for tool_call in tool_calls {
+                if !raw_is_object(&tool_call) {
+                    return SourceContinuations::Unevaluable;
+                }
+                let tool_body = tool_call.get().as_bytes();
+                let tool_index = match raw_top_level_unique_index(tool_body, "index") {
+                    Ok(Some(index)) if tool_indexes.insert(index) => index.to_string(),
+                    _ => return SourceContinuations::Unevaluable,
+                };
+                for (container, field) in [("function", "arguments"), ("custom", "input")] {
+                    let nested = match raw_top_level_unique_object(tool_body, container) {
+                        Ok(nested) => nested,
+                        Err(()) => return SourceContinuations::Unevaluable,
+                    };
+                    if let Some(nested) = nested {
+                        if append_raw_string_carrier(
+                            &mut out,
+                            &mut keys,
+                            &mut source_values,
+                            format!("chat:{choice_index}:tool:{tool_index}"),
+                            format!("{container}:{field}"),
+                            false,
+                            nested.get().as_bytes(),
+                            field,
+                        )
+                        .is_err()
+                        {
+                            return SourceContinuations::Unevaluable;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    source_values_match_expected(source_values, expected)
+        .then_some(SourceContinuations::Ready(out))
+        .unwrap_or(SourceContinuations::Unevaluable)
+}
+
+fn completions_source_continuations(payload: &[u8]) -> SourceContinuations {
+    let Some(expected) = decoded_completions_frame_continuations(payload) else {
+        return SourceContinuations::Absent;
+    };
+    let choices = match raw_top_level_unique_array(payload, "choices") {
+        Ok(Some(choices)) => match raw_array_items(&choices) {
+            Some(choices) => choices,
+            None => return SourceContinuations::Unevaluable,
+        },
+        Ok(None) | Err(()) => return SourceContinuations::Unevaluable,
+    };
+    let mut out = Vec::new();
+    let mut keys = std::collections::HashSet::new();
+    let mut source_values = Vec::new();
+    let mut choice_indexes = std::collections::HashSet::new();
+    for choice in choices {
+        if !raw_is_object(&choice) {
+            return SourceContinuations::Unevaluable;
+        }
+        let choice_body = choice.get().as_bytes();
+        let choice_index = match raw_top_level_unique_index(choice_body, "index") {
+            Ok(Some(index)) if choice_indexes.insert(index) => index.to_string(),
+            _ => return SourceContinuations::Unevaluable,
+        };
+        if append_raw_string_carrier(
+            &mut out,
+            &mut keys,
+            &mut source_values,
+            format!("completions:{choice_index}"),
+            "text".to_owned(),
+            false,
+            choice_body,
+            "text",
+        )
+        .is_err()
+        {
+            return SourceContinuations::Unevaluable;
+        }
+    }
+    source_values_match_expected(source_values, expected)
+        .then_some(SourceContinuations::Ready(out))
+        .unwrap_or(SourceContinuations::Unevaluable)
+}
+
+fn stream_source_continuations(
     protocol: PassthroughProtocol,
     payload: &[u8],
-) -> Option<Vec<String>> {
+) -> SourceContinuations {
+    let payload = payload.trim_ascii();
+    if payload.is_empty() || payload == b"[DONE]" {
+        return SourceContinuations::Absent;
+    }
     match protocol {
-        PassthroughProtocol::Raw => decoded_json_string_values(payload).map(|text| vec![text]),
-        PassthroughProtocol::OpenaiChat => decoded_chat_frame_continuations(payload),
-        PassthroughProtocol::OpenaiCompletions => decoded_completions_frame_continuations(payload),
-        PassthroughProtocol::OpenaiResponses => decoded_responses_frame_continuations(payload),
+        // An opaque protocol offers no carrier identity inside a JSON object
+        // or array. A bare JSON string is the one unambiguous source carrier;
+        // every broader Raw shape follows the configured unevaluable policy.
+        PassthroughProtocol::Raw => match serde_json::from_slice::<String>(payload) {
+            Ok(text) if !text.is_empty() => SourceContinuations::Ready(vec![StreamContinuation {
+                key: "raw:payload:first".to_owned(),
+                family: "raw".to_owned(),
+                identity: "payload".to_owned(),
+                identity_is_ambiguous: false,
+                text,
+            }]),
+            Ok(_) => SourceContinuations::Absent,
+            Err(_) => SourceContinuations::Unevaluable,
+        },
+        PassthroughProtocol::OpenaiChat => chat_choice_source_continuations(payload),
+        PassthroughProtocol::OpenaiCompletions => completions_source_continuations(payload),
+        PassthroughProtocol::OpenaiResponses => responses_source_continuations(payload),
     }
 }
 
-fn frame_guardrail_supplemental_text(
+fn responses_terminal_continuation_prefix(payload: &[u8]) -> Result<Option<String>, ()> {
+    let kind = match raw_top_level_unique_string(payload, "type") {
+        Ok(Some(kind)) => kind,
+        Ok(None) => return Ok(None),
+        Err(()) => return Err(()),
+    };
+    if kind != "response.output_item.done" {
+        return Ok(None);
+    }
+    let top_level_id = raw_top_level_unique_string(payload, "item_id")?;
+    let nested_id = match raw_top_level_unique_object(payload, "item")? {
+        Some(item) => raw_top_level_unique_string(item.get().as_bytes(), "id")?,
+        None => None,
+    };
+    if top_level_id
+        .as_ref()
+        .is_some_and(|item_id| !valid_stream_source_id(item_id))
+        || nested_id
+            .as_ref()
+            .is_some_and(|item_id| !valid_stream_source_id(item_id))
+    {
+        return Err(());
+    }
+    let item_id = match (top_level_id, nested_id) {
+        (Some(top_level_id), Some(nested_id)) if top_level_id == nested_id => Some(top_level_id),
+        (Some(top_level_id), None) => Some(top_level_id),
+        (None, Some(nested_id)) => Some(nested_id),
+        (None, None) => None,
+        (Some(_), Some(_)) => return Err(()),
+    };
+    Ok(item_id.map(|item_id| format!("responses:{item_id:?}:")))
+}
+
+fn frame_guardrail_supplemental_values(
     protocol: PassthroughProtocol,
     frame: &[u8],
     has_source_continuations: bool,
     has_typed_continuation: bool,
-) -> String {
+) -> Vec<String> {
     // On a malformed or unknown frame, typed extraction is the only
     // available output carrier. It already contains the raw fallback, so a
     // second generic scan would double-count it.
     if has_typed_continuation && !has_source_continuations {
-        return String::new();
+        return Vec::new();
     }
     if !has_source_continuations {
-        return frame_guardrail_text(protocol, frame);
+        return frame_guardrail_values(protocol, frame);
     }
 
     let Some(payload) = crate::redact::frame_payload(frame) else {
-        return String::new();
+        return Vec::new();
     };
     let payload = payload.trim();
     if payload.is_empty() || payload == "[DONE]" {
-        return String::new();
+        return Vec::new();
     }
     match protocol {
         // The raw source continuation is the complete decoded payload.
-        PassthroughProtocol::Raw => String::new(),
+        PassthroughProtocol::Raw => Vec::new(),
         PassthroughProtocol::OpenaiChat => {
-            decoded_chat_frame_supplemental_string_values(payload.as_bytes()).unwrap_or_default()
+            decoded_chat_frame_supplemental_values(payload.as_bytes()).unwrap_or_default()
         }
         PassthroughProtocol::OpenaiCompletions => {
-            decoded_completions_frame_supplemental_string_values(payload.as_bytes())
-                .unwrap_or_default()
+            decoded_completions_frame_supplemental_values(payload.as_bytes()).unwrap_or_default()
         }
         // Responses source continuations exist only for the explicitly safe
         // text/tool delta events, whose sole output carrier is `delta`.
-        PassthroughProtocol::OpenaiResponses => String::new(),
+        PassthroughProtocol::OpenaiResponses => Vec::new(),
+    }
+}
+
+fn decoded_chat_frame_values(body: &[u8]) -> Option<Vec<String>> {
+    match raw_top_level_unique_type(body).as_deref() {
+        Some("content_block_delta")
+            if raw_top_level_items_have_only_types(
+                body,
+                "delta",
+                &["thinking_delta", "signature_delta"],
+            )? =>
+        {
+            return decoded_json_string_values_except_root_keys_vec(body, &["model", "delta"]);
+        }
+        Some("content_block_start")
+            if raw_top_level_items_have_only_types(
+                body,
+                "content_block",
+                &["thinking", "redacted_thinking"],
+            )? =>
+        {
+            return decoded_json_string_values_except_root_keys_vec(
+                body,
+                &["model", "content_block"],
+            );
+        }
+        _ => {}
+    }
+    decoded_json_string_values_vec_where(body, |path| {
+        !is_root_key(path, "model") && !is_hidden_chat_stream_reasoning_path(path)
+    })
+}
+
+fn decoded_responses_frame_values(body: &[u8]) -> Option<Vec<String>> {
+    raw_top_level_has_only_types(body, RESPONSES_VISIBLE_DELTA_EVENTS)
+        .then(|| raw_top_level_string_values(body, "delta"))
+        .flatten()
+        .or_else(|| Some(Vec::new()))
+}
+
+fn frame_guardrail_values(protocol: PassthroughProtocol, frame: &[u8]) -> Vec<String> {
+    let Some(payload) = crate::redact::frame_payload(frame) else {
+        return Vec::new();
+    };
+    let payload = payload.trim();
+    if payload.is_empty() || payload == "[DONE]" {
+        return Vec::new();
+    }
+    let raw = || vec![payload.to_string()];
+    match protocol {
+        PassthroughProtocol::Raw => {
+            decoded_json_string_values_vec_where(payload.as_bytes(), |_| true).unwrap_or_else(raw)
+        }
+        PassthroughProtocol::OpenaiChat => {
+            decoded_chat_frame_values(payload.as_bytes()).unwrap_or_else(raw)
+        }
+        PassthroughProtocol::OpenaiCompletions => {
+            decoded_json_string_values_vec_where(payload.as_bytes(), |path| {
+                !is_root_key(path, "model")
+            })
+            .unwrap_or_else(raw)
+        }
+        PassthroughProtocol::OpenaiResponses => {
+            decoded_responses_frame_values(payload.as_bytes()).unwrap_or_default()
+        }
     }
 }
 
@@ -2817,6 +3467,7 @@ fn frame_guardrail_supplemental_text(
 /// their typed visible-content extraction in [`frame_parts`], while this
 /// source-preserving pass retains duplicate selected carriers. Responses
 /// media fields remain opaque even when forwarded verbatim.
+#[cfg(test)]
 fn frame_guardrail_text(protocol: PassthroughProtocol, frame: &[u8]) -> String {
     let Some(payload) = crate::redact::frame_payload(frame) else {
         return String::new();
@@ -2845,15 +3496,20 @@ fn frame_guardrail_text(protocol: PassthroughProtocol, frame: &[u8]) -> String {
     }
 }
 
-/// The independent channels scanned for one stream frame. The first
-/// continuation is the typed visible-output sequence when it maps to one raw
-/// carrier; later channels retain source-only duplicate occurrences across
-/// frames. `supplemental` preserves selected non-carrier source values.
-/// Keeping them separate prevents frame metadata from interrupting a
-/// sensitive literal split across output deltas.
+/// The independent source-identified channels scanned for one stream frame.
+/// `supplemental` preserves selected non-carrier source values. Keeping them
+/// separate prevents frame metadata from interrupting a sensitive literal
+/// split across output deltas.
 struct StreamGuardrailText {
-    continuations: Vec<String>,
-    supplemental: String,
+    continuations: Vec<StreamContinuation>,
+    /// Values with no continuation carrier. They are checked separately so
+    /// unrelated JSON fields cannot become one regex/remote-model segment.
+    supplemental: Vec<String>,
+    unevaluable: bool,
+    /// Responses item closures wait until their already-buffered text has
+    /// passed a guardrail scan. Removing them on the terminal event would
+    /// erase a short delta before an end-of-stream or full-buffer scan.
+    closed_prefixes: Vec<String>,
 }
 
 fn stream_guardrail_text(
@@ -2861,10 +3517,6 @@ fn stream_guardrail_text(
     frame: &[u8],
     continuation: String,
 ) -> StreamGuardrailText {
-    // Keep the typed continuation in a stable first channel when it maps to
-    // one raw carrier. Source-only duplicate occurrences occupy later
-    // channels, preserving bytes a JSON client would discard without sending
-    // the canonical value to the guardrail twice.
     let payload = crate::redact::frame_payload(frame);
     let hidden_reasoning = matches!(protocol, PassthroughProtocol::OpenaiChat)
         && payload.as_ref().is_some_and(|payload| {
@@ -2882,76 +3534,262 @@ fn stream_guardrail_text(
         continuation
     };
     let has_typed_continuation = !typed_continuation.is_empty();
-    let source = payload
-        .and_then(|payload| frame_source_continuations(protocol, payload.trim().as_bytes()))
-        .filter(|source| !source.is_empty());
-    let has_source_continuations = source.is_some();
-    let continuations = match source {
-        Some(mut source) if has_typed_continuation => {
-            if let Some(canonical) = source
-                .iter()
-                .rposition(|candidate| candidate == &typed_continuation)
-            {
-                source.remove(canonical);
-                let mut continuations = vec![typed_continuation];
-                continuations.extend(source);
-                continuations
-            } else {
-                // Multiple source carriers can make a typed extractor join
-                // distinct values. Keep the source occurrences only rather
-                // than scanning their joined representation in addition.
-                source
-            }
-        }
-        Some(source) => source,
-        None => vec![typed_continuation],
+    let source = if hidden_reasoning {
+        SourceContinuations::Absent
+    } else {
+        payload
+            .as_ref()
+            .map_or(SourceContinuations::Absent, |payload| {
+                stream_source_continuations(protocol, payload.trim().as_bytes())
+            })
     };
+    let (closed_prefixes, terminal_unevaluable) =
+        if matches!(protocol, PassthroughProtocol::OpenaiResponses) {
+            match payload
+                .as_ref()
+                .map(|payload| responses_terminal_continuation_prefix(payload.trim().as_bytes()))
+            {
+                Some(Ok(Some(prefix))) => (vec![prefix], false),
+                Some(Ok(None)) | None => (Vec::new(), false),
+                Some(Err(())) => (Vec::new(), true),
+            }
+        } else {
+            (Vec::new(), false)
+        };
+    let (continuations, has_source_continuations, source_unevaluable) = match source {
+        SourceContinuations::Ready(source) => {
+            let has_source_continuations = !source.is_empty();
+            (source, has_source_continuations, false)
+        }
+        // A typed visible delta without a source carrier proof cannot be
+        // continued safely into the next frame. Do not create a generic
+        // positional fallback channel for it.
+        SourceContinuations::Absent if has_typed_continuation => (Vec::new(), false, true),
+        SourceContinuations::Absent => (Vec::new(), false, false),
+        // Do not assign an ordinal to an unkeyable source channel. The
+        // caller applies the configured fail-open/fail-closed policy.
+        SourceContinuations::Unevaluable => (Vec::new(), false, true),
+    };
+    let unevaluable = source_unevaluable || terminal_unevaluable;
     StreamGuardrailText {
         continuations,
-        supplemental: frame_guardrail_supplemental_text(
-            protocol,
-            frame,
-            has_source_continuations,
-            has_typed_continuation,
-        ),
+        supplemental: (!unevaluable)
+            .then(|| {
+                frame_guardrail_supplemental_values(
+                    protocol,
+                    frame,
+                    has_source_continuations,
+                    has_typed_continuation,
+                )
+            })
+            .unwrap_or_default(),
+        unevaluable,
+        closed_prefixes,
     }
 }
 
 fn append_stream_guardrail_text(
-    continuations: &mut Vec<String>,
-    supplemental: &mut String,
+    continuations: &mut Vec<StreamContinuation>,
+    _continuation_tails: &mut Vec<StreamContinuation>,
+    supplemental: &mut Vec<String>,
+    closed_prefixes: &mut Vec<String>,
     text: &StreamGuardrailText,
 ) {
-    if continuations.len() < text.continuations.len() {
-        continuations.resize(text.continuations.len(), String::new());
+    for prefix in &text.closed_prefixes {
+        // Do not retain a terminal with no outstanding carrier: otherwise a
+        // stream of empty item.done events could grow the close set without
+        // contributing any text to the channel cap.
+        if continuations
+            .iter()
+            .any(|continuation| continuation.key.starts_with(prefix))
+            && !closed_prefixes.contains(prefix)
+        {
+            closed_prefixes.push(prefix.clone());
+        }
     }
-    for (index, continuation) in text.continuations.iter().enumerate() {
-        continuations[index].push_str(continuation);
+    for incoming in &text.continuations {
+        if let Some(existing) = continuations
+            .iter_mut()
+            .find(|continuation| continuation.key == incoming.key)
+        {
+            existing.text.push_str(&incoming.text);
+        } else {
+            continuations.push(incoming.clone());
+        }
     }
-    append_scan_text(supplemental, &text.supplemental);
+    supplemental.extend(
+        text.supplemental
+            .iter()
+            .filter(|value| !value.is_empty())
+            .cloned(),
+    );
+}
+
+fn stream_continuation_would_exceed_cap(
+    continuations: &[StreamContinuation],
+    supplemental: &[String],
+    _closed_prefixes: &[String],
+    text: &StreamGuardrailText,
+) -> bool {
+    let mut keys: std::collections::HashSet<_> = continuations
+        .iter()
+        .map(|continuation| continuation.key.as_str())
+        .collect();
+    for continuation in &text.continuations {
+        keys.insert(continuation.key.as_str());
+    }
+    let mut supplemental_candidates = supplemental
+        .iter()
+        .filter(|value| !value.is_empty())
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    supplemental_candidates.extend(
+        text.supplemental
+            .iter()
+            .filter(|value| !value.is_empty())
+            .map(String::as_str),
+    );
+    keys.len() + supplemental_candidates.len() > MAX_STREAM_GUARDRAIL_CHANNELS
+}
+
+fn stream_continuation_identity_conflicts(
+    continuations: &[StreamContinuation],
+    closed_prefixes: &[String],
+    text: &StreamGuardrailText,
+) -> bool {
+    let is_closed = |key: &str| {
+        closed_prefixes
+            .iter()
+            .chain(text.closed_prefixes.iter())
+            .any(|prefix| key.starts_with(prefix))
+    };
+    if text
+        .continuations
+        .iter()
+        .any(|continuation| is_closed(&continuation.key))
+    {
+        return true;
+    }
+    let mut all = continuations
+        .iter()
+        .filter(|continuation| !is_closed(&continuation.key))
+        .collect::<Vec<_>>();
+    for incoming in &text.continuations {
+        if all.iter().any(|existing| {
+            existing.family == incoming.family
+                && existing.identity != incoming.identity
+                && (existing.identity_is_ambiguous || incoming.identity_is_ambiguous)
+        }) {
+            return true;
+        }
+        all.push(incoming);
+    }
+    false
+}
+
+fn retire_scanned_stream_continuations(
+    continuations: &mut Vec<StreamContinuation>,
+    continuation_tails: &mut Vec<StreamContinuation>,
+    closed_prefixes: &mut Vec<String>,
+) {
+    continuations.retain(|continuation| {
+        !closed_prefixes
+            .iter()
+            .any(|prefix| continuation.key.starts_with(prefix))
+    });
+    continuation_tails.retain(|continuation| {
+        !closed_prefixes
+            .iter()
+            .any(|prefix| continuation.key.starts_with(prefix))
+    });
+    closed_prefixes.clear();
+}
+
+/// A fail-open frame with no provable source identity is a hard boundary:
+/// nothing before it may be joined with a later keyed delta. The caller still
+/// relays the frame, but starts a fresh guardrail scan epoch afterward.
+fn reset_stream_guardrail_epoch(
+    continuations: &mut Vec<StreamContinuation>,
+    continuation_tails: &mut Vec<StreamContinuation>,
+    supplemental: &mut Vec<String>,
+    closed_prefixes: &mut Vec<String>,
+) {
+    continuations.clear();
+    continuation_tails.clear();
+    supplemental.clear();
+    closed_prefixes.clear();
+}
+
+/// Preserve the completed epoch for its own end-of-stream scan, then make an
+/// unevaluable frame a hard continuity boundary for all following carriers.
+/// Keeping epochs separate both retains monitor observations and prevents a
+/// literal from joining across the unknown frame.
+fn seal_stream_guardrail_epoch(
+    sealed_epochs: &mut Vec<Vec<String>>,
+    queued_candidates: &mut usize,
+    continuations: &mut Vec<StreamContinuation>,
+    continuation_tails: &mut Vec<StreamContinuation>,
+    supplemental: &mut Vec<String>,
+    closed_prefixes: &mut Vec<String>,
+) -> bool {
+    let candidates = stream_guardrail_scan_text(continuation_tails, continuations, supplemental);
+    let queued = candidates.is_empty()
+        || try_queue_stream_guardrail_epoch(sealed_epochs, queued_candidates, candidates);
+    reset_stream_guardrail_epoch(
+        continuations,
+        continuation_tails,
+        supplemental,
+        closed_prefixes,
+    );
+    queued
+}
+
+/// End-of-stream guardrails must keep epochs separate after an unevaluable
+/// frame, but untrusted streams cannot queue arbitrarily many independent
+/// external scans. An exhausted live fail-open stream records its bypass and
+/// discards later candidates instead.
+fn try_queue_stream_guardrail_epoch(
+    sealed_epochs: &mut Vec<Vec<String>>,
+    queued_candidates: &mut usize,
+    candidates: Vec<String>,
+) -> bool {
+    if sealed_epochs.len() >= MAX_STREAM_GUARDRAIL_EPOCHS {
+        return false;
+    }
+    let Some(total) = queued_candidates.checked_add(candidates.len()) else {
+        return false;
+    };
+    if total > MAX_STREAM_GUARDRAIL_CHANNELS {
+        return false;
+    }
+    *queued_candidates = total;
+    sealed_epochs.push(candidates);
+    true
 }
 
 fn stream_guardrail_scan_text(
-    continuation_tails: &[String],
-    continuations: &[String],
-    supplemental_tail: &str,
-    supplemental: &str,
-) -> String {
-    let mut text = String::new();
-    for (index, continuation) in continuations.iter().enumerate() {
+    continuation_tails: &[StreamContinuation],
+    continuations: &[StreamContinuation],
+    supplemental: &[String],
+) -> Vec<String> {
+    let mut text = Vec::new();
+    let mut scanned = std::collections::HashSet::new();
+    for continuation in continuations {
         let tail = continuation_tails
-            .get(index)
-            .map(String::as_str)
+            .iter()
+            .find(|candidate| candidate.key == continuation.key)
+            .map(|candidate| candidate.text.as_str())
             .unwrap_or_default();
-        append_scan_text(&mut text, &format!("{tail}{continuation}"));
+        let candidate = format!("{tail}{}", continuation.text);
+        if !candidate.is_empty() && scanned.insert(candidate.clone()) {
+            text.push(candidate);
+        }
     }
-    let supplemental = match (supplemental_tail.is_empty(), supplemental.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => supplemental_tail.to_string(),
-        (true, false) => supplemental.to_string(),
-        (false, false) => format!("{supplemental_tail}\n{supplemental}"),
-    };
-    append_scan_text(&mut text, &supplemental);
+    for value in supplemental {
+        if !value.is_empty() && scanned.insert(value.clone()) {
+            text.push(value.clone());
+        }
+    }
     text
 }
 
@@ -3184,14 +4022,22 @@ fn stream_response(
         // caps (the SSE framing is not counted), and the raw frame bytes it
         // bounds too.
         let mut held_content = crate::held_content::HeldBuffer::default();
-        // The semantic delta channel stays contiguous across frames. Raw
-        // supplementary values are scanned separately so metadata cannot
-        // break a literal split over two output deltas.
-        let mut continuation_bufs: Vec<String> = Vec::new();
-        let mut supplemental_buf = String::new();
-        // Overlap carried between Window scans, one per channel.
-        let mut continuation_tails: Vec<String> = Vec::new();
-        let mut supplemental_tail = String::new();
+        // Each source-identified semantic delta stays contiguous across
+        // frames. Supplementary values remain individual scan candidates so
+        // unrelated fields cannot form one guardrail input.
+        let mut continuation_bufs: Vec<StreamContinuation> = Vec::new();
+        let mut supplemental_buf: Vec<String> = Vec::new();
+        // Overlap carried between Window scans, one per source channel.
+        let mut continuation_tails: Vec<StreamContinuation> = Vec::new();
+        // Item-done frames close a Responses carrier, but its buffered text
+        // remains until a successful scan has covered it.
+        let mut closed_continuation_prefixes: Vec<String> = Vec::new();
+        // Each unevaluable live frame seals the previous source epoch. Those
+        // epochs still need their own terminal scan, but must not concatenate
+        // with text that follows the unkeyable frame.
+        let mut sealed_guardrail_epochs: Vec<Vec<String>> = Vec::new();
+        let mut queued_guardrail_candidates = 0;
+        let mut scan_budget_exhausted = false;
         // Degrades BufferFull to live forwarding after a fail-open cap hit.
         let mut fail_opened = false;
         let mut blocked = false;
@@ -3236,7 +4082,7 @@ fn stream_response(
                 let (parts, usage) = frame_parts(protocol, &frame);
                 let held = parts.held();
                 let delta = parts.scan;
-                let guardrail_text = (!chain.is_empty())
+                let guardrail_text = (!chain.is_empty() && !scan_budget_exhausted)
                     .then(|| stream_guardrail_text(protocol, &frame, delta.clone()));
                 if let Some(u) = usage {
                     merge_usage(&mut telemetry.usage, u);
@@ -3248,6 +4094,55 @@ fn stream_response(
                         capture_cap,
                     );
                 }
+                let unevaluable_output = guardrail_text.as_ref().is_some_and(|text| {
+                    text.unevaluable
+                        || stream_continuation_would_exceed_cap(
+                            &continuation_bufs,
+                            &supplemental_buf,
+                            &closed_continuation_prefixes,
+                            text,
+                        )
+                        || stream_continuation_identity_conflicts(
+                            &continuation_bufs,
+                            &closed_continuation_prefixes,
+                            text,
+                        )
+                });
+                if unevaluable_output {
+                    // A holding policy has already promised not to release a
+                    // frame until it scans clean. `fail_open` can bypass an
+                    // unevaluable live stream, but it cannot release the
+                    // held prefix (or this frame) without a scan.
+                    let must_refuse = (policy.holds_back() && !fail_opened)
+                        || aisix_guardrails::Guardrail::refuses_unevaluable_output(&chain);
+                    if must_refuse {
+                        tracing::warn!(
+                            guardrail_hook = "output",
+                            route = %route_name,
+                            "cannot preserve passthrough stream source continuity for guardrails; blocking",
+                        );
+                        pending.clear();
+                        pending_held.clear();
+                        blocked = true;
+                        yield Ok(guardrail_error_frame(
+                            anthropic.unwrap_or(false),
+                            None,
+                            Some(crate::error::TAG_UNSCANNABLE_BODY),
+                        ));
+                        break 'outer;
+                    }
+                    chain.record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+                    if !seal_stream_guardrail_epoch(
+                        &mut sealed_guardrail_epochs,
+                        &mut queued_guardrail_candidates,
+                        &mut continuation_bufs,
+                        &mut continuation_tails,
+                        &mut supplemental_buf,
+                        &mut closed_continuation_prefixes,
+                    ) {
+                        scan_budget_exhausted = true;
+                    }
+                }
                 let frame = Bytes::from(frame);
                 match &policy {
                     _ if fail_opened => {
@@ -3255,10 +4150,12 @@ fn stream_response(
                         yield Ok::<_, std::convert::Infallible>(frame);
                     }
                     StreamOutputPolicy::EndOfStreamCheck => {
-                        if let Some(text) = guardrail_text.as_ref() {
+                        if let Some(text) = guardrail_text.as_ref().filter(|_| !unevaluable_output) {
                             append_stream_guardrail_text(
                                 &mut continuation_bufs,
+                                &mut continuation_tails,
                                 &mut supplemental_buf,
+                                &mut closed_continuation_prefixes,
                                 text,
                             );
                         }
@@ -3266,10 +4163,12 @@ fn stream_response(
                         yield Ok(frame);
                     }
                     StreamOutputPolicy::Window { size_chars, overlap_chars, .. } => {
-                        if let Some(text) = guardrail_text.as_ref() {
+                        if let Some(text) = guardrail_text.as_ref().filter(|_| !unevaluable_output) {
                             append_stream_guardrail_text(
                                 &mut continuation_bufs,
+                                &mut continuation_tails,
                                 &mut supplemental_buf,
+                                &mut closed_continuation_prefixes,
                                 text,
                             );
                         }
@@ -3283,17 +4182,27 @@ fn stream_response(
                         // the cap, mirroring BufferFull's self-bound.
                         if continuation_bufs
                             .iter()
-                            .any(|continuation| continuation.chars().count() >= *size_chars)
-                            || supplemental_buf.chars().count() >= *size_chars
+                            .any(|continuation| continuation.text.chars().count() >= *size_chars)
+                            || supplemental_buf
+                                .iter()
+                                .map(|value| value.chars().count())
+                                .sum::<usize>()
+                                >= *size_chars
                             || held_bytes > MAX_HELD_STREAM_BYTES
                         {
-                            let text = stream_guardrail_scan_text(
+                            let candidates = stream_guardrail_scan_text(
                                 &continuation_tails,
                                 &continuation_bufs,
-                                &supplemental_tail,
                                 &supplemental_buf,
                             );
-                            match scan_output(&chain, &route_name, &text, &mut telemetry).await {
+                            match scan_output_candidates(
+                                &chain,
+                                &route_name,
+                                &candidates,
+                                &mut telemetry,
+                            )
+                            .await
+                            {
                                 GuardrailVerdict::Block {
                                     reason,
                                     guardrail_name,
@@ -3316,41 +4225,48 @@ fn stream_response(
                                     }
                                     pending_held.clear();
                                     held_bytes = 0;
-                                    if continuation_tails.len() < continuation_bufs.len() {
-                                        continuation_tails.resize(
-                                            continuation_bufs.len(),
-                                            String::new(),
-                                        );
+                                    for continuation in &mut continuation_bufs {
+                                        let tail = continuation_tails
+                                            .iter()
+                                            .find(|tail| tail.key == continuation.key)
+                                            .map(|tail| tail.text.as_str())
+                                            .unwrap_or_default();
+                                        let combined = format!("{tail}{}", continuation.text);
+                                        let next_tail = tail_chars(&combined, *overlap_chars);
+                                        if let Some(tail) = continuation_tails
+                                            .iter_mut()
+                                            .find(|tail| tail.key == continuation.key)
+                                        {
+                                            tail.text = next_tail;
+                                        } else {
+                                            continuation_tails.push(StreamContinuation {
+                                                key: continuation.key.clone(),
+                                                family: continuation.family.clone(),
+                                                identity: continuation.identity.clone(),
+                                                identity_is_ambiguous: continuation
+                                                    .identity_is_ambiguous,
+                                                text: next_tail,
+                                            });
+                                        }
+                                        continuation.text.clear();
                                     }
-                                    for (index, continuation) in continuation_bufs.iter_mut().enumerate() {
-                                        let combined = format!(
-                                            "{}{}",
-                                            continuation_tails[index],
-                                            continuation.as_str(),
-                                        );
-                                        continuation_tails[index] =
-                                            tail_chars(&combined, *overlap_chars);
-                                        continuation.clear();
-                                    }
-                                    let combined_supplemental = if supplemental_tail.is_empty() {
-                                        supplemental_buf.clone()
-                                    } else if supplemental_buf.is_empty() {
-                                        supplemental_tail.clone()
-                                    } else {
-                                        format!("{supplemental_tail}\n{supplemental_buf}")
-                                    };
-                                    supplemental_tail =
-                                        tail_chars(&combined_supplemental, *overlap_chars);
                                     supplemental_buf.clear();
+                                    retire_scanned_stream_continuations(
+                                        &mut continuation_bufs,
+                                        &mut continuation_tails,
+                                        &mut closed_continuation_prefixes,
+                                    );
                                 }
                             }
                         }
                     }
                     StreamOutputPolicy::BufferFull { max_buffer_bytes, on_exceeded_fail_open } => {
-                        if let Some(text) = guardrail_text.as_ref() {
+                        if let Some(text) = guardrail_text.as_ref().filter(|_| !unevaluable_output) {
                             append_stream_guardrail_text(
                                 &mut continuation_bufs,
+                                &mut continuation_tails,
                                 &mut supplemental_buf,
+                                &mut closed_continuation_prefixes,
                                 text,
                             );
                         }
@@ -3393,7 +4309,7 @@ fn stream_response(
                 let (parts, usage) = frame_parts(protocol, &rest);
                 let held = parts.held();
                 let delta = parts.scan;
-                let guardrail_text = (!chain.is_empty())
+                let guardrail_text = (!chain.is_empty() && !scan_budget_exhausted)
                     .then(|| stream_guardrail_text(protocol, &rest, delta.clone()));
                 if let Some(u) = usage {
                     merge_usage(&mut telemetry.usage, u);
@@ -3405,10 +4321,62 @@ fn stream_response(
                         capture_cap,
                     );
                 }
-                if let Some(text) = guardrail_text.as_ref() {
+                let unevaluable_output = guardrail_text.as_ref().is_some_and(|text| {
+                    text.unevaluable
+                        || stream_continuation_would_exceed_cap(
+                            &continuation_bufs,
+                            &supplemental_buf,
+                            &closed_continuation_prefixes,
+                            text,
+                        )
+                        || stream_continuation_identity_conflicts(
+                            &continuation_bufs,
+                            &closed_continuation_prefixes,
+                            text,
+                        )
+                });
+                if unevaluable_output {
+                    // See the matching frame path above: a holding policy
+                    // must not release its pending prefix unscanned just
+                    // because this terminal fragment is unevaluable.
+                    let must_refuse = (policy.holds_back() && !fail_opened)
+                        || aisix_guardrails::Guardrail::refuses_unevaluable_output(&chain);
+                    if must_refuse {
+                        tracing::warn!(
+                            guardrail_hook = "output",
+                            route = %route_name,
+                            "cannot preserve passthrough stream source continuity for guardrails; blocking",
+                        );
+                        pending.clear();
+                        pending_held.clear();
+                        yield Ok(guardrail_error_frame(
+                            anthropic.unwrap_or(false),
+                            None,
+                            Some(crate::error::TAG_UNSCANNABLE_BODY),
+                        ));
+                        telemetry.guardrail_blocked = true;
+                        telemetry.stream_reached_end = true;
+                        telemetry.emit();
+                        return;
+                    }
+                    chain.record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+                    if !seal_stream_guardrail_epoch(
+                        &mut sealed_guardrail_epochs,
+                        &mut queued_guardrail_candidates,
+                        &mut continuation_bufs,
+                        &mut continuation_tails,
+                        &mut supplemental_buf,
+                        &mut closed_continuation_prefixes,
+                    ) {
+                        scan_budget_exhausted = true;
+                    }
+                }
+                if let Some(text) = guardrail_text.as_ref().filter(|_| !unevaluable_output) {
                     append_stream_guardrail_text(
                         &mut continuation_bufs,
+                        &mut continuation_tails,
                         &mut supplemental_buf,
+                        &mut closed_continuation_prefixes,
                         text,
                     );
                 }
@@ -3460,36 +4428,47 @@ fn stream_response(
                     }
                 }
             }
-            let text = stream_guardrail_scan_text(
-                &continuation_tails,
-                &continuation_bufs,
-                &supplemental_tail,
-                &supplemental_buf,
-            );
-            if !chain.is_empty() && !text.is_empty() {
-                if let GuardrailVerdict::Block {
-                reason,
-                guardrail_name,
-                unavailable,
-            } =
-                    scan_output(&chain, &route_name, &text, &mut telemetry).await
+            if !scan_budget_exhausted {
+                let candidates = stream_guardrail_scan_text(
+                    &continuation_tails,
+                    &continuation_bufs,
+                    &supplemental_buf,
+                );
+                if (!candidates.is_empty() || sealed_guardrail_epochs.is_empty())
+                    && !try_queue_stream_guardrail_epoch(
+                        &mut sealed_guardrail_epochs,
+                        &mut queued_guardrail_candidates,
+                        candidates,
+                    )
                 {
-                    tracing::warn!(
-                        guardrail_hook = "output",
-                        route = %route_name,
-                        reason = %reason,
-                        "guardrail blocked passthrough-route stream (end)",
-                    );
-                    // Held frames are dropped (fail closed); content already
-                    // forwarded under EndOfStreamCheck cannot be unsent —
-                    // the error frame is the caller-visible signal either way.
-                    pending.clear();
-                    pending_held.clear();
-                    yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), guardrail_name.as_deref(), unavailable.as_deref()));
-                    telemetry.guardrail_blocked = true;
-                    telemetry.stream_reached_end = true;
-                    telemetry.emit();
-                    return;
+                    chain.record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+                }
+            }
+            for candidates in sealed_guardrail_epochs {
+                if !chain.is_empty() {
+                    if let GuardrailVerdict::Block {
+                        reason,
+                        guardrail_name,
+                        unavailable,
+                    } = scan_output_candidates(&chain, &route_name, &candidates, &mut telemetry).await
+                    {
+                        tracing::warn!(
+                            guardrail_hook = "output",
+                            route = %route_name,
+                            reason = %reason,
+                            "guardrail blocked passthrough-route stream (end)",
+                        );
+                        // Held frames are dropped (fail closed); content already
+                        // forwarded under EndOfStreamCheck cannot be unsent —
+                        // the error frame is the caller-visible signal either way.
+                        pending.clear();
+                        pending_held.clear();
+                        yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), guardrail_name.as_deref(), unavailable.as_deref()));
+                        telemetry.guardrail_blocked = true;
+                        telemetry.stream_reached_end = true;
+                        telemetry.emit();
+                        return;
+                    }
                 }
             }
             for f in pending.drain(..) {
@@ -3550,6 +4529,27 @@ async fn scan_output(
     let (verdict, hits) = chain.check_output_unmaskable_observed(&synth).await;
     telemetry.monitor_hits.extend(hits);
     verdict
+}
+
+/// Scan each independently sourced candidate without letting a fail-open
+/// result for one candidate skip a later candidate that another rule blocks.
+async fn scan_output_candidates(
+    chain: &aisix_guardrails::GuardrailChain,
+    route_name: &str,
+    candidates: &[String],
+    telemetry: &mut RouteTelemetry,
+) -> aisix_guardrails::GuardrailVerdict {
+    if candidates.is_empty() {
+        return scan_output(chain, route_name, "", telemetry).await;
+    }
+    for candidate in candidates {
+        if let verdict @ aisix_guardrails::GuardrailVerdict::Block { .. } =
+            scan_output(chain, route_name, candidate, telemetry).await
+        {
+            return verdict;
+        }
+    }
+    aisix_guardrails::GuardrailVerdict::Allow
 }
 
 /// The last `n` chars of `s` (whole string when shorter).
@@ -3968,6 +4968,12 @@ mod tests {
     use tower::ServiceExt;
     use wiremock::matchers::{method as wm_method, path as wm_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn scan_candidates_contain(candidates: &[String], expected: &str) -> bool {
+        candidates
+            .iter()
+            .any(|candidate| candidate.contains(expected))
+    }
 
     fn cfg() -> ProxyConfig {
         ProxyConfig {
@@ -5378,9 +6384,11 @@ mod tests {
             .0
             .scan;
         let media = stream_guardrail_text(PassthroughProtocol::OpenaiResponses, media_frame, typed);
-        let scanned =
-            stream_guardrail_scan_text(&[], &media.continuations, "", &media.supplemental);
-        assert!(!scanned.contains("STREAM_MEDIA_SENTINEL"), "{scanned:?}");
+        let scanned = stream_guardrail_scan_text(&[], &media.continuations, &media.supplemental);
+        assert!(
+            !scan_candidates_contain(&scanned, "STREAM_MEDIA_SENTINEL"),
+            "{scanned:?}"
+        );
 
         // The terminal response repeats prior delta content, including media
         // from image-generation output. It is never a second scan carrier.
@@ -5405,9 +6413,9 @@ mod tests {
             conflicting_delta,
             typed,
         );
-        let scanned = stream_guardrail_scan_text(&[], &text.continuations, "", &text.supplemental);
+        let scanned = stream_guardrail_scan_text(&[], &text.continuations, &text.supplemental);
         assert!(
-            !scanned.contains("CONFLICTING_MEDIA_SENTINEL"),
+            !scan_candidates_contain(&scanned, "CONFLICTING_MEDIA_SENTINEL"),
             "{scanned:?}"
         );
 
@@ -5496,9 +6504,9 @@ mod tests {
     }
 
     #[test]
-    fn stream_guardrail_text_keeps_visible_deltas_contiguous() {
-        let first = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"one\",\"delta\":\"FOR\"}\n\n";
-        let second = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"two\",\"delta\":\"noise\",\"delta\":\"BIDDEN\"}\n\n";
+    fn stream_guardrail_text_preserves_response_duplicate_carrier_branches() {
+        let first = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"one\",\"output_index\":0,\"content_index\":0,\"delta\":\"FOR\",\"delta\":\"ok\"}\n\n";
+        let second = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"one\",\"output_index\":0,\"content_index\":0,\"delta\":\"BIDDEN\"}\n\n";
         let first_parts = frame_parts(PassthroughProtocol::OpenaiResponses, first).0;
         let second_parts = frame_parts(PassthroughProtocol::OpenaiResponses, second).0;
         let first = stream_guardrail_text(
@@ -5512,22 +6520,573 @@ mod tests {
             second_parts.scan,
         );
         let mut continuations = Vec::new();
-        let mut supplemental = String::new();
-        append_stream_guardrail_text(&mut continuations, &mut supplemental, &first);
-        append_stream_guardrail_text(&mut continuations, &mut supplemental, &second);
-        let scanned = stream_guardrail_scan_text(&[], &continuations, "", &supplemental);
-        assert!(scanned.starts_with("FORBIDDEN"), "{scanned:?}");
+        let mut continuation_tails = Vec::new();
+        let mut supplemental = Vec::new();
+        let mut closed_prefixes = Vec::new();
+        append_stream_guardrail_text(
+            &mut continuations,
+            &mut continuation_tails,
+            &mut supplemental,
+            &mut closed_prefixes,
+            &first,
+        );
+        append_stream_guardrail_text(
+            &mut continuations,
+            &mut continuation_tails,
+            &mut supplemental,
+            &mut closed_prefixes,
+            &second,
+        );
+        let scanned =
+            stream_guardrail_scan_text(&continuation_tails, &continuations, &supplemental);
+        assert!(
+            scan_candidates_contain(&scanned, "FORBIDDEN"),
+            "{scanned:?}"
+        );
+        assert!(scan_candidates_contain(&scanned, "okBIDDEN"), "{scanned:?}");
+    }
+
+    #[test]
+    fn stream_guardrail_text_keys_reordered_chat_choices_by_source_index() {
+        let first = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"FOR\"}},{\"index\":1,\"delta\":{\"content\":\"noise\"}}]}\n\n";
+        let second = b"data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"CLEAN\"}},{\"index\":0,\"delta\":{\"content\":\"BIDDEN\"}}]}\n\n";
+        let first_parts = frame_parts(PassthroughProtocol::OpenaiChat, first).0;
+        let second_parts = frame_parts(PassthroughProtocol::OpenaiChat, second).0;
+        let first = stream_guardrail_text(PassthroughProtocol::OpenaiChat, first, first_parts.scan);
+        let second =
+            stream_guardrail_text(PassthroughProtocol::OpenaiChat, second, second_parts.scan);
+        assert!(!first.unevaluable);
+        assert!(!second.unevaluable);
+        let mut continuations = Vec::new();
+        let mut continuation_tails = Vec::new();
+        let mut supplemental = Vec::new();
+        let mut closed_prefixes = Vec::new();
+        append_stream_guardrail_text(
+            &mut continuations,
+            &mut continuation_tails,
+            &mut supplemental,
+            &mut closed_prefixes,
+            &first,
+        );
+        append_stream_guardrail_text(
+            &mut continuations,
+            &mut continuation_tails,
+            &mut supplemental,
+            &mut closed_prefixes,
+            &second,
+        );
+        let scanned =
+            stream_guardrail_scan_text(&continuation_tails, &continuations, &supplemental);
+        assert!(
+            scan_candidates_contain(&scanned, "FORBIDDEN"),
+            "{scanned:?}"
+        );
+        assert!(
+            !scan_candidates_contain(&scanned, "noiseBIDDEN"),
+            "{scanned:?}"
+        );
+    }
+
+    #[test]
+    fn source_continuity_refuses_unkeyable_or_over_cap_response_branches() {
+        let over_cap = br#"{"type":"response.output_text.delta","item_id":"one","output_index":0,"content_index":0,"delta":"a","delta":"b","delta":"c"}"#;
+        assert!(matches!(
+            stream_source_continuations(PassthroughProtocol::OpenaiResponses, over_cap),
+            SourceContinuations::Unevaluable
+        ));
+        let missing_id = br#"{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"FOR"}"#;
+        assert!(matches!(
+            stream_source_continuations(PassthroughProtocol::OpenaiResponses, missing_id),
+            SourceContinuations::Unevaluable
+        ));
+        let oversized_id = "x".repeat(MAX_STREAM_GUARDRAIL_SOURCE_ID_BYTES + 1);
+        let oversized_delta = format!(
+            "{{\"type\":\"response.output_text.delta\",\"item_id\":\"{oversized_id}\",\"output_index\":0,\"content_index\":0,\"delta\":\"safe\"}}"
+        );
+        assert!(matches!(
+            stream_source_continuations(
+                PassthroughProtocol::OpenaiResponses,
+                oversized_delta.as_bytes()
+            ),
+            SourceContinuations::Unevaluable
+        ));
+        let oversized_done = format!(
+            "data: {{\"type\":\"response.output_item.done\",\"item\":{{\"id\":\"{oversized_id}\"}}}}\n\n"
+        );
+        assert!(
+            stream_guardrail_text(
+                PassthroughProtocol::OpenaiResponses,
+                oversized_done.as_bytes(),
+                String::new(),
+            )
+            .unevaluable
+        );
+        assert!(matches!(
+            stream_source_continuations(PassthroughProtocol::Raw, br#"{"state":"FOR"}"#),
+            SourceContinuations::Unevaluable
+        ));
+        assert!(matches!(
+            stream_source_continuations(PassthroughProtocol::Raw, br#""FOR""#),
+            SourceContinuations::Ready(_)
+        ));
+
+        let continuations = (0..MAX_STREAM_GUARDRAIL_CHANNELS)
+            .map(|index| StreamContinuation {
+                key: format!("responses:\"{index}\":text:first"),
+                family: format!("responses:\"{index}\""),
+                identity: "text".to_owned(),
+                identity_is_ambiguous: false,
+                text: "safe".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let incoming = StreamGuardrailText {
+            continuations: vec![StreamContinuation {
+                key: "responses:\"next\":text:first".to_owned(),
+                family: "responses:\"next\"".to_owned(),
+                identity: "text".to_owned(),
+                identity_is_ambiguous: false,
+                text: "safe".to_owned(),
+            }],
+            supplemental: Vec::new(),
+            unevaluable: false,
+            closed_prefixes: Vec::new(),
+        };
+        assert!(stream_continuation_would_exceed_cap(
+            &continuations,
+            &[],
+            &[],
+            &incoming,
+        ));
+
+        let incoming_supplemental = StreamGuardrailText {
+            continuations: vec![StreamContinuation {
+                key: "chat:0:content:first".to_owned(),
+                family: "chat:0".to_owned(),
+                identity: "content".to_owned(),
+                identity_is_ambiguous: false,
+                text: "safe".to_owned(),
+            }],
+            supplemental: (0..MAX_STREAM_GUARDRAIL_CHANNELS)
+                .map(|index| format!("metadata-{index}"))
+                .collect(),
+            unevaluable: false,
+            closed_prefixes: Vec::new(),
+        };
+        assert!(stream_continuation_would_exceed_cap(
+            &[],
+            &[],
+            &[],
+            &incoming_supplemental,
+        ));
+    }
+
+    #[test]
+    fn stream_guardrail_epoch_queue_is_bounded() {
+        let mut candidate_epochs = Vec::new();
+        let mut queued_candidates = 0;
+        for index in 0..MAX_STREAM_GUARDRAIL_CHANNELS {
+            assert!(try_queue_stream_guardrail_epoch(
+                &mut candidate_epochs,
+                &mut queued_candidates,
+                vec![format!("candidate-{index}")],
+            ));
+        }
+        assert!(!try_queue_stream_guardrail_epoch(
+            &mut candidate_epochs,
+            &mut queued_candidates,
+            vec!["one-too-many".to_owned()],
+        ));
+
+        let mut empty_epochs = Vec::new();
+        let mut queued_candidates = 0;
+        for _ in 0..MAX_STREAM_GUARDRAIL_EPOCHS {
+            assert!(try_queue_stream_guardrail_epoch(
+                &mut empty_epochs,
+                &mut queued_candidates,
+                Vec::new(),
+            ));
+        }
+        assert!(!try_queue_stream_guardrail_epoch(
+            &mut empty_epochs,
+            &mut queued_candidates,
+            Vec::new(),
+        ));
+    }
+
+    #[test]
+    fn closed_response_items_still_count_until_a_successful_window_scan() {
+        let mut continuations = Vec::new();
+        let mut tails = Vec::new();
+        let mut supplemental = Vec::new();
+        let mut closed_prefixes = Vec::new();
+        for index in 0..(MAX_STREAM_GUARDRAIL_CHANNELS / 2) {
+            let delta = format!(
+                "data: {{\"type\":\"response.output_text.delta\",\"item_id\":\"{index}\",\"output_index\":0,\"content_index\":0,\"delta\":\"safe\"}}\n\n"
+            );
+            let delta = stream_guardrail_text(
+                PassthroughProtocol::OpenaiResponses,
+                delta.as_bytes(),
+                frame_parts(PassthroughProtocol::OpenaiResponses, delta.as_bytes())
+                    .0
+                    .scan,
+            );
+            append_stream_guardrail_text(
+                &mut continuations,
+                &mut tails,
+                &mut supplemental,
+                &mut closed_prefixes,
+                &delta,
+            );
+            let done = format!(
+                "data: {{\"type\":\"response.output_item.done\",\"item\":{{\"id\":\"{index}\"}}}}\n\n"
+            );
+            let done = stream_guardrail_text(
+                PassthroughProtocol::OpenaiResponses,
+                done.as_bytes(),
+                String::new(),
+            );
+            append_stream_guardrail_text(
+                &mut continuations,
+                &mut tails,
+                &mut supplemental,
+                &mut closed_prefixes,
+                &done,
+            );
+        }
+        assert_eq!(continuations.len(), MAX_STREAM_GUARDRAIL_CHANNELS);
+        assert_eq!(closed_prefixes.len(), MAX_STREAM_GUARDRAIL_CHANNELS / 2);
+        let next = stream_guardrail_text(
+            PassthroughProtocol::OpenaiResponses,
+            b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"next\",\"output_index\":0,\"content_index\":0,\"delta\":\"safe\"}\n\n",
+            "safe".to_owned(),
+        );
+        assert!(stream_continuation_would_exceed_cap(
+            &continuations,
+            &supplemental,
+            &closed_prefixes,
+            &next,
+        ));
+    }
+
+    #[test]
+    fn stream_guardrail_text_keeps_keyed_normal_forms_evaluable() {
+        let cases = [
+            (
+                PassthroughProtocol::OpenaiChat,
+                b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ANTHROPIC_TEXT\"}}\n\n".as_slice(),
+                "ANTHROPIC_TEXT",
+            ),
+            (
+                PassthroughProtocol::OpenaiChat,
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"index\":0,\"type\":\"text\",\"text\":\"PART_TEXT\"}]}}]}\n\n".as_slice(),
+                "PART_TEXT",
+            ),
+            (
+                PassthroughProtocol::OpenaiChat,
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"TOOL_ARGS\"}}],\"content\":\"CHAT_TEXT\"}}]}\n\n".as_slice(),
+                "TOOL_ARGS",
+            ),
+        ];
+        for (protocol, frame, expected) in cases {
+            let typed = frame_parts(protocol, frame).0.scan;
+            let text = stream_guardrail_text(protocol, frame, typed);
+            assert!(!text.unevaluable, "{frame:?}");
+            let scanned = stream_guardrail_scan_text(&[], &text.continuations, &text.supplemental);
+            assert!(scan_candidates_contain(&scanned, expected), "{scanned:?}");
+        }
+
+        let identityless_part = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"NO_ID\"}]}}]}\n\n";
+        let typed = frame_parts(PassthroughProtocol::OpenaiChat, identityless_part)
+            .0
+            .scan;
+        assert!(
+            stream_guardrail_text(PassthroughProtocol::OpenaiChat, identityless_part, typed)
+                .unevaluable
+        );
+    }
+
+    #[test]
+    fn chat_content_part_index_survives_optional_id_changes() {
+        for (first_frame, second_frame) in [
+            (
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"index\":0,\"type\":\"text\",\"text\":\"FOR\"}]}}]}\n\n".as_slice(),
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"index\":0,\"id\":\"later\",\"type\":\"text\",\"text\":\"BIDDEN\"}]}}]}\n\n".as_slice(),
+            ),
+            (
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"index\":0,\"id\":\"first\",\"type\":\"text\",\"text\":\"FOR\"}]}}]}\n\n".as_slice(),
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"index\":0,\"type\":\"text\",\"text\":\"BIDDEN\"}]}}]}\n\n".as_slice(),
+            ),
+        ] {
+            let first = stream_guardrail_text(
+                PassthroughProtocol::OpenaiChat,
+                first_frame,
+                frame_parts(PassthroughProtocol::OpenaiChat, first_frame).0.scan,
+            );
+            let second = stream_guardrail_text(
+                PassthroughProtocol::OpenaiChat,
+                second_frame,
+                frame_parts(PassthroughProtocol::OpenaiChat, second_frame).0.scan,
+            );
+            assert!(!first.unevaluable);
+            assert!(!second.unevaluable);
+            let mut continuations = Vec::new();
+            let mut tails = Vec::new();
+            let mut supplemental = Vec::new();
+            let mut closed_prefixes = Vec::new();
+            append_stream_guardrail_text(
+                &mut continuations,
+                &mut tails,
+                &mut supplemental,
+                &mut closed_prefixes,
+                &first,
+            );
+            append_stream_guardrail_text(
+                &mut continuations,
+                &mut tails,
+                &mut supplemental,
+                &mut closed_prefixes,
+                &second,
+            );
+            assert!(scan_candidates_contain(
+                &stream_guardrail_scan_text(&tails, &continuations, &supplemental),
+                "FORBIDDEN",
+            ));
+        }
+    }
+
+    #[test]
+    fn stream_continuity_never_joins_distinct_carriers() {
+        let first = stream_guardrail_text(
+            PassthroughProtocol::OpenaiResponses,
+            b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"one\",\"output_index\":0,\"content_index\":0,\"delta\":\"FOR\"}\n\n",
+            "FOR".to_owned(),
+        );
+        let second = stream_guardrail_text(
+            PassthroughProtocol::OpenaiResponses,
+            b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"two\",\"output_index\":0,\"content_index\":0,\"delta\":\"BIDDEN\"}\n\n",
+            "BIDDEN".to_owned(),
+        );
+        let mut continuations = Vec::new();
+        let mut tails = Vec::new();
+        let mut supplemental = Vec::new();
+        let mut closed_prefixes = Vec::new();
+        append_stream_guardrail_text(
+            &mut continuations,
+            &mut tails,
+            &mut supplemental,
+            &mut closed_prefixes,
+            &first,
+        );
+        append_stream_guardrail_text(
+            &mut continuations,
+            &mut tails,
+            &mut supplemental,
+            &mut closed_prefixes,
+            &second,
+        );
+        let scanned = stream_guardrail_scan_text(&tails, &continuations, &supplemental);
+        assert_eq!(scanned, vec!["FOR".to_owned(), "BIDDEN".to_owned()]);
+
+        let scalar = stream_guardrail_text(
+            PassthroughProtocol::OpenaiChat,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"FOR\"}}]}\n\n",
+            "FOR".to_owned(),
+        );
+        let indexed_part = stream_guardrail_text(
+            PassthroughProtocol::OpenaiChat,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"index\":0,\"type\":\"text\",\"text\":\"BIDDEN\"}]}}]}\n\n",
+            "BIDDEN".to_owned(),
+        );
+        let mut scalar_continuations = Vec::new();
+        let mut scalar_tails = Vec::new();
+        let mut scalar_supplemental = Vec::new();
+        let mut scalar_closed_prefixes = Vec::new();
+        append_stream_guardrail_text(
+            &mut scalar_continuations,
+            &mut scalar_tails,
+            &mut scalar_supplemental,
+            &mut scalar_closed_prefixes,
+            &scalar,
+        );
+        assert!(stream_continuation_identity_conflicts(
+            &scalar_continuations,
+            &scalar_closed_prefixes,
+            &indexed_part,
+        ));
+    }
+
+    #[test]
+    fn responses_index_identity_cannot_switch_mid_stream() {
+        let indexed = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"one\",\"output_index\":0,\"content_index\":0,\"delta\":\"FOR\"}\n\n";
+        let missing_indexes = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"one\",\"delta\":\"BIDDEN\"}\n\n";
+        for (first, second) in [(indexed, missing_indexes), (missing_indexes, indexed)] {
+            let first = stream_guardrail_text(
+                PassthroughProtocol::OpenaiResponses,
+                first,
+                frame_parts(PassthroughProtocol::OpenaiResponses, first)
+                    .0
+                    .scan,
+            );
+            let second = stream_guardrail_text(
+                PassthroughProtocol::OpenaiResponses,
+                second,
+                frame_parts(PassthroughProtocol::OpenaiResponses, second)
+                    .0
+                    .scan,
+            );
+            assert!(first.unevaluable || second.unevaluable);
+        }
+    }
+
+    #[test]
+    fn fail_open_unscannable_frame_seals_then_resets_guardrail_continuity() {
+        let first_frame = b"data: \"FOR\"\n\n";
+        let opaque_frame = b"data: {\"state\":\"safe\"}\n\n";
+        let second_frame = b"data: \"BIDDEN\"\n\n";
+        let first = stream_guardrail_text(
+            PassthroughProtocol::Raw,
+            first_frame,
+            frame_parts(PassthroughProtocol::Raw, first_frame).0.scan,
+        );
+        let opaque = stream_guardrail_text(
+            PassthroughProtocol::Raw,
+            opaque_frame,
+            frame_parts(PassthroughProtocol::Raw, opaque_frame).0.scan,
+        );
+        let second = stream_guardrail_text(
+            PassthroughProtocol::Raw,
+            second_frame,
+            frame_parts(PassthroughProtocol::Raw, second_frame).0.scan,
+        );
+        assert!(!first.unevaluable);
+        assert!(opaque.unevaluable);
+        assert!(!second.unevaluable);
+
+        let mut continuations = Vec::new();
+        let mut tails = Vec::new();
+        let mut supplemental = Vec::new();
+        let mut closed_prefixes = Vec::new();
+        let mut sealed_epochs = Vec::new();
+        let mut queued_candidates = 0;
+        append_stream_guardrail_text(
+            &mut continuations,
+            &mut tails,
+            &mut supplemental,
+            &mut closed_prefixes,
+            &first,
+        );
+        assert!(seal_stream_guardrail_epoch(
+            &mut sealed_epochs,
+            &mut queued_candidates,
+            &mut continuations,
+            &mut tails,
+            &mut supplemental,
+            &mut closed_prefixes,
+        ));
+        append_stream_guardrail_text(
+            &mut continuations,
+            &mut tails,
+            &mut supplemental,
+            &mut closed_prefixes,
+            &second,
+        );
+        let scanned = stream_guardrail_scan_text(&tails, &continuations, &supplemental);
+        assert_eq!(sealed_epochs, vec![vec!["FOR".to_owned()]]);
+        assert!(scan_candidates_contain(&scanned, "BIDDEN"), "{scanned:?}");
+        assert!(
+            !scan_candidates_contain(&scanned, "FORBIDDEN"),
+            "{scanned:?}"
+        );
+    }
+
+    #[test]
+    fn responses_item_done_waits_for_a_successful_scan_before_retiring() {
+        let delta = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"one\",\"output_index\":0,\"content_index\":0,\"delta\":\"FORBIDDEN\"}\n\n";
+        let done = b"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"one\",\"type\":\"message\"}}\n\n";
+        let delta = stream_guardrail_text(
+            PassthroughProtocol::OpenaiResponses,
+            delta,
+            frame_parts(PassthroughProtocol::OpenaiResponses, delta)
+                .0
+                .scan,
+        );
+        let done = stream_guardrail_text(PassthroughProtocol::OpenaiResponses, done, String::new());
+        assert!(!done.unevaluable);
+        assert_eq!(done.closed_prefixes, vec!["responses:\"one\":".to_owned()]);
+
+        let mut continuations = Vec::new();
+        let mut tails = Vec::new();
+        let mut supplemental = Vec::new();
+        let mut closed_prefixes = Vec::new();
+        append_stream_guardrail_text(
+            &mut continuations,
+            &mut tails,
+            &mut supplemental,
+            &mut closed_prefixes,
+            &delta,
+        );
+        append_stream_guardrail_text(
+            &mut continuations,
+            &mut tails,
+            &mut supplemental,
+            &mut closed_prefixes,
+            &done,
+        );
+        assert!(scan_candidates_contain(
+            &stream_guardrail_scan_text(&tails, &continuations, &supplemental),
+            "FORBIDDEN",
+        ));
+        retire_scanned_stream_continuations(&mut continuations, &mut tails, &mut closed_prefixes);
+        assert!(continuations.is_empty());
+        assert!(tails.is_empty());
+        assert!(closed_prefixes.is_empty());
+
+        let unknown_done =
+            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n\n";
+        let unknown = stream_guardrail_text(
+            PassthroughProtocol::OpenaiResponses,
+            unknown_done,
+            String::new(),
+        );
+        assert!(!unknown.unevaluable);
+        assert!(unknown.closed_prefixes.is_empty());
+
+        let conflicting_done = b"data: {\"type\":\"response.output_item.done\",\"item_id\":\"one\",\"item\":{\"id\":\"two\",\"type\":\"message\"}}\n\n";
+        assert!(
+            stream_guardrail_text(
+                PassthroughProtocol::OpenaiResponses,
+                conflicting_done,
+                String::new(),
+            )
+            .unevaluable
+        );
+    }
+
+    #[test]
+    fn done_sentinel_is_not_an_unevaluable_stream_carrier() {
+        for protocol in [
+            PassthroughProtocol::Raw,
+            PassthroughProtocol::OpenaiChat,
+            PassthroughProtocol::OpenaiCompletions,
+            PassthroughProtocol::OpenaiResponses,
+        ] {
+            let text = stream_guardrail_text(protocol, b"data: [DONE]\n\n", String::new());
+            assert!(!text.unevaluable, "{protocol:?}");
+        }
     }
 
     #[test]
     fn stream_guardrail_text_scans_a_visible_carrier_once() {
         let email = "carol@example.com";
-        let frame = b"data: {\"id\":\"chatcmpl-once\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"ask carol@example.com\"}}]}\n\n";
+        let frame = b"data: {\"id\":\"chatcmpl-once\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ask carol@example.com\"}}]}\n\n";
         let typed = frame_parts(PassthroughProtocol::OpenaiChat, frame).0.scan;
         let text = stream_guardrail_text(PassthroughProtocol::OpenaiChat, frame, typed);
-        let scanned = stream_guardrail_scan_text(&[], &text.continuations, "", &text.supplemental);
+        let scanned = stream_guardrail_scan_text(&[], &text.continuations, &text.supplemental);
         assert_eq!(
-            scanned.matches(email).count(),
+            scanned
+                .iter()
+                .map(|candidate| candidate.matches(email).count())
+                .sum::<usize>(),
             1,
             "typed, raw source, and supplemental channels must not multiply one carrier: {scanned:?}"
         );
@@ -5539,16 +7098,16 @@ mod tests {
         let typed = frame_parts(PassthroughProtocol::OpenaiChat, frame).0.scan;
         assert!(typed.contains("BLOCKME"), "{typed:?}");
         let text = stream_guardrail_text(PassthroughProtocol::OpenaiChat, frame, typed);
-        let scanned = stream_guardrail_scan_text(&[], &text.continuations, "", &text.supplemental);
-        assert!(!scanned.contains("BLOCKME"), "{scanned:?}");
+        let scanned = stream_guardrail_scan_text(&[], &text.continuations, &text.supplemental);
+        assert!(!scan_candidates_contain(&scanned, "BLOCKME"), "{scanned:?}");
 
         let signature = b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"signature_delta\",\"signature\":\"BLOCKME\"}}\n\n";
         let typed = frame_parts(PassthroughProtocol::OpenaiChat, signature)
             .0
             .scan;
         let text = stream_guardrail_text(PassthroughProtocol::OpenaiChat, signature, typed);
-        let scanned = stream_guardrail_scan_text(&[], &text.continuations, "", &text.supplemental);
-        assert!(!scanned.contains("BLOCKME"), "{scanned:?}");
+        let scanned = stream_guardrail_scan_text(&[], &text.continuations, &text.supplemental);
+        assert!(!scan_candidates_contain(&scanned, "BLOCKME"), "{scanned:?}");
     }
 
     #[test]
