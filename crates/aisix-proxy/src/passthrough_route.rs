@@ -1486,6 +1486,21 @@ fn raw_top_level_has_any_type(body: &[u8], wanted: &[&str]) -> bool {
         .any(|kind| wanted.iter().any(|wanted| kind == *wanted))
 }
 
+/// `true` only when every source `type` value is one of `allowed`. This is
+/// stricter than [`raw_top_level_has_any_type`]: an audio or image event must
+/// not borrow a text event's carrier merely by repeating a conflicting type.
+fn raw_top_level_has_only_types(body: &[u8], allowed: &[&str]) -> bool {
+    let Some(values) = raw_top_level_values(body, "type") else {
+        return false;
+    };
+    !values.is_empty()
+        && values.into_iter().all(|value| {
+            serde_json::from_str::<String>(value.get())
+                .ok()
+                .is_some_and(|kind| allowed.iter().any(|allowed| kind == *allowed))
+        })
+}
+
 fn raw_top_level_items_have_only_types(body: &[u8], key: &str, allowed: &[&str]) -> Option<bool> {
     let values = raw_top_level_values(body, key)?;
     Some(
@@ -1523,6 +1538,19 @@ fn append_raw_string_value(out: &mut String, raw: &serde_json::value::RawValue) 
 fn append_raw_top_level_strings(out: &mut String, body: &[u8], key: &str) -> Option<()> {
     for value in raw_top_level_values(body, key)? {
         append_raw_string_value(out, &value)?;
+    }
+    Some(())
+}
+
+/// Append direct string values but do not turn an unexpected non-string into
+/// a raw-body fallback. Response output uses this at the privacy boundary: a
+/// malformed optional text field must not make opaque sibling fields readable
+/// by an external guardrail.
+fn append_raw_top_level_string_values(out: &mut String, body: &[u8], key: &str) -> Option<()> {
+    for value in raw_top_level_values(body, key)? {
+        if let Ok(value) = serde_json::from_str::<String>(value.get()) {
+            append_scan_text(out, &value);
+        }
     }
     Some(())
 }
@@ -1758,20 +1786,110 @@ fn decoded_chat_response_string_values(body: &[u8]) -> Option<String> {
     Some(out)
 }
 
+const RESPONSES_VISIBLE_DELTA_EVENTS: &[&str] = &[
+    "response.output_text.delta",
+    "response.function_call_arguments.delta",
+    "response.mcp_call_arguments.delta",
+    "response.custom_tool_call_input.delta",
+];
+
+/// The only Responses content-part `text` fields the typed output guardrail
+/// reads. Other part types can carry image, audio, file, or reasoning data.
+const RESPONSES_VISIBLE_TEXT_PART_TYPES: &[&str] = &["output_text", "text", "input_text"];
+
+/// Source-preserving counterpart to the typed Responses output scanner's
+/// content-part walk. A missing or conflicting discriminator is opaque: a
+/// media item can use any string-shaped field, so only a unique known text
+/// part may cross the external guardrail boundary.
+fn append_responses_visible_part_strings(
+    out: &mut String,
+    part: &serde_json::value::RawValue,
+) -> Option<()> {
+    let part_body = part.get().as_bytes();
+    match raw_top_level_unique_type(part_body).as_deref() {
+        Some(kind) if RESPONSES_VISIBLE_TEXT_PART_TYPES.contains(&kind) => {
+            append_raw_top_level_string_values(out, part_body, "text")?
+        }
+        Some(_) | None => {}
+    }
+    Some(())
+}
+
+fn append_responses_visible_content_strings(
+    out: &mut String,
+    content: &serde_json::value::RawValue,
+) -> Option<()> {
+    let value = content.get().trim_start();
+    if value.starts_with('"') {
+        return append_raw_string_value(out, content);
+    }
+    if !value.starts_with('[') {
+        return Some(());
+    }
+    let Some(parts) = raw_array_items(content) else {
+        return Some(());
+    };
+    for part in parts {
+        append_responses_visible_part_strings(out, &part)?;
+    }
+    Some(())
+}
+
+/// Source-preserving counterpart to `responses::responses_output_text`.
+/// Restrict the walk to client-visible message text and the tool payloads the
+/// typed output guardrail already reads. A missing or conflicting item type
+/// is opaque rather than a generic raw fallback: without a unique item kind,
+/// `text`, `arguments`, and `input` could be an image/audio/file payload.
+fn append_responses_output_item_strings(
+    out: &mut String,
+    item: &serde_json::value::RawValue,
+) -> Option<()> {
+    let item_body = item.get().as_bytes();
+    match raw_top_level_unique_type(item_body).as_deref() {
+        Some("reasoning") => {}
+        Some("message") => {
+            for content in raw_top_level_values(item_body, "content")? {
+                append_responses_visible_content_strings(out, &content)?;
+            }
+        }
+        Some("function_call" | "mcp_call") => {
+            for key in ["name", "arguments"] {
+                append_raw_top_level_string_values(out, item_body, key)?;
+            }
+        }
+        Some("custom_tool_call") => {
+            for key in ["name", "input"] {
+                append_raw_top_level_string_values(out, item_body, key)?;
+            }
+        }
+        Some(_) | None => {}
+    }
+    Some(())
+}
+
+fn append_responses_output_strings(out: &mut String, body: &[u8]) -> Option<()> {
+    for output in raw_top_level_values(body, "output")? {
+        let Some(items) = raw_array_items(&output) else {
+            continue;
+        };
+        for item in items {
+            append_responses_output_item_strings(out, &item)?;
+        }
+    }
+    Some(())
+}
+
 fn decoded_responses_response_string_values(body: &[u8]) -> Option<String> {
-    let mut out = decoded_json_string_values_except_root_keys(body, &["model", "output"])?;
-    append_raw_array_item_strings(&mut out, body, "output", |item| {
-        raw_object_has_only_types(item, &["reasoning"])
-    })?;
+    let mut out = String::new();
+    append_responses_output_strings(&mut out, body)?;
     Some(out)
 }
 
 /// The response text a guardrail scans, per the route's protocol hint.
 ///
-/// This deliberately reads raw source values rather than `Value`: a
-/// passthrough upstream may send duplicate or deeply nested fields which the
-/// client receives verbatim. Generated reasoning remains out of scope only
-/// for an unambiguous standard reasoning item.
+/// This deliberately reads raw source values rather than `Value`, retaining
+/// duplicate visible text and tool carriers which the client receives
+/// verbatim. Generated reasoning and opaque media remain out of scope.
 fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
     let raw = || String::from_utf8_lossy(body).into_owned();
     match protocol {
@@ -1783,7 +1901,10 @@ fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String
             decoded_non_model_json_string_values(body).unwrap_or_else(raw)
         }
         PassthroughProtocol::OpenaiResponses => {
-            decoded_responses_response_string_values(body).unwrap_or_else(raw)
+            // Without a safely decoded Responses envelope, no discriminator
+            // can establish that a string is visible text rather than opaque
+            // image/audio/file data. Privacy wins over a raw fallback here.
+            decoded_responses_response_string_values(body).unwrap_or_default()
         }
     }
 }
@@ -2444,47 +2565,14 @@ fn decoded_chat_frame_string_values(body: &[u8]) -> Option<String> {
     .ok()
 }
 
+/// The typed stream extractor deliberately takes only text/tool delta events:
+/// `.done`, output-item, and terminal response snapshots repeat those
+/// carriers. Keep the raw source pass on that same boundary, both to avoid
+/// duplicate external moderation and to keep any opaque terminal media out.
 fn decoded_responses_frame_string_values(body: &[u8]) -> Option<String> {
-    match raw_top_level_unique_type(body).as_deref() {
-        Some("response.reasoning_text.delta" | "response.reasoning_summary_text.delta") => {
-            return decoded_json_string_values_except_root_keys(body, &["model", "delta"]);
-        }
-        Some("response.reasoning_text.done" | "response.reasoning_summary_text.done") => {
-            return decoded_json_string_values_except_root_keys(body, &["model", "text"]);
-        }
-        Some("response.reasoning_summary_part.added" | "response.reasoning_summary_part.done") => {
-            return decoded_json_string_values_except_root_keys(body, &["model", "part"]);
-        }
-        Some("response.output_item.added" | "response.output_item.done")
-            if raw_top_level_items_have_only_types(body, "item", &["reasoning"])? =>
-        {
-            return decoded_json_string_values_except_root_keys(body, &["model", "item"]);
-        }
-        Some("response.content_part.added" | "response.content_part.done")
-            if raw_top_level_items_have_only_types(
-                body,
-                "part",
-                &["reasoning_text", "reasoning_summary"],
-            )? =>
-        {
-            return decoded_json_string_values_except_root_keys(body, &["model", "part"]);
-        }
-        _ => {}
-    }
-
-    let responses = raw_top_level_values(body, "response")?;
-    if responses.is_empty() {
-        return decoded_non_model_json_string_values(body);
-    }
-    let mut out = decoded_json_string_values_except_root_keys(body, &["model", "response"])?;
-    for response in responses {
-        append_scan_text(
-            &mut out,
-            &response_guardrail_text(
-                PassthroughProtocol::OpenaiResponses,
-                response.get().as_bytes(),
-            ),
-        );
+    let mut out = String::new();
+    if raw_top_level_has_only_types(body, RESPONSES_VISIBLE_DELTA_EVENTS) {
+        append_raw_top_level_string_values(&mut out, body, "delta")?;
     }
     Some(out)
 }
@@ -2558,14 +2646,94 @@ fn decoded_completions_frame_continuations(body: &[u8]) -> Option<Vec<String>> {
     })
 }
 
+fn is_chat_choice_continuation_path(path: &[crate::json_splice::PathSeg]) -> bool {
+    use crate::json_splice::PathSeg;
+
+    matches!(
+        path,
+        [PathSeg::Key(choices), PathSeg::Index(_), PathSeg::Key(delta), PathSeg::Key(field)]
+            if choices == "choices" && delta == "delta" && field == "content"
+    ) || matches!(
+        path,
+        [PathSeg::Key(choices), PathSeg::Index(_), PathSeg::Key(delta), PathSeg::Key(content), PathSeg::Index(_), PathSeg::Key(text)]
+            if choices == "choices"
+                && delta == "delta"
+                && content == "content"
+                && text == "text"
+    ) || matches!(
+        path,
+        [PathSeg::Key(choices), PathSeg::Index(_), PathSeg::Key(delta), PathSeg::Key(tool_calls), PathSeg::Index(_), PathSeg::Key(kind), PathSeg::Key(value)]
+            if choices == "choices"
+                && delta == "delta"
+                && tool_calls == "tool_calls"
+                && ((kind == "function" && value == "arguments")
+                    || (kind == "custom" && value == "input"))
+    )
+}
+
+fn is_anthropic_delta_continuation_path(path: &[crate::json_splice::PathSeg]) -> bool {
+    use crate::json_splice::PathSeg;
+
+    matches!(
+        path,
+        [PathSeg::Key(delta), PathSeg::Key(field)]
+            if delta == "delta" && matches!(field.as_str(), "text" | "partial_json")
+    )
+}
+
+fn is_anthropic_start_continuation_path(path: &[crate::json_splice::PathSeg]) -> bool {
+    use crate::json_splice::PathSeg;
+
+    matches!(
+        path,
+        [PathSeg::Key(content_block), PathSeg::Key(field)]
+            if content_block == "content_block" && field == "text"
+    ) || matches!(
+        path,
+        [PathSeg::Key(content_block), PathSeg::Key(input), ..]
+            if content_block == "content_block" && input == "input"
+    )
+}
+
+fn is_completions_continuation_path(path: &[crate::json_splice::PathSeg]) -> bool {
+    use crate::json_splice::PathSeg;
+
+    matches!(
+        path,
+        [PathSeg::Key(choices), PathSeg::Index(_), PathSeg::Key(text)]
+            if choices == "choices" && text == "text"
+    )
+}
+
+/// The raw source continuations preserve every occurrence of visible carrier
+/// fields. Supplementary scan text therefore excludes those same paths: a
+/// normal frame must not send one visible value to a guardrail as typed,
+/// source, and supplementary text at once.
+fn decoded_chat_frame_supplemental_string_values(body: &[u8]) -> Option<String> {
+    let anthropic_delta = raw_top_level_has_any_type(body, &["content_block_delta"]);
+    let anthropic_start =
+        !anthropic_delta && raw_top_level_has_any_type(body, &["content_block_start"]);
+    decoded_json_string_values_where(body, |path| {
+        !is_root_key(path, "model")
+            && !is_hidden_chat_stream_reasoning_path(path)
+            && !(if anthropic_delta {
+                is_anthropic_delta_continuation_path(path)
+            } else if anthropic_start {
+                is_anthropic_start_continuation_path(path)
+            } else {
+                is_chat_choice_continuation_path(path)
+            })
+    })
+}
+
+fn decoded_completions_frame_supplemental_string_values(body: &[u8]) -> Option<String> {
+    decoded_json_string_values_where(body, |path| {
+        !is_root_key(path, "model") && !is_completions_continuation_path(path)
+    })
+}
+
 fn decoded_responses_frame_continuations(body: &[u8]) -> Option<Vec<String>> {
-    const VISIBLE_DELTA_EVENTS: &[&str] = &[
-        "response.output_text.delta",
-        "response.function_call_arguments.delta",
-        "response.mcp_call_arguments.delta",
-        "response.custom_tool_call_input.delta",
-    ];
-    if !raw_top_level_has_any_type(body, VISIBLE_DELTA_EVENTS) {
+    if !raw_top_level_has_only_types(body, RESPONSES_VISIBLE_DELTA_EVENTS) {
         return None;
     }
     raw_top_level_string_values(body, "delta").filter(|values| !values.is_empty())
@@ -2583,9 +2751,49 @@ fn frame_source_continuations(
     }
 }
 
+fn frame_guardrail_supplemental_text(
+    protocol: PassthroughProtocol,
+    frame: &[u8],
+    has_source_continuations: bool,
+    has_typed_continuation: bool,
+) -> String {
+    // On a malformed or unknown frame, typed extraction is the only
+    // available output carrier. It already contains the raw fallback, so a
+    // second generic scan would double-count it.
+    if has_typed_continuation && !has_source_continuations {
+        return String::new();
+    }
+    if !has_source_continuations {
+        return frame_guardrail_text(protocol, frame);
+    }
+
+    let Some(payload) = crate::redact::frame_payload(frame) else {
+        return String::new();
+    };
+    let payload = payload.trim();
+    if payload.is_empty() || payload == "[DONE]" {
+        return String::new();
+    }
+    match protocol {
+        // The raw source continuation is the complete decoded payload.
+        PassthroughProtocol::Raw => String::new(),
+        PassthroughProtocol::OpenaiChat => {
+            decoded_chat_frame_supplemental_string_values(payload.as_bytes()).unwrap_or_default()
+        }
+        PassthroughProtocol::OpenaiCompletions => {
+            decoded_completions_frame_supplemental_string_values(payload.as_bytes())
+                .unwrap_or_default()
+        }
+        // Responses source continuations exist only for the explicitly safe
+        // text/tool delta events, whose sole output carrier is `delta`.
+        PassthroughProtocol::OpenaiResponses => String::new(),
+    }
+}
+
 /// Guardrail-only text for a streamed frame. Capture and hold-back retain
 /// their typed visible-content extraction in [`frame_parts`], while this
-/// source-preserving pass also sees duplicate and arbitrary forwarded fields.
+/// source-preserving pass retains duplicate selected carriers. Responses
+/// media fields remain opaque even when forwarded verbatim.
 fn frame_guardrail_text(protocol: PassthroughProtocol, frame: &[u8]) -> String {
     let Some(payload) = crate::redact::frame_payload(frame) else {
         return String::new();
@@ -2606,16 +2814,19 @@ fn frame_guardrail_text(protocol: PassthroughProtocol, frame: &[u8]) -> String {
             decoded_non_model_json_string_values(payload.as_bytes()).unwrap_or_else(raw)
         }
         PassthroughProtocol::OpenaiResponses => {
-            decoded_responses_frame_string_values(payload.as_bytes()).unwrap_or_else(raw)
+            // As with buffered Responses output, only a successful
+            // source-aware selection may cross the external guardrail
+            // boundary. A malformed frame stays forwarded but opaque.
+            decoded_responses_frame_string_values(payload.as_bytes()).unwrap_or_default()
         }
     }
 }
 
 /// The independent channels scanned for one stream frame. The first
-/// continuation is the typed visible-output sequence; later channels retain
-/// source output-carrier occurrences across frames. `supplemental` preserves
-/// every additional decoded source value (including duplicate or nested
-/// fields). Keeping them separate prevents frame metadata from interrupting a
+/// continuation is the typed visible-output sequence when it maps to one raw
+/// carrier; later channels retain source-only duplicate occurrences across
+/// frames. `supplemental` preserves selected non-carrier source values.
+/// Keeping them separate prevents frame metadata from interrupting a
 /// sensitive literal split across output deltas.
 struct StreamGuardrailText {
     continuations: Vec<String>,
@@ -2627,29 +2838,59 @@ fn stream_guardrail_text(
     frame: &[u8],
     continuation: String,
 ) -> StreamGuardrailText {
-    // Keep the typed continuation in a stable first channel even when source
-    // extraction finds raw carriers. A provider can add or remove duplicate
-    // carrier fields between frames; only the typed last-wins sequence then
-    // follows what a normal JSON client sees across that boundary.
+    // Keep the typed continuation in a stable first channel when it maps to
+    // one raw carrier. Source-only duplicate occurrences occupy later
+    // channels, preserving bytes a JSON client would discard without sending
+    // the canonical value to the guardrail twice.
     let payload = crate::redact::frame_payload(frame);
     let hidden_reasoning = matches!(protocol, PassthroughProtocol::OpenaiChat)
         && payload.as_ref().is_some_and(|payload| {
             hidden_chat_stream_reasoning_frame(payload.trim().as_bytes()) == Some(true)
         });
-    let typed_continuation = if hidden_reasoning {
+    let responses_visible_delta = matches!(protocol, PassthroughProtocol::OpenaiResponses)
+        && payload.as_ref().is_some_and(|payload| {
+            raw_top_level_has_only_types(payload.trim().as_bytes(), RESPONSES_VISIBLE_DELTA_EVENTS)
+        });
+    let typed_continuation = if hidden_reasoning
+        || (matches!(protocol, PassthroughProtocol::OpenaiResponses) && !responses_visible_delta)
+    {
         String::new()
     } else {
         continuation
     };
-    let mut continuations = vec![typed_continuation];
-    if let Some(source) =
-        payload.and_then(|payload| frame_source_continuations(protocol, payload.trim().as_bytes()))
-    {
-        continuations.extend(source);
-    }
+    let has_typed_continuation = !typed_continuation.is_empty();
+    let source = payload
+        .and_then(|payload| frame_source_continuations(protocol, payload.trim().as_bytes()))
+        .filter(|source| !source.is_empty());
+    let has_source_continuations = source.is_some();
+    let continuations = match source {
+        Some(mut source) if has_typed_continuation => {
+            if let Some(canonical) = source
+                .iter()
+                .rposition(|candidate| candidate == &typed_continuation)
+            {
+                source.remove(canonical);
+                let mut continuations = vec![typed_continuation];
+                continuations.extend(source);
+                continuations
+            } else {
+                // Multiple source carriers can make a typed extractor join
+                // distinct values. Keep the source occurrences only rather
+                // than scanning their joined representation in addition.
+                source
+            }
+        }
+        Some(source) => source,
+        None => vec![typed_continuation],
+    };
     StreamGuardrailText {
         continuations,
-        supplemental: frame_guardrail_text(protocol, frame),
+        supplemental: frame_guardrail_supplemental_text(
+            protocol,
+            frame,
+            has_source_continuations,
+            has_typed_continuation,
+        ),
     }
 }
 
@@ -4964,7 +5205,7 @@ mod tests {
     }
 
     #[test]
-    fn known_response_envelopes_scan_duplicate_and_nested_source_strings() {
+    fn known_response_envelopes_scan_duplicate_selected_source_strings() {
         let chat = br#"{"model":"routing-only","choices":[{"message":{"content":"\u0042LOCKME","metadata":{"note":"NESTED"}}}],"choices":[{"message":{"content":"clean"}}]}"#;
         let scanned = response_guardrail_text(PassthroughProtocol::OpenaiChat, chat);
         for expected in ["BLOCKME", "NESTED", "clean"] {
@@ -4974,13 +5215,14 @@ mod tests {
 
         let responses = br#"{"output":[{"type":"message","content":[{"type":"output_text","text":"\u0042LOCKME","metadata":{"note":"NESTED"}}]}],"output":[{"type":"message","content":[{"type":"output_text","text":"clean"}]}]}"#;
         let scanned = response_guardrail_text(PassthroughProtocol::OpenaiResponses, responses);
-        for expected in ["BLOCKME", "NESTED", "clean"] {
+        for expected in ["BLOCKME", "clean"] {
             assert!(scanned.contains(expected), "{scanned:?}");
         }
+        assert!(!scanned.contains("NESTED"), "{scanned:?}");
 
         let conflicting_type = br#"{"output":[{"type":"reasoning","type":"message","content":[{"text":"\u0042LOCKME"}]}]}"#;
         assert!(
-            response_guardrail_text(PassthroughProtocol::OpenaiResponses, conflicting_type)
+            !response_guardrail_text(PassthroughProtocol::OpenaiResponses, conflicting_type)
                 .contains("BLOCKME")
         );
 
@@ -4990,14 +5232,107 @@ mod tests {
                 .contains("BLOCKME")
         );
 
-        let deep = format!(
-            r#"{{"output":[{{"type":"message","content":[{{"type":"output_text","nested":{}}}]}}]}}"#,
-            String::from_utf8(deeply_nested_escaped_block_json()).expect("valid test JSON")
+        let duplicate_text = br#"{"output":[{"type":"message","content":[{"type":"output_text","text":"\u0042LOCKME","text":"clean"}]}]}"#;
+        assert!(
+            response_guardrail_text(PassthroughProtocol::OpenaiResponses, duplicate_text)
+                .contains("BLOCKME")
         );
         assert!(
-            response_guardrail_text(PassthroughProtocol::OpenaiResponses, deep.as_bytes())
-                .contains("BLOCKME"),
-            "a known deep response must retain its decoded source leaf"
+            response_guardrail_text(PassthroughProtocol::OpenaiResponses, duplicate_text)
+                .contains("clean")
+        );
+    }
+
+    #[test]
+    fn responses_output_guardrail_keeps_generated_media_opaque() {
+        let buffered = br#"{"output":[{"type":"image_generation_call","result":"BUFFERED_MEDIA_SENTINEL"},{"type":"message","content":[{"type":"output_text","text":"VISIBLE_TEXT_SENTINEL"}]},{"type":"function_call","name":"lookup","arguments":"{\"query\":\"TOOL_ARGUMENT_SENTINEL\"}"},{"type":"mcp_call","name":"mcp","arguments":"MCP_ARGUMENT_SENTINEL"},{"type":"custom_tool_call","name":"custom","input":"CUSTOM_INPUT_SENTINEL"}]}"#;
+        let scanned = response_guardrail_text(PassthroughProtocol::OpenaiResponses, buffered);
+        for expected in [
+            "VISIBLE_TEXT_SENTINEL",
+            "TOOL_ARGUMENT_SENTINEL",
+            "MCP_ARGUMENT_SENTINEL",
+            "CUSTOM_INPUT_SENTINEL",
+        ] {
+            assert!(scanned.contains(expected), "{scanned:?}");
+        }
+        assert!(!scanned.contains("BUFFERED_MEDIA_SENTINEL"), "{scanned:?}");
+
+        // A conflicting item discriminator is opaque as a whole. Even
+        // safe-named fields could be an image/audio/file payload attached to
+        // the other discriminator.
+        let ambiguous = br#"{"output":[{"type":"image_generation_call","type":"message","result":"AMBIGUOUS_MEDIA_SENTINEL","content":[{"type":"output_text","text":"AMBIGUOUS_VISIBLE_SENTINEL"}],"arguments":"AMBIGUOUS_TOOL_SENTINEL"}]}"#;
+        let scanned = response_guardrail_text(PassthroughProtocol::OpenaiResponses, ambiguous);
+        for opaque in [
+            "AMBIGUOUS_MEDIA_SENTINEL",
+            "AMBIGUOUS_VISIBLE_SENTINEL",
+            "AMBIGUOUS_TOOL_SENTINEL",
+        ] {
+            assert!(!scanned.contains(opaque), "{scanned:?}");
+        }
+
+        let unknown =
+            br#"{"output":[{"text":"UNKNOWN_TEXT_SENTINEL","input":"UNKNOWN_MEDIA_SENTINEL"}]}"#;
+        let scanned = response_guardrail_text(PassthroughProtocol::OpenaiResponses, unknown);
+        assert!(!scanned.contains("UNKNOWN_TEXT_SENTINEL"), "{scanned:?}");
+        assert!(!scanned.contains("UNKNOWN_MEDIA_SENTINEL"), "{scanned:?}");
+
+        let media_frame = b"data: {\"type\":\"response.image_generation_call.partial_image\",\"partial_image_b64\":\"STREAM_MEDIA_SENTINEL\"}\n\n";
+        assert!(
+            !frame_guardrail_text(PassthroughProtocol::OpenaiResponses, media_frame)
+                .contains("STREAM_MEDIA_SENTINEL")
+        );
+        let typed = frame_parts(PassthroughProtocol::OpenaiResponses, media_frame)
+            .0
+            .scan;
+        let media = stream_guardrail_text(PassthroughProtocol::OpenaiResponses, media_frame, typed);
+        let scanned =
+            stream_guardrail_scan_text(&[], &media.continuations, "", &media.supplemental);
+        assert!(!scanned.contains("STREAM_MEDIA_SENTINEL"), "{scanned:?}");
+
+        // The terminal response repeats prior delta content, including media
+        // from image-generation output. It is never a second scan carrier.
+        let terminal = b"data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"TERMINAL_MEDIA_SENTINEL\"},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"TERMINAL_VISIBLE_SENTINEL\"}]}]}}\n\n";
+        let scanned = frame_guardrail_text(PassthroughProtocol::OpenaiResponses, terminal);
+        assert!(!scanned.contains("TERMINAL_MEDIA_SENTINEL"), "{scanned:?}");
+        assert!(
+            !scanned.contains("TERMINAL_VISIBLE_SENTINEL"),
+            "{scanned:?}"
+        );
+
+        // `delta` is not a universally textual field: on a conflicting text
+        // and audio discriminator it is opaque, rather than a path for audio
+        // base64 to reach a text guardrail.
+        let conflicting_delta = b"data: {\"type\":\"response.output_audio.delta\",\"type\":\"response.output_text.delta\",\"delta\":\"CONFLICTING_MEDIA_SENTINEL\"}\n\n";
+        let typed = frame_parts(PassthroughProtocol::OpenaiResponses, conflicting_delta)
+            .0
+            .scan;
+        assert!(typed.contains("CONFLICTING_MEDIA_SENTINEL"), "{typed:?}");
+        let text = stream_guardrail_text(
+            PassthroughProtocol::OpenaiResponses,
+            conflicting_delta,
+            typed,
+        );
+        let scanned = stream_guardrail_scan_text(&[], &text.continuations, "", &text.supplemental);
+        assert!(
+            !scanned.contains("CONFLICTING_MEDIA_SENTINEL"),
+            "{scanned:?}"
+        );
+
+        let ambiguous_event = b"data: {\"type\":\"response.output_text.done\",\"type\":\"response.output_audio.done\",\"text\":\"AMBIGUOUS_EVENT_TEXT_SENTINEL\",\"input\":\"AMBIGUOUS_EVENT_MEDIA_SENTINEL\"}\n\n";
+        let scanned = frame_guardrail_text(PassthroughProtocol::OpenaiResponses, ambiguous_event);
+        assert!(
+            !scanned.contains("AMBIGUOUS_EVENT_TEXT_SENTINEL"),
+            "{scanned:?}"
+        );
+        assert!(
+            !scanned.contains("AMBIGUOUS_EVENT_MEDIA_SENTINEL"),
+            "{scanned:?}"
+        );
+
+        let text_frame = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"VISIBLE_STREAM_SENTINEL\"}\n\n";
+        assert!(
+            frame_guardrail_text(PassthroughProtocol::OpenaiResponses, text_frame)
+                .contains("VISIBLE_STREAM_SENTINEL")
         );
     }
 
@@ -5033,19 +5368,20 @@ mod tests {
 
         let responses = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"\\u0042LOCKME\",\"delta\":\"clean\",\"metadata\":{\"note\":\"NESTED\"}}\n\n";
         let scanned = frame_guardrail_text(PassthroughProtocol::OpenaiResponses, responses);
-        for expected in ["BLOCKME", "NESTED", "clean"] {
+        for expected in ["BLOCKME", "clean"] {
             assert!(scanned.contains(expected), "{scanned:?}");
         }
+        assert!(!scanned.contains("NESTED"), "{scanned:?}");
 
         let conflicting = b"data: {\"type\":\"response.content_part.done\",\"part\":{\"type\":\"reasoning_text\",\"type\":\"output_text\",\"text\":\"\\u0042LOCKME\"}}\n\n";
         assert!(
-            frame_guardrail_text(PassthroughProtocol::OpenaiResponses, conflicting)
+            !frame_guardrail_text(PassthroughProtocol::OpenaiResponses, conflicting)
                 .contains("BLOCKME")
         );
 
         let conflicting_item = b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"type\":\"message\",\"content\":[{\"text\":\"\\u0042LOCKME\"}]}}\n\n";
         assert!(
-            frame_guardrail_text(PassthroughProtocol::OpenaiResponses, conflicting_item)
+            !frame_guardrail_text(PassthroughProtocol::OpenaiResponses, conflicting_item)
                 .contains("BLOCKME")
         );
         let hidden_item = b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"type\":\"reasoning\",\"summary\":[{\"text\":\"\\u0042LOCKME\"}]}}\n\n";
@@ -5088,6 +5424,20 @@ mod tests {
         append_stream_guardrail_text(&mut continuations, &mut supplemental, &second);
         let scanned = stream_guardrail_scan_text(&[], &continuations, "", &supplemental);
         assert!(scanned.starts_with("FORBIDDEN"), "{scanned:?}");
+    }
+
+    #[test]
+    fn stream_guardrail_text_scans_a_visible_carrier_once() {
+        let email = "carol@example.com";
+        let frame = b"data: {\"id\":\"chatcmpl-once\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"ask carol@example.com\"}}]}\n\n";
+        let typed = frame_parts(PassthroughProtocol::OpenaiChat, frame).0.scan;
+        let text = stream_guardrail_text(PassthroughProtocol::OpenaiChat, frame, typed);
+        let scanned = stream_guardrail_scan_text(&[], &text.continuations, "", &text.supplemental);
+        assert_eq!(
+            scanned.matches(email).count(),
+            1,
+            "typed, raw source, and supplemental channels must not multiply one carrier: {scanned:?}"
+        );
     }
 
     #[test]
