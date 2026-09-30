@@ -267,7 +267,6 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
   let embed: EmbeddingMock | undefined;
   let upstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;
-  let etcdReachable = false;
   let embeddingModelID = "";
   let unavailableUsageEmbeddingModelID = "";
   let cancelledEmbeddingModelID = "";
@@ -276,6 +275,19 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
   let guardrailModelID = "";
   let overflowGuardrailModelID = "";
   let cacheModelID = "";
+
+  function requireRuntime(): {
+    app: SpawnedApp;
+    sls: MockSls;
+    embed: EmbeddingMock;
+    upstream: OpenAiUpstream;
+    streamUpstream: OpenAiUpstream;
+  } {
+    if (!app || !sls || !embed || !upstream || !streamUpstream) {
+      throw new Error("semantic embedding usage e2e setup did not complete");
+    }
+    return { app, sls, embed, upstream, streamUpstream };
+  }
 
   async function chat(model: string, prompt: string): Promise<ChatResponse> {
     const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
@@ -326,8 +338,7 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
-    etcdReachable = await etcd.ping();
-    if (!etcdReachable) return;
+    expect(await etcd.ping(), "semantic embedding usage e2e requires etcd").toBe(true);
 
     sls = await startMockSls();
     embed = await startEmbeddingMock();
@@ -563,11 +574,8 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     await sls?.close();
   });
 
-  test("semantic routing records its real batched embedding on the chat parent", async (ctx) => {
-    if (!etcdReachable || !app || !sls || !embed) {
-      ctx.skip();
-      return;
-    }
+  test("semantic routing records its real batched embedding on the chat parent", async () => {
+    const { sls, embed } = requireRuntime();
 
     const callsBefore = embed.callCount();
     const response = await chat(ROUTER_MODEL, ROUTE_PROMPT);
@@ -590,11 +598,8 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     expect(row.get("attempt_model")).not.toBe(EMBED_MODEL);
   });
 
-  test("a streamed semantic route keeps its terminal child audit on one parent", async (ctx) => {
-    if (!etcdReachable || !app || !sls || !embed || !streamUpstream) {
-      ctx.skip();
-      return;
-    }
+  test("a streamed semantic route keeps its terminal child audit on one parent", async () => {
+    const { app, sls, embed, streamUpstream } = requireRuntime();
 
     const embeddingCallsBefore = embed.callCount();
     const upstreamCallsBefore = streamUpstream.receivedRequests.length;
@@ -652,11 +657,8 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     expect(row.get("attempt_model")).not.toBe(EMBED_MODEL);
   });
 
-  test("missing provider embedding usage is explicit on the real parent event", async (ctx) => {
-    if (!etcdReachable || !app || !sls || !embed) {
-      ctx.skip();
-      return;
-    }
+  test("missing provider embedding usage is explicit on the real parent event", async () => {
+    const { sls, embed } = requireRuntime();
 
     const callsBefore = embed.callCount();
     const response = await chat(UNAVAILABLE_USAGE_ROUTER_MODEL, ROUTE_PROMPT);
@@ -684,11 +686,8 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
 
   test(
     "a client cancellation during semantic routing keeps its failed child on the terminal parent",
-    async (ctx) => {
-      if (!etcdReachable || !app || !sls || !embed || !upstream) {
-        ctx.skip();
-        return;
-      }
+    async () => {
+      const { app, sls, embed, upstream } = requireRuntime();
 
       const slowEmbeddingCallsBefore = embed.callCountFor(CANCELLED_USAGE_UPSTREAM_MODEL);
       const upstreamCallsBefore = upstream.receivedRequests.length;
@@ -785,11 +784,8 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     60_000,
   );
 
-  test("semantic guardrail records prototypes and candidate only on its parent", async (ctx) => {
-    if (!etcdReachable || !app || !sls || !embed) {
-      ctx.skip();
-      return;
-    }
+  test("semantic guardrail records prototypes and candidate only on its parent", async () => {
+    const { sls, embed } = requireRuntime();
 
     const callsBefore = embed.callCount();
     const response = await chat(GUARDRAIL_MODEL, GUARDRAIL_PROMPT);
@@ -818,11 +814,8 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     }
   });
 
-  test("semantic guardrail child audit caps real bridge work without leaking text", async (ctx) => {
-    if (!etcdReachable || !app || !sls || !embed) {
-      ctx.skip();
-      return;
-    }
+  test("semantic guardrail child audit caps real bridge work without leaking text", async () => {
+    const { sls, embed } = requireRuntime();
 
     const callsBefore = embed.callCount();
     const response = await chat(GUARDRAIL_OVERFLOW_MODEL, GUARDRAIL_OVERFLOW_PROMPT);
@@ -852,11 +845,8 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     }
   });
 
-  test("semantic-cache exact hit makes no embedding call and carries no child audit", async (ctx) => {
-    if (!etcdReachable || !app || !sls || !embed) {
-      ctx.skip();
-      return;
-    }
+  test("semantic-cache exact hit makes no embedding call and carries no child audit", async () => {
+    const { sls, embed } = requireRuntime();
 
     const callsBeforeMiss = embed.callCount();
     const miss = await chat(CACHE_MODEL, CACHE_PROMPT);

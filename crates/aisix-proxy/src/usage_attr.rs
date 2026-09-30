@@ -1043,6 +1043,31 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn terminal_usage_event_never_receives_an_oversized_embedding_model_id() {
+        let parent = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(parent, async {
+            crate::attribution::note_gateway_embedding_call(aisix_obs::GatewayEmbeddingCall {
+                count: 1,
+                purpose: aisix_obs::GatewayEmbeddingPurpose::SemanticRoute,
+                embedding_model_id: "界".repeat(100),
+                prompt_tokens: 1,
+                total_tokens: 1,
+                usage_source: aisix_obs::GatewayEmbeddingUsageSource::Reported,
+                latency_ms: 1,
+                outcome: aisix_obs::GatewayEmbeddingOutcome::Succeeded,
+            });
+
+            let mut terminal = UsageEvent::default();
+            attach_gateway_embedding_audit(&mut terminal);
+            let model_id = &terminal.gateway_embedding_calls[0].embedding_model_id;
+            assert!(model_id.is_char_boundary(model_id.len()));
+            assert!(model_id.len() <= crate::attribution::MAX_GATEWAY_EMBEDDING_MODEL_ID_BYTES);
+            assert_eq!(model_id, &"界".repeat(42));
+        })
+        .await;
+    }
+
     #[test]
     fn metric_model_label_three_outcomes() {
         use aisix_core::resource::ResourceEntry;

@@ -726,6 +726,7 @@ async fn embed_texts_inner(
     let bridge = crate::dispatch::resolve_bridge(hub, &pk_entry.value)
         .ok_or(ProxyError::ProviderUnavailable)?;
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+    let audit_model_id = crate::attribution::capped_gateway_embedding_model_id(&embed_entry.id);
     let dimensions = model.embedding.as_ref().map(|e| e.dimensions);
 
     let req = EmbeddingRequest {
@@ -754,7 +755,7 @@ async fn embed_texts_inner(
     // cancels this parent request while the bridge is pending, its Drop writes
     // a failed child audit directly to the shared parent ledger before the
     // cancel emitter takes that ledger into the terminal 499 event.
-    let mut audit_call = crate::attribution::begin_gateway_embedding_call(purpose, &embed_entry.id);
+    let mut audit_call = crate::attribution::begin_gateway_embedding_call(purpose, &audit_model_id);
     let response = bridge.embed(&req, &ctx).await;
     let latency_ms = audit_call.settle();
     let resp = match response {
@@ -762,7 +763,7 @@ async fn embed_texts_inner(
             crate::attribution::note_gateway_embedding_call(GatewayEmbeddingCall {
                 count: 1,
                 purpose,
-                embedding_model_id: embed_entry.id.clone(),
+                embedding_model_id: audit_model_id.clone(),
                 prompt_tokens: resp.usage.prompt_tokens,
                 total_tokens: resp.usage.total_tokens,
                 usage_source: match resp.usage.source {
@@ -778,7 +779,7 @@ async fn embed_texts_inner(
             crate::attribution::note_gateway_embedding_call(GatewayEmbeddingCall {
                 count: 1,
                 purpose,
-                embedding_model_id: embed_entry.id.clone(),
+                embedding_model_id: audit_model_id,
                 prompt_tokens: 0,
                 total_tokens: 0,
                 usage_source: GatewayEmbeddingUsageSource::Unavailable,
