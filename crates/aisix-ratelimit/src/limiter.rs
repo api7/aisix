@@ -110,6 +110,7 @@ impl Limiter {
             store: Arc::clone(&self.store),
             key: key.to_string(),
             member,
+            has_concurrency_slot: limits.concurrency.is_some(),
             committed: false,
         })
     }
@@ -147,6 +148,7 @@ pub struct Reservation {
     store: Arc<dyn RateStore>,
     key: String,
     member: String,
+    has_concurrency_slot: bool,
     committed: bool,
 }
 
@@ -213,8 +215,9 @@ impl MultiReservation {
     /// Convert into an owned [`StreamConcurrencyGuard`] for the streaming
     /// path. The per-layer concurrency slots stay held — they are NOT
     /// released here — and are released only when the returned guard drops,
-    /// i.e. at stream completion or cancellation. Token accounting still
-    /// happens via [`Limiter::add_tokens_post_stream`].
+    /// i.e. at stream completion or cancellation. Shared stores renew their
+    /// live leases while the guard exists. Token accounting still happens via
+    /// [`Limiter::add_tokens_post_stream`].
     ///
     /// A borrow-based reservation couldn't outlive the request handler, so
     /// the pre-fix streaming path dropped it at handler return; that
@@ -223,6 +226,8 @@ impl MultiReservation {
     #[must_use = "dropping the returned guard immediately releases the concurrency \
                   slot, recreating the early-release bug this fixes"]
     pub fn into_stream_hold(mut self) -> StreamConcurrencyGuard {
+        let mut refresh_interval = None;
+        let mut refresh_holds = Vec::new();
         let holds = self
             .reservations
             .iter_mut()
@@ -230,11 +235,36 @@ impl MultiReservation {
                 // Defuse each reservation's Drop so it doesn't release the
                 // slot now; the returned guard owns release from here on.
                 r.committed = true;
-                (Arc::clone(&r.store), r.key.clone(), r.member.clone())
+                let store = Arc::clone(&r.store);
+                if r.has_concurrency_slot {
+                    if let Some(interval) = store.stream_lease_refresh_interval() {
+                        refresh_interval = Some(
+                            refresh_interval.map_or(interval, |current| current.min(interval)),
+                        );
+                        refresh_holds.push((Arc::clone(&store), r.key.clone(), r.member.clone()));
+                    }
+                }
+                (store, r.key.clone(), r.member.clone())
             })
             .collect();
+        // Proxy handlers create streaming guards inside Tokio. Keep ordinary
+        // callers that do not have a runtime from panicking; they retain the
+        // backend's normal stale-lease recovery behavior instead.
+        let refresh_task = refresh_interval.and_then(|interval| {
+            tokio::runtime::Handle::try_current().ok().map(|handle| {
+                handle.spawn(async move {
+                    loop {
+                        tokio::time::sleep(interval).await;
+                        for (store, key, member) in &refresh_holds {
+                            store.refresh_stream_lease(key, member).await;
+                        }
+                    }
+                })
+            })
+        });
         StreamConcurrencyGuard {
             holds,
+            refresh_task,
             released: false,
         }
     }
@@ -255,6 +285,10 @@ impl std::fmt::Debug for MultiReservation {
 pub struct StreamConcurrencyGuard {
     /// `(store, key, member)` per held layer.
     holds: Vec<(Arc<dyn RateStore>, String, String)>,
+    /// Renews the lease used by shared stores while this guard owns a live
+    /// stream. It is stopped before the terminal release to prevent a late
+    /// renewal from racing stream teardown.
+    refresh_task: Option<tokio::task::JoinHandle<()>>,
     released: bool,
 }
 
@@ -264,6 +298,9 @@ impl StreamConcurrencyGuard {
             return;
         }
         self.released = true;
+        if let Some(task) = self.refresh_task.take() {
+            task.abort();
+        }
         for (store, key, member) in &self.holds {
             store.release(key, member);
         }
@@ -274,6 +311,7 @@ impl std::fmt::Debug for StreamConcurrencyGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamConcurrencyGuard")
             .field("layers", &self.holds.len())
+            .field("refreshing", &self.refresh_task.is_some())
             .field("released", &self.released)
             .finish()
     }

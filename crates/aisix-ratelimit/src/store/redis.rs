@@ -11,13 +11,13 @@
 //! Cluster slot, keeping the per-bucket Lua atomic):
 //! - `aisix:rl:{<bucket>}:<rps|rpm|rph|rpd|tpm|tpd>:<window_start>` — plain
 //!   `INCR`/`GET` counters, `EXPIRE = window + grace`.
-//! - `aisix:rl:{<bucket>}:conc` — a ZSET (`member → score=now`) acting as a
-//!   crash-safe distributed semaphore: acquire prunes entries older than
-//!   `conc_ttl` then counts, so a slot leaked by a crashed/hung replica is
-//!   reclaimed within `conc_ttl`. (LiteLLM's latest tracks parallel
-//!   requests as a window-TTL counter; we use a ZSET with a request-
-//!   lifetime ttl because our streaming requests can outlive a 60s window
-//!   — the same reason `StreamConcurrencyGuard`/#450 exists.)
+//! - `aisix:rl:{<bucket>}:conc` — a ZSET (`member → last-refresh time`) acting
+//!   as a crash-safe distributed semaphore: acquire prunes stale entries then
+//!   counts, so a slot leaked by a crashed/hung replica is reclaimed after its
+//!   `conc_ttl` (with at most one extra second for rolling-upgrade safety).
+//!   Live streams renew their member while their `StreamConcurrencyGuard`
+//!   exists, so a deliberately long SSE response is not mistaken for a
+//!   crashed replica.
 //!
 //! `now` is read from `redis.call('TIME')` inside every script so window
 //! boundaries are identical across replicas regardless of host clock skew.
@@ -88,10 +88,18 @@ local conc_ttl = tonumber(ARGV[4])
 local grace = tonumber(ARGV[5])
 local t = redis.call('TIME')
 local now = tonumber(t[1])
+-- Keep the score in seconds so rolling upgrades still understand existing
+-- integer-second members, but retain Redis TIME's sub-second precision for
+-- a live lease.
+local conc_now = now + tonumber(t[2]) / 1000000
+-- Old nodes wrote integer-second scores. Prune at a whole-second boundary so
+-- a new node cannot mistake an old member acquired late in that second for a
+-- stale member; the safe cost is at most one extra second of retention.
+local conc_prune_before = math.floor(conc_now) - conc_ttl
 
 local conc_key = prefix .. ':conc'
 if conc_max >= 0 then
-  redis.call('ZREMRANGEBYSCORE', conc_key, 0, now - conc_ttl)
+  redis.call('ZREMRANGEBYSCORE', conc_key, 0, '(' .. conc_prune_before)
   local in_flight = redis.call('ZCARD', conc_key)
   if in_flight >= conc_max then
     return {1, 0, 0, conc_max, in_flight}
@@ -143,10 +151,28 @@ for i = 1, nreq do
   end
 end
 if conc_max >= 0 then
-  redis.call('ZADD', conc_key, now, member)
+  redis.call('ZADD', conc_key, conc_now, member)
   redis.call('EXPIRE', conc_key, conc_ttl)
 end
 return {0, 0, 0, 0, 0}
+"#;
+
+/// Refresh one live streaming member's concurrency lease. The member must
+/// already exist: refresh racing stream teardown must not resurrect a member
+/// after `release` removed it. ARGV: prefix, member, conc_ttl.
+const REFRESH_CONCURRENCY_LUA: &str = r#"
+local prefix = ARGV[1]
+local member = ARGV[2]
+local conc_ttl = tonumber(ARGV[3])
+local conc_key = prefix .. ':conc'
+if not redis.call('ZSCORE', conc_key, member) then
+  return 0
+end
+local t = redis.call('TIME')
+local conc_now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+redis.call('ZADD', conc_key, 'XX', conc_now, member)
+redis.call('EXPIRE', conc_key, conc_ttl)
+return 1
 "#;
 
 /// Post-deduct: add `tokens` to the tpm/tpd windows AND release the
@@ -201,10 +227,14 @@ local prefix = ARGV[1]
 local conc_ttl = tonumber(ARGV[2])
 local t = redis.call('TIME')
 local now = tonumber(t[1])
+local conc_now = now + tonumber(t[2]) / 1000000
+-- See ACQUIRE_LUA: use the same conservative boundary so header reads do not
+-- prune a live member while a rolling upgrade is in progress.
+local conc_prune_before = math.floor(conc_now) - conc_ttl
 local ws = now - (now % 60)
 local rpm = tonumber(redis.call('GET', prefix .. ':rpm:' .. ws) or '0')
 local tpm = tonumber(redis.call('GET', prefix .. ':tpm:' .. ws) or '0')
-redis.call('ZREMRANGEBYSCORE', prefix .. ':conc', 0, now - conc_ttl)
+redis.call('ZREMRANGEBYSCORE', prefix .. ':conc', 0, '(' .. conc_prune_before)
 local inflight = redis.call('ZCARD', prefix .. ':conc')
 return {rpm, tpm, inflight, 60 - (now % 60)}
 "#;
@@ -689,6 +719,40 @@ impl RateStore for RedisStore {
                     conn.note_error().await;
                 }
             });
+        }
+    }
+
+    fn stream_lease_refresh_interval(&self) -> Option<std::time::Duration> {
+        let millis = self
+            .conc_ttl
+            .saturating_mul(1_000)
+            .saturating_div(3)
+            .clamp(100, 60_000);
+        Some(std::time::Duration::from_millis(millis))
+    }
+
+    async fn refresh_stream_lease(&self, key: &str, member: &str) {
+        let prefix = self.bucket_prefix(key);
+        let mut conn = match self.conn.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.note_failure("refresh", &e);
+                return;
+            }
+        };
+        let res: Result<i64, redis::RedisError> = Script::new(REFRESH_CONCURRENCY_LUA)
+            .key(&prefix)
+            .arg(&prefix)
+            .arg(member)
+            .arg(self.conc_ttl)
+            .invoke_async(&mut conn)
+            .await;
+        match res {
+            Ok(_) => self.mark_ok(),
+            Err(e) => {
+                self.note_failure("refresh", &e);
+                self.conn.note_error().await;
+            }
         }
     }
 

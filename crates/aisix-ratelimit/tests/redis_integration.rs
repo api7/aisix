@@ -6,11 +6,12 @@
 //! replicas pointed at one Redis — the exact api7/AISIX-Cloud#798 shape:
 //! a limit hit on one replica must already be hit on the other.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_core::{RateLimit, RateLimitScope, RedisConnConfig, RedisMode};
 use aisix_obs::metrics::Metrics;
-use aisix_ratelimit::{RateStore, RedisStore};
+use aisix_ratelimit::{Limiter, MultiReservation, RateStore, RedisStore};
 
 fn redis_url() -> Option<String> {
     std::env::var("RATELIMIT_TEST_REDIS_URL").ok()
@@ -390,10 +391,55 @@ async fn stale_concurrency_slot_is_reclaimed_after_ttl() {
         "slot held while fresh"
     );
 
-    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
     b.acquire(&key, &limits, "b-2")
         .await
         .expect("stale slot reclaimed after conc_ttl");
+}
+
+#[tokio::test]
+async fn stream_hold_renews_redis_lease_until_drop() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    // Keep this short to prove a live stream is not mistaken for a crashed
+    // replica. The stores model two DPs sharing the same Redis backend.
+    let a = Limiter::with_store(Arc::new(store(&url).await.with_conc_ttl(1)));
+    let b = Limiter::with_store(Arc::new(store(&url).await.with_conc_ttl(1)));
+    let key = unique_key("conc-stream-lease");
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..rl()
+    };
+
+    let hold =
+        MultiReservation::new(vec![a.pre_commit(&key, &limits).await.unwrap()]).into_stream_hold();
+
+    // This is longer than conc_ttl plus the one-second rolling-upgrade
+    // compatibility slack. Without the stream lease heartbeat, B's acquire
+    // prunes A and incorrectly admits a second live stream.
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    assert!(
+        matches!(
+            b.pre_commit(&key, &limits).await,
+            Err(aisix_ratelimit::RateLimitError::Concurrency { .. })
+        ),
+        "a live stream must keep its shared concurrency slot beyond conc_ttl"
+    );
+
+    drop(hold);
+    // The release is detached, so bound the wait instead of assuming a
+    // propagation delay on a slow CI runner.
+    let mut acquired = false;
+    for _ in 0..50 {
+        if b.pre_commit(&key, &limits).await.is_ok() {
+            acquired = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(acquired, "slot must free cluster-wide when the stream ends");
 }
 
 /// Redis Cluster: the multi-key acquire/commit Lua must route to the slot

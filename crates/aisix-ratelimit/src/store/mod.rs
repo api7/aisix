@@ -20,6 +20,8 @@
 //!   sync because they run from `Drop` and from the synchronous SSE
 //!   completion callback; the Redis impl makes them fire-and-forget.
 
+use std::time::Duration;
+
 use aisix_core::RateLimit;
 use async_trait::async_trait;
 
@@ -126,6 +128,17 @@ pub trait RateStore: Send + Sync + 'static {
     /// concurrency change). Sync so it can run from the synchronous SSE
     /// completion callback; the Redis impl makes it fire-and-forget.
     fn add_tokens(&self, key: &str, tokens: u64);
+
+    /// How often a live streaming reservation should renew its distributed
+    /// concurrency lease. Local counters have no lease, so they opt out.
+    fn stream_lease_refresh_interval(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Refresh a live streaming reservation's distributed concurrency lease.
+    /// Implementations must never recreate a member that has already been
+    /// released: a final refresh racing with stream teardown must be a no-op.
+    async fn refresh_stream_lease(&self, _key: &str, _member: &str) {}
 
     /// Read-only snapshot for the `x-ratelimit-*` headers. Returns `None`
     /// when there is nothing meaningful to report for the bucket.
