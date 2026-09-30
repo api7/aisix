@@ -738,6 +738,19 @@ pub(crate) fn current() -> Option<Resolved> {
     CURRENT.try_with(|a| a.get()).ok()
 }
 
+/// The current request's attribution cell, for work that continues on a
+/// detached task after the HTTP handler returns.
+///
+/// A WebSocket upgrade moves its session onto axum's upgrade task. That task
+/// does not inherit Tokio task-locals, but it is still the same client request:
+/// the terminal session usage row must retain the model identity captured
+/// before the upgrade. Callers install this exact cell with [`scope`] around
+/// their detached continuation; `None` remains correct outside request
+/// middleware (for example, focused unit tests).
+pub(crate) fn current_cell() -> Option<Arc<RequestAttribution>> {
+    CURRENT.try_with(Arc::clone).ok()
+}
+
 /// The dispatched-target half of an access-log line (AISIX-Cloud#1571).
 ///
 /// The line's `model=` is the entry the CALLER addressed — for a routing

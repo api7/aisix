@@ -42,8 +42,13 @@ pub(crate) fn resolve_model(
     note_dispatchable_entry(&entry);
     // Keep the concrete value separate from ordinary target attribution:
     // an exact request for the literal wildcard row does not run this branch
-    // and must never make its static template eligible for pricing.
-    crate::attribution::note_wildcard_pricing_identity(&entry.id, &upstream);
+    // and must never make its static template eligible for pricing. This is
+    // deliberately decided against the dispatch snapshot: a later terminal
+    // emitter may see a refreshed configuration where the row changed or was
+    // deleted, but it must price the concrete model this request dispatched.
+    if wildcard_pricing_eligible(&entry.value, &upstream) {
+        crate::attribution::note_wildcard_pricing_identity(&entry.id, &upstream);
+    }
     let mut model = entry.value.clone();
     model.model_name = Some(upstream);
     Some(Arc::new(ResourceEntry::new(
@@ -163,6 +168,21 @@ fn resolve_upstream_model_name(model: &Model, capture: &str) -> String {
     }
 }
 
+/// Whether a wildcard dispatch produced a concrete provider-model identity
+/// that is safe to send to CP for pricing.
+///
+/// A wildcard display alias with a fixed upstream is already priced by its
+/// configured model name. Only an upstream template yields a caller-specific
+/// provider-model identity, and a literal `*` is never a concrete catalog key.
+fn wildcard_pricing_eligible(model: &Model, upstream: &str) -> bool {
+    model
+        .model_name
+        .as_deref()
+        .is_some_and(|template| template.contains('*'))
+        && !upstream.is_empty()
+        && !upstream.contains('*')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +261,45 @@ mod tests {
         // The resolved clone keeps the ROW's display_name — the bounded
         // identity metric labels and rate-limit buckets key on.
         assert_eq!(resolved.value.display_name, "openai/*");
+    }
+
+    /// Pricing eligibility belongs to the snapshot that dispatched the
+    /// request. In particular, a wildcard display alias over a fixed model,
+    /// a literal wildcard row, and a capture that is still itself a wildcard
+    /// must not manufacture a concrete provider-model price identity.
+    #[tokio::test]
+    async fn only_concrete_template_capture_sets_wildcard_pricing_identity() {
+        use std::sync::Arc;
+
+        let snap = snapshot_with(vec![
+            ("wildcard", direct_model("openrouter/*", Some("*"))),
+            ("fixed", direct_model("fixed/*", Some("gpt-4o"))),
+        ]);
+
+        crate::attribution::scope(
+            Arc::new(crate::attribution::RequestAttribution::default()),
+            async {
+                resolve_model(&snap, "openrouter/gpt-4o-2024-08-06")
+                    .expect("concrete wildcard request resolves");
+                let resolved = crate::attribution::current().expect("in request scope");
+                assert_eq!(resolved.wildcard_pricing_model_id, "wildcard");
+                assert_eq!(resolved.wildcard_pricing_model, "gpt-4o-2024-08-06");
+            },
+        )
+        .await;
+
+        for requested in ["fixed/anything", "openrouter/*", "openrouter/gpt-*"] {
+            crate::attribution::scope(
+                Arc::new(crate::attribution::RequestAttribution::default()),
+                async {
+                    resolve_model(&snap, requested).expect("configured request resolves");
+                    let resolved = crate::attribution::current().expect("in request scope");
+                    assert!(resolved.wildcard_pricing_model_id.is_empty(), "{requested}");
+                    assert!(resolved.wildcard_pricing_model.is_empty(), "{requested}");
+                },
+            )
+            .await;
+        }
     }
 
     #[test]
