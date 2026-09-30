@@ -56,6 +56,11 @@ const CANCELLED_USAGE_UPSTREAM_MODEL = "embedding-usage-cancelled-mock";
 const GUARDRAIL_OVERFLOW_COUNT = 33;
 
 const ROUTE_EXAMPLE = "route-topic prototype";
+// Keep the streaming router's prototype distinct from the buffered router's.
+// Semantic prototype embeddings are cached across requests, and sharing this
+// value would turn the second scenario into a one-input call depending on test
+// order rather than proving its own two-input bridge usage.
+const STREAM_ROUTE_EXAMPLE = "stream-route-topic prototype";
 const ROUTE_PROMPT = "route-topic caller question";
 const STREAM_RESPONSE_TEXT = "streamed semantic route answer";
 const STREAM_USAGE = {
@@ -470,7 +475,7 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
           {
             name: "route-topic",
             target: STREAM_ROUTE_TARGET,
-            examples: [ROUTE_EXAMPLE],
+            examples: [STREAM_ROUTE_EXAMPLE],
             threshold: 0.9,
           },
         ],
