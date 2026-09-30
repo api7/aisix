@@ -295,6 +295,7 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
   let routeTargetModelID = "";
   let routeDefaultModelID = "";
   let streamRouteTargetModelID = "";
+  let outputGuardrailRouterModelID = "";
   let outputGuardrailTargetModelID = "";
   let guardrailModelID = "";
   let overflowGuardrailModelID = "";
@@ -531,7 +532,7 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
         match: { threshold: 0.9 },
       },
     });
-    await seed.createModel({
+    const outputGuardrailRouter = await seed.createModel({
       display_name: OUTPUT_GUARDRAIL_ROUTER_MODEL,
       semantic: {
         embedding_model: EMBED_MODEL,
@@ -547,6 +548,7 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
         match: { threshold: 0.9 },
       },
     });
+    outputGuardrailRouterModelID = outputGuardrailRouter.id;
     await seed.createModel({
       display_name: STREAM_ROUTER_MODEL,
       semantic: {
@@ -629,9 +631,12 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
       },
       { attach: false },
     );
+    // Guardrail resolution happens on the caller's virtual model before the
+    // semantic router selects its concrete target; this output hook still
+    // runs after that target has returned.
     await seed.attachGuardrailToModel(
       outputSemanticGuardrail.id,
-      outputGuardrailTargetModelID,
+      outputGuardrailRouterModelID,
       100,
     );
 
