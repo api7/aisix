@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { harnessRequest } from "../harness/http.js";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -636,18 +637,9 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
         }),
       });
 
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await call();
-        const ok =
-          r.status === 200 &&
-          (r.headers.get("content-type") ?? "").includes("text/event-stream");
-        await r.text();
-        return ok;
-      } catch {
-        return false;
-      }
-    });
+    // Readiness must not exercise the streaming journey this test asserts.
+    const readiness = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => (await readiness.listModels()).status === 200);
 
     const res = await call();
     expect(res.status).toBe(200);
@@ -721,15 +713,8 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
         }),
       });
 
-    await waitConfigPropagation(async () => {
-      try {
-        const ready = await fetch(`${app!.proxyUrl}/v1/models`, { headers });
-        await ready.text();
-        return ready.status === 200;
-      } catch {
-        return false;
-      }
-    });
+    const readiness = new ProxyClient(app.proxyUrl, STREAM_LIMITED_PLAINTEXT);
+    await waitConfigPropagation(async () => (await readiness.listModels()).status === 200);
 
     // Fetch resolves as soon as the upstream headers are relayed. Keep this
     // body unread while issuing the second request: it is the real caller
@@ -751,15 +736,11 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     await first.body!.cancel();
     let naturallyEnding: Response | undefined;
     await waitConfigPropagation(async () => {
-      try {
-        const afterCancel = await call();
-        const admitted = afterCancel.status === 200;
-        if (admitted) naturallyEnding = afterCancel;
-        else await afterCancel.text();
-        return admitted;
-      } catch {
-        return false;
-      }
+      const afterCancel = await call();
+      const admitted = afterCancel.status === 200;
+      if (admitted) naturallyEnding = afterCancel;
+      else await afterCancel.text();
+      return admitted;
     }, 3_000);
     expect(naturallyEnding).toBeDefined();
     await naturallyEnding!.text();

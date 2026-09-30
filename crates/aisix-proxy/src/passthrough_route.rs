@@ -1496,12 +1496,9 @@ impl<'de> serde::de::Visitor<'de> for OtherTopLevelJsonStringsVisitor<'_, '_> {
 }
 
 fn decoded_json_string_values(body: &[u8]) -> Option<String> {
-    let mut out = String::new();
-    let mut collector = JsonStringCollector { out: &mut out };
-    let mut deserializer = serde_json::Deserializer::from_slice(body);
-    serde::de::DeserializeSeed::deserialize(&mut collector, &mut deserializer).ok()?;
-    deserializer.end().ok()?;
-    (!out.is_empty()).then_some(out)
+    crate::json_splice::collect_string_values(body)
+        .ok()
+        .filter(|out| !out.is_empty())
 }
 
 /// All occurrences of every non-envelope top-level value, preserving
@@ -1528,13 +1525,14 @@ fn decoded_other_top_level_json_string_values(body: &[u8], excluded: &[&str]) ->
 /// is impossible, so detection never loses audit coverage.
 fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
     let raw = || String::from_utf8_lossy(body).into_owned();
+    if matches!(protocol, PassthroughProtocol::Raw) {
+        return decoded_json_string_values(body).unwrap_or_else(raw);
+    }
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return raw();
+        return decoded_json_string_values(body).unwrap_or_else(raw);
     };
     let (mut extracted, envelope_keys): (String, &[&str]) = match protocol {
-        PassthroughProtocol::Raw => {
-            return decoded_json_string_values(body).unwrap_or_else(raw);
-        }
+        PassthroughProtocol::Raw => unreachable!("handled before typed envelope parsing"),
         // An Anthropic Messages body carries its system prompt top-level.
         PassthroughProtocol::OpenaiChat => (
             v.get("system")
@@ -1606,12 +1604,12 @@ fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String 
 /// Best-effort like the request side.
 fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
     let raw = || String::from_utf8_lossy(body).into_owned();
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return raw();
-    };
     if matches!(protocol, PassthroughProtocol::Raw) {
         return decoded_json_string_values(body).unwrap_or_else(raw);
     }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return decoded_json_string_values(body).unwrap_or_else(raw);
+    };
     // Responses answers with `output` items, not `choices`: read them as
     // the typed route does (`responses::responses_output_text`) — message
     // text plus each tool call's name, arguments and input, with generated
@@ -2248,6 +2246,26 @@ fn frame_parts(
         if payload.is_empty() || payload == "[DONE]" {
             break 'payload;
         }
+        if matches!(protocol, PassthroughProtocol::Raw) {
+            // Raw payloads have no typed content/usage envelope to extract.
+            // Scan them with the iterative value walker before touching
+            // serde_json::Value: its default recursion limit would otherwise
+            // turn a valid deeply nested escaped string into raw source text
+            // and let it bypass an output guardrail.
+            if usage_labelled {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                    if let Some(u) = usage_of(&v) {
+                        merge(u);
+                    }
+                }
+            }
+            parts = crate::held_content::Parts {
+                scan: decoded_json_string_values(payload.as_bytes())
+                    .unwrap_or_else(|| payload.to_string()),
+                reasoning: 0,
+            };
+            break 'payload;
+        }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
             // Unparseable joined payload — a non-conformant upstream that
             // put two independent JSON documents on two `data:` lines, say.
@@ -2258,7 +2276,10 @@ fn frame_parts(
             // client receives is the bypass. (Per-line parsing used to catch
             // the two-document case incidentally; this covers it and every
             // other shape that does not parse.)
-            parts.scan.push_str(payload);
+            parts.scan.push_str(
+                &decoded_json_string_values(payload.as_bytes())
+                    .unwrap_or_else(|| payload.to_string()),
+            );
             break 'payload;
         };
         if let Some(u) = v.get("usage").and_then(usage_of) {
@@ -2297,11 +2318,7 @@ fn frame_parts(
             }
         }
         parts = match protocol {
-            PassthroughProtocol::Raw => crate::held_content::Parts {
-                scan: decoded_json_string_values(payload.as_bytes())
-                    .unwrap_or_else(|| payload.to_string()),
-                reasoning: 0,
-            },
+            PassthroughProtocol::Raw => unreachable!("handled before typed frame parsing"),
             // The chat envelope also carries Anthropic Messages streams; the
             // two event shapes are disjoint, so reading both is exact.
             PassthroughProtocol::OpenaiChat => {
@@ -2328,9 +2345,8 @@ fn frame_capture_text(protocol: PassthroughProtocol, frame: &[u8], scan: &str) -
         return scan.to_string();
     }
     crate::redact::frame_payload(frame)
-        .map(|payload| payload.trim())
-        .filter(|payload| !payload.is_empty() && *payload != "[DONE]")
-        .map(str::to_string)
+        .map(|payload| payload.trim().to_owned())
+        .filter(|payload| !payload.is_empty() && payload != "[DONE]")
         .unwrap_or_else(|| scan.to_string())
 }
 
@@ -3163,6 +3179,15 @@ mod tests {
             completion_tokens: completion,
             ..Default::default()
         }
+    }
+
+    /// More than serde_json's default container recursion limit, while still
+    /// small enough to fit comfortably under the request body limit.
+    fn deeply_nested_escaped_block_json() -> Vec<u8> {
+        let mut json = "{\"v\":".repeat(160);
+        json.push_str(r#""\u0042LOCKME""#);
+        json.push_str(&"}".repeat(160));
+        json.into_bytes()
     }
 
     fn provider_key_entry(api_base_unused: &str) -> ResourceEntry<ProviderKey> {
@@ -4310,6 +4335,16 @@ mod tests {
             response_capture_text(PassthroughProtocol::Raw, response),
             r#"{"state":"\u0042LOCKME","state":"clean"}"#
         );
+
+        let deep = deeply_nested_escaped_block_json();
+        assert!(
+            request_guardrail_text(PassthroughProtocol::Raw, &deep).contains("BLOCKME"),
+            "a valid deep Raw request must not fall back to escaped source"
+        );
+        assert!(
+            response_guardrail_text(PassthroughProtocol::Raw, &deep).contains("BLOCKME"),
+            "a valid deep Raw response must not fall back to escaped source"
+        );
     }
 
     #[test]
@@ -4945,6 +4980,15 @@ mod tests {
         assert_eq!(
             frame_capture_text(PassthroughProtocol::Raw, frame, &raw.scan),
             r#"{"state":"\u0042LOCKME","state":"clean"}"#
+        );
+        let deep = deeply_nested_escaped_block_json();
+        let frame = format!("data: {}\n\n", String::from_utf8_lossy(&deep));
+        assert!(
+            frame_parts(PassthroughProtocol::Raw, frame.as_bytes())
+                .0
+                .scan
+                .contains("BLOCKME"),
+            "a valid deep Raw SSE payload must not fall back to escaped source"
         );
     }
 

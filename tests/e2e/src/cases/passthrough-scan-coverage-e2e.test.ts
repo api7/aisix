@@ -10,6 +10,7 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 
 // E2E: what a passthrough route's guardrails read, per detected envelope.
 //
@@ -34,7 +35,12 @@ const ESCAPED_BLOCK = "BLOCKME";
 const ESCAPED_CJK = "中文";
 const ESCAPED_BLOCK_JSON = String.raw`{"state":"\u0042LOCKME","state":"clean"}`;
 const ESCAPED_CJK_JSON = String.raw`{"query":"\u4e2d\u6587"}`;
-const SAFE_ESCAPED_JSON = String.raw`{"state":"\u0063lean"}`;
+const SAFE_ESCAPED_JSON = String.raw`{"state":"\u0063lean","state":"safe"}`;
+const deepEscapedBlockJSON = (depth: number) =>
+  `${'{"v":'.repeat(depth)}"${String.raw`\u0042LOCKME`}"${'}'.repeat(depth)}`;
+// Above serde_json's default recursion limit. It remains valid JSON and the
+// provider receives it verbatim, so Raw guardrails must still decode the leaf.
+const DEEP_ESCAPED_BLOCK_JSON = deepEscapedBlockJSON(160);
 const CAP = 1_000;
 
 const anthropicEvents = (blocks: Array<Record<string, unknown>>) => [
@@ -87,7 +93,9 @@ const STREAMS: Record<string, string[]> = {
 
 describe("passthrough guardrail scan coverage", () => {
   let app: SpawnedApp | undefined;
+  let seed: SeedClient | undefined;
   const upstreams: Record<string, OpenAiUpstream> = {};
+  const otlps: MockOtlp[] = [];
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -95,7 +103,7 @@ describe("passthrough guardrail scan coverage", () => {
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     app = await spawnApp();
-    const seed = new SeedClient(etcd, app.etcdPrefix);
+    seed = new SeedClient(etcd, app.etcdPrefix);
     for (const [name, streamEvents] of Object.entries(STREAMS)) {
       upstreams[name] = await startOpenAiUpstream({ streamEvents });
     }
@@ -108,6 +116,13 @@ describe("passthrough guardrail scan coverage", () => {
     });
     upstreams["raw-stream"] = await startOpenAiUpstream({
       rawStreamFrames: [`data: ${ESCAPED_BLOCK_JSON}\n\n`, "data: [DONE]\n\n"],
+    });
+    upstreams["raw-deep-output"] = await startOpenAiUpstream({
+      rawBody: DEEP_ESCAPED_BLOCK_JSON,
+      rawContentType: "application/json",
+    });
+    upstreams["raw-deep-stream"] = await startOpenAiUpstream({
+      rawStreamFrames: [`data: ${DEEP_ESCAPED_BLOCK_JSON}\n\n`, "data: [DONE]\n\n"],
     });
     upstreams["raw-safe-output"] = await startOpenAiUpstream({
       rawBody: SAFE_ESCAPED_JSON,
@@ -168,6 +183,7 @@ describe("passthrough guardrail scan coverage", () => {
   afterAll(async () => {
     await app?.exit();
     await Promise.all(Object.values(upstreams).map((u) => u.close()));
+    await Promise.all(otlps.map((o) => o.close()));
   });
 
   const call = (route: string, path: string, body: Record<string, unknown>) =>
@@ -187,7 +203,7 @@ describe("passthrough guardrail scan coverage", () => {
   const responsesBody = { model: "gpt-4o-mini", stream: true, input: "go" };
 
   const ready = (ctx: { skip: () => void }) => {
-    if (!etcdReachable || !app) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return false;
     }
@@ -316,6 +332,15 @@ describe("passthrough guardrail scan coverage", () => {
     expect(upstreams.input!.receivedRequests.length).toBe(before);
   });
 
+  test("input: deep raw JSON escapes are decoded before scanning", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams.input!.receivedRequests.length;
+    const res = await callRaw("input", "/v1/any", DEEP_ESCAPED_BLOCK_JSON);
+    expect(res.status).toBe(422);
+    expect(await res.text()).toContain("pt-scan-input");
+    expect(upstreams.input!.receivedRequests.length).toBe(before);
+  });
+
   test("input: safe raw JSON keeps its original bytes upstream", async (ctx) => {
     if (!ready(ctx)) return;
     const before = upstreams.input!.receivedRequests.length;
@@ -346,6 +371,17 @@ describe("passthrough guardrail scan coverage", () => {
     expect(upstreams["raw-safe-output"]!.receivedRequests.length).toBe(before + 1);
   });
 
+  test("output: deep raw JSON escapes are decoded before scanning", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams["raw-deep-output"]!.receivedRequests.length;
+    const res = await callRaw("raw-deep-output", "/v1/any", String.raw`{"state":"clean"}`);
+    expect(res.status).toBe(422);
+    const body = await res.text();
+    expect(body).toContain("pt-scan-output");
+    expect(body).not.toContain(ESCAPED_BLOCK);
+    expect(upstreams["raw-deep-output"]!.receivedRequests.length).toBe(before + 1);
+  });
+
   test("output: raw SSE JSON escapes are decoded before scanning", async (ctx) => {
     if (!ready(ctx)) return;
     const before = upstreams["raw-stream"]!.receivedRequests.length;
@@ -365,5 +401,59 @@ describe("passthrough guardrail scan coverage", () => {
     expect(res.status).toBe(200);
     expect(await res.text()).toBe(`data: ${SAFE_ESCAPED_JSON}\n\n`);
     expect(upstreams["raw-safe-stream"]!.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("telemetry: Raw buffered and SSE responses retain their original JSON source", async (ctx) => {
+    if (!ready(ctx)) return;
+
+    const otlp = await startMockOtlp();
+    otlps.push(otlp);
+    await seed!.createObservabilityExporter({
+      name: "pt-scan-raw-source-capture",
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlp.url,
+      content_mode: "full",
+      content_max_bytes: 4_096,
+    });
+    const proxy = new ProxyClient(app!.proxyUrl, CALLER);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
+
+    const completionFor = async (route: string) => {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const span = otlp.spans.find(
+          (candidate) =>
+            candidate.attributes["aisix.passthrough.route_name"] === `pt-scan-${route}` &&
+            candidate.attributes["gen_ai.completion"] === SAFE_ESCAPED_JSON,
+        );
+        if (span) return span;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      throw new Error(`no raw-source OTLP completion for ${route}`);
+    };
+
+    const buffered = await callRaw("raw-safe-output", "/v1/any", SAFE_ESCAPED_JSON);
+    expect(buffered.status).toBe(200);
+    expect(await buffered.text()).toBe(SAFE_ESCAPED_JSON);
+    await completionFor("raw-safe-output");
+
+    const streamed = await callRaw("raw-safe-stream", "/v1/any", SAFE_ESCAPED_JSON);
+    expect(streamed.status).toBe(200);
+    expect(await streamed.text()).toBe(`data: ${SAFE_ESCAPED_JSON}\n\n`);
+    await completionFor("raw-safe-stream");
+    expect(otlp.parseFailures).toEqual([]);
+  });
+
+  test("output: deep raw SSE JSON escapes are decoded before scanning", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams["raw-deep-stream"]!.receivedRequests.length;
+    const res = await callRaw("raw-deep-stream", "/v1/any", String.raw`{"state":"clean"}`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain("event: error");
+    expect(body).toContain("content_filter");
+    expect(body).not.toContain(ESCAPED_BLOCK);
+    expect(upstreams["raw-deep-stream"]!.receivedRequests.length).toBe(before + 1);
   });
 });

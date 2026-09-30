@@ -14,11 +14,10 @@
 //! data — same rule as `collect_string_leaves` in the MCP scan path),
 //! but they ARE decoded to build the path handed to the predicate.
 //!
-//! The scanner assumes syntactically valid JSON (callers run it on
-//! bytes `serde_json` has already parsed) and still fails safe: any
-//! unexpected byte, overrun, or depth blow-up returns an error rather
-//! than a partially rewritten document. Callers decide the failure
-//! policy (the MCP output hook fails closed).
+//! The scanner is iterative, so deeply nested JSON does not consume the
+//! Rust call stack. It still fails safe: any unexpected byte or overrun
+//! returns an error rather than a partially rewritten document. Callers
+//! decide the failure policy (the MCP output hook fails closed).
 
 use std::ops::Range;
 
@@ -45,11 +44,6 @@ impl PathSeg {
 pub struct SpliceError {
     at: usize,
 }
-
-/// Depth cap. `serde_json` refuses documents deeper than 128, so bytes
-/// that reached a splice call can never hit this; it bounds the scanner
-/// on its own anyway.
-const MAX_DEPTH: usize = 256;
 
 /// Rewrite the string values of `input` selected by `should_rewrite`,
 /// leaving every other byte untouched.
@@ -108,9 +102,6 @@ pub fn rewrite_string_values(
         match b {
             b'{' => {
                 frames.push(Frame::Object);
-                if frames.len() > MAX_DEPTH {
-                    return Err(err(pos));
-                }
                 pos += 1;
                 skip_ws(&mut pos);
                 match input.get(pos) {
@@ -135,9 +126,6 @@ pub fn rewrite_string_values(
             }
             b'[' => {
                 frames.push(Frame::Array);
-                if frames.len() > MAX_DEPTH {
-                    return Err(err(pos));
-                }
                 pos += 1;
                 skip_ws(&mut pos);
                 if input.get(pos) == Some(&b']') {
@@ -242,6 +230,28 @@ pub fn rewrite_string_values(
     Ok(Some(out))
 }
 
+/// Decode and collect every JSON string **value** in source order.
+///
+/// This reuses the iterative splice scanner with a no-op rewrite, so it
+/// preserves duplicate keys and keeps working beyond serde_json's default
+/// container-recursion limit. Object keys are decoded only to maintain the
+/// scanner's structure and are never included in the returned text.
+pub fn collect_string_values(input: &[u8]) -> Result<String, SpliceError> {
+    let mut out = String::new();
+    rewrite_string_values(
+        input,
+        |_| true,
+        |value| {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(value);
+            None
+        },
+    )?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +328,16 @@ mod tests {
         .unwrap();
         // "z" (outside params.arguments) is filtered by the predicate.
         assert_eq!(seen, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn collects_deep_string_values_without_recursion() {
+        let depth = 512;
+        let mut doc = "{\"v\":".repeat(depth);
+        doc.push_str(r#""\u0042LOCKME""#);
+        doc.push_str(&"}".repeat(depth));
+
+        assert_eq!(collect_string_values(doc.as_bytes()).unwrap(), "BLOCKME");
     }
 
     #[test]
