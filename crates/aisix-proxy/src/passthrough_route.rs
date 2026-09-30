@@ -1835,13 +1835,14 @@ fn query_keys_at_all_decode_levels(query: &str) -> Option<Vec<Vec<u8>>> {
     None
 }
 
-/// Match the key canonicalization used by common form parsers: a bracketed
-/// suffix selects a nested value beneath the base key, and ASCII dots/spaces
-/// are aliases for underscores.
+/// Match PHP-style form-key registration after form decoding: leading ASCII
+/// spaces are ignored, a NUL or bracketed suffix terminates the base key, and
+/// ASCII dots/spaces in that base key are aliases for underscores.
 fn normalize_form_query_key(key: &str) -> Vec<u8> {
     key.as_bytes()
         .iter()
-        .take_while(|byte| **byte != b'[')
+        .skip_while(|byte| **byte == b' ')
+        .take_while(|byte| !matches!(**byte, b'\0' | b'['))
         .map(|byte| match *byte {
             b'.' | b' ' => b'_',
             byte => byte,
@@ -3309,6 +3310,23 @@ mod tests {
             .is_err(),
             "a nested-encoded query delimiter must not recreate an operator-owned key"
         );
+        for query in [
+            "+tenant=caller",
+            "%20tenant=caller",
+            "%2520tenant=caller",
+            "tenant%00suffix=caller",
+            "tenant%2500suffix=caller",
+        ] {
+            assert!(
+                join_target_url(
+                    "https://upstream.example/provider/v1?tenant=operator",
+                    "models",
+                    Some(query),
+                )
+                .is_err(),
+                "{query} must not bypass an operator-owned key through PHP-style form-key registration"
+            );
+        }
         for query in [
             "safe=1;tenant=caller",
             "safe=1%3Btenant%3Dcaller",

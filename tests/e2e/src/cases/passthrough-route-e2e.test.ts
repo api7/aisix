@@ -332,6 +332,22 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     expect(upstream.receivedRequests).toHaveLength(baseline);
 
     for (const query of [
+      "+tenant=caller",
+      "%20tenant=caller",
+      "%2520tenant=caller",
+      "tenant%00suffix=caller",
+      "tenant%2500suffix=caller",
+    ]) {
+      const phpFormKeyConflict = await harnessRequest(
+        `${app.proxyUrl}/ptr-boundary/models?${query}`,
+        { headers },
+      );
+      expect(phpFormKeyConflict.statusCode, query).toBe(400);
+      await phpFormKeyConflict.body.text();
+      expect(upstream.receivedRequests, query).toHaveLength(baseline);
+    }
+
+    for (const query of [
       "safe=1;tenant=caller",
       "safe=1%3Btenant%3Dcaller",
       "safe=1%253Btenant%253Dcaller",
