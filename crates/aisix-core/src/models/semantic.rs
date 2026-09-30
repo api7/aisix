@@ -9,10 +9,10 @@
 //! `embedding_model`, scores it against each route's example embeddings
 //! (cosine, aggregated per route), and dispatches to the highest route
 //! whose score clears its threshold — or to `default` when none does.
-//! Route example vectors are populated lazily on the first request that
-//! needs them and cached. That request may make an additional batch
-//! embedding call; the steady-state cost is a single prompt embedding plus
-//! local arithmetic.
+//! Route example vectors are populated lazily during request handling and
+//! cached. A cold request batches its prompt and every distinct uncached
+//! route-example text into the same embedding request; the steady-state cost
+//! is a single prompt embedding plus local arithmetic.
 //!
 //! A router that carries a `classifier` block decides differently: the
 //! latest user message is sent once to a hosted decision model, which
@@ -83,11 +83,11 @@ pub struct SemanticRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub description: Option<String>,
-    /// Example utterances that define this route. AISIX embeds each example
-    /// lazily on the first request that needs it and caches the vector. That
-    /// request may make an additional batch embedding call. Required, with
-    /// at least one example, when the router has no `classifier`; not
-    /// accepted when it has one.
+    /// Example utterances that define this route. AISIX caches their vectors
+    /// lazily. A request batches its prompt and every distinct uncached
+    /// example text into the same embedding request. Required, with at least
+    /// one example, when the router has no `classifier`; not accepted when it
+    /// has one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(min = 1), inner(length(min = 1)))]
     pub examples: Vec<String>,

@@ -1066,7 +1066,7 @@
           "type": "string"
         },
         "examples": {
-          "description": "Example utterances that define this route. AISIX embeds each example lazily on the first request that needs it and caches the vector. That request may make an additional batch embedding call. Required, with at least one example, when the router has no `classifier`; not accepted when it has one.",
+          "description": "Example utterances that define this route. AISIX caches their vectors lazily. A request batches its prompt and every distinct uncached example text into the same embedding request. Required, with at least one example, when the router has no `classifier`; not accepted when it has one.",
           "items": {
             "minLength": 1,
             "type": "string"
