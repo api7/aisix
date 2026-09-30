@@ -476,6 +476,18 @@ struct BodyCounters {
     response_bytes: AtomicU64,
 }
 
+/// The child embedding calls a request caused while it was being served.
+///
+/// This sits outside [`Cell`]: [`detached`] must isolate target attribution,
+/// but semantic routing, the semantic cache, and semantic guardrails still
+/// need to append their gateway-initiated calls to the real parent's terminal
+/// usage event. A detached child therefore receives a fresh `Cell` and shares
+/// only this ledger with its parent.
+#[derive(Default)]
+struct GatewayEmbeddingLedger {
+    calls: Mutex<Vec<aisix_obs::GatewayEmbeddingCall>>,
+}
+
 /// The per-request cell. Attempts within a request are sequential, so the
 /// lock is uncontended; it exists because the cancel guard may read the
 /// cell from a different point in the stack than the writer.
@@ -483,9 +495,42 @@ struct BodyCounters {
 pub(crate) struct RequestAttribution {
     cell: Mutex<Cell>,
     bodies: BodyCounters,
+    gateway_embedding_ledger: Arc<GatewayEmbeddingLedger>,
 }
 
 impl RequestAttribution {
+    /// A sub-call scope that cannot change the parent request's target
+    /// attribution but can still account for gateway-initiated embeddings on
+    /// the parent's eventual terminal usage event.
+    fn detached_child(&self) -> Self {
+        Self {
+            cell: Mutex::new(Cell::default()),
+            bodies: BodyCounters::default(),
+            gateway_embedding_ledger: Arc::clone(&self.gateway_embedding_ledger),
+        }
+    }
+
+    fn note_gateway_embedding_call(&self, call: aisix_obs::GatewayEmbeddingCall) {
+        self.gateway_embedding_ledger
+            .calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(call);
+    }
+
+    /// Move the accumulated child calls into the one terminal parent event.
+    /// Taking rather than cloning makes a duplicate terminal emitter unable
+    /// to report the same bridge call twice.
+    fn take_gateway_embedding_calls(&self) -> Vec<aisix_obs::GatewayEmbeddingCall> {
+        std::mem::take(
+            &mut *self
+                .gateway_embedding_ledger
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
     /// Mark this cell as installed by the telemetry middleware, which will
     /// call [`Self::finish`] once the response body is done with. From here
     /// an access-log line is held until then. `span` is the request span
@@ -663,7 +708,10 @@ pub(crate) fn sync_scope<T>(cell: &Arc<RequestAttribution>, f: impl FnOnce() -> 
 /// merely absent, on exactly the line an operator reads to find out which
 /// member of a routing group served them (AISIX-Cloud#1571).
 pub(crate) fn detached<F: Future>(fut: F) -> impl Future<Output = F::Output> {
-    CURRENT.scope(Arc::new(RequestAttribution::default()), fut)
+    let child = CURRENT
+        .try_with(|parent| Arc::new(parent.detached_child()))
+        .unwrap_or_else(|_| Arc::new(RequestAttribution::default()));
+    CURRENT.scope(child, fut)
 }
 
 /// Note the model name the caller addressed. Called once per request from
@@ -713,6 +761,24 @@ pub(crate) fn note_cache_hit_entry(entry: &Model, hit_layer: &'static str) {
 /// What the current request has resolved, or `None` outside a request.
 pub(crate) fn current() -> Option<Resolved> {
     CURRENT.try_with(|a| a.get()).ok()
+}
+
+/// Record one actual gateway-initiated embedding bridge call. This is safe
+/// inside [`detached`]: that scope keeps a throwaway target cell but shares
+/// the parent's [`GatewayEmbeddingLedger`]. Calls outside an HTTP request are
+/// deliberately dropped, just like every other attribution write.
+pub(crate) fn note_gateway_embedding_call(call: aisix_obs::GatewayEmbeddingCall) {
+    let _ = CURRENT.try_with(|a| a.note_gateway_embedding_call(call));
+}
+
+/// Move this request's gateway-initiated embedding calls into its terminal
+/// usage event. Outside a request scope this is empty; cancellation installs
+/// the original cell with [`sync_scope`] before it emits, so it follows the
+/// same path as ordinary and streaming terminal emitters.
+pub(crate) fn take_gateway_embedding_calls() -> Vec<aisix_obs::GatewayEmbeddingCall> {
+    CURRENT
+        .try_with(|a| a.take_gateway_embedding_calls())
+        .unwrap_or_default()
 }
 
 /// The dispatched-target half of an access-log line (AISIX-Cloud#1571).
@@ -1086,6 +1152,44 @@ mod tests {
         note_requested_model("gpt-4o");
         note_target(&model("openai", "gpt-4o"), "pk-1");
         assert!(current().is_none());
+    }
+
+    /// A gateway-owned embedding must retain the caller's actual target while
+    /// still reaching that caller's one terminal usage event. This is the
+    /// reason the detached cell shares only the child-call ledger, not its
+    /// resolved target state.
+    #[tokio::test]
+    async fn detached_embedding_call_reaches_the_parent_ledger_once() {
+        let parent = Arc::new(RequestAttribution::default());
+        scope(parent.clone(), async {
+            note_target(&model("anthropic", "claude-sonnet"), "pk-chat");
+            detached(async {
+                note_target(&model("openai", "text-embedding-3-small"), "pk-embed");
+                note_gateway_embedding_call(aisix_obs::GatewayEmbeddingCall {
+                    count: 1,
+                    purpose: aisix_obs::GatewayEmbeddingPurpose::Guardrail,
+                    embedding_model_id: "embed-model-id".into(),
+                    prompt_tokens: 4,
+                    total_tokens: 4,
+                    latency_ms: 9,
+                    outcome: aisix_obs::GatewayEmbeddingOutcome::Succeeded,
+                });
+            })
+            .await;
+
+            let target = current().expect("parent request remains in scope");
+            assert_eq!(target.upstream_model, "claude-sonnet");
+            assert_eq!(target.provider_key_id, "pk-chat");
+
+            let calls = take_gateway_embedding_calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0].purpose,
+                aisix_obs::GatewayEmbeddingPurpose::Guardrail
+            );
+            assert!(take_gateway_embedding_calls().is_empty());
+        })
+        .await;
     }
 
     #[tokio::test]

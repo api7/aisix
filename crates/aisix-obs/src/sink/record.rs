@@ -269,6 +269,42 @@ mod tests {
         assert!(bare.get("guardrail_scores").is_none());
     }
 
+    /// AISIX-Cloud#1747: a gateway-initiated embedding remains child work
+    /// of the caller's request, but its token/count/latency audit must ride
+    /// the same metadata-only exporter wire as the parent event. This keeps
+    /// the record visible without folding a different model's usage into the
+    /// parent's billable token fields.
+    #[test]
+    fn gateway_embedding_calls_ride_the_flattened_exporter_wire() {
+        let rec = SinkRecord::metadata_only(UsageEvent {
+            gateway_embedding_calls: vec![crate::usage::GatewayEmbeddingCall {
+                count: 1,
+                purpose: crate::usage::GatewayEmbeddingPurpose::SemanticCache,
+                embedding_model_id: "embedding-model-id".into(),
+                prompt_tokens: 12,
+                total_tokens: 15,
+                latency_ms: 34,
+                outcome: crate::usage::GatewayEmbeddingOutcome::Succeeded,
+            }],
+            ..UsageEvent::default()
+        });
+        let json = serde_json::to_value(&rec).unwrap();
+        let calls = json["gateway_embedding_calls"]
+            .as_array()
+            .expect("flattened onto the record, not nested under `usage`");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["count"], 1);
+        assert_eq!(calls[0]["purpose"], "semantic_cache");
+        assert_eq!(calls[0]["embedding_model_id"], "embedding-model-id");
+        assert_eq!(calls[0]["prompt_tokens"], 12);
+        assert_eq!(calls[0]["total_tokens"], 15);
+        assert_eq!(calls[0]["latency_ms"], 34);
+        assert_eq!(calls[0]["outcome"], "succeeded");
+
+        let bare = serde_json::to_value(SinkRecord::metadata_only(UsageEvent::default())).unwrap();
+        assert!(bare.get("gateway_embedding_calls").is_none());
+    }
+
     #[test]
     fn full_content_record_carries_prompt_and_response() {
         let rec = SinkRecord::metadata_only(UsageEvent::default()).with_content(SinkContent {

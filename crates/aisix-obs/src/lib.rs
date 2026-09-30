@@ -53,7 +53,9 @@ pub use trace::{
     parse_traceparent, screen_tracestate, RemoteTraceContext, RequestTraceBundle, SpanEmit,
     SpanRole, TraceEmission, TRACEPARENT_HEADER, TRACESTATE_HEADER,
 };
-pub use usage::{UsageEvent, UsageSink};
+pub use usage::{
+    GatewayEmbeddingCall, GatewayEmbeddingOutcome, GatewayEmbeddingPurpose, UsageEvent, UsageSink,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ObsError {

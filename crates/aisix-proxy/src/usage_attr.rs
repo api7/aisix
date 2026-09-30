@@ -958,6 +958,14 @@ pub(crate) fn emit_usage(
     if terminal && event.guardrail_blocked {
         state.metrics.record_guardrail_blocked_request();
     }
+    // Gateway-initiated semantic embeddings are child work of this request,
+    // never attempts for the model the caller addressed. Attach their ledger
+    // only to the one terminal parent event: a retry can emit non-terminal
+    // attempt rows, and a stream's terminal emitter may run much later, but
+    // neither may duplicate or replace the parent's token/cost/model fields.
+    if terminal {
+        event.gateway_embedding_calls = crate::attribution::take_gateway_embedding_calls();
+    }
     let emission = trace.map(|bundle| {
         event.trace_id = bundle.trace_id_hex();
         bundle.emission(
