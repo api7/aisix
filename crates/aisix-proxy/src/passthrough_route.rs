@@ -992,7 +992,7 @@ async fn dispatch(
         merge_usage(&mut telemetry.usage, u);
     }
     if telemetry.content_cap.is_some() {
-        telemetry.response_text = response_guardrail_text(protocol, &resp_body);
+        telemetry.response_text = response_capture_text(protocol, &resp_body);
     }
 
     let mut response = Response::builder()
@@ -1221,8 +1221,9 @@ fn anthropic_message_output_text(v: &serde_json::Value) -> String {
 /// forwards bytes verbatim regardless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PassthroughProtocol {
-    /// No recognized envelope: bodies are opaque (guardrails scan them as
-    /// one lossy-UTF-8 text; buffered responses are not probed for usage).
+    /// No recognized envelope: guardrails scan every decoded JSON string
+    /// value, falling back to one lossy-UTF-8 text when the body is not JSON;
+    /// buffered responses are not probed for usage.
     /// A streamed opaque response reports usage from an explicit `usage`
     /// object, or — for the flat token shape agent backends use — only
     /// from a frame the server itself labels one (`event: token_usage`),
@@ -1347,31 +1348,210 @@ fn body_model_name(
         .unwrap_or_default()
 }
 
+fn append_scan_text(out: &mut String, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(text);
+}
+
+/// A duplicate-preserving JSON value walker. `serde_json::Value` is right for
+/// typed envelope extraction but keeps only the final value for a repeated
+/// object key; passthrough forwards the original bytes, so guardrail scanning
+/// must see every decoded string value the upstream can see. Object keys are
+/// structural metadata and deliberately stay out of the guardrail text.
+struct JsonStringCollector<'a> {
+    out: &'a mut String,
+}
+
+struct JsonStringVisitor<'a> {
+    out: &'a mut String,
+}
+
+struct OtherTopLevelJsonStringsVisitor<'out, 'excluded> {
+    out: &'out mut String,
+    excluded: &'excluded [&'excluded str],
+}
+
+impl<'de, 'a, 'b> serde::de::DeserializeSeed<'de> for &'a mut JsonStringCollector<'b> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(JsonStringVisitor { out: self.out })
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for JsonStringVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, text: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        append_scan_text(self.out, text);
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(())
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut collector = JsonStringCollector { out: self.out };
+        while sequence.next_element_seed(&mut collector)?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut collector = JsonStringCollector { out: self.out };
+        while map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+            map.next_value_seed(&mut collector)?;
+        }
+        Ok(())
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for OtherTopLevelJsonStringsVisitor<'_, '_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut collector = JsonStringCollector { out: self.out };
+        while let Some(key) = map.next_key::<String>()? {
+            if self.excluded.iter().any(|excluded| *excluded == key) {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            } else {
+                map.next_value_seed(&mut collector)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn decoded_json_string_values(body: &[u8]) -> Option<String> {
+    let mut out = String::new();
+    let mut collector = JsonStringCollector { out: &mut out };
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    serde::de::DeserializeSeed::deserialize(&mut collector, &mut deserializer).ok()?;
+    deserializer.end().ok()?;
+    (!out.is_empty()).then_some(out)
+}
+
+/// All occurrences of every non-envelope top-level value, preserving
+/// duplicate keys in the source document. The caller's known envelope fields
+/// stay on the existing typed extraction path.
+fn decoded_other_top_level_json_string_values(body: &[u8], excluded: &[&str]) -> Option<String> {
+    let mut out = String::new();
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    serde::de::Deserializer::deserialize_map(
+        &mut deserializer,
+        OtherTopLevelJsonStringsVisitor {
+            out: &mut out,
+            excluded,
+        },
+    )
+    .ok()?;
+    deserializer.end().ok()?;
+    (!out.is_empty()).then_some(out)
+}
+
 /// The request text a guardrail scans, per the detected envelope.
-/// Extraction is best-effort: a shape that yields no text degrades to the
-/// raw lossy-UTF-8 body, so detection never loses audit coverage.
+/// Extraction is best-effort: a shape that yields no typed content falls back
+/// to all decoded JSON strings, then to the raw lossy-UTF-8 body when parsing
+/// is impossible, so detection never loses audit coverage.
 fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
     let raw = || String::from_utf8_lossy(body).into_owned();
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
         return raw();
     };
-    let extracted = match protocol {
-        PassthroughProtocol::Raw => return raw(),
+    let (mut extracted, envelope_keys): (String, &[&str]) = match protocol {
+        PassthroughProtocol::Raw => {
+            return decoded_json_string_values(body).unwrap_or_else(raw);
+        }
         // An Anthropic Messages body carries its system prompt top-level.
-        PassthroughProtocol::OpenaiChat => v
-            .get("system")
-            .map(request_content_text)
-            .into_iter()
-            .chain(
-                v.get("messages")
-                    .and_then(|m| m.as_array())
-                    .into_iter()
-                    .flatten()
-                    .map(|m| message_scan_text(m, true)),
-            )
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
+        PassthroughProtocol::OpenaiChat => (
+            v.get("system")
+                .map(request_content_text)
+                .into_iter()
+                .chain(
+                    v.get("messages")
+                        .and_then(|m| m.as_array())
+                        .into_iter()
+                        .flatten()
+                        .map(|m| message_scan_text(m, true)),
+                )
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            &["system", "messages"],
+        ),
         // Responses API: `input` is either a bare string or an array of
         // items, read exactly as the typed route reads them
         // (`responses::responses_item_text`) — message content, tool
@@ -1380,16 +1560,19 @@ fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String 
         // only the common one: the raw-body fallback below fires only when
         // the WHOLE extraction came back empty, so a slot left out here is
         // never scanned while `/v1/responses` blocks the same body.
-        PassthroughProtocol::OpenaiResponses => match v.get("input") {
-            Some(serde_json::Value::String(t)) => t.clone(),
-            Some(serde_json::Value::Array(items)) => items
-                .iter()
-                .map(crate::responses::responses_item_text)
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => String::new(),
-        },
+        PassthroughProtocol::OpenaiResponses => (
+            match v.get("input") {
+                Some(serde_json::Value::String(t)) => t.clone(),
+                Some(serde_json::Value::Array(items)) => items
+                    .iter()
+                    .map(crate::responses::responses_item_text)
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => String::new(),
+            },
+            &["input"],
+        ),
         PassthroughProtocol::OpenaiCompletions => {
             let prompt = v.get("prompt").map(|p| match p {
                 serde_json::Value::Array(items) => items
@@ -1407,23 +1590,28 @@ fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String 
                 }
                 out.push_str(s);
             }
-            out
+            (out, &["prompt", "suffix"])
         }
     };
     if extracted.is_empty() {
-        raw()
-    } else {
-        extracted
+        return decoded_json_string_values(body).unwrap_or_else(raw);
     }
+    if let Some(other) = decoded_other_top_level_json_string_values(body, envelope_keys) {
+        append_scan_text(&mut extracted, &other);
+    }
+    extracted
 }
 
-/// The response text a guardrail scans / the capture records, per the
-/// route's protocol hint. Best-effort like the request side.
+/// The response text a guardrail scans, per the route's protocol hint.
+/// Best-effort like the request side.
 fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
     let raw = || String::from_utf8_lossy(body).into_owned();
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
         return raw();
     };
+    if matches!(protocol, PassthroughProtocol::Raw) {
+        return decoded_json_string_values(body).unwrap_or_else(raw);
+    }
     // Responses answers with `output` items, not `choices`: read them as
     // the typed route does (`responses::responses_output_text`) — message
     // text plus each tool call's name, arguments and input, with generated
@@ -1440,10 +1628,7 @@ fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String
             return text;
         }
     }
-    let choices = match protocol {
-        PassthroughProtocol::Raw => return raw(),
-        _ => v.get("choices").and_then(|c| c.as_array()),
-    };
+    let choices = v.get("choices").and_then(|c| c.as_array());
     let Some(choices) = choices else { return raw() };
     let texts: Vec<String> = choices
         .iter()
@@ -1463,6 +1648,16 @@ fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String
         raw()
     } else {
         texts.join("\n")
+    }
+}
+
+/// Captures preserve raw passthrough responses for the existing telemetry
+/// contract; guardrail scanning may use a decoded representation instead.
+fn response_capture_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
+    if matches!(protocol, PassthroughProtocol::Raw) {
+        String::from_utf8_lossy(body).into_owned()
+    } else {
+        response_guardrail_text(protocol, body)
     }
 }
 
@@ -2103,7 +2298,8 @@ fn frame_parts(
         }
         parts = match protocol {
             PassthroughProtocol::Raw => crate::held_content::Parts {
-                scan: payload.to_string(),
+                scan: decoded_json_string_values(payload.as_bytes())
+                    .unwrap_or_else(|| payload.to_string()),
                 reasoning: 0,
             },
             // The chat envelope also carries Anthropic Messages streams; the
@@ -2122,6 +2318,20 @@ fn frame_parts(
         };
     }
     (parts, usage)
+}
+
+/// The text persisted for a streamed response. Raw passthrough capture keeps
+/// the provider's JSON source representation even though the guardrail scans
+/// decoded string values from that same frame.
+fn frame_capture_text(protocol: PassthroughProtocol, frame: &[u8], scan: &str) -> String {
+    if !matches!(protocol, PassthroughProtocol::Raw) {
+        return scan.to_string();
+    }
+    crate::redact::frame_payload(frame)
+        .map(|payload| payload.trim())
+        .filter(|payload| !payload.is_empty() && *payload != "[DONE]")
+        .map(str::to_string)
+        .unwrap_or_else(|| scan.to_string())
 }
 
 /// The SSE error frame appended when an output guardrail blocks mid-relay,
@@ -2265,7 +2475,11 @@ fn stream_response(
                     merge_usage(&mut telemetry.usage, u);
                 }
                 if capture_cap.is_some() {
-                    push_capped(&mut telemetry.response_text, &delta, capture_cap);
+                    push_capped(
+                        &mut telemetry.response_text,
+                        &frame_capture_text(protocol, &frame, &delta),
+                        capture_cap,
+                    );
                 }
                 let frame = Bytes::from(frame);
                 match &policy {
@@ -2367,7 +2581,11 @@ fn stream_response(
                     merge_usage(&mut telemetry.usage, u);
                 }
                 if capture_cap.is_some() {
-                    push_capped(&mut telemetry.response_text, &delta, capture_cap);
+                    push_capped(
+                        &mut telemetry.response_text,
+                        &frame_capture_text(protocol, &rest, &delta),
+                        capture_cap,
+                    );
                 }
                 scan_buf.push_str(&delta);
                 let rest = Bytes::from(rest);
@@ -4038,27 +4256,59 @@ mod tests {
     #[test]
     fn request_text_extraction_per_protocol() {
         let chat = br#"{"model":"m","messages":[{"role":"system","content":"s"},{"role":"user","content":[{"type":"text","text":"part"}]}]}"#;
-        assert_eq!(
-            request_guardrail_text(PassthroughProtocol::OpenaiChat, chat),
-            "s\npart"
-        );
+        let scanned = request_guardrail_text(PassthroughProtocol::OpenaiChat, chat);
+        for text in ["s", "part", "m"] {
+            assert!(scanned.contains(text), "{text} missing from {scanned:?}");
+        }
         let fim = br#"{"prompt":"def f(","suffix":"return"}"#;
         assert_eq!(
             request_guardrail_text(PassthroughProtocol::OpenaiCompletions, fim),
             "def f(\nreturn"
         );
-        // Shape mismatch degrades to the raw body.
+        // Shape mismatch degrades to every decoded JSON string value.
         let not_chat = br#"{"input":"x"}"#;
         assert_eq!(
             request_guardrail_text(PassthroughProtocol::OpenaiChat, not_chat),
-            r#"{"input":"x"}"#
+            "x"
         );
-        // A detected envelope whose items carry no text ALSO degrades to
-        // the raw body — detection must never scan less than raw would.
+        // A detected envelope whose items carry no typed text ALSO degrades
+        // to every decoded JSON string value — detection must never scan
+        // less than the forwarded request carries.
         let empty_chat = br#"{"messages":[{"role":"tool","tool_call_id":"1"}]}"#;
+        let scanned = request_guardrail_text(PassthroughProtocol::OpenaiChat, empty_chat);
+        for text in ["tool", "1"] {
+            assert!(scanned.contains(text), "{text} missing from {scanned:?}");
+        }
+    }
+
+    #[test]
+    fn guardrail_text_scans_decoded_forwarded_json_strings() {
+        let raw = br#"{"state":"\u0042LOCKME","nested":{"query":"\u4e2d\u6587"}}"#;
+        let scanned = request_guardrail_text(PassthroughProtocol::Raw, raw);
+        assert!(scanned.contains("BLOCKME"), "got {scanned:?}");
+        assert!(scanned.contains("中文"), "got {scanned:?}");
+        assert!(!scanned.contains(r#"\u0042"#), "got {scanned:?}");
+
+        let duplicate = br#"{"state":"\u0042LOCKME","state":"clean"}"#;
+        let scanned = request_guardrail_text(PassthroughProtocol::Raw, duplicate);
+        for text in ["BLOCKME", "clean"] {
+            assert!(scanned.contains(text), "{text} missing from {scanned:?}");
+        }
+
+        let chat = br#"{"messages":[{"role":"user","content":"clean"}],"state":{"query":"BLOCKME"},"state":"also-clean","documents":["\u4e2d\u6587"]}"#;
+        let scanned = request_guardrail_text(PassthroughProtocol::OpenaiChat, chat);
+        for text in ["clean", "BLOCKME", "also-clean", "中文"] {
+            assert!(scanned.contains(text), "{text} missing from {scanned:?}");
+        }
+
+        let response = br#"{"state":"\u0042LOCKME","state":"clean"}"#;
+        let scanned = response_guardrail_text(PassthroughProtocol::Raw, response);
+        for text in ["BLOCKME", "clean"] {
+            assert!(scanned.contains(text), "{text} missing from {scanned:?}");
+        }
         assert_eq!(
-            request_guardrail_text(PassthroughProtocol::OpenaiChat, empty_chat),
-            String::from_utf8_lossy(empty_chat)
+            response_capture_text(PassthroughProtocol::Raw, response),
+            r#"{"state":"\u0042LOCKME","state":"clean"}"#
         );
     }
 
@@ -4686,9 +4936,16 @@ mod tests {
             "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"plan\"}\n\n",
         );
         assert_eq!((r.scan.as_str(), r.reasoning), ("", 4));
-        // Raw counts and scans the whole payload, envelope included.
+        // A Raw payload without strings falls back to its full source text.
         let raw = parts(PassthroughProtocol::Raw, "data: {\"x\":1}\n\n");
         assert_eq!((raw.scan.as_str(), raw.held()), ("{\"x\":1}", 7));
+        let frame = b"data: {\"state\":\"\\u0042LOCKME\",\"state\":\"clean\"}\n\n";
+        let raw = frame_parts(PassthroughProtocol::Raw, frame).0;
+        assert_eq!(raw.scan, "BLOCKME\nclean");
+        assert_eq!(
+            frame_capture_text(PassthroughProtocol::Raw, frame, &raw.scan),
+            r#"{"state":"\u0042LOCKME","state":"clean"}"#
+        );
     }
 
     /// An Anthropic Messages body on the chat envelope is scanned in every

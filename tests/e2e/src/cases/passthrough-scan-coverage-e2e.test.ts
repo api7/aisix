@@ -30,6 +30,11 @@ const CALLER = "sk-pt-scan-coverage";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
 const OUT_LIT = "outputleakliteral";
 const IN_LIT = "inputleakliteral";
+const ESCAPED_BLOCK = "BLOCKME";
+const ESCAPED_CJK = "中文";
+const ESCAPED_BLOCK_JSON = String.raw`{"state":"\u0042LOCKME","state":"clean"}`;
+const ESCAPED_CJK_JSON = String.raw`{"query":"\u4e2d\u6587"}`;
+const SAFE_ESCAPED_JSON = String.raw`{"state":"\u0063lean"}`;
 const CAP = 1_000;
 
 const anthropicEvents = (blocks: Array<Record<string, unknown>>) => [
@@ -97,6 +102,20 @@ describe("passthrough guardrail scan coverage", () => {
     upstreams.input = await startOpenAiUpstream({
       nonStreamBody: { id: "c", object: "chat.completion", choices: [] },
     });
+    upstreams["raw-output"] = await startOpenAiUpstream({
+      rawBody: ESCAPED_BLOCK_JSON,
+      rawContentType: "application/json",
+    });
+    upstreams["raw-stream"] = await startOpenAiUpstream({
+      rawStreamFrames: [`data: ${ESCAPED_BLOCK_JSON}\n\n`, "data: [DONE]\n\n"],
+    });
+    upstreams["raw-safe-output"] = await startOpenAiUpstream({
+      rawBody: SAFE_ESCAPED_JSON,
+      rawContentType: "application/json",
+    });
+    upstreams["raw-safe-stream"] = await startOpenAiUpstream({
+      rawStreamFrames: [`data: ${SAFE_ESCAPED_JSON}\n\n`],
+    });
     const pk = await seed.createProviderKey({
       display_name: "pt-scan-pk",
       secret: "sk-mock",
@@ -115,14 +134,21 @@ describe("passthrough guardrail scan coverage", () => {
       enabled: true,
       hook_point: "output",
       kind: "keyword",
-      patterns: [{ kind: "literal", value: OUT_LIT }],
+      patterns: [
+        { kind: "literal", value: OUT_LIT },
+        { kind: "literal", value: ESCAPED_BLOCK },
+      ],
     });
     await seed.createGuardrail({
       name: "pt-scan-input",
       enabled: true,
       hook_point: "input",
       kind: "keyword",
-      patterns: [{ kind: "literal", value: IN_LIT }],
+      patterns: [
+        { kind: "literal", value: IN_LIT },
+        { kind: "literal", value: ESCAPED_BLOCK },
+        { kind: "literal", value: ESCAPED_CJK },
+      ],
     });
     // Folds the output chain's hold-back cap down to CAP, fail-closed.
     await seed.createGuardrail({
@@ -149,6 +175,12 @@ describe("passthrough guardrail scan coverage", () => {
       method: "POST",
       headers: { authorization: `Bearer ${CALLER}`, "content-type": "application/json" },
       body: JSON.stringify(body),
+    });
+  const callRaw = (route: string, path: string, body: string) =>
+    fetch(`${app!.proxyUrl}/pt-scan-${route}${path}`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER}`, "content-type": "application/json" },
+      body,
     });
   const anthropicBody = { model: "claude-3-5-haiku-20241022", max_tokens: 64, stream: true, messages: [{ role: "user", content: "go" }] };
   const chatBody = { model: "gpt-4o-mini", stream: true, messages: [{ role: "user", content: "go" }] };
@@ -235,5 +267,103 @@ describe("passthrough guardrail scan coverage", () => {
     expect(res.status).toBe(422);
     expect(await res.text()).toContain("pt-scan-input");
     expect(upstreams.input!.receivedRequests.length).toBe(before);
+  });
+
+  test.for([
+    [
+      "system-one state",
+      {
+        messages: [{ role: "user", content: "clean" }],
+        state: { query: IN_LIT },
+      },
+    ],
+    [
+      "rerank query and documents",
+      {
+        messages: [{ role: "user", content: "clean" }],
+        query: IN_LIT,
+        documents: ["clean"],
+      },
+    ],
+  ] as const)("input: forwarded %s is scanned", async ([, body], ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams.input!.receivedRequests.length;
+    const res = await call("input", "/v1/any", body);
+    expect(res.status).toBe(422);
+    expect(await res.text()).toContain("pt-scan-input");
+    expect(upstreams.input!.receivedRequests.length).toBe(before);
+  });
+
+  test("input: a duplicate forwarded field is scanned", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams.input!.receivedRequests.length;
+    const body = String.raw`{"messages":[{"role":"user","content":"clean"}],"state":{"query":"${IN_LIT}"},"state":"clean"}`;
+    const res = await callRaw("input", "/v1/any", body);
+    expect(res.status).toBe(422);
+    expect(await res.text()).toContain("pt-scan-input");
+    expect(upstreams.input!.receivedRequests.length).toBe(before);
+  });
+
+  test.for([
+    ["ASCII", ESCAPED_BLOCK_JSON],
+    ["CJK", ESCAPED_CJK_JSON],
+  ] as const)("input: raw JSON %s escapes are decoded before scanning", async ([, body], ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams.input!.receivedRequests.length;
+    const res = await callRaw("input", "/v1/any", body);
+    expect(res.status).toBe(422);
+    expect(await res.text()).toContain("pt-scan-input");
+    expect(upstreams.input!.receivedRequests.length).toBe(before);
+  });
+
+  test("input: safe raw JSON keeps its original bytes upstream", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams.input!.receivedRequests.length;
+    const res = await callRaw("input", "/v1/any", SAFE_ESCAPED_JSON);
+    expect(res.status).toBe(200);
+    await res.text();
+    expect(upstreams.input!.receivedRequests.length).toBe(before + 1);
+    expect(upstreams.input!.receivedRequests.at(-1)!.body).toBe(SAFE_ESCAPED_JSON);
+  });
+
+  test("output: raw JSON escapes are decoded before scanning", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams["raw-output"]!.receivedRequests.length;
+    const res = await callRaw("raw-output", "/v1/any", String.raw`{"state":"clean"}`);
+    expect(res.status).toBe(422);
+    const body = await res.text();
+    expect(body).toContain("pt-scan-output");
+    expect(body).not.toContain(ESCAPED_BLOCK);
+    expect(upstreams["raw-output"]!.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("output: safe raw JSON keeps its original bytes downstream", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams["raw-safe-output"]!.receivedRequests.length;
+    const res = await callRaw("raw-safe-output", "/v1/any", SAFE_ESCAPED_JSON);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(SAFE_ESCAPED_JSON);
+    expect(upstreams["raw-safe-output"]!.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("output: raw SSE JSON escapes are decoded before scanning", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams["raw-stream"]!.receivedRequests.length;
+    const res = await callRaw("raw-stream", "/v1/any", String.raw`{"state":"clean"}`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain("event: error");
+    expect(body).toContain("content_filter");
+    expect(body).not.toContain(ESCAPED_BLOCK);
+    expect(upstreams["raw-stream"]!.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("output: safe raw SSE JSON keeps its original bytes downstream", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams["raw-safe-stream"]!.receivedRequests.length;
+    const res = await callRaw("raw-safe-stream", "/v1/any", SAFE_ESCAPED_JSON);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(`data: ${SAFE_ESCAPED_JSON}\n\n`);
+    expect(upstreams["raw-safe-stream"]!.receivedRequests.length).toBe(before + 1);
   });
 });
