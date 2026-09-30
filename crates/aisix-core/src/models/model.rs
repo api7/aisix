@@ -310,12 +310,12 @@ pub struct Model {
     #[schemars(length(min = 1, max = 255))]
     pub pricing_key: Option<String>,
 
-    /// Opaque control-plane-issued canonical, non-nil UUID that authorizes a
-    /// concrete wildcard-upstream model name for pricing. It is relevant only
-    /// to a direct-shaped wildcard model (chat or embedding); without it the
-    /// data plane deliberately omits the resolved model from terminal
-    /// telemetry so the control plane can leave the call unpriced rather than
-    /// trust mutable configuration.
+    /// Opaque control-plane-issued canonical, non-nil UUID that authorizes the
+    /// configured exact or wildcard-resolved upstream model name for pricing.
+    /// It is relevant only to a direct-shaped model (chat or embedding);
+    /// without it the data plane deliberately omits the resolved model from
+    /// terminal telemetry so the control plane can leave the call unpriced
+    /// rather than trust mutable configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(
         regex(pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"),

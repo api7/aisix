@@ -46,8 +46,13 @@ pub(crate) fn resolve_model(
     // deliberately decided against the dispatch snapshot: a later terminal
     // emitter may see a refreshed configuration where the row changed or was
     // deleted, but it must price the concrete model this request dispatched.
-    if wildcard_pricing_eligible(&entry.value, &upstream) {
-        crate::attribution::note_wildcard_pricing_identity(
+    if entry
+        .value
+        .model_name
+        .as_deref()
+        .is_some_and(|template| template.contains('*'))
+    {
+        crate::attribution::note_pricing_identity(
             &entry.id,
             entry.value.pricing_authority_id.as_deref(),
             &upstream,
@@ -74,6 +79,13 @@ fn note_dispatchable_entry(entry: &ResourceEntry<Model>) {
         return;
     }
     crate::attribution::note_resolved_entry(&entry.id);
+    if let Some(upstream) = model.model_name.as_deref() {
+        crate::attribution::note_pricing_identity(
+            &entry.id,
+            model.pricing_authority_id.as_deref(),
+            upstream,
+        );
+    }
 }
 
 /// Wildcard fallback: the most specific direct Model whose `*`-glob
@@ -173,21 +185,6 @@ fn resolve_upstream_model_name(model: &Model, capture: &str) -> String {
     }
 }
 
-/// Whether a wildcard dispatch produced a concrete provider-model identity
-/// that is safe to send to CP for pricing.
-///
-/// A wildcard display alias with a fixed upstream is already priced by its
-/// configured model name. Only an upstream template yields a caller-specific
-/// provider-model identity, and a literal `*` is never a concrete catalog key.
-fn wildcard_pricing_eligible(model: &Model, upstream: &str) -> bool {
-    model
-        .model_name
-        .as_deref()
-        .is_some_and(|template| template.contains('*'))
-        && !upstream.is_empty()
-        && !upstream.contains('*')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,17 +272,24 @@ mod tests {
     }
 
     /// Pricing eligibility belongs to the snapshot that dispatched the
-    /// request. In particular, a wildcard display alias over a fixed model,
-    /// a literal wildcard row, a capture that is still itself a wildcard, or
-    /// an absent, nil, or noncanonical pricing authority must not manufacture
-    /// a concrete provider-model price identity.
+    /// request. Exact models and wildcard aliases over a fixed upstream carry
+    /// their exact authority; a literal wildcard row, a capture that is still
+    /// itself a wildcard, or an absent, nil, or noncanonical authority must
+    /// not manufacture a concrete provider-model price identity.
     #[tokio::test]
-    async fn only_concrete_template_capture_with_authority_sets_wildcard_pricing_identity() {
+    async fn dispatchable_models_with_authority_set_pricing_identity() {
         use std::sync::Arc;
 
+        let mut embedding = priced_direct_model("embedding", Some("text-embedding-3-small"));
+        embedding.embedding = Some(aisix_core::EmbeddingConfig {
+            dimensions: 4,
+            normalize: true,
+        });
         let snap = snapshot_with(vec![
             ("wildcard", priced_direct_model("openrouter/*", Some("*"))),
             ("fixed", priced_direct_model("fixed/*", Some("gpt-4o"))),
+            ("exact", priced_direct_model("exact", Some("gpt-4o-mini"))),
+            ("embedding", embedding),
             ("unpriced", direct_model("unpriced/*", Some("*"))),
         ]);
         let mut nil_authority = direct_model("nil/*", Some("*"));
@@ -307,18 +311,17 @@ mod tests {
                 resolve_model(&snap, "openrouter/gpt-4o-2024-08-06")
                     .expect("concrete wildcard request resolves");
                 let resolved = crate::attribution::current().expect("in request scope");
-                assert_eq!(resolved.wildcard_pricing_model_id, "wildcard");
+                assert_eq!(resolved.pricing_model_id, "wildcard");
                 assert_eq!(
-                    resolved.wildcard_pricing_authority_id,
+                    resolved.pricing_authority_id,
                     "a3ebdc63-e921-4323-a75c-3b911f950046"
                 );
-                assert_eq!(resolved.wildcard_pricing_model, "gpt-4o-2024-08-06");
+                assert_eq!(resolved.pricing_model, "gpt-4o-2024-08-06");
             },
         )
         .await;
 
         for requested in [
-            "fixed/anything",
             "openrouter/*",
             "openrouter/gpt-*",
             "unpriced/gpt-4o",
@@ -330,12 +333,30 @@ mod tests {
                 async {
                     resolve_model(&snap, requested).expect("configured request resolves");
                     let resolved = crate::attribution::current().expect("in request scope");
-                    assert!(resolved.wildcard_pricing_model_id.is_empty(), "{requested}");
-                    assert!(
-                        resolved.wildcard_pricing_authority_id.is_empty(),
+                    assert!(resolved.pricing_model_id.is_empty(), "{requested}");
+                    assert!(resolved.pricing_authority_id.is_empty(), "{requested}");
+                    assert!(resolved.pricing_model.is_empty(), "{requested}");
+                },
+            )
+            .await;
+        }
+
+        for (requested, model_id, model_name) in [
+            ("fixed/anything", "fixed", "gpt-4o"),
+            ("exact", "exact", "gpt-4o-mini"),
+            ("embedding", "embedding", "text-embedding-3-small"),
+        ] {
+            crate::attribution::scope(
+                Arc::new(crate::attribution::RequestAttribution::default()),
+                async {
+                    resolve_model(&snap, requested).expect("configured request resolves");
+                    let resolved = crate::attribution::current().expect("in request scope");
+                    assert_eq!(resolved.pricing_model_id, model_id, "{requested}");
+                    assert_eq!(
+                        resolved.pricing_authority_id, "a3ebdc63-e921-4323-a75c-3b911f950046",
                         "{requested}"
                     );
-                    assert!(resolved.wildcard_pricing_model.is_empty(), "{requested}");
+                    assert_eq!(resolved.pricing_model, model_name, "{requested}");
                 },
             )
             .await;
@@ -347,9 +368,9 @@ mod tests {
             async {
                 resolve_model(&snap, &overlong).expect("overlong wildcard request still resolves");
                 let resolved = crate::attribution::current().expect("in request scope");
-                assert!(resolved.wildcard_pricing_model_id.is_empty());
-                assert!(resolved.wildcard_pricing_authority_id.is_empty());
-                assert!(resolved.wildcard_pricing_model.is_empty());
+                assert!(resolved.pricing_model_id.is_empty());
+                assert!(resolved.pricing_authority_id.is_empty());
+                assert!(resolved.pricing_model.is_empty());
             },
         )
         .await;

@@ -125,7 +125,7 @@ pub struct UsageEvent {
 
     /// Canonical non-nil CP-issued UUID paired with `resolved_pricing_model`.
     /// Both values are absent for older DP configuration or any request that
-    /// did not dispatch a concrete wildcard-template model.
+    /// did not dispatch a concrete direct or embedding model.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pricing_authority_id: String,
 

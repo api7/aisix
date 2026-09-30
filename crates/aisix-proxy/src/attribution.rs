@@ -83,17 +83,16 @@ pub(crate) struct Resolved {
     /// it at read time, so the pair is byte-identical to the one the
     /// success path emits.
     pub provider_key_id: String,
-    /// The concrete upstream model produced by the wildcard-resolution
-    /// branch, paired with the configured wildcard row that produced it.
-    /// Empty for exact model resolution, including a request that literally
-    /// names a wildcard row. Telemetry uses this only for an event that
+    /// The concrete upstream model paired with the immutable CP-issued
+    /// authority that existed at dispatch. Empty means no valid authority was
+    /// present in this snapshot. Telemetry uses this only for an event that
     /// actually dispatched that same row; it is not an access-log identity.
-    pub wildcard_pricing_model_id: String,
+    pub pricing_model_id: String,
     /// Canonical non-nil UUID issued by CP that makes the concrete model below
     /// billable. This stays beside the captured model id so a terminal emitter
     /// can either send the complete authority tuple or omit it entirely.
-    pub wildcard_pricing_authority_id: String,
-    pub wildcard_pricing_model: String,
+    pub pricing_authority_id: String,
+    pub pricing_model: String,
     /// Which cache layer answered this request, once one has — `Some`
     /// exactly when the response came out of the cache.
     ///
@@ -700,15 +699,12 @@ pub(crate) fn note_target(model: &Model, provider_key_id: &str) {
     });
 }
 
-/// Record the complete pricing authority a caller-addressed wildcard row
-/// resolved to.
-///
-/// This is deliberately separate from [`note_target`]: an exact request for
-/// the literal wildcard row also has an upstream model name, but it never
-/// passed wildcard capture and must not be used as a pricing identity. The
-/// authority is optional for rolling upgrades; without it, retain nothing so
-/// the terminal event cannot assert a concrete wildcard price.
-pub(crate) fn note_wildcard_pricing_identity(
+/// Record the complete pricing authority a direct or embedding dispatch
+/// resolved to. This is deliberately separate from [`note_target`]: it is
+/// accounting provenance rather than an access-log identity. The authority is
+/// optional for rolling upgrades; without it, retain nothing so the terminal
+/// event cannot assert a mutable current-model price.
+pub(crate) fn note_pricing_identity(
     model_id: &str,
     pricing_authority_id: Option<&str>,
     concrete_model: &str,
@@ -717,29 +713,30 @@ pub(crate) fn note_wildcard_pricing_identity(
         return;
     };
     if model_id.is_empty()
-        || !valid_wildcard_pricing_model(concrete_model)
+        || !valid_pricing_model(concrete_model)
         || !valid_pricing_authority_id(pricing_authority_id)
     {
         return;
     }
     with(|r| {
-        r.wildcard_pricing_model_id = model_id.to_string();
-        r.wildcard_pricing_authority_id = pricing_authority_id.to_string();
-        r.wildcard_pricing_model = concrete_model.to_string();
+        r.pricing_model_id = model_id.to_string();
+        r.pricing_authority_id = pricing_authority_id.to_string();
+        r.pricing_model = concrete_model.to_string();
     });
 }
 
-// Keep this in step with AISIX Cloud's model-pricing name bound. A wildcard
-// capture can be a valid upstream model name while still being too long to
-// become a safe CP pricing lookup key; omit the entire optional tuple so its
-// terminal parent event remains observable and explicitly unpriced.
-const MAX_WILDCARD_PRICING_MODEL_CHARS: usize = 120;
+// Keep this in step with AISIX Cloud's model-pricing name bound. A configured
+// or wildcard-resolved upstream name can be valid for dispatch while still
+// being too long to become a safe CP pricing lookup key; omit the entire
+// optional tuple so its terminal parent event remains observable and
+// explicitly unpriced.
+const MAX_PRICING_MODEL_CHARS: usize = 120;
 
-fn valid_wildcard_pricing_model(model: &str) -> bool {
+fn valid_pricing_model(model: &str) -> bool {
     !model.is_empty()
         && !model.contains('*')
         && !model.contains('\0')
-        && model.chars().count() <= MAX_WILDCARD_PRICING_MODEL_CHARS
+        && model.chars().count() <= MAX_PRICING_MODEL_CHARS
 }
 
 fn valid_pricing_authority_id(id: &str) -> bool {
@@ -769,9 +766,9 @@ pub(crate) fn note_cache_hit_entry(entry: &Model, hit_layer: &'static str) {
     note_target(entry, entry.provider_key_id.as_deref().unwrap_or_default());
     with(|r| {
         r.cache_hit_layer = Some(hit_layer);
-        r.wildcard_pricing_model_id.clear();
-        r.wildcard_pricing_authority_id.clear();
-        r.wildcard_pricing_model.clear();
+        r.pricing_model_id.clear();
+        r.pricing_authority_id.clear();
+        r.pricing_model.clear();
     });
 }
 
