@@ -18,7 +18,6 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::time::Instant;
 
 use dashmap::DashMap;
 
@@ -751,9 +750,13 @@ async fn embed_texts_inner(
         }
     };
 
-    let started = Instant::now();
+    // Keep this guard alive across the bridge await. If the downstream client
+    // cancels this parent request while the bridge is pending, its Drop writes
+    // a failed child audit directly to the shared parent ledger before the
+    // cancel emitter takes that ledger into the terminal 499 event.
+    let mut audit_call = crate::attribution::begin_gateway_embedding_call(purpose, &embed_entry.id);
     let response = bridge.embed(&req, &ctx).await;
-    let latency_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+    let latency_ms = audit_call.settle();
     let resp = match response {
         Ok(resp) => {
             crate::attribution::note_gateway_embedding_call(GatewayEmbeddingCall {

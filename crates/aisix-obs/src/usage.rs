@@ -50,8 +50,9 @@ pub enum GatewayEmbeddingPurpose {
 
 /// Whether a gateway-initiated embedding bridge call returned a response.
 ///
-/// Failed calls retain their elapsed time and count but have no provider usage
-/// to report, so their token counters are zero and their `usage_source` is
+/// Failed calls — including an in-flight bridge call cancelled with its parent
+/// request — retain their elapsed time and count but have no provider usage to
+/// report, so their token counters are zero and their `usage_source` is
 /// `unavailable`. The concrete bridge error is deliberately not exported: it
 /// can contain provider-specific or sensitive detail and is already
 /// represented by the parent request outcome.
@@ -84,9 +85,10 @@ pub enum GatewayEmbeddingUsageSource {
 /// Bedrock Titan bridge fans a batch out into one request per input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GatewayEmbeddingCall {
-    /// This entry represents one completed gateway bridge invocation. It is
-    /// explicit so downstream consumers can sum counts without deriving
-    /// semantics from the array shape.
+    /// This entry represents one gateway bridge invocation that started. It
+    /// is explicit so downstream consumers can sum counts without deriving
+    /// semantics from the array shape, including an in-flight call cancelled
+    /// before its bridge response arrives.
     pub count: u32,
     pub purpose: GatewayEmbeddingPurpose,
     pub embedding_model_id: String,

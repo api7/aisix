@@ -60,7 +60,7 @@ use crate::sink::{
     SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHealth, SinkRecord, SinkResult,
     SinkStatsSnapshot,
 };
-use crate::usage::UsageEvent;
+use crate::usage::{GatewayEmbeddingCall, UsageEvent};
 
 /// Wall-clock duration of an OTLP/HTTP POST before we abandon it.
 /// Tight on purpose — we never want a slow exporter to backlog tokio
@@ -997,6 +997,26 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
     if !event.error_message.is_empty() {
         attributes.push(attr_string("aisix.error_message", &event.error_message));
     }
+    // Gateway-owned semantic embeddings are child work of this request, not
+    // attempts for its client-selected model. OTLP attributes cannot carry a
+    // nested object, so retain the bounded audit trail as a JSON string and
+    // expose the number of calls omitted from that string separately. The
+    // encoder is an allowlist: without this explicit projection OTLP loses
+    // the audit fields that SLS and other sink records retain.
+    let (gateway_calls, export_dropped) =
+        gateway_embedding_calls_attribute(&event.gateway_embedding_calls);
+    if let Some(calls) = gateway_calls {
+        attributes.push(calls);
+    }
+    let gateway_calls_dropped = event
+        .gateway_embedding_calls_dropped
+        .saturating_add(export_dropped);
+    if gateway_calls_dropped > 0 {
+        attributes.push(attr_int(
+            "aisix.gateway_embedding_calls_dropped",
+            i64::from(gateway_calls_dropped),
+        ));
+    }
     // Downstream client attribution (#492). Custom attrs so exporters
     // can slice by source IP / client type; the OTLP encoder is an
     // explicit allowlist, so new UsageEvent fields must be added here.
@@ -1198,14 +1218,103 @@ fn attr_string(key: &str, value: &str) -> Value {
 /// delivery problem as much as a storage one.
 const MAX_PROTOCOL_ATTR_BYTES: usize = 256;
 
-/// [`attr_string`] for a value a caller controls, cut to
-/// [`MAX_PROTOCOL_ATTR_BYTES`] on a UTF-8 boundary.
-fn attr_string_capped(key: &str, value: &str) -> Value {
-    let mut end = MAX_PROTOCOL_ATTR_BYTES.min(value.len());
+/// Bound the serialized child-work audit on an OTLP span. The source ledger
+/// retains at most 64 calls, but exporter input is public enough that the
+/// encoder also protects itself from a synthetic or malformed `UsageEvent`.
+///
+/// The value is JSON rather than a semconv array because these child calls
+/// have several scalar fields and OTLP attributes have one homogeneous value.
+const MAX_GATEWAY_EMBEDDING_CALLS_ATTR_BYTES: usize = 32 * 1024;
+const MAX_GATEWAY_EMBEDDING_CALLS_ATTR_ITEMS: usize = 64;
+const MAX_GATEWAY_EMBEDDING_MODEL_ID_ATTR_BYTES: usize = 128;
+
+#[derive(serde::Serialize)]
+struct OtlpGatewayEmbeddingCall<'a> {
+    count: u32,
+    purpose: crate::usage::GatewayEmbeddingPurpose,
+    embedding_model_id: &'a str,
+    prompt_tokens: u32,
+    total_tokens: u32,
+    usage_source: crate::usage::GatewayEmbeddingUsageSource,
+    latency_ms: u32,
+    outcome: crate::usage::GatewayEmbeddingOutcome,
+}
+
+/// Encode the retained ordered prefix as valid JSON inside one bounded OTLP
+/// string attribute. `dropped` includes both calls the request ledger omitted
+/// and calls this exporter cannot fit, so a trace never silently looks
+/// complete after either cap applies.
+fn gateway_embedding_calls_attribute(calls: &[GatewayEmbeddingCall]) -> (Option<Value>, u32) {
+    let mut encoded = String::from("[");
+    let mut retained = 0usize;
+    let mut dropped = 0u32;
+
+    for (index, call) in calls.iter().enumerate() {
+        if index == MAX_GATEWAY_EMBEDDING_CALLS_ATTR_ITEMS {
+            dropped = dropped.saturating_add(usize_to_u32(calls.len().saturating_sub(index)));
+            break;
+        }
+        let item = serde_json::to_string(&OtlpGatewayEmbeddingCall {
+            count: call.count,
+            purpose: call.purpose,
+            embedding_model_id: capped_utf8(
+                &call.embedding_model_id,
+                MAX_GATEWAY_EMBEDDING_MODEL_ID_ATTR_BYTES,
+            ),
+            prompt_tokens: call.prompt_tokens,
+            total_tokens: call.total_tokens,
+            usage_source: call.usage_source,
+            latency_ms: call.latency_ms,
+            outcome: call.outcome,
+        })
+        // Serializing these scalar fields into an owned String cannot fail.
+        .expect("gateway embedding audit is JSON-serializable");
+        let separator = usize::from(retained > 0);
+        if encoded
+            .len()
+            .saturating_add(separator)
+            .saturating_add(item.len())
+            .saturating_add(1)
+            > MAX_GATEWAY_EMBEDDING_CALLS_ATTR_BYTES
+        {
+            // Preserve an ordered prefix, like the request ledger does, and
+            // make every omitted suffix visible through the count attribute.
+            dropped = dropped.saturating_add(usize_to_u32(calls.len().saturating_sub(index)));
+            break;
+        }
+        if retained > 0 {
+            encoded.push(',');
+        }
+        encoded.push_str(&item);
+        retained += 1;
+    }
+    if retained == 0 {
+        return (None, dropped);
+    }
+    encoded.push(']');
+    debug_assert!(encoded.len() <= MAX_GATEWAY_EMBEDDING_CALLS_ATTR_BYTES);
+    (
+        Some(attr_string("aisix.gateway_embedding_calls", &encoded)),
+        dropped,
+    )
+}
+
+fn usize_to_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn capped_utf8(value: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(value.len());
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
-    attr_string(key, &value[..end])
+    &value[..end]
+}
+
+/// [`attr_string`] for a value a caller controls, cut to
+/// [`MAX_PROTOCOL_ATTR_BYTES`] on a UTF-8 boundary.
+fn attr_string_capped(key: &str, value: &str) -> Value {
+    attr_string(key, capped_utf8(value, MAX_PROTOCOL_ATTR_BYTES))
 }
 
 fn attr_int(key: &str, value: i64) -> Value {
@@ -2228,6 +2337,65 @@ mod tests {
         assert!(!keys.contains(&"aisix.attempt_kind"));
         assert!(!keys.contains(&"aisix.attempt_model"));
         assert!(!keys.contains(&"aisix.error_class"));
+    }
+
+    #[test]
+    fn payload_carries_a_bounded_gateway_embedding_child_audit() {
+        let mut event = sample_event();
+        // These belong only to the parent event. The child-audit schema has
+        // no text, provider-error, or credential fields, so they must never
+        // cross into its serialized OTLP attribute.
+        event.error_message = "provider-error-sentinel".into();
+        event.api_key_id = "credential-sentinel".into();
+        event.requested_model = "caller-text-sentinel".into();
+        // One more than the OTLP prefix cap, with an overlong multibyte model
+        // id: both caps must remain visible without emitting invalid JSON.
+        event.gateway_embedding_calls = (0..=MAX_GATEWAY_EMBEDDING_CALLS_ATTR_ITEMS)
+            .map(|index| GatewayEmbeddingCall {
+                count: 1,
+                purpose: crate::usage::GatewayEmbeddingPurpose::SemanticRoute,
+                embedding_model_id: format!("{}-{index}", "情".repeat(100)),
+                prompt_tokens: index as u32,
+                total_tokens: index as u32 + 1,
+                usage_source: crate::usage::GatewayEmbeddingUsageSource::Reported,
+                latency_ms: index as u32 + 2,
+                outcome: crate::usage::GatewayEmbeddingOutcome::Succeeded,
+            })
+            .collect();
+        event.gateway_embedding_calls_dropped = 7;
+
+        let body = build_otlp_traces_payload(&event, "test-exp");
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap();
+        let find = |key: &str| attrs.iter().find(|attr| attr["key"] == key);
+        let encoded = find("aisix.gateway_embedding_calls")
+            .expect("child audit is in the OTLP allowlist")["value"]["stringValue"]
+            .as_str()
+            .expect("child audit is serialized JSON");
+        assert!(encoded.len() <= MAX_GATEWAY_EMBEDDING_CALLS_ATTR_BYTES);
+        let calls: Vec<Value> =
+            serde_json::from_str(encoded).expect("the bounded child audit remains valid JSON");
+        assert_eq!(calls.len(), MAX_GATEWAY_EMBEDDING_CALLS_ATTR_ITEMS);
+        for sentinel in [
+            "provider-error-sentinel",
+            "credential-sentinel",
+            "caller-text-sentinel",
+        ] {
+            assert!(
+                !encoded.contains(sentinel),
+                "parent-only sentinel leaked into child audit: {sentinel}"
+            );
+        }
+        assert_eq!(calls[0]["purpose"], "semantic_route");
+        let model_id = calls[0]["embedding_model_id"].as_str().unwrap();
+        assert!(model_id.len() <= MAX_GATEWAY_EMBEDDING_MODEL_ID_ATTR_BYTES);
+        assert!(model_id.chars().all(|character| character == '情'));
+        assert_eq!(
+            find("aisix.gateway_embedding_calls_dropped")
+                .expect("ledger and exporter truncation are both visible")["value"]["intValue"],
+            "8",
+        );
     }
 
     #[test]

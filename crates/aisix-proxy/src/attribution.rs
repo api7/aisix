@@ -508,6 +508,66 @@ pub(crate) struct GatewayEmbeddingAudit {
     pub(crate) dropped: u32,
 }
 
+impl GatewayEmbeddingLedger {
+    fn record(&self, call: aisix_obs::GatewayEmbeddingCall) {
+        let mut ledger = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ledger.calls.len() < MAX_GATEWAY_EMBEDDING_CALLS {
+            ledger.calls.push(call);
+            return;
+        }
+        ledger.dropped = ledger.dropped.saturating_add(1);
+    }
+}
+
+/// Records an in-flight gateway-owned embedding call if its future is
+/// cancelled before the bridge returns.
+///
+/// The guard owns the ledger rather than consulting [`CURRENT`] from
+/// [`Drop`]. A handler cancellation drops the detached child scope before the
+/// parent cancel guard emits its terminal event, but task-local state is not a
+/// safe dependency for that cleanup path. The shared ledger is still alive at
+/// that point, so the terminal 499 event retains the failed child call.
+#[must_use = "an in-flight embedding call must stay guarded until it settles"]
+pub(crate) struct GatewayEmbeddingCallGuard {
+    ledger: Option<Arc<GatewayEmbeddingLedger>>,
+    purpose: aisix_obs::GatewayEmbeddingPurpose,
+    embedding_model_id: String,
+    started: Instant,
+    recorded: bool,
+}
+
+impl GatewayEmbeddingCallGuard {
+    /// Disarm the cancellation fallback and return this bridge invocation's
+    /// elapsed time for the ordinary success/error record.
+    pub(crate) fn settle(&mut self) -> u32 {
+        self.recorded = true;
+        u32::try_from(self.started.elapsed().as_millis()).unwrap_or(u32::MAX)
+    }
+}
+
+impl Drop for GatewayEmbeddingCallGuard {
+    fn drop(&mut self) {
+        if !self.recorded {
+            if let Some(ledger) = &self.ledger {
+                ledger.record(aisix_obs::GatewayEmbeddingCall {
+                    count: 1,
+                    purpose: self.purpose,
+                    embedding_model_id: self.embedding_model_id.clone(),
+                    prompt_tokens: 0,
+                    total_tokens: 0,
+                    usage_source: aisix_obs::GatewayEmbeddingUsageSource::Unavailable,
+                    latency_ms: u32::try_from(self.started.elapsed().as_millis())
+                        .unwrap_or(u32::MAX),
+                    outcome: aisix_obs::GatewayEmbeddingOutcome::Failed,
+                });
+            }
+        }
+    }
+}
+
 /// The per-request cell. Attempts within a request are sequential, so the
 /// lock is uncontended; it exists because the cancel guard may read the
 /// cell from a different point in the stack than the writer.
@@ -531,16 +591,7 @@ impl RequestAttribution {
     }
 
     fn note_gateway_embedding_call(&self, call: aisix_obs::GatewayEmbeddingCall) {
-        let mut ledger = self
-            .gateway_embedding_ledger
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if ledger.calls.len() < MAX_GATEWAY_EMBEDDING_CALLS {
-            ledger.calls.push(call);
-            return;
-        }
-        ledger.dropped = ledger.dropped.saturating_add(1);
+        self.gateway_embedding_ledger.record(call);
     }
 
     /// Move the bounded child-call prefix and its dropped count into the one
@@ -796,6 +847,28 @@ pub(crate) fn current() -> Option<Resolved> {
 /// deliberately dropped, just like every other attribution write.
 pub(crate) fn note_gateway_embedding_call(call: aisix_obs::GatewayEmbeddingCall) {
     let _ = CURRENT.try_with(|a| a.note_gateway_embedding_call(call));
+}
+
+/// Start accounting for one gateway-initiated embedding bridge call.
+///
+/// Call this immediately before `bridge.embed(...).await`, then call
+/// [`GatewayEmbeddingCallGuard::settle`] before emitting the ordinary
+/// success/error record. If the enclosing request future is dropped while
+/// awaiting the bridge, [`Drop`] records a bounded failed call against the
+/// parent ledger before cancellation emits the parent event.
+pub(crate) fn begin_gateway_embedding_call(
+    purpose: aisix_obs::GatewayEmbeddingPurpose,
+    embedding_model_id: &str,
+) -> GatewayEmbeddingCallGuard {
+    GatewayEmbeddingCallGuard {
+        ledger: CURRENT
+            .try_with(|attribution| Arc::clone(&attribution.gateway_embedding_ledger))
+            .ok(),
+        purpose,
+        embedding_model_id: embedding_model_id.to_string(),
+        started: Instant::now(),
+        recorded: false,
+    }
 }
 
 /// Move this request's bounded gateway-initiated embedding audit into its
@@ -1230,6 +1303,47 @@ mod tests {
                 aisix_obs::GatewayEmbeddingPurpose::Guardrail
             );
             assert!(take_gateway_embedding_audit().calls.is_empty());
+        })
+        .await;
+    }
+
+    /// The guard is created immediately before `bridge.embed(...).await`.
+    /// Poll this child through that point, then drop it as a cancelled handler
+    /// would; the parent terminal emitter must still see the in-flight call.
+    #[tokio::test]
+    async fn cancelled_child_embedding_bridge_call_reaches_the_parent_ledger() {
+        let parent = Arc::new(RequestAttribution::default());
+        scope(parent, async {
+            let mut bridge_await = Box::pin(detached(async {
+                let _call = begin_gateway_embedding_call(
+                    aisix_obs::GatewayEmbeddingPurpose::SemanticRoute,
+                    "embed-model-id",
+                );
+                std::future::pending::<()>().await;
+            }));
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(bridge_await.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(bridge_await);
+
+            let audit = take_gateway_embedding_audit();
+            assert_eq!(audit.calls.len(), 1);
+            assert_eq!(audit.dropped, 0);
+            let call = &audit.calls[0];
+            assert_eq!(
+                call.purpose,
+                aisix_obs::GatewayEmbeddingPurpose::SemanticRoute
+            );
+            assert_eq!(call.embedding_model_id, "embed-model-id");
+            assert_eq!(
+                call.usage_source,
+                aisix_obs::GatewayEmbeddingUsageSource::Unavailable
+            );
+            assert_eq!(call.outcome, aisix_obs::GatewayEmbeddingOutcome::Failed);
+            assert_eq!(call.prompt_tokens, 0);
+            assert_eq!(call.total_tokens, 0);
         })
         .await;
     }
