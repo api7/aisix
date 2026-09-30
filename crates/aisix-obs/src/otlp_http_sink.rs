@@ -1257,10 +1257,7 @@ fn gateway_embedding_calls_attribute(calls: &[GatewayEmbeddingCall]) -> (Option<
         let item = serde_json::to_string(&OtlpGatewayEmbeddingCall {
             count: call.count,
             purpose: call.purpose,
-            embedding_model_id: capped_utf8(
-                &call.embedding_model_id,
-                MAX_GATEWAY_EMBEDDING_MODEL_ID_ATTR_BYTES,
-            ),
+            embedding_model_id: gateway_embedding_model_id(&call.embedding_model_id),
             prompt_tokens: call.prompt_tokens,
             total_tokens: call.total_tokens,
             usage_source: call.usage_source,
@@ -1301,6 +1298,24 @@ fn gateway_embedding_calls_attribute(calls: &[GatewayEmbeddingCall]) -> (Option<
 
 fn usize_to_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+/// Return an OTLP-safe embedding resource ID, or `unknown`.
+///
+/// Gateway embedding audit records can originate outside the proxy, so the
+/// exporter treats this as its own final boundary. Reject rather than truncate
+/// an unsafe value: keeping a prefix could still export its contents.
+fn gateway_embedding_model_id(value: &str) -> &str {
+    if !value.is_empty()
+        && value.len() <= MAX_GATEWAY_EMBEDDING_MODEL_ID_ATTR_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        value
+    } else {
+        "unknown"
+    }
 }
 
 fn capped_utf8(value: &str, max_bytes: usize) -> &str {
@@ -2348,8 +2363,8 @@ mod tests {
         event.error_message = "provider-error-sentinel".into();
         event.api_key_id = "credential-sentinel".into();
         event.requested_model = "caller-text-sentinel".into();
-        // One more than the OTLP prefix cap, with an overlong multibyte model
-        // id: both caps must remain visible without emitting invalid JSON.
+        // One more than the OTLP resource-ID cap, with an unsafe multibyte
+        // value: both caps must remain visible without exporting the input.
         event.gateway_embedding_calls = (0..=MAX_GATEWAY_EMBEDDING_CALLS_ATTR_ITEMS)
             .map(|index| GatewayEmbeddingCall {
                 count: 1,
@@ -2389,13 +2404,65 @@ mod tests {
         }
         assert_eq!(calls[0]["purpose"], "semantic_route");
         let model_id = calls[0]["embedding_model_id"].as_str().unwrap();
-        assert!(model_id.len() <= MAX_GATEWAY_EMBEDDING_MODEL_ID_ATTR_BYTES);
-        assert!(model_id.chars().all(|character| character == '情'));
+        assert_eq!(model_id, "unknown");
+        assert!(!encoded.contains('情'));
         assert_eq!(
             find("aisix.gateway_embedding_calls_dropped")
                 .expect("ledger and exporter truncation are both visible")["value"]["intValue"],
             "8",
         );
+    }
+
+    #[test]
+    fn gateway_embedding_audit_ids_are_sanitized_at_the_otlp_boundary() {
+        let unsafe_ids = [
+            ("chinese-leak-", "chinese-leak-情".to_owned()),
+            ("control-leak-", "control-leak-\u{1b}[31m".to_owned()),
+            ("at-leak-", "at-leak@example".to_owned()),
+            (
+                "long-leak-",
+                format!(
+                    "long-leak-{}",
+                    "a".repeat(MAX_GATEWAY_EMBEDDING_MODEL_ID_ATTR_BYTES)
+                ),
+            ),
+        ];
+        let mut audit_calls = vec![GatewayEmbeddingCall {
+            count: 1,
+            purpose: crate::usage::GatewayEmbeddingPurpose::SemanticRoute,
+            embedding_model_id: "embed_model-01".into(),
+            prompt_tokens: 0,
+            total_tokens: 0,
+            usage_source: crate::usage::GatewayEmbeddingUsageSource::Unavailable,
+            latency_ms: 0,
+            outcome: crate::usage::GatewayEmbeddingOutcome::Failed,
+        }];
+        audit_calls.extend(unsafe_ids.iter().map(|(_, id)| GatewayEmbeddingCall {
+            count: 1,
+            purpose: crate::usage::GatewayEmbeddingPurpose::SemanticRoute,
+            embedding_model_id: id.clone(),
+            prompt_tokens: 0,
+            total_tokens: 0,
+            usage_source: crate::usage::GatewayEmbeddingUsageSource::Unavailable,
+            latency_ms: 0,
+            outcome: crate::usage::GatewayEmbeddingOutcome::Failed,
+        }));
+
+        let (attribute, dropped) = gateway_embedding_calls_attribute(&audit_calls);
+        assert_eq!(dropped, 0);
+        let encoded = attribute.expect("audit attribute is retained")["value"]["stringValue"]
+            .as_str()
+            .expect("audit attribute is JSON text");
+        let calls: Vec<Value> =
+            serde_json::from_str(encoded).expect("audit attribute remains valid JSON");
+        assert_eq!(calls[0]["embedding_model_id"], "embed_model-01");
+        for (call, (prefix, _)) in calls.iter().skip(1).zip(unsafe_ids.iter()) {
+            assert_eq!(call["embedding_model_id"], "unknown");
+            assert!(
+                !encoded.contains(prefix),
+                "unsafe embedding resource ID prefix leaked into OTLP JSON: {prefix}"
+            );
+        }
     }
 
     #[test]

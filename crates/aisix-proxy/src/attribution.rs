@@ -483,19 +483,28 @@ struct BodyCounters {
 /// telemetry allocation unbounded.
 pub(crate) const MAX_GATEWAY_EMBEDDING_CALLS: usize = 64;
 
-/// Maximum UTF-8 byte length retained for a gateway-initiated embedding
-/// model identifier. This field crosses the usage sink boundary, so bound it
-/// before it reaches the parent ledger rather than relying on individual
+/// Maximum byte length for a gateway-initiated embedding resource ID retained
+/// in the audit event. This field crosses the usage sink boundary, so validate
+/// it before it reaches the parent ledger rather than relying on individual
 /// exporters to do so.
 pub(crate) const MAX_GATEWAY_EMBEDDING_MODEL_ID_BYTES: usize = 128;
 
-/// Return a UTF-8-safe, bounded copy of a gateway embedding model identifier.
+/// Return a bounded ASCII-safe gateway embedding resource ID, or `unknown`.
+///
+/// Resource IDs originate in etcd and reach OTLP/exporters through the child
+/// embedding audit. Keep only the fixed `[A-Za-z0-9_-]` vocabulary; do not
+/// truncate an invalid value because a retained prefix could still expose it.
 pub(crate) fn capped_gateway_embedding_model_id(value: &str) -> String {
-    let mut end = MAX_GATEWAY_EMBEDDING_MODEL_ID_BYTES.min(value.len());
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
+    if !value.is_empty()
+        && value.len() <= MAX_GATEWAY_EMBEDDING_MODEL_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        value.to_owned()
+    } else {
+        "unknown".to_owned()
     }
-    value[..end].to_owned()
 }
 
 /// The child embedding calls a request caused while it was being served.
@@ -1333,7 +1342,7 @@ mod tests {
             let mut bridge_await = Box::pin(detached(async {
                 let _call = begin_gateway_embedding_call(
                     aisix_obs::GatewayEmbeddingPurpose::SemanticRoute,
-                    "embed-model-id",
+                    "cancel-leak-情",
                 );
                 std::future::pending::<()>().await;
             }));
@@ -1352,7 +1361,7 @@ mod tests {
                 call.purpose,
                 aisix_obs::GatewayEmbeddingPurpose::SemanticRoute
             );
-            assert_eq!(call.embedding_model_id, "embed-model-id");
+            assert_eq!(call.embedding_model_id, "unknown");
             assert_eq!(
                 call.usage_source,
                 aisix_obs::GatewayEmbeddingUsageSource::Unavailable
@@ -1364,38 +1373,26 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
-    async fn child_embedding_model_ids_are_utf8_safe_and_bounded_before_the_usage_sink() {
-        let parent = Arc::new(RequestAttribution::default());
-        let oversized = format!("{}-suffix", "界".repeat(100));
-        scope(parent, async {
-            note_gateway_embedding_call(aisix_obs::GatewayEmbeddingCall {
-                count: 1,
-                purpose: aisix_obs::GatewayEmbeddingPurpose::SemanticRoute,
-                embedding_model_id: oversized.clone(),
-                prompt_tokens: 0,
-                total_tokens: 0,
-                usage_source: aisix_obs::GatewayEmbeddingUsageSource::Unavailable,
-                latency_ms: 0,
-                outcome: aisix_obs::GatewayEmbeddingOutcome::Failed,
-            });
-            let guard = begin_gateway_embedding_call(
-                aisix_obs::GatewayEmbeddingPurpose::SemanticRoute,
-                &oversized,
-            );
-            drop(guard);
-
-            let audit = take_gateway_embedding_audit();
-            assert_eq!(audit.calls.len(), 2);
-            for call in audit.calls {
-                assert!(call
-                    .embedding_model_id
-                    .is_char_boundary(call.embedding_model_id.len()));
-                assert!(call.embedding_model_id.len() <= MAX_GATEWAY_EMBEDDING_MODEL_ID_BYTES);
-                assert_eq!(call.embedding_model_id, "界".repeat(42));
-            }
-        })
-        .await;
+    #[test]
+    fn child_embedding_model_ids_allow_only_bounded_ascii_safe_resource_ids() {
+        assert_eq!(
+            capped_gateway_embedding_model_id("embed_model-01"),
+            "embed_model-01"
+        );
+        assert_eq!(
+            capped_gateway_embedding_model_id("embed@customer"),
+            "unknown"
+        );
+        assert_eq!(
+            capped_gateway_embedding_model_id("embed\u{1b}[31m"),
+            "unknown"
+        );
+        assert_eq!(
+            capped_gateway_embedding_model_id(
+                &"a".repeat(MAX_GATEWAY_EMBEDDING_MODEL_ID_BYTES + 1)
+            ),
+            "unknown"
+        );
     }
 
     #[tokio::test]

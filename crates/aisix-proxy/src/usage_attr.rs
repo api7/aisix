@@ -1044,7 +1044,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_usage_event_never_receives_an_oversized_embedding_model_id() {
+    async fn terminal_usage_event_replaces_an_unsafe_embedding_model_id_with_unknown() {
         let parent = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
         crate::attribution::scope(parent, async {
             crate::attribution::note_gateway_embedding_call(aisix_obs::GatewayEmbeddingCall {
@@ -1061,9 +1061,7 @@ mod tests {
             let mut terminal = UsageEvent::default();
             attach_gateway_embedding_audit(&mut terminal);
             let model_id = &terminal.gateway_embedding_calls[0].embedding_model_id;
-            assert!(model_id.is_char_boundary(model_id.len()));
-            assert!(model_id.len() <= crate::attribution::MAX_GATEWAY_EMBEDDING_MODEL_ID_BYTES);
-            assert_eq!(model_id, &"界".repeat(42));
+            assert_eq!(model_id, "unknown");
         })
         .await;
     }
