@@ -50,6 +50,9 @@ const CACHE_MODEL = "seu-1747-cache-chat";
 const UNAVAILABLE_USAGE_EMBED_MODEL = "seu-1747-embed-usage-unavailable";
 const UNAVAILABLE_USAGE_ROUTER_MODEL = "seu-1747-router-usage-unavailable";
 const UNAVAILABLE_USAGE_UPSTREAM_MODEL = "embedding-usage-unavailable-mock";
+const FAILED_USAGE_EMBED_MODEL = "seu-1747-embed-usage-failed";
+const FAILED_USAGE_ROUTER_MODEL = "seu-1747-router-usage-failed";
+const FAILED_USAGE_UPSTREAM_MODEL = "embedding-usage-failed-mock";
 const CANCELLED_EMBED_MODEL = "seu-1747-embed-cancelled";
 const CANCELLED_ROUTER_MODEL = "seu-1747-router-cancelled";
 const CANCELLED_USAGE_UPSTREAM_MODEL = "embedding-usage-cancelled-mock";
@@ -157,6 +160,12 @@ async function startEmbeddingMock(): Promise<EmbeddingMock> {
       calls++;
       const upstreamModel = body.model ?? "embedding-usage-mock";
       callsByModel.set(upstreamModel, (callsByModel.get(upstreamModel) ?? 0) + 1);
+      if (body.model === FAILED_USAGE_UPSTREAM_MODEL) {
+        res.statusCode = 502;
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ error: { message: "embedding upstream unavailable" } }));
+        return;
+      }
       const inputs = Array.isArray(body.input) ? body.input : [body.input ?? ""];
       const promptTokens = inputs.length * 10;
       const responseTimer = setTimeout(
@@ -274,6 +283,7 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
   let streamUpstream: OpenAiUpstream | undefined;
   let embeddingModelID = "";
   let unavailableUsageEmbeddingModelID = "";
+  let failedUsageEmbeddingModelID = "";
   let cancelledEmbeddingModelID = "";
   let routeTargetModelID = "";
   let streamRouteTargetModelID = "";
@@ -407,6 +417,14 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
       embedding: { dimensions: 4, normalize: true },
     });
     unavailableUsageEmbeddingModelID = unavailableUsageEmbedding.id;
+    const failedUsageEmbedding = await seed.createModel({
+      display_name: FAILED_USAGE_EMBED_MODEL,
+      provider: "openai",
+      model_name: FAILED_USAGE_UPSTREAM_MODEL,
+      provider_key_id: embeddingKey.id,
+      embedding: { dimensions: 4, normalize: true },
+    });
+    failedUsageEmbeddingModelID = failedUsageEmbedding.id;
     const cancelledEmbedding = await seed.createModel({
       display_name: CANCELLED_EMBED_MODEL,
       provider: "openai",
@@ -465,6 +483,23 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
         ],
         default: ROUTE_DEFAULT,
         match: { threshold: 0.9 },
+      },
+    });
+    await seed.createModel({
+      display_name: FAILED_USAGE_ROUTER_MODEL,
+      semantic: {
+        embedding_model: FAILED_USAGE_EMBED_MODEL,
+        routes: [
+          {
+            name: "route-topic",
+            target: ROUTE_TARGET,
+            examples: [ROUTE_EXAMPLE],
+            threshold: 0.9,
+          },
+        ],
+        default: ROUTE_DEFAULT,
+        match: { threshold: 0.9 },
+        on_embedding_failure: "fail",
       },
     });
     await seed.createModel({
@@ -687,6 +722,49 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     expect(call.latency_ms).toBeGreaterThan(0);
     expect(row.has("gateway_embedding_calls_dropped")).toBe(false);
     expectUnchangedParentUsage(row);
+  });
+
+  test("a semantic embedding bridge error retains its failed child on the 503 parent", async () => {
+    const { sls, embed, upstream } = requireRuntime();
+
+    const failedEmbeddingCallsBefore = embed.callCountFor(FAILED_USAGE_UPSTREAM_MODEL);
+    const upstreamCallsBefore = upstream.receivedRequests.length;
+    const response = await chat(FAILED_USAGE_ROUTER_MODEL, ROUTE_PROMPT);
+    expect(response.status).toBe(503);
+    expect(response.requestId, "the DP stamps the failed parent request id").not.toBe("");
+    expect(embed.callCountFor(FAILED_USAGE_UPSTREAM_MODEL)).toBe(failedEmbeddingCallsBefore + 1);
+    expect(
+      upstream.receivedRequests.length,
+      "on_embedding_failure=fail must not dispatch a chat target",
+    ).toBe(upstreamCallsBefore);
+
+    const row = await usageRow(response.requestId);
+    expect(rowsForRequest(sls, response.requestId)).toHaveLength(1);
+    expect(row.get("status_code")).toBe("503");
+
+    const calls = embeddingCalls(row);
+    expect(calls).toHaveLength(1);
+    expect(row.has("gateway_embedding_calls_dropped")).toBe(false);
+    const call = calls[0]!;
+    expect(call.count).toBe(1);
+    expect(call.purpose).toBe("semantic_route");
+    expect(call.embedding_model_id).toBe(failedUsageEmbeddingModelID);
+    expect(call.prompt_tokens).toBe(0);
+    expect(call.total_tokens).toBe(0);
+    expect(call.usage_source).toBe("unavailable");
+    expect(call.outcome).toBe("failed");
+
+    // The bridge selected no target, so its zero usage is child-only and
+    // cannot turn into a billable or attributed parent attempt.
+    expect(row.get("prompt_tokens") ?? "0").toBe("0");
+    expect(row.get("completion_tokens") ?? "0").toBe("0");
+    expect(row.get("total_tokens") ?? "0").toBe("0");
+    expect(Number(row.get("cost_usd") ?? "0")).toBe(0);
+    expect(row.get("requested_model")).toBe(FAILED_USAGE_ROUTER_MODEL);
+    expect(row.get("model_id") ?? "").toBe("");
+    expect(row.get("attempt_model") ?? "").toBe("");
+    expect(row.get("model_id") ?? "").not.toBe(failedUsageEmbeddingModelID);
+    expect(row.get("attempt_model") ?? "").not.toBe(FAILED_USAGE_EMBED_MODEL);
   });
 
   test(
