@@ -357,7 +357,7 @@
           ]
         },
         "examples": {
-          "description": "Example utterances that define this route. AISIX caches their vectors lazily. A request batches its prompt and every distinct uncached example text into the same embedding request. Required, with at least one example, when the router has no `classifier`; not accepted when it has one.",
+          "description": "Example utterances that define this route. AISIX caches their vectors lazily. A cold route request passes its prompt and every distinct uncached example text as one logical embedding batch. Providers without batch support may issue multiple upstream calls (Bedrock Titan does). Required, with at least one example, when the router has no `classifier`; not accepted when it has one.",
           "items": {
             "minLength": 1,
             "type": "string"

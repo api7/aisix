@@ -10,9 +10,10 @@
 //! (cosine, aggregated per route), and dispatches to the highest route
 //! whose score clears its threshold — or to `default` when none does.
 //! Route example vectors are populated lazily during request handling and
-//! cached. A cold request batches its prompt and every distinct uncached
-//! route-example text into the same embedding request; the steady-state cost
-//! is a single prompt embedding plus local arithmetic.
+//! cached. A cold route request passes its prompt and every distinct uncached
+//! route-example text as one logical embedding batch. Providers without batch
+//! support may issue multiple upstream calls (Bedrock Titan does). In steady
+//! state, the batch contains only the prompt, followed by local arithmetic.
 //!
 //! A router that carries a `classifier` block decides differently: the
 //! latest user message is sent once to a hosted decision model, which
@@ -84,10 +85,11 @@ pub struct SemanticRoute {
     #[schemars(length(min = 1))]
     pub description: Option<String>,
     /// Example utterances that define this route. AISIX caches their vectors
-    /// lazily. A request batches its prompt and every distinct uncached
-    /// example text into the same embedding request. Required, with at least
-    /// one example, when the router has no `classifier`; not accepted when it
-    /// has one.
+    /// lazily. A cold route request passes its prompt and every distinct
+    /// uncached example text as one logical embedding batch. Providers without
+    /// batch support may issue multiple upstream calls (Bedrock Titan does).
+    /// Required, with at least one example, when the router has no
+    /// `classifier`; not accepted when it has one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(min = 1), inner(length(min = 1)))]
     pub examples: Vec<String>,

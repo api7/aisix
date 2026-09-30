@@ -111,7 +111,7 @@ pub(crate) fn failure_target<'a>(
 
 /// Per-instance cache of route example-utterance embeddings, populated
 /// lazily on the first request that needs them and reused across requests
-/// so the steady-state per-request cost is a single embedding call for the
+/// so a steady-state request's logical embedding batch contains only the
 /// prompt. Keyed by `(embedding_model_id, dimensions, example_text)` —
 /// changing the embedding model or its dimensions auto-invalidates, since
 /// a stale vector of the wrong dimension must never be served.
@@ -309,8 +309,9 @@ async fn decide_by_embedding(
         .map(|e| e.dimensions)
         .unwrap_or(0);
 
-    // Batch the prompt (index 0) with every uncached example text in one
-    // embedding call. Steady state: only the prompt is uncached.
+    // Assemble the prompt (index 0) with every uncached example text as one
+    // logical embedding batch. Providers without batch input may split it
+    // into multiple upstream calls. Steady state: only the prompt is uncached.
     let mut pending: Vec<String> = Vec::new();
     for route in &semantic.routes {
         for ex in &route.examples {
