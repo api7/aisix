@@ -1798,7 +1798,9 @@ fn join_target_url(base: &str, rest: &str, query: Option<&str>) -> Result<String
 /// Query key comparison examines each bounded whole-query decoded form. A
 /// backend may decode before splitting on `&` or `;`, so checking only keys
 /// from the original form would miss `safe=1%26tenant%3Dcaller` becoming a
-/// `tenant` key downstream. Query sets here are tiny, so a simple vector
+/// `tenant` key downstream. Some form parsers also canonicalize a key's
+/// bracketed suffix and ASCII dot/space spelling, so compare that normalized
+/// form at every decode level. Query sets here are tiny, so a simple vector
 /// keeps the parser behavior explicit without adding a dependency.
 fn query_keys_overlap(base: &str, inbound: &str) -> bool {
     let Some(base_keys) = query_keys_at_all_decode_levels(base) else {
@@ -1818,7 +1820,7 @@ fn query_keys_at_all_decode_levels(query: &str) -> Option<Vec<Vec<u8>>> {
     for _ in 0..=MAX_PERCENT_DECODE_PASSES {
         for field in decoded.split(|byte| matches!(*byte, b'&' | b';')) {
             for (key, _) in url::form_urlencoded::parse(field) {
-                let key = key.into_owned().into_bytes();
+                let key = normalize_form_query_key(&key);
                 if !keys.iter().any(|existing| existing == &key) {
                     keys.push(key);
                 }
@@ -1831,6 +1833,20 @@ fn query_keys_at_all_decode_levels(query: &str) -> Option<Vec<Vec<u8>>> {
         decoded = next;
     }
     None
+}
+
+/// Match the key canonicalization used by common form parsers: a bracketed
+/// suffix selects a nested value beneath the base key, and ASCII dots/spaces
+/// are aliases for underscores.
+fn normalize_form_query_key(key: &str) -> Vec<u8> {
+    key.as_bytes()
+        .iter()
+        .take_while(|byte| **byte != b'[')
+        .map(|byte| match *byte {
+            b'.' | b' ' => b'_',
+            byte => byte,
+        })
+        .collect()
 }
 
 /// A backend may decode percent escapes before routing. Decode a bounded
@@ -3308,6 +3324,32 @@ mod tests {
                 "{query} must not recreate an operator-owned key through a semicolon delimiter"
             );
         }
+        for query in [
+            "tenant.id=caller",
+            "tenant%2Eid=caller",
+            "tenant%252Eid=caller",
+            "tenant+id=caller",
+            "tenant%20id=caller",
+        ] {
+            assert!(
+                join_target_url(
+                    "https://upstream.example/provider/v1?tenant_id=operator",
+                    "models",
+                    Some(query),
+                )
+                .is_err(),
+                "{query} must not bypass an operator-owned key through form-key normalization"
+            );
+        }
+        assert!(
+            join_target_url(
+                "https://upstream.example/provider/v1?tenant=operator",
+                "models",
+                Some("tenant%5Brole%5D=caller"),
+            )
+            .is_err(),
+            "a bracketed caller key must not bypass its operator-owned base key"
+        );
 
         // Test raw, percent-encoded, and encoded-separator spellings. The
         // gateway must reject them before a ProviderKey can be sent outside

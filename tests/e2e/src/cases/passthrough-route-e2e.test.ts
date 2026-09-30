@@ -247,11 +247,17 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
       target_url: `${upstream.baseUrl}/provider/v1?tenant=operator`,
       provider_key_id: pk.id,
     });
+    await seed.createPassthroughRoute({
+      name: "ptr-form-key-boundary",
+      path_prefix: "/ptr-form-key-boundary",
+      target_url: `${upstream.baseUrl}/provider/v1?tenant_id=operator`,
+      provider_key_id: pk.id,
+    });
 
     const headers = { authorization: `Bearer ${CALLER_PLAINTEXT}` };
     await waitConfigPropagation(async () => {
       try {
-        const ready = await fetch(`${app!.proxyUrl}/ptr-boundary/models`, {
+        const ready = await fetch(`${app!.proxyUrl}/ptr-form-key-boundary/models`, {
           headers,
         });
         await ready.text();
@@ -262,7 +268,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     });
 
     expect(upstream.receivedRequests.at(-1)?.path).toBe(
-      "/provider/v1/models?tenant=operator",
+      "/provider/v1/models?tenant_id=operator",
     );
     const allowedQuery = await harnessRequest(
       `${app.proxyUrl}/ptr-boundary/models?limit=3`,
@@ -338,6 +344,30 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
       await semicolonQueryDelimiter.body.text();
       expect(upstream.receivedRequests, query).toHaveLength(baseline);
     }
+
+    for (const query of [
+      "tenant.id=caller",
+      "tenant%2Eid=caller",
+      "tenant%252Eid=caller",
+      "tenant+id=caller",
+      "tenant%20id=caller",
+    ]) {
+      const normalizedKeyConflict = await harnessRequest(
+        `${app.proxyUrl}/ptr-form-key-boundary/models?${query}`,
+        { headers },
+      );
+      expect(normalizedKeyConflict.statusCode, query).toBe(400);
+      await normalizedKeyConflict.body.text();
+      expect(upstream.receivedRequests, query).toHaveLength(baseline);
+    }
+
+    const bracketedKeyConflict = await harnessRequest(
+      `${app.proxyUrl}/ptr-boundary/models?tenant%5Brole%5D=caller`,
+      { headers },
+    );
+    expect(bracketedKeyConflict.statusCode).toBe(400);
+    await bracketedKeyConflict.body.text();
+    expect(upstream.receivedRequests).toHaveLength(baseline);
   });
 
   test("forward-proxy BYO: host match beats typed routes; Authorization forwarded verbatim", async (ctx) => {
