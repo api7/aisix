@@ -2450,7 +2450,8 @@ mod tests {
 
         let (attribute, dropped) = gateway_embedding_calls_attribute(&audit_calls);
         assert_eq!(dropped, 0);
-        let encoded = attribute.expect("audit attribute is retained")["value"]["stringValue"]
+        let attribute = attribute.expect("audit attribute is retained");
+        let encoded = attribute["value"]["stringValue"]
             .as_str()
             .expect("audit attribute is JSON text");
         let calls: Vec<Value> =
