@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use aisix_core::{RateLimit, RateLimitScope, RedisConnConfig, RedisMode};
 use aisix_obs::metrics::Metrics;
-use aisix_ratelimit::{Limiter, MultiReservation, RateStore, RedisStore};
+use aisix_ratelimit::{
+    store::redis::DEFAULT_PREFIX, Limiter, MultiReservation, RateStore, RedisStore,
+};
 
 fn redis_url() -> Option<String> {
     std::env::var("RATELIMIT_TEST_REDIS_URL").ok()
@@ -373,7 +375,8 @@ async fn stale_concurrency_slot_is_reclaimed_after_ttl() {
         eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
         return;
     };
-    // 1s slot lifetime: a never-released slot (crashed replica) is pruned.
+    // A 1s slot lifetime plus the one-second rolling-upgrade compatibility
+    // margin: a never-released slot (crashed replica) is eventually pruned.
     let a = store(&url).await.with_conc_ttl(1);
     let b = store(&url).await.with_conc_ttl(1);
     let key = unique_key("conc-ttl");
@@ -395,6 +398,95 @@ async fn stale_concurrency_slot_is_reclaimed_after_ttl() {
     b.acquire(&key, &limits, "b-2")
         .await
         .expect("stale slot reclaimed after conc_ttl");
+}
+
+#[tokio::test]
+async fn refreshing_released_member_does_not_recreate_slot() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let a = store(&url).await.with_conc_ttl(1);
+    let b = store(&url).await.with_conc_ttl(1);
+    let key = unique_key("conc-refresh-release");
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..rl()
+    };
+
+    a.acquire(&key, &limits, "a-stream")
+        .await
+        .expect("first stream allowed");
+    // `commit` removes the member synchronously in Redis. A queued lease
+    // refresh that follows must see it missing rather than add it back.
+    a.commit(&key, 0, "a-stream").await;
+    a.refresh_stream_lease(&key, "a-stream").await;
+
+    b.acquire(&key, &limits, "b-stream")
+        .await
+        .expect("refresh after release must not recreate the slot");
+}
+
+#[tokio::test]
+async fn legacy_integer_member_survives_the_upgrade_prune_boundary() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let b = store(&url).await.with_conc_ttl(1);
+    let key = unique_key("conc-legacy-upgrade");
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..rl()
+    };
+    let client = redis::Client::open(url.as_str()).expect("raw Redis client");
+    let mut raw = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw Redis connection");
+
+    // A pre-renewal gateway wrote one integer-second score. Install a score
+    // that is exactly on the new build's stale boundary while still early in
+    // the current server second. An inclusive or fractional prune erases it
+    // too early; the conservative exclusive boundary keeps it.
+    let legacy_second = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let time: Vec<String> = redis::cmd("TIME")
+                .query_async(&mut raw)
+                .await
+                .expect("Redis TIME");
+            let seconds: u64 = time[0].parse().expect("TIME seconds");
+            let micros: u64 = time[1].parse().expect("TIME microseconds");
+            if micros < 500_000 {
+                return seconds;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reach an early Redis second");
+    let conc_key = format!("{DEFAULT_PREFIX}:{{{key}}}:conc");
+    let _: i64 = redis::cmd("ZADD")
+        .arg(&conc_key)
+        .arg(legacy_second.saturating_sub(1))
+        .arg("legacy-stream")
+        .query_async(&mut raw)
+        .await
+        .expect("install legacy member");
+    let _: i64 = redis::cmd("EXPIRE")
+        .arg(&conc_key)
+        .arg(5)
+        .query_async(&mut raw)
+        .await
+        .expect("keep legacy member for the boundary check");
+
+    assert!(
+        matches!(
+            b.acquire(&key, &limits, "new-stream").await,
+            Err(aisix_ratelimit::RateLimitError::Concurrency { .. })
+        ),
+        "new code must not prune a live legacy member at the upgrade boundary"
+    );
 }
 
 #[tokio::test]

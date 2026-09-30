@@ -85,7 +85,8 @@ local prefix = ARGV[1]
 local member = ARGV[2]
 local conc_max = tonumber(ARGV[3])
 local conc_ttl = tonumber(ARGV[4])
-local grace = tonumber(ARGV[5])
+local conc_key_ttl = tonumber(ARGV[5])
+local grace = tonumber(ARGV[6])
 local t = redis.call('TIME')
 local now = tonumber(t[1])
 -- Keep the score in seconds so rolling upgrades still understand existing
@@ -106,7 +107,7 @@ if conc_max >= 0 then
   end
 end
 
-local idx = 6
+local idx = 7
 local nreq = tonumber(ARGV[idx]); idx = idx + 1
 local req = {}
 for i = 1, nreq do
@@ -152,18 +153,18 @@ for i = 1, nreq do
 end
 if conc_max >= 0 then
   redis.call('ZADD', conc_key, conc_now, member)
-  redis.call('EXPIRE', conc_key, conc_ttl)
+  redis.call('EXPIRE', conc_key, conc_key_ttl)
 end
 return {0, 0, 0, 0, 0}
 "#;
 
 /// Refresh one live streaming member's concurrency lease. The member must
 /// already exist: refresh racing stream teardown must not resurrect a member
-/// after `release` removed it. ARGV: prefix, member, conc_ttl.
+/// after `release` removed it. ARGV: prefix, member, conc_key_ttl.
 const REFRESH_CONCURRENCY_LUA: &str = r#"
 local prefix = ARGV[1]
 local member = ARGV[2]
-local conc_ttl = tonumber(ARGV[3])
+local conc_key_ttl = tonumber(ARGV[3])
 local conc_key = prefix .. ':conc'
 if not redis.call('ZSCORE', conc_key, member) then
   return 0
@@ -171,7 +172,7 @@ end
 local t = redis.call('TIME')
 local conc_now = tonumber(t[1]) + tonumber(t[2]) / 1000000
 redis.call('ZADD', conc_key, 'XX', conc_now, member)
-redis.call('EXPIRE', conc_key, conc_ttl)
+redis.call('EXPIRE', conc_key, conc_key_ttl)
 return 1
 "#;
 
@@ -532,6 +533,9 @@ impl RateStore for RedisStore {
             member.to_string(),
             limits.concurrency.map(i64::from).unwrap_or(-1).to_string(),
             self.conc_ttl.to_string(),
+            // Pruning retains a pre-upgrade integer-second member through its
+            // boundary, so the key must survive for the same extra second.
+            self.conc_ttl.saturating_add(1).to_string(),
             self.grace.to_string(),
         ];
         push_dims(&mut args, &super::request_dims(limits));
@@ -744,7 +748,7 @@ impl RateStore for RedisStore {
             .key(&prefix)
             .arg(&prefix)
             .arg(member)
-            .arg(self.conc_ttl)
+            .arg(self.conc_ttl.saturating_add(1))
             .invoke_async(&mut conn)
             .await;
         match res {
