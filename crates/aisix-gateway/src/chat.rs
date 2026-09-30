@@ -902,10 +902,27 @@ pub struct EmbeddingResponse {
     pub usage: EmbeddingUsage,
 }
 
+/// Provenance of the token counters on an embedding response.
+///
+/// Embedding providers may return vectors without a complete usage block.
+/// `Reported` means the provider supplied the count needed to populate this
+/// input-only response's counters; `Unavailable` keeps an absent count from
+/// being mistaken for a provider-reported zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EmbeddingUsageSource {
+    Reported,
+    #[default]
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EmbeddingUsage {
     pub prompt_tokens: u32,
     pub total_tokens: u32,
+    /// Internal provenance for telemetry. Client embedding response bodies
+    /// retain their established OpenAI-compatible `usage` shape.
+    #[serde(skip)]
+    pub source: EmbeddingUsageSource,
 }
 
 #[cfg(test)]

@@ -51,9 +51,10 @@ pub enum GatewayEmbeddingPurpose {
 /// Whether a gateway-initiated embedding bridge call returned a response.
 ///
 /// Failed calls retain their elapsed time and count but have no provider usage
-/// to report, so their token counters are zero. The concrete bridge error is
-/// deliberately not exported: it can contain provider-specific or sensitive
-/// detail and is already represented by the parent request outcome.
+/// to report, so their token counters are zero and their `usage_source` is
+/// `unavailable`. The concrete bridge error is deliberately not exported: it
+/// can contain provider-specific or sensitive detail and is already
+/// represented by the parent request outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayEmbeddingOutcome {
@@ -61,22 +62,37 @@ pub enum GatewayEmbeddingOutcome {
     Failed,
 }
 
-/// One actual embedding call the gateway made while serving a parent request.
+/// Where the child call's token counters came from.
+///
+/// `Unavailable` is explicit rather than inferring from zero: zero can be a
+/// legitimate provider-reported count, while some embedding providers return
+/// vectors without a complete usage block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayEmbeddingUsageSource {
+    Reported,
+    Unavailable,
+}
+
+/// One gateway embedding-bridge invocation while serving a parent request.
 ///
 /// This is an audit detail, not a billable child event. `embedding_model_id`
 /// is the configured Model resource id rather than a provider credential or
 /// raw upstream model name, keeping a rename-stable join to the configured
-/// embedding model without exposing request content.
+/// embedding model without exposing request content. One bridge invocation
+/// is not necessarily one outbound provider HTTP request: for example, the
+/// Bedrock Titan bridge fans a batch out into one request per input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GatewayEmbeddingCall {
-    /// This entry represents one completed bridge invocation. It is explicit
-    /// so downstream consumers can sum counts without deriving semantics from
-    /// the array shape.
+    /// This entry represents one completed gateway bridge invocation. It is
+    /// explicit so downstream consumers can sum counts without deriving
+    /// semantics from the array shape.
     pub count: u32,
     pub purpose: GatewayEmbeddingPurpose,
     pub embedding_model_id: String,
     pub prompt_tokens: u32,
     pub total_tokens: u32,
+    pub usage_source: GatewayEmbeddingUsageSource,
     pub latency_ms: u32,
     pub outcome: GatewayEmbeddingOutcome,
 }
@@ -198,9 +214,10 @@ pub struct UsageEvent {
     /// and cost fields. Those describe the model the caller addressed; adding
     /// a different embedding model's tokens there would mis-price the parent
     /// request and replace its model-level accounting. Each entry describes
-    /// one actual bridge call (`count` is therefore always one). It contains
-    /// only a fixed purpose, configured model resource id, provider-reported
-    /// token counts, elapsed time, and a bounded outcome — never
+    /// one gateway bridge invocation (`count` is therefore always one), not
+    /// necessarily one provider HTTP request. It contains only a fixed
+    /// purpose, configured model resource id, token provenance, token counts,
+    /// elapsed time, and a bounded outcome — never
     /// request text, route examples, credentials, or provider error text.
     ///
     /// Empty is omitted for wire compatibility with older CPs, which ignore
@@ -210,6 +227,14 @@ pub struct UsageEvent {
     /// completion have settled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gateway_embedding_calls: Vec<GatewayEmbeddingCall>,
+
+    /// Gateway bridge invocations omitted from `gateway_embedding_calls`
+    /// after its per-request 64-item prefix cap. This is a saturating count:
+    /// a non-zero value makes truncation explicit without allowing a malformed
+    /// request to make the parent event unbounded. It is terminal-event-only,
+    /// alongside the retained prefix.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub gateway_embedding_calls_dropped: u32,
 
     /// In-process only, never on the wire: the reasoning the record took
     /// back out of the gateway's folded completion count. Consumers that
@@ -1691,6 +1716,7 @@ mod tests {
     fn gateway_embedding_calls_are_a_safe_optional_child_audit_trail() {
         let empty = serde_json::to_string(&UsageEvent::default()).unwrap();
         assert!(!empty.contains("gateway_embedding_calls"));
+        assert!(!empty.contains("gateway_embedding_calls_dropped"));
 
         let ev = UsageEvent {
             gateway_embedding_calls: vec![GatewayEmbeddingCall {
@@ -1699,9 +1725,11 @@ mod tests {
                 embedding_model_id: "embed-model-id".into(),
                 prompt_tokens: 7,
                 total_tokens: 7,
+                usage_source: GatewayEmbeddingUsageSource::Reported,
                 latency_ms: 13,
                 outcome: GatewayEmbeddingOutcome::Succeeded,
             }],
+            gateway_embedding_calls_dropped: 3,
             ..Default::default()
         };
         let json = serde_json::to_value(ev).unwrap();
@@ -1713,10 +1741,12 @@ mod tests {
                 "embedding_model_id": "embed-model-id",
                 "prompt_tokens": 7,
                 "total_tokens": 7,
+                "usage_source": "reported",
                 "latency_ms": 13,
                 "outcome": "succeeded",
             }])
         );
+        assert_eq!(json["gateway_embedding_calls_dropped"], 3);
     }
 
     #[test]

@@ -22,7 +22,8 @@ use aisix_gateway::structured_output::{
 use aisix_gateway::{
     Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatFormat,
     ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingUsage, EmbeddingVector, FinishReason, Role, UpstreamHeaderContext, UsageStats,
+    EmbeddingUsage, EmbeddingUsageSource, EmbeddingVector, FinishReason, Role,
+    UpstreamHeaderContext, UsageStats,
 };
 use async_trait::async_trait;
 use aws_credential_types::provider::SharedCredentialsProvider;
@@ -814,9 +815,11 @@ impl Bridge for BedrockBridge {
 
         let mut data = Vec::with_capacity(req.input.len());
         let mut prompt_tokens: u64 = 0;
+        let mut usage_reported = false;
 
         let base_id = strip_region_prefix(upstream_id);
         if base_id.starts_with("amazon.titan-embed") {
+            usage_reported = !req.input.is_empty();
             for (i, text) in req.input.iter().enumerate() {
                 let mut body = serde_json::json!({"inputText": text});
                 // `dimensions` is a Titan V2 knob; G1 rejects unknown keys.
@@ -838,7 +841,11 @@ impl Bridge for BedrockBridge {
                     .map_err(|e| map_sdk_error(e, started, deadline))?;
                 let parsed: TitanEmbedResponse = serde_json::from_slice(resp.body().as_ref())
                     .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-                prompt_tokens += parsed.input_text_token_count;
+                if let Some(token_count) = parsed.input_text_token_count {
+                    prompt_tokens += token_count;
+                } else {
+                    usage_reported = false;
+                }
                 data.push(EmbeddingObject {
                     index: i as u32,
                     object: "embedding".to_string(),
@@ -879,8 +886,9 @@ impl Bridge for BedrockBridge {
                     embedding: EmbeddingVector::Float(values),
                 });
             }
-            // Cohere-on-Bedrock returns no token statistics; usage stays 0
-            // (LiteLLM surfaces the same absence).
+            // Cohere-on-Bedrock returns no token statistics; record the
+            // source as unavailable rather than presenting this zero as a
+            // provider-reported count.
         } else {
             return Err(BridgeError::Config(format!(
                 "bedrock embeddings support amazon.titan-embed-* and cohere.embed-* \
@@ -889,6 +897,11 @@ impl Bridge for BedrockBridge {
         }
 
         let tokens = prompt_tokens.min(u32::MAX as u64) as u32;
+        let source = if usage_reported {
+            EmbeddingUsageSource::Reported
+        } else {
+            EmbeddingUsageSource::Unavailable
+        };
         Ok(EmbeddingResponse {
             object: "list".to_string(),
             model: req.model.clone(),
@@ -896,6 +909,7 @@ impl Bridge for BedrockBridge {
             usage: EmbeddingUsage {
                 prompt_tokens: tokens,
                 total_tokens: tokens,
+                source,
             },
         })
     }
@@ -906,8 +920,8 @@ impl Bridge for BedrockBridge {
 #[derive(Debug, Deserialize)]
 struct TitanEmbedResponse {
     embedding: Vec<f32>,
-    #[serde(rename = "inputTextTokenCount", default)]
-    input_text_token_count: u64,
+    #[serde(rename = "inputTextTokenCount")]
+    input_text_token_count: Option<u64>,
 }
 
 /// Cohere-on-Bedrock embed response (`embeddings` = one vector per text).
@@ -5696,6 +5710,7 @@ mod tests {
         assert_eq!(resp.data.len(), 2);
         assert_eq!(resp.data[1].index, 1);
         assert_eq!(resp.usage.prompt_tokens, 8, "4 tokens per input, summed");
+        assert_eq!(resp.usage.source, EmbeddingUsageSource::Reported);
 
         // Titan embeds ONE text per call -> two upstream invokes, in order.
         let received = server.received_requests().await.unwrap();
@@ -5710,6 +5725,45 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .contains("AWS4-HMAC-SHA256"));
+    }
+
+    #[tokio::test]
+    async fn titan_embed_without_input_token_count_keeps_vector_and_marks_usage_unavailable() {
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/model/amazon.titan-embed-text-v1/invoke"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "embedding": [0.25, 0.5]
+            })))
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("amazon.titan-embed-text-v1"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = EmbeddingRequest {
+            model: "customer-facing-name".into(),
+            input: vec!["a".into()],
+            input_was_single: true,
+            encoding_format: None,
+            dimensions: None,
+        };
+
+        let resp = bridge.embed(&req, &ctx).await.expect("titan embed");
+        assert_eq!(resp.data.len(), 1);
+        let EmbeddingVector::Float(vector) = &resp.data[0].embedding else {
+            panic!("Titan must return a float vector");
+        };
+        assert_eq!(vector, &[0.25, 0.5]);
+        assert_eq!(resp.usage.prompt_tokens, 0);
+        assert_eq!(resp.usage.total_tokens, 0);
+        assert_eq!(resp.usage.source, EmbeddingUsageSource::Unavailable);
     }
 
     #[tokio::test]
@@ -5787,6 +5841,9 @@ mod tests {
         };
         let resp = bridge.embed(&req, &ctx).await.expect("cohere embed");
         assert_eq!(resp.data.len(), 2);
+        assert_eq!(resp.usage.prompt_tokens, 0);
+        assert_eq!(resp.usage.total_tokens, 0);
+        assert_eq!(resp.usage.source, EmbeddingUsageSource::Unavailable);
 
         let received = server.received_requests().await.unwrap();
         assert_eq!(received.len(), 1, "cohere batches in a single call");

@@ -28,10 +28,10 @@ use aisix_core::models::{
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, Model};
-use aisix_gateway::{EmbeddingRequest, EmbeddingVector};
+use aisix_gateway::{EmbeddingRequest, EmbeddingUsageSource, EmbeddingVector};
 use aisix_obs::{
-    GatewayEmbeddingCall, GatewayEmbeddingOutcome, GatewayEmbeddingPurpose, SemanticAccessLog,
-    SemanticFallback,
+    GatewayEmbeddingCall, GatewayEmbeddingOutcome, GatewayEmbeddingPurpose,
+    GatewayEmbeddingUsageSource, SemanticAccessLog, SemanticFallback,
 };
 
 use crate::error::ProxyError;
@@ -762,6 +762,10 @@ async fn embed_texts_inner(
                 embedding_model_id: embed_entry.id.clone(),
                 prompt_tokens: resp.usage.prompt_tokens,
                 total_tokens: resp.usage.total_tokens,
+                usage_source: match resp.usage.source {
+                    EmbeddingUsageSource::Reported => GatewayEmbeddingUsageSource::Reported,
+                    EmbeddingUsageSource::Unavailable => GatewayEmbeddingUsageSource::Unavailable,
+                },
                 latency_ms,
                 outcome: GatewayEmbeddingOutcome::Succeeded,
             });
@@ -774,6 +778,7 @@ async fn embed_texts_inner(
                 embedding_model_id: embed_entry.id.clone(),
                 prompt_tokens: 0,
                 total_tokens: 0,
+                usage_source: GatewayEmbeddingUsageSource::Unavailable,
                 latency_ms,
                 outcome: GatewayEmbeddingOutcome::Failed,
             });

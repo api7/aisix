@@ -54,7 +54,8 @@ pub use trace::{
     SpanRole, TraceEmission, TRACEPARENT_HEADER, TRACESTATE_HEADER,
 };
 pub use usage::{
-    GatewayEmbeddingCall, GatewayEmbeddingOutcome, GatewayEmbeddingPurpose, UsageEvent, UsageSink,
+    GatewayEmbeddingCall, GatewayEmbeddingOutcome, GatewayEmbeddingPurpose,
+    GatewayEmbeddingUsageSource, UsageEvent, UsageSink,
 };
 
 #[derive(Debug, thiserror::Error)]

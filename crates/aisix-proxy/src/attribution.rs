@@ -476,6 +476,13 @@ struct BodyCounters {
     response_bytes: AtomicU64,
 }
 
+/// The maximum child embedding bridge invocations retained per parent event.
+///
+/// The parent event keeps this ordered prefix and a saturating dropped count,
+/// rather than allowing an attacker-controlled semantic configuration to make
+/// telemetry allocation unbounded.
+pub(crate) const MAX_GATEWAY_EMBEDDING_CALLS: usize = 64;
+
 /// The child embedding calls a request caused while it was being served.
 ///
 /// This sits outside [`Cell`]: [`detached`] must isolate target attribution,
@@ -485,7 +492,20 @@ struct BodyCounters {
 /// only this ledger with its parent.
 #[derive(Default)]
 struct GatewayEmbeddingLedger {
-    calls: Mutex<Vec<aisix_obs::GatewayEmbeddingCall>>,
+    state: Mutex<GatewayEmbeddingLedgerState>,
+}
+
+#[derive(Default)]
+struct GatewayEmbeddingLedgerState {
+    calls: Vec<aisix_obs::GatewayEmbeddingCall>,
+    dropped: u32,
+}
+
+/// The bounded child-work audit transferred to a terminal parent event.
+#[derive(Default)]
+pub(crate) struct GatewayEmbeddingAudit {
+    pub(crate) calls: Vec<aisix_obs::GatewayEmbeddingCall>,
+    pub(crate) dropped: u32,
 }
 
 /// The per-request cell. Attempts within a request are sequential, so the
@@ -511,24 +531,31 @@ impl RequestAttribution {
     }
 
     fn note_gateway_embedding_call(&self, call: aisix_obs::GatewayEmbeddingCall) {
-        self.gateway_embedding_ledger
-            .calls
+        let mut ledger = self
+            .gateway_embedding_ledger
+            .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(call);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ledger.calls.len() < MAX_GATEWAY_EMBEDDING_CALLS {
+            ledger.calls.push(call);
+            return;
+        }
+        ledger.dropped = ledger.dropped.saturating_add(1);
     }
 
-    /// Move the accumulated child calls into the one terminal parent event.
-    /// Taking rather than cloning makes a duplicate terminal emitter unable
-    /// to report the same bridge call twice.
-    fn take_gateway_embedding_calls(&self) -> Vec<aisix_obs::GatewayEmbeddingCall> {
-        std::mem::take(
-            &mut *self
-                .gateway_embedding_ledger
-                .calls
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
+    /// Move the bounded child-call prefix and its dropped count into the one
+    /// terminal parent event. Taking rather than cloning makes a duplicate
+    /// terminal emitter unable to report the same bridge call twice.
+    fn take_gateway_embedding_audit(&self) -> GatewayEmbeddingAudit {
+        let mut ledger = self
+            .gateway_embedding_ledger
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        GatewayEmbeddingAudit {
+            calls: std::mem::take(&mut ledger.calls),
+            dropped: std::mem::take(&mut ledger.dropped),
+        }
     }
 
     /// Mark this cell as installed by the telemetry middleware, which will
@@ -771,13 +798,13 @@ pub(crate) fn note_gateway_embedding_call(call: aisix_obs::GatewayEmbeddingCall)
     let _ = CURRENT.try_with(|a| a.note_gateway_embedding_call(call));
 }
 
-/// Move this request's gateway-initiated embedding calls into its terminal
-/// usage event. Outside a request scope this is empty; cancellation installs
-/// the original cell with [`sync_scope`] before it emits, so it follows the
-/// same path as ordinary and streaming terminal emitters.
-pub(crate) fn take_gateway_embedding_calls() -> Vec<aisix_obs::GatewayEmbeddingCall> {
+/// Move this request's bounded gateway-initiated embedding audit into its
+/// terminal usage event. Outside a request scope this is empty; cancellation
+/// installs the original cell with [`sync_scope`] before it emits, so it
+/// follows the same path as ordinary and streaming terminal emitters.
+pub(crate) fn take_gateway_embedding_audit() -> GatewayEmbeddingAudit {
     CURRENT
-        .try_with(|a| a.take_gateway_embedding_calls())
+        .try_with(|a| a.take_gateway_embedding_audit())
         .unwrap_or_default()
 }
 
@@ -1103,6 +1130,19 @@ mod tests {
         .unwrap()
     }
 
+    fn embedding_call(index: usize) -> aisix_obs::GatewayEmbeddingCall {
+        aisix_obs::GatewayEmbeddingCall {
+            count: 1,
+            purpose: aisix_obs::GatewayEmbeddingPurpose::SemanticRoute,
+            embedding_model_id: format!("embed-{index}"),
+            prompt_tokens: index as u32,
+            total_tokens: index as u32,
+            usage_source: aisix_obs::GatewayEmbeddingUsageSource::Reported,
+            latency_ms: index as u32,
+            outcome: aisix_obs::GatewayEmbeddingOutcome::Succeeded,
+        }
+    }
+
     /// The two sides are read off the clock a moment apart, downstream
     /// first on some stream ends; the recorded upstream side must still
     /// never exceed the request it ran inside.
@@ -1171,6 +1211,7 @@ mod tests {
                     embedding_model_id: "embed-model-id".into(),
                     prompt_tokens: 4,
                     total_tokens: 4,
+                    usage_source: aisix_obs::GatewayEmbeddingUsageSource::Reported,
                     latency_ms: 9,
                     outcome: aisix_obs::GatewayEmbeddingOutcome::Succeeded,
                 });
@@ -1181,15 +1222,60 @@ mod tests {
             assert_eq!(target.upstream_model, "claude-sonnet");
             assert_eq!(target.provider_key_id, "pk-chat");
 
-            let calls = take_gateway_embedding_calls();
-            assert_eq!(calls.len(), 1);
+            let audit = take_gateway_embedding_audit();
+            assert_eq!(audit.calls.len(), 1);
+            assert_eq!(audit.dropped, 0);
             assert_eq!(
-                calls[0].purpose,
+                audit.calls[0].purpose,
                 aisix_obs::GatewayEmbeddingPurpose::Guardrail
             );
-            assert!(take_gateway_embedding_calls().is_empty());
+            assert!(take_gateway_embedding_audit().calls.is_empty());
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn child_embedding_ledger_keeps_the_ordered_prefix_and_reports_all_drops() {
+        let parent = Arc::new(RequestAttribution::default());
+        scope(parent, async {
+            let total = MAX_GATEWAY_EMBEDDING_CALLS + 257;
+            for index in 0..total {
+                note_gateway_embedding_call(embedding_call(index));
+            }
+
+            let audit = take_gateway_embedding_audit();
+            assert_eq!(audit.calls.len(), MAX_GATEWAY_EMBEDDING_CALLS);
+            assert_eq!(audit.calls[0].embedding_model_id, "embed-0");
+            assert_eq!(
+                audit.calls[MAX_GATEWAY_EMBEDDING_CALLS - 1].embedding_model_id,
+                format!("embed-{}", MAX_GATEWAY_EMBEDDING_CALLS - 1),
+            );
+            assert_eq!(audit.dropped, 257);
+
+            let second_take = take_gateway_embedding_audit();
+            assert!(second_take.calls.is_empty());
+            assert_eq!(second_take.dropped, 0);
+        })
+        .await;
+    }
+
+    #[test]
+    fn child_embedding_ledger_drop_counter_saturates() {
+        let attribution = RequestAttribution::default();
+        for index in 0..MAX_GATEWAY_EMBEDDING_CALLS {
+            attribution.note_gateway_embedding_call(embedding_call(index));
+        }
+        attribution
+            .gateway_embedding_ledger
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .dropped = u32::MAX;
+
+        attribution.note_gateway_embedding_call(embedding_call(MAX_GATEWAY_EMBEDDING_CALLS));
+        let audit = attribution.take_gateway_embedding_audit();
+        assert_eq!(audit.calls.len(), MAX_GATEWAY_EMBEDDING_CALLS);
+        assert_eq!(audit.dropped, u32::MAX);
     }
 
     #[tokio::test]

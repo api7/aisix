@@ -40,7 +40,12 @@ const ROUTER_MODEL = "seu-1747-router";
 const ROUTE_TARGET = "seu-1747-route-target";
 const ROUTE_DEFAULT = "seu-1747-route-default";
 const GUARDRAIL_MODEL = "seu-1747-guardrail-chat";
+const GUARDRAIL_OVERFLOW_MODEL = "seu-1747-guardrail-overflow-chat";
 const CACHE_MODEL = "seu-1747-cache-chat";
+const UNAVAILABLE_USAGE_EMBED_MODEL = "seu-1747-embed-usage-unavailable";
+const UNAVAILABLE_USAGE_ROUTER_MODEL = "seu-1747-router-usage-unavailable";
+const UNAVAILABLE_USAGE_UPSTREAM_MODEL = "embedding-usage-unavailable-mock";
+const GUARDRAIL_OVERFLOW_COUNT = 33;
 
 const ROUTE_EXAMPLE = "route-topic prototype";
 const ROUTE_PROMPT = "route-topic caller question";
@@ -49,7 +54,13 @@ const GUARDRAIL_EXAMPLES = [
   "guardrail-prototype-second",
 ];
 const GUARDRAIL_PROMPT = "guardrail-candidate-allowed";
+const GUARDRAIL_OVERFLOW_PROMPT = "guardrail-prototype-overflow-candidate";
+const GUARDRAIL_OVERFLOW_PROTOTYPES = Array.from(
+  { length: GUARDRAIL_OVERFLOW_COUNT },
+  (_, index) => `guardrail-prototype-overflow-${index}`,
+);
 const CACHE_PROMPT = "cache-topic exact-hit";
+const SLS_BARRIER_PROMPT = "semantic-embedding-usage-sls-barrier";
 
 function keywordVector(text: string): number[] {
   const lower = text.toLowerCase();
@@ -80,9 +91,9 @@ async function startEmbeddingMock(): Promise<EmbeddingMock> {
         return;
       }
 
-      let body: { input?: string | string[] };
+      let body: { model?: string; input?: string | string[] };
       try {
-        body = JSON.parse(raw || "{}") as { input?: string | string[] };
+        body = JSON.parse(raw || "{}") as { model?: string; input?: string | string[] };
       } catch {
         res.statusCode = 400;
         res.setHeader("content-type", "application/json");
@@ -99,16 +110,20 @@ async function startEmbeddingMock(): Promise<EmbeddingMock> {
         res.end(
           JSON.stringify({
             object: "list",
-            model: "embedding-usage-mock",
+            model: body.model ?? "embedding-usage-mock",
             data: inputs.map((text, index) => ({
               object: "embedding",
               index,
               embedding: keywordVector(text),
             })),
-            usage: {
-              prompt_tokens: promptTokens,
-              total_tokens: promptTokens + 1,
-            },
+            ...(body.model === UNAVAILABLE_USAGE_UPSTREAM_MODEL
+              ? {}
+              : {
+                  usage: {
+                    prompt_tokens: promptTokens,
+                    total_tokens: promptTokens + 1,
+                  },
+                }),
           }),
         );
       }, EMBEDDING_DELAY_MS);
@@ -142,6 +157,7 @@ interface GatewayEmbeddingCall {
   embedding_model_id: string;
   prompt_tokens: number;
   total_tokens: number;
+  usage_source: "reported" | "unavailable";
   latency_ms: number;
   outcome: "succeeded" | "failed";
 }
@@ -168,6 +184,7 @@ function expectSucceededCall(
   // estimate: the mock returns 10 tokens per input and total = prompt + 1.
   expect(call.prompt_tokens).toBe(promptTokens);
   expect(call.total_tokens).toBe(promptTokens + 1);
+  expect(call.usage_source).toBe("reported");
   // The endpoint delays every response, making this assert a real duration
   // rather than merely a field's existence.
   expect(call.latency_ms).toBeGreaterThan(0);
@@ -190,8 +207,10 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
   let upstream: OpenAiUpstream | undefined;
   let etcdReachable = false;
   let embeddingModelID = "";
+  let unavailableUsageEmbeddingModelID = "";
   let routeTargetModelID = "";
   let guardrailModelID = "";
+  let overflowGuardrailModelID = "";
   let cacheModelID = "";
 
   async function chat(model: string, prompt: string): Promise<ChatResponse> {
@@ -219,12 +238,26 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
 
   async function usageRow(requestId: string): Promise<Map<string, string>> {
     expect(requestId, "the DP stamps the parent request id").not.toBe("");
-    return waitForSlsLog(
+    const row = await waitForSlsLog(
       sls!,
       LOGSTORE,
       (row) => row.get("request_id") === requestId,
       `the parent UsageEvent for ${requestId}`,
     );
+
+    // The SLS writer is asynchronous. Its FIFO queue guarantees the direct
+    // model's later row follows every row for this request, making exact-one
+    // checks below stable rather than a snapshot of an in-flight export.
+    const barrier = await chat(ROUTE_DEFAULT, SLS_BARRIER_PROMPT);
+    expect(barrier.status, "the direct-model SLS barrier must complete").toBe(200);
+    expect(barrier.requestId, "the direct-model SLS barrier must have a request id").not.toBe("");
+    await waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (barrierRow) => barrierRow.get("request_id") === barrier.requestId,
+      `the SLS barrier UsageEvent for ${barrier.requestId}`,
+    );
+    return row;
   }
 
   beforeAll(async () => {
@@ -282,6 +315,14 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
       embedding: { dimensions: 4, normalize: true },
     });
     embeddingModelID = embedding.id;
+    const unavailableUsageEmbedding = await seed.createModel({
+      display_name: UNAVAILABLE_USAGE_EMBED_MODEL,
+      provider: "openai",
+      model_name: UNAVAILABLE_USAGE_UPSTREAM_MODEL,
+      provider_key_id: embeddingKey.id,
+      embedding: { dimensions: 4, normalize: true },
+    });
+    unavailableUsageEmbeddingModelID = unavailableUsageEmbedding.id;
 
     const chatKey = await seed.createProviderKey({
       display_name: "semantic-embedding-usage-chat-pk",
@@ -301,6 +342,8 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     await createChatModel(ROUTE_DEFAULT);
     const guardrailModel = await createChatModel(GUARDRAIL_MODEL);
     guardrailModelID = guardrailModel.id;
+    const overflowGuardrailModel = await createChatModel(GUARDRAIL_OVERFLOW_MODEL);
+    overflowGuardrailModelID = overflowGuardrailModel.id;
     const cacheModel = await createChatModel(CACHE_MODEL);
     cacheModelID = cacheModel.id;
 
@@ -308,6 +351,22 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
       display_name: ROUTER_MODEL,
       semantic: {
         embedding_model: EMBED_MODEL,
+        routes: [
+          {
+            name: "route-topic",
+            target: ROUTE_TARGET,
+            examples: [ROUTE_EXAMPLE],
+            threshold: 0.9,
+          },
+        ],
+        default: ROUTE_DEFAULT,
+        match: { threshold: 0.9 },
+      },
+    });
+    await seed.createModel({
+      display_name: UNAVAILABLE_USAGE_ROUTER_MODEL,
+      semantic: {
+        embedding_model: UNAVAILABLE_USAGE_EMBED_MODEL,
         routes: [
           {
             name: "route-topic",
@@ -340,6 +399,26 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
       scope_id: guardrailModelID,
       priority: 100,
     });
+
+    // Each distinct prototype is cold, while the candidate is intentionally
+    // uncached request data. Monitor mode lets every row run even though this
+    // mock maps the prototype and candidate to the same vector.
+    for (const [index, prototype] of GUARDRAIL_OVERFLOW_PROTOTYPES.entries()) {
+      const guardrail = await seed.createGuardrail(
+        {
+          enabled: true,
+          name: `semantic-embedding-usage-overflow-${index}`,
+          hook_point: "input",
+          enforcement_mode: "monitor",
+          kind: "semantic",
+          embedding_model: EMBED_MODEL,
+          deny_examples: [prototype],
+          deny_threshold: 0.99,
+        },
+        { attach: false },
+      );
+      await seed.attachGuardrailToModel(guardrail.id, overflowGuardrailModelID, 200 + index);
+    }
 
     await seed.createCachePolicy({
       name: "semantic-embedding-usage-cache",
@@ -381,12 +460,43 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     const calls = embeddingCalls(row);
     expect(calls).toHaveLength(1);
     expectSucceededCall(calls[0]!, "semantic_route", embeddingModelID, 20);
+    expect(row.has("gateway_embedding_calls_dropped")).toBe(false);
     expectUnchangedParentUsage(row);
     // The route target, not the detached embedding model, still owns the
     // parent event's pricing and attempt attribution.
     expect(row.get("model_id")).toBe(routeTargetModelID);
     expect(row.get("attempt_model")).toBe(ROUTE_TARGET);
     expect(row.get("attempt_model")).not.toBe(EMBED_MODEL);
+  });
+
+  test("missing provider embedding usage is explicit on the real parent event", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !embed) {
+      ctx.skip();
+      return;
+    }
+
+    const callsBefore = embed.callCount();
+    const response = await chat(UNAVAILABLE_USAGE_ROUTER_MODEL, ROUTE_PROMPT);
+    expect(response.status).toBe(200);
+    expect(response.route).toBe("route-topic");
+    expect(response.servedBy).toBe(ROUTE_TARGET);
+    expect(embed.callCount()).toBe(callsBefore + 1);
+
+    const row = await usageRow(response.requestId);
+    expect(rowsForRequest(sls, response.requestId)).toHaveLength(1);
+    const calls = embeddingCalls(row);
+    expect(calls).toHaveLength(1);
+    const call = calls[0]!;
+    expect(call.count).toBe(1);
+    expect(call.purpose).toBe("semantic_route");
+    expect(call.embedding_model_id).toBe(unavailableUsageEmbeddingModelID);
+    expect(call.outcome).toBe("succeeded");
+    expect(call.usage_source).toBe("unavailable");
+    expect(call.prompt_tokens).toBe(0);
+    expect(call.total_tokens).toBe(0);
+    expect(call.latency_ms).toBeGreaterThan(0);
+    expect(row.has("gateway_embedding_calls_dropped")).toBe(false);
+    expectUnchangedParentUsage(row);
   });
 
   test("semantic guardrail records prototypes and candidate only on its parent", async (ctx) => {
@@ -419,6 +529,40 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     const childAudit = row.get("gateway_embedding_calls")!;
     for (const text of [...GUARDRAIL_EXAMPLES, GUARDRAIL_PROMPT]) {
       expect(childAudit).not.toContain(text);
+    }
+  });
+
+  test("semantic guardrail child audit caps real bridge work without leaking text", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !embed) {
+      ctx.skip();
+      return;
+    }
+
+    const callsBefore = embed.callCount();
+    const response = await chat(GUARDRAIL_OVERFLOW_MODEL, GUARDRAIL_OVERFLOW_PROMPT);
+    expect(response.status).toBe(200);
+    // One cold prototype bridge plus one request-data bridge for every
+    // monitor-mode row. A block-mode short circuit cannot satisfy this.
+    expect(embed.callCount()).toBe(callsBefore + GUARDRAIL_OVERFLOW_COUNT * 2);
+
+    const row = await usageRow(response.requestId);
+    expect(rowsForRequest(sls, response.requestId)).toHaveLength(1);
+    const calls = embeddingCalls(row);
+    expect(calls).toHaveLength(64);
+    for (const call of calls) {
+      expectSucceededCall(call, "guardrail", embeddingModelID, 10);
+    }
+    expect(row.get("gateway_embedding_calls_dropped")).toBe("2");
+    expectUnchangedParentUsage(row);
+    expect(row.get("model_id")).toBe(overflowGuardrailModelID);
+    expect(row.get("requested_model")).toBe(GUARDRAIL_OVERFLOW_MODEL);
+    expect(row.get("attempt_model")).toBeUndefined();
+
+    // Metadata-only audit stays value-free: neither the caller's input nor
+    // the operator's prototype texts may survive its bridge accounting.
+    const audit = JSON.stringify(Object.fromEntries(row));
+    for (const text of [GUARDRAIL_OVERFLOW_PROMPT, ...GUARDRAIL_OVERFLOW_PROTOTYPES]) {
+      expect(audit).not.toContain(text);
     }
   });
 

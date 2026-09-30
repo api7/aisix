@@ -283,9 +283,11 @@ mod tests {
                 embedding_model_id: "embedding-model-id".into(),
                 prompt_tokens: 12,
                 total_tokens: 15,
+                usage_source: crate::usage::GatewayEmbeddingUsageSource::Reported,
                 latency_ms: 34,
                 outcome: crate::usage::GatewayEmbeddingOutcome::Succeeded,
             }],
+            gateway_embedding_calls_dropped: 2,
             ..UsageEvent::default()
         });
         let json = serde_json::to_value(&rec).unwrap();
@@ -298,11 +300,14 @@ mod tests {
         assert_eq!(calls[0]["embedding_model_id"], "embedding-model-id");
         assert_eq!(calls[0]["prompt_tokens"], 12);
         assert_eq!(calls[0]["total_tokens"], 15);
+        assert_eq!(calls[0]["usage_source"], "reported");
         assert_eq!(calls[0]["latency_ms"], 34);
         assert_eq!(calls[0]["outcome"], "succeeded");
+        assert_eq!(json["gateway_embedding_calls_dropped"], 2);
 
         let bare = serde_json::to_value(SinkRecord::metadata_only(UsageEvent::default())).unwrap();
         assert!(bare.get("gateway_embedding_calls").is_none());
+        assert!(bare.get("gateway_embedding_calls_dropped").is_none());
     }
 
     #[test]
