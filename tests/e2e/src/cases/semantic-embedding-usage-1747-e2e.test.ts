@@ -34,6 +34,9 @@ const CREDENTIAL_REF = "mock";
 const SLS_PROJECT = "aisix-e2e-obs";
 const LOGSTORE = "semantic-embedding-usage-1747";
 const EMBEDDING_DELAY_MS = 20;
+// The cancellation case must leave the bridge pending long enough for the
+// client to disconnect after the real DP has dispatched it.
+const CANCELLED_EMBEDDING_DELAY_MS = 30_000;
 
 const EMBED_MODEL = "seu-1747-embed";
 const ROUTER_MODEL = "seu-1747-router";
@@ -45,6 +48,9 @@ const CACHE_MODEL = "seu-1747-cache-chat";
 const UNAVAILABLE_USAGE_EMBED_MODEL = "seu-1747-embed-usage-unavailable";
 const UNAVAILABLE_USAGE_ROUTER_MODEL = "seu-1747-router-usage-unavailable";
 const UNAVAILABLE_USAGE_UPSTREAM_MODEL = "embedding-usage-unavailable-mock";
+const CANCELLED_EMBED_MODEL = "seu-1747-embed-cancelled";
+const CANCELLED_ROUTER_MODEL = "seu-1747-router-cancelled";
+const CANCELLED_USAGE_UPSTREAM_MODEL = "embedding-usage-cancelled-mock";
 const GUARDRAIL_OVERFLOW_COUNT = 33;
 
 const ROUTE_EXAMPLE = "route-topic prototype";
@@ -74,12 +80,14 @@ function keywordVector(text: string): number[] {
 interface EmbeddingMock {
   baseUrl: string;
   callCount(): number;
+  callCountFor(model: string): number;
   close(): Promise<void>;
 }
 
 /** OpenAI-compatible embedding endpoint with provider-reported usage. */
 async function startEmbeddingMock(): Promise<EmbeddingMock> {
   let calls = 0;
+  const callsByModel = new Map<string, number>();
   const server: Server = createServer((req, res) => {
     res.on("error", () => {});
     let raw = "";
@@ -102,31 +110,43 @@ async function startEmbeddingMock(): Promise<EmbeddingMock> {
       }
 
       calls++;
+      const upstreamModel = body.model ?? "embedding-usage-mock";
+      callsByModel.set(upstreamModel, (callsByModel.get(upstreamModel) ?? 0) + 1);
       const inputs = Array.isArray(body.input) ? body.input : [body.input ?? ""];
       const promptTokens = inputs.length * 10;
-      setTimeout(() => {
-        res.statusCode = 200;
-        res.setHeader("content-type", "application/json");
-        res.end(
-          JSON.stringify({
-            object: "list",
-            model: body.model ?? "embedding-usage-mock",
-            data: inputs.map((text, index) => ({
-              object: "embedding",
-              index,
-              embedding: keywordVector(text),
-            })),
-            ...(body.model === UNAVAILABLE_USAGE_UPSTREAM_MODEL
-              ? {}
-              : {
-                  usage: {
-                    prompt_tokens: promptTokens,
-                    total_tokens: promptTokens + 1,
-                  },
-                }),
-          }),
-        );
-      }, EMBEDDING_DELAY_MS);
+      const responseTimer = setTimeout(
+        () => {
+          if (res.destroyed || res.writableEnded) return;
+          res.statusCode = 200;
+          res.setHeader("content-type", "application/json");
+          res.end(
+            JSON.stringify({
+              object: "list",
+              model: upstreamModel,
+              data: inputs.map((text, index) => ({
+                object: "embedding",
+                index,
+                embedding: keywordVector(text),
+              })),
+              ...(body.model === UNAVAILABLE_USAGE_UPSTREAM_MODEL
+                ? {}
+                : {
+                    usage: {
+                      prompt_tokens: promptTokens,
+                      total_tokens: promptTokens + 1,
+                    },
+                  }),
+            }),
+          );
+        },
+        body.model === CANCELLED_USAGE_UPSTREAM_MODEL
+          ? CANCELLED_EMBEDDING_DELAY_MS
+          : EMBEDDING_DELAY_MS,
+      );
+      // A cancelled DP bridge closes this response before the intentionally
+      // slow timer fires. Clearing it keeps a failed test from pinning its
+      // Node fixture for the full delay during teardown.
+      res.once("close", () => clearTimeout(responseTimer));
     });
   });
   const port = await pickFreePort();
@@ -134,6 +154,7 @@ async function startEmbeddingMock(): Promise<EmbeddingMock> {
   return {
     baseUrl: `http://127.0.0.1:${port}`,
     callCount: () => calls,
+    callCountFor: (model) => callsByModel.get(model) ?? 0,
     async close() {
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
@@ -208,6 +229,7 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
   let etcdReachable = false;
   let embeddingModelID = "";
   let unavailableUsageEmbeddingModelID = "";
+  let cancelledEmbeddingModelID = "";
   let routeTargetModelID = "";
   let guardrailModelID = "";
   let overflowGuardrailModelID = "";
@@ -323,6 +345,14 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
       embedding: { dimensions: 4, normalize: true },
     });
     unavailableUsageEmbeddingModelID = unavailableUsageEmbedding.id;
+    const cancelledEmbedding = await seed.createModel({
+      display_name: CANCELLED_EMBED_MODEL,
+      provider: "openai",
+      model_name: CANCELLED_USAGE_UPSTREAM_MODEL,
+      provider_key_id: embeddingKey.id,
+      embedding: { dimensions: 4, normalize: true },
+    });
+    cancelledEmbeddingModelID = cancelledEmbedding.id;
 
     const chatKey = await seed.createProviderKey({
       display_name: "semantic-embedding-usage-chat-pk",
@@ -367,6 +397,22 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
       display_name: UNAVAILABLE_USAGE_ROUTER_MODEL,
       semantic: {
         embedding_model: UNAVAILABLE_USAGE_EMBED_MODEL,
+        routes: [
+          {
+            name: "route-topic",
+            target: ROUTE_TARGET,
+            examples: [ROUTE_EXAMPLE],
+            threshold: 0.9,
+          },
+        ],
+        default: ROUTE_DEFAULT,
+        match: { threshold: 0.9 },
+      },
+    });
+    await seed.createModel({
+      display_name: CANCELLED_ROUTER_MODEL,
+      semantic: {
+        embedding_model: CANCELLED_EMBED_MODEL,
         routes: [
           {
             name: "route-topic",
@@ -498,6 +544,109 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     expect(row.has("gateway_embedding_calls_dropped")).toBe(false);
     expectUnchangedParentUsage(row);
   });
+
+  test(
+    "a client cancellation during semantic routing keeps its failed child on the terminal parent",
+    async (ctx) => {
+      if (!etcdReachable || !app || !sls || !embed || !upstream) {
+        ctx.skip();
+        return;
+      }
+
+      const slowEmbeddingCallsBefore = embed.callCountFor(CANCELLED_USAGE_UPSTREAM_MODEL);
+      const upstreamCallsBefore = upstream.receivedRequests.length;
+      const controller = new AbortController();
+      const inflight = fetch(`${app.proxyUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        },
+        body: JSON.stringify({
+          model: CANCELLED_ROUTER_MODEL,
+          messages: [{ role: "user", content: ROUTE_PROMPT }],
+        }),
+        signal: controller.signal,
+      });
+
+      // Abort only after the real DP has reached the slow embedding
+      // provider. A fixed delay could fire before semantic routing begins,
+      // in which case the resulting 499 would prove nothing about the
+      // in-flight bridge guard.
+      for (
+        let i = 0;
+        i < 200 && embed.callCountFor(CANCELLED_USAGE_UPSTREAM_MODEL) === slowEmbeddingCallsBefore;
+        i++
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(
+        embed.callCountFor(CANCELLED_USAGE_UPSTREAM_MODEL),
+        "the DP never dispatched the slow semantic embedding",
+      ).toBe(slowEmbeddingCallsBefore + 1);
+      controller.abort();
+      await expect(inflight).rejects.toThrow();
+
+      const row = await waitForSlsLog(
+        sls,
+        LOGSTORE,
+        (log) => log.get("requested_model") === CANCELLED_ROUTER_MODEL,
+        `the terminal 499 UsageEvent for ${CANCELLED_ROUTER_MODEL}`,
+        20_000,
+      );
+      const requestId = row.get("request_id") ?? "";
+      expect(requestId, "the cancellation event retains its request id").not.toBe("");
+      expect(
+        upstream.receivedRequests.length,
+        "semantic routing must not dispatch a target after the client cancellation",
+      ).toBe(upstreamCallsBefore);
+
+      // The direct-model barrier is later in the exporter FIFO queue, so by
+      // the time it is visible every row the cancelled request could emit is
+      // visible too. That lets this assert exactly one terminal parent row.
+      const barrier = await chat(ROUTE_DEFAULT, SLS_BARRIER_PROMPT);
+      expect(barrier.status, "the SLS barrier must complete").toBe(200);
+      await waitForSlsLog(
+        sls,
+        LOGSTORE,
+        (barrierRow) => barrierRow.get("request_id") === barrier.requestId,
+        `the SLS barrier UsageEvent for ${barrier.requestId}`,
+      );
+      expect(rowsForRequest(sls, requestId)).toHaveLength(1);
+
+      expect(row.get("status_code")).toBe("499");
+      expect(row.get("error_class")).toBe("client_disconnected");
+      expect(row.get("error_message")).toContain("before the response head");
+      expect(row.get("operation")).toBe("chat");
+
+      const calls = embeddingCalls(row);
+      expect(calls).toHaveLength(1);
+      expect(row.has("gateway_embedding_calls_dropped")).toBe(false);
+      const call = calls[0]!;
+      expect(call.count).toBe(1);
+      expect(call.purpose).toBe("semantic_route");
+      expect(call.embedding_model_id).toBe(cancelledEmbeddingModelID);
+      expect(call.prompt_tokens).toBe(0);
+      expect(call.total_tokens).toBe(0);
+      expect(call.usage_source).toBe("unavailable");
+      expect(call.outcome).toBe("failed");
+      expect(call.latency_ms).toBeGreaterThan(0);
+
+      // The embedding never selected a route target, so it is child work
+      // only: no target request has reached the chat upstream, and the
+      // parent remains unpriced and unattributed to the embedding model.
+      expect(row.get("prompt_tokens") ?? "0").toBe("0");
+      expect(row.get("completion_tokens") ?? "0").toBe("0");
+      expect(row.get("total_tokens") ?? "0").toBe("0");
+      expect(Number(row.get("cost_usd") ?? "0")).toBe(0);
+      expect(row.get("requested_model")).toBe(CANCELLED_ROUTER_MODEL);
+      expect(row.get("model_id") ?? "").toBe("");
+      expect(row.get("attempt_model") ?? "").toBe("");
+      expect(row.get("model_id") ?? "").not.toBe(cancelledEmbeddingModelID);
+      expect(row.get("attempt_model") ?? "").not.toBe(CANCELLED_EMBED_MODEL);
+    },
+    60_000,
+  );
 
   test("semantic guardrail records prototypes and candidate only on its parent", async (ctx) => {
     if (!etcdReachable || !app || !sls || !embed) {
