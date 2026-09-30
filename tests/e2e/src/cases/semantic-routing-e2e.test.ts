@@ -38,6 +38,7 @@ const COLD_FIRST_PROMPT = "please review this contract in the cold batch";
 const COLD_LATER_PROMPT = "please review this NDA after the batch is warm";
 const COLD_LEGAL_EXAMPLE = "analyze a contract for legal risk";
 const COLD_CODE_EXAMPLE = "write a Python code review";
+const COLD_TRANSLATE_EXAMPLE = "translate this document";
 
 function keywordVector(text: string): number[] {
   const t = text.toLowerCase();
@@ -184,10 +185,10 @@ describe("semantic routing e2e", () => {
     });
 
     // Keep a separate router and local protocol embedding upstream cold until
-    // its regression test. The repeated examples prove the cold logical
-    // batch is deduplicated both within and across routes. Both routes use
-    // the same target so their tied score cannot make the observed response
-    // nondeterministic.
+    // its regression test. Repeated examples prove the cold logical batch is
+    // deduplicated within and across routes; the translate example proves
+    // every route contributes. Both routes use the same target so their tied
+    // score cannot make the observed response nondeterministic.
     const coldEmbed = await startEmbeddingMock();
     coldEmbeddingMock = coldEmbed;
     embedMocks.push(coldEmbed);
@@ -205,7 +206,7 @@ describe("semantic routing e2e", () => {
           {
             name: "legal-shared-examples",
             target: "legal-model",
-            examples: [COLD_LEGAL_EXAMPLE, COLD_CODE_EXAMPLE],
+            examples: [COLD_LEGAL_EXAMPLE, COLD_CODE_EXAMPLE, COLD_TRANSLATE_EXAMPLE],
           },
         ],
         default: "default-model",
@@ -330,7 +331,7 @@ describe("semantic routing e2e", () => {
     // This local OpenAI-compatible upstream supports an input array, making
     // the logical batch observable as one protocol request.
     expect(coldEmbeddingMock.receivedInputs()).toEqual([
-      [COLD_FIRST_PROMPT, COLD_LEGAL_EXAMPLE, COLD_CODE_EXAMPLE],
+      [COLD_FIRST_PROMPT, COLD_LEGAL_EXAMPLE, COLD_CODE_EXAMPLE, COLD_TRANSLATE_EXAMPLE],
     ]);
 
     const later = await chat(COLD_ROUTER, COLD_LATER_PROMPT);
@@ -338,7 +339,7 @@ describe("semantic routing e2e", () => {
     expect(later.content).toBe("served-by-legal");
     expect(later.route).toBe("legal");
     expect(coldEmbeddingMock.receivedInputs()).toEqual([
-      [COLD_FIRST_PROMPT, COLD_LEGAL_EXAMPLE, COLD_CODE_EXAMPLE],
+      [COLD_FIRST_PROMPT, COLD_LEGAL_EXAMPLE, COLD_CODE_EXAMPLE, COLD_TRANSLATE_EXAMPLE],
       [COLD_LATER_PROMPT],
     ]);
   });
