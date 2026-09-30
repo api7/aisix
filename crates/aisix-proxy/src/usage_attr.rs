@@ -455,7 +455,10 @@ pub(crate) fn wildcard_resolved_pricing_model<'a>(
     model_id: &str,
     upstream_model: &'a str,
 ) -> Option<&'a str> {
-    if upstream_model.is_empty() {
+    // A literal wildcard is a configured template, not a concrete upstream
+    // identity. Sending it to CP would turn a static `*` into a selectable
+    // price, so only a concrete captured value is eligible.
+    if upstream_model.is_empty() || upstream_model.contains('*') {
         return None;
     }
     let entry = snap.models.get_by_id(model_id)?;
@@ -468,19 +471,24 @@ pub(crate) fn wildcard_resolved_pricing_model<'a>(
 }
 
 /// Fill the optional DP-to-CP wildcard-pricing identity at the one usage
-/// emission chokepoint. A cache hit has no dispatched target; its
-/// `upstream_model` is the cached entry's static mapping, not a concrete
-/// pricing identity. Detached gateway work has no caller attribution and
-/// therefore cannot accidentally price itself as the parent request.
-fn apply_wildcard_pricing_model(snap: &AisixSnapshot, event: &mut UsageEvent) {
+/// emission chokepoint. The identity exists only when model resolution took
+/// the wildcard-capture branch; an exact request for the literal wildcard
+/// row therefore cannot turn its static template into a price. A cache hit
+/// or pre-dispatch failure has no upstream call to price. Detached gateway
+/// work has no caller attribution and therefore cannot price itself as the
+/// parent request.
+fn apply_wildcard_pricing_model(snap: &AisixSnapshot, event: &mut UsageEvent, dispatched: bool) {
+    if !dispatched {
+        return;
+    }
     let Some(resolved) = crate::attribution::current() else {
         return;
     };
-    if resolved.cache_hit_layer.is_some() {
+    if resolved.cache_hit_layer.is_some() || resolved.wildcard_pricing_model_id != event.model_id {
         return;
     }
     if let Some(model) =
-        wildcard_resolved_pricing_model(snap, &event.model_id, &resolved.upstream_model)
+        wildcard_resolved_pricing_model(snap, &event.model_id, &resolved.wildcard_pricing_model)
     {
         event.resolved_pricing_model = model.to_string();
     }
@@ -1005,7 +1013,7 @@ pub(crate) fn emit_usage(
     if terminal && event.guardrail_blocked {
         state.metrics.record_guardrail_blocked_request();
     }
-    apply_wildcard_pricing_model(snap, &mut event);
+    apply_wildcard_pricing_model(snap, &mut event, dispatched);
     let emission = trace.map(|bundle| {
         event.trace_id = bundle.trace_id_hex();
         bundle.emission(
@@ -1141,6 +1149,10 @@ mod tests {
             None
         );
         assert_eq!(wildcard_resolved_pricing_model(&snap, "wildcard", ""), None);
+        assert_eq!(
+            wildcard_resolved_pricing_model(&snap, "wildcard", "*"),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1162,18 +1174,17 @@ mod tests {
             models: table,
             ..Default::default()
         };
-        let served: aisix_core::Model = serde_json::from_value(serde_json::json!({
-            "display_name": "openrouter/*",
-            "provider": "openai",
-            "model_name": "gpt-4o-2024-08-06",
-            "provider_key_id": "pk-1",
-        }))
-        .unwrap();
-
         crate::attribution::scope(
             Arc::new(crate::attribution::RequestAttribution::default()),
             async {
-                crate::attribution::note_target(&served, "pk-1");
+                let served =
+                    crate::model_resolve::resolve_model(&snap, "openrouter/gpt-4o-2024-08-06")
+                        .expect("wildcard model resolves");
+                crate::attribution::note_target(&served.value, "pk-1");
+                let attribution =
+                    crate::attribution::current().expect("in request attribution scope");
+                assert_eq!(attribution.wildcard_pricing_model_id, "wildcard");
+                assert_eq!(attribution.wildcard_pricing_model, "gpt-4o-2024-08-06");
                 let mut event = UsageEvent {
                     // NO-GUARDRAIL-CHAIN: this focused unit test constructs
                     // a synthetic pricing event, not a gateway request.
@@ -1182,7 +1193,7 @@ mod tests {
                     applied_guardrails: Vec::new(),
                     ..Default::default()
                 };
-                apply_wildcard_pricing_model(&snap, &mut event);
+                apply_wildcard_pricing_model(&snap, &mut event, true);
                 assert_eq!(event.resolved_pricing_model, "gpt-4o-2024-08-06");
 
                 crate::attribution::note_cache_hit_entry(&cache_entry, "exact");
@@ -1198,11 +1209,124 @@ mod tests {
                     applied_guardrails: Vec::new(),
                     ..Default::default()
                 };
-                apply_wildcard_pricing_model(&snap, &mut cached_event);
+                apply_wildcard_pricing_model(&snap, &mut cached_event, false);
                 assert!(cached_event.resolved_pricing_model.is_empty());
             },
         )
         .await;
+
+        crate::attribution::scope(
+            Arc::new(crate::attribution::RequestAttribution::default()),
+            async {
+                let literal = crate::model_resolve::resolve_model(&snap, "openrouter/*")
+                    .expect("literal configured wildcard row resolves exactly");
+                crate::attribution::note_target(&literal.value, "pk-1");
+                let attribution =
+                    crate::attribution::current().expect("in request attribution scope");
+                assert!(attribution.wildcard_pricing_model_id.is_empty());
+                assert!(attribution.wildcard_pricing_model.is_empty());
+
+                let mut event = UsageEvent {
+                    // This exact alias is dispatchable but its static `*`
+                    // template is never a concrete catalog price.
+                    model_id: "wildcard".to_string(),
+                    guardrail_bypassed_reason: String::new(),
+                    applied_guardrails: Vec::new(),
+                    ..Default::default()
+                };
+                apply_wildcard_pricing_model(&snap, &mut event, true);
+                assert!(event.resolved_pricing_model.is_empty());
+            },
+        )
+        .await;
+    }
+
+    /// A failed attempt retains its target row so it can be observed, but a
+    /// target rate-limit or bridge-preparation refusal never reached a
+    /// provider and therefore must not claim a concrete wildcard price.
+    #[tokio::test]
+    async fn undispatched_wildcard_attempt_has_no_pricing_identity() {
+        use aisix_core::snapshot::{ResourceTable, SnapshotHandle};
+        use aisix_core::ProxyConfig;
+        use aisix_gateway::Hub;
+        use aisix_obs::UsageSink;
+
+        let table = ResourceTable::default();
+        let configured: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "openrouter/*",
+            "provider": "openai",
+            "model_name": "*",
+            "provider_key_id": "pk-1",
+        }))
+        .unwrap();
+        table.insert(ResourceEntry::new("wildcard", configured, 1));
+        let snap = AisixSnapshot {
+            models: table,
+            ..Default::default()
+        };
+        let cfg = ProxyConfig {
+            addr: "127.0.0.1:0".into(),
+            request_body_limit_bytes: 0,
+            real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
+            tls: None,
+            listeners: Vec::new(),
+            thread_per_core: None,
+            workers: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let state = ProxyState::new(
+            SnapshotHandle::new(snap.clone()),
+            Arc::new(Hub::new()),
+            &cfg,
+        )
+        .with_usage_sink(UsageSink::new(tx));
+        let client = ClientContext::default();
+        let attempts = [crate::attempt::AttemptRecord {
+            index: 0,
+            kind: "initial",
+            target_model: String::new(),
+            target_model_id: "wildcard".to_string(),
+            provider_key_id: "pk-1".to_string(),
+            status: 429,
+            success: false,
+            error_class: "rate_limited".to_string(),
+            error_message: "target rate limit refused before dispatch".to_string(),
+            latency_ms: 0,
+            dispatched: false,
+        }];
+
+        crate::attribution::scope(
+            Arc::new(crate::attribution::RequestAttribution::default()),
+            async {
+                let served =
+                    crate::model_resolve::resolve_model(&snap, "openrouter/gpt-4o-2024-08-06")
+                        .expect("wildcard model resolves");
+                crate::attribution::note_target(&served.value, "pk-1");
+                emit_failed_attempts(
+                    &state,
+                    &snap,
+                    crate::operation::CHAT,
+                    "request-1746",
+                    "openrouter/gpt-4o-2024-08-06",
+                    "api-key",
+                    &client,
+                    &[],
+                    &attempts,
+                    true,
+                    false,
+                    Vec::new(),
+                    crate::redact::RedactionCounts::new(),
+                    &None,
+                );
+            },
+        )
+        .await;
+
+        let event = rx.try_recv().expect("failed attempt emits usage");
+        assert_eq!(event.model_id, "wildcard");
+        assert!(event.resolved_pricing_model.is_empty());
     }
 
     /// AISIX-Cloud#1289: the id is upstream-controlled and reaches a log line

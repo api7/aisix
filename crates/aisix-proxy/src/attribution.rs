@@ -83,6 +83,13 @@ pub(crate) struct Resolved {
     /// it at read time, so the pair is byte-identical to the one the
     /// success path emits.
     pub provider_key_id: String,
+    /// The concrete upstream model produced by the wildcard-resolution
+    /// branch, paired with the configured wildcard row that produced it.
+    /// Empty for exact model resolution, including a request that literally
+    /// names a wildcard row. Telemetry uses this only for an event that
+    /// actually dispatched that same row; it is not an access-log identity.
+    pub wildcard_pricing_model_id: String,
+    pub wildcard_pricing_model: String,
     /// Which cache layer answered this request, once one has — `Some`
     /// exactly when the response came out of the cache.
     ///
@@ -689,6 +696,18 @@ pub(crate) fn note_target(model: &Model, provider_key_id: &str) {
     });
 }
 
+/// Record the concrete model a caller-addressed wildcard row resolved to.
+///
+/// This is deliberately separate from [`note_target`]: an exact request for
+/// the literal wildcard row also has an upstream model name, but it never
+/// passed wildcard capture and must not be used as a pricing identity.
+pub(crate) fn note_wildcard_pricing_identity(model_id: &str, concrete_model: &str) {
+    with(|r| {
+        r.wildcard_pricing_model_id = model_id.to_string();
+        r.wildcard_pricing_model = concrete_model.to_string();
+    });
+}
+
 /// Overwrite the target half with what a CACHE HIT may honestly claim.
 ///
 /// A hit contacts no upstream, so nothing was dispatched to and the line
@@ -707,7 +726,11 @@ pub(crate) fn note_target(model: &Model, provider_key_id: &str) {
 /// group, whose candidate is no more the producer than any other.
 pub(crate) fn note_cache_hit_entry(entry: &Model, hit_layer: &'static str) {
     note_target(entry, entry.provider_key_id.as_deref().unwrap_or_default());
-    with(|r| r.cache_hit_layer = Some(hit_layer));
+    with(|r| {
+        r.cache_hit_layer = Some(hit_layer);
+        r.wildcard_pricing_model_id.clear();
+        r.wildcard_pricing_model.clear();
+    });
 }
 
 /// What the current request has resolved, or `None` outside a request.

@@ -40,6 +40,10 @@ pub(crate) fn resolve_model(
     // A wildcard row is a direct model, and attribution stays on the ROW
     // (see the module docs), so the synthetic clone below inherits its id.
     note_dispatchable_entry(&entry);
+    // Keep the concrete value separate from ordinary target attribution:
+    // an exact request for the literal wildcard row does not run this branch
+    // and must never make its static template eligible for pricing.
+    crate::attribution::note_wildcard_pricing_identity(&entry.id, &upstream);
     let mut model = entry.value.clone();
     model.model_name = Some(upstream);
     Some(Arc::new(ResourceEntry::new(
