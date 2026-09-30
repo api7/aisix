@@ -2542,7 +2542,10 @@ mod tests {
         snap.apikeys.insert(apikey_entry(&["*"]));
         let (app, mut rx) = build_app_with_sink(snap);
 
-        let encoded = encode_routed_id("batch_1", "jobs/*");
+        // A concrete caller hint enters the wildcard-capture branch. The
+        // zero-token management event must still stay unpriced even though
+        // this GET genuinely contacts the upstream batch API.
+        let encoded = encode_routed_id("batch_1", "jobs/gpt-4o-2024-08-06");
         let mk_req = || {
             Request::builder()
                 .method("GET")
@@ -2564,7 +2567,7 @@ mod tests {
 
         // Two events expected: the zero-token management event plus ONE
         // aggregated batch event from the detached attribution task.
-        let mut mgmt = 0u32;
+        let mut mgmt: Option<ObsUsageEvent> = None;
         let mut agg: Option<ObsUsageEvent> = None;
         for _ in 0..2 {
             let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
@@ -2574,10 +2577,17 @@ mod tests {
             if ev.inbound_protocol == "batch" {
                 agg = Some(ev);
             } else {
-                mgmt += 1;
+                assert!(
+                    mgmt.replace(ev).is_none(),
+                    "only one management event expected"
+                );
             }
         }
-        assert_eq!(mgmt, 1);
+        let mgmt = mgmt.expect("management event must be emitted");
+        assert!(
+            mgmt.resolved_pricing_model.is_empty(),
+            "a batch-management request must not select wildcard pricing"
+        );
         let agg = agg.expect("aggregated batch event must be emitted");
         // cp-api accepts any visible-ASCII request_id since
         // AISIX-Cloud#1288, so this is no longer a wire constraint — but a

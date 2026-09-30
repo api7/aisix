@@ -477,8 +477,17 @@ pub(crate) fn wildcard_resolved_pricing_model<'a>(
 /// or pre-dispatch failure has no upstream call to price. Detached gateway
 /// work has no caller attribution and therefore cannot price itself as the
 /// parent request.
-fn apply_wildcard_pricing_model(snap: &AisixSnapshot, event: &mut UsageEvent, dispatched: bool) {
-    if !dispatched {
+fn apply_wildcard_pricing_model(
+    snap: &AisixSnapshot,
+    event: &mut UsageEvent,
+    surface: Surface,
+    dispatched: bool,
+) {
+    // Batch-management rows are observable upstream management requests, not
+    // the batch's model inference. They stay unpriced even when their route
+    // resolves through a wildcard alias; batch completion accounting is a
+    // separate surface with its own attribution rules.
+    if surface == crate::operation::BATCHES || !dispatched {
         return;
     }
     let Some(resolved) = crate::attribution::current() else {
@@ -1013,7 +1022,7 @@ pub(crate) fn emit_usage(
     if terminal && event.guardrail_blocked {
         state.metrics.record_guardrail_blocked_request();
     }
-    apply_wildcard_pricing_model(snap, &mut event, dispatched);
+    apply_wildcard_pricing_model(snap, &mut event, surface, dispatched);
     let emission = trace.map(|bundle| {
         event.trace_id = bundle.trace_id_hex();
         bundle.emission(
@@ -1193,8 +1202,24 @@ mod tests {
                     applied_guardrails: Vec::new(),
                     ..Default::default()
                 };
-                apply_wildcard_pricing_model(&snap, &mut event, true);
+                apply_wildcard_pricing_model(&snap, &mut event, crate::operation::CHAT, true);
                 assert_eq!(event.resolved_pricing_model, "gpt-4o-2024-08-06");
+
+                let mut batch_event = UsageEvent {
+                    // NO-GUARDRAIL-CHAIN: this focused unit test constructs
+                    // a synthetic pricing event, not a gateway request.
+                    model_id: "wildcard".to_string(),
+                    guardrail_bypassed_reason: String::new(),
+                    applied_guardrails: Vec::new(),
+                    ..Default::default()
+                };
+                apply_wildcard_pricing_model(
+                    &snap,
+                    &mut batch_event,
+                    crate::operation::BATCHES,
+                    true,
+                );
+                assert!(batch_event.resolved_pricing_model.is_empty());
 
                 crate::attribution::note_cache_hit_entry(&cache_entry, "exact");
                 let cached_attribution =
@@ -1209,7 +1234,12 @@ mod tests {
                     applied_guardrails: Vec::new(),
                     ..Default::default()
                 };
-                apply_wildcard_pricing_model(&snap, &mut cached_event, false);
+                apply_wildcard_pricing_model(
+                    &snap,
+                    &mut cached_event,
+                    crate::operation::CHAT,
+                    false,
+                );
                 assert!(cached_event.resolved_pricing_model.is_empty());
             },
         )
@@ -1227,14 +1257,16 @@ mod tests {
                 assert!(attribution.wildcard_pricing_model.is_empty());
 
                 let mut event = UsageEvent {
-                    // This exact alias is dispatchable but its static `*`
-                    // template is never a concrete catalog price.
+                    // NO-GUARDRAIL-CHAIN: this focused unit test constructs
+                    // a synthetic pricing event, not a gateway request. This
+                    // exact alias is dispatchable but its static `*` template
+                    // is never a concrete catalog price.
                     model_id: "wildcard".to_string(),
                     guardrail_bypassed_reason: String::new(),
                     applied_guardrails: Vec::new(),
                     ..Default::default()
                 };
-                apply_wildcard_pricing_model(&snap, &mut event, true);
+                apply_wildcard_pricing_model(&snap, &mut event, crate::operation::CHAT, true);
                 assert!(event.resolved_pricing_model.is_empty());
             },
         )
