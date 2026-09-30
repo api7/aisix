@@ -439,14 +439,13 @@ pub(crate) fn metric_model_label_pair<'a>(
     }
 }
 
-/// Fill the optional DP-to-CP wildcard-pricing identity at the one usage
+/// Fill the optional DP-to-CP wildcard-pricing authority at the one usage
 /// emission chokepoint. Model resolution establishes eligibility from the
-/// dispatch snapshot and records only a concrete provider-model identity, so
-/// this path must not consult an emission-time snapshot that may have changed
-/// while a stream or realtime session was still running. A cache hit or
-/// pre-dispatch failure has no upstream call to price. Detached gateway work
-/// has no caller attribution and therefore cannot price itself as the parent
-/// request.
+/// dispatch snapshot and records a complete authority tuple, so this path must
+/// not consult an emission-time snapshot that may have changed while a stream
+/// or realtime session was still running. A cache hit or pre-dispatch failure
+/// has no upstream call to price. Detached gateway work has no caller
+/// attribution and therefore cannot price itself as the parent request.
 fn apply_wildcard_pricing_model(event: &mut UsageEvent, surface: Surface, dispatched: bool) {
     // Batch-management rows are observable upstream management requests, not
     // the batch's model inference. They stay unpriced even when their route
@@ -461,7 +460,10 @@ fn apply_wildcard_pricing_model(event: &mut UsageEvent, surface: Surface, dispat
     if resolved.cache_hit_layer.is_some() || resolved.wildcard_pricing_model_id != event.model_id {
         return;
     }
-    if !resolved.wildcard_pricing_model.is_empty() {
+    if !resolved.wildcard_pricing_authority_id.is_empty()
+        && !resolved.wildcard_pricing_model.is_empty()
+    {
+        event.pricing_authority_id = resolved.wildcard_pricing_authority_id;
         event.resolved_pricing_model = resolved.wildcard_pricing_model;
     }
 }
@@ -1069,7 +1071,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_attribution_stamps_only_concrete_wildcard_pricing_models() {
+    async fn request_attribution_stamps_only_concrete_wildcard_pricing_authorities() {
         use aisix_core::resource::ResourceEntry;
         use aisix_core::snapshot::ResourceTable;
 
@@ -1079,6 +1081,7 @@ mod tests {
             "provider": "openai",
             "model_name": "*",
             "provider_key_id": "pk-1",
+            "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046",
         }))
         .unwrap();
         let cache_entry = configured.clone();
@@ -1097,6 +1100,10 @@ mod tests {
                 let attribution =
                     crate::attribution::current().expect("in request attribution scope");
                 assert_eq!(attribution.wildcard_pricing_model_id, "wildcard");
+                assert_eq!(
+                    attribution.wildcard_pricing_authority_id,
+                    "a3ebdc63-e921-4323-a75c-3b911f950046"
+                );
                 assert_eq!(attribution.wildcard_pricing_model, "gpt-4o-2024-08-06");
                 let mut event = UsageEvent {
                     // NO-GUARDRAIL-CHAIN: this focused unit test constructs
@@ -1107,6 +1114,10 @@ mod tests {
                     ..Default::default()
                 };
                 apply_wildcard_pricing_model(&mut event, crate::operation::CHAT, true);
+                assert_eq!(
+                    event.pricing_authority_id,
+                    "a3ebdc63-e921-4323-a75c-3b911f950046"
+                );
                 assert_eq!(event.resolved_pricing_model, "gpt-4o-2024-08-06");
 
                 let mut batch_event = UsageEvent {
@@ -1118,6 +1129,7 @@ mod tests {
                     ..Default::default()
                 };
                 apply_wildcard_pricing_model(&mut batch_event, crate::operation::BATCHES, true);
+                assert!(batch_event.pricing_authority_id.is_empty());
                 assert!(batch_event.resolved_pricing_model.is_empty());
 
                 crate::attribution::note_cache_hit_entry(&cache_entry, "exact");
@@ -1128,7 +1140,11 @@ mod tests {
                 // `note_cache_hit_entry` clears the identity above. Restore
                 // one here to pin the separate emission gate too: a cache
                 // hit is never billable as an upstream wildcard dispatch.
-                crate::attribution::note_wildcard_pricing_identity("wildcard", "gpt-4o-2024-08-06");
+                crate::attribution::note_wildcard_pricing_identity(
+                    "wildcard",
+                    Some("a3ebdc63-e921-4323-a75c-3b911f950046"),
+                    "gpt-4o-2024-08-06",
+                );
                 let mut cached_event = UsageEvent {
                     // NO-GUARDRAIL-CHAIN: this focused unit test constructs
                     // a synthetic pricing event, not a gateway request.
@@ -1138,6 +1154,7 @@ mod tests {
                     ..Default::default()
                 };
                 apply_wildcard_pricing_model(&mut cached_event, crate::operation::CHAT, true);
+                assert!(cached_event.pricing_authority_id.is_empty());
                 assert!(cached_event.resolved_pricing_model.is_empty());
             },
         )
@@ -1152,6 +1169,7 @@ mod tests {
                 let attribution =
                     crate::attribution::current().expect("in request attribution scope");
                 assert!(attribution.wildcard_pricing_model_id.is_empty());
+                assert!(attribution.wildcard_pricing_authority_id.is_empty());
                 assert!(attribution.wildcard_pricing_model.is_empty());
 
                 let mut event = UsageEvent {
@@ -1165,7 +1183,46 @@ mod tests {
                     ..Default::default()
                 };
                 apply_wildcard_pricing_model(&mut event, crate::operation::CHAT, true);
+                assert!(event.pricing_authority_id.is_empty());
                 assert!(event.resolved_pricing_model.is_empty());
+            },
+        )
+        .await;
+
+        // A configuration projected by an older control plane has the
+        // wildcard template but no authority UUID. It may dispatch, but its
+        // terminal event must not claim a concrete catalog price.
+        let legacy_table = ResourceTable::default();
+        let mut legacy_configured = cache_entry;
+        legacy_configured.pricing_authority_id = None;
+        legacy_table.insert(ResourceEntry::new("legacy", legacy_configured, 1));
+        let legacy_snap = AisixSnapshot {
+            models: legacy_table,
+            ..Default::default()
+        };
+        crate::attribution::scope(
+            Arc::new(crate::attribution::RequestAttribution::default()),
+            async {
+                crate::model_resolve::resolve_model(&legacy_snap, "openrouter/gpt-4o-2024-08-06")
+                    .expect("legacy wildcard model resolves");
+                let attribution =
+                    crate::attribution::current().expect("in request attribution scope");
+                assert!(attribution.wildcard_pricing_model_id.is_empty());
+                assert!(attribution.wildcard_pricing_authority_id.is_empty());
+                assert!(attribution.wildcard_pricing_model.is_empty());
+
+                let mut event = UsageEvent {
+                    // NO-GUARDRAIL-CHAIN: this focused test constructs a
+                    // synthetic terminal usage event after dispatch.
+                    model_id: "legacy".to_string(),
+                    guardrail_bypassed_reason: String::new(),
+                    applied_guardrails: Vec::new(),
+                    ..Default::default()
+                };
+                apply_wildcard_pricing_model(&mut event, crate::operation::CHAT, true);
+                let wire = serde_json::to_value(event).expect("usage event serialises");
+                assert!(wire.get("pricing_authority_id").is_none());
+                assert!(wire.get("resolved_pricing_model").is_none());
             },
         )
         .await;
@@ -1189,6 +1246,7 @@ mod tests {
                 "provider": "openai",
                 "model_name": template,
                 "provider_key_id": "pk-1",
+                "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046",
             }))
             .unwrap();
             table.insert(ResourceEntry::new("wildcard", model, 1));
@@ -1261,6 +1319,10 @@ mod tests {
                 event.resolved_pricing_model, "gpt-4o-2024-08-06",
                 "{case} must not rewrite the dispatched wildcard identity"
             );
+            assert_eq!(
+                event.pricing_authority_id, "a3ebdc63-e921-4323-a75c-3b911f950046",
+                "{case} must not rewrite the dispatched wildcard authority"
+            );
         }
     }
 
@@ -1280,6 +1342,7 @@ mod tests {
             "provider": "openai",
             "model_name": "*",
             "provider_key_id": "pk-1",
+            "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046",
         }))
         .unwrap();
         table.insert(ResourceEntry::new("wildcard", configured, 1));
@@ -1349,6 +1412,7 @@ mod tests {
 
         let event = rx.try_recv().expect("failed attempt emits usage");
         assert_eq!(event.model_id, "wildcard");
+        assert!(event.pricing_authority_id.is_empty());
         assert!(event.resolved_pricing_model.is_empty());
     }
 

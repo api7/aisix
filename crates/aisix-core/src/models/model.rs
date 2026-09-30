@@ -310,6 +310,19 @@ pub struct Model {
     #[schemars(length(min = 1, max = 255))]
     pub pricing_key: Option<String>,
 
+    /// Opaque control-plane-issued canonical, non-nil UUID that authorizes a
+    /// concrete wildcard-upstream model name for pricing. It is relevant only
+    /// to a direct-shaped wildcard model (chat or embedding); without it the
+    /// data plane deliberately omits the resolved model from terminal
+    /// telemetry so the control plane can leave the call unpriced rather than
+    /// trust mutable configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        regex(pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"),
+        length(min = 36, max = 64)
+    )]
+    pub pricing_authority_id: Option<String>,
+
     /// Direct-model-only background health-check configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_model_check: Option<BackgroundModelCheck>,
@@ -420,6 +433,9 @@ impl Model {
         }
         if self.effort_mapping.take().is_some() {
             stripped.push("effort_mapping");
+        }
+        if self.pricing_authority_id.take().is_some() {
+            stripped.push("pricing_authority_id");
         }
         if self.pricing_key.take().is_some() {
             stripped.push("pricing_key");
@@ -533,8 +549,8 @@ pub fn model_one_of() -> Value {
 /// [`Model::strip_kind_inapplicable`]). Kind policy (project decision):
 /// generic call knobs (`timeout`/`stream_timeout`/`retries`) resolve
 /// member → group → deployment default wherever a group slot exists;
-/// model-specific knobs (`auto_prompt_caching`, `cost`, `pricing_key`) are
-/// direct-only.
+/// model-specific knobs (`auto_prompt_caching`, `cost`, `pricing_key`,
+/// `pricing_authority_id`) are direct-shaped-only.
 pub fn model_one_of_strict() -> Value {
     model_one_of_variant(true)
 }
@@ -559,6 +575,7 @@ fn model_one_of_variant(strict: bool) -> Value {
                 "auto_prompt_caching",
                 "cost",
                 "pricing_key",
+                "pricing_authority_id",
                 "effort_mapping",
             ],
         );
@@ -580,6 +597,7 @@ fn model_one_of_variant(strict: bool) -> Value {
                 "auto_prompt_caching",
                 "cost",
                 "pricing_key",
+                "pricing_authority_id",
                 "effort_mapping",
             ],
         );
@@ -592,6 +610,7 @@ fn model_one_of_variant(strict: bool) -> Value {
                 "auto_prompt_caching",
                 "cost",
                 "pricing_key",
+                "pricing_authority_id",
                 "effort_mapping",
             ],
         );
@@ -695,6 +714,23 @@ mod tests {
     }
 
     #[test]
+    fn pricing_authority_id_round_trips_only_when_set() {
+        let mut model: Model = serde_json::from_str(sample_json()).unwrap();
+        assert!(model.pricing_authority_id.is_none());
+        assert!(serde_json::to_value(&model)
+            .unwrap()
+            .get("pricing_authority_id")
+            .is_none());
+
+        model.pricing_authority_id = Some("a3ebdc63-e921-4323-a75c-3b911f950046".to_string());
+        let encoded = serde_json::to_value(&model).unwrap();
+        assert_eq!(
+            encoded["pricing_authority_id"],
+            serde_json::json!("a3ebdc63-e921-4323-a75c-3b911f950046")
+        );
+    }
+
+    #[test]
     fn deserialises_stream_timeout_and_helpers_fold_zero() {
         let m: Model = serde_json::from_str(
             r#"{
@@ -762,11 +798,20 @@ mod tests {
             "retries": 2,
             "timeout": 1000,
             "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0},
-            "auto_prompt_caching": {"enabled": true}
+            "auto_prompt_caching": {"enabled": true},
+            "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046"
         }));
         let mut stripped = group.strip_kind_inapplicable();
         stripped.sort_unstable();
-        assert_eq!(stripped, ["auto_prompt_caching", "cost", "retries"]);
+        assert_eq!(
+            stripped,
+            [
+                "auto_prompt_caching",
+                "cost",
+                "pricing_authority_id",
+                "retries"
+            ]
+        );
         assert!(group.retries.is_none() && group.cost.is_none());
         assert_eq!(group.timeout, Some(1000));
         // Semantic parent: timeout/retries are the group slots and stay.
@@ -780,9 +825,13 @@ mod tests {
             },
             "retries": 2,
             "timeout": 1000,
-            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0}
+            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0},
+            "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046"
         }));
-        assert_eq!(sem.strip_kind_inapplicable(), ["cost"]);
+        assert_eq!(
+            sem.strip_kind_inapplicable(),
+            ["cost", "pricing_authority_id"]
+        );
         assert_eq!(sem.retries, Some(2));
         assert_eq!(sem.timeout, Some(1000));
         // Direct: nothing strips.
@@ -792,10 +841,15 @@ mod tests {
             "model_name": "gpt-4o",
             "provider_key_id": "pk-1",
             "retries": 2,
-            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0}
+            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0},
+            "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046"
         }));
         assert!(direct.strip_kind_inapplicable().is_empty());
         assert_eq!(direct.retries, Some(2));
+        assert_eq!(
+            direct.pricing_authority_id.as_deref(),
+            Some("a3ebdc63-e921-4323-a75c-3b911f950046")
+        );
         // Ensemble parent: the whole generic set strips (its own
         // deadline knob is `ensemble.timeout_ms`).
         let mut ens = load(serde_json::json!({
@@ -804,7 +858,9 @@ mod tests {
             "timeout": 1000,
             "stream_timeout": 500,
             "retries": 1,
-            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0}
+            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0},
+            "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046",
+            "pricing_key": "catalog-gpt"
         }));
         // Asserted WITHOUT a pre-sort: the strip output is already
         // lexicographic (a pure-strip loader row keeps the fields
@@ -812,7 +868,14 @@ mod tests {
         let ens_stripped = ens.strip_kind_inapplicable();
         assert_eq!(
             ens_stripped,
-            ["cost", "retries", "stream_timeout", "timeout"]
+            [
+                "cost",
+                "pricing_authority_id",
+                "pricing_key",
+                "retries",
+                "stream_timeout",
+                "timeout"
+            ]
         );
     }
 

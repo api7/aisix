@@ -845,6 +845,19 @@ pub fn model_root_schema(strict: bool) -> Value {
         .as_object_mut()
         .expect("model root schema is a JSON object")
         .insert("oneOf".to_string(), one_of);
+    if strict {
+        // CP-issued pricing authorities are canonical UUIDs, but UUID nil is
+        // not an authority. Keep this write-only so an already-projected
+        // legacy row still loads and the DP can safely emit it unpriced.
+        schema
+            .pointer_mut("/properties/pricing_authority_id")
+            .and_then(Value::as_object_mut)
+            .expect("model schema declares pricing_authority_id")
+            .insert(
+                "not".to_string(),
+                json!({"const": "00000000-0000-0000-0000-000000000000"}),
+            );
+    }
     // `OnEmbeddingFailure` is `#[serde(untagged)]` with an object variant
     // (`{ "target": … }`): serde buffers untagged content and silently
     // swallows unknown fields inside it, invisible to the write path's
@@ -6065,10 +6078,12 @@ mod tests {
             "display_name": "g",
             "routing": {"strategy": "failover", "targets": [{"model": "m"}]},
             "retries": 3,
-            "cost": {"input_per_1k": 0.5, "output_per_1k": 1.5}
+            "cost": {"input_per_1k": 0.5, "output_per_1k": 1.5},
+            "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046"
         });
         let msg = validate_model(&group).unwrap_err().message;
         assert!(msg.contains("`cost`"), "{msg}");
+        assert!(msg.contains("`pricing_authority_id`"), "{msg}");
         assert!(msg.contains("`retries`"), "{msg}");
         assert!(msg.contains("model group"), "{msg}");
         assert!(
@@ -6112,6 +6127,42 @@ mod tests {
         assert!(msg.contains("`effort_mapping`"), "{msg}");
         assert!(msg.contains("embedding model"), "{msg}");
         assert!(!msg.contains("semantic router"), "{msg}");
+    }
+
+    #[test]
+    fn pricing_authority_id_is_canonical_non_nil_on_write_and_lenient_on_read() {
+        let base = json!({
+            "display_name": "catalog/*",
+            "provider": "openai",
+            "model_name": "*",
+            "provider_key_id": "pk"
+        });
+        let mut valid = base.clone();
+        valid["pricing_authority_id"] = json!("a3ebdc63-e921-4323-a75c-3b911f950046");
+        validate_model(&valid).expect("canonical authority UUID writes");
+
+        for invalid in [
+            "00000000-0000-0000-0000-000000000000",
+            "A3EBDC63-E921-4323-A75C-3B911F950046",
+            "not-a-uuid",
+        ] {
+            let mut model = base.clone();
+            model["pricing_authority_id"] = json!(invalid);
+            assert!(
+                validate_model(&model).is_err(),
+                "strict write must reject {invalid:?}"
+            );
+        }
+
+        let mut legacy = base;
+        legacy["pricing_authority_id"] = json!("00000000-0000-0000-0000-000000000000");
+        validate_model_lenient(&legacy).expect("legacy nil authority still loads unpriced");
+
+        let schema = model_root_schema(true);
+        assert_eq!(
+            schema["properties"]["pricing_authority_id"]["maxLength"],
+            json!(64)
+        );
     }
 
     #[test]

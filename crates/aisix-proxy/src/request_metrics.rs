@@ -705,6 +705,7 @@ mod tests {
             upstream_model: "gpt-4o-mini".to_string(),
             provider_key_id: "pk-1".to_string(),
             wildcard_pricing_model_id: String::new(),
+            wildcard_pricing_authority_id: String::new(),
             wildcard_pricing_model: String::new(),
             cache_hit_layer: None,
         }
@@ -772,6 +773,7 @@ mod tests {
                 "provider": "openai",
                 "model_name": "*",
                 "provider_key_id": "pk-1",
+                "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046",
             }),
         );
         let refreshed = snapshot_with(
@@ -792,12 +794,20 @@ mod tests {
                 let captured =
                     crate::attribution::current().expect("request attribution is installed");
                 assert_eq!(captured.wildcard_pricing_model_id, "wildcard");
+                assert_eq!(
+                    captured.wildcard_pricing_authority_id,
+                    "a3ebdc63-e921-4323-a75c-3b911f950046"
+                );
                 assert_eq!(captured.wildcard_pricing_model, "gpt-4o");
 
                 assert!(!is_ensemble(&refreshed, "openrouter/gpt-4o"));
                 let after_metrics =
                     crate::attribution::current().expect("request attribution is installed");
                 assert_eq!(after_metrics.wildcard_pricing_model_id, "wildcard");
+                assert_eq!(
+                    after_metrics.wildcard_pricing_authority_id,
+                    "a3ebdc63-e921-4323-a75c-3b911f950046"
+                );
                 assert_eq!(after_metrics.wildcard_pricing_model, "gpt-4o");
             },
         )

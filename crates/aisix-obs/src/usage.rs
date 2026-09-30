@@ -123,6 +123,12 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub resolved_pricing_model: String,
 
+    /// Canonical non-nil CP-issued UUID paired with `resolved_pricing_model`.
+    /// Both values are absent for older DP configuration or any request that
+    /// did not dispatch a concrete wildcard-template model.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pricing_authority_id: String,
+
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
 
@@ -1608,6 +1614,7 @@ mod tests {
             api_key_id: "ak-uuid".into(),
             requested_model: "smart-group".into(),
             resolved_pricing_model: "gpt-4o-2024-08-06".into(),
+            pricing_authority_id: "a3ebdc63-e921-4323-a75c-3b911f950046".into(),
             prompt_tokens: 12,
             completion_tokens: 34,
             upstream_latency_ms: 56,
@@ -1623,6 +1630,7 @@ mod tests {
         // so the dashboard can show the group a routed request used.
         assert!(json.contains(r#""requested_model":"smart-group""#));
         assert!(json.contains(r#""resolved_pricing_model":"gpt-4o-2024-08-06""#));
+        assert!(json.contains(r#""pricing_authority_id":"a3ebdc63-e921-4323-a75c-3b911f950046""#));
         assert!(json.contains(r#""prompt_tokens":12"#));
         assert!(json.contains(r#""completion_tokens":34"#));
         assert!(json.contains(r#""guardrail_blocked":false"#));
@@ -1644,6 +1652,7 @@ mod tests {
         assert!(!json.contains("reasoning_tokens"));
         assert!(!json.contains("cache_creation_tokens"));
         assert!(!json.contains("cache_read_tokens"));
+        assert!(!json.contains("pricing_authority_id"));
         assert!(!json.contains("provider_request_id"));
         assert!(!json.contains("provider_model_version"));
         assert!(!json.contains("finish_reason"));

@@ -1625,6 +1625,7 @@ mod tests {
             "provider": "openai",
             "model_name": "gpt-realtime-*",
             "provider_key_id": PK_ID,
+            "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046",
         }))
         .unwrap();
         snap.models.insert(ResourceEntry::new("m-rt", wildcard, 2));
@@ -1658,6 +1659,10 @@ mod tests {
             .expect("usage sink closed");
         assert_eq!(event.model_id, "m-rt");
         assert_eq!(event.requested_model, "rt-2026-01-01");
+        assert_eq!(
+            event.pricing_authority_id,
+            "a3ebdc63-e921-4323-a75c-3b911f950046"
+        );
         assert_eq!(event.resolved_pricing_model, "gpt-realtime-2026-01-01");
     }
 
