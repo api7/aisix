@@ -184,8 +184,10 @@ describe("semantic routing e2e", () => {
     });
 
     // Keep a separate router and local protocol embedding upstream cold until
-    // its regression test. The duplicate legal example proves examples are
-    // deduplicated within the cold logical batch.
+    // its regression test. The repeated examples prove the cold logical
+    // batch is deduplicated both within and across routes. Both routes use
+    // the same target so their tied score cannot make the observed response
+    // nondeterministic.
     const coldEmbed = await startEmbeddingMock();
     coldEmbeddingMock = coldEmbed;
     embedMocks.push(coldEmbed);
@@ -199,6 +201,11 @@ describe("semantic routing e2e", () => {
             name: "legal",
             target: "legal-model",
             examples: [COLD_LEGAL_EXAMPLE, COLD_LEGAL_EXAMPLE, COLD_CODE_EXAMPLE],
+          },
+          {
+            name: "legal-shared-examples",
+            target: "legal-model",
+            examples: [COLD_LEGAL_EXAMPLE, COLD_CODE_EXAMPLE],
           },
         ],
         default: "default-model",
