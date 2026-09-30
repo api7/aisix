@@ -1257,20 +1257,15 @@ enum PassthroughProtocol {
 /// and extraction degrades to the whole body when the detected shape
 /// yields no text.
 fn detect_protocol(body: &[u8]) -> PassthroughProtocol {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return PassthroughProtocol::Raw;
-    };
-    if v.get("messages").is_some_and(serde_json::Value::is_array) {
+    // Do not materialize the entire document just to inspect its envelope:
+    // a valid request can exceed serde_json::Value's nesting limit in an
+    // unrelated forwarded field. `RawValue` keeps the chosen top-level
+    // carrier shallow while preserving the last-key behavior of a JSON map.
+    if raw_top_level_last_has_shape(body, "messages", false) {
         PassthroughProtocol::OpenaiChat
-    } else if v
-        .get("input")
-        .is_some_and(|i| i.is_string() || i.is_array())
-    {
+    } else if raw_top_level_last_has_shape(body, "input", true) {
         PassthroughProtocol::OpenaiResponses
-    } else if v
-        .get("prompt")
-        .is_some_and(|p| p.is_string() || p.is_array())
-    {
+    } else if raw_top_level_last_has_shape(body, "prompt", true) {
         PassthroughProtocol::OpenaiCompletions
     } else {
         PassthroughProtocol::Raw
@@ -1444,6 +1439,24 @@ fn raw_top_level_values(
     Some(values)
 }
 
+/// Match the last source occurrence, the same duplicate-key convention a
+/// materialized JSON map used before protocol detection became shallow.
+/// `allow_string` is for the Responses and Completions bare-string forms;
+/// Chat requires an array of messages.
+fn raw_top_level_last_has_shape(body: &[u8], key: &str, allow_string: bool) -> bool {
+    raw_top_level_values(body, key)
+        .and_then(|values| values.into_iter().last())
+        .is_some_and(|value| match value.get().trim_start().as_bytes().first() {
+            Some(b'[') => true,
+            Some(b'"') => allow_string,
+            _ => false,
+        })
+}
+
+fn raw_is_object(raw: &serde_json::value::RawValue) -> bool {
+    raw.get().trim_start().starts_with('{')
+}
+
 fn raw_array_items(
     raw: &serde_json::value::RawValue,
 ) -> Option<Vec<Box<serde_json::value::RawValue>>> {
@@ -1537,17 +1550,9 @@ fn append_raw_string_value(out: &mut String, raw: &serde_json::value::RawValue) 
 
 fn append_raw_top_level_strings(out: &mut String, body: &[u8], key: &str) -> Option<()> {
     for value in raw_top_level_values(body, key)? {
-        append_raw_string_value(out, &value)?;
-    }
-    Some(())
-}
-
-/// Append direct string values but do not turn an unexpected non-string into
-/// a raw-body fallback. Response output uses this at the privacy boundary: a
-/// malformed optional text field must not make opaque sibling fields readable
-/// by an external guardrail.
-fn append_raw_top_level_string_values(out: &mut String, body: &[u8], key: &str) -> Option<()> {
-    for value in raw_top_level_values(body, key)? {
+        // A valid but wrongly typed nominal text field must not make its
+        // opaque object/array sibling content eligible for a whole-body raw
+        // fallback at the guardrail boundary.
         if let Ok(value) = serde_json::from_str::<String>(value.get()) {
             append_scan_text(out, &value);
         }
@@ -1574,6 +1579,9 @@ fn append_raw_text_value(out: &mut String, raw: &serde_json::value::RawValue) ->
         return Some(());
     }
     for part in raw_array_items(raw)? {
+        if !raw_is_object(&part) {
+            continue;
+        }
         append_raw_top_level_strings(out, part.get().as_bytes(), "text")?;
     }
     Some(())
@@ -1596,6 +1604,9 @@ fn append_chat_request_content_strings(
         return Some(());
     }
     for block in raw_array_items(content)? {
+        if !raw_is_object(&block) {
+            continue;
+        }
         let block_body = block.get().as_bytes();
         let types = raw_top_level_values(block_body, "type")?;
         let kind = raw_top_level_unique_type(block_body);
@@ -1632,6 +1643,9 @@ fn append_chat_request_message_strings(
     out: &mut String,
     message: &serde_json::value::RawValue,
 ) -> Option<()> {
+    if !raw_is_object(message) {
+        return Some(());
+    }
     let message_body = message.get().as_bytes();
     append_scan_text(
         out,
@@ -1660,7 +1674,13 @@ fn decoded_chat_request_string_values(body: &[u8]) -> Option<String> {
         append_chat_request_content_strings(&mut out, &system)?;
     }
     for array in raw_top_level_values(body, "messages")? {
-        for message in raw_array_items(&array)? {
+        // The selected (last) carrier made this a Chat envelope. Preserve
+        // other duplicate source values without turning a malformed earlier
+        // carrier into a whole-body fallback that exposes opaque media.
+        let Some(messages) = raw_array_items(&array) else {
+            continue;
+        };
+        for message in messages {
             append_chat_request_message_strings(&mut out, &message)?;
         }
     }
@@ -1671,6 +1691,9 @@ fn append_responses_item_strings(
     out: &mut String,
     item: &serde_json::value::RawValue,
 ) -> Option<()> {
+    if !raw_is_object(item) {
+        return Some(());
+    }
     let item_body = item.get().as_bytes();
     let text_keys = [
         "content",
@@ -1808,7 +1831,7 @@ fn append_responses_visible_part_strings(
     let part_body = part.get().as_bytes();
     match raw_top_level_unique_type(part_body).as_deref() {
         Some(kind) if RESPONSES_VISIBLE_TEXT_PART_TYPES.contains(&kind) => {
-            append_raw_top_level_string_values(out, part_body, "text")?
+            append_raw_top_level_strings(out, part_body, "text")?
         }
         Some(_) | None => {}
     }
@@ -1854,12 +1877,12 @@ fn append_responses_output_item_strings(
         }
         Some("function_call" | "mcp_call") => {
             for key in ["name", "arguments"] {
-                append_raw_top_level_string_values(out, item_body, key)?;
+                append_raw_top_level_strings(out, item_body, key)?;
             }
         }
         Some("custom_tool_call") => {
             for key in ["name", "input"] {
-                append_raw_top_level_string_values(out, item_body, key)?;
+                append_raw_top_level_strings(out, item_body, key)?;
             }
         }
         Some(_) | None => {}
@@ -2572,7 +2595,7 @@ fn decoded_chat_frame_string_values(body: &[u8]) -> Option<String> {
 fn decoded_responses_frame_string_values(body: &[u8]) -> Option<String> {
     let mut out = String::new();
     if raw_top_level_has_only_types(body, RESPONSES_VISIBLE_DELTA_EVENTS) {
-        append_raw_top_level_string_values(&mut out, body, "delta")?;
+        append_raw_top_level_strings(&mut out, body, "delta")?;
     }
     Some(out)
 }
@@ -3980,6 +4003,15 @@ mod tests {
         json.into_bytes()
     }
 
+    fn deeply_nested_responses_request_with_opaque_media() -> Vec<u8> {
+        let mut json = r#"{"input":[{"type":"message","content":[{"type":"input_image","image_url":"\u0042LOCKME"},{"type":"input_text","text":"clean"}]}],"metadata":"#.to_owned();
+        json.push_str(&"{\"next\":".repeat(160));
+        json.push_str(r#""deep""#);
+        json.push_str(&"}".repeat(160));
+        json.push('}');
+        json.into_bytes()
+    }
+
     fn provider_key_entry(api_base_unused: &str) -> ResourceEntry<ProviderKey> {
         let json = format!(
             r#"{{"display_name":"openai-up","secret":"sk-upstream","api_base":"{api_base_unused}","provider":"openai","adapter":"openai"}}"#
@@ -5117,6 +5149,67 @@ mod tests {
         let scanned = request_guardrail_text(PassthroughProtocol::OpenaiCompletions, completions);
         assert!(scanned.contains("clean"), "{scanned:?}");
         assert!(!scanned.contains("BLOCKME"), "{scanned:?}");
+    }
+
+    #[test]
+    fn deep_responses_request_stays_typed_and_keeps_media_opaque() {
+        let request = deeply_nested_responses_request_with_opaque_media();
+        assert_eq!(
+            detect_protocol(&request),
+            PassthroughProtocol::OpenaiResponses
+        );
+        let scanned = request_guardrail_text(PassthroughProtocol::OpenaiResponses, &request);
+        assert!(scanned.contains("clean"), "{scanned:?}");
+        assert!(
+            !scanned.contains("BLOCKME"),
+            "a deep valid envelope must not fall back to raw media: {scanned:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_chat_carrier_skips_malformed_source_without_leaking_media() {
+        let request = br#"{"messages":{"content":[{"type":"image","source":{"data":"\u0042LOCKME"}}]},"messages":[{"role":"user","content":"clean"}]}"#;
+        assert_eq!(detect_protocol(request), PassthroughProtocol::OpenaiChat);
+        let scanned = request_guardrail_text(PassthroughProtocol::OpenaiChat, request);
+        assert!(scanned.contains("clean"), "{scanned:?}");
+        assert!(
+            !scanned.contains("BLOCKME"),
+            "a malformed duplicate must not trigger raw fallback: {scanned:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_typed_array_items_keep_media_opaque() {
+        let cases = [
+            (
+                PassthroughProtocol::OpenaiChat,
+                br#"{"messages":["junk",{"role":"user","content":[{"type":"image","source":{"data":"\u0042LOCKME"}},{"type":"text","text":"clean"}]}]}"#.as_slice(),
+            ),
+            (
+                PassthroughProtocol::OpenaiChat,
+                br#"{"messages":[{"role":"user","content":["junk",{"type":"image","source":{"data":"\u0042LOCKME"}},{"type":"text","text":"clean"}]}]}"#.as_slice(),
+            ),
+            (
+                PassthroughProtocol::OpenaiChat,
+                br#"{"messages":[{"role":"user","content":[{"type":"text","text":{"image_url":"\u0042LOCKME"}},{"type":"text","text":"clean"}]}]}"#.as_slice(),
+            ),
+            (
+                PassthroughProtocol::OpenaiResponses,
+                br#"{"input":["junk",{"type":"message","content":[{"type":"input_image","image_url":"\u0042LOCKME"},{"type":"input_text","text":"clean"}]}]}"#.as_slice(),
+            ),
+            (
+                PassthroughProtocol::OpenaiResponses,
+                br#"{"input":[{"type":"message","content":[{"type":"input_text","text":{"image_url":"\u0042LOCKME"}},{"type":"input_text","text":"clean"}]}]}"#.as_slice(),
+            ),
+        ];
+        for (protocol, request) in cases {
+            let scanned = request_guardrail_text(protocol, request);
+            assert!(scanned.contains("clean"), "{protocol:?}: {scanned:?}");
+            assert!(
+                !scanned.contains("BLOCKME"),
+                "a malformed array item must not trigger raw fallback for {protocol:?}: {scanned:?}"
+            );
+        }
     }
 
     #[test]
