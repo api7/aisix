@@ -37,7 +37,6 @@ jobs:
           ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
           ETCD_ADVERTISE_CLIENT_URLS: http://0.0.0.0:2379
     env:
-      AISIX_E2E_OPENAI_API_KEY: ${{ secrets.AISIX_E2E_OPENAI_API_KEY }}
       AISIX_E2E_OPENAI_EMBEDDING_MODEL: ${{ vars.AISIX_E2E_OPENAI_EMBEDDING_MODEL || 'text-embedding-3-small' }}
       AISIX_E2E_OPENAI_EMBEDDING_DIMENSIONS: ${{ vars.AISIX_E2E_OPENAI_EMBEDDING_DIMENSIONS || '1536' }}
       AISIX_E2E_OPENAI_CHAT_MODEL: ${{ vars.AISIX_E2E_OPENAI_CHAT_MODEL || 'gpt-4o-mini' }}
@@ -49,6 +48,8 @@ jobs:
         with:
           persist-credentials: false
       - name: require protected provider credential
+        env:
+          AISIX_E2E_OPENAI_API_KEY: ${{ secrets.AISIX_E2E_OPENAI_API_KEY }}
         run: |
           if [ -z "$AISIX_E2E_OPENAI_API_KEY" ]; then
             echo "::error::AISIX_E2E_OPENAI_API_KEY is absent from the real-provider-e2e environment."
@@ -73,4 +74,6 @@ jobs:
         run: pnpm exec tsc --noEmit
       - name: run real OpenAI semantic-embedding smoke
         working-directory: tests/e2e
+        env:
+          AISIX_E2E_OPENAI_API_KEY: ${{ secrets.AISIX_E2E_OPENAI_API_KEY }}
         run: pnpm exec vitest run --config vitest.real-provider.config.ts
