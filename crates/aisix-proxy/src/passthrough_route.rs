@@ -2636,9 +2636,12 @@ fn stream_guardrail_text(
         && payload.as_ref().is_some_and(|payload| {
             hidden_chat_stream_reasoning_frame(payload.trim().as_bytes()) == Some(true)
         });
-    let mut continuations = vec![(!hidden_reasoning)
-        .then_some(continuation)
-        .unwrap_or_default()];
+    let typed_continuation = if hidden_reasoning {
+        String::new()
+    } else {
+        continuation
+    };
+    let mut continuations = vec![typed_continuation];
     if let Some(source) =
         payload.and_then(|payload| frame_source_continuations(protocol, payload.trim().as_bytes()))
     {
