@@ -2620,6 +2620,7 @@ mod tests {
             "provider": "openai",
             "model_name": "*",
             "provider_key_id": PK_A,
+            "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046",
         }))
         .unwrap();
         snap.models.insert(ResourceEntry::new("m-a", wildcard, 1));
@@ -2669,6 +2670,10 @@ mod tests {
         }
         let mgmt = mgmt.expect("management event must be emitted");
         assert!(
+            mgmt.pricing_authority_id.is_empty(),
+            "a batch-management request must not select wildcard pricing"
+        );
+        assert!(
             mgmt.resolved_pricing_model.is_empty(),
             "a batch-management request must not select wildcard pricing"
         );
@@ -2690,8 +2695,12 @@ mod tests {
         assert_eq!(agg.provider_model_version, "gpt-4o-2024-08-06");
         assert_eq!(agg.requested_model, "jobs/*");
         assert!(
+            agg.pricing_authority_id.is_empty(),
+            "a detached batch aggregate must not select wildcard pricing"
+        );
+        assert!(
             agg.resolved_pricing_model.is_empty(),
-            "an upstream batch output model must not select wildcard pricing"
+            "a detached batch aggregate must not select wildcard pricing"
         );
 
         // Second retrieve: management event only — the attribution is

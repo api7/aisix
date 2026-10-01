@@ -56,6 +56,10 @@ function embeddingUpstreamResponse() {
   };
 }
 
+function routedId(raw: string, model: string): string {
+  return `aisix-${Buffer.from(`${raw};model,${model}`).toString("base64url")}`;
+}
+
 describe("wildcard pricing telemetry e2e", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
@@ -237,5 +241,60 @@ describe("wildcard pricing telemetry e2e", () => {
     expect(event.get("pricing_authority_id")).toBe(PRICING_AUTHORITY_ID);
     expect(event.get("resolved_pricing_model")).toBe(EMBEDDING_UPSTREAM_MODEL);
     expect(event.get("prompt_tokens")).toBe("7");
+  });
+
+  test("wildcard-routed job management events remain unpriced", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !upstream || !wildcardID) {
+      ctx.skip();
+      return;
+    }
+
+    const model = `openrouter/${KNOWN_MODEL}`;
+    const calls = [
+      [
+        "file",
+        "files",
+        `/v1/files/${routedId("file-wildcard", model)}`,
+        "/v1/files/file-wildcard",
+      ],
+      [
+        "batch",
+        "batches",
+        `/v1/batches/${routedId("batch-wildcard", model)}`,
+        "/v1/batches/batch-wildcard",
+      ],
+      [
+        "fine-tuning",
+        "fine_tuning",
+        `/v1/fine_tuning/jobs/${routedId("ftjob-wildcard", model)}`,
+        "/v1/fine_tuning/jobs/ftjob-wildcard",
+      ],
+    ] as const;
+
+    for (const [kind, operation, gatewayPath, upstreamPath] of calls) {
+      const before = upstream.receivedRequests.length;
+      const res = await fetch(`${app.proxyUrl}${gatewayPath}`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      const body = await res.text();
+      expect(res.status, `${kind}: ${body}`).toBe(200);
+
+      const forwarded = upstream.receivedRequests.slice(before);
+      expect(forwarded).toHaveLength(1);
+      expect(forwarded[0]!.method).toBe("GET");
+      expect(forwarded[0]!.path).toBe(upstreamPath);
+
+      const event = await waitForSlsLog(
+        sls,
+        LOGSTORE,
+        (log) => log.get("operation") === operation && log.get("model_id") === wildcardID,
+        `${kind} wildcard management usage event`,
+      );
+      expect(event.get("requested_model")).toBe(WILDCARD_ALIAS);
+      expect(event.get("prompt_tokens")).toBe("0");
+      expect(event.get("completion_tokens")).toBe("0");
+      expect(event.get("pricing_authority_id")).toBeUndefined();
+      expect(event.get("resolved_pricing_model")).toBeUndefined();
+    }
   });
 });

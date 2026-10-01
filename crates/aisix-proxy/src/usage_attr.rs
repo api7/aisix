@@ -439,6 +439,34 @@ pub(crate) fn metric_model_label_pair<'a>(
     }
 }
 
+/// Whether a usage surface is a model-inference request whose dispatch
+/// identity can name a concrete wildcard price.
+///
+/// This is intentionally an allowlist rather than a list of the management
+/// surfaces we currently know about. A new zero-token or control-plane route
+/// must remain unpriced until it explicitly establishes the same billing
+/// contract as a model-inference surface. Batch completion is also absent:
+/// it represents detached, after-the-fact output aggregation and has no live
+/// request attribution from which to take a wildcard identity.
+fn is_billable_inference_surface(surface: Surface) -> bool {
+    [
+        crate::operation::CHAT,
+        crate::operation::COMPLETIONS,
+        crate::operation::MESSAGES,
+        crate::operation::RESPONSES,
+        crate::operation::EMBEDDINGS,
+        crate::operation::RERANK,
+        crate::operation::REALTIME,
+        crate::operation::IMAGE_GENERATION,
+        crate::operation::IMAGE_EDIT,
+        crate::operation::TRANSCRIPTION,
+        crate::operation::TRANSLATION,
+        crate::operation::SPEECH,
+        crate::operation::VIDEO_GENERATION,
+    ]
+    .contains(&surface)
+}
+
 /// Fill the optional DP-to-CP wildcard-pricing authority at the one usage
 /// emission chokepoint. Model resolution establishes eligibility from the
 /// dispatch snapshot and records a complete authority tuple, so this path must
@@ -447,15 +475,7 @@ pub(crate) fn metric_model_label_pair<'a>(
 /// has no upstream call to price. Detached gateway work has no caller
 /// attribution and therefore cannot price itself as the parent request.
 fn apply_wildcard_pricing_model(event: &mut UsageEvent, surface: Surface, dispatched: bool) {
-    // Files, batches, and fine-tuning rows are observable zero-token
-    // management requests, not model inference. They stay unpriced even when
-    // their route resolves through a wildcard alias; batch completion
-    // accounting is a separate surface with its own attribution rules.
-    if !dispatched
-        || surface == crate::operation::FILES
-        || surface == crate::operation::BATCHES
-        || surface == crate::operation::FINE_TUNING
-    {
+    if !dispatched || !is_billable_inference_surface(surface) {
         return;
     }
     let Some(resolved) = crate::attribution::current() else {
@@ -1202,7 +1222,8 @@ mod tests {
                 );
                 assert_eq!(event.resolved_pricing_model, "gpt-4o-2024-08-06");
 
-                for (surface, management_kind) in [
+                for (surface, non_inference_kind) in [
+                    (crate::operation::COUNT_TOKENS, "count-tokens"),
                     (crate::operation::FILES, "file"),
                     (crate::operation::BATCHES, "batch"),
                     (crate::operation::FINE_TUNING, "fine-tuning"),
@@ -1218,11 +1239,11 @@ mod tests {
                     apply_wildcard_pricing_model(&mut management_event, surface, true);
                     assert!(
                         management_event.pricing_authority_id.is_empty(),
-                        "{management_kind} management event must not select wildcard pricing"
+                        "{non_inference_kind} non-inference event must not select wildcard pricing"
                     );
                     assert!(
                         management_event.resolved_pricing_model.is_empty(),
-                        "{management_kind} management event must not select wildcard pricing"
+                        "{non_inference_kind} non-inference event must not select wildcard pricing"
                     );
                 }
 
