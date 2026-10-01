@@ -1699,7 +1699,7 @@ fn raw_top_level_value_refs<'a>(body: &'a [u8], wanted_key: &str) -> Option<Vec<
 fn raw_top_level_values_except<'a>(body: &'a [u8], excluded: &[&str]) -> Option<Vec<RawJson<'a>>> {
     let mut values = Vec::new();
     raw_object_members(body, |key, value| {
-        if !excluded.iter().any(|excluded| key == *excluded) {
+        if !excluded.contains(&key) {
             values.push(value);
         }
     })?;
