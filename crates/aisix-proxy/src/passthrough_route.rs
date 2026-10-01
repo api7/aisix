@@ -580,36 +580,73 @@ async fn dispatch(
 
     // INPUT guardrails on the (envelope-extracted) request text.
     if !resolved_chain.is_empty() {
-        let text = request_guardrail_text(protocol, &body_bytes);
-        let chat = aisix_gateway::ChatFormat::new(
-            route.name.clone(),
-            vec![aisix_gateway::ChatMessage::user(text)],
-        );
-        let (verdict, hits) =
-            aisix_guardrails::Guardrail::check_input_unmaskable_observed(&resolved_chain, &chat)
-                .await;
-        monitor_hits.extend(hits);
-        if let aisix_guardrails::GuardrailVerdict::Block {
-            reason,
-            guardrail_name,
-            unavailable,
-        } = verdict
-        {
-            // Per #153 the matched-pattern detail stays in ops logs only.
-            tracing::warn!(
-                guardrail_hook = "input",
-                route = %route.name,
-                reason = %reason,
-                "guardrail blocked passthrough-route request",
+        let text = match try_request_guardrail_text(protocol, &body_bytes) {
+            Ok(text) => Some(text),
+            Err(err) if !err.is_depth_exceeded() => {
+                Some(request_guardrail_text(protocol, &body_bytes))
+            }
+            Err(err)
+                if !aisix_guardrails::Guardrail::refuses_unevaluable_input(&resolved_chain) =>
+            {
+                tracing::debug!(
+                    guardrail_hook = "input",
+                    route = %route.name,
+                    error = %err,
+                    "cannot scan passthrough-route request to its bounded depth; nothing attached both reads the request and fails closed",
+                );
+                resolved_chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+                None
+            }
+            Err(err) => {
+                tracing::warn!(
+                    guardrail_hook = "input",
+                    route = %route.name,
+                    error = %err,
+                    "cannot scan passthrough-route request to its bounded depth; blocking",
+                );
+                return Err(RouteError::of(
+                    crate::error::guardrail_block_error(
+                        "request",
+                        None,
+                        Some(crate::error::TAG_UNSCANNABLE_BODY),
+                    ),
+                    &auth,
+                ));
+            }
+        };
+        if let Some(text) = text {
+            let chat = aisix_gateway::ChatFormat::new(
+                route.name.clone(),
+                vec![aisix_gateway::ChatMessage::user(text)],
             );
-            return Err(RouteError::of(
-                crate::error::guardrail_block_error(
-                    "request",
-                    guardrail_name.as_deref(),
-                    unavailable.as_deref(),
-                ),
-                &auth,
-            ));
+            let (verdict, hits) = aisix_guardrails::Guardrail::check_input_unmaskable_observed(
+                &resolved_chain,
+                &chat,
+            )
+            .await;
+            monitor_hits.extend(hits);
+            if let aisix_guardrails::GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+                unavailable,
+            } = verdict
+            {
+                // Per #153 the matched-pattern detail stays in ops logs only.
+                tracing::warn!(
+                    guardrail_hook = "input",
+                    route = %route.name,
+                    reason = %reason,
+                    "guardrail blocked passthrough-route request",
+                );
+                return Err(RouteError::of(
+                    crate::error::guardrail_block_error(
+                        "request",
+                        guardrail_name.as_deref(),
+                        unavailable.as_deref(),
+                    ),
+                    &auth,
+                ));
+            }
         }
     }
 
@@ -959,42 +996,81 @@ async fn dispatch(
 
     // OUTPUT guardrails on the (envelope-extracted) response text.
     if !resolved_chain.is_empty() {
-        let text = response_guardrail_text(protocol, &resp_body);
-        let synth = aisix_gateway::ChatResponse {
-            id: String::new(),
-            model: route.name.clone(),
-            message: aisix_gateway::ChatMessage::assistant(text),
-            finish_reason: aisix_gateway::FinishReason::Stop,
-            usage: aisix_gateway::UsageStats::default(),
+        let text = match try_response_guardrail_text(protocol, &resp_body) {
+            Ok(text) => Some(text),
+            Err(err) if !err.is_depth_exceeded() => {
+                Some(response_guardrail_text(protocol, &resp_body))
+            }
+            Err(err)
+                if !aisix_guardrails::Guardrail::refuses_unevaluable_output(&resolved_chain) =>
+            {
+                tracing::debug!(
+                    guardrail_hook = "output",
+                    route = %route.name,
+                    error = %err,
+                    "cannot scan passthrough-route response to its bounded depth; nothing attached both reads the response and fails closed",
+                );
+                resolved_chain.record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+                None
+            }
+            Err(err) => {
+                tracing::warn!(
+                    guardrail_hook = "output",
+                    route = %route.name,
+                    error = %err,
+                    "cannot scan passthrough-route response to its bounded depth; blocking",
+                );
+                telemetry.guardrail_blocked = true;
+                telemetry.emitted = true;
+                return Err(RouteError::of(
+                    crate::error::guardrail_block_error(
+                        "response",
+                        None,
+                        Some(crate::error::TAG_UNSCANNABLE_BODY),
+                    ),
+                    &auth,
+                ));
+            }
         };
-        let (verdict, hits) =
-            aisix_guardrails::Guardrail::check_output_unmaskable_observed(&resolved_chain, &synth)
-                .await;
-        telemetry.monitor_hits.extend(hits);
-        if let aisix_guardrails::GuardrailVerdict::Block {
-            reason,
-            guardrail_name,
-            unavailable,
-        } = verdict
-        {
-            tracing::warn!(
-                guardrail_hook = "output",
-                route = %route.name,
-                reason = %reason,
-                "guardrail blocked passthrough-route response",
-            );
-            telemetry.guardrail_blocked = true;
-            // The telemetry guard has not emitted yet; drop it silently and
-            // let the shared error path report the 422.
-            telemetry.emitted = true;
-            return Err(RouteError::of(
-                crate::error::guardrail_block_error(
-                    "response",
-                    guardrail_name.as_deref(),
-                    unavailable.as_deref(),
-                ),
-                &auth,
-            ));
+        if let Some(text) = text {
+            let synth = aisix_gateway::ChatResponse {
+                id: String::new(),
+                model: route.name.clone(),
+                message: aisix_gateway::ChatMessage::assistant(text),
+                finish_reason: aisix_gateway::FinishReason::Stop,
+                usage: aisix_gateway::UsageStats::default(),
+            };
+            let (verdict, hits) = aisix_guardrails::Guardrail::check_output_unmaskable_observed(
+                &resolved_chain,
+                &synth,
+            )
+            .await;
+            telemetry.monitor_hits.extend(hits);
+            if let aisix_guardrails::GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+                unavailable,
+            } = verdict
+            {
+                tracing::warn!(
+                    guardrail_hook = "output",
+                    route = %route.name,
+                    reason = %reason,
+                    "guardrail blocked passthrough-route response",
+                );
+                telemetry.guardrail_blocked = true;
+                // The telemetry guard has not emitted yet; drop it silently and
+                // let the shared error path report the 422.
+                telemetry.emitted = true;
+                return Err(RouteError::of(
+                    crate::error::guardrail_block_error(
+                        "response",
+                        guardrail_name.as_deref(),
+                        unavailable.as_deref(),
+                    ),
+                    &auth,
+                ));
+            }
         }
     }
 
@@ -1398,15 +1474,39 @@ fn decoded_non_model_json_string_values(body: &[u8]) -> Option<String> {
     decoded_json_string_values_where(body, |path| !is_root_key(path, "model"))
 }
 
-fn decoded_json_string_values_including_empty(body: &[u8]) -> Option<String> {
-    crate::json_splice::collect_string_values(body).ok()
+fn decoded_json_string_values_including_empty(
+    body: &[u8],
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> Option<String> {
+    match crate::json_splice::collect_string_values(body) {
+        Ok(values) => Some(values),
+        Err(error) => {
+            if scan_error.is_none() {
+                *scan_error = Some(error);
+            }
+            None
+        }
+    }
 }
 
-fn decoded_json_string_values_except_root_keys(body: &[u8], excluded: &[&str]) -> Option<String> {
-    crate::json_splice::collect_string_values_where(body, |path| {
-        !excluded.iter().any(|key| is_root_key(path, key))
-    })
-    .ok()
+fn decoded_json_string_values_except_root_keys(
+    body: &[u8],
+    excluded: &[&str],
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> Option<String> {
+    let mut out = String::new();
+    for value in raw_top_level_values_except(body, excluded)? {
+        match crate::json_splice::collect_string_values(value.get().as_bytes()) {
+            Ok(values) => append_scan_text(&mut out, &values),
+            Err(error) => {
+                if scan_error.is_none() {
+                    *scan_error = Some(error);
+                }
+                return None;
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Source values of all occurrences of one top-level key. `RawValue` keeps
@@ -1445,6 +1545,46 @@ fn raw_top_level_values(
     let mut deserializer = serde_json::Deserializer::from_slice(body);
     let values =
         serde::de::Deserializer::deserialize_map(&mut deserializer, Values { wanted_key }).ok()?;
+    deserializer.end().ok()?;
+    Some(values)
+}
+
+/// Source values of top-level keys other than `excluded`. Values are captured
+/// as raw JSON before filtering so a known opaque carrier can be skipped
+/// without recursively deserializing its payload.
+fn raw_top_level_values_except(
+    body: &[u8],
+    excluded: &[&str],
+) -> Option<Vec<Box<serde_json::value::RawValue>>> {
+    struct Values<'a> {
+        excluded: &'a [&'a str],
+    }
+
+    impl<'de> serde::de::Visitor<'de> for Values<'_> {
+        type Value = Vec<Box<serde_json::value::RawValue>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON object")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut values = Vec::new();
+            while let Some(key) = map.next_key::<String>()? {
+                let value = map.next_value::<Box<serde_json::value::RawValue>>()?;
+                if !self.excluded.iter().any(|excluded| key == *excluded) {
+                    values.push(value);
+                }
+            }
+            Ok(values)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let values =
+        serde::de::Deserializer::deserialize_map(&mut deserializer, Values { excluded }).ok()?;
     deserializer.end().ok()?;
     Some(values)
 }
@@ -1636,6 +1776,7 @@ fn append_raw_text_value(out: &mut String, raw: &serde_json::value::RawValue) ->
 fn append_chat_request_content_strings(
     out: &mut String,
     content: &serde_json::value::RawValue,
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
 ) -> Option<()> {
     let value = content.get().trim_start();
     if value.starts_with('"') {
@@ -1654,7 +1795,7 @@ fn append_chat_request_content_strings(
         if !types.is_empty() && kind.is_none() {
             append_scan_text(
                 out,
-                &decoded_json_string_values_including_empty(block_body)?,
+                &decoded_json_string_values_including_empty(block_body, scan_error)?,
             );
             continue;
         }
@@ -1662,14 +1803,17 @@ fn append_chat_request_content_strings(
             Some("redacted_thinking") => {}
             Some("tool_result") => {
                 for nested in raw_top_level_values(block_body, "content")? {
-                    append_chat_request_content_strings(out, &nested)?;
+                    append_chat_request_content_strings(out, &nested, scan_error)?;
                 }
             }
             Some("tool_use") => {
                 for input in raw_top_level_values(block_body, "input")? {
                     append_scan_text(
                         out,
-                        &decoded_json_string_values_including_empty(input.get().as_bytes())?,
+                        &decoded_json_string_values_including_empty(
+                            input.get().as_bytes(),
+                            scan_error,
+                        )?,
                     );
                 }
             }
@@ -1683,6 +1827,7 @@ fn append_chat_request_content_strings(
 fn append_chat_request_message_strings(
     out: &mut String,
     message: &serde_json::value::RawValue,
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
 ) -> Option<()> {
     if !raw_is_object(message) {
         return Some(());
@@ -1693,26 +1838,33 @@ fn append_chat_request_message_strings(
         &decoded_json_string_values_except_root_keys(
             message_body,
             &["content", "tool_calls", "reasoning_content", "reasoning"],
+            scan_error,
         )?,
     );
     for content in raw_top_level_values(message_body, "content")? {
-        append_chat_request_content_strings(out, &content)?;
+        append_chat_request_content_strings(out, &content, scan_error)?;
     }
     for tool_calls in raw_top_level_values(message_body, "tool_calls")? {
         append_scan_text(
             out,
-            &decoded_json_string_values_including_empty(tool_calls.get().as_bytes())?,
+            &decoded_json_string_values_including_empty(tool_calls.get().as_bytes(), scan_error)?,
         );
     }
     append_raw_top_level_strings(out, message_body, "reasoning_content")?;
     Some(())
 }
 
-fn decoded_chat_request_string_values(body: &[u8]) -> Option<String> {
-    let mut out =
-        decoded_json_string_values_except_root_keys(body, &["model", "system", "messages"])?;
+fn decoded_chat_request_string_values(
+    body: &[u8],
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> Option<String> {
+    let mut out = decoded_json_string_values_except_root_keys(
+        body,
+        &["model", "system", "messages"],
+        scan_error,
+    )?;
     for system in raw_top_level_values(body, "system")? {
-        append_chat_request_content_strings(&mut out, &system)?;
+        append_chat_request_content_strings(&mut out, &system, scan_error)?;
     }
     for array in raw_top_level_values(body, "messages")? {
         // The selected (last) carrier made this a Chat envelope. Preserve
@@ -1722,7 +1874,7 @@ fn decoded_chat_request_string_values(body: &[u8]) -> Option<String> {
             continue;
         };
         for message in messages {
-            append_chat_request_message_strings(&mut out, &message)?;
+            append_chat_request_message_strings(&mut out, &message, scan_error)?;
         }
     }
     Some(out)
@@ -1731,6 +1883,7 @@ fn decoded_chat_request_string_values(body: &[u8]) -> Option<String> {
 fn append_responses_item_strings(
     out: &mut String,
     item: &serde_json::value::RawValue,
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
 ) -> Option<()> {
     if !raw_is_object(item) {
         return Some(());
@@ -1747,7 +1900,7 @@ fn append_responses_item_strings(
     ];
     append_scan_text(
         out,
-        &decoded_json_string_values_except_root_keys(item_body, &text_keys)?,
+        &decoded_json_string_values_except_root_keys(item_body, &text_keys, scan_error)?,
     );
     for key in text_keys {
         for value in raw_top_level_values(item_body, key)? {
@@ -1757,24 +1910,34 @@ fn append_responses_item_strings(
     Some(())
 }
 
-fn decoded_responses_request_string_values(body: &[u8]) -> Option<String> {
-    let mut out = decoded_json_string_values_except_root_keys(body, &["model", "input"])?;
+fn decoded_responses_request_string_values(
+    body: &[u8],
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> Option<String> {
+    let mut out =
+        decoded_json_string_values_except_root_keys(body, &["model", "input"], scan_error)?;
     for input in raw_top_level_values(body, "input")? {
         let value = input.get().trim_start();
         if value.starts_with('"') {
             append_raw_string_value(&mut out, &input)?;
         } else if value.starts_with('[') {
             for item in raw_array_items(&input)? {
-                append_responses_item_strings(&mut out, &item)?;
+                append_responses_item_strings(&mut out, &item, scan_error)?;
             }
         }
     }
     Some(out)
 }
 
-fn decoded_completions_request_string_values(body: &[u8]) -> Option<String> {
-    let mut out =
-        decoded_json_string_values_except_root_keys(body, &["model", "prompt", "suffix"])?;
+fn decoded_completions_request_string_values(
+    body: &[u8],
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> Option<String> {
+    let mut out = decoded_json_string_values_except_root_keys(
+        body,
+        &["model", "prompt", "suffix"],
+        scan_error,
+    )?;
     for prompt in raw_top_level_values(body, "prompt")? {
         let value = prompt.get().trim_start();
         if value.starts_with('"') {
@@ -1797,20 +1960,43 @@ fn decoded_completions_request_string_values(body: &[u8]) -> Option<String> {
 /// duplicate keys and stops at its default nesting limit. Scan decoded source
 /// values while preserving typed opaque boundaries: signed Anthropic
 /// `redacted_thinking`, image, and document payloads are not caller text.
-fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
+fn request_guardrail_text_with_scan_error(
+    protocol: PassthroughProtocol,
+    body: &[u8],
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> String {
     let raw = || String::from_utf8_lossy(body).into_owned();
     match protocol {
         PassthroughProtocol::Raw => decoded_json_string_values(body).unwrap_or_else(raw),
         PassthroughProtocol::OpenaiChat => {
-            decoded_chat_request_string_values(body).unwrap_or_else(raw)
+            decoded_chat_request_string_values(body, scan_error).unwrap_or_else(raw)
         }
         PassthroughProtocol::OpenaiCompletions => {
-            decoded_completions_request_string_values(body).unwrap_or_else(raw)
+            decoded_completions_request_string_values(body, scan_error).unwrap_or_else(raw)
         }
         PassthroughProtocol::OpenaiResponses => {
-            decoded_responses_request_string_values(body).unwrap_or_else(raw)
+            decoded_responses_request_string_values(body, scan_error).unwrap_or_else(raw)
         }
     }
+}
+
+fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
+    let mut ignored_scan_error = None;
+    request_guardrail_text_with_scan_error(protocol, body, &mut ignored_scan_error)
+}
+
+/// Like [`request_guardrail_text`], but preserves scanner failures from the
+/// exact typed source selectors that read a value for input inspection.
+fn try_request_guardrail_text(
+    protocol: PassthroughProtocol,
+    body: &[u8],
+) -> Result<String, crate::json_splice::SpliceError> {
+    if matches!(protocol, PassthroughProtocol::Raw) {
+        return crate::json_splice::collect_string_values(body);
+    }
+    let mut scan_error = None;
+    let text = request_guardrail_text_with_scan_error(protocol, body, &mut scan_error);
+    scan_error.map_or(Ok(text), Err)
 }
 
 /// Return the string field which an explicitly typed Chat content part
@@ -1937,6 +2123,7 @@ fn append_chat_output_message_strings(
 fn append_anthropic_output_content_strings(
     out: &mut String,
     content: &serde_json::value::RawValue,
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
 ) -> Option<()> {
     if !content.get().trim_start().starts_with('[') {
         return Some(());
@@ -1953,7 +2140,10 @@ fn append_anthropic_output_content_strings(
                 for input in raw_top_level_values(block_body, "input")? {
                     append_scan_text(
                         out,
-                        &decoded_json_string_values_including_empty(input.get().as_bytes())?,
+                        &decoded_json_string_values_including_empty(
+                            input.get().as_bytes(),
+                            scan_error,
+                        )?,
                     );
                 }
             }
@@ -1963,7 +2153,10 @@ fn append_anthropic_output_content_strings(
     Some(())
 }
 
-fn decoded_chat_response_string_values(body: &[u8]) -> Option<String> {
+fn decoded_chat_response_string_values(
+    body: &[u8],
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> Option<String> {
     let mut out = String::new();
     let choices = raw_top_level_values(body, "choices")?;
     let has_chat_choices = choices
@@ -1984,7 +2177,7 @@ fn decoded_chat_response_string_values(body: &[u8]) -> Option<String> {
     }
     if !has_chat_choices && raw_top_level_unique_type(body).as_deref() == Some("message") {
         for content in raw_top_level_values(body, "content")? {
-            append_anthropic_output_content_strings(&mut out, &content)?;
+            append_anthropic_output_content_strings(&mut out, &content, scan_error)?;
         }
     }
     Some(out)
@@ -2094,7 +2287,11 @@ fn decoded_responses_response_string_values(body: &[u8]) -> Option<String> {
 /// This deliberately reads raw source values rather than `Value`, retaining
 /// duplicate visible text and tool carriers which the client receives
 /// verbatim. Generated reasoning and opaque media remain out of scope.
-fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
+fn response_guardrail_text_with_scan_error(
+    protocol: PassthroughProtocol,
+    body: &[u8],
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> String {
     let raw = || String::from_utf8_lossy(body).into_owned();
     match protocol {
         PassthroughProtocol::Raw => decoded_json_string_values(body).unwrap_or_else(raw),
@@ -2102,7 +2299,7 @@ fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String
             // A detected Chat response can carry opaque multimodal values.
             // Without a successful type-aware selection, relay it but do not
             // send a raw fallback to an external output guardrail.
-            decoded_chat_response_string_values(body).unwrap_or_default()
+            decoded_chat_response_string_values(body, scan_error).unwrap_or_default()
         }
         PassthroughProtocol::OpenaiCompletions => {
             decoded_non_model_json_string_values(body).unwrap_or_else(raw)
@@ -2113,6 +2310,38 @@ fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String
             // image/audio/file data. Privacy wins over a raw fallback here.
             decoded_responses_response_string_values(body).unwrap_or_default()
         }
+    }
+}
+
+fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
+    let mut ignored_scan_error = None;
+    response_guardrail_text_with_scan_error(protocol, body, &mut ignored_scan_error)
+}
+
+/// Like [`response_guardrail_text`], but preserves scanner failures from the
+/// exact typed source selectors that read a value for output inspection.
+fn try_response_guardrail_text(
+    protocol: PassthroughProtocol,
+    body: &[u8],
+) -> Result<String, crate::json_splice::SpliceError> {
+    match protocol {
+        PassthroughProtocol::Raw => crate::json_splice::collect_string_values(body),
+        PassthroughProtocol::OpenaiCompletions => {
+            let text = crate::json_splice::collect_string_values_where(body, |path| {
+                !is_root_key(path, "model")
+            })?;
+            Ok(if text.is_empty() {
+                response_guardrail_text(protocol, body)
+            } else {
+                text
+            })
+        }
+        PassthroughProtocol::OpenaiChat => {
+            let mut scan_error = None;
+            let text = response_guardrail_text_with_scan_error(protocol, body, &mut scan_error);
+            scan_error.map_or(Ok(text), Err)
+        }
+        PassthroughProtocol::OpenaiResponses => Ok(response_guardrail_text(protocol, body)),
     }
 }
 
@@ -3212,7 +3441,10 @@ fn anthropic_source_continuations(
                     "text",
                 ),
                 Some("tool_use") => {
-                    let mut inputs = raw_top_level_values(block_body, "input").ok_or(())?;
+                    let mut inputs = match raw_top_level_values(block_body, "input") {
+                        Some(inputs) => inputs,
+                        None => return SourceContinuations::Unevaluable,
+                    };
                     let Some(input) = inputs.pop() else {
                         return SourceContinuations::Absent;
                     };
@@ -3237,8 +3469,11 @@ fn anthropic_source_continuations(
                         // durable leaf identity on this envelope. An empty object is
                         // harmless; a visible value must use the bounded policy.
                         let text =
-                            crate::json_splice::collect_string_values(input.get().as_bytes())
-                                .map_err(|_| ())?;
+                            match crate::json_splice::collect_string_values(input.get().as_bytes())
+                            {
+                                Ok(text) => text,
+                                Err(_) => return SourceContinuations::Unevaluable,
+                            };
                         if text.is_empty() {
                             Ok(())
                         } else {

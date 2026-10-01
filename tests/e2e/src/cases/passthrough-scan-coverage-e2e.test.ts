@@ -47,9 +47,21 @@ const RAW_SUFFIX_SSE = `"BIDDEN"`;
 const RAW_HELD_BLOCK_SSE = `"FORBIDDEN"`;
 const deepEscapedBlockJSON = (depth: number) =>
   `${'{"v":'.repeat(depth)}"${String.raw`\u0042LOCKME`}"${'}'.repeat(depth)}`;
+const deepLiteralBlockJSON = (depth: number) =>
+  `${'{"v":'.repeat(depth)}"${ESCAPED_BLOCK}"${'}'.repeat(depth)}`;
 // Above serde_json's default recursion limit. It remains valid JSON and the
 // provider receives it verbatim, so Raw guardrails must still decode the leaf.
 const DEEP_ESCAPED_BLOCK_JSON = deepEscapedBlockJSON(160);
+// Mirrors `json_splice::MAX_JSON_DEPTH`: one deeper is unscannable and must
+// use the resolved guardrail failure policy instead of falling back to escapes.
+const JSON_DEPTH_CAP = 4_096;
+const OVER_DEPTH_ESCAPED_BLOCK_JSON = deepEscapedBlockJSON(JSON_DEPTH_CAP + 1);
+const OVER_DEPTH_OPAQUE_BLOCK_JSON = deepLiteralBlockJSON(JSON_DEPTH_CAP + 1);
+const OVER_DEPTH_CHAT_INPUT = `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"go","metadata":${OVER_DEPTH_ESCAPED_BLOCK_JSON}}]}`;
+const OVER_DEPTH_RESPONSES_INPUT = `{"model":"gpt-4o-mini","input":[{"role":"user","metadata":${OVER_DEPTH_ESCAPED_BLOCK_JSON},"content":[{"type":"input_text","text":"go"}]}]}`;
+const OVER_DEPTH_CHAT_OPAQUE_INPUT = `{"model":"gpt-4o-mini","messages":[{"role":"user","content":[{"type":"image","source":{"data":"image","metadata":${OVER_DEPTH_OPAQUE_BLOCK_JSON}}},{"type":"text","text":"go"}]}]}`;
+const OVER_DEPTH_RESPONSES_OPAQUE_INPUT = `{"model":"gpt-4o-mini","input":[{"role":"user","content":[{"type":"input_image","image_url":{"url":"https://example.invalid/image","metadata":${OVER_DEPTH_OPAQUE_BLOCK_JSON}}},{"type":"input_text","text":"go"}]}]}`;
+const OVER_DEPTH_ANTHROPIC_TOOL_OUTPUT = `{"type":"message","content":[{"type":"tool_use","id":"tool_1","name":"lookup","input":${OVER_DEPTH_ESCAPED_BLOCK_JSON}}]}`;
 const CAP = 1_000;
 const SPLIT_BLOCK = "FORBIDDEN";
 const SPLIT_BLOCK_REGEX = String.raw`FOR\s*BIDDEN`;
@@ -153,6 +165,18 @@ describe("passthrough guardrail scan coverage", () => {
     });
     upstreams["raw-deep-output"] = await startOpenAiUpstream({
       rawBody: DEEP_ESCAPED_BLOCK_JSON,
+      rawContentType: "application/json",
+    });
+    upstreams["raw-over-depth-output"] = await startOpenAiUpstream({
+      rawBody: OVER_DEPTH_ESCAPED_BLOCK_JSON,
+      rawContentType: "application/json",
+    });
+    upstreams["completions-over-depth-output"] = await startOpenAiUpstream({
+      rawBody: OVER_DEPTH_ESCAPED_BLOCK_JSON,
+      rawContentType: "application/json",
+    });
+    upstreams["anthropic-over-depth-tool-output"] = await startOpenAiUpstream({
+      rawBody: OVER_DEPTH_ANTHROPIC_TOOL_OUTPUT,
       rawContentType: "application/json",
     });
     upstreams["raw-deep-stream"] = await startOpenAiUpstream({
@@ -523,6 +547,46 @@ describe("passthrough guardrail scan coverage", () => {
     expect(upstreams.input!.receivedRequests.length).toBe(before);
   });
 
+  test("input: Raw JSON beyond the scanner depth cap fails closed", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams.input!.receivedRequests.length;
+    const res = await callRaw("input", "/v1/any", OVER_DEPTH_ESCAPED_BLOCK_JSON);
+    expect(res.status).toBe(422);
+    const body = await res.text();
+    expect(body).toContain("guardrail_unavailable");
+    expect(body).toContain("unscannable_body");
+    expect(body).not.toContain(ESCAPED_BLOCK);
+    expect(upstreams.input!.receivedRequests.length).toBe(before);
+  });
+
+  test.for([
+    ["Chat", OVER_DEPTH_CHAT_INPUT],
+    ["Responses", OVER_DEPTH_RESPONSES_INPUT],
+  ] as const)("input: %s envelope beyond the scanner depth cap fails closed", async ([, body], ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams.input!.receivedRequests.length;
+    const res = await callRaw("input", "/v1/any", body);
+    expect(res.status).toBe(422);
+    const response = await res.text();
+    expect(response).toContain("guardrail_unavailable");
+    expect(response).toContain("unscannable_body");
+    expect(response).not.toContain(ESCAPED_BLOCK);
+    expect(upstreams.input!.receivedRequests.length).toBe(before);
+  });
+
+  test.for([
+    ["Chat", OVER_DEPTH_CHAT_OPAQUE_INPUT],
+    ["Responses", OVER_DEPTH_RESPONSES_OPAQUE_INPUT],
+  ] as const)("input: %s opaque media beyond the scanner depth cap stays out of scope", async ([, body], ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams.input!.receivedRequests.length;
+    const res = await callRaw("input", "/v1/any", body);
+    expect(res.status).toBe(200);
+    await res.text();
+    expect(upstreams.input!.receivedRequests.length).toBe(before + 1);
+    expect(upstreams.input!.receivedRequests.at(-1)!.body).toBe(body);
+  });
+
   test("input: safe raw JSON keeps its original bytes upstream", async (ctx) => {
     if (!ready(ctx)) return;
     const before = upstreams.input!.receivedRequests.length;
@@ -562,6 +626,53 @@ describe("passthrough guardrail scan coverage", () => {
     expect(body).toContain("pt-scan-output");
     expect(body).not.toContain(ESCAPED_BLOCK);
     expect(upstreams["raw-deep-output"]!.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("output: Raw JSON beyond the scanner depth cap fails closed", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams["raw-over-depth-output"]!.receivedRequests.length;
+    const res = await callRaw("raw-over-depth-output", "/v1/any", String.raw`{"state":"clean"}`);
+    expect(res.status).toBe(422);
+    const body = await res.text();
+    expect(body).toContain("guardrail_unavailable");
+    expect(body).toContain("unscannable_body");
+    expect(body).not.toContain(ESCAPED_BLOCK);
+    expect(upstreams["raw-over-depth-output"]!.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("output: completions JSON beyond the scanner depth cap fails closed", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams["completions-over-depth-output"]!.receivedRequests.length;
+    const res = await callRaw(
+      "completions-over-depth-output",
+      "/v1/completions",
+      `{"model":"gpt-4o-mini","prompt":"go"}`,
+    );
+    expect(res.status).toBe(422);
+    const body = await res.text();
+    expect(body).toContain("guardrail_unavailable");
+    expect(body).toContain("unscannable_body");
+    expect(body).not.toContain(ESCAPED_BLOCK);
+    expect(upstreams["completions-over-depth-output"]!.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("output: Anthropic tool input beyond the scanner depth cap fails closed", async (ctx) => {
+    if (!ready(ctx)) return;
+    const route = "anthropic-over-depth-tool-output";
+    const upstream = upstreams[route];
+    if (!upstream) throw new Error(`missing ${route} upstream`);
+    const before = upstream.receivedRequests.length;
+    const res = await callRaw(
+      route,
+      "/v1/any",
+      `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"go"}]}`,
+    );
+    expect(res.status).toBe(422);
+    const response = await res.text();
+    expect(response).toContain("guardrail_unavailable");
+    expect(response).toContain("unscannable_body");
+    expect(response).not.toContain(ESCAPED_BLOCK);
+    expect(upstream.receivedRequests.length).toBe(before + 1);
   });
 
   test("output: raw SSE JSON escapes are decoded before scanning", async (ctx) => {
@@ -652,16 +763,18 @@ describe("passthrough guardrail scan coverage", () => {
 });
 
 // This is intentionally a separate DP: the main suite has an env-scoped
-// blocking row, so it cannot demonstrate the live, monitor-only policy of
-// an output `fail_open: true` chain.
+// blocking row, so it cannot demonstrate the live fail-open policy on either
+// an unevaluable Raw input or output stream.
 describe("passthrough Raw stream unevaluable-output fail-open", () => {
   const caller = "sk-pt-scan-fail-open";
   const callerHash = createHash("sha256").update(caller).digest("hex");
   const route = "pt-scan-fail-open";
+  const depthInputRoute = "pt-scan-depth-fail-open-input";
   const logstore = "pt-scan-fail-open";
   const credentialRef = "pt_scan_open";
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
+  let depthInputUpstream: OpenAiUpstream | undefined;
   let sls: MockSls | undefined;
   let etcdReachable = false;
 
@@ -678,6 +791,10 @@ describe("passthrough Raw stream unevaluable-output fail-open", () => {
         `data: ${RAW_SUFFIX_SSE}\n\n`,
         "data: [DONE]\n\n",
       ],
+    });
+    depthInputUpstream = await startOpenAiUpstream({
+      rawBody: SAFE_ESCAPED_JSON,
+      rawContentType: "application/json",
     });
     app = await spawnApp({
       extraEnv: {
@@ -706,6 +823,20 @@ describe("passthrough Raw stream unevaluable-output fail-open", () => {
       target_url: upstream.baseUrl,
       provider_key_id: providerKey.id,
     });
+    await seed.createPassthroughRoute({
+      name: depthInputRoute,
+      path_prefix: `/${depthInputRoute}`,
+      target_url: depthInputUpstream.baseUrl,
+      provider_key_id: providerKey.id,
+    });
+    await seed.createGuardrail({
+      name: "pt-scan-depth-fail-open-input",
+      enabled: true,
+      hook_point: "input",
+      fail_open: true,
+      kind: "keyword",
+      patterns: [{ kind: "literal", value: ESCAPED_BLOCK }],
+    });
     await seed.createGuardrail({
       name: "pt-scan-fail-open-output",
       enabled: true,
@@ -732,7 +863,31 @@ describe("passthrough Raw stream unevaluable-output fail-open", () => {
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
+    await depthInputUpstream?.close();
     await sls?.close();
+  });
+
+  test("forwards Raw JSON beyond the depth cap only under input fail_open", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !depthInputUpstream) return ctx.skip();
+
+    const before = depthInputUpstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/${depthInputRoute}/v1/any`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${caller}`, "content-type": "application/json" },
+      body: OVER_DEPTH_ESCAPED_BLOCK_JSON,
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(SAFE_ESCAPED_JSON);
+    expect(depthInputUpstream.receivedRequests.length).toBe(before + 1);
+
+    const log = await waitForSlsLog(
+      sls,
+      logstore,
+      (entry) => entry.get("passthrough_route_name") === depthInputRoute,
+      "fail-open depth-capped passthrough usage event",
+    );
+    expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
+    expect(log.get("guardrail_bypassed_reason")).toBe("unscannable_body");
   });
 
   test("starts a new live scan epoch after an unkeyable Raw SSE object", async (ctx) => {

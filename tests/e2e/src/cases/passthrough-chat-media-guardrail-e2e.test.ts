@@ -36,6 +36,9 @@ const STREAM_TOOL = "stream-tool-arguments-sentinel";
 const BUFFERED_MESSAGE_REFUSAL = "buffered-message-refusal-BLOCKME";
 const BUFFERED_CONTENT_REFUSAL = "buffered-content-refusal-BLOCKME";
 const STREAM_REFUSAL = "stream-refusal-BLOCKME";
+// `openai_moderation` uses the default whole-stream hold cap (256 KiB).
+const STREAM_REFUSAL_CAP = 262_144;
+const STREAM_OVERSIZED_REFUSAL = `stream-oversized-refusal-${"x".repeat(STREAM_REFUSAL_CAP + 1)}`;
 
 interface ModerationSink {
   baseUrl: string;
@@ -188,6 +191,52 @@ const streamedRefusalResponse = [
   "data: [DONE]\n\n",
 ];
 
+const streamedOversizedRefusalResponse = [
+  `data: ${JSON.stringify({
+    id: "chat_oversized_refusal_stream",
+    object: "chat.completion.chunk",
+    model: "gpt-4o-mini",
+    choices: [{ index: 0, delta: { role: "assistant", refusal: STREAM_OVERSIZED_REFUSAL } }],
+  })}\n\n`,
+  "data: [DONE]\n\n",
+];
+
+const streamedOversizedContentRefusalResponse = [
+  `data: ${JSON.stringify({
+    id: "chat_oversized_content_refusal_stream",
+    object: "chat.completion.chunk",
+    model: "gpt-4o-mini",
+    choices: [
+      {
+        index: 0,
+        delta: {
+          role: "assistant",
+          content: [{ index: 0, type: "refusal", refusal: STREAM_OVERSIZED_REFUSAL }],
+        },
+      },
+    ],
+  })}\n\n`,
+  "data: [DONE]\n\n",
+];
+
+const streamedOversizedLegacyToolResponse = [
+  `data: ${JSON.stringify({
+    id: "chat_oversized_legacy_tool_stream",
+    object: "chat.completion.chunk",
+    model: "gpt-4o-mini",
+    choices: [
+      {
+        index: 0,
+        delta: {
+          role: "assistant",
+          function_call: { name: "lookup", arguments: STREAM_OVERSIZED_REFUSAL },
+        },
+      },
+    ],
+  })}\n\n`,
+  "data: [DONE]\n\n",
+];
+
 describe("Chat passthrough keeps media out of external output guardrails", () => {
   let app: SpawnedApp | undefined;
   let seed: SeedClient | undefined;
@@ -196,6 +245,9 @@ describe("Chat passthrough keeps media out of external output guardrails", () =>
   let bufferedMessageRefusalUpstream: OpenAiUpstream | undefined;
   let bufferedContentRefusalUpstream: OpenAiUpstream | undefined;
   let streamRefusalUpstream: OpenAiUpstream | undefined;
+  let streamOversizedRefusalUpstream: OpenAiUpstream | undefined;
+  let streamOversizedContentRefusalUpstream: OpenAiUpstream | undefined;
+  let streamOversizedLegacyToolUpstream: OpenAiUpstream | undefined;
   let moderation: ModerationSink | undefined;
   let etcdReachable = false;
 
@@ -214,6 +266,15 @@ describe("Chat passthrough keeps media out of external output guardrails", () =>
       nonStreamBody: bufferedContentRefusalResponse,
     });
     streamRefusalUpstream = await startOpenAiUpstream({ rawStreamFrames: streamedRefusalResponse });
+    streamOversizedRefusalUpstream = await startOpenAiUpstream({
+      rawStreamFrames: streamedOversizedRefusalResponse,
+    });
+    streamOversizedContentRefusalUpstream = await startOpenAiUpstream({
+      rawStreamFrames: streamedOversizedContentRefusalResponse,
+    });
+    streamOversizedLegacyToolUpstream = await startOpenAiUpstream({
+      rawStreamFrames: streamedOversizedLegacyToolResponse,
+    });
     app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
 
@@ -252,6 +313,24 @@ describe("Chat passthrough keeps media out of external output guardrails", () =>
       target_url: streamRefusalUpstream.baseUrl,
       provider_key_id: providerKey.id,
     });
+    await seed.createPassthroughRoute({
+      name: "passthrough-chat-refusal-stream-oversized",
+      path_prefix: "/chat-refusal-stream-oversized",
+      target_url: streamOversizedRefusalUpstream.baseUrl,
+      provider_key_id: providerKey.id,
+    });
+    await seed.createPassthroughRoute({
+      name: "passthrough-chat-refusal-stream-oversized-content",
+      path_prefix: "/chat-refusal-stream-oversized-content",
+      target_url: streamOversizedContentRefusalUpstream.baseUrl,
+      provider_key_id: providerKey.id,
+    });
+    await seed.createPassthroughRoute({
+      name: "passthrough-chat-legacy-tool-stream-oversized",
+      path_prefix: "/chat-legacy-tool-stream-oversized",
+      target_url: streamOversizedLegacyToolUpstream.baseUrl,
+      provider_key_id: providerKey.id,
+    });
     await seed.createGuardrail({
       name: "passthrough-chat-media-output",
       enabled: true,
@@ -279,6 +358,9 @@ describe("Chat passthrough keeps media out of external output guardrails", () =>
     await bufferedMessageRefusalUpstream?.close();
     await bufferedContentRefusalUpstream?.close();
     await streamRefusalUpstream?.close();
+    await streamOversizedRefusalUpstream?.close();
+    await streamOversizedContentRefusalUpstream?.close();
+    await streamOversizedLegacyToolUpstream?.close();
     await moderation?.close();
   });
 
@@ -425,5 +507,56 @@ describe("Chat passthrough keeps media out of external output guardrails", () =>
       return;
     }
     await expectBlockedRefusal("chat-refusal-stream", true, streamRefusalUpstream, STREAM_REFUSAL);
+  });
+
+  test("streamed Chat refusal deltas count toward the output hold cap", async (ctx) => {
+    if (!etcdReachable || !app || !streamOversizedRefusalUpstream || !moderation) {
+      ctx.skip();
+      return;
+    }
+    const upstreamBefore = streamOversizedRefusalUpstream.receivedRequests.length;
+    const moderationBefore = moderation.inputs.length;
+    const response = await request("chat-refusal-stream-oversized", true);
+    const body = await response.text();
+    const bodyExcerpt = body.slice(0, 512);
+    expect(response.status, bodyExcerpt).toBe(200);
+    expect(body.includes("output_buffer_exceeded"), bodyExcerpt).toBe(true);
+    expect(body.includes(STREAM_OVERSIZED_REFUSAL), bodyExcerpt).toBe(false);
+    expect(streamOversizedRefusalUpstream.receivedRequests.length).toBe(upstreamBefore + 1);
+    expect(moderation.inputs.slice(moderationBefore)).toHaveLength(0);
+  });
+
+  test("streamed typed Chat refusals count toward the output hold cap", async (ctx) => {
+    if (!etcdReachable || !app || !streamOversizedContentRefusalUpstream || !moderation) {
+      ctx.skip();
+      return;
+    }
+    const upstreamBefore = streamOversizedContentRefusalUpstream.receivedRequests.length;
+    const moderationBefore = moderation.inputs.length;
+    const response = await request("chat-refusal-stream-oversized-content", true);
+    const body = await response.text();
+    const bodyExcerpt = body.slice(0, 512);
+    expect(response.status, bodyExcerpt).toBe(200);
+    expect(body.includes("output_buffer_exceeded"), bodyExcerpt).toBe(true);
+    expect(body.includes(STREAM_OVERSIZED_REFUSAL), bodyExcerpt).toBe(false);
+    expect(streamOversizedContentRefusalUpstream.receivedRequests.length).toBe(upstreamBefore + 1);
+    expect(moderation.inputs.slice(moderationBefore)).toHaveLength(0);
+  });
+
+  test("streamed legacy Chat tool arguments count toward the output hold cap", async (ctx) => {
+    if (!etcdReachable || !app || !streamOversizedLegacyToolUpstream || !moderation) {
+      ctx.skip();
+      return;
+    }
+    const upstreamBefore = streamOversizedLegacyToolUpstream.receivedRequests.length;
+    const moderationBefore = moderation.inputs.length;
+    const response = await request("chat-legacy-tool-stream-oversized", true);
+    const body = await response.text();
+    const bodyExcerpt = body.slice(0, 512);
+    expect(response.status, bodyExcerpt).toBe(200);
+    expect(body.includes("output_buffer_exceeded"), bodyExcerpt).toBe(true);
+    expect(body.includes(STREAM_OVERSIZED_REFUSAL), bodyExcerpt).toBe(false);
+    expect(streamOversizedLegacyToolUpstream.receivedRequests.length).toBe(upstreamBefore + 1);
+    expect(moderation.inputs.slice(moderationBefore)).toHaveLength(0);
   });
 });

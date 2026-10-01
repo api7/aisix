@@ -2,8 +2,8 @@
 //!
 //! While a stream is held back for output inspection (a hold-back
 //! [`aisix_guardrails::StreamOutputPolicy`]), the cap bounds
-//! the model-generated content held: assistant text, reasoning, and
-//! tool-call arguments. SSE and JSON framing — event names, ids, indexes,
+//! the model-generated content held: assistant text, refusals, reasoning,
+//! and tool-call arguments. SSE and JSON framing — event names, ids, indexes,
 //! the envelope around each delta — is never counted, so the same response
 //! trips the cap at the same point whichever route and wire protocol
 //! carries it.
@@ -193,8 +193,9 @@ pub(crate) fn chat_delta(delta: &ChatDelta) -> usize {
 }
 
 /// One stream event split the way the output guardrails read it: `scan`
-/// is the generated text they inspect (assistant text and tool-call
-/// arguments), `reasoning` the generated reasoning they do not inspect.
+/// is the generated text they inspect (assistant text, refusals, and
+/// tool-call arguments), `reasoning` the generated reasoning they do not
+/// inspect.
 /// Both count toward the hold-back cap, so [`Parts::held`] is the cap's
 /// measure and `scan` the scanner's input — one extraction for both.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -268,8 +269,8 @@ pub(crate) fn responses_event_parts(v: &Value) -> Parts {
 }
 
 /// An OpenAI chat-completions stream chunk: every choice's `delta.content`
-/// and tool-call arguments are scanned; `reasoning_content` (or the
-/// `reasoning` spelling some relays use) is reasoning.
+/// refusals, and tool-call arguments are scanned; `reasoning_content` (or
+/// the `reasoning` spelling some relays use) is reasoning.
 pub(crate) fn chat_chunk_parts(v: &Value) -> Parts {
     let mut p = Parts::default();
     for delta in v
@@ -284,10 +285,14 @@ pub(crate) fn chat_chunk_parts(v: &Value) -> Parts {
             Some(Value::Array(parts)) => {
                 for part in parts {
                     p.scan_str(part.get("text"));
+                    if part.get("type").and_then(Value::as_str) == Some("refusal") {
+                        p.scan_str(part.get("refusal"));
+                    }
                 }
             }
             _ => {}
         }
+        p.scan_str(delta.get("refusal"));
         for tc in delta
             .get("tool_calls")
             .and_then(Value::as_array)
@@ -297,6 +302,7 @@ pub(crate) fn chat_chunk_parts(v: &Value) -> Parts {
             p.scan_str(tc.get("function").and_then(|f| f.get("arguments")));
             p.scan_str(tc.get("custom").and_then(|c| c.get("input")));
         }
+        p.scan_str(delta.get("function_call").and_then(|f| f.get("arguments")));
         p.reasoning_str(delta.get("reasoning_content"));
         p.reasoning_str(delta.get("reasoning"));
     }
@@ -361,6 +367,36 @@ mod tests {
             ]),
         };
         assert_eq!(chat_delta(&delta), 3 + 2 + 7);
+    }
+
+    #[test]
+    fn chat_chunk_counts_refusals_and_legacy_tool_arguments_as_scanned_content() {
+        let direct = "direct streamed refusal";
+        let direct_parts = chat_chunk_parts(&json!({
+            "choices": [{"delta": {"refusal": direct}}],
+        }));
+        assert_eq!(direct_parts.scan, direct);
+        assert_eq!(direct_parts.held(), direct.len());
+
+        let typed = "typed streamed refusal";
+        let typed_parts = chat_chunk_parts(&json!({
+            "choices": [{"delta": {"content": [{"type": "refusal", "refusal": typed}]}}],
+        }));
+        assert_eq!(typed_parts.scan, typed);
+        assert_eq!(typed_parts.held(), typed.len());
+
+        let opaque_parts = chat_chunk_parts(&json!({
+            "choices": [{"delta": {"content": [{"type": "future_media", "refusal": typed}]}}],
+        }));
+        assert!(opaque_parts.scan.is_empty());
+        assert_eq!(opaque_parts.held(), 0);
+
+        let arguments = "legacy streamed tool arguments";
+        let legacy_parts = chat_chunk_parts(&json!({
+            "choices": [{"delta": {"function_call": {"arguments": arguments}}}],
+        }));
+        assert_eq!(legacy_parts.scan, arguments);
+        assert_eq!(legacy_parts.held(), arguments.len());
     }
 
     #[test]

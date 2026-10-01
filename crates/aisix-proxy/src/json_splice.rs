@@ -15,9 +15,10 @@
 //! but they ARE decoded to build the path handed to the predicate.
 //!
 //! The scanner is iterative, so deeply nested JSON does not consume the
-//! Rust call stack. It still fails safe: any unexpected byte or overrun
-//! returns an error rather than a partially rewritten document. Callers
-//! decide the failure policy (the MCP output hook fails closed).
+//! Rust call stack. [`MAX_JSON_DEPTH`] bounds its per-request traversal
+//! allocations. It still fails safe: any unexpected byte, overrun, or
+//! depth excess returns an error rather than a partially rewritten document.
+//! Callers decide the failure policy (the MCP output hook fails closed).
 
 use std::ops::Range;
 
@@ -39,11 +40,31 @@ impl PathSeg {
 
 /// Scanner failure. Carries no document content (the byte offset only),
 /// so an error can be logged without leaking the payload.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpliceErrorKind {
+    Invalid,
+    DepthExceeded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("json splice scan failed at byte {at}")]
 pub struct SpliceError {
     at: usize,
+    kind: SpliceErrorKind,
 }
+
+impl SpliceError {
+    /// Whether the scanner stopped at its bounded traversal limit rather than
+    /// because the input was malformed.
+    pub(crate) fn is_depth_exceeded(self) -> bool {
+        self.kind == SpliceErrorKind::DepthExceeded
+    }
+}
+
+/// Traversal depth cap. This keeps the iterative scanner stack-safe without
+/// allowing an unbounded JSON path/frame allocation from an unbounded raw
+/// passthrough body. It remains well beyond serde_json's usual recursion cap.
+const MAX_JSON_DEPTH: usize = 4_096;
 
 /// Rewrite the string values of `input` selected by `should_rewrite`,
 /// leaving every other byte untouched.
@@ -65,7 +86,10 @@ pub fn rewrite_string_values(
         Array,
     }
 
-    let err = |at: usize| SpliceError { at };
+    let err = |at: usize| SpliceError {
+        at,
+        kind: SpliceErrorKind::Invalid,
+    };
     let mut splices: Vec<(Range<usize>, String)> = Vec::new();
     let mut path: Vec<PathSeg> = Vec::new();
     let mut frames: Vec<Frame> = Vec::new();
@@ -87,11 +111,17 @@ pub fn rewrite_string_values(
                 _ => i += 1,
             }
         }
-        Err(SpliceError { at: start })
+        Err(SpliceError {
+            at: start,
+            kind: SpliceErrorKind::Invalid,
+        })
     };
     let decode_str = |range: Range<usize>| -> Result<String, SpliceError> {
         let at = range.start;
-        serde_json::from_slice::<String>(&input[range]).map_err(|_| SpliceError { at })
+        serde_json::from_slice::<String>(&input[range]).map_err(|_| SpliceError {
+            at,
+            kind: SpliceErrorKind::Invalid,
+        })
     };
 
     // `true` → the loop continues at a VALUE position; `false` → the
@@ -102,6 +132,12 @@ pub fn rewrite_string_values(
         match b {
             b'{' => {
                 frames.push(Frame::Object);
+                if frames.len() > MAX_JSON_DEPTH {
+                    return Err(SpliceError {
+                        at: pos,
+                        kind: SpliceErrorKind::DepthExceeded,
+                    });
+                }
                 pos += 1;
                 skip_ws(&mut pos);
                 match input.get(pos) {
@@ -126,6 +162,12 @@ pub fn rewrite_string_values(
             }
             b'[' => {
                 frames.push(Frame::Array);
+                if frames.len() > MAX_JSON_DEPTH {
+                    return Err(SpliceError {
+                        at: pos,
+                        kind: SpliceErrorKind::DepthExceeded,
+                    });
+                }
                 pos += 1;
                 skip_ws(&mut pos);
                 if input.get(pos) == Some(&b']') {
@@ -233,9 +275,10 @@ pub fn rewrite_string_values(
 /// Decode and collect every JSON string **value** in source order.
 ///
 /// This reuses the iterative splice scanner with a no-op rewrite, so it
-/// preserves duplicate keys and keeps working beyond serde_json's default
-/// container-recursion limit. Object keys are decoded only to maintain the
-/// scanner's structure and are never included in the returned text.
+/// preserves duplicate keys and works beyond serde_json's default
+/// container-recursion limit, up to [`MAX_JSON_DEPTH`]. Object keys are
+/// decoded only to maintain the scanner's structure and are never included in
+/// the returned text.
 pub fn collect_string_values(input: &[u8]) -> Result<String, SpliceError> {
     collect_string_values_where(input, |_| true)
 }
@@ -243,8 +286,8 @@ pub fn collect_string_values(input: &[u8]) -> Result<String, SpliceError> {
 /// Decode and collect selected JSON string **values** in source order.
 ///
 /// Like [`collect_string_values`], this preserves duplicate keys and stays
-/// stack-safe for deeply nested documents. The predicate sees the decoded
-/// path of each string value, never an object key.
+/// stack-safe within the bounded nesting limit. The predicate sees the
+/// decoded path of each string value, never an object key.
 pub fn collect_string_values_where(
     input: &[u8],
     mut include: impl FnMut(&[PathSeg]) -> bool,
@@ -487,5 +530,13 @@ mod tests {
         assert!(rewrite_string_values(doc.as_bytes(), |_| true, |_| None)
             .expect("valid deep JSON")
             .is_none());
+    }
+
+    #[test]
+    fn nesting_beyond_the_cap_errors() {
+        let depth = MAX_JSON_DEPTH + 1;
+        let doc = format!("{}\"value\"{}", "[".repeat(depth), "]".repeat(depth));
+        let err = rewrite_string_values(doc.as_bytes(), |_| true, |_| None).unwrap_err();
+        assert!(err.is_depth_exceeded());
     }
 }
