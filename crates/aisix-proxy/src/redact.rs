@@ -1004,7 +1004,11 @@ fn redact_responses_item(
                 for part in parts {
                     let field = match part.get("type").and_then(Value::as_str) {
                         Some("input_text" | "output_text" | "text") => Some("text"),
-                        Some("refusal") if dir.is_output() => Some("refusal"),
+                        Some("refusal")
+                            if matches!(dir, Direction::Output | Direction::OutputEcho) =>
+                        {
+                            Some("refusal")
+                        }
                         _ => None,
                     };
                     if let Some(field) = field.and_then(|field| part.get_mut(field)) {

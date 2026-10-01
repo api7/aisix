@@ -4015,11 +4015,11 @@ fn responses_stream_coordinates(
         .ok_or(())
         .and_then(bounded_stream_source_id)?;
     let output_index = raw_top_level_unique_index(payload, "output_index")?
-        .ok_or(())
+        .ok_or(())?
         .to_string();
     let content_index = if needs_content_index {
         raw_top_level_unique_index(payload, "content_index")?
-            .ok_or(())
+            .ok_or(())?
             .to_string()
     } else {
         String::new()
@@ -4032,7 +4032,7 @@ fn responses_output_item_coordinates(
     item: &RawJson<'_>,
 ) -> Result<(String, String), ()> {
     let output_index = raw_top_level_unique_index(payload, "output_index")?
-        .ok_or(())
+        .ok_or(())?
         .to_string();
     let nested_id = raw_top_level_unique_string(item.get().as_bytes(), "id")?
         .ok_or(())
