@@ -50,6 +50,8 @@ const OPEN_ROW = "cap-fail-open";
 const OPEN_ROUTE = "cap-open-passthrough";
 const TAIL_ROUTE = "cap-tail-passthrough";
 const OPEN_TAIL_ROUTE = "cap-open-tail-passthrough";
+const CUMULATIVE_TAIL_ROUTE = "cap-cumulative-tail-passthrough";
+const OPEN_CUMULATIVE_TAIL_ROUTE = "cap-open-cumulative-tail-passthrough";
 
 // 30 pieces of 100 bytes: three times the tight cap, far under the loose one.
 const TIGHT_CAP = 1_000;
@@ -121,14 +123,32 @@ const RESPONSES_STREAM = [
   }),
 ];
 
-// A passthrough stream whose last frame never ends: a short answer, then a
-// keep-alive the upstream leaves unterminated, carrying no content but past
-// the raw bound (128 × the tight cap) the hold-back also keeps.
+// A passthrough stream whose last frame never ends: a short answer, then an
+// oversized JSON frame deliberately split before its closing bytes. The
+// first piece exceeds the raw bound (128 × the tight cap), so the relay must
+// make its buffer-cap decision without decoding an incomplete SSE payload.
 const TAIL_MARKER = "tail-marker";
+const UNTERMINATED_TAIL_JSON = JSON.stringify({
+  id: `${TAIL_MARKER}-${"k".repeat(200_000)}`,
+  object: "chat.completion.chunk",
+  choices: [],
+});
 const UNTERMINATED_TAIL_STREAM = [
   `data: ${chatChunk({ role: "assistant" })}\n\n`,
   `data: ${chatChunk({ content: PIECES[0] })}\n\n`,
-  `data: ${JSON.stringify({ id: `${TAIL_MARKER}-${"k".repeat(200_000)}`, object: "chat.completion.chunk", choices: [] })}`,
+  `data: ${UNTERMINATED_TAIL_JSON.slice(0, 150_000)}`,
+  UNTERMINATED_TAIL_JSON.slice(150_000),
+];
+
+// These complete comment frames are each below the splitter's raw bound.
+// Together they remain held just below it; the malformed EOF tail is also
+// below that bound by itself, but makes the cumulative raw hold exceed it.
+// A preflight must therefore pick `output_buffer_exceeded` before attempting
+// to parse the incomplete JSON as a guardrail source carrier.
+const CUMULATIVE_TAIL_MARKER = "cumulative-tail-marker";
+const CUMULATIVE_TAIL_STREAM = [
+  ...Array.from({ length: 3 }, () => `: ${"c".repeat(40_000)}\n\n`),
+  `data: {"id":"${CUMULATIVE_TAIL_MARKER}-${"e".repeat(12_000)}`,
 ];
 
 interface EnforcedHit {
@@ -261,7 +281,12 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
     });
     await attachBoth("passthrough_route", route.id);
 
-    const tailUp = await startOpenAiUpstream({ rawStreamFrames: UNTERMINATED_TAIL_STREAM });
+    const tailUp = await startOpenAiUpstream({
+      rawStreamFrames: UNTERMINATED_TAIL_STREAM,
+      // Ensure the prefix is available to the relay before the closing
+      // bytes; it reproduces a live upstream that stalls mid-frame.
+      eventDelayMs: 25,
+    });
     upstreams.push(tailUp);
     const tailPk = await seed.createProviderKey({
       display_name: "cap-tail-backing-pk",
@@ -285,6 +310,32 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
       guardrail_id: open.id,
       scope_type: "passthrough_route",
       scope_id: openTailRoute.id,
+      priority: 100,
+    });
+    const cumulativeTailUp = await startOpenAiUpstream({ rawStreamFrames: CUMULATIVE_TAIL_STREAM });
+    upstreams.push(cumulativeTailUp);
+    const cumulativeTailPk = await seed.createProviderKey({
+      display_name: "cap-cumulative-tail-backing-pk",
+      secret: "sk-mock",
+      api_base: `${cumulativeTailUp.baseUrl}/v1`,
+    });
+    const cumulativeTailRoute = await seed.createPassthroughRoute({
+      name: CUMULATIVE_TAIL_ROUTE,
+      path_prefix: "/passthrough/cumulative-tail",
+      target_url: `${cumulativeTailUp.baseUrl}/v1`,
+      provider_key_id: cumulativeTailPk.id,
+    });
+    await attachBoth("passthrough_route", cumulativeTailRoute.id);
+    const openCumulativeTailRoute = await seed.createPassthroughRoute({
+      name: OPEN_CUMULATIVE_TAIL_ROUTE,
+      path_prefix: "/passthrough/open-cumulative-tail",
+      target_url: `${cumulativeTailUp.baseUrl}/v1`,
+      provider_key_id: cumulativeTailPk.id,
+    });
+    await seed.update("guardrail_attachments", randomUUID(), {
+      guardrail_id: open.id,
+      scope_type: "passthrough_route",
+      scope_id: openCumulativeTailRoute.id,
       priority: 100,
     });
     const openRoute = await seed.createPassthroughRoute({
@@ -419,6 +470,36 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
     });
     expect(body, "fail_open releases the tail").toContain(TAIL_MARKER);
     await expectBypass("passthrough tail", (l) => l.get("passthrough_route_name") === OPEN_TAIL_ROUTE);
+  });
+
+  test("passthrough route: a cumulative unterminated EOF tail hits the raw cap before parsing", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const body = await post("/passthrough/cumulative-tail/chat/completions", {
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: "go" }],
+    });
+    expect(body).toContain("output_buffer_exceeded");
+    expect(body).not.toContain("unscannable_body");
+    expect(body).not.toContain(CUMULATIVE_TAIL_MARKER);
+    await expectCapHit(
+      "passthrough cumulative tail",
+      (l) => l.get("passthrough_route_name") === CUMULATIVE_TAIL_ROUTE,
+      TIGHT,
+    );
+  });
+
+  test("passthrough route: a cumulative unterminated EOF tail fails open as a bypass", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const body = await post("/passthrough/open-cumulative-tail/chat/completions", {
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: "go" }],
+    });
+    expect(body, "fail_open releases the malformed EOF tail").toContain(CUMULATIVE_TAIL_MARKER);
+    expect(body).not.toContain("unscannable_body");
+    await expectBypass(
+      "passthrough cumulative tail",
+      (l) => l.get("passthrough_route_name") === OPEN_CUMULATIVE_TAIL_ROUTE,
+    );
   });
 
   test("a kind with no max_buffer_bytes of its own is named when the default cap trips", async (ctx) => {

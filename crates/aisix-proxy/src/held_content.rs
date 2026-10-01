@@ -44,6 +44,21 @@ impl HeldBuffer {
         self.raw = self.raw.saturating_add(raw);
     }
 
+    /// Whether admitting one more held frame would cross either bound.
+    ///
+    /// The relay uses this before decoding an unterminated terminal frame so
+    /// the configured raw-buffer cap wins over its otherwise fail-closed
+    /// malformed-frame handling.
+    pub(crate) fn would_exceed_after(
+        &self,
+        content: usize,
+        raw: usize,
+        max_buffer_bytes: usize,
+    ) -> bool {
+        self.content.saturating_add(content) > max_buffer_bytes
+            || self.raw.saturating_add(raw) > max_buffer_bytes.saturating_mul(RAW_HOLD_FACTOR)
+    }
+
     /// Past either bound: the content cap, or the raw-byte guard derived
     /// from it.
     pub(crate) fn exceeds(&self, max_buffer_bytes: usize) -> bool {

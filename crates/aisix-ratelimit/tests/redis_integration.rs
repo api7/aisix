@@ -534,6 +534,57 @@ async fn stream_hold_renews_redis_lease_until_drop() {
     assert!(acquired, "slot must free cluster-wide when the stream ends");
 }
 
+/// The response-header phase can outlive Redis's crash-recovery TTL before
+/// the gateway knows that the response is an SSE stream. That live request
+/// must keep its slot through the later handoff to `StreamConcurrencyGuard`.
+#[tokio::test]
+async fn reservation_renews_redis_lease_before_stream_handoff() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let a = Limiter::with_store(Arc::new(store(&url).await.with_conc_ttl(1)));
+    let b = Limiter::with_store(Arc::new(store(&url).await.with_conc_ttl(1)));
+    let key = unique_key("conc-pre-stream-lease");
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..rl()
+    };
+
+    // Simulate a slow upstream header phase. Before this fix, the member
+    // expired here because renewal did not start until `into_stream_hold`.
+    let reservation = MultiReservation::new(vec![a.pre_commit(&key, &limits).await.unwrap()]);
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    assert!(
+        matches!(
+            b.pre_commit(&key, &limits).await,
+            Err(aisix_ratelimit::RateLimitError::Concurrency { .. })
+        ),
+        "an active pre-handoff request must keep its shared concurrency slot"
+    );
+
+    let hold = reservation.into_stream_hold();
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    assert!(
+        matches!(
+            b.pre_commit(&key, &limits).await,
+            Err(aisix_ratelimit::RateLimitError::Concurrency { .. })
+        ),
+        "the same lease must remain held after the stream handoff"
+    );
+
+    drop(hold);
+    let mut acquired = false;
+    for _ in 0..50 {
+        if b.pre_commit(&key, &limits).await.is_ok() {
+            acquired = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(acquired, "slot must free cluster-wide when the stream ends");
+}
+
 /// Redis Cluster: the multi-key acquire/commit Lua must route to the slot
 /// owning the `{bucket}` hash tag and enforce one shared window. A wrong
 /// (or missing) routing key would surface as a CROSSSLOT/MOVED error here.

@@ -819,6 +819,15 @@ async fn dispatch(
         .timeout_ms
         .map(Duration::from_millis)
         .or(state.default_timeouts.request);
+    // A healthy SSE relay can be arbitrarily long, but no single silence
+    // gap may keep its concurrency reservation forever. Route-level timeout
+    // is the most specific bound; otherwise mirror the deployment stream →
+    // request fallback used by typed streaming routes.
+    let stream_read_timeout = route
+        .timeout_ms
+        .map(Duration::from_millis)
+        .or(state.default_timeouts.stream)
+        .or(state.default_timeouts.request);
 
     let bridge_timeout = |d: Duration| aisix_gateway::BridgeError::Timeout {
         elapsed_ms: d.as_millis().min(u64::MAX as u128) as u64,
@@ -920,6 +929,7 @@ async fn dispatch(
             telemetry,
             &client.request_id,
             reservation.into_stream_hold(),
+            stream_read_timeout,
         ));
     }
 
@@ -2506,26 +2516,36 @@ const MAX_STREAM_GUARDRAIL_SOURCE_ID_BYTES: usize = 256;
 /// them at end-of-stream.
 struct SseFrameSplitter(aisix_gateway::sse::SseFrameSplitter);
 
-impl SseFrameSplitter {
-    fn new() -> Self {
-        Self::with_max_frame_bytes(MAX_HELD_STREAM_BYTES)
-    }
+struct SseFrame {
+    bytes: Vec<u8>,
+    /// The upstream did not terminate the frame before the configured
+    /// hold-back raw-byte bound, so `bytes` cannot safely be decoded as an
+    /// SSE payload.
+    overflowed: bool,
+}
 
+impl SseFrameSplitter {
     fn with_max_frame_bytes(max_frame_bytes: usize) -> Self {
         Self(aisix_gateway::sse::SseFrameSplitter::new(max_frame_bytes))
     }
 
-    fn push(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
+    fn push(&mut self, chunk: &[u8]) -> Vec<SseFrame> {
         self.0.push(chunk);
         let mut frames = Vec::new();
         loop {
             match self.0.next_frame() {
-                Ok(Some(frame)) => frames.push(frame),
+                Ok(Some(bytes)) => frames.push(SseFrame {
+                    bytes,
+                    overflowed: false,
+                }),
                 Ok(None) => break,
                 // Frame-terminator starvation: hand the oversized run on as-is
                 // rather than buffering without bound.
                 Err(_) => {
-                    frames.push(self.0.take_rest());
+                    frames.push(SseFrame {
+                        bytes: self.0.take_rest(),
+                        overflowed: true,
+                    });
                     break;
                 }
             }
@@ -2963,13 +2983,17 @@ fn responses_source_continuations(payload: &[u8]) -> SourceContinuations {
     SourceContinuations::Ready(out)
 }
 
+struct SourceBranchIdentity {
+    family: String,
+    identity: String,
+    identity_is_ambiguous: bool,
+}
+
 fn append_raw_string_carrier(
     out: &mut Vec<StreamContinuation>,
     keys: &mut std::collections::HashSet<String>,
     source_values: &mut Vec<String>,
-    family: String,
-    identity: String,
-    identity_is_ambiguous: bool,
+    source: SourceBranchIdentity,
     body: &[u8],
     key: &str,
 ) -> Result<(), ()> {
@@ -2977,9 +3001,9 @@ fn append_raw_string_carrier(
         out,
         keys,
         source_values,
-        family,
-        identity,
-        identity_is_ambiguous,
+        source.family,
+        source.identity,
+        source.identity_is_ambiguous,
         raw_top_level_string_values(body, key).ok_or(())?,
     )
 }
@@ -3018,9 +3042,11 @@ fn anthropic_source_continuations(
                 &mut out,
                 &mut keys,
                 &mut source_values,
-                family.clone(),
-                "text".to_owned(),
-                false,
+                SourceBranchIdentity {
+                    family: family.clone(),
+                    identity: "text".to_owned(),
+                    identity_is_ambiguous: false,
+                },
                 delta_body,
                 "text",
             )
@@ -3029,9 +3055,11 @@ fn anthropic_source_continuations(
                     &mut out,
                     &mut keys,
                     &mut source_values,
-                    family.clone(),
-                    "partial_json".to_owned(),
-                    false,
+                    SourceBranchIdentity {
+                        family: family.clone(),
+                        identity: "partial_json".to_owned(),
+                        identity_is_ambiguous: false,
+                    },
                     delta_body,
                     "partial_json",
                 )
@@ -3047,9 +3075,11 @@ fn anthropic_source_continuations(
                 &mut out,
                 &mut keys,
                 &mut source_values,
-                family.clone(),
-                "text".to_owned(),
-                false,
+                SourceBranchIdentity {
+                    family: family.clone(),
+                    identity: "text".to_owned(),
+                    identity_is_ambiguous: false,
+                },
                 block_body,
                 "text",
             )
@@ -3066,9 +3096,11 @@ fn anthropic_source_continuations(
                         &mut out,
                         &mut keys,
                         &mut source_values,
-                        family.clone(),
-                        "input".to_owned(),
-                        false,
+                        SourceBranchIdentity {
+                            family: family.clone(),
+                            identity: "input".to_owned(),
+                            identity_is_ambiguous: false,
+                        },
                         block_body,
                         "input",
                     );
@@ -3087,9 +3119,7 @@ fn anthropic_source_continuations(
         }
         _ => return SourceContinuations::Absent,
     };
-    if result.is_err() {
-        SourceContinuations::Unevaluable
-    } else if !source_values_match_expected(source_values, expected) {
+    if result.is_err() || !source_values_match_expected(source_values, expected) {
         SourceContinuations::Unevaluable
     } else if out.is_empty() {
         SourceContinuations::Absent
@@ -3232,9 +3262,11 @@ fn chat_choice_source_continuations(payload: &[u8]) -> SourceContinuations {
                             &mut out,
                             &mut keys,
                             &mut source_values,
-                            format!("chat:{choice_index}:tool:{tool_index}"),
-                            format!("{container}:{field}"),
-                            false,
+                            SourceBranchIdentity {
+                                family: format!("chat:{choice_index}:tool:{tool_index}"),
+                                identity: format!("{container}:{field}"),
+                                identity_is_ambiguous: false,
+                            },
                             nested.get().as_bytes(),
                             field,
                         )
@@ -3247,9 +3279,11 @@ fn chat_choice_source_continuations(payload: &[u8]) -> SourceContinuations {
             }
         }
     }
-    source_values_match_expected(source_values, expected)
-        .then_some(SourceContinuations::Ready(out))
-        .unwrap_or(SourceContinuations::Unevaluable)
+    if source_values_match_expected(source_values, expected) {
+        SourceContinuations::Ready(out)
+    } else {
+        SourceContinuations::Unevaluable
+    }
 }
 
 fn completions_source_continuations(payload: &[u8]) -> SourceContinuations {
@@ -3280,9 +3314,11 @@ fn completions_source_continuations(payload: &[u8]) -> SourceContinuations {
             &mut out,
             &mut keys,
             &mut source_values,
-            format!("completions:{choice_index}"),
-            "text".to_owned(),
-            false,
+            SourceBranchIdentity {
+                family: format!("completions:{choice_index}"),
+                identity: "text".to_owned(),
+                identity_is_ambiguous: false,
+            },
             choice_body,
             "text",
         )
@@ -3291,9 +3327,11 @@ fn completions_source_continuations(payload: &[u8]) -> SourceContinuations {
             return SourceContinuations::Unevaluable;
         }
     }
-    source_values_match_expected(source_values, expected)
-        .then_some(SourceContinuations::Ready(out))
-        .unwrap_or(SourceContinuations::Unevaluable)
+    if source_values_match_expected(source_values, expected) {
+        SourceContinuations::Ready(out)
+    } else {
+        SourceContinuations::Unevaluable
+    }
 }
 
 fn stream_source_continuations(
@@ -3326,6 +3364,14 @@ fn stream_source_continuations(
 }
 
 fn responses_terminal_continuation_prefix(payload: &[u8]) -> Result<Option<String>, ()> {
+    let payload = payload.trim_ascii();
+    // `[DONE]` terminates an SSE stream but is not a JSON Responses event.
+    // Treat it like the source-continuation path does: no carrier closes and
+    // no malformed payload is introduced. Other malformed payloads still
+    // reach the fail-closed path below.
+    if payload.is_empty() || payload == b"[DONE]" {
+        return Ok(None);
+    }
     let kind = match raw_top_level_unique_string(payload, "type") {
         Ok(Some(kind)) => kind,
         Ok(None) => return Ok(None),
@@ -3571,16 +3617,16 @@ fn stream_guardrail_text(
     let unevaluable = source_unevaluable || terminal_unevaluable;
     StreamGuardrailText {
         continuations,
-        supplemental: (!unevaluable)
-            .then(|| {
-                frame_guardrail_supplemental_values(
-                    protocol,
-                    frame,
-                    has_source_continuations,
-                    has_typed_continuation,
-                )
-            })
-            .unwrap_or_default(),
+        supplemental: if unevaluable {
+            Vec::new()
+        } else {
+            frame_guardrail_supplemental_values(
+                protocol,
+                frame,
+                has_source_continuations,
+                has_typed_continuation,
+            )
+        },
         unevaluable,
         closed_prefixes,
     }
@@ -3992,6 +4038,7 @@ fn stream_response(
     mut telemetry: RouteTelemetry,
     request_id: &str,
     stream_hold: aisix_ratelimit::StreamConcurrencyGuard,
+    stream_read_timeout: Option<Duration>,
 ) -> Response {
     use aisix_guardrails::{Guardrail as _, GuardrailVerdict, StreamOutputPolicy};
     use futures::StreamExt;
@@ -4013,7 +4060,12 @@ fn stream_response(
         // from handler to body. It drops only when this body completes or the
         // client cancels it, rather than when the response headers are built.
         let _stream_hold = stream_hold;
-        let mut upstream = upstream_resp.bytes_stream();
+        let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
+        let mut upstream = Box::pin(crate::stream_timeout::with_read_timeout_bytes_signalled(
+            upstream_resp.bytes_stream(),
+            stream_read_timeout,
+            read_timeout.clone(),
+        ));
         let mut splitter = SseFrameSplitter::with_max_frame_bytes(splitter_cap);
         // Held-back frames (Window / BufferFull) not yet released.
         let mut pending: Vec<Bytes> = Vec::new();
@@ -4073,6 +4125,41 @@ fn stream_response(
                     .min(u32::MAX as u128) as u32;
             }
             for frame in splitter.push(&chunk) {
+                let overflowed = frame.overflowed;
+                let frame = frame.bytes;
+                if overflowed && !fail_opened {
+                    if let Some((max_buffer_bytes, on_exceeded_fail_open)) = policy.hold_cap() {
+                        // `overflowed` means the splitter crossed this same
+                        // raw-byte bound before it found a frame terminator.
+                        // Do not hand that partial payload to any decoder.
+                        if held_content.would_exceed_after(0, frame.len(), max_buffer_bytes) {
+                            if on_exceeded_fail_open {
+                                fail_opened = true;
+                                chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                                for pending_frame in pending.drain(..) {
+                                    telemetry.mark_first_delivery();
+                                    yield Ok(pending_frame);
+                                }
+                                pending_held.clear();
+                                held_content = crate::held_content::HeldBuffer::default();
+                                telemetry.mark_first_delivery();
+                                yield Ok(Bytes::from(frame));
+                                continue;
+                            }
+
+                            tracing::warn!(
+                                route = %route_name,
+                                "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
+                            );
+                            blocked = true;
+                            chain.record_output_buffer_exceeded();
+                            pending.clear();
+                            pending_held.clear();
+                            yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
+                            break 'outer;
+                        }
+                    }
+                }
                 if anthropic.is_none() && matches!(protocol, PassthroughProtocol::OpenaiChat) {
                     anthropic = anthropic_stream_frame(&frame);
                 }
@@ -4082,8 +4169,6 @@ fn stream_response(
                 let (parts, usage) = frame_parts(protocol, &frame);
                 let held = parts.held();
                 let delta = parts.scan;
-                let guardrail_text = (!chain.is_empty() && !scan_budget_exhausted && !fail_opened)
-                    .then(|| stream_guardrail_text(protocol, &frame, delta.clone()));
                 if let Some(u) = usage {
                     merge_usage(&mut telemetry.usage, u);
                 }
@@ -4094,6 +4179,8 @@ fn stream_response(
                         capture_cap,
                     );
                 }
+                let guardrail_text = (!chain.is_empty() && !scan_budget_exhausted && !fail_opened)
+                    .then(|| stream_guardrail_text(protocol, &frame, delta.clone()));
                 let unevaluable_output = guardrail_text.as_ref().is_some_and(|text| {
                     text.unevaluable
                         || stream_continuation_would_exceed_cap(
@@ -4320,19 +4407,71 @@ fn stream_response(
             }
         }
 
+        if let Some(err) = read_timeout.fired() {
+            telemetry.record_failure(&err);
+            tracing::warn!(
+                route = %route_name,
+                error = %telemetry.error_message,
+                "passthrough-route upstream stream timed out mid-relay",
+            );
+        }
+
         if !blocked {
             // Trailing bytes with no frame terminator, plus the final scan
             // of whatever the policy has not cleared yet.
             let rest = splitter.take_rest();
             if !rest.is_empty() {
+                // The raw half of the hold-back cap is knowable without
+                // decoding the unterminated tail. Decide it before a parser
+                // can turn malformed JSON into an unrelated unscannable-body
+                // refusal or capture it into telemetry.
+                let tail_raw_cap_hit = match &policy {
+                    StreamOutputPolicy::Window {
+                        max_buffer_bytes,
+                        on_exceeded_fail_open,
+                        ..
+                    }
+                    | StreamOutputPolicy::BufferFull {
+                        max_buffer_bytes,
+                        on_exceeded_fail_open,
+                    } if !fail_opened => held_content
+                        .would_exceed_after(0, rest.len(), *max_buffer_bytes)
+                        .then_some(*on_exceeded_fail_open),
+                    _ => None,
+                };
+                match tail_raw_cap_hit {
+                    Some(false) => {
+                        tracing::warn!(
+                            route = %route_name,
+                            "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
+                        );
+                        chain.record_output_buffer_exceeded();
+                        pending.clear();
+                        pending_held.clear();
+                        yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
+                        telemetry.guardrail_blocked = true;
+                        telemetry.stream_reached_end = true;
+                        telemetry.emit();
+                        return;
+                    }
+                    Some(true) => {
+                        fail_opened = true;
+                        chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                        for frame in pending.drain(..) {
+                            telemetry.mark_first_delivery();
+                            yield Ok(frame);
+                        }
+                        pending_held.clear();
+                        telemetry.mark_first_delivery();
+                        yield Ok(Bytes::from(rest));
+                    }
+                    None => {
                 if anthropic.is_none() && matches!(protocol, PassthroughProtocol::OpenaiChat) {
                     anthropic = anthropic_stream_frame(&rest);
                 }
                 let (parts, usage) = frame_parts(protocol, &rest);
                 let held = parts.held();
                 let delta = parts.scan;
-                let guardrail_text = (!chain.is_empty() && !scan_budget_exhausted && !fail_opened)
-                    .then(|| stream_guardrail_text(protocol, &rest, delta.clone()));
                 if let Some(u) = usage {
                     merge_usage(&mut telemetry.usage, u);
                 }
@@ -4343,7 +4482,55 @@ fn stream_response(
                         capture_cap,
                     );
                 }
-                let unevaluable_output = guardrail_text.as_ref().is_some_and(|text| {
+
+                // The raw cap was checked above before decoding. The regular
+                // held-frame path below additionally applies the decoded
+                // content cap to this tail.
+                let tail_cap_hit = match &policy {
+                    StreamOutputPolicy::Window {
+                        max_buffer_bytes,
+                        on_exceeded_fail_open,
+                        ..
+                    }
+                    | StreamOutputPolicy::BufferFull {
+                        max_buffer_bytes,
+                        on_exceeded_fail_open,
+                    } if !fail_opened => held_content
+                        .would_exceed_after(held, rest.len(), *max_buffer_bytes)
+                        .then_some(*on_exceeded_fail_open),
+                    _ => None,
+                };
+                match tail_cap_hit {
+                    Some(false) => {
+                        tracing::warn!(
+                            route = %route_name,
+                            "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
+                        );
+                        chain.record_output_buffer_exceeded();
+                        pending.clear();
+                        pending_held.clear();
+                        yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
+                        telemetry.guardrail_blocked = true;
+                        telemetry.stream_reached_end = true;
+                        telemetry.emit();
+                        return;
+                    }
+                    Some(true) => {
+                        fail_opened = true;
+                        chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                        for frame in pending.drain(..) {
+                            telemetry.mark_first_delivery();
+                            yield Ok(frame);
+                        }
+                        pending_held.clear();
+                        telemetry.mark_first_delivery();
+                        yield Ok(Bytes::from(rest));
+                    }
+                    None => {
+                        let guardrail_text =
+                            (!chain.is_empty() && !scan_budget_exhausted && !fail_opened)
+                                .then(|| stream_guardrail_text(protocol, &rest, delta.clone()));
+                        let unevaluable_output = guardrail_text.as_ref().is_some_and(|text| {
                     text.unevaluable
                         || stream_continuation_would_exceed_cap(
                             &continuation_bufs,
@@ -4455,6 +4642,10 @@ fn stream_response(
                         telemetry.mark_first_delivery();
                         yield Ok(rest);
                     }
+                }
+                    }
+                }
+                }
                 }
             }
             if !fail_opened {
@@ -5593,16 +5784,18 @@ mod tests {
 
     #[test]
     fn sse_splitter_emits_complete_frames_and_keeps_partials() {
-        let mut s = SseFrameSplitter::new();
+        let mut s = SseFrameSplitter::with_max_frame_bytes(MAX_HELD_STREAM_BYTES);
         let frames = s.push(b"data: a\n\ndata: b\n\ndata: par");
         assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0], b"data: a\n\n");
+        assert_eq!(frames[0].bytes, b"data: a\n\n");
+        assert!(!frames[0].overflowed);
         let frames = s.push(b"tial\n\n");
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0], b"data: partial\n\n");
+        assert_eq!(frames[0].bytes, b"data: partial\n\n");
+        assert!(!frames[0].overflowed);
         assert!(s.take_rest().is_empty());
         // CRLF boundaries too.
-        let mut s = SseFrameSplitter::new();
+        let mut s = SseFrameSplitter::with_max_frame_bytes(MAX_HELD_STREAM_BYTES);
         let frames = s.push(b"data: x\r\n\r\nrest");
         assert_eq!(frames.len(), 1);
         assert_eq!(s.take_rest(), b"rest");
@@ -5611,11 +5804,11 @@ mod tests {
     #[test]
     fn sse_splitter_and_usage_label_read_cr_framing() {
         let frame = b"event: token_usage\rdata: {\"input_tokens\":3,\"output_tokens\":4}\r\r";
-        let mut s = SseFrameSplitter::new();
-        assert_eq!(
-            s.push(&[&frame[..], b"data: next"].concat()),
-            vec![frame.to_vec()]
-        );
+        let mut s = SseFrameSplitter::with_max_frame_bytes(MAX_HELD_STREAM_BYTES);
+        let frames = s.push(&[&frame[..], b"data: next"].concat());
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].bytes, frame);
+        assert!(!frames[0].overflowed);
         assert_eq!(s.take_rest(), b"data: next");
         assert!(is_usage_labelled_frame(frame));
         let (_, usage) = frame_delta(PassthroughProtocol::Raw, frame);
@@ -5868,8 +6061,11 @@ mod tests {
             Some(usage_dims(26, 4)),
         );
         // …and the frame splitter agrees about where such a frame ends.
-        let mut splitter = SseFrameSplitter::new();
-        assert_eq!(splitter.push(crlf), vec![crlf.to_vec()]);
+        let mut splitter = SseFrameSplitter::with_max_frame_bytes(MAX_HELD_STREAM_BYTES);
+        let frames = splitter.push(crlf);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].bytes, crlf);
+        assert!(!frames[0].overflowed);
     }
 
     /// A comment-only frame — the keepalive some relays emit while the
@@ -7644,14 +7840,18 @@ mod tests {
 
     #[test]
     fn sse_splitter_bounds_an_unterminated_frame() {
-        let mut s = SseFrameSplitter::new();
+        let mut s = SseFrameSplitter::with_max_frame_bytes(MAX_HELD_STREAM_BYTES);
         // Feed > MAX_HELD_STREAM_BYTES without a frame terminator: the
         // splitter must hand the oversized run on instead of buffering
         // without bound.
         let chunk = vec![b'x'; 256 * 1024];
         let mut emitted = 0usize;
         for _ in 0..8 {
-            emitted += s.push(&chunk).iter().map(Vec::len).sum::<usize>();
+            emitted += s
+                .push(&chunk)
+                .iter()
+                .map(|frame| frame.bytes.len())
+                .sum::<usize>();
         }
         assert!(
             emitted >= MAX_HELD_STREAM_BYTES,
@@ -7663,7 +7863,10 @@ mod tests {
     #[test]
     fn sse_splitter_honors_a_route_specific_frame_cap() {
         let mut s = SseFrameSplitter::with_max_frame_bytes(4);
-        assert_eq!(s.push(b"12345"), vec![b"12345".to_vec()]);
+        let frames = s.push(b"12345");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].bytes, b"12345");
+        assert!(frames[0].overflowed);
         assert!(s.take_rest().is_empty());
     }
 

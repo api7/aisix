@@ -106,11 +106,19 @@ impl Limiter {
     ) -> Result<Reservation, RateLimitError> {
         let member = self.next_member();
         self.store.acquire(key, limits, &member).await?;
+        let has_concurrency_slot = limits.concurrency.is_some();
+        let refresh_task = spawn_lease_refresh(
+            Arc::clone(&self.store),
+            key.to_string(),
+            member.clone(),
+            has_concurrency_slot,
+        );
         Ok(Reservation {
             store: Arc::clone(&self.store),
             key: key.to_string(),
             member,
-            has_concurrency_slot: limits.concurrency.is_some(),
+            has_concurrency_slot,
+            refresh_task,
             committed: false,
         })
     }
@@ -136,6 +144,34 @@ impl Limiter {
     }
 }
 
+/// Keep a distributed concurrency member alive from acquisition until the
+/// request either commits, drops, or transfers the member to a stream hold.
+///
+/// A request can spend longer than the Redis concurrency TTL waiting for
+/// upstream response headers. Starting only after the SSE handoff lets a
+/// second replica prune that still-live request before the handoff happens.
+/// Local stores opt out, and callers outside a Tokio runtime retain the
+/// backend's normal stale-lease recovery behavior.
+fn spawn_lease_refresh(
+    store: Arc<dyn RateStore>,
+    key: String,
+    member: String,
+    has_concurrency_slot: bool,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !has_concurrency_slot {
+        return None;
+    }
+    let interval = store.stream_lease_refresh_interval()?;
+    tokio::runtime::Handle::try_current().ok().map(|handle| {
+        handle.spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                store.refresh_stream_lease(&key, &member).await;
+            }
+        })
+    })
+}
+
 impl Default for Limiter {
     fn default() -> Self {
         Self::new()
@@ -149,6 +185,9 @@ pub struct Reservation {
     key: String,
     member: String,
     has_concurrency_slot: bool,
+    /// Starts at successful acquire, rather than at the later SSE handoff:
+    /// a slow header phase is still an active request that owns this slot.
+    refresh_task: Option<tokio::task::JoinHandle<()>>,
     committed: bool,
 }
 
@@ -162,9 +201,16 @@ impl std::fmt::Debug for Reservation {
 }
 
 impl Reservation {
+    fn stop_refresh(&mut self) {
+        if let Some(task) = self.refresh_task.take() {
+            task.abort();
+        }
+    }
+
     /// Post-deduct phase. Records the actual token cost against TPM/TPD
     /// and releases the concurrency slot.
     pub async fn commit_tokens(mut self, tokens: u64) {
+        self.stop_refresh();
         self.store.commit(&self.key, tokens, &self.member).await;
         self.committed = true;
     }
@@ -172,6 +218,7 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
+        self.stop_refresh();
         if self.committed {
             return;
         }
@@ -226,8 +273,7 @@ impl MultiReservation {
     #[must_use = "dropping the returned guard immediately releases the concurrency \
                   slot, recreating the early-release bug this fixes"]
     pub fn into_stream_hold(mut self) -> StreamConcurrencyGuard {
-        let mut refresh_interval: Option<std::time::Duration> = None;
-        let mut refresh_holds = Vec::new();
+        let mut refresh_tasks = Vec::new();
         let holds = self
             .reservations
             .iter_mut()
@@ -236,35 +282,22 @@ impl MultiReservation {
                 // slot now; the returned guard owns release from here on.
                 r.committed = true;
                 let store = Arc::clone(&r.store);
-                if r.has_concurrency_slot {
-                    if let Some(interval) = store.stream_lease_refresh_interval() {
-                        refresh_interval = Some(
-                            refresh_interval.map_or(interval, |current| current.min(interval)),
-                        );
-                        refresh_holds.push((Arc::clone(&store), r.key.clone(), r.member.clone()));
-                    }
+                if let Some(task) = r.refresh_task.take().or_else(|| {
+                    spawn_lease_refresh(
+                        Arc::clone(&store),
+                        r.key.clone(),
+                        r.member.clone(),
+                        r.has_concurrency_slot,
+                    )
+                }) {
+                    refresh_tasks.push(task);
                 }
                 (store, r.key.clone(), r.member.clone())
             })
             .collect();
-        // Proxy handlers create streaming guards inside Tokio. Keep ordinary
-        // callers that do not have a runtime from panicking; they retain the
-        // backend's normal stale-lease recovery behavior instead.
-        let refresh_task = refresh_interval.and_then(|interval| {
-            tokio::runtime::Handle::try_current().ok().map(|handle| {
-                handle.spawn(async move {
-                    loop {
-                        tokio::time::sleep(interval).await;
-                        for (store, key, member) in &refresh_holds {
-                            store.refresh_stream_lease(key, member).await;
-                        }
-                    }
-                })
-            })
-        });
         StreamConcurrencyGuard {
             holds,
-            refresh_task,
+            refresh_tasks,
             released: false,
         }
     }
@@ -286,9 +319,9 @@ pub struct StreamConcurrencyGuard {
     /// `(store, key, member)` per held layer.
     holds: Vec<(Arc<dyn RateStore>, String, String)>,
     /// Renews the lease used by shared stores while this guard owns a live
-    /// stream. It is stopped before the terminal release to prevent a late
-    /// renewal from racing stream teardown.
-    refresh_task: Option<tokio::task::JoinHandle<()>>,
+    /// stream. These tasks began at reservation acquisition and are stopped
+    /// before terminal release to prevent a late renewal from racing teardown.
+    refresh_tasks: Vec<tokio::task::JoinHandle<()>>,
     released: bool,
 }
 
@@ -298,7 +331,7 @@ impl StreamConcurrencyGuard {
             return;
         }
         self.released = true;
-        if let Some(task) = self.refresh_task.take() {
+        for task in self.refresh_tasks.drain(..) {
             task.abort();
         }
         for (store, key, member) in &self.holds {
@@ -311,7 +344,7 @@ impl std::fmt::Debug for StreamConcurrencyGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamConcurrencyGuard")
             .field("layers", &self.holds.len())
-            .field("refreshing", &self.refresh_task.is_some())
+            .field("refreshing", &!self.refresh_tasks.is_empty())
             .field("released", &self.released)
             .finish()
     }

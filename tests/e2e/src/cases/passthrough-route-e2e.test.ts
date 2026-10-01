@@ -50,6 +50,10 @@ const STREAM_LIMITED_PLAINTEXT = "sk-ptr-e2e-stream-limit";
 const STREAM_LIMITED_KEY_HASH = createHash("sha256")
   .update(STREAM_LIMITED_PLAINTEXT)
   .digest("hex");
+const STREAM_TIMEOUT_PLAINTEXT = "sk-ptr-e2e-stream-timeout";
+const STREAM_TIMEOUT_KEY_HASH = createHash("sha256")
+  .update(STREAM_TIMEOUT_PLAINTEXT)
+  .digest("hex");
 
 describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed paths", () => {
   let app: SpawnedApp | undefined;
@@ -777,6 +781,91 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
 
     expect(upstream.receivedRequests).toHaveLength(upstreamCallsWhileStreaming + 2);
   });
+
+  test("a silent SSE gap terminates and releases the concurrency slot", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    const upstream = await startOpenAiUpstream({
+      scriptedResponses: [
+        {
+          streamEvents: [
+            JSON.stringify({ choices: [{ delta: { content: "first" } }] }),
+            JSON.stringify({ choices: [{ delta: { content: "late" } }] }),
+            "[DONE]",
+          ],
+          // The first event is immediate; the next one violates the route's
+          // 100 ms per-read budget after headers have already been relayed.
+          eventDelayMs: 1_500,
+        },
+        { nonStreamBody: { recovered: true } },
+      ],
+    });
+    upstreams.push(upstream);
+
+    const pk = await seed.createProviderKey({
+      display_name: "ptr-sse-timeout-pk",
+      secret: "sk-mock",
+      api_base: "http://unused-on-routes",
+    });
+    await seed.createPassthroughRoute({
+      name: "ptr-sse-timeout",
+      path_prefix: "/sse-timeout",
+      target_url: upstream.baseUrl,
+      provider_key_id: pk.id,
+      timeout_ms: 100,
+    });
+    await seed.createApiKey({
+      key_hash: STREAM_TIMEOUT_KEY_HASH,
+      allowed_models: ["*"],
+      allowed_routes: ["ptr-sse-timeout"],
+      rate_limit: { concurrency: 1 },
+    });
+
+    const headers = {
+      authorization: `Bearer ${STREAM_TIMEOUT_PLAINTEXT}`,
+      "content-type": "application/json",
+    };
+    const call = () =>
+      fetch(`${app!.proxyUrl}/sse-timeout/chat/completions`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "hi" }],
+          stream: true,
+        }),
+      });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const probe = await fetch(`${app!.proxyUrl}/v1/models`, {
+          headers: { authorization: `Bearer ${STREAM_TIMEOUT_PLAINTEXT}` },
+        });
+        await probe.text();
+        return probe.status === 200;
+      } catch {
+        return false;
+      }
+    });
+
+    const started = Date.now();
+    const stalled = await call();
+    expect(stalled.status).toBe(200);
+    const body = await stalled.text();
+    const elapsed = Date.now() - started;
+    expect(body).toContain("first");
+    expect(body).not.toContain("late");
+    expect(elapsed).toBeLessThan(1_000);
+
+    // A new request can enter after the timeout. A leaked concurrency hold
+    // would instead be a gateway 429 and would never consume step three.
+    const recovered = await call();
+    expect(recovered.status).toBe(200);
+    expect(await recovered.json()).toEqual({ recovered: true });
+  }, 10_000);
 
   test("envelope auto-detection: usage follows the request body, never the config", async (ctx) => {
     if (!etcdReachable || !app || !seed) {

@@ -170,10 +170,11 @@ pub struct PassthroughRoute {
     pub forward_client_headers: Vec<String>,
 
     /// Maximum time, in milliseconds, for the upstream exchange. Bounds
-    /// the response-header phase and any non-SSE body read, but never a
-    /// healthy SSE relay (which ends with the upstream stream or the
-    /// client hanging up). When omitted, the gateway default request
-    /// timeout applies the same way.
+    /// the response-header phase and any non-SSE body read. For SSE it
+    /// bounds the wait for the first byte and every later no-byte gap, but
+    /// not the total duration of a healthy relay (which ends with the
+    /// upstream stream or the client hanging up). When omitted, the gateway
+    /// default request timeout applies the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub timeout_ms: Option<u64>,
