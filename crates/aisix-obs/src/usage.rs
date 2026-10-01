@@ -1,8 +1,10 @@
 //! Per-request usage events the proxy emits at end-of-request.
 //!
-//! The wire shape mirrors cp-api's `dpmgr_usage_events` table 1:1 —
-//! see `aisix-cloud:internal/dpmgr/api/telemetry.go` and
+//! The billable scalar wire shape mirrors cp-api's `dpmgr_usage_events`
+//! table — see `aisix-cloud:internal/dpmgr/api/telemetry.go` and
 //! `migrations/009_dpmgr_usage_events.up.sql` for the receiving end.
+//! Additive child-work audit fields are also delivered on this event; legacy
+//! CPs ignore them while exporter sinks retain them.
 //!
 //! Lifecycle:
 //!
@@ -31,15 +33,82 @@ use crate::metrics::UsageEventLabels;
 use aisix_core::{AppliedGuardrail, GuardrailEnforcedHit, GuardrailMonitorHit, GuardrailScore};
 use serde::Serialize;
 
-/// One usage event. Emitted at end-of-request (success / upstream error /
-/// guardrail block) per chat completion. Field shape pinned to the
-/// cp-api wire (snake_case via serde).
+/// The fixed subsystem that made an embedding call while serving a caller's
+/// request.
 ///
-/// All fields are Copy / String / `Option<String>` so the event is
-/// cheap to construct on the request hot path. `costed in USD` per
-/// the DP's pricing snapshot at request time — provider prices can
-/// change post-hoc, but we record what was current when the request
-/// ran.
+/// `Guardrail` covers semantic guardrails and custom guardrails that invoke
+/// the injected embedding dispatcher. The dispatcher intentionally receives
+/// no policy-kind context, so claiming the narrower semantic kind there would
+/// make a real custom-guardrail call misleading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayEmbeddingPurpose {
+    SemanticRoute,
+    SemanticCache,
+    Guardrail,
+}
+
+/// Whether a gateway-initiated embedding bridge call returned a response.
+///
+/// Failed calls — including an in-flight bridge call cancelled with its parent
+/// request — retain their elapsed time and count but have no provider usage to
+/// report, so their token counters are zero and their `usage_source` is
+/// `unavailable`. The concrete bridge error is deliberately not exported: it
+/// can contain provider-specific or sensitive detail and is already
+/// represented by the parent request outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayEmbeddingOutcome {
+    Succeeded,
+    Failed,
+}
+
+/// Where the child call's token counters came from.
+///
+/// `Unavailable` is explicit rather than inferring from zero: zero can be a
+/// legitimate provider-reported count, while some embedding providers return
+/// vectors without a complete usage block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayEmbeddingUsageSource {
+    Reported,
+    Unavailable,
+}
+
+/// One gateway embedding-bridge invocation while serving a parent request.
+///
+/// This is an audit detail, not a billable child event. `embedding_model_id`
+/// is the configured Model resource id rather than a provider credential or
+/// raw upstream model name, keeping a rename-stable join to the configured
+/// embedding model without exposing request content. One bridge invocation
+/// is not necessarily one outbound provider HTTP request: for example, the
+/// Bedrock Titan bridge fans a batch out into one request per input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GatewayEmbeddingCall {
+    /// This entry represents one gateway bridge invocation that started. It
+    /// is explicit so downstream consumers can sum counts without deriving
+    /// semantics from the array shape, including an in-flight call cancelled
+    /// before its bridge response arrives.
+    pub count: u32,
+    pub purpose: GatewayEmbeddingPurpose,
+    pub embedding_model_id: String,
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
+    pub usage_source: GatewayEmbeddingUsageSource,
+    pub latency_ms: u32,
+    pub outcome: GatewayEmbeddingOutcome,
+}
+
+/// One usage event. Emitted at end-of-request (success / upstream error /
+/// guardrail block) per chat completion. Scalar field shape is pinned to the
+/// cp-api wire; additive audit fields also use snake_case via serde.
+///
+/// Its scalar fields are Copy / String / `Option<String>` so the event is
+/// cheap to construct on the request hot path. The request-scoped
+/// `gateway_embedding_calls` audit trail is deliberately separate from its
+/// parent accounting fields. `costed in USD` per the DP's pricing snapshot at
+/// request time — provider prices can change post-hoc, but we record what was
+/// current when the request ran.
 ///
 /// `model_id` and `api_key_id` are optional: a guardrail-rejected
 /// request may have neither (rejection runs before model resolution).
@@ -138,6 +207,36 @@ pub struct UsageEvent {
     /// == total_tokens` as reasoning counted beside the completion.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub total_tokens: u32,
+
+    /// Embedding calls the gateway made on this request's behalf rather than
+    /// at the caller's direction: semantic routing, semantic cache lookup,
+    /// or semantic guardrails.
+    ///
+    /// These are deliberately separate from this event's top-level token
+    /// and cost fields. Those describe the model the caller addressed; adding
+    /// a different embedding model's tokens there would mis-price the parent
+    /// request and replace its model-level accounting. Each entry describes
+    /// one gateway bridge invocation (`count` is therefore always one), not
+    /// necessarily one provider HTTP request. It contains only a fixed
+    /// purpose, configured model resource id, token provenance, token counts,
+    /// elapsed time, and a bounded outcome — never
+    /// request text, route examples, credentials, or provider error text.
+    ///
+    /// Empty is omitted for wire compatibility with older CPs, which ignore
+    /// additive fields. Exporter sinks retain populated entries; persisting
+    /// them in a CP database is a separate schema migration. The field is
+    /// attached only to the terminal parent event, after retries and stream
+    /// completion have settled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gateway_embedding_calls: Vec<GatewayEmbeddingCall>,
+
+    /// Gateway bridge invocations omitted from `gateway_embedding_calls`
+    /// after its per-request 64-item prefix cap. This is a saturating count:
+    /// a non-zero value makes truncation explicit without allowing a malformed
+    /// request to make the parent event unbounded. It is terminal-event-only,
+    /// alongside the retained prefix.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub gateway_embedding_calls_dropped: u32,
 
     /// In-process only, never on the wire: the reasoning the record took
     /// back out of the gateway's folded completion count. Consumers that
@@ -1613,6 +1712,43 @@ mod tests {
         assert!(json.contains(r#""prompt_tokens":12"#));
         assert!(json.contains(r#""completion_tokens":34"#));
         assert!(json.contains(r#""guardrail_blocked":false"#));
+    }
+
+    #[test]
+    fn gateway_embedding_calls_are_a_safe_optional_child_audit_trail() {
+        let empty = serde_json::to_string(&UsageEvent::default()).unwrap();
+        assert!(!empty.contains("gateway_embedding_calls"));
+        assert!(!empty.contains("gateway_embedding_calls_dropped"));
+
+        let ev = UsageEvent {
+            gateway_embedding_calls: vec![GatewayEmbeddingCall {
+                count: 1,
+                purpose: GatewayEmbeddingPurpose::SemanticRoute,
+                embedding_model_id: "embed-model-id".into(),
+                prompt_tokens: 7,
+                total_tokens: 7,
+                usage_source: GatewayEmbeddingUsageSource::Reported,
+                latency_ms: 13,
+                outcome: GatewayEmbeddingOutcome::Succeeded,
+            }],
+            gateway_embedding_calls_dropped: 3,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(ev).unwrap();
+        assert_eq!(
+            json["gateway_embedding_calls"],
+            serde_json::json!([{
+                "count": 1,
+                "purpose": "semantic_route",
+                "embedding_model_id": "embed-model-id",
+                "prompt_tokens": 7,
+                "total_tokens": 7,
+                "usage_source": "reported",
+                "latency_ms": 13,
+                "outcome": "succeeded",
+            }])
+        );
+        assert_eq!(json["gateway_embedding_calls_dropped"], 3);
     }
 
     #[test]

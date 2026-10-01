@@ -957,6 +957,7 @@ async fn cache_semantic_embed(
         &sem.embed_entry,
         embed_deadline,
         request_id,
+        aisix_obs::GatewayEmbeddingPurpose::SemanticCache,
         &texts,
     )
     .await
