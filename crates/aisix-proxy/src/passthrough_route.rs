@@ -742,7 +742,7 @@ async fn dispatch(
     // A passthrough route promises provider response bytes verbatim. Use the
     // no-decode client even for buffered responses: otherwise reqwest can
     // transparently inflate a non-success SSE body while stripping its
-    // representation headers before `stream_non_success_response` relays it.
+    // representation headers before `stream_opaque_response` relays it.
     let http_client = crate::http_client::raw_relay_client_for(conn.as_ref());
 
     // Strip set: protocol metadata always; per-mode credential handling.
@@ -968,6 +968,8 @@ async fn dispatch(
     let success_response_is_encoded = status.is_success()
         && output_guardrail_active
         && response_has_non_identity_content_encoding(&resp_headers);
+    let bypass_uninspectable_output = success_response_is_encoded
+        && !aisix_guardrails::Guardrail::refuses_unevaluable_output(&resolved_chain);
 
     let mut telemetry = RouteTelemetry {
         state: state.clone(),
@@ -1018,33 +1020,44 @@ async fn dispatch(
     // `Content-Encoding` and byte length. A successful reply that ignores
     // our identity-only negotiation cannot be parsed safely by either the
     // buffered or SSE output selector, so refuse it before any compressed
-    // bytes can become a guardrail input or reach the caller.
+    // bytes can become a guardrail input. A configured fail-open output
+    // policy still forwards the original representation and records the
+    // bypass; fail-closed keeps the refusal contract.
     if success_response_is_encoded {
-        tracing::warn!(
-            guardrail_hook = "output",
-            route = %route.name,
-            "cannot inspect an encoded successful passthrough-route response; blocking",
-        );
-        telemetry.guardrail_blocked = true;
-        telemetry.emitted = true;
-        return Err(RouteError::of(
-            crate::error::guardrail_block_error(
-                "response",
-                None,
-                Some(crate::error::TAG_UNSCANNABLE_BODY),
-            ),
-            &auth,
-        ));
+        if bypass_uninspectable_output {
+            tracing::debug!(
+                guardrail_hook = "output",
+                route = %route.name,
+                "cannot inspect an encoded successful passthrough-route response; resolved chain does not fail closed",
+            );
+            resolved_chain.record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+        } else {
+            tracing::warn!(
+                guardrail_hook = "output",
+                route = %route.name,
+                "cannot inspect an encoded successful passthrough-route response; blocking",
+            );
+            telemetry.guardrail_blocked = true;
+            telemetry.emitted = true;
+            return Err(RouteError::of(
+                crate::error::guardrail_block_error(
+                    "response",
+                    None,
+                    Some(crate::error::TAG_UNSCANNABLE_BODY),
+                ),
+                &auth,
+            ));
+        }
     }
 
     if is_sse {
         telemetry.streaming = true;
         let stream_hold = reservation.into_stream_hold();
-        // A non-success SSE response is an upstream error contract, just
-        // like a buffered 4xx/5xx. It must remain byte-for-byte relay data:
-        // no output guardrail, heartbeat, or SSE parsing may rewrite it.
-        if !status.is_success() {
-            return Ok(stream_non_success_response(
+        // Non-success replies, and encoded fail-open success replies, are
+        // opaque relay contracts. They must remain byte-for-byte data: no
+        // output guardrail, heartbeat, or SSE parsing may rewrite them.
+        if !status.is_success() || bypass_uninspectable_output {
+            return Ok(stream_opaque_response(
                 upstream_resp,
                 resp_headers,
                 status,
@@ -1094,7 +1107,7 @@ async fn dispatch(
     // Output guardrails govern generated successful answers. A provider's
     // non-success body is its error contract, so preserve its status, headers,
     // and bytes instead of replacing a 4xx/5xx with a local guardrail 422.
-    if status.is_success() && !resolved_chain.is_empty() {
+    if status.is_success() && !bypass_uninspectable_output && !resolved_chain.is_empty() {
         let text = match try_response_guardrail_text(protocol, &resp_body) {
             Ok(text) => Some(text),
             Err(err) if !err.is_unevaluable() => {
@@ -1176,7 +1189,7 @@ async fn dispatch(
     if let Some(u) = response_usage(protocol, raw_shape, &resp_body) {
         merge_usage(&mut telemetry.usage, u);
     }
-    if telemetry.content_cap.is_some() {
+    if telemetry.content_cap.is_some() && !bypass_uninspectable_output {
         telemetry.response_text = response_capture_text(protocol, &resp_body);
     }
 
@@ -1675,6 +1688,11 @@ impl<'a> RawJson<'a> {
 // shared budget for every selector collection and the nested Chat work list.
 const MAX_RAW_SELECTOR_ITEMS: usize = crate::json_splice::MAX_JSON_SCAN_VALUES;
 const MAX_RAW_SELECTOR_BYTES: usize = crate::json_splice::MAX_JSON_SCAN_TEXT_BYTES;
+// Nested Anthropic tool-result carriers are selected from source-preserved
+// spans. Cap their cumulative structural walk, not just the current work
+// queue, so deeply nested valid JSON cannot make the selector re-scan every
+// remaining suffix quadratically.
+const MAX_NESTED_CONTENT_SELECTOR_WORK_BYTES: usize = MAX_RAW_SELECTOR_BYTES * 8;
 
 fn raw_selector_push<'a>(
     values: &mut Vec<RawJson<'a>>,
@@ -1692,6 +1710,30 @@ fn raw_selector_push<'a>(
     *source_bytes = next_bytes;
     values.push(value);
     Some(())
+}
+
+/// Keep a structural source reference without charging the span's bytes to a
+/// text-selector budget. Callers must only use this for a carrier that they
+/// subsequently narrow to a selected text field; opaque siblings must not
+/// make an otherwise valid carrier unevaluable merely because they are large.
+fn raw_selector_push_ref<'a>(values: &mut Vec<RawJson<'a>>, value: RawJson<'a>) -> Option<()> {
+    if values.len() >= MAX_RAW_SELECTOR_ITEMS {
+        return None;
+    }
+    values.try_reserve(1).ok()?;
+    values.push(value);
+    Some(())
+}
+
+fn charge_nested_content_selector_work(total: &mut usize, bytes: usize) -> bool {
+    let Some(next) = total.checked_add(bytes) else {
+        return false;
+    };
+    if next > MAX_NESTED_CONTENT_SELECTOR_WORK_BYTES {
+        return false;
+    }
+    *total = next;
+    true
 }
 
 fn raw_skip_ws(bytes: &[u8], pos: &mut usize) {
@@ -1849,7 +1891,14 @@ fn raw_top_level_values<'a>(body: &'a [u8], wanted_key: &str) -> Option<Vec<RawJ
 /// Retaining a source fragment is a pointer copy, so nested carrier walks do
 /// not copy their remaining `tool_result.content` suffixes.
 fn raw_top_level_value_refs<'a>(body: &'a [u8], wanted_key: &str) -> Option<Vec<RawJson<'a>>> {
-    raw_top_level_values(body, wanted_key)
+    let mut values = Vec::new();
+    let mut within_cap = true;
+    raw_object_members(body, |key, value| {
+        if within_cap && key == wanted_key {
+            within_cap = raw_selector_push_ref(&mut values, value).is_some();
+        }
+    })?;
+    within_cap.then_some(values)
 }
 
 /// Source values of top-level keys other than `excluded`. Known opaque
@@ -1929,7 +1978,40 @@ fn raw_array_items<'a>(raw: &RawJson<'a>) -> Option<Vec<RawJson<'a>>> {
 }
 
 fn raw_array_item_refs<'a>(raw: &RawJson<'a>) -> Option<Vec<RawJson<'a>>> {
-    raw_array_items(raw)
+    let source = raw.get();
+    let bytes = source.as_bytes();
+    let mut pos = 0;
+    raw_skip_ws(bytes, &mut pos);
+    (bytes.get(pos) == Some(&b'[')).then_some(())?;
+    pos += 1;
+    let mut values = Vec::new();
+    loop {
+        raw_skip_ws(bytes, &mut pos);
+        if bytes.get(pos) == Some(&b']') {
+            pos += 1;
+            raw_skip_ws(bytes, &mut pos);
+            return (pos == bytes.len()).then_some(values);
+        }
+        let value_start = pos;
+        let value_end = raw_value_end(bytes, value_start)?;
+        raw_selector_push_ref(
+            &mut values,
+            RawJson {
+                source: &source[value_start..value_end],
+            },
+        )?;
+        pos = value_end;
+        raw_skip_ws(bytes, &mut pos);
+        match bytes.get(pos) {
+            Some(b',') => pos += 1,
+            Some(b']') => {
+                pos += 1;
+                raw_skip_ws(bytes, &mut pos);
+                return (pos == bytes.len()).then_some(values);
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// `true` only for an unambiguous typed item. Conflicting or non-string
@@ -1960,21 +2042,6 @@ fn raw_top_level_unique_type(body: &[u8]) -> Result<Option<String>, ()> {
     Ok(types
         .all(|kind| kind.as_deref() == Some(first.as_str()))
         .then_some(first))
-}
-
-/// `true` only when every source `type` value is one of `allowed`. This is
-/// deliberately strict: an audio or image event must not borrow a text
-/// event's carrier merely by repeating a conflicting type.
-fn raw_top_level_has_only_types(body: &[u8], allowed: &[&str]) -> bool {
-    let Some(values) = raw_top_level_values(body, "type") else {
-        return false;
-    };
-    !values.is_empty()
-        && values.into_iter().all(|value| {
-            serde_json::from_str::<String>(value.get())
-                .ok()
-                .is_some_and(|kind| allowed.iter().any(|allowed| kind == *allowed))
-        })
 }
 
 fn raw_top_level_items_have_only_types(body: &[u8], key: &str, allowed: &[&str]) -> Option<bool> {
@@ -2086,6 +2153,30 @@ fn raw_top_level_unique_array<'a>(body: &'a [u8], key: &str) -> Result<Option<Ra
     }
 }
 
+/// Like [`raw_top_level_unique_array`], but retains the carrier by reference
+/// so a large opaque extension inside it cannot exhaust the selected-text
+/// budget before the selector reaches the text field.
+fn raw_top_level_unique_array_ref<'a>(
+    body: &'a [u8],
+    key: &str,
+) -> Result<Option<RawJson<'a>>, ()> {
+    let mut values = raw_top_level_value_refs(body, key).ok_or(())?;
+    match values.len() {
+        0 => Ok(None),
+        1 => {
+            let value = values.pop().expect("one value");
+            value
+                .get()
+                .trim_start()
+                .starts_with('[')
+                .then_some(value)
+                .map(Some)
+                .ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
 /// The typed content extractors inspect a bare string or the direct `text`
 /// field of typed parts. Keep that boundary when walking raw source, so image
 /// and document payloads never reach external guardrails as text.
@@ -2148,6 +2239,7 @@ fn append_chat_request_content_strings(
     // it does for the byte scanner's frame stack. A carrier at the cap still
     // scans; only one more nested carrier is unevaluable.
     let mut work = Vec::new();
+    let mut selector_work_bytes = 0;
     let initial_bytes = content.get().len();
     if initial_bytes > MAX_RAW_SELECTOR_BYTES || work.try_reserve(1).is_err() {
         mark_unevaluable(scan_error);
@@ -2182,6 +2274,11 @@ fn append_chat_request_content_strings(
                 }
                 // Push backwards so the LIFO work stack preserves the
                 // previous depth-first, source-order traversal.
+                if !charge_nested_content_selector_work(&mut selector_work_bytes, value.get().len())
+                {
+                    mark_unevaluable(scan_error);
+                    return None;
+                }
                 let Some(blocks) = raw_array_item_refs(&value) else {
                     mark_unevaluable(scan_error);
                     return None;
@@ -2218,10 +2315,20 @@ fn append_chat_request_content_strings(
                     return None;
                 }
                 let block_body = block.get().as_bytes();
+                if !charge_nested_content_selector_work(&mut selector_work_bytes, block_body.len())
+                {
+                    mark_unevaluable(scan_error);
+                    return None;
+                }
                 let Some(types) = raw_top_level_values(block_body, "type") else {
                     mark_unevaluable(scan_error);
                     return None;
                 };
+                if !charge_nested_content_selector_work(&mut selector_work_bytes, block_body.len())
+                {
+                    mark_unevaluable(scan_error);
+                    return None;
+                }
                 let kind = match raw_top_level_unique_type(block_body) {
                     Ok(kind) => kind,
                     Err(()) => {
@@ -2239,6 +2346,13 @@ fn append_chat_request_content_strings(
                 match kind.as_deref() {
                     Some("redacted_thinking") => {}
                     Some("tool_result") => {
+                        if !charge_nested_content_selector_work(
+                            &mut selector_work_bytes,
+                            block_body.len(),
+                        ) {
+                            mark_unevaluable(scan_error);
+                            return None;
+                        }
                         let Some(nested) = raw_top_level_value_refs(block_body, "content") else {
                             mark_unevaluable(scan_error);
                             return None;
@@ -2280,6 +2394,13 @@ fn append_chat_request_content_strings(
                         }
                     }
                     Some("tool_use") => {
+                        if !charge_nested_content_selector_work(
+                            &mut selector_work_bytes,
+                            block_body.len(),
+                        ) {
+                            mark_unevaluable(scan_error);
+                            return None;
+                        }
                         let Some(inputs) = raw_top_level_values(block_body, "input") else {
                             mark_unevaluable(scan_error);
                             return None;
@@ -2684,14 +2805,14 @@ fn decoded_completions_response_string_values(
     body: &[u8],
     scan_error: &mut Option<crate::json_splice::SpliceError>,
 ) -> Option<String> {
-    let choices = match raw_top_level_unique_array(body, "choices") {
+    let choices = match raw_top_level_unique_array_ref(body, "choices") {
         Ok(Some(choices)) => choices,
         Ok(None) | Err(()) => {
             mark_unevaluable(scan_error);
             return None;
         }
     };
-    let choices = match raw_array_items(&choices) {
+    let choices = match raw_array_item_refs(&choices) {
         Some(choices) => choices,
         None => {
             mark_unevaluable(scan_error);
@@ -2746,16 +2867,79 @@ fn decoded_chat_response_string_values(
     Some(out)
 }
 
-const RESPONSES_VISIBLE_DELTA_EVENTS: &[&str] = &[
-    "response.output_text.delta",
-    "response.function_call_arguments.delta",
-    "response.mcp_call_arguments.delta",
-    "response.custom_tool_call_input.delta",
-];
+/// One direct Responses stream carrier that exposes client-visible output.
+/// `content_index` separates text/refusal parts; tool calls are item-scoped.
+#[derive(Clone, Copy)]
+struct ResponsesDirectStreamEvent {
+    fields: &'static [&'static str],
+    content_index: bool,
+}
 
-/// The only Responses content-part `text` fields the typed output guardrail
-/// reads. Other part types can carry image, audio, file, or reasoning data.
-const RESPONSES_VISIBLE_TEXT_PART_TYPES: &[&str] = &["output_text", "text", "input_text"];
+fn responses_direct_stream_event(kind: &str) -> Option<ResponsesDirectStreamEvent> {
+    match kind {
+        "response.output_text.delta" | "response.refusal.delta" => {
+            Some(ResponsesDirectStreamEvent {
+                fields: &["delta"],
+                content_index: true,
+            })
+        }
+        "response.output_text.done" => Some(ResponsesDirectStreamEvent {
+            fields: &["text"],
+            content_index: true,
+        }),
+        "response.refusal.done" => Some(ResponsesDirectStreamEvent {
+            fields: &["refusal"],
+            content_index: true,
+        }),
+        "response.function_call_arguments.delta" | "response.mcp_call_arguments.delta" => {
+            Some(ResponsesDirectStreamEvent {
+                fields: &["delta"],
+                content_index: false,
+            })
+        }
+        "response.function_call_arguments.done" => Some(ResponsesDirectStreamEvent {
+            fields: &["name", "arguments"],
+            content_index: false,
+        }),
+        "response.mcp_call_arguments.done" => Some(ResponsesDirectStreamEvent {
+            fields: &["arguments"],
+            content_index: false,
+        }),
+        "response.custom_tool_call_input.delta" => Some(ResponsesDirectStreamEvent {
+            fields: &["delta"],
+            content_index: false,
+        }),
+        "response.custom_tool_call_input.done" => Some(ResponsesDirectStreamEvent {
+            fields: &["input"],
+            content_index: false,
+        }),
+        _ => None,
+    }
+}
+
+fn responses_stream_event_is_visible(kind: &str) -> bool {
+    responses_direct_stream_event(kind).is_some()
+        || matches!(
+            kind,
+            "response.content_part.added"
+                | "response.content_part.done"
+                | "response.output_item.added"
+                | "response.output_item.done"
+                | "response.completed"
+                | "response.incomplete"
+                | "response.failed"
+        )
+}
+
+/// The only Responses content-part fields the typed output guardrail reads.
+/// Other part types can carry image, audio, file, or reasoning data.
+fn responses_visible_content_part_field(kind: &str) -> Option<&'static str> {
+    match kind {
+        "output_text" | "text" | "input_text" => Some("text"),
+        "refusal" => Some("refusal"),
+        _ => None,
+    }
+}
 
 /// Source-preserving counterpart to the typed Responses output scanner's
 /// content-part walk. A missing or conflicting discriminator is opaque: a
@@ -2763,11 +2947,12 @@ const RESPONSES_VISIBLE_TEXT_PART_TYPES: &[&str] = &["output_text", "text", "inp
 /// part may cross the external guardrail boundary.
 fn append_responses_visible_part_strings(out: &mut String, part: &RawJson<'_>) -> Option<()> {
     let part_body = part.get().as_bytes();
-    match raw_top_level_unique_type(part_body).ok()?.as_deref() {
-        Some(kind) if RESPONSES_VISIBLE_TEXT_PART_TYPES.contains(&kind) => {
-            append_raw_top_level_strings(out, part_body, "text")?
-        }
-        Some(_) | None => {}
+    if let Some(field) = raw_top_level_unique_type(part_body)
+        .ok()?
+        .as_deref()
+        .and_then(responses_visible_content_part_field)
+    {
+        append_raw_top_level_strings(out, part_body, field)?;
     }
     Some(())
 }
@@ -3565,15 +3750,14 @@ fn decoded_chat_frame_string_values(body: &[u8]) -> Option<String> {
     Some(out)
 }
 
-/// The typed stream extractor deliberately takes only text/tool delta events:
-/// `.done`, output-item, and terminal response snapshots repeat those
-/// carriers. Keep the raw source pass on that same boundary, both to avoid
-/// duplicate external moderation and to keep any opaque terminal media out.
+/// The raw stream selector accepts every typed, client-visible Responses
+/// carrier. A provider may legally end after an authoritative `.done`, item,
+/// part, or terminal snapshot without having sent a delta first.
 #[cfg(test)]
 fn decoded_responses_frame_string_values(body: &[u8]) -> Option<String> {
     let mut out = String::new();
-    if raw_top_level_has_only_types(body, RESPONSES_VISIBLE_DELTA_EVENTS) {
-        append_raw_top_level_strings(&mut out, body, "delta")?;
+    for value in responses_stream_selected_values(body).ok()? {
+        append_scan_text(&mut out, &value)?;
     }
     Some(out)
 }
@@ -3823,60 +4007,209 @@ fn source_values_match_expected(mut source_values: Vec<String>, mut expected: Ve
     source_values == expected
 }
 
-fn responses_source_continuations(payload: &[u8]) -> SourceContinuations {
-    let kind = match raw_top_level_unique_string(payload, "type") {
-        Ok(Some(kind)) if RESPONSES_VISIBLE_DELTA_EVENTS.contains(&kind.as_str()) => kind,
-        Ok(Some(_)) | Ok(None) => return SourceContinuations::Absent,
-        Err(()) => return SourceContinuations::Unevaluable,
-    };
-    let item_id = match raw_top_level_unique_string(payload, "item_id") {
-        Ok(Some(item_id)) => match bounded_stream_source_id(item_id) {
-            Ok(item_id) => item_id,
-            Err(()) => return SourceContinuations::Unevaluable,
-        },
-        Ok(None) | Err(()) => return SourceContinuations::Unevaluable,
-    };
-    let output_index = match raw_top_level_unique_index(payload, "output_index") {
-        Ok(Some(index)) => index.to_string(),
-        Ok(None) | Err(()) => return SourceContinuations::Unevaluable,
-    };
-    let content_index = if kind == "response.output_text.delta" {
-        match raw_top_level_unique_index(payload, "content_index") {
-            Ok(Some(index)) => index.to_string(),
-            Ok(None) | Err(()) => return SourceContinuations::Unevaluable,
-        }
+fn responses_stream_coordinates(
+    payload: &[u8],
+    needs_content_index: bool,
+) -> Result<(String, String, String), ()> {
+    let item_id = raw_top_level_unique_string(payload, "item_id")?
+        .ok_or(())
+        .and_then(bounded_stream_source_id)?;
+    let output_index = raw_top_level_unique_index(payload, "output_index")?
+        .ok_or(())
+        .to_string();
+    let content_index = if needs_content_index {
+        raw_top_level_unique_index(payload, "content_index")?
+            .ok_or(())
+            .to_string()
     } else {
-        // Tool-argument deltas have no content part. Their stable identity is
-        // the item plus output index and event kind; an incidental content
-        // field must not create a second source channel.
         String::new()
     };
-    let values = match raw_top_level_string_values(payload, "delta") {
-        Some(values) => values,
-        None => return SourceContinuations::Unevaluable,
-    };
-    if values.is_empty() {
-        return SourceContinuations::Absent;
+    Ok((item_id, output_index, content_index))
+}
+
+fn responses_output_item_coordinates(
+    payload: &[u8],
+    item: &RawJson<'_>,
+) -> Result<(String, String), ()> {
+    let output_index = raw_top_level_unique_index(payload, "output_index")?
+        .ok_or(())
+        .to_string();
+    let nested_id = raw_top_level_unique_string(item.get().as_bytes(), "id")?
+        .ok_or(())
+        .and_then(bounded_stream_source_id)?;
+    match raw_top_level_unique_string(payload, "item_id")? {
+        Some(top_level_id) if top_level_id != nested_id => Err(()),
+        Some(top_level_id) => Ok((bounded_stream_source_id(top_level_id)?, output_index)),
+        None => Ok((nested_id, output_index)),
     }
-    let mut out = Vec::new();
-    let mut keys = std::collections::HashSet::new();
+}
+
+fn responses_content_part_selected_values(payload: &[u8]) -> Result<Vec<String>, ()> {
+    let part = raw_top_level_unique_object(payload, "part")?.ok_or(())?;
+    let Some(field) = raw_top_level_unique_type(part.get().as_bytes())?
+        .as_deref()
+        .and_then(responses_visible_content_part_field)
+    else {
+        return Ok(Vec::new());
+    };
+    raw_top_level_string_values(part.get().as_bytes(), field).ok_or(())
+}
+
+fn responses_output_item_selected_values(item: &RawJson<'_>) -> Result<Vec<String>, ()> {
+    let mut text = String::new();
+    append_responses_output_item_strings(&mut text, item).ok_or(())?;
+    Ok((!text.is_empty()).then_some(text).into_iter().collect())
+}
+
+fn responses_terminal_selected_values(payload: &[u8]) -> Result<Vec<String>, ()> {
+    let response = raw_top_level_unique_object(payload, "response")?.ok_or(())?;
+    let mut text = String::new();
+    append_responses_output_strings(&mut text, response.get().as_bytes()).ok_or(())?;
+    Ok((!text.is_empty()).then_some(text).into_iter().collect())
+}
+
+/// The client-visible source values on one Responses event. Every arm is
+/// type-aware: media/reasoning carriers remain opaque even when an upstream
+/// sends the event without any preceding delta.
+fn responses_stream_selected_values(payload: &[u8]) -> Result<Vec<String>, ()> {
+    let Some(kind) = raw_top_level_unique_string(payload, "type")? else {
+        return Ok(Vec::new());
+    };
+    if let Some(event) = responses_direct_stream_event(&kind) {
+        let mut values = Vec::new();
+        for field in event.fields {
+            values.extend(raw_top_level_string_values(payload, field).ok_or(())?);
+        }
+        return Ok(values);
+    }
+    match kind.as_str() {
+        "response.content_part.added" | "response.content_part.done" => {
+            responses_content_part_selected_values(payload)
+        }
+        "response.output_item.added" | "response.output_item.done" => {
+            let item = raw_top_level_unique_object(payload, "item")?.ok_or(())?;
+            responses_output_item_selected_values(&item)
+        }
+        "response.completed" | "response.incomplete" | "response.failed" => {
+            responses_terminal_selected_values(payload)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn append_responses_source_continuation(
+    out: &mut Vec<StreamContinuation>,
+    keys: &mut std::collections::HashSet<String>,
+    family: String,
+    identity: String,
+    values: Vec<String>,
+) -> Result<(), ()> {
     let mut source_values = Vec::new();
-    let family = format!("responses:{item_id:?}");
-    let identity = format!("{kind:?}:{output_index}:{content_index}:delta");
-    if append_source_branches(
-        &mut out,
-        &mut keys,
+    append_source_branches(
+        out,
+        keys,
         &mut source_values,
         family,
         identity,
         false,
         values,
     )
-    .is_err()
-    {
-        return SourceContinuations::Unevaluable;
+}
+
+fn responses_source_continuations(payload: &[u8]) -> SourceContinuations {
+    let kind = match raw_top_level_unique_string(payload, "type") {
+        Ok(Some(kind)) => kind,
+        Ok(None) => return SourceContinuations::Absent,
+        Err(()) => return SourceContinuations::Unevaluable,
+    };
+    if !responses_stream_event_is_visible(&kind) {
+        return SourceContinuations::Absent;
     }
-    SourceContinuations::Ready(out)
+
+    let mut out = Vec::new();
+    let mut keys = std::collections::HashSet::new();
+    let result = (|| -> Result<(), ()> {
+        if let Some(event) = responses_direct_stream_event(&kind) {
+            let fields = event
+                .fields
+                .iter()
+                .map(|field| {
+                    Ok((
+                        *field,
+                        raw_top_level_string_values(payload, field).ok_or(())?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, ()>>()?;
+            if fields.iter().all(|(_, values)| values.is_empty()) {
+                return Ok(());
+            }
+            let (item_id, output_index, content_index) =
+                responses_stream_coordinates(payload, event.content_index)?;
+            for (field, values) in fields {
+                append_responses_source_continuation(
+                    &mut out,
+                    &mut keys,
+                    format!("responses:{item_id:?}"),
+                    format!("{kind:?}:{output_index}:{content_index}:{field}"),
+                    values,
+                )?;
+            }
+            return Ok(());
+        }
+        match kind.as_str() {
+            "response.content_part.added" | "response.content_part.done" => {
+                let values = responses_content_part_selected_values(payload)?;
+                if values.is_empty() {
+                    return Ok(());
+                }
+                let (item_id, output_index, content_index) =
+                    responses_stream_coordinates(payload, true)?;
+                append_responses_source_continuation(
+                    &mut out,
+                    &mut keys,
+                    format!("responses:{item_id:?}"),
+                    format!("{kind:?}:{output_index}:{content_index}:part"),
+                    values,
+                )
+            }
+            "response.output_item.added" | "response.output_item.done" => {
+                let item = raw_top_level_unique_object(payload, "item")?.ok_or(())?;
+                let values = responses_output_item_selected_values(&item)?;
+                if values.is_empty() {
+                    return Ok(());
+                }
+                let (item_id, output_index) = responses_output_item_coordinates(payload, &item)?;
+                append_responses_source_continuation(
+                    &mut out,
+                    &mut keys,
+                    format!("responses:{item_id:?}"),
+                    format!("{kind:?}:{output_index}:item"),
+                    values,
+                )
+            }
+            "response.completed" | "response.incomplete" | "response.failed" => {
+                let values = responses_terminal_selected_values(payload)?;
+                if values.is_empty() {
+                    return Ok(());
+                }
+                append_responses_source_continuation(
+                    &mut out,
+                    &mut keys,
+                    "responses:terminal".to_owned(),
+                    format!("{kind:?}:response"),
+                    values,
+                )
+            }
+            _ => Ok(()),
+        }
+    })();
+    if result.is_err() {
+        SourceContinuations::Unevaluable
+    } else if out.is_empty() {
+        SourceContinuations::Absent
+    } else {
+        SourceContinuations::Ready(out)
+    }
 }
 
 struct SourceBranchIdentity {
@@ -4252,8 +4585,8 @@ fn chat_choice_source_continuations(payload: &[u8]) -> SourceContinuations {
 }
 
 fn completions_source_continuations(payload: &[u8]) -> SourceContinuations {
-    let choices = match raw_top_level_unique_array(payload, "choices") {
-        Ok(Some(choices)) => match raw_array_items(&choices) {
+    let choices = match raw_top_level_unique_array_ref(payload, "choices") {
+        Ok(Some(choices)) => match raw_array_item_refs(&choices) {
             Some(choices) => choices,
             None => return SourceContinuations::Unevaluable,
         },
@@ -4420,8 +4753,8 @@ fn frame_guardrail_supplemental_values(
             decoded_chat_frame_supplemental_values(payload.as_bytes()).ok_or(())
         }
         PassthroughProtocol::OpenaiCompletions => Ok(Vec::new()),
-        // Responses source continuations exist only for the explicitly safe
-        // text/tool delta events, whose sole output carrier is `delta`.
+        // Responses source continuations cover every type-aware visible
+        // carrier, so no generic raw field is supplemental.
         PassthroughProtocol::OpenaiResponses => Ok(Vec::new()),
     }
 }
@@ -4431,10 +4764,7 @@ fn decoded_chat_frame_values(body: &[u8]) -> Option<Vec<String>> {
 }
 
 fn decoded_responses_frame_values(body: &[u8]) -> Option<Vec<String>> {
-    raw_top_level_has_only_types(body, RESPONSES_VISIBLE_DELTA_EVENTS)
-        .then(|| raw_top_level_string_values(body, "delta"))
-        .flatten()
-        .or_else(|| Some(Vec::new()))
+    responses_stream_selected_values(body).ok()
 }
 
 fn frame_guardrail_values(protocol: PassthroughProtocol, frame: &[u8]) -> Vec<String> {
@@ -4527,12 +4857,15 @@ fn stream_guardrail_text(
         && payload.as_ref().is_some_and(|payload| {
             hidden_chat_stream_reasoning_frame(payload.trim().as_bytes()) == Some(true)
         });
-    let responses_visible_delta = matches!(protocol, PassthroughProtocol::OpenaiResponses)
+    let responses_visible_carrier = matches!(protocol, PassthroughProtocol::OpenaiResponses)
         && payload.as_ref().is_some_and(|payload| {
-            raw_top_level_has_only_types(payload.trim().as_bytes(), RESPONSES_VISIBLE_DELTA_EVENTS)
+            matches!(
+                raw_top_level_unique_string(payload.trim().as_bytes(), "type"),
+                Ok(Some(kind)) if responses_stream_event_is_visible(&kind)
+            )
         });
     let typed_continuation = if hidden_reasoning
-        || (matches!(protocol, PassthroughProtocol::OpenaiResponses) && !responses_visible_delta)
+        || (matches!(protocol, PassthroughProtocol::OpenaiResponses) && !responses_visible_carrier)
     {
         String::new()
     } else if matches!(protocol, PassthroughProtocol::OpenaiChat) {
@@ -4632,6 +4965,7 @@ fn append_stream_guardrail_text(
         // contributing any text to the channel cap.
         if continuations
             .iter()
+            .chain(text.continuations.iter())
             .any(|continuation| continuation.key.starts_with(prefix))
             && !closed_prefixes.contains(prefix)
         {
@@ -4688,19 +5022,25 @@ fn stream_continuation_identity_conflicts(
     closed_prefixes: &[String],
     text: &StreamGuardrailText,
 ) -> bool {
-    let is_closed = |key: &str| {
-        closed_prefixes
-            .iter()
-            .chain(text.closed_prefixes.iter())
-            .any(|prefix| key.starts_with(prefix))
-    };
+    // A just-arrived `response.output_item.done` both carries an
+    // authoritative item snapshot and closes older deltas for that item.
+    // Its own prefix must not make the snapshot look like a post-close
+    // continuation; only prefixes established by an earlier frame do that.
+    let was_closed = |key: &str| closed_prefixes.iter().any(|prefix| key.starts_with(prefix));
     if text
         .continuations
         .iter()
-        .any(|continuation| is_closed(&continuation.key))
+        .any(|continuation| was_closed(&continuation.key))
     {
         return true;
     }
+    let is_closed = |key: &str| {
+        was_closed(key)
+            || text
+                .closed_prefixes
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+    };
     let mut all = continuations
         .iter()
         .filter(|continuation| !is_closed(&continuation.key))
@@ -5009,11 +5349,12 @@ fn anthropic_stream_frame(frame: &[u8]) -> Option<bool> {
     }
 }
 
-/// Relay a non-success upstream SSE error without parsing or mutating its
-/// frames. The telemetry guard still fires from `Drop` when the client
-/// disconnects mid-relay.
+/// Relay an opaque upstream SSE representation without parsing or mutating
+/// its frames. This covers non-success error contracts and encoded successful
+/// replies intentionally bypassed by an output fail-open policy. The telemetry
+/// guard still fires from `Drop` when the client disconnects mid-relay.
 #[allow(clippy::too_many_arguments)]
-fn stream_non_success_response(
+fn stream_opaque_response(
     upstream_resp: reqwest::Response,
     resp_headers: HeaderMap,
     status: reqwest::StatusCode,
@@ -5052,7 +5393,7 @@ fn stream_non_success_response(
                     tracing::warn!(
                         route = %route_name,
                         error = %telemetry.error_message,
-                        "passthrough-route non-success SSE relay failed mid-stream",
+                        "passthrough-route opaque SSE relay failed mid-stream",
                     );
                     break;
                 }
@@ -5063,7 +5404,7 @@ fn stream_non_success_response(
             tracing::warn!(
                 route = %route_name,
                 error = %telemetry.error_message,
-                "passthrough-route non-success SSE relay timed out mid-stream",
+                "passthrough-route opaque SSE relay timed out mid-stream",
             );
         }
         telemetry.stream_reached_end = true;
@@ -5137,6 +5478,11 @@ fn stream_response(
         // caps (the SSE framing is not counted), and the raw frame bytes it
         // bounds too.
         let mut held_content = crate::held_content::HeldBuffer::default();
+        // Responses repeats a logical carrier in delta, done, part, item,
+        // and terminal events. Keep a bounded identity ledger for the whole
+        // response so those representations do not consume the content cap
+        // repeatedly, including across Window releases.
+        let mut responses_held_content = crate::held_content::ResponsesHeldContent::default();
         // Each source-identified semantic delta stays contiguous across
         // frames. Supplementary values remain individual scan candidates so
         // unrelated fields cannot form one guardrail input.
@@ -5232,7 +5578,16 @@ fn stream_response(
                     telemetry.record_failure(&err);
                 }
                 let (parts, usage) = frame_parts(protocol, &frame);
-                let held = parts.held();
+                let held = if matches!(protocol, PassthroughProtocol::OpenaiResponses)
+                    && policy.hold_cap().is_some()
+                    && !fail_opened
+                {
+                    responses_held_content
+                        .observe_sse_frame(&frame)
+                        .unwrap_or_else(|| parts.held())
+                } else {
+                    parts.held()
+                };
                 let delta = parts.scan;
                 if let Some(u) = usage {
                     merge_usage(&mut telemetry.usage, u);
@@ -5574,7 +5929,16 @@ fn stream_response(
                     anthropic = anthropic_stream_frame(&rest);
                 }
                 let (parts, usage) = frame_parts(protocol, &rest);
-                let held = parts.held();
+                let held = if matches!(protocol, PassthroughProtocol::OpenaiResponses)
+                    && policy.hold_cap().is_some()
+                    && !fail_opened
+                {
+                    responses_held_content
+                        .observe_sse_frame(&rest)
+                        .unwrap_or_else(|| parts.held())
+                } else {
+                    parts.held()
+                };
                 let delta = parts.scan;
                 if let Some(u) = usage {
                     merge_usage(&mut telemetry.usage, u);
@@ -6212,6 +6576,7 @@ fn copy_safe_headers(src: &HeaderMap, dst: &mut HeaderMap) {
                 | "proxy-authenticate"
                 | "proxy-authorization"
                 | "te"
+                | "trailer"
                 | "trailers"
                 | "upgrade"
         ) {
@@ -7680,6 +8045,11 @@ mod tests {
         }
         assert!(!scanned.contains("NESTED"), "{scanned:?}");
 
+        let refusal = br#"{"output":[{"type":"message","content":[{"type":"refusal","refusal":"\u0042LOCKREFUSAL","metadata":{"note":"NESTED"}}]}]}"#;
+        let scanned = response_guardrail_text(PassthroughProtocol::OpenaiResponses, refusal);
+        assert!(scanned.contains("BLOCKREFUSAL"), "{scanned:?}");
+        assert!(!scanned.contains("NESTED"), "{scanned:?}");
+
         let conflicting_type = br#"{"output":[{"type":"reasoning","type":"message","content":[{"text":"\u0042LOCKME"}]}]}"#;
         assert!(
             !response_guardrail_text(PassthroughProtocol::OpenaiResponses, conflicting_type)
@@ -8009,15 +8379,13 @@ mod tests {
             "{scanned:?}"
         );
 
-        // The terminal response repeats prior delta content, including media
-        // from image-generation output. It is never a second scan carrier.
+        // A terminal response can be the only authoritative output carrier.
+        // Its message text is scanned, while opaque image-generation data is
+        // still excluded.
         let terminal = b"data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"TERMINAL_MEDIA_SENTINEL\"},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"TERMINAL_VISIBLE_SENTINEL\"}]}]}}\n\n";
         let scanned = frame_guardrail_text(PassthroughProtocol::OpenaiResponses, terminal);
         assert!(!scanned.contains("TERMINAL_MEDIA_SENTINEL"), "{scanned:?}");
-        assert!(
-            !scanned.contains("TERMINAL_VISIBLE_SENTINEL"),
-            "{scanned:?}"
-        );
+        assert!(scanned.contains("TERMINAL_VISIBLE_SENTINEL"), "{scanned:?}");
 
         // `delta` is not a universally textual field: on a conflicting text
         // and audio discriminator it is opaque, rather than a path for audio
@@ -8092,6 +8460,11 @@ mod tests {
         for expected in ["BLOCKME", "clean"] {
             assert!(scanned.contains(expected), "{scanned:?}");
         }
+        assert!(!scanned.contains("NESTED"), "{scanned:?}");
+
+        let refusal = b"data: {\"type\":\"response.refusal.delta\",\"delta\":\"\\u0042LOCKREFUSAL\",\"metadata\":{\"note\":\"NESTED\"}}\n\n";
+        let scanned = frame_guardrail_text(PassthroughProtocol::OpenaiResponses, refusal);
+        assert!(scanned.contains("BLOCKREFUSAL"), "{scanned:?}");
         assert!(!scanned.contains("NESTED"), "{scanned:?}");
 
         let conflicting = b"data: {\"type\":\"response.content_part.done\",\"part\":{\"type\":\"reasoning_text\",\"type\":\"output_text\",\"text\":\"\\u0042LOCKME\"}}\n\n";
@@ -8217,6 +8590,20 @@ mod tests {
         let missing_id = br#"{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"FOR"}"#;
         assert!(matches!(
             stream_source_continuations(PassthroughProtocol::OpenaiResponses, missing_id),
+            SourceContinuations::Unevaluable
+        ));
+        let refusal = br#"{"type":"response.refusal.delta","item_id":"one","output_index":0,"content_index":0,"delta":"FOR"}"#;
+        assert!(matches!(
+            stream_source_continuations(PassthroughProtocol::OpenaiResponses, refusal),
+            SourceContinuations::Ready(_)
+        ));
+        let refusal_missing_content_index =
+            br#"{"type":"response.refusal.delta","item_id":"one","output_index":0,"delta":"FOR"}"#;
+        assert!(matches!(
+            stream_source_continuations(
+                PassthroughProtocol::OpenaiResponses,
+                refusal_missing_content_index
+            ),
             SourceContinuations::Unevaluable
         ));
         let oversized_id = "x".repeat(MAX_STREAM_GUARDRAIL_SOURCE_ID_BYTES + 1);
@@ -8685,6 +9072,55 @@ mod tests {
             )
             .unevaluable
         );
+
+        // A legal done-only item carries its complete visible message and
+        // closes itself after the current scan. It must not look like a
+        // post-close continuation or leave one channel behind forever.
+        let standalone_done = b"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"standalone\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"VISIBLE\"}]}}\n\n";
+        let standalone = stream_guardrail_text(
+            PassthroughProtocol::OpenaiResponses,
+            standalone_done,
+            frame_parts(PassthroughProtocol::OpenaiResponses, standalone_done)
+                .0
+                .scan,
+        );
+        assert!(!standalone.unevaluable);
+        assert_eq!(
+            standalone.closed_prefixes,
+            vec!["responses:\"standalone\":".to_owned()]
+        );
+        assert!(!stream_continuation_identity_conflicts(
+            &[],
+            &[],
+            &standalone,
+        ));
+        let mut standalone_continuations = Vec::new();
+        let mut standalone_tails = Vec::new();
+        let mut standalone_supplemental = Vec::new();
+        let mut standalone_closures = Vec::new();
+        append_stream_guardrail_text(
+            &mut standalone_continuations,
+            &mut standalone_tails,
+            &mut standalone_supplemental,
+            &mut standalone_closures,
+            &standalone,
+        );
+        assert!(scan_candidates_contain(
+            &stream_guardrail_scan_text(
+                &standalone_tails,
+                &standalone_continuations,
+                &standalone_supplemental,
+            ),
+            "VISIBLE",
+        ));
+        retire_scanned_stream_continuations(
+            &mut standalone_continuations,
+            &mut standalone_tails,
+            &mut standalone_closures,
+        );
+        assert!(standalone_continuations.is_empty());
+        assert!(standalone_tails.is_empty());
+        assert!(standalone_closures.is_empty());
     }
 
     #[test]
@@ -9284,10 +9720,15 @@ mod tests {
         src.append("set-cookie", HeaderValue::from_static("a=1"));
         src.append("set-cookie", HeaderValue::from_static("b=2"));
         src.append("vary", HeaderValue::from_static("accept"));
+        src.append("trailer", HeaderValue::from_static("x-upstream-checksum"));
         let mut dst = HeaderMap::new();
         copy_safe_headers(&src, &mut dst);
         let cookies: Vec<_> = dst.get_all("set-cookie").iter().collect();
         assert_eq!(cookies.len(), 2, "both Set-Cookie values must relay");
+        assert!(
+            dst.get("trailer").is_none(),
+            "a relay that does not forward trailers must not advertise them"
+        );
     }
 
     #[test]
@@ -9486,21 +9927,19 @@ mod tests {
     }
 
     #[test]
-    fn nested_anthropic_tool_result_content_at_depth_cap_is_scanned() {
-        let body =
-            nested_anthropic_tool_result_request(crate::json_splice::MAX_JSON_DEPTH, "BLOCKME");
+    fn nested_anthropic_tool_result_content_within_work_cap_is_scanned() {
+        let body = nested_anthropic_tool_result_request(32, "BLOCKME");
         let text = try_request_guardrail_text(PassthroughProtocol::OpenaiChat, &body)
-            .expect("nested tool results at the shared JSON depth cap remain evaluable");
+            .expect("nested tool results within the structural-work cap remain evaluable");
         assert!(text.contains("BLOCKME"), "{text}");
     }
 
     #[test]
-    fn nested_anthropic_tool_result_content_beyond_depth_cap_is_unevaluable() {
-        let body =
-            nested_anthropic_tool_result_request(crate::json_splice::MAX_JSON_DEPTH + 1, "safe");
+    fn nested_anthropic_tool_result_content_beyond_work_cap_is_unevaluable() {
+        let body = nested_anthropic_tool_result_request(crate::json_splice::MAX_JSON_DEPTH, "safe");
         let error = try_request_guardrail_text(PassthroughProtocol::OpenaiChat, &body)
-            .expect_err("nested tool results beyond the shared JSON depth cap must not recurse");
-        assert!(error.is_depth_exceeded(), "{error}");
+            .expect_err("nested tool results beyond the structural-work cap must not recurse");
+        assert!(error.is_unevaluable(), "{error}");
     }
 
     #[test]
@@ -9810,7 +10249,7 @@ data: [DONE]\n\n";
     #[tokio::test]
     async fn a_malformed_supplemental_stream_selector_ignores_output_fail_open() {
         let v = relayed_refusal_frame(MALFORMED_SUPPLEMENTAL_SSE, OUTPUT_FAIL_OPEN).await;
-        assert_eq!(v["error"]["type"], "content_filter", "{v}");
+        assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
         assert_eq!(v["error"]["code"], "guardrail_unavailable", "{v}");
     }
 }

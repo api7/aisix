@@ -22,8 +22,8 @@ import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 // Output: a streamed reply is scanned for its generated text and tool-call
 // arguments on every envelope — Anthropic Messages text and tool input
 // deltas (carried on the chat envelope), chat tool-call arguments, and
-// Responses function-call argument deltas. Generated reasoning is not
-// scanned. The same extraction feeds the hold-back cap (#513): a stream
+// Responses function-call argument/refusal deltas. Generated reasoning is
+// not scanned. The same extraction feeds the hold-back cap (#513): a stream
 // whose frames outweigh `max_buffer_bytes` while its content does not is
 // released.
 //
@@ -85,19 +85,20 @@ const DEEP_ESCAPED_BLOCK_JSON = deepEscapedBlockJSON(160);
 // Mirrors `json_splice::MAX_JSON_DEPTH`: one deeper is unscannable and must
 // use the resolved guardrail failure policy instead of falling back to escapes.
 const JSON_DEPTH_CAP = 4_096;
+const NESTED_TOOL_RESULT_WORK_SAFE_DEPTH = 32;
 const OVER_DEPTH_ESCAPED_BLOCK_JSON = deepEscapedBlockJSON(JSON_DEPTH_CAP + 1);
 const OVER_DEPTH_OPAQUE_BLOCK_JSON = deepLiteralBlockJSON(JSON_DEPTH_CAP + 1);
 const AT_DEPTH_ANTHROPIC_TOOL_RESULT_INPUT = deeplyNestedAnthropicToolResultRequest(
-  JSON_DEPTH_CAP,
-  "nested-tool-result-at-depth-cap",
+  NESTED_TOOL_RESULT_WORK_SAFE_DEPTH,
+  "nested-tool-result-within-work-cap",
 );
 const OVER_DEPTH_ANTHROPIC_TOOL_RESULT_INPUT = deeplyNestedAnthropicToolResultRequest(
-  JSON_DEPTH_CAP + 1,
-  "nested-tool-result-fail-closed",
+  JSON_DEPTH_CAP,
+  "nested-tool-result-work-cap-fail-closed",
 );
 const OVER_DEPTH_ANTHROPIC_TOOL_RESULT_FAIL_OPEN_INPUT = deeplyNestedAnthropicToolResultRequest(
-  JSON_DEPTH_CAP + 1,
-  "nested-tool-result-fail-open",
+  JSON_DEPTH_CAP,
+  "nested-tool-result-work-cap-fail-open",
 );
 const OVER_DEPTH_CHAT_INPUT = `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"go","metadata":${OVER_DEPTH_ESCAPED_BLOCK_JSON}}]}`;
 const OVER_DEPTH_RESPONSES_INPUT = `{"model":"gpt-4o-mini","input":[{"role":"user","metadata":${OVER_DEPTH_ESCAPED_BLOCK_JSON},"content":[{"type":"input_text","text":"go"}]}]}`;
@@ -105,16 +106,25 @@ const OVER_DEPTH_CHAT_OPAQUE_INPUT = `{"model":"gpt-4o-mini","messages":[{"role"
 const OVER_DEPTH_RESPONSES_OPAQUE_INPUT = `{"model":"gpt-4o-mini","input":[{"role":"user","content":[{"type":"input_image","image_url":{"url":"https://example.invalid/image","metadata":${OVER_DEPTH_OPAQUE_BLOCK_JSON}}},{"type":"input_text","text":"go"}]}]}`;
 const OVER_DEPTH_ANTHROPIC_TOOL_OUTPUT = `{"type":"message","content":[{"type":"tool_use","id":"tool_1","name":"lookup","input":${OVER_DEPTH_ESCAPED_BLOCK_JSON}}]}`;
 const CAP = 1_000;
+const RESPONSES_SNAPSHOT_TEXT = "x".repeat(300);
 const SPLIT_BLOCK = "FORBIDDEN";
 const SPLIT_BLOCK_REGEX = String.raw`FOR\s*BIDDEN`;
 const KNOWN_CHAT_OUTPUT = String.raw`{"model":"routing-only","choices":[{"message":{"content":"\u0042LOCKME","metadata":{"note":"${OUT_LIT}"}}}],"choices":[{"message":{"content":"clean"}}]}`;
 const KNOWN_RESPONSES_OUTPUT = String.raw`{"output":[{"type":"message","content":[{"type":"output_text","text":"\u0042LOCKME","metadata":{"note":"${OUT_LIT}"}}]}],"output":[{"type":"message","content":[{"type":"output_text","text":"clean"}]}]}`;
+const RESPONSES_REFUSAL_OUTPUT = JSON.stringify({
+  output: [
+    {
+      type: "message",
+      content: [{ type: "refusal", refusal: OUT_LIT, metadata: { note: ESCAPED_BLOCK } }],
+    },
+  ],
+});
 const KNOWN_CHAT_STREAM = `${String.raw`data: {"choices":[{"index":0,"delta":{"content":"\u0042LOCKME"}},{"index":1,"delta":{"content":"clean"}}]}`}\n\n`;
 const KNOWN_RESPONSES_STREAM = `${String.raw`data: {"type":"response.output_text.delta","item_id":"known","output_index":0,"content_index":0,"delta":"\u0042LOCKME","delta":"clean","metadata":{"note":"${OUT_LIT}"}}`}\n\n`;
 const SPLIT_RESPONSES_STREAM = [
   `data: {"type":"response.output_text.delta","item_id":"same","output_index":0,"content_index":0,"delta":"FOR"}\n\n`,
   `data: {"type":"response.output_text.delta","item_id":"same","output_index":0,"content_index":0,"delta":"noise","delta":"BIDDEN"}\n\n`,
-  `data: {"type":"response.output_item.done","item":{"id":"same","type":"message"}}\n\n`,
+  `data: {"type":"response.output_item.done","output_index":0,"item":{"id":"same","type":"message"}}\n\n`,
   "data: [DONE]\n\n",
 ];
 const DISTINCT_ITEMS_RESPONSES_STREAM = [
@@ -124,9 +134,9 @@ const DISTINCT_ITEMS_RESPONSES_STREAM = [
 ];
 const RESPONSES_REASONING_STREAM = [
   `data: ${JSON.stringify({ type: "response.reasoning_text.done", text: OUT_LIT })}\n\n`,
-  `data: ${JSON.stringify({ type: "response.content_part.done", part: { type: "reasoning_text", text: OUT_LIT } })}\n\n`,
-  `data: ${JSON.stringify({ type: "response.output_item.done", item: { id: "reasoning", type: "reasoning", summary: [{ type: "summary_text", text: OUT_LIT }] } })}\n\n`,
-  `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: "message", output_index: 0, content_index: 0, delta: "clean" })}\n\n`,
+  `data: ${JSON.stringify({ type: "response.content_part.done", item_id: "reasoning", output_index: 0, content_index: 0, part: { type: "reasoning_text", text: OUT_LIT } })}\n\n`,
+  `data: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: { id: "reasoning", type: "reasoning", summary: [{ type: "summary_text", text: OUT_LIT }] } })}\n\n`,
+  `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: "message", output_index: 1, content_index: 0, delta: "clean" })}\n\n`,
   `data: ${JSON.stringify({ type: "response.completed", response: { output: [{ type: "reasoning", summary: [{ type: "summary_text", text: OUT_LIT }] }, { type: "message", content: [{ type: "output_text", text: "clean" }] }] } })}\n\n`,
   "data: [DONE]\n\n",
 ];
@@ -169,6 +179,59 @@ const STREAMS: Record<string, string[]> = {
     JSON.stringify({ type: "response.created", response: { id: "r", status: "in_progress", output: [] } }),
     JSON.stringify({ type: "response.function_call_arguments.delta", item_id: "fc", output_index: 0, delta: `{"q":"${OUT_LIT}"}` }),
     JSON.stringify({ type: "response.completed", response: { id: "r", status: "completed", output: [] } }),
+  ],
+  "responses-refusal": [
+    JSON.stringify({ type: "response.refusal.delta", item_id: "msg_refusal", output_index: 0, content_index: 0, delta: OUT_LIT }),
+    JSON.stringify({ type: "response.refusal.done", item_id: "msg_refusal", output_index: 0, content_index: 0, refusal: OUT_LIT }),
+    JSON.stringify({ type: "response.completed", response: { id: "r_refusal", status: "completed", output: [{ type: "message", content: [{ type: "refusal", refusal: OUT_LIT }] }] } }),
+  ],
+  "responses-refusal-cap": [
+    JSON.stringify({ type: "response.refusal.delta", item_id: "msg_refusal_cap", output_index: 0, content_index: 0, delta: "x".repeat(CAP + 1) }),
+    JSON.stringify({ type: "response.completed", response: { id: "r_refusal_cap", status: "completed", output: [{ type: "message", content: [{ type: "refusal", refusal: "x".repeat(CAP + 1) }] }] } }),
+  ],
+  "responses-refusal-done-cap": [
+    JSON.stringify({ type: "response.refusal.done", item_id: "msg_refusal_done_cap", output_index: 0, content_index: 0, refusal: "x".repeat(CAP + 1) }),
+  ],
+  "responses-repeated-snapshots-under-cap": [
+    JSON.stringify({ type: "response.output_text.delta", item_id: "snapshot", output_index: 0, content_index: 0, delta: RESPONSES_SNAPSHOT_TEXT }),
+    JSON.stringify({ type: "response.output_text.done", item_id: "snapshot", output_index: 0, content_index: 0, text: RESPONSES_SNAPSHOT_TEXT }),
+    JSON.stringify({ type: "response.content_part.done", item_id: "snapshot", output_index: 0, content_index: 0, part: { type: "output_text", text: RESPONSES_SNAPSHOT_TEXT } }),
+    JSON.stringify({ type: "response.output_item.done", item_id: "snapshot", output_index: 0, item: { id: "snapshot", type: "message", content: [{ type: "output_text", text: RESPONSES_SNAPSHOT_TEXT }] } }),
+    JSON.stringify({ type: "response.completed", response: { output: [{ id: "snapshot", type: "message", content: [{ type: "output_text", text: RESPONSES_SNAPSHOT_TEXT }] }] } }),
+  ],
+  "responses-output-text-done": [
+    JSON.stringify({ type: "response.output_text.done", item_id: "text_done", output_index: 0, content_index: 0, text: OUT_LIT }),
+  ],
+  "responses-refusal-done-only": [
+    JSON.stringify({ type: "response.refusal.done", item_id: "refusal_done", output_index: 0, content_index: 0, refusal: OUT_LIT }),
+  ],
+  "responses-function-done": [
+    JSON.stringify({ type: "response.function_call_arguments.done", item_id: "function_done", output_index: 0, name: "lookup", arguments: JSON.stringify({ query: OUT_LIT }) }),
+  ],
+  "responses-mcp-done": [
+    JSON.stringify({ type: "response.mcp_call_arguments.done", item_id: "mcp_done", output_index: 0, arguments: JSON.stringify({ query: OUT_LIT }) }),
+  ],
+  "responses-custom-done": [
+    JSON.stringify({ type: "response.custom_tool_call_input.done", item_id: "custom_done", output_index: 0, input: OUT_LIT }),
+  ],
+  "responses-content-part-added": [
+    JSON.stringify({ type: "response.content_part.added", item_id: "part_added", output_index: 0, content_index: 0, part: { type: "refusal", refusal: OUT_LIT } }),
+  ],
+  "responses-content-part-done": [
+    JSON.stringify({ type: "response.content_part.done", item_id: "part_done", output_index: 0, content_index: 0, part: { type: "refusal", refusal: OUT_LIT } }),
+  ],
+  "responses-output-item-added": [
+    JSON.stringify({ type: "response.output_item.added", output_index: 0, item: { id: "item_added", type: "message", content: [{ type: "refusal", refusal: OUT_LIT }] } }),
+  ],
+  "responses-output-item-done": [
+    JSON.stringify({ type: "response.output_item.done", output_index: 0, item: { id: "item_done", type: "message", content: [{ type: "refusal", refusal: OUT_LIT }] } }),
+  ],
+  "responses-terminal-only": [
+    JSON.stringify({ type: "response.completed", response: { id: "terminal_only", status: "completed", output: [{ type: "message", content: [{ type: "refusal", refusal: OUT_LIT }] }] } }),
+  ],
+  "responses-clean-delta-malicious-done": [
+    JSON.stringify({ type: "response.output_text.delta", item_id: "mismatch", output_index: 0, content_index: 0, delta: "clean" }),
+    JSON.stringify({ type: "response.refusal.done", item_id: "mismatch", output_index: 0, content_index: 0, refusal: OUT_LIT }),
   ],
   // ~600 bytes of text over 60 frames: the frames outweigh the cap, the
   // text they carry does not.
@@ -310,6 +373,10 @@ describe("passthrough guardrail scan coverage", () => {
       rawBody: KNOWN_RESPONSES_OUTPUT,
       rawContentType: "application/json",
     });
+    upstreams["responses-refusal-buffered"] = await startOpenAiUpstream({
+      rawBody: RESPONSES_REFUSAL_OUTPUT,
+      rawContentType: "application/json",
+    });
     upstreams["known-chat-stream-output"] = await startOpenAiUpstream({
       rawStreamFrames: [KNOWN_CHAT_STREAM],
     });
@@ -435,6 +502,120 @@ describe("passthrough guardrail scan coverage", () => {
     if (!upstream) throw new Error(`missing ${route} upstream`);
     const before = upstream.receivedRequests.length;
     await expectBlocked(await call(route, path, body));
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("output: a buffered Responses refusal is source-scanned", async (ctx) => {
+    if (!ready(ctx)) return;
+    const route = "responses-refusal-buffered";
+    const upstream = upstreams[route];
+    if (!upstream) throw new Error(`missing ${route} upstream`);
+    const before = upstream.receivedRequests.length;
+    const res = await callRaw(route, "/v1/any", `{"model":"gpt-4o-mini","input":"go"}`);
+    const body = await res.text();
+    expect(res.status, body).toBe(422);
+    expect(body).toContain("pt-scan-output");
+    expect(body).not.toContain(OUT_LIT);
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("output: a streamed Responses refusal is source-scanned", async (ctx) => {
+    if (!ready(ctx)) return;
+    const route = "responses-refusal";
+    const upstream = upstreams[route];
+    if (!upstream) throw new Error(`missing ${route} upstream`);
+    const before = upstream.receivedRequests.length;
+    await expectBlocked(
+      await callRaw(route, "/v1/any", `{"model":"gpt-4o-mini","stream":true,"input":"go"}`),
+    );
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+  });
+
+  test.for([
+    "responses-output-text-done",
+    "responses-refusal-done-only",
+    "responses-function-done",
+    "responses-mcp-done",
+    "responses-custom-done",
+    "responses-content-part-added",
+    "responses-content-part-done",
+    "responses-output-item-added",
+    "responses-output-item-done",
+    "responses-terminal-only",
+    "responses-clean-delta-malicious-done",
+  ] as const)("output: standalone Responses carrier %s is source-scanned", async (route, ctx) => {
+    if (!ready(ctx)) return;
+    const upstream = upstreams[route];
+    if (!upstream) throw new Error(`missing ${route} upstream`);
+    const before = upstream.receivedRequests.length;
+    const res = await callRaw(route, "/v1/any", `{"model":"gpt-4o-mini","stream":true,"input":"go"}`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain("event: error");
+    expect(body).toContain("content_filter");
+    expect(body).toContain("pt-scan-output");
+    expect(body).not.toContain("guardrail_unavailable");
+    expect(body).not.toContain("unscannable_body");
+    expect(body).not.toContain(OUT_LIT);
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("output: a streamed Responses refusal obeys the hold-back cap", async (ctx) => {
+    if (!ready(ctx)) return;
+    const route = "responses-refusal-cap";
+    const upstream = upstreams[route];
+    if (!upstream) throw new Error(`missing ${route} upstream`);
+    const before = upstream.receivedRequests.length;
+    const res = await callRaw(
+      route,
+      "/v1/any",
+      `{"model":"gpt-4o-mini","stream":true,"input":"go"}`,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain("event: error");
+    expect(body).toContain("guardrail_unavailable");
+    expect(body).toContain("output_buffer_exceeded");
+    expect(body).not.toContain("x".repeat(CAP + 1));
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("output: a done-only Responses refusal obeys the hold-back cap", async (ctx) => {
+    if (!ready(ctx)) return;
+    const route = "responses-refusal-done-cap";
+    const upstream = upstreams[route];
+    if (!upstream) throw new Error(`missing ${route} upstream`);
+    const before = upstream.receivedRequests.length;
+    const res = await callRaw(
+      route,
+      "/v1/any",
+      `{"model":"gpt-4o-mini","stream":true,"input":"go"}`,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain("event: error");
+    expect(body).toContain("guardrail_unavailable");
+    expect(body).toContain("output_buffer_exceeded");
+    expect(body).not.toContain("x".repeat(CAP + 1));
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("output: repeated Responses snapshots count as one logical carrier toward the hold-back cap", async (ctx) => {
+    if (!ready(ctx)) return;
+    const route = "responses-repeated-snapshots-under-cap";
+    const upstream = upstreams[route];
+    if (!upstream) throw new Error(`missing ${route} upstream`);
+    const before = upstream.receivedRequests.length;
+    const res = await callRaw(
+      route,
+      "/v1/any",
+      `{"model":"gpt-4o-mini","stream":true,"input":"go"}`,
+    );
+    const body = await res.text();
+    expect(res.status, body).toBe(200);
+    expect(body).toContain(RESPONSES_SNAPSHOT_TEXT);
+    expect(body).not.toContain("event: error");
+    expect(body).not.toContain("output_buffer_exceeded");
     expect(upstream.receivedRequests.length).toBe(before + 1);
   });
 
@@ -653,6 +834,9 @@ describe("passthrough guardrail scan coverage", () => {
     const response = await res.text();
     expect(response).toContain("event: error");
     expect(response).toContain("content_filter");
+    expect(response).toContain("pt-scan-output");
+    expect(response).not.toContain("guardrail_unavailable");
+    expect(response).not.toContain("unscannable_body");
     expect(response).not.toContain(SPLIT_BLOCK);
     expect(upstream.receivedRequests.length).toBe(before + 1);
   });
@@ -862,7 +1046,7 @@ describe("passthrough guardrail scan coverage", () => {
     expect(upstreams.input!.receivedRequests.length).toBe(before);
   });
 
-  test("input: nested Anthropic tool results at the scanner depth cap are blocked", async (ctx) => {
+  test("input: nested Anthropic tool results within the structural-work cap are blocked", async (ctx) => {
     if (!ready(ctx)) return;
     const before = upstreams.input!.receivedRequests.length;
     const res = await callRaw("input", "/v1/any", AT_DEPTH_ANTHROPIC_TOOL_RESULT_INPUT);
@@ -875,7 +1059,7 @@ describe("passthrough guardrail scan coverage", () => {
     expect(upstreams.input!.receivedRequests.length).toBe(before);
   });
 
-  test("input: nested Anthropic tool results beyond the scanner depth cap fail closed", async (ctx) => {
+  test("input: nested Anthropic tool results beyond the structural-work cap fail closed", async (ctx) => {
     if (!ready(ctx)) return;
     const before = upstreams.input!.receivedRequests.length;
     const res = await callRaw("input", "/v1/any", OVER_DEPTH_ANTHROPIC_TOOL_RESULT_INPUT);
@@ -1090,6 +1274,158 @@ describe("passthrough guardrail scan coverage", () => {
   });
 });
 
+// An output fail-open policy must relay an encoded successful representation
+// unchanged. It cannot send compressed bytes to a text moderator, but it must
+// record that the response bypassed inspection rather than turning a 200 into
+// a local 422.
+describe("passthrough encoded successful output fail-open", () => {
+  const caller = "sk-pt-encoded-fail-open";
+  const callerHash = createHash("sha256").update(caller).digest("hex");
+  const bufferedRoute = "pt-encoded-buffered-fail-open";
+  const sseRoute = "pt-encoded-sse-fail-open";
+  const logstore = "pt-encoded-fail-open";
+  const credentialRef = "pt_encoded_open";
+  let app: SpawnedApp | undefined;
+  let bufferedUpstream: OpenAiUpstream | undefined;
+  let sseUpstream: OpenAiUpstream | undefined;
+  let moderationUpstream: OpenAiUpstream | undefined;
+  let sls: MockSls | undefined;
+  let etcdReachable = false;
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    sls = await startMockSls();
+    bufferedUpstream = await startOpenAiUpstream({
+      rawBody: UPSTREAM_200_GZIP_JSON,
+      rawContentType: "application/json",
+      responseHeaders: {
+        "content-encoding": "gzip",
+        "content-length": String(UPSTREAM_200_GZIP_JSON.byteLength),
+      },
+    });
+    sseUpstream = await startOpenAiUpstream({
+      rawBody: UPSTREAM_200_GZIP_SSE,
+      rawContentType: "text/event-stream; charset=utf-8",
+      responseHeaders: {
+        "content-encoding": "gzip",
+        "content-length": String(UPSTREAM_200_GZIP_SSE.byteLength),
+      },
+    });
+    moderationUpstream = await startOpenAiUpstream({
+      nonStreamBody: { id: "unused", results: [] },
+    });
+    app = await spawnApp({
+      extraEnv: {
+        [`SLS_CRED_${credentialRef.toUpperCase()}_AK_ID`]: "mock-akid",
+        [`SLS_CRED_${credentialRef.toUpperCase()}_AK_SECRET`]: "mock-secret",
+      },
+    });
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createObservabilityExporter({
+      name: "pt-encoded-fail-open-sls",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: "aisix-e2e-obs",
+      logstore,
+      credential_ref: credentialRef,
+    });
+    const providerKey = await seed.createProviderKey({
+      display_name: "pt-encoded-fail-open-pk",
+      secret: "sk-mock",
+      api_base: bufferedUpstream.baseUrl,
+    });
+    await seed.createPassthroughRoute({
+      name: bufferedRoute,
+      path_prefix: `/${bufferedRoute}`,
+      target_url: bufferedUpstream.baseUrl,
+      provider_key_id: providerKey.id,
+    });
+    await seed.createPassthroughRoute({
+      name: sseRoute,
+      path_prefix: `/${sseRoute}`,
+      target_url: sseUpstream.baseUrl,
+      provider_key_id: providerKey.id,
+    });
+    await seed.createGuardrail({
+      name: "pt-encoded-fail-open-output",
+      enabled: true,
+      hook_point: "output",
+      kind: "openai_moderation",
+      endpoint: moderationUpstream.baseUrl,
+      api_key: "sk-local-moderation",
+      output_fail_open: true,
+    });
+    await seed.createApiKey({ key_hash: callerHash, allowed_models: [], allowed_routes: ["*"] });
+    const proxy = new ProxyClient(app.proxyUrl, caller);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
+  }, 90_000);
+
+  afterAll(async () => {
+    await app?.exit();
+    await bufferedUpstream?.close();
+    await sseUpstream?.close();
+    await moderationUpstream?.close();
+    await sls?.close();
+  });
+
+  const assertBypassAudit = async (route: string, requestId: string) => {
+    const log = await waitForSlsLog(
+      sls!,
+      logstore,
+      (entry) => entry.get("passthrough_route_name") === route && entry.get("request_id") === requestId,
+      "encoded fail-open passthrough usage event",
+    );
+    expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
+    expect(log.get("guardrail_bypassed_reason")).toBe("unscannable_body");
+  };
+
+  test("relays an encoded buffered response without calling moderation", async (ctx) => {
+    if (!etcdReachable || !app || !bufferedUpstream || !moderationUpstream || !sls) return ctx.skip();
+
+    const before = bufferedUpstream.receivedRequests.length;
+    const res = await openRawHttpRequest(
+      `${app.proxyUrl}/${bufferedRoute}/v1/completions`,
+      { authorization: `Bearer ${caller}`, "content-type": "application/json" },
+      `{"model":"gpt-4o-mini","prompt":"clean"}`,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toBe("application/json");
+    expect(res.headers["content-encoding"]).toBe("gzip");
+    expect(res.headers["content-length"]).toBe(String(UPSTREAM_200_GZIP_JSON.byteLength));
+    const requestId = String(res.headers["x-aisix-request-id"] ?? "");
+    expect(requestId).toBeTruthy();
+    expect(await readRawHttpBody(res)).toEqual(UPSTREAM_200_GZIP_JSON);
+    expect(bufferedUpstream.receivedRequests.length).toBe(before + 1);
+    expect(moderationUpstream.receivedRequests).toHaveLength(0);
+    await assertBypassAudit(bufferedRoute, requestId);
+  });
+
+  test("relays an encoded SSE response without calling moderation", async (ctx) => {
+    if (!etcdReachable || !app || !sseUpstream || !moderationUpstream || !sls) return ctx.skip();
+
+    const before = sseUpstream.receivedRequests.length;
+    const res = await openRawHttpRequest(
+      `${app.proxyUrl}/${sseRoute}/v1/chat/completions`,
+      { authorization: `Bearer ${caller}`, "content-type": "application/json" },
+      `{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"clean"}]}`,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toBe("text/event-stream; charset=utf-8");
+    expect(res.headers["content-encoding"]).toBe("gzip");
+    expect(res.headers["content-length"]).toBe(String(UPSTREAM_200_GZIP_SSE.byteLength));
+    const requestId = String(res.headers["x-aisix-request-id"] ?? "");
+    expect(requestId).toBeTruthy();
+    expect(await readRawHttpBody(res)).toEqual(UPSTREAM_200_GZIP_SSE);
+    expect(sseUpstream.receivedRequests.length).toBe(before + 1);
+    expect(moderationUpstream.receivedRequests).toHaveLength(0);
+    await assertBypassAudit(sseRoute, requestId);
+  });
+});
+
 // A source carrier can be valid while a separate selected supplemental field
 // is malformed. Even an explicitly output-fail-open remote guardrail may not
 // turn that local selector failure into an unscanned provider frame.
@@ -1296,7 +1632,7 @@ describe("passthrough Raw stream unevaluable-output fail-open", () => {
     expect(log.get("guardrail_bypassed_reason")).toBe("unscannable_body");
   });
 
-  test("forwards nested Anthropic tool results beyond the depth cap only under input fail_open", async (ctx) => {
+  test("forwards nested Anthropic tool results beyond the work cap only under input fail_open", async (ctx) => {
     if (!etcdReachable || !app || !sls || !depthInputUpstream) return ctx.skip();
 
     const before = depthInputUpstream.receivedRequests.length;

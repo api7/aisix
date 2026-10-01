@@ -289,7 +289,12 @@ fn raw_client_builder() -> reqwest::ClientBuilder {
     // workspace dependency declaration). The remaining decoder features are
     // not compiled in, so disabling gzip is sufficient to preserve every
     // representation this binary could otherwise transform.
-    crate::upstream_http::client_builder().no_gzip()
+    crate::upstream_http::client_builder()
+        .no_gzip()
+        // The passthrough target is validated before dispatch. Following an
+        // upstream Location would make a second, unchecked request and could
+        // carry the injected provider credential beyond that boundary.
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 fn raw_client() -> &'static reqwest::Client {

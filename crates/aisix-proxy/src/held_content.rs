@@ -18,10 +18,14 @@
 //! [`RAW_HOLD_FACTOR`] times the same cap, through [`HeldBuffer`]. Crossing
 //! either bound is the same buffer-exceeded event.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use aisix_gateway::ChatDelta;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 /// Raw bytes a hold-back may keep, as a multiple of `max_buffer_bytes`
 /// (32 MiB at the 256 KiB default). Above the framing an ordinary token
@@ -220,6 +224,521 @@ impl Parts {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ResponsesCarrierMode {
+    Delta,
+    Snapshot,
+}
+
+const MAX_RESPONSES_HELD_CARRIERS: usize = 1_024;
+const MAX_RESPONSES_HELD_ID_BYTES: usize = 512;
+
+struct ResponsesHeldCarrier {
+    bytes: usize,
+    hash: Sha256,
+}
+
+/// Logical generated content currently retained by a Responses SSE
+/// hold-back buffer. OpenAI emits the same text as deltas, direct `.done`
+/// events, content-part/item snapshots, and the terminal response object.
+/// The raw-byte cap still counts every frame, while this state prevents those
+/// equivalent source carriers from consuming the content cap repeatedly.
+#[derive(Default)]
+pub(crate) struct ResponsesHeldContent {
+    carriers: HashMap<String, ResponsesHeldCarrier>,
+    saturated: bool,
+}
+
+impl ResponsesHeldContent {
+    /// Returns `None` when this is not one parseable Responses SSE frame; the
+    /// caller then uses the conservative generic held-content extraction.
+    pub(crate) fn observe_sse_frame(&mut self, frame: &[u8]) -> Option<usize> {
+        if self.saturated {
+            return None;
+        }
+        let payload = crate::redact::frame_payload(frame)?;
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            return Some(0);
+        }
+        let event = serde_json::from_str::<Value>(payload).ok()?;
+        self.observe_event(&event)
+    }
+
+    /// Records one parsed event. `None` asks the caller to use the generic
+    /// content counter: either the ledger has reached its fixed key budget,
+    /// or this event was the one that reached it.
+    pub(crate) fn observe_event(&mut self, event: &Value) -> Option<usize> {
+        if self.saturated {
+            return None;
+        }
+        let held = self.observe_event_inner(event);
+        (!self.saturated).then_some(held)
+    }
+
+    fn observe_event_inner(&mut self, event: &Value) -> usize {
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") => self.observe_event_content(
+                event,
+                "text",
+                event.get("delta").and_then(Value::as_str),
+                ResponsesCarrierMode::Delta,
+            ),
+            Some("response.refusal.delta") => self.observe_event_content(
+                event,
+                "refusal",
+                event.get("delta").and_then(Value::as_str),
+                ResponsesCarrierMode::Delta,
+            ),
+            Some("response.output_text.done") => self.observe_event_content(
+                event,
+                "text",
+                event.get("text").and_then(Value::as_str),
+                ResponsesCarrierMode::Snapshot,
+            ),
+            Some("response.refusal.done") => self.observe_event_content(
+                event,
+                "refusal",
+                event.get("refusal").and_then(Value::as_str),
+                ResponsesCarrierMode::Snapshot,
+            ),
+            Some("response.function_call_arguments.delta") => self.observe_event_tool(
+                event,
+                "function_call",
+                "arguments",
+                event.get("delta").and_then(Value::as_str),
+                ResponsesCarrierMode::Delta,
+            ),
+            Some("response.mcp_call_arguments.delta") => self.observe_event_tool(
+                event,
+                "mcp_call",
+                "arguments",
+                event.get("delta").and_then(Value::as_str),
+                ResponsesCarrierMode::Delta,
+            ),
+            Some("response.custom_tool_call_input.delta") => self.observe_event_tool(
+                event,
+                "custom_tool_call",
+                "input",
+                event.get("delta").and_then(Value::as_str),
+                ResponsesCarrierMode::Delta,
+            ),
+            Some("response.function_call_arguments.done") => {
+                self.observe_event_tool(
+                    event,
+                    "function_call",
+                    "name",
+                    event.get("name").and_then(Value::as_str),
+                    ResponsesCarrierMode::Snapshot,
+                ) + self.observe_event_tool(
+                    event,
+                    "function_call",
+                    "arguments",
+                    event.get("arguments").and_then(Value::as_str),
+                    ResponsesCarrierMode::Snapshot,
+                )
+            }
+            Some("response.mcp_call_arguments.done") => {
+                self.observe_event_tool(
+                    event,
+                    "mcp_call",
+                    "name",
+                    event.get("name").and_then(Value::as_str),
+                    ResponsesCarrierMode::Snapshot,
+                ) + self.observe_event_tool(
+                    event,
+                    "mcp_call",
+                    "arguments",
+                    event.get("arguments").and_then(Value::as_str),
+                    ResponsesCarrierMode::Snapshot,
+                )
+            }
+            Some("response.custom_tool_call_input.done") => {
+                self.observe_event_tool(
+                    event,
+                    "custom_tool_call",
+                    "name",
+                    event.get("name").and_then(Value::as_str),
+                    ResponsesCarrierMode::Snapshot,
+                ) + self.observe_event_tool(
+                    event,
+                    "custom_tool_call",
+                    "input",
+                    event.get("input").and_then(Value::as_str),
+                    ResponsesCarrierMode::Snapshot,
+                )
+            }
+            Some("response.content_part.added" | "response.content_part.done") => event
+                .get("part")
+                .map(|part| self.observe_event_part(event, part, ResponsesCarrierMode::Snapshot))
+                .unwrap_or(0),
+            Some("response.output_item.added" | "response.output_item.done") => event
+                .get("item")
+                .map(|item| {
+                    self.observe_item(
+                        item,
+                        response_item_base(event, item),
+                        ResponsesCarrierMode::Snapshot,
+                    )
+                })
+                .unwrap_or(0),
+            Some("response.completed" | "response.incomplete" | "response.failed") => event
+                .get("response")
+                .and_then(|response| response.get("output"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(index, item)| {
+                            self.observe_item(
+                                item,
+                                response_item_base_at(item, index),
+                                ResponsesCarrierMode::Snapshot,
+                            )
+                        })
+                        .sum()
+                })
+                .unwrap_or(0),
+            Some("response.reasoning_text.delta") => self.observe_event_reasoning(
+                event,
+                "content",
+                event.get("content_index").and_then(Value::as_u64),
+                event.get("delta").and_then(Value::as_str),
+                ResponsesCarrierMode::Delta,
+            ),
+            Some("response.reasoning_summary_text.delta") => self.observe_event_reasoning(
+                event,
+                "summary",
+                event.get("summary_index").and_then(Value::as_u64),
+                event.get("delta").and_then(Value::as_str),
+                ResponsesCarrierMode::Delta,
+            ),
+            Some("response.reasoning_text.done") => self.observe_event_reasoning(
+                event,
+                "content",
+                event.get("content_index").and_then(Value::as_u64),
+                event.get("text").and_then(Value::as_str),
+                ResponsesCarrierMode::Snapshot,
+            ),
+            Some("response.reasoning_summary_text.done") => self.observe_event_reasoning(
+                event,
+                "summary",
+                event.get("summary_index").and_then(Value::as_u64),
+                event.get("text").and_then(Value::as_str),
+                ResponsesCarrierMode::Snapshot,
+            ),
+            Some(
+                "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done",
+            ) => event
+                .get("part")
+                .and_then(|part| part.get("text"))
+                .and_then(Value::as_str)
+                .map(|text| {
+                    self.observe_event_reasoning(
+                        event,
+                        "summary",
+                        event.get("summary_index").and_then(Value::as_u64),
+                        Some(text),
+                        ResponsesCarrierMode::Snapshot,
+                    )
+                })
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    fn observe_event_content(
+        &mut self,
+        event: &Value,
+        field: &str,
+        text: Option<&str>,
+        mode: ResponsesCarrierMode,
+    ) -> usize {
+        let key = response_event_base(event).and_then(|base| {
+            event
+                .get("content_index")
+                .and_then(Value::as_u64)
+                .map(|index| format!("{base}/content/{index}/{field}"))
+        });
+        self.observe_text(key, text, mode)
+    }
+
+    fn observe_event_part(
+        &mut self,
+        event: &Value,
+        part: &Value,
+        mode: ResponsesCarrierMode,
+    ) -> usize {
+        match part.get("type").and_then(Value::as_str) {
+            Some("reasoning_text") => self.observe_event_reasoning(
+                event,
+                "content",
+                event.get("content_index").and_then(Value::as_u64),
+                part.get("text").and_then(Value::as_str),
+                mode,
+            ),
+            Some("summary_text") => self.observe_event_reasoning(
+                event,
+                "summary",
+                event.get("summary_index").and_then(Value::as_u64),
+                part.get("text").and_then(Value::as_str),
+                mode,
+            ),
+            _ => {
+                let Some((field, text)) = responses_part_text(part) else {
+                    return 0;
+                };
+                self.observe_event_content(event, field, Some(text), mode)
+            }
+        }
+    }
+
+    fn observe_event_tool(
+        &mut self,
+        event: &Value,
+        tool_type: &str,
+        field: &str,
+        text: Option<&str>,
+        mode: ResponsesCarrierMode,
+    ) -> usize {
+        let key = response_event_base(event).map(|base| format!("{base}/tool/{tool_type}/{field}"));
+        self.observe_text(key, text, mode)
+    }
+
+    fn observe_event_reasoning(
+        &mut self,
+        event: &Value,
+        group: &str,
+        index: Option<u64>,
+        text: Option<&str>,
+        mode: ResponsesCarrierMode,
+    ) -> usize {
+        let key = response_event_base(event)
+            .zip(index)
+            .map(|(base, index)| format!("{base}/reasoning/{group}/{index}"));
+        self.observe_text(key, text, mode)
+    }
+
+    fn observe_item(
+        &mut self,
+        item: &Value,
+        base: Option<String>,
+        mode: ResponsesCarrierMode,
+    ) -> usize {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => item
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .enumerate()
+                        .map(|(index, part)| {
+                            let Some((field, text)) = responses_part_text(part) else {
+                                return 0;
+                            };
+                            self.observe_text(
+                                base.as_ref()
+                                    .map(|base| format!("{base}/content/{index}/{field}")),
+                                Some(text),
+                                mode,
+                            )
+                        })
+                        .sum()
+                })
+                .unwrap_or(0),
+            Some("reasoning") => ["content", "summary"]
+                .into_iter()
+                .map(|group| {
+                    item.get(group)
+                        .and_then(Value::as_array)
+                        .map(|parts| {
+                            parts
+                                .iter()
+                                .enumerate()
+                                .map(|(index, part)| {
+                                    self.observe_text(
+                                        base.as_ref().map(|base| {
+                                            format!("{base}/reasoning/{group}/{index}")
+                                        }),
+                                        part.get("text").and_then(Value::as_str),
+                                        mode,
+                                    )
+                                })
+                                .sum::<usize>()
+                        })
+                        .unwrap_or(0)
+                })
+                .sum(),
+            Some("function_call" | "mcp_call") => {
+                let tool_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+                self.observe_text(
+                    base.as_ref()
+                        .map(|base| format!("{base}/tool/{tool_type}/name")),
+                    item.get("name").and_then(Value::as_str),
+                    mode,
+                ) + self.observe_text(
+                    base.map(|base| format!("{base}/tool/{tool_type}/arguments")),
+                    item.get("arguments").and_then(Value::as_str),
+                    mode,
+                )
+            }
+            Some("custom_tool_call") => {
+                self.observe_text(
+                    base.as_ref()
+                        .map(|base| format!("{base}/tool/custom_tool_call/name")),
+                    item.get("name").and_then(Value::as_str),
+                    mode,
+                ) + self.observe_text(
+                    base.map(|base| format!("{base}/tool/custom_tool_call/input")),
+                    item.get("input").and_then(Value::as_str),
+                    mode,
+                )
+            }
+            _ => 0,
+        }
+    }
+
+    fn observe_text(
+        &mut self,
+        key: Option<String>,
+        text: Option<&str>,
+        mode: ResponsesCarrierMode,
+    ) -> usize {
+        let Some(text) = text.filter(|text| !text.is_empty()) else {
+            return 0;
+        };
+        let Some(key) = key else {
+            // A missing/conflicting coordinate must never borrow another
+            // carrier's ledger entry. Charge it in full without retaining an
+            // unbounded anonymous key.
+            return text.len();
+        };
+        match mode {
+            ResponsesCarrierMode::Delta => {
+                if !self.carriers.contains_key(&key)
+                    && self.carriers.len() >= MAX_RESPONSES_HELD_CARRIERS
+                {
+                    self.saturated = true;
+                    return text.len();
+                }
+                match self.carriers.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        let entry = entry.get_mut();
+                        entry.bytes = entry.bytes.saturating_add(text.len());
+                        entry.hash.update(text.as_bytes());
+                        text.len()
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let mut hash = Sha256::new();
+                        hash.update(text.as_bytes());
+                        entry.insert(ResponsesHeldCarrier {
+                            bytes: text.len(),
+                            hash,
+                        });
+                        text.len()
+                    }
+                }
+            }
+            ResponsesCarrierMode::Snapshot => {
+                if !self.carriers.contains_key(&key) {
+                    if self.carriers.len() >= MAX_RESPONSES_HELD_CARRIERS {
+                        self.saturated = true;
+                        return text.len();
+                    }
+                    let mut hash = Sha256::new();
+                    hash.update(text.as_bytes());
+                    self.carriers.insert(
+                        key,
+                        ResponsesHeldCarrier {
+                            bytes: text.len(),
+                            hash,
+                        },
+                    );
+                    return text.len();
+                }
+                let previous = self
+                    .carriers
+                    .get_mut(&key)
+                    .expect("carrier was present immediately before lookup");
+                if text.len() == previous.bytes
+                    && Sha256::digest(text.as_bytes()) == previous.hash.clone().finalize()
+                {
+                    0
+                } else {
+                    let prefix_matches = text.get(..previous.bytes).is_some_and(|prefix| {
+                        Sha256::digest(prefix.as_bytes()) == previous.hash.clone().finalize()
+                    });
+                    if prefix_matches {
+                        let suffix = text
+                            .get(previous.bytes..)
+                            .expect("validated UTF-8 prefix boundary");
+                        previous.bytes = text.len();
+                        previous.hash.update(suffix.as_bytes());
+                        suffix.len()
+                    } else {
+                        let mut hash = Sha256::new();
+                        hash.update(text.as_bytes());
+                        *previous = ResponsesHeldCarrier {
+                            bytes: text.len(),
+                            hash,
+                        };
+                        text.len()
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn response_event_base(event: &Value) -> Option<String> {
+    response_base(
+        event.get("item_id").and_then(Value::as_str),
+        event.get("output_index").and_then(Value::as_u64),
+    )
+}
+
+fn response_item_base(event: &Value, item: &Value) -> Option<String> {
+    let top_level_id = event.get("item_id").and_then(Value::as_str);
+    let item_id = item.get("id").and_then(Value::as_str)?;
+    if top_level_id.is_some_and(|top_level_id| top_level_id != item_id) {
+        return None;
+    }
+    response_base(
+        Some(item_id),
+        event.get("output_index").and_then(Value::as_u64),
+    )
+}
+
+fn response_item_base_at(item: &Value, output_index: usize) -> Option<String> {
+    response_base(
+        item.get("id").and_then(Value::as_str),
+        u64::try_from(output_index).ok(),
+    )
+}
+
+fn response_base(item_id: Option<&str>, output_index: Option<u64>) -> Option<String> {
+    let item_id = item_id?;
+    let output_index = output_index?;
+    (!item_id.is_empty() && item_id.len() <= MAX_RESPONSES_HELD_ID_BYTES)
+        .then(|| format!("{}:{item_id}:{output_index}", item_id.len()))
+}
+
+fn responses_part_text(part: &Value) -> Option<(&'static str, &str)> {
+    match part.get("type").and_then(Value::as_str) {
+        Some("output_text" | "text" | "input_text") => part
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| ("text", text)),
+        Some("refusal") => part
+            .get("refusal")
+            .and_then(Value::as_str)
+            .map(|text| ("refusal", text)),
+        _ => None,
+    }
+}
+
 /// An Anthropic Messages stream event: `text` and `partial_json` deltas and
 /// the text or tool input a `content_block_start` already carries are
 /// scanned; `thinking` is reasoning.
@@ -248,20 +767,117 @@ pub(crate) fn anthropic_event_parts(v: &Value) -> Parts {
     p
 }
 
-/// An OpenAI Responses stream event. Only delta events count: the `.done`
-/// events and the terminal `response.*` snapshot repeat content already
-/// counted from its deltas.
+fn responses_part_parts(parts: &mut Parts, part: &Value, reasoning: bool) {
+    let text = match part.get("type").and_then(Value::as_str) {
+        Some("output_text" | "text" | "input_text") => part.get("text"),
+        Some("refusal") => part.get("refusal"),
+        Some("reasoning_text" | "summary_text") => {
+            parts.reasoning_str(part.get("text"));
+            return;
+        }
+        _ => return,
+    };
+    if reasoning {
+        parts.reasoning_str(text);
+    } else {
+        parts.scan_str(text);
+    }
+}
+
+fn responses_item_parts(parts: &mut Parts, item: &Value) {
+    match item.get("type").and_then(Value::as_str) {
+        Some("reasoning") => {
+            for key in ["content", "summary"] {
+                for part in item
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    responses_part_parts(parts, part, true);
+                }
+            }
+        }
+        Some("message") => {
+            for part in item
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                responses_part_parts(parts, part, false);
+            }
+        }
+        Some("function_call" | "mcp_call") => {
+            parts.scan_str(item.get("name"));
+            parts.scan_str(item.get("arguments"));
+        }
+        Some("custom_tool_call") => {
+            parts.scan_str(item.get("name"));
+            parts.scan_str(item.get("input"));
+        }
+        _ => {}
+    }
+}
+
+/// An OpenAI Responses stream event. A stream can legally end on a direct
+/// `.done`, content-part, output-item, or terminal snapshot event without a
+/// preceding delta, so every client-visible carrier contributes to the output
+/// scan. The generic held-content counter below is deliberately conservative;
+/// held Responses routes use [`ResponsesHeldContent`] to avoid charging the
+/// same identified carrier again. Reasoning remains held but outside the
+/// output-guardrail scan.
 pub(crate) fn responses_event_parts(v: &Value) -> Parts {
     let mut p = Parts::default();
     match v.get("type").and_then(Value::as_str) {
         Some(
             "response.output_text.delta"
+            | "response.refusal.delta"
             | "response.function_call_arguments.delta"
             | "response.mcp_call_arguments.delta"
             | "response.custom_tool_call_input.delta",
         ) => p.scan_str(v.get("delta")),
+        Some("response.output_text.done") => p.scan_str(v.get("text")),
+        Some("response.refusal.done") => p.scan_str(v.get("refusal")),
+        Some("response.function_call_arguments.done" | "response.mcp_call_arguments.done") => {
+            p.scan_str(v.get("name"));
+            p.scan_str(v.get("arguments"));
+        }
+        Some("response.custom_tool_call_input.done") => {
+            p.scan_str(v.get("name"));
+            p.scan_str(v.get("input"));
+        }
+        Some("response.content_part.added" | "response.content_part.done") => {
+            if let Some(part) = v.get("part") {
+                responses_part_parts(&mut p, part, false);
+            }
+        }
+        Some("response.output_item.added" | "response.output_item.done") => {
+            if let Some(item) = v.get("item") {
+                responses_item_parts(&mut p, item);
+            }
+        }
+        Some("response.completed" | "response.incomplete" | "response.failed") => {
+            for item in v
+                .get("response")
+                .and_then(|response| response.get("output"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                responses_item_parts(&mut p, item);
+            }
+        }
         Some("response.reasoning_text.delta" | "response.reasoning_summary_text.delta") => {
             p.reasoning_str(v.get("delta"))
+        }
+        Some("response.reasoning_text.done" | "response.reasoning_summary_text.done") => {
+            p.reasoning_str(v.get("text"))
+        }
+        Some("response.reasoning_summary_part.added" | "response.reasoning_summary_part.done") => {
+            if let Some(part) = v.get("part") {
+                responses_part_parts(&mut p, part, true);
+            }
         }
         _ => {}
     }
@@ -351,6 +967,28 @@ pub(crate) fn sse_frames(frames: &[u8], per_event: fn(&Value) -> usize) -> usize
         .sum()
 }
 
+/// Held Responses content across every SSE frame in `frames`, with one
+/// bounded source ledger shared by the complete frames and the final tail.
+/// Once the ledger cannot safely identify more source carriers, fall back to
+/// the generic counter rather than treating later content as free.
+pub(crate) fn responses_sse_held_frames(ledger: &mut ResponsesHeldContent, frames: &[u8]) -> usize {
+    crate::redact::sse_frame_payloads(frames)
+        .iter()
+        .map(|payload| {
+            let payload = payload.trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                return 0;
+            }
+            match serde_json::from_str::<Value>(payload) {
+                Ok(event) => ledger
+                    .observe_event(&event)
+                    .unwrap_or_else(|| responses_event(&event)),
+                Err(_) => payload.len(),
+            }
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,17 +1050,154 @@ mod tests {
     }
 
     #[test]
-    fn responses_frames_count_deltas_not_snapshots() {
+    fn responses_frames_count_every_authoritative_output_carrier() {
         let frames = concat!(
             "event: response.reasoning_summary_text.delta\n",
             "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"think\"}\n\n",
             "event: response.output_text.delta\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "event: response.refusal.delta\n",
+            "data: {\"type\":\"response.refusal.delta\",\"delta\":\"no\"}\n\n",
             "event: response.output_text.done\n",
             "data: {\"type\":\"response.output_text.done\",\"text\":\"hi\"}\n\n",
             "data: [DONE]\n\n",
         );
-        assert_eq!(sse_frames(frames.as_bytes(), responses_event), 5 + 2);
+        assert_eq!(
+            sse_frames(frames.as_bytes(), responses_event),
+            5 + 2 + 2 + 2
+        );
+    }
+
+    fn responses_frame(event: Value) -> Vec<u8> {
+        format!("data: {event}\n\n").into_bytes()
+    }
+
+    #[test]
+    fn responses_held_content_counts_repeated_output_snapshots_once() {
+        let text = "x".repeat(300);
+        let frames = [
+            responses_frame(json!({
+                "type": "response.output_text.delta",
+                "item_id": "message_1",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": text.as_str(),
+            })),
+            responses_frame(json!({
+                "type": "response.output_text.done",
+                "item_id": "message_1",
+                "output_index": 0,
+                "content_index": 0,
+                "text": text.as_str(),
+            })),
+            responses_frame(json!({
+                "type": "response.content_part.done",
+                "item_id": "message_1",
+                "output_index": 0,
+                "content_index": 0,
+                "part": { "type": "output_text", "text": text.as_str() },
+            })),
+            responses_frame(json!({
+                "type": "response.output_item.done",
+                "item_id": "message_1",
+                "output_index": 0,
+                "item": {
+                    "id": "message_1",
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": text.as_str() }],
+                },
+            })),
+            responses_frame(json!({
+                "type": "response.completed",
+                "response": {
+                    "output": [{
+                        "id": "message_1",
+                        "type": "message",
+                        "content": [{ "type": "output_text", "text": text.as_str() }],
+                    }],
+                },
+            })),
+        ];
+        let mut ledger = ResponsesHeldContent::default();
+
+        assert_eq!(
+            responses_sse_held_frames(&mut ledger, &frames[0]),
+            text.len(),
+            "the initial delta establishes the logical carrier"
+        );
+        assert_eq!(
+            responses_sse_held_frames(&mut ledger, &frames[1..].concat()),
+            0,
+            "done, part, item, and terminal forms share that carrier across reads"
+        );
+    }
+
+    #[test]
+    fn responses_held_content_deduplicates_reasoning_part_snapshots() {
+        let text = "think";
+        let frames = [
+            responses_frame(json!({
+                "type": "response.reasoning_text.delta",
+                "item_id": "reasoning_1",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": text,
+            })),
+            responses_frame(json!({
+                "type": "response.content_part.done",
+                "item_id": "reasoning_1",
+                "output_index": 0,
+                "content_index": 0,
+                "part": { "type": "reasoning_text", "text": text },
+            })),
+            responses_frame(json!({
+                "type": "response.output_item.done",
+                "item_id": "reasoning_1",
+                "output_index": 0,
+                "item": {
+                    "id": "reasoning_1",
+                    "type": "reasoning",
+                    "content": [{ "type": "reasoning_text", "text": text }],
+                },
+            })),
+        ];
+        let mut ledger = ResponsesHeldContent::default();
+
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| ledger.observe_sse_frame(frame).unwrap())
+                .sum::<usize>(),
+            text.len()
+        );
+    }
+
+    #[test]
+    fn responses_held_content_counts_extensions_and_unidentified_snapshots() {
+        let mut ledger = ResponsesHeldContent::default();
+        let delta = responses_frame(json!({
+            "type": "response.output_text.delta",
+            "item_id": "message_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "abc",
+        }));
+        let extended = responses_frame(json!({
+            "type": "response.output_text.done",
+            "item_id": "message_1",
+            "output_index": 0,
+            "content_index": 0,
+            "text": "abcdef",
+        }));
+        let unkeyed = responses_frame(json!({
+            "type": "response.output_text.done",
+            "text": "abc",
+        }));
+
+        assert_eq!(ledger.observe_sse_frame(&delta), Some(3));
+        assert_eq!(ledger.observe_sse_frame(&extended), Some(3));
+        assert_eq!(ledger.observe_sse_frame(&unkeyed), Some(3));
+        assert_eq!(ledger.observe_sse_frame(&unkeyed), Some(3));
     }
 
     #[test]
