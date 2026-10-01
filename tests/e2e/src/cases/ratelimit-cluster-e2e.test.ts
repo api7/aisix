@@ -33,6 +33,16 @@ const CALLER_PLAINTEXT = "sk-rl-cluster-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
+const PASSTHROUGH_CALLER_PLAINTEXT = "sk-rl-cluster-passthrough-caller";
+const PASSTHROUGH_CALLER_KEY_HASH = createHash("sha256")
+  .update(PASSTHROUGH_CALLER_PLAINTEXT)
+  .digest("hex");
+const PASSTHROUGH_ROUTE = "rl-cluster-passthrough";
+const PASSTHROUGH_PREFIX = "/rl-cluster-passthrough";
+// Short enough to prove a live stream renews its lease, while leaving a
+// generous interval for CI scheduling around the three-second assertion.
+const PASSTHROUGH_CONCURRENCY_TTL_SECS = 1;
+const PASSTHROUGH_WAIT_BEYOND_TTL_MS = 3_000;
 
 const ETCD_ENDPOINT = etcdEndpoint();
 const REDIS_URL = process.env.AISIX_E2E_REDIS ?? "redis://127.0.0.1:6379";
@@ -203,6 +213,143 @@ describe("rate limit is shared across replicas with backend=redis (#798)", () =>
     expect(second.headers.get("retry-after")).toBeTruthy();
     await second.body?.cancel();
   });
+});
+
+// E2E for #1737: a route's SSE response has already returned headers when
+// its body remains live. The shared Redis semaphore must therefore stay held
+// beyond its short crash-recovery TTL, across a different gateway process.
+describe("passthrough SSE concurrency is shared and renewed across Redis replicas (#1737)", () => {
+  let appA: SpawnedApp | undefined;
+  let appB: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let infraReady = false;
+  const prefix = `/aisix-e2e-rl-passthrough-${randomUUID()}`;
+
+  const headers = {
+    authorization: `Bearer ${PASSTHROUGH_CALLER_PLAINTEXT}`,
+    "content-type": "application/json",
+  };
+  const call = (proxyUrl: string) =>
+    fetch(`${proxyUrl}${PASSTHROUGH_PREFIX}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: "hold this stream open" }],
+        stream: true,
+      }),
+    });
+
+  beforeAll(async () => {
+    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    if (!infraReady) return;
+
+    const streamEvents = [
+      JSON.stringify({ choices: [{ delta: { content: "released" } }] }),
+      "[DONE]",
+    ];
+    upstream = await startOpenAiUpstream({
+      scriptedResponses: [
+        // This stream flushes headers then stays open through the TTL
+        // boundary. The post-cancel request ends normally.
+        { streamEvents, firstEventDelayMs: 10_000 },
+        { streamEvents },
+      ],
+    });
+    const extra = {
+      etcd: sharedEtcd(prefix),
+      ratelimit: {
+        backend: "redis",
+        redis: { url: REDIS_URL },
+        concurrency_ttl_secs: PASSTHROUGH_CONCURRENCY_TTL_SECS,
+      },
+    };
+    appA = await spawnApp({ extra });
+    appB = await spawnApp({ extra });
+
+    const seed = new SeedClient(new EtcdClient(), prefix);
+    const providerKey = await seed.createProviderKey({
+      display_name: "rl-cluster-passthrough-pk",
+      secret: "sk-mock",
+      api_base: "http://unused-on-passthrough-route",
+    });
+    await seed.createPassthroughRoute({
+      name: PASSTHROUGH_ROUTE,
+      path_prefix: PASSTHROUGH_PREFIX,
+      target_url: upstream.baseUrl,
+      provider_key_id: providerKey.id,
+    });
+    // Write the caller last, then wait for its local models surface on each
+    // replica. That proves the route and its ProviderKey reached the same
+    // snapshot without consuming either scripted stream.
+    await seed.createApiKey({
+      key_hash: PASSTHROUGH_CALLER_KEY_HASH,
+      allowed_models: ["*"],
+      allowed_routes: [PASSTHROUGH_ROUTE],
+      rate_limit: { concurrency: 1 },
+    });
+
+    for (const app of [appA!, appB!]) {
+      const probe = new ProxyClient(app.proxyUrl, PASSTHROUGH_CALLER_PLAINTEXT);
+      await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
+    }
+  });
+
+  afterAll(async () => {
+    await appA?.exit();
+    await appB?.exit();
+    await upstream?.close();
+    if (infraReady) await new EtcdClient().deletePrefix(prefix);
+  });
+
+  test(
+    "a live stream blocks the other replica past the TTL, then cancellation frees it",
+    async (ctx) => {
+      if (!infraReady || !appA || !appB || !upstream) {
+        ctx.skip();
+        return;
+      }
+
+      // The first response has headers but no event yet, so leaving its body
+      // unread precisely models a client consuming a still-live SSE stream.
+      const first = await call(appA.proxyUrl);
+      expect(first.status).toBe(200);
+      expect(first.headers.get("content-type") ?? "").toContain("text/event-stream");
+      const upstreamCallsWhileHeld = upstream.receivedRequests.length;
+      expect(upstreamCallsWhileHeld).toBe(1);
+
+      // A stale lease would be reclaimed after one second. Keep the stream
+      // alive much longer, then prove B still sees the same global cap.
+      await new Promise((resolve) =>
+        setTimeout(resolve, PASSTHROUGH_WAIT_BEYOND_TTL_MS),
+      );
+      const blocked = await call(appB.proxyUrl);
+      expect(blocked.status).toBe(429);
+      expect(blocked.headers.get("x-ratelimit-scope")).toBe("concurrency");
+      await blocked.text();
+      expect(upstream.receivedRequests).toHaveLength(upstreamCallsWhileHeld);
+
+      // Client cancellation releases the remote lease. Polling B rules out a
+      // locally released A-only hold and waits for the Redis release to land.
+      expect(first.body).not.toBeNull();
+      await first.body!.cancel();
+      let admitted: Response | undefined;
+      await waitConfigPropagation(async () => {
+        const response = await call(appB!.proxyUrl);
+        if (response.status !== 200) {
+          await response.text();
+          return false;
+        }
+        admitted = response;
+        return true;
+      }, 5_000);
+      expect(admitted).toBeDefined();
+      expect(admitted!.headers.get("content-type") ?? "").toContain("text/event-stream");
+      expect(await admitted!.text()).toContain("[DONE]");
+      expect(upstream.receivedRequests).toHaveLength(upstreamCallsWhileHeld + 1);
+    },
+    15_000,
+  );
 });
 
 describe("rate limit is NOT shared with backend=memory (per-replica, the #798 bug)", () => {

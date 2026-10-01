@@ -1409,15 +1409,6 @@ fn decoded_json_string_values_except_root_keys(body: &[u8], excluded: &[&str]) -
     .ok()
 }
 
-fn decoded_json_string_values_except_root_keys_vec(
-    body: &[u8],
-    excluded: &[&str],
-) -> Option<Vec<String>> {
-    decoded_json_string_values_vec_where(body, |path| {
-        !excluded.iter().any(|key| is_root_key(path, key))
-    })
-}
-
 /// Source values of all occurrences of one top-level key. `RawValue` keeps
 /// repeated keys separate, unlike `serde_json::Value`.
 fn raw_top_level_values(
@@ -1510,17 +1501,9 @@ fn raw_top_level_unique_type(body: &[u8]) -> Option<String> {
         .then_some(first)
 }
 
-fn raw_top_level_has_any_type(body: &[u8], wanted: &[&str]) -> bool {
-    raw_top_level_values(body, "type")
-        .into_iter()
-        .flatten()
-        .filter_map(|value| serde_json::from_str::<String>(value.get()).ok())
-        .any(|kind| wanted.iter().any(|wanted| kind == *wanted))
-}
-
 /// `true` only when every source `type` value is one of `allowed`. This is
-/// stricter than [`raw_top_level_has_any_type`]: an audio or image event must
-/// not borrow a text event's carrier merely by repeating a conflicting type.
+/// deliberately strict: an audio or image event must not borrow a text
+/// event's carrier merely by repeating a conflicting type.
 fn raw_top_level_has_only_types(body: &[u8], allowed: &[&str]) -> bool {
     let Some(values) = raw_top_level_values(body, "type") else {
         return false;
@@ -1541,25 +1524,6 @@ fn raw_top_level_items_have_only_types(body: &[u8], key: &str, allowed: &[&str])
                 .iter()
                 .all(|value| raw_object_has_only_types(value, allowed)),
     )
-}
-
-fn append_raw_array_item_strings(
-    out: &mut String,
-    body: &[u8],
-    key: &str,
-    mut skip: impl FnMut(&serde_json::value::RawValue) -> bool,
-) -> Option<()> {
-    for array in raw_top_level_values(body, key)? {
-        for item in raw_array_items(&array)? {
-            if !skip(&item) {
-                append_scan_text(
-                    out,
-                    &decoded_json_string_values_including_empty(item.get().as_bytes())?,
-                );
-            }
-        }
-    }
-    Some(())
 }
 
 fn append_raw_string_value(out: &mut String, raw: &serde_json::value::RawValue) -> Option<()> {
@@ -1849,38 +1813,178 @@ fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String 
     }
 }
 
-fn is_hidden_chat_reasoning_path(path: &[crate::json_splice::PathSeg]) -> bool {
-    use crate::json_splice::PathSeg;
+/// Return the string field which an explicitly typed Chat content part
+/// exposes to the client. Image, audio, file, and future part types stay
+/// opaque at the external output-guardrail boundary.
+fn chat_visible_content_part_field(kind: &str) -> Option<&'static str> {
+    match kind {
+        "text" => Some("text"),
+        "refusal" => Some("refusal"),
+        _ => None,
+    }
+}
 
-    let path = match path {
-        [PathSeg::Key(choices), PathSeg::Index(_), rest @ ..] if choices == "choices" => rest,
-        _ => path,
-    };
-    matches!(
-        path,
-        [
-            PathSeg::Key(message_or_delta),
-            PathSeg::Key(reasoning),
-            ..
-        ] if matches!(message_or_delta.as_str(), "message" | "delta")
-            && matches!(reasoning.as_str(), "reasoning_content" | "reasoning")
-    )
+/// Append a Chat `content` value that is known to be client-visible output.
+/// A bare string is the Chat response's ordinary text shape; array entries
+/// need one unambiguous known discriminator before their text or refusal
+/// field may cross the output-guardrail boundary.
+fn append_chat_visible_content_strings(
+    out: &mut String,
+    content: &serde_json::value::RawValue,
+) -> Option<()> {
+    let value = content.get().trim_start();
+    if value.starts_with('"') {
+        return append_raw_string_value(out, content);
+    }
+    if !value.starts_with('[') {
+        return Some(());
+    }
+    for part in raw_array_items(content)? {
+        if !raw_is_object(&part) {
+            continue;
+        }
+        let part_body = part.get().as_bytes();
+        if let Some(field) = raw_top_level_unique_type(part_body)
+            .as_deref()
+            .and_then(chat_visible_content_part_field)
+        {
+            append_raw_top_level_strings(out, part_body, field)?;
+        }
+    }
+    Some(())
+}
+
+/// The stream can omit a tool-call's discriminator after its first delta.
+/// Accept that continuation shape, but never let an explicit unknown or
+/// conflicting type borrow a function/custom field as visible tool text.
+fn chat_tool_continuation_fields(body: &[u8]) -> Option<&'static [(&'static str, &'static str)]> {
+    let types = raw_top_level_values(body, "type")?;
+    match raw_top_level_unique_type(body).as_deref() {
+        Some("function") => Some(&[("function", "arguments")]),
+        Some("custom") => Some(&[("custom", "input")]),
+        None if types.is_empty() => Some(&[("function", "arguments"), ("custom", "input")]),
+        _ => Some(&[]),
+    }
+}
+
+fn append_chat_tool_call_strings(
+    out: &mut String,
+    tool_calls: &serde_json::value::RawValue,
+) -> Option<()> {
+    if !tool_calls.get().trim_start().starts_with('[') {
+        return Some(());
+    }
+    for tool_call in raw_array_items(tool_calls)? {
+        if !raw_is_object(&tool_call) {
+            continue;
+        }
+        let tool_body = tool_call.get().as_bytes();
+        for (container, field) in chat_tool_continuation_fields(tool_body)? {
+            for payload in raw_top_level_values(tool_body, container)? {
+                if !raw_is_object(&payload) {
+                    continue;
+                }
+                let payload_body = payload.get().as_bytes();
+                append_raw_top_level_strings(out, payload_body, "name")?;
+                append_raw_top_level_strings(out, payload_body, field)?;
+            }
+        }
+    }
+    Some(())
+}
+
+/// Preserve the pre-`tool_calls` Chat tool shape without widening the
+/// response walk beyond its explicit `name` and `arguments` fields.
+fn append_chat_legacy_function_call_strings(
+    out: &mut String,
+    function_call: &serde_json::value::RawValue,
+) -> Option<()> {
+    if !raw_is_object(function_call) {
+        return Some(());
+    }
+    let function_body = function_call.get().as_bytes();
+    append_raw_top_level_strings(out, function_body, "name")?;
+    append_raw_top_level_strings(out, function_body, "arguments")?;
+    Some(())
+}
+
+fn append_chat_output_message_strings(
+    out: &mut String,
+    message: &serde_json::value::RawValue,
+) -> Option<()> {
+    if !raw_is_object(message) {
+        return Some(());
+    }
+    let message_body = message.get().as_bytes();
+    for content in raw_top_level_values(message_body, "content")? {
+        append_chat_visible_content_strings(out, &content)?;
+    }
+    // OpenAI Chat also exposes a refusal as a direct message member rather
+    // than a typed content part.
+    append_raw_top_level_strings(out, message_body, "refusal")?;
+    for tool_calls in raw_top_level_values(message_body, "tool_calls")? {
+        append_chat_tool_call_strings(out, &tool_calls)?;
+    }
+    for function_call in raw_top_level_values(message_body, "function_call")? {
+        append_chat_legacy_function_call_strings(out, &function_call)?;
+    }
+    Some(())
+}
+
+/// Anthropic Messages replies can travel through a Chat passthrough route.
+/// Their generated text and tool-use payloads are visible output; all other
+/// content-block kinds remain opaque.
+fn append_anthropic_output_content_strings(
+    out: &mut String,
+    content: &serde_json::value::RawValue,
+) -> Option<()> {
+    if !content.get().trim_start().starts_with('[') {
+        return Some(());
+    }
+    for block in raw_array_items(content)? {
+        if !raw_is_object(&block) {
+            continue;
+        }
+        let block_body = block.get().as_bytes();
+        match raw_top_level_unique_type(block_body).as_deref() {
+            Some("text") => append_raw_top_level_strings(out, block_body, "text")?,
+            Some("tool_use") => {
+                append_raw_top_level_strings(out, block_body, "name")?;
+                for input in raw_top_level_values(block_body, "input")? {
+                    append_scan_text(
+                        out,
+                        &decoded_json_string_values_including_empty(input.get().as_bytes())?,
+                    );
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+    Some(())
 }
 
 fn decoded_chat_response_string_values(body: &[u8]) -> Option<String> {
-    let mut out =
-        decoded_json_string_values_except_root_keys(body, &["model", "content", "choices"])?;
-    append_raw_array_item_strings(&mut out, body, "content", |item| {
-        raw_object_has_only_types(item, &["thinking", "redacted_thinking"])
-    })?;
-    for array in raw_top_level_values(body, "choices")? {
-        for item in raw_array_items(&array)? {
-            let text =
-                crate::json_splice::collect_string_values_where(item.get().as_bytes(), |path| {
-                    !is_hidden_chat_reasoning_path(path)
-                })
-                .ok()?;
-            append_scan_text(&mut out, &text);
+    let mut out = String::new();
+    let choices = raw_top_level_values(body, "choices")?;
+    let has_chat_choices = choices
+        .iter()
+        .any(|choices| choices.get().trim_start().starts_with('['));
+    for array in choices {
+        let Some(choices) = raw_array_items(&array) else {
+            continue;
+        };
+        for choice in choices {
+            if !raw_is_object(&choice) {
+                continue;
+            }
+            for message in raw_top_level_values(choice.get().as_bytes(), "message")? {
+                append_chat_output_message_strings(&mut out, &message)?;
+            }
+        }
+    }
+    if !has_chat_choices && raw_top_level_unique_type(body).as_deref() == Some("message") {
+        for content in raw_top_level_values(body, "content")? {
+            append_anthropic_output_content_strings(&mut out, &content)?;
         }
     }
     Some(out)
@@ -1995,7 +2099,10 @@ fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String
     match protocol {
         PassthroughProtocol::Raw => decoded_json_string_values(body).unwrap_or_else(raw),
         PassthroughProtocol::OpenaiChat => {
-            decoded_chat_response_string_values(body).unwrap_or_else(raw)
+            // A detected Chat response can carry opaque multimodal values.
+            // Without a successful type-aware selection, relay it but do not
+            // send a raw fallback to an external output guardrail.
+            decoded_chat_response_string_values(body).unwrap_or_default()
         }
         PassthroughProtocol::OpenaiCompletions => {
             decoded_non_model_json_string_values(body).unwrap_or_else(raw)
@@ -2636,10 +2743,6 @@ fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<P
     (parts.scan, usage)
 }
 
-fn is_hidden_chat_stream_reasoning_path(path: &[crate::json_splice::PathSeg]) -> bool {
-    is_hidden_chat_reasoning_path(path)
-}
-
 /// Whether one unambiguous Anthropic stream event carries only generated
 /// reasoning. `None` means the source shape was not safely inspectable, so
 /// callers must preserve it rather than treating it as hidden.
@@ -2661,31 +2764,14 @@ fn hidden_chat_stream_reasoning_frame(body: &[u8]) -> Option<bool> {
 
 #[cfg(test)]
 fn decoded_chat_frame_string_values(body: &[u8]) -> Option<String> {
-    match raw_top_level_unique_type(body).as_deref() {
-        Some("content_block_delta")
-            if raw_top_level_items_have_only_types(
-                body,
-                "delta",
-                &["thinking_delta", "signature_delta"],
-            )? =>
-        {
-            return decoded_json_string_values_except_root_keys(body, &["model", "delta"]);
-        }
-        Some("content_block_start")
-            if raw_top_level_items_have_only_types(
-                body,
-                "content_block",
-                &["thinking", "redacted_thinking"],
-            )? =>
-        {
-            return decoded_json_string_values_except_root_keys(body, &["model", "content_block"]);
-        }
-        _ => {}
+    let mut out = String::new();
+    for value in decoded_chat_frame_continuations(body)? {
+        append_scan_text(&mut out, &value);
     }
-    crate::json_splice::collect_string_values_where(body, |path| {
-        !is_root_key(path, "model") && !is_hidden_chat_stream_reasoning_path(path)
-    })
-    .ok()
+    for value in decoded_chat_frame_supplemental_values(body)? {
+        append_scan_text(&mut out, &value);
+    }
+    Some(out)
 }
 
 /// The typed stream extractor deliberately takes only text/tool delta events:
@@ -2702,60 +2788,110 @@ fn decoded_responses_frame_string_values(body: &[u8]) -> Option<String> {
 }
 
 fn decoded_chat_frame_continuations(body: &[u8]) -> Option<Vec<String>> {
-    use crate::json_splice::PathSeg;
-
-    if hidden_chat_stream_reasoning_frame(body) == Some(true) {
-        return None;
-    }
-    if raw_top_level_has_any_type(body, &["content_block_delta"]) {
-        return decoded_json_string_values_vec_where(body, |path| {
-            matches!(
-                path,
-                [PathSeg::Key(delta), PathSeg::Key(field)]
-                    if delta == "delta" && matches!(field.as_str(), "text" | "partial_json")
-            )
-        });
-    }
-    if raw_top_level_has_any_type(body, &["content_block_start"]) {
-        let mut out = Vec::new();
-        for block in raw_top_level_values(body, "content_block")? {
-            out.extend(raw_top_level_string_values(block.get().as_bytes(), "text")?);
-            for input in raw_top_level_values(block.get().as_bytes(), "input")? {
-                out.extend(
-                    crate::json_splice::collect_string_values_where_vec(
-                        input.get().as_bytes(),
-                        |_| true,
-                    )
-                    .ok()?,
-                );
+    match raw_top_level_unique_type(body).as_deref() {
+        Some("content_block_delta") => {
+            let delta = raw_top_level_unique_object(body, "delta").ok()??;
+            match raw_top_level_unique_type(delta.get().as_bytes()).as_deref() {
+                Some("text_delta") => raw_top_level_string_values(delta.get().as_bytes(), "text"),
+                Some("input_json_delta") => {
+                    raw_top_level_string_values(delta.get().as_bytes(), "partial_json")
+                }
+                Some(_) | None => Some(Vec::new()),
             }
         }
-        return (!out.is_empty()).then_some(out);
+        Some("content_block_start") => {
+            let block = raw_top_level_unique_object(body, "content_block").ok()??;
+            let block_body = block.get().as_bytes();
+            match raw_top_level_unique_type(block_body).as_deref() {
+                Some("text") => raw_top_level_string_values(block_body, "text"),
+                Some("tool_use") => {
+                    let mut out = Vec::new();
+                    for input in raw_top_level_values(block_body, "input")? {
+                        out.extend(
+                            crate::json_splice::collect_string_values_where_vec(
+                                input.get().as_bytes(),
+                                |_| true,
+                            )
+                            .ok()?,
+                        );
+                    }
+                    Some(out)
+                }
+                Some(_) | None => Some(Vec::new()),
+            }
+        }
+        _ => {
+            let choices = raw_top_level_unique_array(body, "choices").ok()??;
+            let choices = raw_array_items(&choices)?;
+            let mut out = Vec::new();
+            for choice in choices {
+                if !raw_is_object(&choice) {
+                    return None;
+                }
+                let delta = match raw_top_level_unique_object(choice.get().as_bytes(), "delta") {
+                    Ok(Some(delta)) => delta,
+                    Ok(None) => continue,
+                    Err(()) => return None,
+                };
+                let delta_body = delta.get().as_bytes();
+                let mut content = raw_top_level_values(delta_body, "content")?;
+                if content.len() > 1 {
+                    return None;
+                }
+                if let Some(content) = content.pop() {
+                    match content.get().trim_start().as_bytes().first() {
+                        Some(b'"') => out.push(serde_json::from_str(content.get()).ok()?),
+                        Some(b'[') => {
+                            for part in raw_array_items(&content)? {
+                                if !raw_is_object(&part) {
+                                    return None;
+                                }
+                                let part_body = part.get().as_bytes();
+                                if let Some(field) = raw_top_level_unique_type(part_body)
+                                    .as_deref()
+                                    .and_then(chat_visible_content_part_field)
+                                {
+                                    out.extend(raw_top_level_string_values(part_body, field)?);
+                                }
+                            }
+                        }
+                        Some(b'n') => {}
+                        _ => return None,
+                    }
+                }
+                out.extend(raw_top_level_string_values(delta_body, "refusal")?);
+                let tool_calls = raw_top_level_unique_array(delta_body, "tool_calls").ok()?;
+                if let Some(tool_calls) = tool_calls {
+                    for tool_call in raw_array_items(&tool_calls)? {
+                        if !raw_is_object(&tool_call) {
+                            return None;
+                        }
+                        let tool_body = tool_call.get().as_bytes();
+                        for (container, field) in chat_tool_continuation_fields(tool_body)? {
+                            for payload in raw_top_level_values(tool_body, container)? {
+                                if !raw_is_object(&payload) {
+                                    return None;
+                                }
+                                out.extend(raw_top_level_string_values(
+                                    payload.get().as_bytes(),
+                                    field,
+                                )?);
+                            }
+                        }
+                    }
+                }
+                let function_call =
+                    raw_top_level_unique_object(delta_body, "function_call").ok()?;
+                if let Some(function_call) = function_call {
+                    out.extend(raw_top_level_string_values(
+                        function_call.get().as_bytes(),
+                        "arguments",
+                    )?);
+                }
+            }
+            Some(out)
+        }
     }
-    decoded_json_string_values_vec_where(body, |path| {
-        matches!(
-            path,
-            [PathSeg::Key(choices), PathSeg::Index(_), PathSeg::Key(delta), PathSeg::Key(field)]
-                if choices == "choices"
-                    && delta == "delta"
-                    && field == "content"
-        ) || matches!(
-            path,
-            [PathSeg::Key(choices), PathSeg::Index(_), PathSeg::Key(delta), PathSeg::Key(content), PathSeg::Index(_), PathSeg::Key(text)]
-                if choices == "choices"
-                    && delta == "delta"
-                    && content == "content"
-                    && text == "text"
-        ) || matches!(
-            path,
-            [PathSeg::Key(choices), PathSeg::Index(_), PathSeg::Key(delta), PathSeg::Key(tool_calls), PathSeg::Index(_), PathSeg::Key(kind), PathSeg::Key(value)]
-                if choices == "choices"
-                    && delta == "delta"
-                    && tool_calls == "tool_calls"
-                    && ((kind == "function" && value == "arguments")
-                        || (kind == "custom" && value == "input"))
-        )
-    })
 }
 
 fn decoded_completions_frame_continuations(body: &[u8]) -> Option<Vec<String>> {
@@ -2768,55 +2904,6 @@ fn decoded_completions_frame_continuations(body: &[u8]) -> Option<Vec<String>> {
                 if choices == "choices" && text == "text"
         )
     })
-}
-
-fn is_chat_choice_continuation_path(path: &[crate::json_splice::PathSeg]) -> bool {
-    use crate::json_splice::PathSeg;
-
-    matches!(
-        path,
-        [PathSeg::Key(choices), PathSeg::Index(_), PathSeg::Key(delta), PathSeg::Key(field)]
-            if choices == "choices" && delta == "delta" && field == "content"
-    ) || matches!(
-        path,
-        [PathSeg::Key(choices), PathSeg::Index(_), PathSeg::Key(delta), PathSeg::Key(content), PathSeg::Index(_), PathSeg::Key(text)]
-            if choices == "choices"
-                && delta == "delta"
-                && content == "content"
-                && text == "text"
-    ) || matches!(
-        path,
-        [PathSeg::Key(choices), PathSeg::Index(_), PathSeg::Key(delta), PathSeg::Key(tool_calls), PathSeg::Index(_), PathSeg::Key(kind), PathSeg::Key(value)]
-            if choices == "choices"
-                && delta == "delta"
-                && tool_calls == "tool_calls"
-                && ((kind == "function" && value == "arguments")
-                    || (kind == "custom" && value == "input"))
-    )
-}
-
-fn is_anthropic_delta_continuation_path(path: &[crate::json_splice::PathSeg]) -> bool {
-    use crate::json_splice::PathSeg;
-
-    matches!(
-        path,
-        [PathSeg::Key(delta), PathSeg::Key(field)]
-            if delta == "delta" && matches!(field.as_str(), "text" | "partial_json")
-    )
-}
-
-fn is_anthropic_start_continuation_path(path: &[crate::json_splice::PathSeg]) -> bool {
-    use crate::json_splice::PathSeg;
-
-    matches!(
-        path,
-        [PathSeg::Key(content_block), PathSeg::Key(field)]
-            if content_block == "content_block" && field == "text"
-    ) || matches!(
-        path,
-        [PathSeg::Key(content_block), PathSeg::Key(input), ..]
-            if content_block == "content_block" && input == "input"
-    )
 }
 
 fn is_completions_continuation_path(path: &[crate::json_splice::PathSeg]) -> bool {
@@ -2834,20 +2921,59 @@ fn is_completions_continuation_path(path: &[crate::json_splice::PathSeg]) -> boo
 /// normal frame must not send one visible value to a guardrail as typed,
 /// source, and supplementary text at once.
 fn decoded_chat_frame_supplemental_values(body: &[u8]) -> Option<Vec<String>> {
-    let anthropic_delta = raw_top_level_has_any_type(body, &["content_block_delta"]);
-    let anthropic_start =
-        !anthropic_delta && raw_top_level_has_any_type(body, &["content_block_start"]);
-    decoded_json_string_values_vec_where(body, |path| {
-        !is_root_key(path, "model")
-            && !is_hidden_chat_stream_reasoning_path(path)
-            && !(if anthropic_delta {
-                is_anthropic_delta_continuation_path(path)
-            } else if anthropic_start {
-                is_anthropic_start_continuation_path(path)
-            } else {
-                is_chat_choice_continuation_path(path)
-            })
-    })
+    if raw_top_level_unique_type(body).as_deref() == Some("content_block_delta") {
+        return Some(Vec::new());
+    }
+    if raw_top_level_unique_type(body).as_deref() == Some("content_block_start") {
+        let block = raw_top_level_unique_object(body, "content_block").ok()??;
+        return match raw_top_level_unique_type(block.get().as_bytes()).as_deref() {
+            Some("tool_use") => raw_top_level_string_values(block.get().as_bytes(), "name"),
+            Some(_) | None => Some(Vec::new()),
+        };
+    }
+
+    let choices = raw_top_level_unique_array(body, "choices").ok()??;
+    let choices = raw_array_items(&choices)?;
+    let mut out = Vec::new();
+    for choice in choices {
+        if !raw_is_object(&choice) {
+            return None;
+        }
+        let delta = match raw_top_level_unique_object(choice.get().as_bytes(), "delta") {
+            Ok(Some(delta)) => delta,
+            Ok(None) => continue,
+            Err(()) => return None,
+        };
+        let tool_calls = raw_top_level_unique_array(delta.get().as_bytes(), "tool_calls").ok()?;
+        if let Some(tool_calls) = tool_calls {
+            for tool_call in raw_array_items(&tool_calls)? {
+                if !raw_is_object(&tool_call) {
+                    return None;
+                }
+                let tool_body = tool_call.get().as_bytes();
+                for (container, _) in chat_tool_continuation_fields(tool_body)? {
+                    for payload in raw_top_level_values(tool_body, container)? {
+                        if !raw_is_object(&payload) {
+                            return None;
+                        }
+                        out.extend(raw_top_level_string_values(
+                            payload.get().as_bytes(),
+                            "name",
+                        )?);
+                    }
+                }
+            }
+        }
+        let function_call =
+            raw_top_level_unique_object(delta.get().as_bytes(), "function_call").ok()?;
+        if let Some(function_call) = function_call {
+            out.extend(raw_top_level_string_values(
+                function_call.get().as_bytes(),
+                "name",
+            )?);
+        }
+    }
+    Some(out)
 }
 
 fn decoded_completions_frame_supplemental_values(body: &[u8]) -> Option<Vec<String>> {
@@ -3009,7 +3135,7 @@ fn append_raw_string_carrier(
 }
 
 fn raw_part_identity(body: &[u8]) -> Result<String, ()> {
-    // Content arrays can repeat a visible `text` field. Their numeric index
+    // Content arrays can repeat a visible text or refusal field. Their numeric index
     // is the only canonical identity that remains stable when a provider
     // later adds an optional `id`; id-only arrays use the unevaluable policy
     // rather than silently switching source channels.
@@ -3038,20 +3164,20 @@ fn anthropic_source_continuations(
                 _ => return SourceContinuations::Unevaluable,
             };
             let delta_body = delta.get().as_bytes();
-            append_raw_string_carrier(
-                &mut out,
-                &mut keys,
-                &mut source_values,
-                SourceBranchIdentity {
-                    family: family.clone(),
-                    identity: "text".to_owned(),
-                    identity_is_ambiguous: false,
-                },
-                delta_body,
-                "text",
-            )
-            .and_then(|()| {
-                append_raw_string_carrier(
+            match raw_top_level_unique_type(delta_body).as_deref() {
+                Some("text_delta") => append_raw_string_carrier(
+                    &mut out,
+                    &mut keys,
+                    &mut source_values,
+                    SourceBranchIdentity {
+                        family: family.clone(),
+                        identity: "text".to_owned(),
+                        identity_is_ambiguous: false,
+                    },
+                    delta_body,
+                    "text",
+                ),
+                Some("input_json_delta") => append_raw_string_carrier(
                     &mut out,
                     &mut keys,
                     &mut source_values,
@@ -3062,8 +3188,9 @@ fn anthropic_source_continuations(
                     },
                     delta_body,
                     "partial_json",
-                )
-            })
+                ),
+                Some(_) | None => Ok(()),
+            }
         }
         "content_block_start" => {
             let block = match raw_top_level_unique_object(payload, "content_block") {
@@ -3071,51 +3198,56 @@ fn anthropic_source_continuations(
                 _ => return SourceContinuations::Unevaluable,
             };
             let block_body = block.get().as_bytes();
-            append_raw_string_carrier(
-                &mut out,
-                &mut keys,
-                &mut source_values,
-                SourceBranchIdentity {
-                    family: family.clone(),
-                    identity: "text".to_owned(),
-                    identity_is_ambiguous: false,
-                },
-                block_body,
-                "text",
-            )
-            .and_then(|()| {
-                let mut inputs = raw_top_level_values(block_body, "input").ok_or(())?;
-                let Some(input) = inputs.pop() else {
-                    return Ok(());
-                };
-                if !inputs.is_empty() {
-                    return Err(());
+            match raw_top_level_unique_type(block_body).as_deref() {
+                Some("text") => append_raw_string_carrier(
+                    &mut out,
+                    &mut keys,
+                    &mut source_values,
+                    SourceBranchIdentity {
+                        family: family.clone(),
+                        identity: "text".to_owned(),
+                        identity_is_ambiguous: false,
+                    },
+                    block_body,
+                    "text",
+                ),
+                Some("tool_use") => {
+                    let mut inputs = raw_top_level_values(block_body, "input").ok_or(())?;
+                    let Some(input) = inputs.pop() else {
+                        return SourceContinuations::Absent;
+                    };
+                    if !inputs.is_empty() {
+                        return SourceContinuations::Unevaluable;
+                    }
+                    if input.get().trim_start().starts_with('"') {
+                        append_raw_string_carrier(
+                            &mut out,
+                            &mut keys,
+                            &mut source_values,
+                            SourceBranchIdentity {
+                                family: family.clone(),
+                                identity: "input".to_owned(),
+                                identity_is_ambiguous: false,
+                            },
+                            block_body,
+                            "input",
+                        )
+                    } else {
+                        // A nested tool input can have many source leaves but no
+                        // durable leaf identity on this envelope. An empty object is
+                        // harmless; a visible value must use the bounded policy.
+                        let text =
+                            crate::json_splice::collect_string_values(input.get().as_bytes())
+                                .map_err(|_| ())?;
+                        if text.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(())
+                        }
+                    }
                 }
-                if input.get().trim_start().starts_with('"') {
-                    return append_raw_string_carrier(
-                        &mut out,
-                        &mut keys,
-                        &mut source_values,
-                        SourceBranchIdentity {
-                            family: family.clone(),
-                            identity: "input".to_owned(),
-                            identity_is_ambiguous: false,
-                        },
-                        block_body,
-                        "input",
-                    );
-                }
-                // A nested tool input can have many source leaves but no
-                // durable leaf identity on this envelope. An empty object is
-                // harmless; a visible value must use the bounded policy.
-                let text = crate::json_splice::collect_string_values(input.get().as_bytes())
-                    .map_err(|_| ())?;
-                if text.is_empty() {
-                    Ok(())
-                } else {
-                    Err(())
-                }
-            })
+                Some(_) | None => Ok(()),
+            }
         }
         _ => return SourceContinuations::Absent,
     };
@@ -3203,15 +3335,21 @@ fn chat_choice_source_continuations(payload: &[u8]) -> SourceContinuations {
                         if !raw_is_object(&part) {
                             return SourceContinuations::Unevaluable;
                         }
-                        let text_values =
-                            match raw_top_level_string_values(part.get().as_bytes(), "text") {
-                                Some(text_values) => text_values,
-                                None => return SourceContinuations::Unevaluable,
-                            };
-                        if text_values.is_empty() {
+                        let part_body = part.get().as_bytes();
+                        let Some(field) = raw_top_level_unique_type(part_body)
+                            .as_deref()
+                            .and_then(chat_visible_content_part_field)
+                        else {
+                            continue;
+                        };
+                        let visible_values = match raw_top_level_string_values(part_body, field) {
+                            Some(visible_values) => visible_values,
+                            None => return SourceContinuations::Unevaluable,
+                        };
+                        if visible_values.is_empty() {
                             continue;
                         }
-                        let part_id = match raw_part_identity(part.get().as_bytes()) {
+                        let part_id = match raw_part_identity(part_body) {
                             Ok(part_id) if part_ids.insert(part_id.clone()) => part_id,
                             _ => return SourceContinuations::Unevaluable,
                         };
@@ -3220,9 +3358,9 @@ fn chat_choice_source_continuations(payload: &[u8]) -> SourceContinuations {
                             &mut keys,
                             &mut source_values,
                             format!("chat:{choice_index}:content"),
-                            format!("part:{part_id}:text"),
+                            format!("part:{part_id}:{field}"),
                             false,
-                            text_values,
+                            visible_values,
                         )
                         .is_err()
                         {
@@ -3233,6 +3371,22 @@ fn chat_choice_source_continuations(payload: &[u8]) -> SourceContinuations {
                 Some(b'n') => {}
                 _ => return SourceContinuations::Unevaluable,
             }
+        }
+        if append_raw_string_carrier(
+            &mut out,
+            &mut keys,
+            &mut source_values,
+            SourceBranchIdentity {
+                family: format!("chat:{choice_index}:refusal"),
+                identity: "refusal".to_owned(),
+                identity_is_ambiguous: false,
+            },
+            delta_body,
+            "refusal",
+        )
+        .is_err()
+        {
+            return SourceContinuations::Unevaluable;
         }
         let tool_calls = match raw_top_level_unique_array(delta_body, "tool_calls") {
             Ok(tool_calls) => tool_calls,
@@ -3252,7 +3406,10 @@ fn chat_choice_source_continuations(payload: &[u8]) -> SourceContinuations {
                     Ok(Some(index)) if tool_indexes.insert(index) => index.to_string(),
                     _ => return SourceContinuations::Unevaluable,
                 };
-                for (container, field) in [("function", "arguments"), ("custom", "input")] {
+                for (container, field) in match chat_tool_continuation_fields(tool_body) {
+                    Some(fields) => fields,
+                    None => return SourceContinuations::Unevaluable,
+                } {
                     let nested = match raw_top_level_unique_object(tool_body, container) {
                         Ok(nested) => nested,
                         Err(()) => return SourceContinuations::Unevaluable,
@@ -3276,6 +3433,28 @@ fn chat_choice_source_continuations(payload: &[u8]) -> SourceContinuations {
                         }
                     }
                 }
+            }
+        }
+        let function_call = match raw_top_level_unique_object(delta_body, "function_call") {
+            Ok(function_call) => function_call,
+            Err(()) => return SourceContinuations::Unevaluable,
+        };
+        if let Some(function_call) = function_call {
+            if append_raw_string_carrier(
+                &mut out,
+                &mut keys,
+                &mut source_values,
+                SourceBranchIdentity {
+                    family: format!("chat:{choice_index}:legacy_function"),
+                    identity: "arguments".to_owned(),
+                    identity_is_ambiguous: false,
+                },
+                function_call.get().as_bytes(),
+                "arguments",
+            )
+            .is_err()
+            {
+                return SourceContinuations::Unevaluable;
             }
         }
     }
@@ -3410,9 +3589,8 @@ fn frame_guardrail_supplemental_values(
     has_source_continuations: bool,
     has_typed_continuation: bool,
 ) -> Vec<String> {
-    // On a malformed or unknown frame, typed extraction is the only
-    // available output carrier. It already contains the raw fallback, so a
-    // second generic scan would double-count it.
+    // A typed continuation without source proof becomes unevaluable; do not
+    // add a second, generic supplemental scan for that same frame.
     if has_typed_continuation && !has_source_continuations {
         return Vec::new();
     }
@@ -3443,33 +3621,7 @@ fn frame_guardrail_supplemental_values(
 }
 
 fn decoded_chat_frame_values(body: &[u8]) -> Option<Vec<String>> {
-    match raw_top_level_unique_type(body).as_deref() {
-        Some("content_block_delta")
-            if raw_top_level_items_have_only_types(
-                body,
-                "delta",
-                &["thinking_delta", "signature_delta"],
-            )? =>
-        {
-            return decoded_json_string_values_except_root_keys_vec(body, &["model", "delta"]);
-        }
-        Some("content_block_start")
-            if raw_top_level_items_have_only_types(
-                body,
-                "content_block",
-                &["thinking", "redacted_thinking"],
-            )? =>
-        {
-            return decoded_json_string_values_except_root_keys_vec(
-                body,
-                &["model", "content_block"],
-            );
-        }
-        _ => {}
-    }
-    decoded_json_string_values_vec_where(body, |path| {
-        !is_root_key(path, "model") && !is_hidden_chat_stream_reasoning_path(path)
-    })
+    decoded_chat_frame_supplemental_values(body)
 }
 
 fn decoded_responses_frame_values(body: &[u8]) -> Option<Vec<String>> {
@@ -3493,7 +3645,7 @@ fn frame_guardrail_values(protocol: PassthroughProtocol, frame: &[u8]) -> Vec<St
             decoded_json_string_values_vec_where(payload.as_bytes(), |_| true).unwrap_or_else(raw)
         }
         PassthroughProtocol::OpenaiChat => {
-            decoded_chat_frame_values(payload.as_bytes()).unwrap_or_else(raw)
+            decoded_chat_frame_values(payload.as_bytes()).unwrap_or_default()
         }
         PassthroughProtocol::OpenaiCompletions => {
             decoded_json_string_values_vec_where(payload.as_bytes(), |path| {
@@ -3509,8 +3661,8 @@ fn frame_guardrail_values(protocol: PassthroughProtocol, frame: &[u8]) -> Vec<St
 
 /// Guardrail-only text for a streamed frame. Capture and hold-back retain
 /// their typed visible-content extraction in [`frame_parts`], while this
-/// source-preserving pass retains duplicate selected carriers. Responses
-/// media fields remain opaque even when forwarded verbatim.
+/// source-preserving pass retains duplicate selected carriers. Chat and
+/// Responses media fields remain opaque even when forwarded verbatim.
 #[cfg(test)]
 fn frame_guardrail_text(protocol: PassthroughProtocol, frame: &[u8]) -> String {
     let Some(payload) = crate::redact::frame_payload(frame) else {
@@ -3526,7 +3678,10 @@ fn frame_guardrail_text(protocol: PassthroughProtocol, frame: &[u8]) -> String {
             decoded_json_string_values(payload.as_bytes()).unwrap_or_else(raw)
         }
         PassthroughProtocol::OpenaiChat => {
-            decoded_chat_frame_string_values(payload.as_bytes()).unwrap_or_else(raw)
+            // A detected Chat frame can carry opaque multimodal values.
+            // Without a successful type-aware selection, relay it but do not
+            // send a raw fallback to an external output guardrail.
+            decoded_chat_frame_string_values(payload.as_bytes()).unwrap_or_default()
         }
         PassthroughProtocol::OpenaiCompletions => {
             decoded_non_model_json_string_values(payload.as_bytes()).unwrap_or_else(raw)
@@ -3574,6 +3729,18 @@ fn stream_guardrail_text(
         || (matches!(protocol, PassthroughProtocol::OpenaiResponses) && !responses_visible_delta)
     {
         String::new()
+    } else if matches!(protocol, PassthroughProtocol::OpenaiChat) {
+        // `frame_parts` retains text-shaped fields for capture and hold-back,
+        // including ones on opaque multimodal parts. Its raw scan text must
+        // not make such a part an external-guardrail candidate or prevent a
+        // sibling, type-allowed text/tool value from being scanned.
+        payload
+            .as_ref()
+            .and_then(|payload| {
+                decoded_chat_frame_continuations(payload.trim().as_bytes())
+                    .map(|values| values.join("\n"))
+            })
+            .unwrap_or(continuation)
     } else {
         continuation
     };
@@ -4125,13 +4292,15 @@ fn stream_response(
                     .min(u32::MAX as u128) as u32;
             }
             for frame in splitter.push(&chunk) {
-                let overflowed = frame.overflowed;
+                // Both completed and splitter-overflowed frames take the
+                // same raw-cap preflight below.
+                let _overflowed = frame.overflowed;
                 let frame = frame.bytes;
-                if overflowed && !fail_opened {
+                if !fail_opened {
                     if let Some((max_buffer_bytes, on_exceeded_fail_open)) = policy.hold_cap() {
-                        // `overflowed` means the splitter crossed this same
-                        // raw-byte bound before it found a frame terminator.
-                        // Do not hand that partial payload to any decoder.
+                        // Apply the raw-byte bound before parsing every frame.
+                        // The splitter marks an unterminated frame as overflowed,
+                        // but a complete frame can be oversized as well.
                         if held_content.would_exceed_after(0, frame.len(), max_buffer_bytes) {
                             if on_exceeded_fail_open {
                                 fail_opened = true;
@@ -6534,9 +6703,10 @@ mod tests {
     fn known_response_envelopes_scan_duplicate_selected_source_strings() {
         let chat = br#"{"model":"routing-only","choices":[{"message":{"content":"\u0042LOCKME","metadata":{"note":"NESTED"}}}],"choices":[{"message":{"content":"clean"}}]}"#;
         let scanned = response_guardrail_text(PassthroughProtocol::OpenaiChat, chat);
-        for expected in ["BLOCKME", "NESTED", "clean"] {
+        for expected in ["BLOCKME", "clean"] {
             assert!(scanned.contains(expected), "{scanned:?}");
         }
+        assert!(!scanned.contains("NESTED"), "{scanned:?}");
         assert!(!scanned.contains("routing-only"), "{scanned:?}");
 
         let responses = br#"{"output":[{"type":"message","content":[{"type":"output_text","text":"\u0042LOCKME","metadata":{"note":"NESTED"}}]}],"output":[{"type":"message","content":[{"type":"output_text","text":"clean"}]}]}"#;
@@ -6567,6 +6737,145 @@ mod tests {
             response_guardrail_text(PassthroughProtocol::OpenaiResponses, duplicate_text)
                 .contains("clean")
         );
+    }
+
+    #[test]
+    fn chat_output_guardrail_keeps_media_and_unknown_parts_opaque() {
+        let buffered = br#"{
+            "choices": [{
+                "message": {
+                    "content": [
+                        {"type":"image_url","image_url":{"url":"BUFFERED_IMAGE_SENTINEL"}},
+                        {"type":"input_audio","input_audio":{"data":"BUFFERED_AUDIO_SENTINEL"}},
+                        {"type":"file","file":{"file_data":"BUFFERED_FILE_SENTINEL"}},
+                        {"type":"future_media","text":"BUFFERED_OPAQUE_PART_SENTINEL"},
+                        {"type":"text","text":"BUFFERED_VISIBLE_SENTINEL"}
+                    ],
+                    "reasoning_content": "BUFFERED_REASONING_SENTINEL",
+                    "metadata": {"note":"BUFFERED_METADATA_SENTINEL"},
+                    "tool_calls": [
+                        {"type":"function","function":{"name":"lookup","arguments":"BUFFERED_TOOL_ARGUMENT_SENTINEL"}},
+                        {"type":"custom","custom":{"name":"custom","input":"BUFFERED_CUSTOM_INPUT_SENTINEL"}}
+                    ],
+                    "function_call": {"name":"legacy","arguments":"BUFFERED_LEGACY_ARGUMENT_SENTINEL"}
+                }
+            }]
+        }"#;
+        let scanned = response_guardrail_text(PassthroughProtocol::OpenaiChat, buffered);
+        for expected in [
+            "BUFFERED_VISIBLE_SENTINEL",
+            "lookup",
+            "BUFFERED_TOOL_ARGUMENT_SENTINEL",
+            "custom",
+            "BUFFERED_CUSTOM_INPUT_SENTINEL",
+            "legacy",
+            "BUFFERED_LEGACY_ARGUMENT_SENTINEL",
+        ] {
+            assert!(scanned.contains(expected), "{scanned:?}");
+        }
+        for opaque in [
+            "BUFFERED_IMAGE_SENTINEL",
+            "BUFFERED_AUDIO_SENTINEL",
+            "BUFFERED_FILE_SENTINEL",
+            "BUFFERED_OPAQUE_PART_SENTINEL",
+            "BUFFERED_REASONING_SENTINEL",
+            "BUFFERED_METADATA_SENTINEL",
+        ] {
+            assert!(!scanned.contains(opaque), "{scanned:?}");
+        }
+
+        let frame = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"index\":0,\"type\":\"image_url\",\"image_url\":{\"url\":\"STREAM_IMAGE_SENTINEL\"}},{\"index\":1,\"type\":\"input_audio\",\"input_audio\":{\"data\":\"STREAM_AUDIO_SENTINEL\"}},{\"index\":2,\"type\":\"file\",\"file\":{\"file_data\":\"STREAM_FILE_SENTINEL\"}},{\"index\":3,\"type\":\"future_media\",\"text\":\"STREAM_OPAQUE_PART_SENTINEL\"},{\"index\":4,\"type\":\"text\",\"text\":\"STREAM_VISIBLE_SENTINEL\"}],\"reasoning_content\":\"STREAM_REASONING_SENTINEL\",\"metadata\":{\"note\":\"STREAM_METADATA_SENTINEL\"},\"tool_calls\":[{\"index\":0,\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"STREAM_TOOL_ARGUMENT_SENTINEL\"}},{\"index\":1,\"type\":\"custom\",\"custom\":{\"name\":\"custom\",\"input\":\"STREAM_CUSTOM_INPUT_SENTINEL\"}}],\"function_call\":{\"name\":\"legacy\",\"arguments\":\"STREAM_LEGACY_ARGUMENT_SENTINEL\"}}}]}\n\n";
+        let typed = frame_parts(PassthroughProtocol::OpenaiChat, frame).0.scan;
+        assert!(typed.contains("STREAM_OPAQUE_PART_SENTINEL"), "{typed:?}");
+        let text = stream_guardrail_text(PassthroughProtocol::OpenaiChat, frame, typed);
+        assert!(!text.unevaluable);
+        let scanned = stream_guardrail_scan_text(&[], &text.continuations, &text.supplemental);
+        for expected in [
+            "STREAM_VISIBLE_SENTINEL",
+            "lookup",
+            "STREAM_TOOL_ARGUMENT_SENTINEL",
+            "custom",
+            "STREAM_CUSTOM_INPUT_SENTINEL",
+            "legacy",
+            "STREAM_LEGACY_ARGUMENT_SENTINEL",
+        ] {
+            assert!(scan_candidates_contain(&scanned, expected), "{scanned:?}");
+        }
+        for opaque in [
+            "STREAM_IMAGE_SENTINEL",
+            "STREAM_AUDIO_SENTINEL",
+            "STREAM_FILE_SENTINEL",
+            "STREAM_OPAQUE_PART_SENTINEL",
+            "STREAM_REASONING_SENTINEL",
+            "STREAM_METADATA_SENTINEL",
+        ] {
+            assert!(!scan_candidates_contain(&scanned, opaque), "{scanned:?}");
+        }
+    }
+
+    #[test]
+    fn chat_output_guardrail_scans_client_visible_refusals() {
+        let buffered = br#"{
+            "choices": [{
+                "message": {
+                    "content": [
+                        {"type":"image_url","image_url":{"url":"BUFFERED_MEDIA_SENTINEL"}},
+                        {"type":"refusal","refusal":"CONTENT_REFUSAL_BLOCKME"}
+                    ],
+                    "refusal":"MESSAGE_REFUSAL_BLOCKME",
+                    "reasoning_content":"BUFFERED_REASONING_SENTINEL"
+                }
+            }]
+        }"#;
+        let scanned = response_guardrail_text(PassthroughProtocol::OpenaiChat, buffered);
+        for refusal in ["CONTENT_REFUSAL_BLOCKME", "MESSAGE_REFUSAL_BLOCKME"] {
+            assert!(scanned.contains(refusal), "{scanned:?}");
+        }
+        for opaque in ["BUFFERED_MEDIA_SENTINEL", "BUFFERED_REASONING_SENTINEL"] {
+            assert!(!scanned.contains(opaque), "{scanned:?}");
+        }
+
+        let first_frame =
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"refusal\":\"BLOC\"}}]}\n\n";
+        let second_frame =
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"refusal\":\"KME\"}}]}\n\n";
+        let first = stream_guardrail_text(
+            PassthroughProtocol::OpenaiChat,
+            first_frame,
+            frame_parts(PassthroughProtocol::OpenaiChat, first_frame)
+                .0
+                .scan,
+        );
+        let second = stream_guardrail_text(
+            PassthroughProtocol::OpenaiChat,
+            second_frame,
+            frame_parts(PassthroughProtocol::OpenaiChat, second_frame)
+                .0
+                .scan,
+        );
+        assert!(!first.unevaluable);
+        assert!(!second.unevaluable);
+
+        let mut continuations = Vec::new();
+        let mut tails = Vec::new();
+        let mut supplemental = Vec::new();
+        let mut closed_prefixes = Vec::new();
+        append_stream_guardrail_text(
+            &mut continuations,
+            &mut tails,
+            &mut supplemental,
+            &mut closed_prefixes,
+            &first,
+        );
+        append_stream_guardrail_text(
+            &mut continuations,
+            &mut tails,
+            &mut supplemental,
+            &mut closed_prefixes,
+            &second,
+        );
+        let scanned = stream_guardrail_scan_text(&tails, &continuations, &supplemental);
+        assert!(scan_candidates_contain(&scanned, "BLOCKME"), "{scanned:?}");
     }
 
     #[test]
@@ -6687,12 +6996,13 @@ mod tests {
     }
 
     #[test]
-    fn known_sse_envelopes_scan_duplicate_and_nested_source_strings() {
-        let chat = b"data: {\"choices\":[{\"delta\":{\"content\":\"\\u0042LOCKME\",\"metadata\":{\"note\":\"NESTED\"}}}],\"choices\":[{\"delta\":{\"content\":\"clean\"}}]}\n\n";
+    fn known_sse_envelopes_scan_selected_source_strings() {
+        let chat = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\\u0042LOCKME\",\"metadata\":{\"note\":\"NESTED\"}}},{\"index\":1,\"delta\":{\"content\":\"clean\"}}]}\n\n";
         let scanned = frame_guardrail_text(PassthroughProtocol::OpenaiChat, chat);
-        for expected in ["BLOCKME", "NESTED", "clean"] {
+        for expected in ["BLOCKME", "clean"] {
             assert!(scanned.contains(expected), "{scanned:?}");
         }
+        assert!(!scanned.contains("NESTED"), "{scanned:?}");
 
         let responses = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"\\u0042LOCKME\",\"delta\":\"clean\",\"metadata\":{\"note\":\"NESTED\"}}\n\n";
         let scanned = frame_guardrail_text(PassthroughProtocol::OpenaiResponses, responses);
@@ -6720,7 +7030,7 @@ mod tests {
 
         let conflicting_anthropic = b"data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"thinking\",\"type\":\"text\",\"text\":\"\\u0042LOCKME\"}}\n\n";
         assert!(
-            frame_guardrail_text(PassthroughProtocol::OpenaiChat, conflicting_anthropic)
+            !frame_guardrail_text(PassthroughProtocol::OpenaiChat, conflicting_anthropic)
                 .contains("BLOCKME")
         );
         let hidden_anthropic = b"data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"thinking\",\"type\":\"thinking\",\"thinking\":\"\\u0042LOCKME\"}}\n\n";

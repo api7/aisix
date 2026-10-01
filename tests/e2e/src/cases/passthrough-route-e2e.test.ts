@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
+import { connect } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { harnessRequest } from "../harness/http.js";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -54,6 +56,57 @@ const STREAM_TIMEOUT_PLAINTEXT = "sk-ptr-e2e-stream-timeout";
 const STREAM_TIMEOUT_KEY_HASH = createHash("sha256")
   .update(STREAM_TIMEOUT_PLAINTEXT)
   .digest("hex");
+const STREAM_RAW_CHUNK_PLAINTEXT = "sk-ptr-e2e-stream-raw-chunk";
+const STREAM_RAW_CHUNK_KEY_HASH = createHash("sha256")
+  .update(STREAM_RAW_CHUNK_PLAINTEXT)
+  .digest("hex");
+
+/**
+ * Send an HTTP/1.1 request line without a URL client parsing or normalizing
+ * its path. This pins the route boundary against the bytes a proxy receives.
+ */
+function rawHttpStatus(proxyUrl: string, path: string): Promise<number> {
+  const target = new URL(proxyUrl);
+  const port = Number(target.port || "80");
+
+  return new Promise<number>((resolve, reject) => {
+    const socket = connect({ host: target.hostname, port });
+    let response = "";
+    let settled = false;
+    const timeout = setTimeout(
+      () => finish(new Error(`timed out waiting for raw HTTP response to ${path}`)),
+      5_000,
+    );
+
+    function finish(result: number | Error): void {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      socket.destroy();
+      if (result instanceof Error) reject(result);
+      else resolve(result);
+    }
+
+    socket.once("connect", () => {
+      socket.write(
+        [
+          `GET ${path} HTTP/1.1`,
+          `Host: ${target.host}`,
+          `Authorization: Bearer ${CALLER_PLAINTEXT}`,
+          "Connection: close",
+          "",
+          "",
+        ].join("\r\n"),
+      );
+    });
+    socket.on("data", (chunk: Buffer) => {
+      response += chunk.toString("utf8");
+      const status = /^HTTP\/1\.[01] (\d{3})\b/.exec(response);
+      if (status) finish(Number(status[1]));
+    });
+    socket.once("error", (error) => finish(error));
+  });
+}
 
 describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed paths", () => {
   let app: SpawnedApp | undefined;
@@ -285,8 +338,22 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     );
 
     const baseline = upstream.receivedRequests.length;
-    // Use undici's raw request helper: fetch implementations are allowed to
-    // normalize URL escapes before the gateway receives the wire path.
+    // URL clients may normalize these before the gateway sees the request.
+    // Write the request line ourselves to preserve the traversal bytes.
+    for (const remainder of [
+      "../models",
+      "%2e%2e/models",
+      "%2E%2E/models",
+      "..\\models",
+    ]) {
+      const status = await rawHttpStatus(
+        app.proxyUrl,
+        `/ptr-boundary/${remainder}`,
+      );
+      expect(status, remainder).toBe(400);
+      expect(upstream.receivedRequests, remainder).toHaveLength(baseline);
+    }
+
     for (const remainder of [
       "%252e%252e%252fmodels",
       "..;ignored/models",
@@ -865,6 +932,69 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     const recovered = await call();
     expect(recovered.status).toBe(200);
     expect(await recovered.json()).toEqual({ recovered: true });
+  }, 10_000);
+
+  test("an SSE frame may span raw upstream chunks without timing out", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    // Each raw-body gap is below the 100 ms route timeout, but assembling this
+    // one SSE frame takes longer than 100 ms. A frame-based timeout would fail
+    // before the third write; the relay's raw-chunk timeout must not.
+    const upstream = await startOpenAiUpstream({
+      rawBodyChunks: [
+        'data: {"choices":[{"delta":{"content":"raw-',
+        'chunk-',
+        'timeout"}}]}\n\n',
+        "data: [DONE]\n\n",
+      ],
+      rawContentType: "text/event-stream",
+      eventDelayMs: 60,
+    });
+    upstreams.push(upstream);
+
+    const pk = await seed.createProviderKey({
+      display_name: "ptr-sse-raw-chunk-timeout-pk",
+      secret: "sk-mock",
+      api_base: "http://unused-on-routes",
+    });
+    await seed.createPassthroughRoute({
+      name: "ptr-sse-raw-chunk-timeout",
+      path_prefix: "/sse-raw-chunk-timeout",
+      target_url: upstream.baseUrl,
+      provider_key_id: pk.id,
+      timeout_ms: 100,
+    });
+    await seed.createApiKey({
+      key_hash: STREAM_RAW_CHUNK_KEY_HASH,
+      allowed_models: ["*"],
+      allowed_routes: ["ptr-sse-raw-chunk-timeout"],
+    });
+
+    const call = () =>
+      fetch(`${app!.proxyUrl}/sse-raw-chunk-timeout/chat/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${STREAM_RAW_CHUNK_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "hi" }],
+          stream: true,
+        }),
+      });
+
+    const probe = new ProxyClient(app.proxyUrl, STREAM_RAW_CHUNK_PLAINTEXT);
+    await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
+
+    const response = await call();
+    const body = await response.text();
+    expect(response.status, body).toBe(200);
+    expect(body).toContain("raw-chunk-timeout");
+    expect(body).toContain("[DONE]");
   }, 10_000);
 
   test("envelope auto-detection: usage follows the request body, never the config", async (ctx) => {

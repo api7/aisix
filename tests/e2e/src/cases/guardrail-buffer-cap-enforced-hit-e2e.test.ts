@@ -52,6 +52,7 @@ const TAIL_ROUTE = "cap-tail-passthrough";
 const OPEN_TAIL_ROUTE = "cap-open-tail-passthrough";
 const CUMULATIVE_TAIL_ROUTE = "cap-cumulative-tail-passthrough";
 const OPEN_CUMULATIVE_TAIL_ROUTE = "cap-open-cumulative-tail-passthrough";
+const COMPLETE_FRAME_ROUTE = "cap-complete-frame-passthrough";
 
 // 30 pieces of 100 bytes: three times the tight cap, far under the loose one.
 const TIGHT_CAP = 1_000;
@@ -138,6 +139,14 @@ const UNTERMINATED_TAIL_STREAM = [
   `data: ${chatChunk({ content: PIECES[0] })}\n\n`,
   `data: ${UNTERMINATED_TAIL_JSON.slice(0, 150_000)}`,
   UNTERMINATED_TAIL_JSON.slice(150_000),
+];
+
+// This malformed frame is fully terminated, so the SSE splitter returns it
+// without an overflow marker. Its raw bytes still exceed the hold-back cap
+// and must be rejected before any JSON parsing or guardrail extraction.
+const COMPLETE_FRAME_MARKER = "complete-frame-marker";
+const COMPLETE_FRAME_STREAM = [
+  `data: {"id":"${COMPLETE_FRAME_MARKER}-${"m".repeat(200_000)}\n\n`,
 ];
 
 // These complete comment frames are each below the splitter's raw bound.
@@ -312,6 +321,20 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
       scope_id: openTailRoute.id,
       priority: 100,
     });
+    const completeFrameUp = await startOpenAiUpstream({ rawStreamFrames: COMPLETE_FRAME_STREAM });
+    upstreams.push(completeFrameUp);
+    const completeFramePk = await seed.createProviderKey({
+      display_name: "cap-complete-frame-backing-pk",
+      secret: "sk-mock",
+      api_base: `${completeFrameUp.baseUrl}/v1`,
+    });
+    const completeFrameRoute = await seed.createPassthroughRoute({
+      name: COMPLETE_FRAME_ROUTE,
+      path_prefix: "/passthrough/complete-frame",
+      target_url: `${completeFrameUp.baseUrl}/v1`,
+      provider_key_id: completeFramePk.id,
+    });
+    await attachBoth("passthrough_route", completeFrameRoute.id);
     const cumulativeTailUp = await startOpenAiUpstream({ rawStreamFrames: CUMULATIVE_TAIL_STREAM });
     upstreams.push(cumulativeTailUp);
     const cumulativeTailPk = await seed.createProviderKey({
@@ -470,6 +493,22 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
     });
     expect(body, "fail_open releases the tail").toContain(TAIL_MARKER);
     await expectBypass("passthrough tail", (l) => l.get("passthrough_route_name") === OPEN_TAIL_ROUTE);
+  });
+
+  test("passthrough route: a complete oversized frame hits the raw cap before parsing", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const body = await post("/passthrough/complete-frame/chat/completions", {
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: "go" }],
+    });
+    expect(body).toContain("output_buffer_exceeded");
+    expect(body).not.toContain("unscannable_body");
+    expect(body).not.toContain(COMPLETE_FRAME_MARKER);
+    await expectCapHit(
+      "passthrough complete frame",
+      (l) => l.get("passthrough_route_name") === COMPLETE_FRAME_ROUTE,
+      TIGHT,
+    );
   });
 
   test("passthrough route: a cumulative unterminated EOF tail hits the raw cap before parsing", async (ctx) => {
