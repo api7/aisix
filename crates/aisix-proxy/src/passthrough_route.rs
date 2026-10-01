@@ -1619,10 +1619,6 @@ fn decoded_json_string_values_vec_where(
         .filter(|out| !out.is_empty())
 }
 
-fn is_root_key(path: &[crate::json_splice::PathSeg], key: &str) -> bool {
-    path.first().is_some_and(|segment| segment.is_key(key))
-}
-
 fn decoded_json_string_values_including_empty(
     body: &[u8],
     scan_error: &mut Option<crate::json_splice::SpliceError>,
@@ -7814,7 +7810,7 @@ mod tests {
     fn malformed_or_capped_stream_supplemental_is_marked_separately() {
         let supplemental_failure = |name_fields: String| {
             format!(
-                "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"input\":\"clean\",{name_fields}}}}\n\n"
+                "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"input\":\"clean\",{name_fields}}}}}\n\n"
             )
         };
         let malformed = supplemental_failure("\"name\":1".to_owned());
@@ -8283,6 +8279,7 @@ mod tests {
             }],
             supplemental: Vec::new(),
             unevaluable: false,
+            supplemental_unevaluable: false,
             closed_prefixes: Vec::new(),
         };
         assert!(stream_continuation_would_exceed_cap(
@@ -8304,6 +8301,7 @@ mod tests {
                 .map(|index| format!("metadata-{index}"))
                 .collect(),
             unevaluable: false,
+            supplemental_unevaluable: false,
             closed_prefixes: Vec::new(),
         };
         assert!(stream_continuation_would_exceed_cap(
