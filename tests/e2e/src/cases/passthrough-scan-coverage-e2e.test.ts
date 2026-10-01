@@ -931,6 +931,8 @@ describe("passthrough Raw stream unevaluable-output fail-open", () => {
       body: OVER_DEPTH_ANTHROPIC_TOOL_RESULT_FAIL_OPEN_INPUT,
     });
     expect(res.status).toBe(200);
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    expect(requestId).toBeTruthy();
     expect(await res.text()).toBe(SAFE_ESCAPED_JSON);
     expect(depthInputUpstream.receivedRequests.length).toBe(before + 1);
     expect(depthInputUpstream.receivedRequests.at(-1)!.body).toBe(
@@ -942,7 +944,7 @@ describe("passthrough Raw stream unevaluable-output fail-open", () => {
       logstore,
       (entry) =>
         entry.get("passthrough_route_name") === depthInputRoute &&
-        entry.get("requested_model") === "nested-tool-result-fail-open",
+        entry.get("request_id") === requestId,
       "fail-open nested-tool-result passthrough usage event",
     );
     expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
