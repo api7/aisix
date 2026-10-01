@@ -27,14 +27,21 @@ pub fn client() -> &'static Client {
 /// CA nor a resolution address — so the ordinary path keeps sharing one
 /// connection pool.
 ///
-/// Every passthrough surface goes through here rather than [`client`]:
-/// a key configured with a private CA, or with an upstream reachable only
-/// at a fixed address, has to reach its endpoint on `/v1/messages`,
-/// `/v1/responses`, `/v1/audio/*`, `/v1/videos/*`, the jobs surface and
-/// the raw tunnel, not only on the endpoints that run through a provider
-/// bridge.
+/// Every typed passthrough surface goes through here rather than [`client`].
+/// The raw tunnel uses [`raw_relay_client_for`], which applies the same
+/// per-key connection rules while preserving encoded response bytes. A key
+/// configured with a private CA, or with an upstream reachable only at a
+/// fixed address, must reach every endpoint rather than only the surfaces
+/// that run through a provider bridge.
 pub fn client_for(conn: Option<&UpstreamConnection>) -> Client {
     aisix_gateway::upstream_tls::client_for_provider_key(client(), conn)
+}
+
+/// The client for a raw passthrough relay. Unlike [`client_for`], this opts
+/// out of reqwest's transparent content decoders so provider error and binary
+/// responses retain their encoded bytes and representation headers.
+pub fn raw_relay_client_for(conn: Option<&UpstreamConnection>) -> Client {
+    aisix_gateway::upstream_tls::raw_client_for_provider_key(conn)
 }
 
 #[cfg(test)]

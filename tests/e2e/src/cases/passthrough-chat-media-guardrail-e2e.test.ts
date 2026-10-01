@@ -39,6 +39,8 @@ const STREAM_REFUSAL = "stream-refusal-BLOCKME";
 // `openai_moderation` uses the default whole-stream hold cap (256 KiB).
 const STREAM_REFUSAL_CAP = 262_144;
 const STREAM_OVERSIZED_REFUSAL = `stream-oversized-refusal-${"x".repeat(STREAM_REFUSAL_CAP + 1)}`;
+const COMPLETIONS_VISIBLE = "completions-visible-text-sentinel";
+const COMPLETIONS_OPAQUE = "completions-opaque-extension-sentinel";
 
 interface ModerationSink {
   baseUrl: string;
@@ -237,6 +239,24 @@ const streamedOversizedLegacyToolResponse = [
   "data: [DONE]\n\n",
 ];
 
+const bufferedCompletionsResponse = {
+  choices: [{ text: COMPLETIONS_VISIBLE, opaque: COMPLETIONS_OPAQUE }],
+  opaque: { data: COMPLETIONS_OPAQUE },
+};
+
+const malformedBufferedCompletionsResponse = {
+  choices: { text: COMPLETIONS_VISIBLE },
+  opaque: { data: COMPLETIONS_OPAQUE },
+};
+
+const malformedStreamedCompletionsResponse = [
+  `data: ${JSON.stringify({
+    choices: { index: 0, text: COMPLETIONS_VISIBLE },
+    opaque: { data: COMPLETIONS_OPAQUE },
+  })}\n\n`,
+  "data: [DONE]\n\n",
+];
+
 describe("Chat passthrough keeps media out of external output guardrails", () => {
   let app: SpawnedApp | undefined;
   let seed: SeedClient | undefined;
@@ -248,6 +268,9 @@ describe("Chat passthrough keeps media out of external output guardrails", () =>
   let streamOversizedRefusalUpstream: OpenAiUpstream | undefined;
   let streamOversizedContentRefusalUpstream: OpenAiUpstream | undefined;
   let streamOversizedLegacyToolUpstream: OpenAiUpstream | undefined;
+  let bufferedCompletionsUpstream: OpenAiUpstream | undefined;
+  let malformedBufferedCompletionsUpstream: OpenAiUpstream | undefined;
+  let malformedStreamedCompletionsUpstream: OpenAiUpstream | undefined;
   let moderation: ModerationSink | undefined;
   let etcdReachable = false;
 
@@ -274,6 +297,15 @@ describe("Chat passthrough keeps media out of external output guardrails", () =>
     });
     streamOversizedLegacyToolUpstream = await startOpenAiUpstream({
       rawStreamFrames: streamedOversizedLegacyToolResponse,
+    });
+    bufferedCompletionsUpstream = await startOpenAiUpstream({
+      nonStreamBody: bufferedCompletionsResponse,
+    });
+    malformedBufferedCompletionsUpstream = await startOpenAiUpstream({
+      nonStreamBody: malformedBufferedCompletionsResponse,
+    });
+    malformedStreamedCompletionsUpstream = await startOpenAiUpstream({
+      rawStreamFrames: malformedStreamedCompletionsResponse,
     });
     app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
@@ -331,6 +363,24 @@ describe("Chat passthrough keeps media out of external output guardrails", () =>
       target_url: streamOversizedLegacyToolUpstream.baseUrl,
       provider_key_id: providerKey.id,
     });
+    await seed.createPassthroughRoute({
+      name: "passthrough-completions-buffered",
+      path_prefix: "/completions-buffered",
+      target_url: bufferedCompletionsUpstream.baseUrl,
+      provider_key_id: providerKey.id,
+    });
+    await seed.createPassthroughRoute({
+      name: "passthrough-completions-malformed-buffered",
+      path_prefix: "/completions-malformed-buffered",
+      target_url: malformedBufferedCompletionsUpstream.baseUrl,
+      provider_key_id: providerKey.id,
+    });
+    await seed.createPassthroughRoute({
+      name: "passthrough-completions-malformed-stream",
+      path_prefix: "/completions-malformed-stream",
+      target_url: malformedStreamedCompletionsUpstream.baseUrl,
+      provider_key_id: providerKey.id,
+    });
     await seed.createGuardrail({
       name: "passthrough-chat-media-output",
       enabled: true,
@@ -361,6 +411,9 @@ describe("Chat passthrough keeps media out of external output guardrails", () =>
     await streamOversizedRefusalUpstream?.close();
     await streamOversizedContentRefusalUpstream?.close();
     await streamOversizedLegacyToolUpstream?.close();
+    await bufferedCompletionsUpstream?.close();
+    await malformedBufferedCompletionsUpstream?.close();
+    await malformedStreamedCompletionsUpstream?.close();
     await moderation?.close();
   });
 
@@ -376,6 +429,16 @@ describe("Chat passthrough keeps media out of external output guardrails", () =>
         messages: [{ role: "user", content: "go" }],
         stream,
       }),
+    });
+
+  const completionsRequest = (route: string, stream: boolean) =>
+    fetch(`${app!.proxyUrl}/${route}/v1/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "gpt-4o-mini", prompt: "go", stream }),
     });
 
   const expectExternalGuardrailText = (
@@ -474,6 +537,58 @@ describe("Chat passthrough keeps media out of external output guardrails", () =>
       STREAM_TOOL,
       [STREAM_IMAGE, STREAM_AUDIO, STREAM_FILE, STREAM_OPAQUE, STREAM_REASONING],
     );
+  });
+
+  test("buffered Completions sends only choices text to the external guardrail", async (ctx) => {
+    if (!etcdReachable || !app || !bufferedCompletionsUpstream || !moderation) {
+      ctx.skip();
+      return;
+    }
+    const upstreamBefore = bufferedCompletionsUpstream.receivedRequests.length;
+    const moderationBefore = moderation.inputs.length;
+    const response = await completionsRequest("completions-buffered", false);
+    const body = await response.text();
+    expect(response.status, body).toBe(200);
+    expect(body).toContain(COMPLETIONS_VISIBLE);
+    expect(body).toContain(COMPLETIONS_OPAQUE);
+    expect(bufferedCompletionsUpstream.receivedRequests.length).toBe(upstreamBefore + 1);
+    const inputs = moderation.inputs.slice(moderationBefore);
+    expect(inputs.some((input) => input.includes(COMPLETIONS_VISIBLE)), inputs.join("\n")).toBe(true);
+    expect(inputs.every((input) => !input.includes(COMPLETIONS_OPAQUE)), inputs.join("\n")).toBe(true);
+  });
+
+  test("malformed Completions carriers fail closed without calling the external guardrail", async (ctx) => {
+    if (
+      !etcdReachable ||
+      !app ||
+      !malformedBufferedCompletionsUpstream ||
+      !malformedStreamedCompletionsUpstream ||
+      !moderation
+    ) {
+      ctx.skip();
+      return;
+    }
+
+    const bufferedBefore = malformedBufferedCompletionsUpstream.receivedRequests.length;
+    const moderationBeforeBuffered = moderation.inputs.length;
+    const buffered = await completionsRequest("completions-malformed-buffered", false);
+    const bufferedBody = await buffered.text();
+    expect(buffered.status, bufferedBody).toBe(422);
+    expect(bufferedBody).toContain("guardrail_unavailable");
+    expect(bufferedBody).not.toContain(COMPLETIONS_OPAQUE);
+    expect(malformedBufferedCompletionsUpstream.receivedRequests.length).toBe(bufferedBefore + 1);
+    expect(moderation.inputs.slice(moderationBeforeBuffered)).toHaveLength(0);
+
+    const streamBefore = malformedStreamedCompletionsUpstream.receivedRequests.length;
+    const moderationBeforeStream = moderation.inputs.length;
+    const streamed = await completionsRequest("completions-malformed-stream", true);
+    const streamedBody = await streamed.text();
+    expect(streamed.status, streamedBody).toBe(200);
+    expect(streamedBody).toContain("event: error");
+    expect(streamedBody).toContain("guardrail_unavailable");
+    expect(streamedBody).not.toContain(COMPLETIONS_OPAQUE);
+    expect(malformedStreamedCompletionsUpstream.receivedRequests.length).toBe(streamBefore + 1);
+    expect(moderation.inputs.slice(moderationBeforeStream)).toHaveLength(0);
   });
 
   test("buffered Chat refusals are blocked by the external output guardrail", async (ctx) => {

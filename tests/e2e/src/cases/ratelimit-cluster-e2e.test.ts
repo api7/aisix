@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { request, type IncomingMessage } from "node:http";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
@@ -43,6 +44,10 @@ const PASSTHROUGH_PREFIX = "/rl-cluster-passthrough";
 // generous interval for CI scheduling around the three-second assertion.
 const PASSTHROUGH_CONCURRENCY_TTL_SECS = 1;
 const PASSTHROUGH_WAIT_BEYOND_TTL_MS = 3_000;
+const PASSTHROUGH_502_SSE = 'event: upstream_error\ndata: {"message":"still-live"}\n\n';
+// Keep a full CI-scheduling cushion after the cross-TTL probe, then wait for
+// this explicit EOF before asserting that the shared slot is released.
+const PASSTHROUGH_502_EOF_DELAY_MS = PASSTHROUGH_WAIT_BEYOND_TTL_MS + 3_000;
 
 const ETCD_ENDPOINT = etcdEndpoint();
 const REDIS_URL = process.env.AISIX_E2E_REDIS ?? "redis://127.0.0.1:6379";
@@ -121,6 +126,27 @@ function chatRequest(proxyUrl: string, model: string): Promise<Response> {
       model,
       messages: [{ role: "user", content: "hello" }],
     }),
+  });
+}
+
+function rawPost(
+  url: string,
+  headers: Record<string, string>,
+  body: string,
+): Promise<IncomingMessage> {
+  return new Promise((resolve, reject) => {
+    const req = request(url, { method: "POST", headers }, resolve);
+    req.once("error", reject);
+    req.end(body);
+  });
+}
+
+function readRawBody(response: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    response.on("data", (chunk: Buffer) => chunks.push(chunk));
+    response.once("error", reject);
+    response.once("end", () => resolve(Buffer.concat(chunks)));
   });
 }
 
@@ -346,6 +372,129 @@ describe("passthrough SSE concurrency is shared and renewed across Redis replica
       expect(admitted).toBeDefined();
       expect(admitted!.headers.get("content-type") ?? "").toContain("text/event-stream");
       expect(await admitted!.text()).toContain("[DONE]");
+      expect(upstream.receivedRequests).toHaveLength(upstreamCallsWhileHeld + 1);
+    },
+    15_000,
+  );
+});
+
+// Non-success SSE bodies use the same streaming handoff as successful ones.
+// This needs its own E2E because a 502 must keep the distributed slot until
+// the upstream error body's EOF without rewriting its bytes.
+describe("passthrough 502 SSE concurrency is shared through delayed EOF (#1737)", () => {
+  let appA: SpawnedApp | undefined;
+  let appB: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let infraReady = false;
+  const prefix = `/aisix-e2e-rl-passthrough-502-${randomUUID()}`;
+  const route = "rl-cluster-passthrough-502";
+  const routePrefix = `/${route}`;
+  const caller = "sk-rl-cluster-passthrough-502";
+  const callerHash = createHash("sha256").update(caller).digest("hex");
+  const headers = {
+    authorization: `Bearer ${caller}`,
+    "content-type": "application/json",
+  };
+  const body = JSON.stringify({ model: "gpt-4o-mini", stream: true });
+  const call = (proxyUrl: string) => rawPost(`${proxyUrl}${routePrefix}/v1/any`, headers, body);
+
+  beforeAll(async () => {
+    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    if (!infraReady) return;
+
+    upstream = await startOpenAiUpstream({
+      scriptedResponses: [
+        {
+          status: 502,
+          rawErrorBodyChunks: [PASSTHROUGH_502_SSE],
+          eventDelayMs: PASSTHROUGH_502_EOF_DELAY_MS,
+          responseHeaders: { "content-type": "text/event-stream; charset=utf-8" },
+        },
+        {
+          status: 502,
+          rawErrorBody: PASSTHROUGH_502_SSE,
+          responseHeaders: { "content-type": "text/event-stream; charset=utf-8" },
+        },
+      ],
+    });
+    const extra = {
+      etcd: sharedEtcd(prefix),
+      ratelimit: {
+        backend: "redis",
+        redis: { url: REDIS_URL },
+        concurrency_ttl_secs: PASSTHROUGH_CONCURRENCY_TTL_SECS,
+      },
+    };
+    appA = await spawnApp({ extra });
+    appB = await spawnApp({ extra });
+
+    const seed = new SeedClient(new EtcdClient(), prefix);
+    const providerKey = await seed.createProviderKey({
+      display_name: "rl-cluster-passthrough-502-pk",
+      secret: "sk-mock",
+      api_base: "http://unused-on-passthrough-route",
+    });
+    await seed.createPassthroughRoute({
+      name: route,
+      path_prefix: routePrefix,
+      target_url: upstream.baseUrl,
+      provider_key_id: providerKey.id,
+    });
+    await seed.createApiKey({
+      key_hash: callerHash,
+      allowed_models: ["*"],
+      allowed_routes: [route],
+      rate_limit: { concurrency: 1 },
+    });
+    for (const app of [appA!, appB!]) {
+      const probe = new ProxyClient(app.proxyUrl, caller);
+      await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
+    }
+  });
+
+  afterAll(async () => {
+    await appA?.exit();
+    await appB?.exit();
+    await upstream?.close();
+    if (infraReady) await new EtcdClient().deletePrefix(prefix);
+  });
+
+  test(
+    "an unread 502 SSE holds the shared slot beyond TTL, then EOF releases it without changing bytes",
+    async (ctx) => {
+      if (!infraReady || !appA || !appB || !upstream) {
+        ctx.skip();
+        return;
+      }
+
+      const first = await call(appA.proxyUrl);
+      expect(first.statusCode).toBe(502);
+      expect(first.headers["content-type"]).toBe("text/event-stream; charset=utf-8");
+      const upstreamCallsWhileHeld = upstream.receivedRequests.length;
+      expect(upstreamCallsWhileHeld).toBe(1);
+
+      // The client has response headers but no body reader. The source's
+      // delayed EOF crosses the one-second distributed lease TTL.
+      await new Promise((resolve) => setTimeout(resolve, PASSTHROUGH_WAIT_BEYOND_TTL_MS));
+      const blocked = await call(appB.proxyUrl);
+      expect(blocked.statusCode).toBe(429);
+      expect(blocked.headers["x-ratelimit-scope"]).toBe("concurrency");
+      await readRawBody(blocked);
+      expect(upstream.receivedRequests).toHaveLength(upstreamCallsWhileHeld);
+
+      expect(await readRawBody(first)).toEqual(Buffer.from(PASSTHROUGH_502_SSE));
+      let released: IncomingMessage | undefined;
+      await waitConfigPropagation(async () => {
+        const response = await call(appB!.proxyUrl);
+        if (response.statusCode !== 502) {
+          await readRawBody(response);
+          return false;
+        }
+        released = response;
+        return true;
+      }, 5_000);
+      expect(released).toBeDefined();
+      expect(await readRawBody(released!)).toEqual(Buffer.from(PASSTHROUGH_502_SSE));
       expect(upstream.receivedRequests).toHaveLength(upstreamCallsWhileHeld + 1);
     },
     15_000,

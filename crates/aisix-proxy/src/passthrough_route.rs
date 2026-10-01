@@ -403,6 +403,46 @@ impl RouteError {
     }
 }
 
+/// `true` only for the SSE media type itself. Parameters are permitted, but a
+/// prefix such as `text/event-streaming` is an ordinary buffered response and
+/// must remain subject to the normal output-guardrail path.
+fn response_is_sse(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(header::CONTENT_TYPE).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    values.next().is_none()
+        && value.to_str().ok().is_some_and(|value| {
+            value.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("text/event-stream")
+            })
+        })
+}
+
+/// A raw-relay client must never hand encoded success bytes to an output
+/// selector. `identity` is harmless; every other (or malformed) coding is
+/// unavailable for inspection unless the upstream honored our identity-only
+/// request negotiation.
+fn response_has_non_identity_content_encoding(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| {
+            let Ok(value) = value.to_str() else {
+                return true;
+            };
+            let mut saw_coding = false;
+            for coding in value.split(',') {
+                let coding = coding.trim();
+                if coding.is_empty() || !coding.eq_ignore_ascii_case("identity") {
+                    return true;
+                }
+                saw_coding = true;
+            }
+            !saw_coding
+        })
+}
+
 // ---------------------------------------------------------------------------
 // The pipeline
 // ---------------------------------------------------------------------------
@@ -572,6 +612,7 @@ async fn dispatch(
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     *audit_out = resolved_chain.audit_log();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let output_guardrail_active = aisix_guardrails::Guardrail::runs_on_output(&resolved_chain);
 
     // Envelope detection: once per exchange, from the request body's
     // top-level keys; the response and stream frames reuse it. Keep a
@@ -698,7 +739,11 @@ async fn dispatch(
     let conn = pk_entry
         .as_ref()
         .and_then(|pk| pk.value.upstream_connection());
-    let http_client = crate::http_client::client_for(conn.as_ref());
+    // A passthrough route promises provider response bytes verbatim. Use the
+    // no-decode client even for buffered responses: otherwise reqwest can
+    // transparently inflate a non-success SSE body while stripping its
+    // representation headers before `stream_non_success_response` relays it.
+    let http_client = crate::http_client::raw_relay_client_for(conn.as_ref());
 
     // Strip set: protocol metadata always; per-mode credential handling.
     let mut strip: std::collections::HashSet<String> =
@@ -811,6 +856,13 @@ async fn dispatch(
         if aisix_core::header_forward_blocked(&lower) {
             continue;
         }
+        // The raw relay disables reqwest decompression to preserve an
+        // upstream's non-success SSE bytes. When output guardrails need to
+        // inspect successful replies, negotiate an inspectable response
+        // rather than forwarding a client request for a compressed one.
+        if output_guardrail_active && lower == "accept-encoding" {
+            continue;
+        }
         if strip.contains(&lower) {
             if !forwards(&lower) {
                 continue;
@@ -818,6 +870,10 @@ async fn dispatch(
             forwarded_slots.insert(lower);
         }
         builder = builder.header(name, value);
+    }
+
+    if output_guardrail_active {
+        builder = builder.header(header::ACCEPT_ENCODING, "identity");
     }
 
     // Inject the gateway-held upstream credential (inject mode only).
@@ -908,15 +964,10 @@ async fn dispatch(
     // same guess would 502 an upstream that merely mislabels itself. Not
     // drift: see that function's doc comment for why the two populations
     // take opposite defaults.
-    let is_sse = resp_headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.trim_start()
-                .to_ascii_lowercase()
-                .starts_with("text/event-stream")
-        })
-        .unwrap_or(false);
+    let is_sse = response_is_sse(&resp_headers);
+    let success_response_is_encoded = status.is_success()
+        && output_guardrail_active
+        && response_has_non_identity_content_encoding(&resp_headers);
 
     let mut telemetry = RouteTelemetry {
         state: state.clone(),
@@ -962,6 +1013,29 @@ async fn dispatch(
         guardrail_blocked: false,
         emitted: false,
     };
+
+    // The raw relay keeps error representations untouched, including their
+    // `Content-Encoding` and byte length. A successful reply that ignores
+    // our identity-only negotiation cannot be parsed safely by either the
+    // buffered or SSE output selector, so refuse it before any compressed
+    // bytes can become a guardrail input or reach the caller.
+    if success_response_is_encoded {
+        tracing::warn!(
+            guardrail_hook = "output",
+            route = %route.name,
+            "cannot inspect an encoded successful passthrough-route response; blocking",
+        );
+        telemetry.guardrail_blocked = true;
+        telemetry.emitted = true;
+        return Err(RouteError::of(
+            crate::error::guardrail_block_error(
+                "response",
+                None,
+                Some(crate::error::TAG_UNSCANNABLE_BODY),
+            ),
+            &auth,
+        ));
+    }
 
     if is_sse {
         telemetry.streaming = true;
@@ -1547,14 +1621,6 @@ fn decoded_json_string_values_vec_where(
 
 fn is_root_key(path: &[crate::json_splice::PathSeg], key: &str) -> bool {
     path.first().is_some_and(|segment| segment.is_key(key))
-}
-
-/// A detected envelope still forwards raw bytes, including duplicate keys and
-/// arbitrary nested fields. Scan every decoded string the upstream can read;
-/// the root `model` alone is routing metadata rather than caller content.
-#[cfg(test)]
-fn decoded_non_model_json_string_values(body: &[u8]) -> Option<String> {
-    decoded_json_string_values_where(body, |path| !is_root_key(path, "model"))
 }
 
 fn decoded_json_string_values_including_empty(
@@ -2619,6 +2685,53 @@ fn append_anthropic_output_content_strings(
     Some(())
 }
 
+/// OpenAI Completions exposes generated text only through a top-level
+/// `choices` array. Do not use a broad JSON-string collection here: an
+/// otherwise-valid provider extension may contain image, audio, or other
+/// opaque data that must never cross an external output-guardrail boundary.
+///
+/// Unlike the Chat selector, a detected Completions response has no other
+/// compatible response envelope. Its `choices` carrier is therefore required
+/// and must be unambiguous; a malformed, repeated, or over-cap selector is
+/// unevaluable rather than a reason to scan arbitrary source fields.
+fn decoded_completions_response_string_values(
+    body: &[u8],
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> Option<String> {
+    let choices = match raw_top_level_unique_array(body, "choices") {
+        Ok(Some(choices)) => choices,
+        Ok(None) | Err(()) => {
+            mark_unevaluable(scan_error);
+            return None;
+        }
+    };
+    let choices = match raw_array_items(&choices) {
+        Some(choices) => choices,
+        None => {
+            mark_unevaluable(scan_error);
+            return None;
+        }
+    };
+    let mut out = String::new();
+    for choice in choices {
+        if !raw_is_object(&choice) {
+            mark_unevaluable(scan_error);
+            return None;
+        }
+        match raw_top_level_unique_string(choice.get().as_bytes(), "text") {
+            Ok(Some(text)) => append_scan_text(&mut out, &text)?,
+            // An empty choice has no generated text to inspect. It is not a
+            // reason to widen the output selector to another field.
+            Ok(None) => {}
+            Err(()) => {
+                mark_unevaluable(scan_error);
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
 fn decoded_chat_response_string_values(
     body: &[u8],
     scan_error: &mut Option<crate::json_splice::SpliceError>,
@@ -2759,17 +2872,13 @@ fn response_guardrail_text_with_scan_error(
             }
         }
         PassthroughProtocol::OpenaiCompletions => {
-            // A detected completions response can also contain opaque
-            // provider fields. If its JSON cannot be selected safely, do
-            // not turn that failure into a raw whole-body guardrail scan.
-            match crate::json_splice::collect_string_values_where(body, |path| {
-                !is_root_key(path, "model")
-            }) {
-                Ok(text) => text,
-                Err(error) => {
-                    if scan_error.is_none() {
-                        *scan_error = Some(error);
-                    }
+            // A detected Completions response may carry opaque provider
+            // extensions. Only `choices[].text` may leave this process for
+            // output inspection; a bad selector is unevaluable, never a
+            // whole-body fallback.
+            match decoded_completions_response_string_values(body, scan_error) {
+                Some(text) => text,
+                None => {
                     mark_unevaluable(scan_error);
                     String::new()
                 }
@@ -3594,16 +3703,6 @@ fn decoded_chat_frame_continuations(body: &[u8]) -> Option<Vec<String>> {
     }
 }
 
-fn is_completions_continuation_path(path: &[crate::json_splice::PathSeg]) -> bool {
-    use crate::json_splice::PathSeg;
-
-    matches!(
-        path,
-        [PathSeg::Key(choices), PathSeg::Index(_), PathSeg::Key(text)]
-            if choices == "choices" && text == "text"
-    )
-}
-
 /// The raw source continuations preserve every occurrence of visible carrier
 /// fields. Supplementary scan text therefore excludes those same paths: a
 /// normal frame must not send one visible value to a guardrail as typed,
@@ -3665,12 +3764,6 @@ fn decoded_chat_frame_supplemental_values(body: &[u8]) -> Option<Vec<String>> {
         }
     }
     Some(out)
-}
-
-fn decoded_completions_frame_supplemental_values(body: &[u8]) -> Option<Vec<String>> {
-    decoded_json_string_values_vec_where(body, |path| {
-        !is_root_key(path, "model") && !is_completions_continuation_path(path)
-    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4173,13 +4266,6 @@ fn chat_choice_source_continuations(payload: &[u8]) -> SourceContinuations {
 }
 
 fn completions_source_continuations(payload: &[u8]) -> SourceContinuations {
-    let expected = match crate::json_splice::collect_string_values_where_vec(payload, |path| {
-        is_completions_continuation_path(path)
-    }) {
-        Ok(expected) if expected.is_empty() => return SourceContinuations::Absent,
-        Ok(expected) => expected,
-        Err(_) => return SourceContinuations::Unevaluable,
-    };
     let choices = match raw_top_level_unique_array(payload, "choices") {
         Ok(Some(choices)) => match raw_array_items(&choices) {
             Some(choices) => choices,
@@ -4200,27 +4286,29 @@ fn completions_source_continuations(payload: &[u8]) -> SourceContinuations {
             Ok(Some(index)) if choice_indexes.insert(index) => index.to_string(),
             _ => return SourceContinuations::Unevaluable,
         };
-        if append_raw_string_carrier(
+        let text = match raw_top_level_unique_string(choice_body, "text") {
+            Ok(Some(text)) => vec![text],
+            Ok(None) => Vec::new(),
+            Err(()) => return SourceContinuations::Unevaluable,
+        };
+        if append_source_branches(
             &mut out,
             &mut keys,
             &mut source_values,
-            SourceBranchIdentity {
-                family: format!("completions:{choice_index}"),
-                identity: "text".to_owned(),
-                identity_is_ambiguous: false,
-            },
-            choice_body,
-            "text",
+            format!("completions:{choice_index}"),
+            "text".to_owned(),
+            false,
+            text,
         )
         .is_err()
         {
             return SourceContinuations::Unevaluable;
         }
     }
-    if source_values_match_expected(source_values, expected) {
-        SourceContinuations::Ready(out)
+    if out.is_empty() {
+        SourceContinuations::Absent
     } else {
-        SourceContinuations::Unevaluable
+        SourceContinuations::Ready(out)
     }
 }
 
@@ -4316,6 +4404,13 @@ fn frame_guardrail_supplemental_values(
     has_source_continuations: bool,
     has_typed_continuation: bool,
 ) -> Result<Vec<String>, ()> {
+    // A detected Completions frame exposes no output carrier beyond
+    // `choices[].text`, which `completions_source_continuations` reads
+    // directly. Provider extensions are opaque, including when this frame
+    // has no text delta, so they never become a generic supplemental scan.
+    if matches!(protocol, PassthroughProtocol::OpenaiCompletions) {
+        return Ok(Vec::new());
+    }
     // A typed continuation without source proof becomes unevaluable; do not
     // add a second, generic supplemental scan for that same frame.
     if has_typed_continuation && !has_source_continuations {
@@ -4338,9 +4433,7 @@ fn frame_guardrail_supplemental_values(
         PassthroughProtocol::OpenaiChat => {
             decoded_chat_frame_supplemental_values(payload.as_bytes()).ok_or(())
         }
-        PassthroughProtocol::OpenaiCompletions => {
-            decoded_completions_frame_supplemental_values(payload.as_bytes()).ok_or(())
-        }
+        PassthroughProtocol::OpenaiCompletions => Ok(Vec::new()),
         // Responses source continuations exist only for the explicitly safe
         // text/tool delta events, whose sole output carrier is `delta`.
         PassthroughProtocol::OpenaiResponses => Ok(Vec::new()),
@@ -4374,12 +4467,7 @@ fn frame_guardrail_values(protocol: PassthroughProtocol, frame: &[u8]) -> Vec<St
         PassthroughProtocol::OpenaiChat => {
             decoded_chat_frame_values(payload.as_bytes()).unwrap_or_default()
         }
-        PassthroughProtocol::OpenaiCompletions => {
-            decoded_json_string_values_vec_where(payload.as_bytes(), |path| {
-                !is_root_key(path, "model")
-            })
-            .unwrap_or_default()
-        }
+        PassthroughProtocol::OpenaiCompletions => Vec::new(),
         PassthroughProtocol::OpenaiResponses => {
             decoded_responses_frame_values(payload.as_bytes()).unwrap_or_default()
         }
@@ -4410,7 +4498,9 @@ fn frame_guardrail_text(protocol: PassthroughProtocol, frame: &[u8]) -> String {
             decoded_chat_frame_string_values(payload.as_bytes()).unwrap_or_default()
         }
         PassthroughProtocol::OpenaiCompletions => {
-            decoded_non_model_json_string_values(payload.as_bytes()).unwrap_or_default()
+            let mut scan_error = None;
+            decoded_completions_response_string_values(payload.as_bytes(), &mut scan_error)
+                .unwrap_or_default()
         }
         PassthroughProtocol::OpenaiResponses => {
             // As with buffered Responses output, only a successful
@@ -4431,6 +4521,10 @@ struct StreamGuardrailText {
     /// unrelated JSON fields cannot become one regex/remote-model segment.
     supplemental: Vec<String>,
     unevaluable: bool,
+    /// A supplementary selector failed after a source carrier was proven.
+    /// This is a local selection failure, not an upstream guardrail outage:
+    /// output `fail_open` must not turn it into an unscanned provider field.
+    supplemental_unevaluable: bool,
     /// Responses item closures wait until their already-buffered text has
     /// passed a guardrail scan. Removing them on the terminal event would
     /// erase a short delta before an end-of-stream or full-buffer scan.
@@ -4508,6 +4602,7 @@ fn stream_guardrail_text(
         SourceContinuations::Unevaluable => (Vec::new(), false, true),
     };
     let mut unevaluable = source_unevaluable || terminal_unevaluable;
+    let mut supplemental_unevaluable = false;
     let supplemental = if unevaluable {
         Vec::new()
     } else {
@@ -4524,6 +4619,7 @@ fn stream_guardrail_text(
             Ok(values) => values,
             Err(()) => {
                 unevaluable = true;
+                supplemental_unevaluable = true;
                 Vec::new()
             }
         }
@@ -4532,6 +4628,7 @@ fn stream_guardrail_text(
         continuations,
         supplemental,
         unevaluable,
+        supplemental_unevaluable,
         closed_prefixes,
     }
 }
@@ -5213,11 +5310,15 @@ fn stream_response(
                         )
                 });
                 if unevaluable_output {
+                    let supplemental_unevaluable = guardrail_text
+                        .as_ref()
+                        .is_some_and(|text| text.supplemental_unevaluable);
                     // A holding policy has already promised not to release a
                     // frame until it scans clean. `fail_open` can bypass an
                     // unevaluable live stream, but it cannot release the
                     // held prefix (or this frame) without a scan.
-                    let must_refuse = (policy.holds_back() && !fail_opened)
+                    let must_refuse = supplemental_unevaluable
+                        || (policy.holds_back() && !fail_opened)
                         || aisix_guardrails::Guardrail::refuses_unevaluable_output(&chain);
                     if must_refuse {
                         tracing::warn!(
@@ -5562,10 +5663,14 @@ fn stream_response(
                         )
                 });
                 if unevaluable_output {
+                    let supplemental_unevaluable = guardrail_text
+                        .as_ref()
+                        .is_some_and(|text| text.supplemental_unevaluable);
                     // See the matching frame path above: a holding policy
                     // must not release its pending prefix unscanned just
                     // because this terminal fragment is unevaluable.
-                    let must_refuse = (policy.holds_back() && !fail_opened)
+                    let must_refuse = supplemental_unevaluable
+                        || (policy.holds_back() && !fail_opened)
                         || aisix_guardrails::Guardrail::refuses_unevaluable_output(&chain);
                     if must_refuse {
                         tracing::warn!(
@@ -7613,37 +7718,50 @@ mod tests {
     }
 
     #[test]
-    fn malformed_completions_output_is_unevaluable_without_raw_fallback() {
-        let buffered = br#"{"choices":[{"text":"clean"}],"opaque":{"data":"BLOCKME"}"#;
-        let error = try_response_guardrail_text(PassthroughProtocol::OpenaiCompletions, buffered)
-            .expect_err("a malformed completions response must fail closed");
-        assert!(error.is_unevaluable(), "{error}");
-        assert!(
-            !response_guardrail_text(PassthroughProtocol::OpenaiCompletions, buffered)
-                .contains("BLOCKME"),
-            "a malformed completions response must not fall back to opaque source text"
-        );
+    fn completions_output_selects_only_choice_text_and_fails_closed_on_bad_carriers() {
+        let buffered = br#"{"choices":[{"text":"\u0042LOCKME","opaque":"OPAQUE"},{"text":"clean"}],"opaque":{"data":"OPAQUE"}}"#;
+        let scanned = response_guardrail_text(PassthroughProtocol::OpenaiCompletions, buffered);
+        assert!(scanned.contains("BLOCKME"), "{scanned:?}");
+        assert!(scanned.contains("clean"), "{scanned:?}");
+        assert!(!scanned.contains("OPAQUE"), "{scanned:?}");
 
-        let streamed = b"data: {\"choices\":[{\"index\":0,\"text\":\"clean\"}],\"opaque\":{\"data\":\"BLOCKME\"}\n\n";
-        let typed = frame_parts(PassthroughProtocol::OpenaiCompletions, streamed)
-            .0
-            .scan;
-        assert!(
-            stream_guardrail_text(PassthroughProtocol::OpenaiCompletions, streamed, typed)
-                .unevaluable
+        let cases: [&[u8]; 6] = [
+            br#"{"opaque":"BLOCKME"}"#,
+            br#"{"choices":{"text":"clean"},"opaque":"BLOCKME"}"#,
+            br#"{"choices":[{"text":"clean"}],"choices":[{"text":"other"}],"opaque":"BLOCKME"}"#,
+            br#"{"choices":["not-a-choice"],"opaque":"BLOCKME"}"#,
+            br#"{"choices":[{"text":{"opaque":"BLOCKME"}}]}"#,
+            br#"{"choices":[{"text":"clean","text":"other"}],"opaque":"BLOCKME"}"#,
+        ];
+        for body in cases {
+            let error = try_response_guardrail_text(PassthroughProtocol::OpenaiCompletions, body)
+                .expect_err("a malformed completions carrier must fail closed");
+            assert!(error.is_unevaluable(), "{error}");
+            assert!(
+                !response_guardrail_text(PassthroughProtocol::OpenaiCompletions, body)
+                    .contains("BLOCKME"),
+                "a malformed completions response must not fall back to opaque source text"
+            );
+        }
+
+        let oversized = format!(
+            r#"{{"choices":[{{"text":"{}"}}],"opaque":"BLOCKME"}}"#,
+            "x".repeat(MAX_RAW_SELECTOR_BYTES + 1),
         );
-        assert!(
-            !frame_guardrail_text(PassthroughProtocol::OpenaiCompletions, streamed)
-                .contains("BLOCKME"),
-            "a malformed completions stream frame must not fall back to opaque source text"
-        );
+        assert!(try_response_guardrail_text(
+            PassthroughProtocol::OpenaiCompletions,
+            oversized.as_bytes()
+        )
+        .expect_err("an oversized selected completions value must fail closed")
+        .is_unevaluable());
     }
 
     #[test]
-    fn streamed_completions_supplemental_cap_is_unevaluable_without_raw_fallback() {
+    fn streamed_completions_select_only_choice_text_and_reject_bad_carriers() {
         let frame = format!(
-            "data: {{\"choices\":[{{\"index\":0,\"text\":\"clean\"}}],\"opaque\":\"{}\"}}\n\n",
+            "data: {{\"choices\":[{{\"index\":0,\"text\":\"clean\",\"opaque\":\"{}\"}}],\"opaque\":\"{}\"}}\n\n",
             "BLOCKME".repeat(MAX_RAW_SELECTOR_BYTES / "BLOCKME".len() + 1),
+            "BLOCKME",
         );
         let typed = frame_parts(PassthroughProtocol::OpenaiCompletions, frame.as_bytes())
             .0
@@ -7653,12 +7771,69 @@ mod tests {
             frame.as_bytes(),
             typed,
         );
-        assert!(text.unevaluable);
+        assert!(!text.unevaluable);
         let scanned = stream_guardrail_scan_text(&[], &text.continuations, &text.supplemental);
+        assert!(scan_candidates_contain(&scanned, "clean"), "{scanned:?}");
         assert!(
             !scan_candidates_contain(&scanned, "BLOCKME"),
-            "a capped supplemental selector must not raw-fallback opaque output: {scanned:?}"
+            "opaque completions extensions must not become supplemental guardrail text: {scanned:?}"
         );
+        assert!(
+            !frame_guardrail_text(PassthroughProtocol::OpenaiCompletions, frame.as_bytes())
+                .contains("BLOCKME"),
+            "a completions frame must not fall back to opaque source text"
+        );
+
+        for payload in [
+            br#"{"choices":{"index":0,"text":"clean"}}"#.as_slice(),
+            br#"{"choices":[{"index":0,"text":"clean"}],"choices":[{"index":1,"text":"other"}]}"#
+                .as_slice(),
+            br#"{"choices":["not-a-choice"]}"#.as_slice(),
+            br#"{"choices":[{"index":0,"text":"clean","text":"other"}]}"#.as_slice(),
+        ] {
+            assert!(matches!(
+                stream_source_continuations(PassthroughProtocol::OpenaiCompletions, payload),
+                SourceContinuations::Unevaluable
+            ));
+        }
+
+        let oversized = format!(
+            r#"{{"choices":[{{"index":0,"text":"{}"}}]}}"#,
+            "x".repeat(MAX_RAW_SELECTOR_BYTES + 1),
+        );
+        assert!(matches!(
+            stream_source_continuations(
+                PassthroughProtocol::OpenaiCompletions,
+                oversized.as_bytes()
+            ),
+            SourceContinuations::Unevaluable
+        ));
+    }
+
+    #[test]
+    fn malformed_or_capped_stream_supplemental_is_marked_separately() {
+        let supplemental_failure = |name_fields: String| {
+            format!(
+                "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"input\":\"clean\",{name_fields}}}}\n\n"
+            )
+        };
+        let malformed = supplemental_failure("\"name\":1".to_owned());
+        let capped = supplemental_failure(format!(
+            "{}\"name\":\"last\"",
+            "\"name\":\"n\",".repeat(MAX_RAW_SELECTOR_ITEMS),
+        ));
+        for frame in [&malformed, &capped] {
+            let typed = frame_parts(PassthroughProtocol::OpenaiChat, frame.as_bytes())
+                .0
+                .scan;
+            let text =
+                stream_guardrail_text(PassthroughProtocol::OpenaiChat, frame.as_bytes(), typed);
+            assert!(text.unevaluable, "{frame}");
+            assert!(
+                text.supplemental_unevaluable,
+                "the selected supplemental failure must remain distinguishable: {frame}"
+            );
+        }
     }
 
     #[test]
@@ -8619,6 +8794,63 @@ mod tests {
     }
 
     #[test]
+    fn passthrough_sse_detection_requires_the_exact_media_type() {
+        for (value, expected) in [
+            ("text/event-stream", true),
+            (" TEXT/EVENT-STREAM ; charset=utf-8", true),
+            ("text/event-streaming", false),
+            ("application/json", false),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(value).unwrap());
+            assert_eq!(response_is_sse(&headers), expected, "{value}");
+        }
+
+        let mut repeated = HeaderMap::new();
+        repeated.append(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        repeated.append(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-streaming"),
+        );
+        assert!(!response_is_sse(&repeated));
+    }
+
+    #[test]
+    fn encoded_success_response_is_not_an_inspectable_guardrail_input() {
+        for (value, encoded) in [
+            (None, false),
+            (Some("identity"), false),
+            (Some(" IDENTITY , identity "), false),
+            (Some("gzip"), true),
+            (Some("gzip, identity"), true),
+            (Some(""), true),
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert(
+                    header::CONTENT_ENCODING,
+                    HeaderValue::from_str(value).unwrap(),
+                );
+            }
+            assert_eq!(
+                response_has_non_identity_content_encoding(&headers),
+                encoded,
+                "{value:?}"
+            );
+        }
+
+        let mut invalid = HeaderMap::new();
+        invalid.insert(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert!(response_has_non_identity_content_encoding(&invalid));
+    }
+
+    #[test]
     fn responses_protocol_extracts_prompt_completion_and_usage() {
         // GitHub's Copilot CLI sends every inference turn to POST
         // /responses, so a forward-proxy route left on `openai_chat`
@@ -9538,6 +9770,7 @@ mod tests {
 
     const OUTPUT_KEYWORD_BLOCK: &str = r#"{"name":"out-block","enabled":true,"hook_point":"output","kind":"keyword","patterns":[{"kind":"literal","value":"FORBIDDEN"}]}"#;
     const OUTPUT_CAP_FAIL_CLOSED: &str = r#"{"name":"out-cap","enabled":true,"hook_point":"output","kind":"azure_content_safety_text_moderation","endpoint":"http://127.0.0.1:1","api_key":"k","stream_processing_mode":"buffer_full","max_buffer_bytes":4,"on_buffer_exceeded":"fail_closed"}"#;
+    const OUTPUT_FAIL_OPEN: &str = r#"{"name":"out-open","enabled":true,"hook_point":"output","kind":"openai_moderation","endpoint":"http://127.0.0.1:1","api_key":"k","output_fail_open":true}"#;
 
     const ANTHROPIC_SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n\
 event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
@@ -9549,6 +9782,8 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     const OPENAI_SSE: &str = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"say FORBIDDEN now\"},\"finish_reason\":null}]}\n\n\
 data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
 data: [DONE]\n\n";
+
+    const MALFORMED_SUPPLEMENTAL_SSE: &str = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"input\":\"clean\",\"name\":1}}\n\n";
 
     /// A refusal ending a relayed Anthropic Messages stream is the frame
     /// `/v1/messages` emits for it: an SDK-legal `error.type` and the
@@ -9580,6 +9815,13 @@ data: [DONE]\n\n";
         assert!(v.get("type").is_none(), "{v}");
 
         let v = relayed_refusal_frame(OPENAI_SSE, OUTPUT_CAP_FAIL_CLOSED).await;
+        assert_eq!(v["error"]["type"], "content_filter", "{v}");
+        assert_eq!(v["error"]["code"], "guardrail_unavailable", "{v}");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_supplemental_stream_selector_ignores_output_fail_open() {
+        let v = relayed_refusal_frame(MALFORMED_SUPPLEMENTAL_SSE, OUTPUT_FAIL_OPEN).await;
         assert_eq!(v["error"]["type"], "content_filter", "{v}");
         assert_eq!(v["error"]["code"], "guardrail_unavailable", "{v}");
     }

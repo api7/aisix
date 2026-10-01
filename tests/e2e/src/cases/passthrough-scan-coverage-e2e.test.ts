@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { request, type IncomingMessage } from "node:http";
+import { gzipSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -32,6 +34,10 @@ import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 
 const CALLER = "sk-pt-scan-coverage";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
+const ERROR_STREAM_CALLER = "sk-pt-scan-error-stream";
+const ERROR_STREAM_CALLER_HASH = createHash("sha256").update(ERROR_STREAM_CALLER).digest("hex");
+const SUPPLEMENTAL_CALLER = "sk-pt-scan-supplemental";
+const SUPPLEMENTAL_CALLER_HASH = createHash("sha256").update(SUPPLEMENTAL_CALLER).digest("hex");
 const OUT_LIT = "outputleakliteral";
 const IN_LIT = "inputleakliteral";
 const ESCAPED_BLOCK = "BLOCKME";
@@ -47,6 +53,17 @@ const RAW_SUFFIX_SSE = `"BIDDEN"`;
 const RAW_HELD_BLOCK_SSE = `"FORBIDDEN"`;
 const UPSTREAM_502_HTML = `<html><body>${OUT_LIT}</body></html>`;
 const UPSTREAM_502_SSE = `event: upstream_error\ndata: {"message":"${OUT_LIT}"}\n\n`;
+const UPSTREAM_502_GZIP = gzipSync(Buffer.from(UPSTREAM_502_SSE));
+const UPSTREAM_200_GZIP_JSON = gzipSync(
+  Buffer.from(`{"choices":[{"text":"${ESCAPED_BLOCK}"}]}`),
+);
+const UPSTREAM_200_GZIP_SSE = gzipSync(
+  Buffer.from(
+    `data: {"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"${ESCAPED_BLOCK}"}}]}\n\n`,
+  ),
+);
+const MALFORMED_SUPPLEMENTAL_SSE =
+  'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","input":"clean","name":1}}\n\n';
 const deepEscapedBlockJSON = (depth: number) =>
   `${'{"v":'.repeat(depth)}"${String.raw`\u0042LOCKME`}"${'}'.repeat(depth)}`;
 const deepLiteralBlockJSON = (depth: number) =>
@@ -162,6 +179,27 @@ const STREAMS: Record<string, string[]> = {
   ],
 };
 
+function openRawHttpRequest(
+  url: string,
+  headers: Record<string, string>,
+  body: string,
+): Promise<IncomingMessage> {
+  return new Promise((resolve, reject) => {
+    const req = request(url, { method: "POST", headers }, resolve);
+    req.once("error", reject);
+    req.end(body);
+  });
+}
+
+function readRawHttpBody(response: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    response.on("data", (chunk: Buffer) => chunks.push(chunk));
+    response.once("error", reject);
+    response.once("end", () => resolve(Buffer.concat(chunks)));
+  });
+}
+
 describe("passthrough guardrail scan coverage", () => {
   let app: SpawnedApp | undefined;
   let seed: SeedClient | undefined;
@@ -197,6 +235,39 @@ describe("passthrough guardrail scan coverage", () => {
         "cache-control": "no-cache",
         "x-upstream-error": "edge-sse-502",
       },
+    });
+    upstreams["gzip-sse-502"] = await startOpenAiUpstream({
+      status: 502,
+      rawErrorBody: UPSTREAM_502_GZIP,
+      responseHeaders: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "content-encoding": "gzip",
+        "content-length": String(UPSTREAM_502_GZIP.byteLength),
+        "x-upstream-error": "edge-gzip-sse-502",
+      },
+    });
+    upstreams["gzip-buffered-200"] = await startOpenAiUpstream({
+      rawBody: UPSTREAM_200_GZIP_JSON,
+      rawContentType: "application/json",
+      responseHeaders: { "content-encoding": "gzip" },
+    });
+    upstreams["gzip-sse-200"] = await startOpenAiUpstream({
+      rawBody: UPSTREAM_200_GZIP_SSE,
+      rawContentType: "text/event-stream; charset=utf-8",
+      responseHeaders: { "content-encoding": "gzip" },
+    });
+    upstreams["delayed-sse-502"] = await startOpenAiUpstream({
+      status: 502,
+      rawErrorBodyChunks: [UPSTREAM_502_SSE, ""],
+      eventDelayMs: 1_500,
+      responseHeaders: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "x-upstream-error": "edge-delayed-sse-502",
+      },
+    });
+    upstreams["event-streaming"] = await startOpenAiUpstream({
+      rawBody: ESCAPED_BLOCK_JSON,
+      rawContentType: "text/event-streaming; charset=utf-8",
     });
     upstreams["raw-output"] = await startOpenAiUpstream({
       rawBody: ESCAPED_BLOCK_JSON,
@@ -299,6 +370,12 @@ describe("passthrough guardrail scan coverage", () => {
       max_buffer_bytes: CAP,
       on_buffer_exceeded: "fail_closed",
     });
+    await seed.createApiKey({
+      key_hash: ERROR_STREAM_CALLER_HASH,
+      allowed_models: [],
+      allowed_routes: ["pt-scan-delayed-sse-502"],
+      rate_limit: { concurrency: 1 },
+    });
     await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: [], allowed_routes: ["*"] });
     const proxy = new ProxyClient(app.proxyUrl, CALLER);
     await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
@@ -322,6 +399,11 @@ describe("passthrough guardrail scan coverage", () => {
       headers: { authorization: `Bearer ${CALLER}`, "content-type": "application/json" },
       body,
     });
+  const callRawHttp = (route: string, path: string, body: string, caller = CALLER) =>
+    openRawHttpRequest(`${app!.proxyUrl}/pt-scan-${route}${path}`, {
+      authorization: `Bearer ${caller}`,
+      "content-type": "application/json",
+    }, body);
   const anthropicBody = { model: "claude-3-5-haiku-20241022", max_tokens: 64, stream: true, messages: [{ role: "user", content: "go" }] };
   const chatBody = { model: "gpt-4o-mini", stream: true, messages: [{ role: "user", content: "go" }] };
   const responsesBody = { model: "gpt-4o-mini", stream: true, input: "go" };
@@ -390,6 +472,112 @@ describe("passthrough guardrail scan coverage", () => {
     expect(await res.text()).toBe(UPSTREAM_502_SSE);
     expect(upstream.receivedRequests.length).toBe(before + 1);
   });
+
+  test("output: a non-2xx SSE relay preserves encoded bytes and representation headers", async (ctx) => {
+    if (!ready(ctx)) return;
+    const upstream = upstreams["gzip-sse-502"];
+    if (!upstream) throw new Error("missing gzip-sse-502 upstream");
+    const before = upstream.receivedRequests.length;
+    const res = await callRawHttp("gzip-sse-502", "/v1/any", `{"state":"clean"}`);
+    expect(res.statusCode).toBe(502);
+    expect(res.headers["content-type"]).toBe("text/event-stream; charset=utf-8");
+    expect(res.headers["content-encoding"]).toBe("gzip");
+    expect(res.headers["content-length"]).toBe(String(UPSTREAM_502_GZIP.byteLength));
+    expect(await readRawHttpBody(res)).toEqual(UPSTREAM_502_GZIP);
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+  });
+
+  test.for([
+    [
+      "gzip-buffered-200",
+      "/v1/completions",
+      `{"model":"gpt-4o-mini","prompt":"clean"}`,
+    ],
+    [
+      "gzip-sse-200",
+      "/v1/chat/completions",
+      `{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"clean"}]}`,
+    ],
+  ] as const)(
+    "output: encoded successful %s response is never sent to a guardrail selector",
+    async ([route, path, requestBody], ctx) => {
+      if (!ready(ctx)) return;
+      const upstream = upstreams[route];
+      if (!upstream) throw new Error(`missing ${route} upstream`);
+      const before = upstream.receivedRequests.length;
+      const res = await callRaw(route, path, requestBody);
+      const body = await res.text();
+      expect(res.status, body).toBe(422);
+      expect(body).toContain("guardrail_unavailable");
+      expect(body).toContain("unscannable_body");
+      expect(body).not.toContain(ESCAPED_BLOCK);
+      expect(upstream.receivedRequests.length).toBe(before + 1);
+      expect(upstream.receivedRequests.at(-1)?.headers["accept-encoding"]).toBe("identity");
+    },
+  );
+
+  test("output: text/event-streaming is buffered and scanned as a non-SSE response", async (ctx) => {
+    if (!ready(ctx)) return;
+    const upstream = upstreams["event-streaming"];
+    if (!upstream) throw new Error("missing event-streaming upstream");
+    const before = upstream.receivedRequests.length;
+    const res = await callRaw("event-streaming", "/v1/any", `{"state":"clean"}`);
+    const body = await res.text();
+    expect(res.status, body).toBe(422);
+    expect(body).toContain("pt-scan-output");
+    expect(body).not.toContain(ESCAPED_BLOCK);
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+  });
+
+  test(
+    "output: a delayed 502 SSE holds its concurrency slot until EOF and relays bytes unchanged",
+    { timeout: 20_000 },
+    async (ctx) => {
+      if (!ready(ctx)) return;
+      const upstream = upstreams["delayed-sse-502"];
+      if (!upstream) throw new Error("missing delayed-sse-502 upstream");
+      const headers = { authorization: `Bearer ${ERROR_STREAM_CALLER}` };
+      await waitConfigPropagation(async () => {
+        const probe = await fetch(`${app!.proxyUrl}/v1/models`, { headers });
+        await probe.text();
+        return probe.status === 200;
+      });
+
+      const before = upstream.receivedRequests.length;
+      const first = await callRawHttp(
+        "delayed-sse-502",
+        "/v1/any",
+        `{"state":"clean"}`,
+        ERROR_STREAM_CALLER,
+      );
+      expect(first.statusCode).toBe(502);
+      expect(first.headers["content-type"]).toBe("text/event-stream; charset=utf-8");
+
+      // Do not attach a reader before this request. The caller has headers
+      // but has not consumed EOF, which is the lifecycle that must retain
+      // the gateway's concurrency reservation.
+      const second = await fetch(`${app!.proxyUrl}/pt-scan-delayed-sse-502/v1/any`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: `{"state":"clean"}`,
+      });
+      expect(second.status).toBe(429);
+      expect(second.headers.get("x-ratelimit-scope")).toBe("concurrency");
+      await second.text();
+      expect(upstream.receivedRequests.length).toBe(before + 1);
+
+      expect(await readRawHttpBody(first)).toEqual(Buffer.from(UPSTREAM_502_SSE));
+      const after = await callRawHttp(
+        "delayed-sse-502",
+        "/v1/any",
+        `{"state":"clean"}`,
+        ERROR_STREAM_CALLER,
+      );
+      expect(after.statusCode).toBe(502);
+      await readRawHttpBody(after);
+      expect(upstream.receivedRequests.length).toBe(before + 2);
+    },
+  );
 
   test("output: generated thinking is not scanned", async (ctx) => {
     if (!ready(ctx)) return;
@@ -899,6 +1087,84 @@ describe("passthrough guardrail scan coverage", () => {
     expect(body).toContain("unscannable_body");
     expect(body).not.toContain(ESCAPED_BLOCK);
     expect(upstreams["raw-deep-stream"]!.receivedRequests.length).toBe(before + 1);
+  });
+});
+
+// A source carrier can be valid while a separate selected supplemental field
+// is malformed. Even an explicitly output-fail-open remote guardrail may not
+// turn that local selector failure into an unscanned provider frame.
+describe("passthrough supplemental selector fail-closed", () => {
+  const route = "pt-scan-supplemental";
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let etcdReachable = false;
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    upstream = await startOpenAiUpstream({ rawStreamFrames: [MALFORMED_SUPPLEMENTAL_SSE] });
+    app = await spawnApp();
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    const providerKey = await seed.createProviderKey({
+      display_name: "pt-scan-supplemental-pk",
+      secret: "sk-mock",
+      api_base: upstream.baseUrl,
+    });
+    await seed.createPassthroughRoute({
+      name: route,
+      path_prefix: `/${route}`,
+      target_url: upstream.baseUrl,
+      provider_key_id: providerKey.id,
+    });
+    await seed.createGuardrail({
+      name: "pt-scan-supplemental-output-open",
+      enabled: true,
+      hook_point: "output",
+      kind: "openai_moderation",
+      api_key: "sk-local-moderation",
+      endpoint: upstream.baseUrl,
+      output_fail_open: true,
+    });
+    await seed.createApiKey({
+      key_hash: SUPPLEMENTAL_CALLER_HASH,
+      allowed_models: [],
+      allowed_routes: [route],
+    });
+    const proxy = new ProxyClient(app.proxyUrl, SUPPLEMENTAL_CALLER);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
+  }, 90_000);
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+  });
+
+  test("malformed selected supplemental data is refused before an output-fail-open sink runs", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const before = upstream.receivedRequests.length;
+    const response = await fetch(`${app.proxyUrl}/${route}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${SUPPLEMENTAL_CALLER}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        stream: true,
+        messages: [{ role: "user", content: "go" }],
+      }),
+    });
+    const body = await response.text();
+    expect(response.status, body).toBe(200);
+    expect(body).toContain("event: error");
+    expect(body).toContain("guardrail_unavailable");
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+    expect(upstream.receivedRequests.at(-1)?.path).toBe("/v1/chat/completions");
   });
 });
 
