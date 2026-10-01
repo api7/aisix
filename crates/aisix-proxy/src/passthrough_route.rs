@@ -1775,50 +1775,104 @@ fn append_raw_text_value(out: &mut String, raw: &serde_json::value::RawValue) ->
 /// duplicate `type` is scanned as source rather than becoming a bypass.
 fn append_chat_request_content_strings(
     out: &mut String,
-    content: &serde_json::value::RawValue,
+    content: Box<serde_json::value::RawValue>,
     scan_error: &mut Option<crate::json_splice::SpliceError>,
 ) -> Option<()> {
-    let value = content.get().trim_start();
-    if value.starts_with('"') {
-        return append_raw_string_value(out, content);
+    enum Work {
+        Content {
+            value: Box<serde_json::value::RawValue>,
+            depth: usize,
+        },
+        Block {
+            value: Box<serde_json::value::RawValue>,
+            depth: usize,
+        },
     }
-    if !value.starts_with('[') {
-        return Some(());
-    }
-    for block in raw_array_items(content)? {
-        if !raw_is_object(&block) {
-            continue;
-        }
-        let block_body = block.get().as_bytes();
-        let types = raw_top_level_values(block_body, "type")?;
-        let kind = raw_top_level_unique_type(block_body);
-        if !types.is_empty() && kind.is_none() {
-            append_scan_text(
-                out,
-                &decoded_json_string_values_including_empty(block_body, scan_error)?,
-            );
-            continue;
-        }
-        match kind.as_deref() {
-            Some("redacted_thinking") => {}
-            Some("tool_result") => {
-                for nested in raw_top_level_values(block_body, "content")? {
-                    append_chat_request_content_strings(out, &nested, scan_error)?;
+
+    // `tool_result.content` can itself contain another `tool_result`. Keep
+    // that caller-controlled nesting off the Rust call stack. This measures
+    // the content-carrier depth, while a wide valid array stays valid just as
+    // it does for the byte scanner's frame stack.
+    let mut work = vec![Work::Content {
+        value: content,
+        depth: 1,
+    }];
+    while let Some(work_item) = work.pop() {
+        match work_item {
+            Work::Content { value, depth } => {
+                let value_text = value.get().trim_start();
+                if value_text.starts_with('"') {
+                    append_raw_string_value(out, &value)?;
+                    continue;
+                }
+                if !value_text.starts_with('[') {
+                    continue;
+                }
+                // Push backwards so the LIFO work stack preserves the
+                // previous depth-first, source-order traversal.
+                for block in raw_array_items(&value)?.into_iter().rev() {
+                    work.push(Work::Block {
+                        value: block,
+                        depth,
+                    });
                 }
             }
-            Some("tool_use") => {
-                for input in raw_top_level_values(block_body, "input")? {
+            Work::Block {
+                value: block,
+                depth,
+            } => {
+                if !raw_is_object(&block) {
+                    continue;
+                }
+                let block_body = block.get().as_bytes();
+                let types = raw_top_level_values(block_body, "type")?;
+                let kind = raw_top_level_unique_type(block_body);
+                if !types.is_empty() && kind.is_none() {
                     append_scan_text(
                         out,
-                        &decoded_json_string_values_including_empty(
-                            input.get().as_bytes(),
-                            scan_error,
-                        )?,
+                        &decoded_json_string_values_including_empty(block_body, scan_error)?,
                     );
+                    continue;
+                }
+                match kind.as_deref() {
+                    Some("redacted_thinking") => {}
+                    Some("tool_result") => {
+                        let nested = raw_top_level_values(block_body, "content")?;
+                        if nested.is_empty() {
+                            continue;
+                        }
+                        let Some(depth) = depth
+                            .checked_add(1)
+                            .filter(|depth| *depth <= crate::json_splice::MAX_JSON_DEPTH)
+                        else {
+                            if scan_error.is_none() {
+                                *scan_error =
+                                    Some(crate::json_splice::SpliceError::depth_exceeded());
+                            }
+                            return None;
+                        };
+                        for nested in nested.into_iter().rev() {
+                            work.push(Work::Content {
+                                value: nested,
+                                depth,
+                            });
+                        }
+                    }
+                    Some("tool_use") => {
+                        for input in raw_top_level_values(block_body, "input")? {
+                            append_scan_text(
+                                out,
+                                &decoded_json_string_values_including_empty(
+                                    input.get().as_bytes(),
+                                    scan_error,
+                                )?,
+                            );
+                        }
+                    }
+                    Some("thinking") => append_raw_top_level_strings(out, block_body, "thinking")?,
+                    _ => append_raw_top_level_strings(out, block_body, "text")?,
                 }
             }
-            Some("thinking") => append_raw_top_level_strings(out, block_body, "thinking")?,
-            _ => append_raw_top_level_strings(out, block_body, "text")?,
         }
     }
     Some(())
@@ -1842,7 +1896,7 @@ fn append_chat_request_message_strings(
         )?,
     );
     for content in raw_top_level_values(message_body, "content")? {
-        append_chat_request_content_strings(out, &content, scan_error)?;
+        append_chat_request_content_strings(out, content, scan_error)?;
     }
     for tool_calls in raw_top_level_values(message_body, "tool_calls")? {
         append_scan_text(
@@ -1864,7 +1918,7 @@ fn decoded_chat_request_string_values(
         scan_error,
     )?;
     for system in raw_top_level_values(body, "system")? {
-        append_chat_request_content_strings(&mut out, &system, scan_error)?;
+        append_chat_request_content_strings(&mut out, system, scan_error)?;
     }
     for array in raw_top_level_values(body, "messages")? {
         // The selected (last) carrier made this a Chat envelope. Preserve
@@ -5644,6 +5698,16 @@ mod tests {
         json.into_bytes()
     }
 
+    fn nested_anthropic_tool_result_request(depth: usize) -> Vec<u8> {
+        let content = format!(
+            "{}[{{\"type\":\"text\",\"text\":\"safe\"}}]{}",
+            r#"[{"type":"tool_result","tool_use_id":"t","content":"#.repeat(depth),
+            "}]".repeat(depth),
+        );
+        format!(r#"{{"model":"claude","messages":[{{"role":"user","content":{content}}}]}}"#)
+            .into_bytes()
+    }
+
     fn provider_key_entry(api_base_unused: &str) -> ResourceEntry<ProviderKey> {
         let json = format!(
             r#"{{"display_name":"openai-up","secret":"sk-upstream","api_base":"{api_base_unused}","provider":"openai","adapter":"openai"}}"#
@@ -8565,6 +8629,14 @@ mod tests {
         for slot in ["SYS", "THINK", "ARGS", "RESULT"] {
             assert!(text.contains(slot), "{slot} missing from {text}");
         }
+    }
+
+    #[test]
+    fn nested_anthropic_tool_result_content_beyond_depth_cap_is_unevaluable() {
+        let body = nested_anthropic_tool_result_request(crate::json_splice::MAX_JSON_DEPTH + 1);
+        let error = try_request_guardrail_text(PassthroughProtocol::OpenaiChat, &body)
+            .expect_err("nested tool results beyond the shared JSON depth cap must not recurse");
+        assert!(error.is_depth_exceeded(), "{error}");
     }
 
     /// Buffered Anthropic and Responses replies are read slot by slot:

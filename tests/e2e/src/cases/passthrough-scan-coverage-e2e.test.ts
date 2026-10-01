@@ -49,6 +49,17 @@ const deepEscapedBlockJSON = (depth: number) =>
   `${'{"v":'.repeat(depth)}"${String.raw`\u0042LOCKME`}"${'}'.repeat(depth)}`;
 const deepLiteralBlockJSON = (depth: number) =>
   `${'{"v":'.repeat(depth)}"${ESCAPED_BLOCK}"${'}'.repeat(depth)}`;
+const ANTHROPIC_TOOL_RESULT_PREFIX = '[{"type":"tool_result","tool_use_id":"t","content":';
+const ANTHROPIC_TOOL_RESULT_TEXT = `[{"type":"text","text":"${ESCAPED_BLOCK}"}]`;
+const ANTHROPIC_TOOL_RESULT_SUFFIX = "}]";
+const deeplyNestedAnthropicToolResultRequest = (depth: number, model: string) => {
+  const content = [
+    ANTHROPIC_TOOL_RESULT_PREFIX.repeat(depth),
+    ANTHROPIC_TOOL_RESULT_TEXT,
+    ANTHROPIC_TOOL_RESULT_SUFFIX.repeat(depth),
+  ].join("");
+  return `{"model":"${model}","max_tokens":64,"messages":[{"role":"user","content":${content}}]}`;
+};
 // Above serde_json's default recursion limit. It remains valid JSON and the
 // provider receives it verbatim, so Raw guardrails must still decode the leaf.
 const DEEP_ESCAPED_BLOCK_JSON = deepEscapedBlockJSON(160);
@@ -57,6 +68,14 @@ const DEEP_ESCAPED_BLOCK_JSON = deepEscapedBlockJSON(160);
 const JSON_DEPTH_CAP = 4_096;
 const OVER_DEPTH_ESCAPED_BLOCK_JSON = deepEscapedBlockJSON(JSON_DEPTH_CAP + 1);
 const OVER_DEPTH_OPAQUE_BLOCK_JSON = deepLiteralBlockJSON(JSON_DEPTH_CAP + 1);
+const OVER_DEPTH_ANTHROPIC_TOOL_RESULT_INPUT = deeplyNestedAnthropicToolResultRequest(
+  JSON_DEPTH_CAP + 1,
+  "nested-tool-result-fail-closed",
+);
+const OVER_DEPTH_ANTHROPIC_TOOL_RESULT_FAIL_OPEN_INPUT = deeplyNestedAnthropicToolResultRequest(
+  JSON_DEPTH_CAP + 1,
+  "nested-tool-result-fail-open",
+);
 const OVER_DEPTH_CHAT_INPUT = `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"go","metadata":${OVER_DEPTH_ESCAPED_BLOCK_JSON}}]}`;
 const OVER_DEPTH_RESPONSES_INPUT = `{"model":"gpt-4o-mini","input":[{"role":"user","metadata":${OVER_DEPTH_ESCAPED_BLOCK_JSON},"content":[{"type":"input_text","text":"go"}]}]}`;
 const OVER_DEPTH_CHAT_OPAQUE_INPUT = `{"model":"gpt-4o-mini","messages":[{"role":"user","content":[{"type":"image","source":{"data":"image","metadata":${OVER_DEPTH_OPAQUE_BLOCK_JSON}}},{"type":"text","text":"go"}]}]}`;
@@ -559,6 +578,18 @@ describe("passthrough guardrail scan coverage", () => {
     expect(upstreams.input!.receivedRequests.length).toBe(before);
   });
 
+  test("input: nested Anthropic tool results beyond the scanner depth cap fail closed", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams.input!.receivedRequests.length;
+    const res = await callRaw("input", "/v1/any", OVER_DEPTH_ANTHROPIC_TOOL_RESULT_INPUT);
+    expect(res.status).toBe(422);
+    const body = await res.text();
+    expect(body).toContain("guardrail_unavailable");
+    expect(body).toContain("unscannable_body");
+    expect(body).not.toContain(ESCAPED_BLOCK);
+    expect(upstreams.input!.receivedRequests.length).toBe(before);
+  });
+
   test.for([
     ["Chat", OVER_DEPTH_CHAT_INPUT],
     ["Responses", OVER_DEPTH_RESPONSES_INPUT],
@@ -885,6 +916,34 @@ describe("passthrough Raw stream unevaluable-output fail-open", () => {
       logstore,
       (entry) => entry.get("passthrough_route_name") === depthInputRoute,
       "fail-open depth-capped passthrough usage event",
+    );
+    expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
+    expect(log.get("guardrail_bypassed_reason")).toBe("unscannable_body");
+  });
+
+  test("forwards nested Anthropic tool results beyond the depth cap only under input fail_open", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !depthInputUpstream) return ctx.skip();
+
+    const before = depthInputUpstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/${depthInputRoute}/v1/any`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${caller}`, "content-type": "application/json" },
+      body: OVER_DEPTH_ANTHROPIC_TOOL_RESULT_FAIL_OPEN_INPUT,
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(SAFE_ESCAPED_JSON);
+    expect(depthInputUpstream.receivedRequests.length).toBe(before + 1);
+    expect(depthInputUpstream.receivedRequests.at(-1)!.body).toBe(
+      OVER_DEPTH_ANTHROPIC_TOOL_RESULT_FAIL_OPEN_INPUT,
+    );
+
+    const log = await waitForSlsLog(
+      sls,
+      logstore,
+      (entry) =>
+        entry.get("passthrough_route_name") === depthInputRoute &&
+        entry.get("requested_model") === "nested-tool-result-fail-open",
+      "fail-open nested-tool-result passthrough usage event",
     );
     expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
     expect(log.get("guardrail_bypassed_reason")).toBe("unscannable_body");

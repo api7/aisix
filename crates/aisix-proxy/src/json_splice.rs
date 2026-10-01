@@ -59,12 +59,23 @@ impl SpliceError {
     pub(crate) fn is_depth_exceeded(self) -> bool {
         self.kind == SpliceErrorKind::DepthExceeded
     }
+
+    /// Report an exhausted JSON traversal budget from a selector which uses
+    /// the same bounded raw-JSON policy as this scanner. Selectors retain raw
+    /// fragments rather than source offsets, so the synthetic error uses the
+    /// start of that fragment as its safe, non-payload-bearing location.
+    pub(crate) fn depth_exceeded() -> Self {
+        Self {
+            at: 0,
+            kind: SpliceErrorKind::DepthExceeded,
+        }
+    }
 }
 
 /// Traversal depth cap. This keeps the iterative scanner stack-safe without
 /// allowing an unbounded JSON path/frame allocation from an unbounded raw
 /// passthrough body. It remains well beyond serde_json's usual recursion cap.
-const MAX_JSON_DEPTH: usize = 4_096;
+pub(crate) const MAX_JSON_DEPTH: usize = 4_096;
 
 /// Rewrite the string values of `input` selected by `should_rewrite`,
 /// leaving every other byte untouched.
