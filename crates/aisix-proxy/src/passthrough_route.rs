@@ -574,13 +574,21 @@ async fn dispatch(
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
     // Envelope detection: once per exchange, from the request body's
-    // top-level keys; the response and stream frames reuse it.
-    let protocol = detect_protocol(&body_bytes);
+    // top-level keys; the response and stream frames reuse it. Keep a
+    // malformed JSON-like root distinct from an ordinary opaque body: a
+    // failed selector must never silently become a whole-body raw scan.
+    let (protocol, probe_error) = match probe_json(&body_bytes) {
+        JsonProbe::Raw => (PassthroughProtocol::Raw, None),
+        JsonProbe::Protocol(protocol) => (protocol, None),
+        JsonProbe::Unevaluable(error) => (PassthroughProtocol::Raw, Some(error)),
+    };
     let raw_shape = detect_raw_usage_shape(protocol, &body_bytes);
 
     // INPUT guardrails on the (envelope-extracted) request text.
     if !resolved_chain.is_empty() {
-        let text = match try_request_guardrail_text(protocol, &body_bytes) {
+        let request_text =
+            probe_error.map_or_else(|| try_request_guardrail_text(protocol, &body_bytes), Err);
+        let text = match request_text {
             Ok(text) => Some(text),
             Err(err) if !err.is_unevaluable() => {
                 Some(request_guardrail_text(protocol, &body_bytes))
@@ -957,6 +965,21 @@ async fn dispatch(
 
     if is_sse {
         telemetry.streaming = true;
+        let stream_hold = reservation.into_stream_hold();
+        // A non-success SSE response is an upstream error contract, just
+        // like a buffered 4xx/5xx. It must remain byte-for-byte relay data:
+        // no output guardrail, heartbeat, or SSE parsing may rewrite it.
+        if !status.is_success() {
+            return Ok(stream_non_success_response(
+                upstream_resp,
+                resp_headers,
+                status,
+                telemetry,
+                &client.request_id,
+                stream_hold,
+                stream_read_timeout,
+            ));
+        }
         return Ok(stream_response(
             protocol,
             resolved_chain,
@@ -965,7 +988,7 @@ async fn dispatch(
             status,
             telemetry,
             &client.request_id,
-            reservation.into_stream_hold(),
+            stream_hold,
             stream_read_timeout,
         ));
     }
@@ -994,8 +1017,10 @@ async fn dispatch(
         )
     })?;
 
-    // OUTPUT guardrails on the (envelope-extracted) response text.
-    if !resolved_chain.is_empty() {
+    // Output guardrails govern generated successful answers. A provider's
+    // non-success body is its error contract, so preserve its status, headers,
+    // and bytes instead of replacing a 4xx/5xx with a local guardrail 422.
+    if status.is_success() && !resolved_chain.is_empty() {
         let text = match try_response_guardrail_text(protocol, &resp_body) {
             Ok(text) => Some(text),
             Err(err) if !err.is_unevaluable() => {
@@ -1332,6 +1357,17 @@ enum PassthroughProtocol {
     OpenaiResponses,
 }
 
+/// Detection preserves the safety outcome separately from the protocol hint.
+/// A malformed root that merely resembles JSON cannot be treated as an opaque
+/// raw request: doing so would turn a failed typed selector into a whole-body
+/// scan and expose media fields to an external guardrail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonProbe {
+    Raw,
+    Protocol(PassthroughProtocol),
+    Unevaluable(crate::json_splice::SpliceError),
+}
+
 /// Detect the request envelope from the body's top-level keys. The three
 /// LLM envelopes are structurally exclusive — `messages`, `input` (a string
 /// or an array) and `prompt` are each the required carrier field of exactly
@@ -1356,6 +1392,38 @@ fn detect_protocol(body: &[u8]) -> PassthroughProtocol {
         PassthroughProtocol::OpenaiCompletions
     } else {
         PassthroughProtocol::Raw
+    }
+}
+
+fn raw_json_container_like(body: &[u8]) -> bool {
+    body.iter()
+        .copied()
+        .find(|byte| !matches!(*byte, b' ' | b'\t' | b'\n' | b'\r'))
+        .is_some_and(|byte| matches!(byte, b'{' | b'['))
+}
+
+fn raw_json_scan_error(
+    body: &[u8],
+    error: crate::json_splice::SpliceError,
+) -> crate::json_splice::SpliceError {
+    if raw_json_container_like(body) && !error.is_unevaluable() {
+        crate::json_splice::SpliceError::unevaluable()
+    } else {
+        error
+    }
+}
+
+fn probe_json(body: &[u8]) -> JsonProbe {
+    let protocol = detect_protocol(body);
+    if !matches!(protocol, PassthroughProtocol::Raw) {
+        return JsonProbe::Protocol(protocol);
+    }
+    if !raw_json_container_like(body) {
+        return JsonProbe::Raw;
+    }
+    match crate::json_splice::validate_json(body) {
+        Ok(()) => JsonProbe::Raw,
+        Err(error) => JsonProbe::Unevaluable(raw_json_scan_error(body, error)),
     }
 }
 
@@ -1430,14 +1498,21 @@ fn body_model_name(
         .unwrap_or_default()
 }
 
-fn append_scan_text(out: &mut String, text: &str) {
+fn append_scan_text(out: &mut String, text: &str) -> Option<()> {
     if text.is_empty() {
-        return;
+        return Some(());
     }
-    if !out.is_empty() {
+    let separator = if out.is_empty() { 0 } else { 1 };
+    let next_len = out.len().checked_add(separator)?.checked_add(text.len())?;
+    if next_len > MAX_RAW_SELECTOR_BYTES {
+        return None;
+    }
+    out.try_reserve(next_len - out.len()).ok()?;
+    if separator != 0 {
         out.push('\n');
     }
     out.push_str(text);
+    Some(())
 }
 
 fn decoded_json_string_values(body: &[u8]) -> Option<String> {
@@ -1446,6 +1521,12 @@ fn decoded_json_string_values(body: &[u8]) -> Option<String> {
         .filter(|out| !out.is_empty())
 }
 
+fn try_raw_json_string_values(body: &[u8]) -> Result<String, crate::json_splice::SpliceError> {
+    crate::json_splice::collect_string_values(body)
+        .map_err(|error| raw_json_scan_error(body, error))
+}
+
+#[cfg(test)]
 fn decoded_json_string_values_where(
     body: &[u8],
     include: impl FnMut(&[crate::json_splice::PathSeg]) -> bool,
@@ -1471,6 +1552,7 @@ fn is_root_key(path: &[crate::json_splice::PathSeg], key: &str) -> bool {
 /// A detected envelope still forwards raw bytes, including duplicate keys and
 /// arbitrary nested fields. Scan every decoded string the upstream can read;
 /// the root `model` alone is routing metadata rather than caller content.
+#[cfg(test)]
 fn decoded_non_model_json_string_values(body: &[u8]) -> Option<String> {
     decoded_json_string_values_where(body, |path| !is_root_key(path, "model"))
 }
@@ -1507,7 +1589,7 @@ fn decoded_json_string_values_except_root_keys(
     let mut out = String::new();
     for value in raw_top_level_values_except(body, excluded)? {
         match crate::json_splice::collect_string_values(value.get().as_bytes()) {
-            Ok(values) => append_scan_text(&mut out, &values),
+            Ok(values) => append_scan_text(&mut out, &values)?,
             Err(error) => {
                 if scan_error.is_none() {
                     *scan_error = Some(error);
@@ -1534,6 +1616,30 @@ impl<'a> RawJson<'a> {
     fn get(self) -> &'a str {
         self.source
     }
+}
+
+// Source selectors retain only borrowed spans, but a wide array or repeated
+// top-level carrier can still make their bookkeeping unbounded. Keep one
+// shared budget for every selector collection and the nested Chat work list.
+const MAX_RAW_SELECTOR_ITEMS: usize = crate::json_splice::MAX_JSON_SCAN_VALUES;
+const MAX_RAW_SELECTOR_BYTES: usize = crate::json_splice::MAX_JSON_SCAN_TEXT_BYTES;
+
+fn raw_selector_push<'a>(
+    values: &mut Vec<RawJson<'a>>,
+    source_bytes: &mut usize,
+    value: RawJson<'a>,
+) -> Option<()> {
+    if values.len() >= MAX_RAW_SELECTOR_ITEMS {
+        return None;
+    }
+    let next_bytes = source_bytes.checked_add(value.get().len())?;
+    if next_bytes > MAX_RAW_SELECTOR_BYTES {
+        return None;
+    }
+    values.try_reserve(1).ok()?;
+    *source_bytes = next_bytes;
+    values.push(value);
+    Some(())
 }
 
 fn raw_skip_ws(bytes: &[u8], pos: &mut usize) {
@@ -1620,9 +1726,7 @@ fn raw_value_end(bytes: &[u8], start: usize) -> Option<usize> {
             if token == b"true" || token == b"false" || token == b"null" {
                 Some(pos)
             } else {
-                serde_json::from_slice::<serde_json::Number>(token)
-                    .ok()
-                    .map(|_| pos)
+                crate::json_splice::is_json_number(token).then_some(pos)
             }
         }
     }
@@ -1680,12 +1784,14 @@ fn raw_object_members<'a>(body: &'a [u8], mut visit: impl FnMut(&str, RawJson<'a
 /// unrelated forwarded fields.
 fn raw_top_level_values<'a>(body: &'a [u8], wanted_key: &str) -> Option<Vec<RawJson<'a>>> {
     let mut values = Vec::new();
+    let mut source_bytes = 0;
+    let mut within_cap = true;
     raw_object_members(body, |key, value| {
-        if key == wanted_key {
-            values.push(value);
+        if within_cap && key == wanted_key {
+            within_cap = raw_selector_push(&mut values, &mut source_bytes, value).is_some();
         }
     })?;
-    Some(values)
+    within_cap.then_some(values)
 }
 
 /// Retaining a source fragment is a pointer copy, so nested carrier walks do
@@ -1698,12 +1804,14 @@ fn raw_top_level_value_refs<'a>(body: &'a [u8], wanted_key: &str) -> Option<Vec<
 /// carriers are skipped before their internals are traversed for a scan.
 fn raw_top_level_values_except<'a>(body: &'a [u8], excluded: &[&str]) -> Option<Vec<RawJson<'a>>> {
     let mut values = Vec::new();
+    let mut source_bytes = 0;
+    let mut within_cap = true;
     raw_object_members(body, |key, value| {
-        if !excluded.contains(&key) {
-            values.push(value);
+        if within_cap && !excluded.contains(&key) {
+            within_cap = raw_selector_push(&mut values, &mut source_bytes, value).is_some();
         }
     })?;
-    Some(values)
+    within_cap.then_some(values)
 }
 
 /// Match the last source occurrence, the same duplicate-key convention a
@@ -1711,13 +1819,18 @@ fn raw_top_level_values_except<'a>(body: &'a [u8], excluded: &[&str]) -> Option<
 /// `allow_string` is for the Responses and Completions bare-string forms;
 /// Chat requires an array of messages.
 fn raw_top_level_last_has_shape(body: &[u8], key: &str, allow_string: bool) -> bool {
-    raw_top_level_values(body, key)
-        .and_then(|values| values.into_iter().last())
-        .is_some_and(|value| match value.get().trim_start().as_bytes().first() {
-            Some(b'[') => true,
-            Some(b'"') => allow_string,
-            _ => false,
-        })
+    let mut last = None;
+    raw_object_members(body, |candidate, value| {
+        if candidate == key {
+            last = Some(value);
+        }
+    })
+    .and(last)
+    .is_some_and(|value| match value.get().trim_start().as_bytes().first() {
+        Some(b'[') => true,
+        Some(b'"') => allow_string,
+        _ => false,
+    })
 }
 
 fn raw_is_object(raw: &RawJson<'_>) -> bool {
@@ -1732,6 +1845,7 @@ fn raw_array_items<'a>(raw: &RawJson<'a>) -> Option<Vec<RawJson<'a>>> {
     (bytes.get(pos) == Some(&b'[')).then_some(())?;
     pos += 1;
     let mut values = Vec::new();
+    let mut source_bytes = 0;
     loop {
         raw_skip_ws(bytes, &mut pos);
         if bytes.get(pos) == Some(&b']') {
@@ -1741,9 +1855,13 @@ fn raw_array_items<'a>(raw: &RawJson<'a>) -> Option<Vec<RawJson<'a>>> {
         }
         let value_start = pos;
         let value_end = raw_value_end(bytes, value_start)?;
-        values.push(RawJson {
-            source: &source[value_start..value_end],
-        });
+        raw_selector_push(
+            &mut values,
+            &mut source_bytes,
+            RawJson {
+                source: &source[value_start..value_end],
+            },
+        )?;
         pos = value_end;
         raw_skip_ws(bytes, &mut pos);
         match bytes.get(pos) {
@@ -1779,15 +1897,17 @@ fn raw_object_has_only_types(raw: &RawJson<'_>, allowed: &[&str]) -> bool {
         && types.all(|kind| kind.as_deref() == Some(first.as_str()))
 }
 
-fn raw_top_level_unique_type(body: &[u8]) -> Option<String> {
+fn raw_top_level_unique_type(body: &[u8]) -> Result<Option<String>, ()> {
     let mut types = raw_top_level_values(body, "type")
+        .ok_or(())?
         .into_iter()
-        .flatten()
         .map(|value| serde_json::from_str::<String>(value.get()).ok());
-    let first = types.next()??;
-    types
+    let Some(Some(first)) = types.next() else {
+        return Ok(None);
+    };
+    Ok(types
         .all(|kind| kind.as_deref() == Some(first.as_str()))
-        .then_some(first)
+        .then_some(first))
 }
 
 /// `true` only when every source `type` value is one of `allowed`. This is
@@ -1816,7 +1936,7 @@ fn raw_top_level_items_have_only_types(body: &[u8], key: &str, allowed: &[&str])
 }
 
 fn append_raw_string_value(out: &mut String, raw: &RawJson<'_>) -> Option<()> {
-    append_scan_text(out, &serde_json::from_str::<String>(raw.get()).ok()?);
+    append_scan_text(out, &serde_json::from_str::<String>(raw.get()).ok()?)?;
     Some(())
 }
 
@@ -1826,17 +1946,40 @@ fn append_raw_top_level_strings(out: &mut String, body: &[u8], key: &str) -> Opt
         // opaque object/array sibling content eligible for a whole-body raw
         // fallback at the guardrail boundary.
         if let Ok(value) = serde_json::from_str::<String>(value.get()) {
-            append_scan_text(out, &value);
+            append_scan_text(out, &value)?;
         }
     }
     Some(())
 }
 
+fn append_typed_top_level_strings(
+    out: &mut String,
+    body: &[u8],
+    key: &str,
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> Option<()> {
+    let Some(values) = raw_top_level_values(body, key) else {
+        mark_unevaluable(scan_error);
+        return None;
+    };
+    for value in values {
+        let Ok(value) = serde_json::from_str::<String>(value.get()) else {
+            mark_unevaluable(scan_error);
+            return None;
+        };
+        append_scan_text(out, &value)?;
+    }
+    Some(())
+}
+
 fn raw_top_level_string_values(body: &[u8], key: &str) -> Option<Vec<String>> {
-    raw_top_level_values(body, key)?
-        .into_iter()
-        .map(|value| serde_json::from_str::<String>(value.get()).ok())
-        .collect()
+    let values = raw_top_level_values(body, key)?;
+    let mut strings = Vec::new();
+    strings.try_reserve(values.len()).ok()?;
+    for value in values {
+        strings.push(serde_json::from_str::<String>(value.get()).ok()?);
+    }
+    Some(strings)
 }
 
 fn raw_top_level_unique_string(body: &[u8], key: &str) -> Result<Option<String>, ()> {
@@ -1894,7 +2037,12 @@ fn raw_top_level_unique_array<'a>(body: &'a [u8], key: &str) -> Result<Option<Ra
 /// The typed content extractors inspect a bare string or the direct `text`
 /// field of typed parts. Keep that boundary when walking raw source, so image
 /// and document payloads never reach external guardrails as text.
-fn append_raw_text_value(out: &mut String, raw: &RawJson<'_>) -> Option<()> {
+fn append_raw_text_value(
+    out: &mut String,
+    raw: &RawJson<'_>,
+    strict_content_parts: bool,
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> Option<()> {
     let value = raw.get().trim_start();
     if value.starts_with('"') {
         return append_raw_string_value(out, raw);
@@ -1904,9 +2052,25 @@ fn append_raw_text_value(out: &mut String, raw: &RawJson<'_>) -> Option<()> {
     }
     for part in raw_array_items(raw)? {
         if !raw_is_object(&part) {
+            if strict_content_parts {
+                mark_unevaluable(scan_error);
+                return None;
+            }
             continue;
         }
-        append_raw_top_level_strings(out, part.get().as_bytes(), "text")?;
+        let part_body = part.get().as_bytes();
+        let kind = match raw_top_level_unique_type(part_body) {
+            Ok(kind) => kind,
+            Err(()) => {
+                mark_unevaluable(scan_error);
+                return None;
+            }
+        };
+        if strict_content_parts && matches!(kind.as_deref(), Some("input_text" | "text")) {
+            append_typed_top_level_strings(out, part_body, "text", scan_error)?;
+        } else {
+            append_raw_top_level_strings(out, part_body, "text")?;
+        }
     }
     Some(())
 }
@@ -1931,11 +2095,22 @@ fn append_chat_request_content_strings(
     // the content-carrier depth, while a wide valid array stays valid just as
     // it does for the byte scanner's frame stack. A carrier at the cap still
     // scans; only one more nested carrier is unevaluable.
-    let mut work = vec![Work::Content {
-        value: *content,
-        depth: 0,
-    }];
-    while let Some(work_item) = work.pop() {
+    let mut work = Vec::new();
+    let initial_bytes = content.get().len();
+    if initial_bytes > MAX_RAW_SELECTOR_BYTES || work.try_reserve(1).is_err() {
+        mark_unevaluable(scan_error);
+        return None;
+    }
+    work.push((
+        Work::Content {
+            value: *content,
+            depth: 0,
+        },
+        initial_bytes,
+    ));
+    let mut work_bytes = initial_bytes;
+    while let Some((work_item, item_bytes)) = work.pop() {
+        work_bytes = work_bytes.saturating_sub(item_bytes);
         match work_item {
             Work::Content { value, depth } => {
                 let value_text = value.get().trim_start();
@@ -1960,10 +2135,26 @@ fn append_chat_request_content_strings(
                     return None;
                 };
                 for block in blocks.into_iter().rev() {
-                    work.push(Work::Block {
-                        value: block,
-                        depth,
-                    });
+                    let block_bytes = block.get().len();
+                    let Some(next_bytes) = work_bytes.checked_add(block_bytes) else {
+                        mark_unevaluable(scan_error);
+                        return None;
+                    };
+                    if work.len() >= MAX_RAW_SELECTOR_ITEMS
+                        || next_bytes > MAX_RAW_SELECTOR_BYTES
+                        || work.try_reserve(1).is_err()
+                    {
+                        mark_unevaluable(scan_error);
+                        return None;
+                    }
+                    work_bytes = next_bytes;
+                    work.push((
+                        Work::Block {
+                            value: block,
+                            depth,
+                        },
+                        block_bytes,
+                    ));
                 }
             }
             Work::Block {
@@ -1979,12 +2170,18 @@ fn append_chat_request_content_strings(
                     mark_unevaluable(scan_error);
                     return None;
                 };
-                let kind = raw_top_level_unique_type(block_body);
+                let kind = match raw_top_level_unique_type(block_body) {
+                    Ok(kind) => kind,
+                    Err(()) => {
+                        mark_unevaluable(scan_error);
+                        return None;
+                    }
+                };
                 if !types.is_empty() && kind.is_none() {
                     append_scan_text(
                         out,
                         &decoded_json_string_values_including_empty(block_body, scan_error)?,
-                    );
+                    )?;
                     continue;
                 }
                 match kind.as_deref() {
@@ -2008,10 +2205,26 @@ fn append_chat_request_content_strings(
                             return None;
                         };
                         for nested in nested.into_iter().rev() {
-                            work.push(Work::Content {
-                                value: nested,
-                                depth,
-                            });
+                            let nested_bytes = nested.get().len();
+                            let Some(next_bytes) = work_bytes.checked_add(nested_bytes) else {
+                                mark_unevaluable(scan_error);
+                                return None;
+                            };
+                            if work.len() >= MAX_RAW_SELECTOR_ITEMS
+                                || next_bytes > MAX_RAW_SELECTOR_BYTES
+                                || work.try_reserve(1).is_err()
+                            {
+                                mark_unevaluable(scan_error);
+                                return None;
+                            }
+                            work_bytes = next_bytes;
+                            work.push((
+                                Work::Content {
+                                    value: nested,
+                                    depth,
+                                },
+                                nested_bytes,
+                            ));
                         }
                     }
                     Some("tool_use") => {
@@ -2026,10 +2239,15 @@ fn append_chat_request_content_strings(
                                     input.get().as_bytes(),
                                     scan_error,
                                 )?,
-                            );
+                            )?;
                         }
                     }
-                    Some("thinking") => append_raw_top_level_strings(out, block_body, "thinking")?,
+                    Some("thinking") => {
+                        append_typed_top_level_strings(out, block_body, "thinking", scan_error)?
+                    }
+                    Some("text") => {
+                        append_typed_top_level_strings(out, block_body, "text", scan_error)?
+                    }
                     _ => append_raw_top_level_strings(out, block_body, "text")?,
                 }
             }
@@ -2055,7 +2273,7 @@ fn append_chat_request_message_strings(
             &["content", "tool_calls", "reasoning_content", "reasoning"],
             scan_error,
         )?,
-    );
+    )?;
     let Some(contents) = raw_top_level_values(message_body, "content") else {
         mark_unevaluable(scan_error);
         return None;
@@ -2071,7 +2289,7 @@ fn append_chat_request_message_strings(
         append_scan_text(
             out,
             &decoded_json_string_values_including_empty(tool_calls.get().as_bytes(), scan_error)?,
-        );
+        )?;
     }
     append_raw_top_level_strings(out, message_body, "reasoning_content")?;
     Some(())
@@ -2118,7 +2336,8 @@ fn append_responses_item_strings(
     scan_error: &mut Option<crate::json_splice::SpliceError>,
 ) -> Option<()> {
     if !raw_is_object(item) {
-        return Some(());
+        mark_unevaluable(scan_error);
+        return None;
     }
     let item_body = item.get().as_bytes();
     let text_keys = [
@@ -2133,10 +2352,10 @@ fn append_responses_item_strings(
     append_scan_text(
         out,
         &decoded_json_string_values_except_root_keys(item_body, &text_keys, scan_error)?,
-    );
+    )?;
     for key in text_keys {
         for value in raw_top_level_values(item_body, key)? {
-            append_raw_text_value(out, &value)?;
+            append_raw_text_value(out, &value, key == "content", scan_error)?;
         }
     }
     Some(())
@@ -2156,6 +2375,9 @@ fn decoded_responses_request_string_values(
             for item in raw_array_items(&input)? {
                 append_responses_item_strings(&mut out, &item, scan_error)?;
             }
+        } else {
+            mark_unevaluable(scan_error);
+            return None;
         }
     }
     Some(out)
@@ -2212,7 +2434,13 @@ fn request_guardrail_text_with_scan_error(
             }
         }
         PassthroughProtocol::OpenaiCompletions => {
-            decoded_completions_request_string_values(body, scan_error).unwrap_or_else(raw)
+            match decoded_completions_request_string_values(body, scan_error) {
+                Some(text) => text,
+                None => {
+                    mark_unevaluable(scan_error);
+                    String::new()
+                }
+            }
         }
         PassthroughProtocol::OpenaiResponses => {
             match decoded_responses_request_string_values(body, scan_error) {
@@ -2238,7 +2466,7 @@ fn try_request_guardrail_text(
     body: &[u8],
 ) -> Result<String, crate::json_splice::SpliceError> {
     if matches!(protocol, PassthroughProtocol::Raw) {
-        return crate::json_splice::collect_string_values(body);
+        return try_raw_json_string_values(body);
     }
     let mut scan_error = None;
     let text = request_guardrail_text_with_scan_error(protocol, body, &mut scan_error);
@@ -2274,6 +2502,7 @@ fn append_chat_visible_content_strings(out: &mut String, content: &RawJson<'_>) 
         }
         let part_body = part.get().as_bytes();
         if let Some(field) = raw_top_level_unique_type(part_body)
+            .ok()?
             .as_deref()
             .and_then(chat_visible_content_part_field)
         {
@@ -2288,7 +2517,7 @@ fn append_chat_visible_content_strings(out: &mut String, content: &RawJson<'_>) 
 /// conflicting type borrow a function/custom field as visible tool text.
 fn chat_tool_continuation_fields(body: &[u8]) -> Option<&'static [(&'static str, &'static str)]> {
     let types = raw_top_level_values(body, "type")?;
-    match raw_top_level_unique_type(body).as_deref() {
+    match raw_top_level_unique_type(body).ok()?.as_deref() {
         Some("function") => Some(&[("function", "arguments")]),
         Some("custom") => Some(&[("custom", "input")]),
         None if types.is_empty() => Some(&[("function", "arguments"), ("custom", "input")]),
@@ -2370,7 +2599,7 @@ fn append_anthropic_output_content_strings(
             continue;
         }
         let block_body = block.get().as_bytes();
-        match raw_top_level_unique_type(block_body).as_deref() {
+        match raw_top_level_unique_type(block_body).ok()?.as_deref() {
             Some("text") => append_raw_top_level_strings(out, block_body, "text")?,
             Some("tool_use") => {
                 append_raw_top_level_strings(out, block_body, "name")?;
@@ -2381,7 +2610,7 @@ fn append_anthropic_output_content_strings(
                             input.get().as_bytes(),
                             scan_error,
                         )?,
-                    );
+                    )?;
                 }
             }
             Some(_) | None => {}
@@ -2400,9 +2629,7 @@ fn decoded_chat_response_string_values(
         .iter()
         .any(|choices| choices.get().trim_start().starts_with('['));
     for array in choices {
-        let Some(choices) = raw_array_items(&array) else {
-            continue;
-        };
+        let choices = raw_array_items(&array)?;
         for choice in choices {
             if !raw_is_object(&choice) {
                 continue;
@@ -2412,7 +2639,7 @@ fn decoded_chat_response_string_values(
             }
         }
     }
-    if !has_chat_choices && raw_top_level_unique_type(body).as_deref() == Some("message") {
+    if !has_chat_choices && raw_top_level_unique_type(body).ok()?.as_deref() == Some("message") {
         for content in raw_top_level_values(body, "content")? {
             append_anthropic_output_content_strings(&mut out, &content, scan_error)?;
         }
@@ -2437,7 +2664,7 @@ const RESPONSES_VISIBLE_TEXT_PART_TYPES: &[&str] = &["output_text", "text", "inp
 /// part may cross the external guardrail boundary.
 fn append_responses_visible_part_strings(out: &mut String, part: &RawJson<'_>) -> Option<()> {
     let part_body = part.get().as_bytes();
-    match raw_top_level_unique_type(part_body).as_deref() {
+    match raw_top_level_unique_type(part_body).ok()?.as_deref() {
         Some(kind) if RESPONSES_VISIBLE_TEXT_PART_TYPES.contains(&kind) => {
             append_raw_top_level_strings(out, part_body, "text")?
         }
@@ -2454,9 +2681,7 @@ fn append_responses_visible_content_strings(out: &mut String, content: &RawJson<
     if !value.starts_with('[') {
         return Some(());
     }
-    let Some(parts) = raw_array_items(content) else {
-        return Some(());
-    };
+    let parts = raw_array_items(content)?;
     for part in parts {
         append_responses_visible_part_strings(out, &part)?;
     }
@@ -2470,7 +2695,7 @@ fn append_responses_visible_content_strings(out: &mut String, content: &RawJson<
 /// `text`, `arguments`, and `input` could be an image/audio/file payload.
 fn append_responses_output_item_strings(out: &mut String, item: &RawJson<'_>) -> Option<()> {
     let item_body = item.get().as_bytes();
-    match raw_top_level_unique_type(item_body).as_deref() {
+    match raw_top_level_unique_type(item_body).ok()?.as_deref() {
         Some("reasoning") => {}
         Some("message") => {
             for content in raw_top_level_values(item_body, "content")? {
@@ -2494,9 +2719,7 @@ fn append_responses_output_item_strings(out: &mut String, item: &RawJson<'_>) ->
 
 fn append_responses_output_strings(out: &mut String, body: &[u8]) -> Option<()> {
     for output in raw_top_level_values(body, "output")? {
-        let Some(items) = raw_array_items(&output) else {
-            continue;
-        };
+        let items = raw_array_items(&output)?;
         for item in items {
             append_responses_output_item_strings(out, &item)?;
         }
@@ -2536,7 +2759,21 @@ fn response_guardrail_text_with_scan_error(
             }
         }
         PassthroughProtocol::OpenaiCompletions => {
-            decoded_non_model_json_string_values(body).unwrap_or_else(raw)
+            // A detected completions response can also contain opaque
+            // provider fields. If its JSON cannot be selected safely, do
+            // not turn that failure into a raw whole-body guardrail scan.
+            match crate::json_splice::collect_string_values_where(body, |path| {
+                !is_root_key(path, "model")
+            }) {
+                Ok(text) => text,
+                Err(error) => {
+                    if scan_error.is_none() {
+                        *scan_error = Some(error);
+                    }
+                    mark_unevaluable(scan_error);
+                    String::new()
+                }
+            }
         }
         PassthroughProtocol::OpenaiResponses => {
             // Without a safely decoded Responses envelope, no discriminator
@@ -2559,16 +2796,11 @@ fn try_response_guardrail_text(
     body: &[u8],
 ) -> Result<String, crate::json_splice::SpliceError> {
     match protocol {
-        PassthroughProtocol::Raw => crate::json_splice::collect_string_values(body),
+        PassthroughProtocol::Raw => try_raw_json_string_values(body),
         PassthroughProtocol::OpenaiCompletions => {
-            let text = crate::json_splice::collect_string_values_where(body, |path| {
-                !is_root_key(path, "model")
-            })?;
-            Ok(if text.is_empty() {
-                response_guardrail_text(protocol, body)
-            } else {
-                text
-            })
+            let mut scan_error = None;
+            let text = response_guardrail_text_with_scan_error(protocol, body, &mut scan_error);
+            scan_error.map_or(Ok(text), Err)
         }
         PassthroughProtocol::OpenaiChat => {
             let mut scan_error = None;
@@ -3211,7 +3443,7 @@ fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<P
 /// reasoning. `None` means the source shape was not safely inspectable, so
 /// callers must preserve it rather than treating it as hidden.
 fn hidden_chat_stream_reasoning_frame(body: &[u8]) -> Option<bool> {
-    match raw_top_level_unique_type(body).as_deref() {
+    match raw_top_level_unique_type(body).ok()?.as_deref() {
         Some("content_block_delta") => raw_top_level_items_have_only_types(
             body,
             "delta",
@@ -3230,10 +3462,10 @@ fn hidden_chat_stream_reasoning_frame(body: &[u8]) -> Option<bool> {
 fn decoded_chat_frame_string_values(body: &[u8]) -> Option<String> {
     let mut out = String::new();
     for value in decoded_chat_frame_continuations(body)? {
-        append_scan_text(&mut out, &value);
+        append_scan_text(&mut out, &value)?;
     }
     for value in decoded_chat_frame_supplemental_values(body)? {
-        append_scan_text(&mut out, &value);
+        append_scan_text(&mut out, &value)?;
     }
     Some(out)
 }
@@ -3252,10 +3484,13 @@ fn decoded_responses_frame_string_values(body: &[u8]) -> Option<String> {
 }
 
 fn decoded_chat_frame_continuations(body: &[u8]) -> Option<Vec<String>> {
-    match raw_top_level_unique_type(body).as_deref() {
+    match raw_top_level_unique_type(body).ok()?.as_deref() {
         Some("content_block_delta") => {
             let delta = raw_top_level_unique_object(body, "delta").ok()??;
-            match raw_top_level_unique_type(delta.get().as_bytes()).as_deref() {
+            match raw_top_level_unique_type(delta.get().as_bytes())
+                .ok()?
+                .as_deref()
+            {
                 Some("text_delta") => raw_top_level_string_values(delta.get().as_bytes(), "text"),
                 Some("input_json_delta") => {
                     raw_top_level_string_values(delta.get().as_bytes(), "partial_json")
@@ -3266,7 +3501,7 @@ fn decoded_chat_frame_continuations(body: &[u8]) -> Option<Vec<String>> {
         Some("content_block_start") => {
             let block = raw_top_level_unique_object(body, "content_block").ok()??;
             let block_body = block.get().as_bytes();
-            match raw_top_level_unique_type(block_body).as_deref() {
+            match raw_top_level_unique_type(block_body).ok()?.as_deref() {
                 Some("text") => raw_top_level_string_values(block_body, "text"),
                 Some("tool_use") => {
                     let mut out = Vec::new();
@@ -3312,6 +3547,7 @@ fn decoded_chat_frame_continuations(body: &[u8]) -> Option<Vec<String>> {
                                 }
                                 let part_body = part.get().as_bytes();
                                 if let Some(field) = raw_top_level_unique_type(part_body)
+                                    .ok()?
                                     .as_deref()
                                     .and_then(chat_visible_content_part_field)
                                 {
@@ -3358,18 +3594,6 @@ fn decoded_chat_frame_continuations(body: &[u8]) -> Option<Vec<String>> {
     }
 }
 
-fn decoded_completions_frame_continuations(body: &[u8]) -> Option<Vec<String>> {
-    use crate::json_splice::PathSeg;
-
-    decoded_json_string_values_vec_where(body, |path| {
-        matches!(
-            path,
-            [PathSeg::Key(choices), PathSeg::Index(_), PathSeg::Key(text)]
-                if choices == "choices" && text == "text"
-        )
-    })
-}
-
 fn is_completions_continuation_path(path: &[crate::json_splice::PathSeg]) -> bool {
     use crate::json_splice::PathSeg;
 
@@ -3385,12 +3609,15 @@ fn is_completions_continuation_path(path: &[crate::json_splice::PathSeg]) -> boo
 /// normal frame must not send one visible value to a guardrail as typed,
 /// source, and supplementary text at once.
 fn decoded_chat_frame_supplemental_values(body: &[u8]) -> Option<Vec<String>> {
-    if raw_top_level_unique_type(body).as_deref() == Some("content_block_delta") {
+    if raw_top_level_unique_type(body).ok()?.as_deref() == Some("content_block_delta") {
         return Some(Vec::new());
     }
-    if raw_top_level_unique_type(body).as_deref() == Some("content_block_start") {
+    if raw_top_level_unique_type(body).ok()?.as_deref() == Some("content_block_start") {
         let block = raw_top_level_unique_object(body, "content_block").ok()??;
-        return match raw_top_level_unique_type(block.get().as_bytes()).as_deref() {
+        return match raw_top_level_unique_type(block.get().as_bytes())
+            .ok()?
+            .as_deref()
+        {
             Some("tool_use") => raw_top_level_string_values(block.get().as_bytes(), "name"),
             Some(_) | None => Some(Vec::new()),
         };
@@ -3628,7 +3855,11 @@ fn anthropic_source_continuations(
                 _ => return SourceContinuations::Unevaluable,
             };
             let delta_body = delta.get().as_bytes();
-            match raw_top_level_unique_type(delta_body).as_deref() {
+            let kind = match raw_top_level_unique_type(delta_body) {
+                Ok(kind) => kind,
+                Err(()) => return SourceContinuations::Unevaluable,
+            };
+            match kind.as_deref() {
                 Some("text_delta") => append_raw_string_carrier(
                     &mut out,
                     &mut keys,
@@ -3662,7 +3893,11 @@ fn anthropic_source_continuations(
                 _ => return SourceContinuations::Unevaluable,
             };
             let block_body = block.get().as_bytes();
-            match raw_top_level_unique_type(block_body).as_deref() {
+            let kind = match raw_top_level_unique_type(block_body) {
+                Ok(kind) => kind,
+                Err(()) => return SourceContinuations::Unevaluable,
+            };
+            match kind.as_deref() {
                 Some("text") => append_raw_string_carrier(
                     &mut out,
                     &mut keys,
@@ -3806,9 +4041,11 @@ fn chat_choice_source_continuations(payload: &[u8]) -> SourceContinuations {
                             return SourceContinuations::Unevaluable;
                         }
                         let part_body = part.get().as_bytes();
-                        let Some(field) = raw_top_level_unique_type(part_body)
-                            .as_deref()
-                            .and_then(chat_visible_content_part_field)
+                        let kind = match raw_top_level_unique_type(part_body) {
+                            Ok(kind) => kind,
+                            Err(()) => return SourceContinuations::Unevaluable,
+                        };
+                        let Some(field) = kind.as_deref().and_then(chat_visible_content_part_field)
                         else {
                             continue;
                         };
@@ -3936,8 +4173,12 @@ fn chat_choice_source_continuations(payload: &[u8]) -> SourceContinuations {
 }
 
 fn completions_source_continuations(payload: &[u8]) -> SourceContinuations {
-    let Some(expected) = decoded_completions_frame_continuations(payload) else {
-        return SourceContinuations::Absent;
+    let expected = match crate::json_splice::collect_string_values_where_vec(payload, |path| {
+        is_completions_continuation_path(path)
+    }) {
+        Ok(expected) if expected.is_empty() => return SourceContinuations::Absent,
+        Ok(expected) => expected,
+        Err(_) => return SourceContinuations::Unevaluable,
     };
     let choices = match raw_top_level_unique_array(payload, "choices") {
         Ok(Some(choices)) => match raw_array_items(&choices) {
@@ -3995,17 +4236,33 @@ fn stream_source_continuations(
         // An opaque protocol offers no carrier identity inside a JSON object
         // or array. A bare JSON string is the one unambiguous source carrier;
         // every broader Raw shape follows the configured unevaluable policy.
-        PassthroughProtocol::Raw => match serde_json::from_slice::<String>(payload) {
-            Ok(text) if !text.is_empty() => SourceContinuations::Ready(vec![StreamContinuation {
-                key: "raw:payload:first".to_owned(),
-                family: "raw".to_owned(),
-                identity: "payload".to_owned(),
-                identity_is_ambiguous: false,
-                text,
-            }]),
-            Ok(_) => SourceContinuations::Absent,
-            Err(_) => SourceContinuations::Unevaluable,
-        },
+        PassthroughProtocol::Raw => {
+            if payload.first() != Some(&b'"') {
+                return SourceContinuations::Unevaluable;
+            }
+            let Ok(mut values) =
+                crate::json_splice::collect_string_values_where_vec(payload, |_| true)
+            else {
+                return SourceContinuations::Unevaluable;
+            };
+            let Some(text) = values.pop() else {
+                return SourceContinuations::Unevaluable;
+            };
+            if !values.is_empty() {
+                return SourceContinuations::Unevaluable;
+            }
+            if text.is_empty() {
+                SourceContinuations::Absent
+            } else {
+                SourceContinuations::Ready(vec![StreamContinuation {
+                    key: "raw:payload:first".to_owned(),
+                    family: "raw".to_owned(),
+                    identity: "payload".to_owned(),
+                    identity_is_ambiguous: false,
+                    text,
+                }])
+            }
+        }
         PassthroughProtocol::OpenaiChat => chat_choice_source_continuations(payload),
         PassthroughProtocol::OpenaiCompletions => completions_source_continuations(payload),
         PassthroughProtocol::OpenaiResponses => responses_source_continuations(payload),
@@ -4058,35 +4315,35 @@ fn frame_guardrail_supplemental_values(
     frame: &[u8],
     has_source_continuations: bool,
     has_typed_continuation: bool,
-) -> Vec<String> {
+) -> Result<Vec<String>, ()> {
     // A typed continuation without source proof becomes unevaluable; do not
     // add a second, generic supplemental scan for that same frame.
     if has_typed_continuation && !has_source_continuations {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if !has_source_continuations {
-        return frame_guardrail_values(protocol, frame);
+        return Ok(frame_guardrail_values(protocol, frame));
     }
 
     let Some(payload) = crate::redact::frame_payload(frame) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let payload = payload.trim();
     if payload.is_empty() || payload == "[DONE]" {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     match protocol {
         // The raw source continuation is the complete decoded payload.
-        PassthroughProtocol::Raw => Vec::new(),
+        PassthroughProtocol::Raw => Ok(Vec::new()),
         PassthroughProtocol::OpenaiChat => {
-            decoded_chat_frame_supplemental_values(payload.as_bytes()).unwrap_or_default()
+            decoded_chat_frame_supplemental_values(payload.as_bytes()).ok_or(())
         }
         PassthroughProtocol::OpenaiCompletions => {
-            decoded_completions_frame_supplemental_values(payload.as_bytes()).unwrap_or_default()
+            decoded_completions_frame_supplemental_values(payload.as_bytes()).ok_or(())
         }
         // Responses source continuations exist only for the explicitly safe
         // text/tool delta events, whose sole output carrier is `delta`.
-        PassthroughProtocol::OpenaiResponses => Vec::new(),
+        PassthroughProtocol::OpenaiResponses => Ok(Vec::new()),
     }
 }
 
@@ -4109,10 +4366,10 @@ fn frame_guardrail_values(protocol: PassthroughProtocol, frame: &[u8]) -> Vec<St
     if payload.is_empty() || payload == "[DONE]" {
         return Vec::new();
     }
-    let raw = || vec![payload.to_string()];
     match protocol {
         PassthroughProtocol::Raw => {
-            decoded_json_string_values_vec_where(payload.as_bytes(), |_| true).unwrap_or_else(raw)
+            decoded_json_string_values_vec_where(payload.as_bytes(), |_| true)
+                .unwrap_or_else(|| vec![payload.to_string()])
         }
         PassthroughProtocol::OpenaiChat => {
             decoded_chat_frame_values(payload.as_bytes()).unwrap_or_default()
@@ -4121,7 +4378,7 @@ fn frame_guardrail_values(protocol: PassthroughProtocol, frame: &[u8]) -> Vec<St
             decoded_json_string_values_vec_where(payload.as_bytes(), |path| {
                 !is_root_key(path, "model")
             })
-            .unwrap_or_else(raw)
+            .unwrap_or_default()
         }
         PassthroughProtocol::OpenaiResponses => {
             decoded_responses_frame_values(payload.as_bytes()).unwrap_or_default()
@@ -4142,10 +4399,9 @@ fn frame_guardrail_text(protocol: PassthroughProtocol, frame: &[u8]) -> String {
     if payload.is_empty() || payload == "[DONE]" {
         return String::new();
     }
-    let raw = || payload.to_string();
     match protocol {
         PassthroughProtocol::Raw => {
-            decoded_json_string_values(payload.as_bytes()).unwrap_or_else(raw)
+            decoded_json_string_values(payload.as_bytes()).unwrap_or_else(|| payload.to_string())
         }
         PassthroughProtocol::OpenaiChat => {
             // A detected Chat frame can carry opaque multimodal values.
@@ -4154,7 +4410,7 @@ fn frame_guardrail_text(protocol: PassthroughProtocol, frame: &[u8]) -> String {
             decoded_chat_frame_string_values(payload.as_bytes()).unwrap_or_default()
         }
         PassthroughProtocol::OpenaiCompletions => {
-            decoded_non_model_json_string_values(payload.as_bytes()).unwrap_or_else(raw)
+            decoded_non_model_json_string_values(payload.as_bytes()).unwrap_or_default()
         }
         PassthroughProtocol::OpenaiResponses => {
             // As with buffered Responses output, only a successful
@@ -4251,19 +4507,30 @@ fn stream_guardrail_text(
         // caller applies the configured fail-open/fail-closed policy.
         SourceContinuations::Unevaluable => (Vec::new(), false, true),
     };
-    let unevaluable = source_unevaluable || terminal_unevaluable;
+    let mut unevaluable = source_unevaluable || terminal_unevaluable;
+    let supplemental = if unevaluable {
+        Vec::new()
+    } else {
+        // A source-proofed frame can still carry supplemental selected
+        // strings (for example completions metadata). If that bounded walk
+        // fails, dropping it would turn a cap or malformed JSON into an
+        // unscanned bypass; let the caller apply its unevaluable policy.
+        match frame_guardrail_supplemental_values(
+            protocol,
+            frame,
+            has_source_continuations,
+            has_typed_continuation,
+        ) {
+            Ok(values) => values,
+            Err(()) => {
+                unevaluable = true;
+                Vec::new()
+            }
+        }
+    };
     StreamGuardrailText {
         continuations,
-        supplemental: if unevaluable {
-            Vec::new()
-        } else {
-            frame_guardrail_supplemental_values(
-                protocol,
-                frame,
-                has_source_continuations,
-                has_typed_continuation,
-            )
-        },
+        supplemental,
         unevaluable,
         closed_prefixes,
     }
@@ -4659,8 +4926,84 @@ fn anthropic_stream_frame(frame: &[u8]) -> Option<bool> {
     }
 }
 
-/// Build the streamed relay response: upstream SSE frames are forwarded
-/// incrementally, tee'd through the chain's [`StreamOutputPolicy`]
+/// Relay a non-success upstream SSE error without parsing or mutating its
+/// frames. The telemetry guard still fires from `Drop` when the client
+/// disconnects mid-relay.
+#[allow(clippy::too_many_arguments)]
+fn stream_non_success_response(
+    upstream_resp: reqwest::Response,
+    resp_headers: HeaderMap,
+    status: reqwest::StatusCode,
+    mut telemetry: RouteTelemetry,
+    request_id: &str,
+    stream_hold: aisix_ratelimit::StreamConcurrencyGuard,
+    stream_read_timeout: Option<Duration>,
+) -> Response {
+    use futures::StreamExt;
+
+    let route_name = telemetry.route_name.clone();
+    let stream = async_stream::stream! {
+        let _stream_hold = stream_hold;
+        let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
+        let mut upstream = Box::pin(crate::stream_timeout::with_read_timeout_bytes_signalled(
+            upstream_resp.bytes_stream(),
+            stream_read_timeout,
+            read_timeout.clone(),
+        ));
+        while let Some(chunk) = upstream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    if telemetry.upstream_ttft_ms == 0 {
+                        telemetry.upstream_ttft_ms = telemetry
+                            .attempt_started
+                            .elapsed()
+                            .as_millis()
+                            .min(u32::MAX as u128) as u32;
+                    }
+                    telemetry.mark_first_delivery();
+                    yield Ok::<_, std::convert::Infallible>(chunk);
+                }
+                Err(err) => {
+                    let bridge = crate::dispatch::reqwest_error_to_bridge(&err, telemetry.started);
+                    telemetry.record_failure(&bridge);
+                    tracing::warn!(
+                        route = %route_name,
+                        error = %telemetry.error_message,
+                        "passthrough-route non-success SSE relay failed mid-stream",
+                    );
+                    break;
+                }
+            }
+        }
+        if let Some(err) = read_timeout.fired() {
+            telemetry.record_failure(&err);
+            tracing::warn!(
+                route = %route_name,
+                error = %telemetry.error_message,
+                "passthrough-route non-success SSE relay timed out mid-stream",
+            );
+        }
+        telemetry.stream_reached_end = true;
+        telemetry.emit();
+    };
+
+    let mut response = Response::builder()
+        .status(status)
+        .body(Body::from_stream(crate::request_id::in_request_span(
+            stream,
+        )))
+        .unwrap();
+    copy_safe_headers(&resp_headers, response.headers_mut());
+    if let Ok(hv) = HeaderValue::from_str(request_id) {
+        response
+            .headers_mut()
+            .insert(header::HeaderName::from_static("x-aisix-request-id"), hv);
+    }
+    response
+}
+
+/// Build a successful streamed relay response: upstream SSE frames are
+/// forwarded incrementally, tee'd through the chain's [`StreamOutputPolicy`]
 /// (window / full-buffer hold-back, end-of-stream check otherwise), while
 /// usage and capture accumulate for the end-of-stream telemetry emit. The
 /// telemetry guard also fires from `Drop` when the client disconnects
@@ -4817,6 +5160,41 @@ fn stream_response(
                         &frame_capture_text(protocol, &frame, &delta),
                         capture_cap,
                     );
+                }
+                // Source-preserving selectors impose their own bounded
+                // collection cap. A visible delta that already exceeds the
+                // configured hold cap is not an unscannable carrier: the
+                // established streaming contract reports
+                // `output_buffer_exceeded` before trying that selector.
+                if !fail_opened {
+                    if let Some((max_buffer_bytes, on_exceeded_fail_open)) = policy.hold_cap() {
+                        if held_content.would_exceed_after(held, frame.len(), max_buffer_bytes) {
+                            if on_exceeded_fail_open {
+                                fail_opened = true;
+                                chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                                for pending_frame in pending.drain(..) {
+                                    telemetry.mark_first_delivery();
+                                    yield Ok(pending_frame);
+                                }
+                                pending_held.clear();
+                                held_content = crate::held_content::HeldBuffer::default();
+                                telemetry.mark_first_delivery();
+                                yield Ok(Bytes::from(frame));
+                                continue;
+                            }
+
+                            tracing::warn!(
+                                route = %route_name,
+                                "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
+                            );
+                            blocked = true;
+                            chain.record_output_buffer_exceeded();
+                            pending.clear();
+                            pending_held.clear();
+                            yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
+                            break 'outer;
+                        }
+                    }
                 }
                 let guardrail_text = (!chain.is_empty() && !scan_budget_exhausted && !fail_opened)
                     .then(|| stream_guardrail_text(protocol, &frame, delta.clone()));
@@ -7062,19 +7440,20 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_chat_carrier_skips_malformed_source_without_leaking_media() {
+    fn duplicate_chat_carrier_is_unevaluable_without_leaking_media() {
         let request = br#"{"messages":{"content":[{"type":"image","source":{"data":"\u0042LOCKME"}}]},"messages":[{"role":"user","content":"clean"}]}"#;
         assert_eq!(detect_protocol(request), PassthroughProtocol::OpenaiChat);
-        let scanned = request_guardrail_text(PassthroughProtocol::OpenaiChat, request);
-        assert!(scanned.contains("clean"), "{scanned:?}");
+        let error = try_request_guardrail_text(PassthroughProtocol::OpenaiChat, request)
+            .expect_err("a duplicate malformed carrier must fail closed");
+        assert!(error.is_unevaluable(), "{error}");
         assert!(
-            !scanned.contains("BLOCKME"),
-            "a malformed duplicate must not trigger raw fallback: {scanned:?}"
+            !request_guardrail_text(PassthroughProtocol::OpenaiChat, request).contains("BLOCKME"),
+            "a malformed duplicate must not trigger raw fallback"
         );
     }
 
     #[test]
-    fn malformed_typed_array_items_keep_media_opaque() {
+    fn malformed_typed_array_items_are_unevaluable_without_leaking_media() {
         let cases = [
             (
                 PassthroughProtocol::OpenaiChat,
@@ -7098,11 +7477,12 @@ mod tests {
             ),
         ];
         for (protocol, request) in cases {
-            let scanned = request_guardrail_text(protocol, request);
-            assert!(scanned.contains("clean"), "{protocol:?}: {scanned:?}");
+            let error = try_request_guardrail_text(protocol, request)
+                .expect_err("a malformed typed array item must fail closed");
+            assert!(error.is_unevaluable(), "{protocol:?}: {error}");
             assert!(
-                !scanned.contains("BLOCKME"),
-                "a malformed array item must not trigger raw fallback for {protocol:?}: {scanned:?}"
+                !request_guardrail_text(protocol, request).contains("BLOCKME"),
+                "a malformed array item must not trigger raw fallback for {protocol:?}"
             );
         }
     }
@@ -7229,6 +7609,55 @@ mod tests {
         assert!(
             response_guardrail_text(PassthroughProtocol::OpenaiResponses, duplicate_text)
                 .contains("clean")
+        );
+    }
+
+    #[test]
+    fn malformed_completions_output_is_unevaluable_without_raw_fallback() {
+        let buffered = br#"{"choices":[{"text":"clean"}],"opaque":{"data":"BLOCKME"}"#;
+        let error = try_response_guardrail_text(PassthroughProtocol::OpenaiCompletions, buffered)
+            .expect_err("a malformed completions response must fail closed");
+        assert!(error.is_unevaluable(), "{error}");
+        assert!(
+            !response_guardrail_text(PassthroughProtocol::OpenaiCompletions, buffered)
+                .contains("BLOCKME"),
+            "a malformed completions response must not fall back to opaque source text"
+        );
+
+        let streamed = b"data: {\"choices\":[{\"index\":0,\"text\":\"clean\"}],\"opaque\":{\"data\":\"BLOCKME\"}\n\n";
+        let typed = frame_parts(PassthroughProtocol::OpenaiCompletions, streamed)
+            .0
+            .scan;
+        assert!(
+            stream_guardrail_text(PassthroughProtocol::OpenaiCompletions, streamed, typed)
+                .unevaluable
+        );
+        assert!(
+            !frame_guardrail_text(PassthroughProtocol::OpenaiCompletions, streamed)
+                .contains("BLOCKME"),
+            "a malformed completions stream frame must not fall back to opaque source text"
+        );
+    }
+
+    #[test]
+    fn streamed_completions_supplemental_cap_is_unevaluable_without_raw_fallback() {
+        let frame = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"text\":\"clean\"}}],\"opaque\":\"{}\"}}\n\n",
+            "BLOCKME".repeat(MAX_RAW_SELECTOR_BYTES / "BLOCKME".len() + 1),
+        );
+        let typed = frame_parts(PassthroughProtocol::OpenaiCompletions, frame.as_bytes())
+            .0
+            .scan;
+        let text = stream_guardrail_text(
+            PassthroughProtocol::OpenaiCompletions,
+            frame.as_bytes(),
+            typed,
+        );
+        assert!(text.unevaluable);
+        let scanned = stream_guardrail_scan_text(&[], &text.continuations, &text.supplemental);
+        assert!(
+            !scan_candidates_contain(&scanned, "BLOCKME"),
+            "a capped supplemental selector must not raw-fallback opaque output: {scanned:?}"
         );
     }
 
@@ -8890,6 +9319,147 @@ mod tests {
                 .expect_err("a malformed source selector must not produce an empty scan");
             assert!(error.is_unevaluable(), "{error}");
         }
+    }
+
+    #[test]
+    fn shallow_selector_accepts_valid_large_json_numbers() {
+        let body = br#"{"messages":[{"role":"user","content":"clean"}],"metadata":1e400}"#;
+        assert_eq!(detect_protocol(body), PassthroughProtocol::OpenaiChat);
+        assert!(try_request_guardrail_text(PassthroughProtocol::OpenaiChat, body).is_ok());
+    }
+
+    #[test]
+    fn malformed_json_like_raw_probe_cannot_fallback_after_typed_media() {
+        let malformed = br#"{"messages":[{"role":"user","content":[{"type":"image","source":{"data":"BLOCKME"}}]}],"broken":"#;
+        assert_eq!(detect_protocol(malformed), PassthroughProtocol::Raw);
+        let JsonProbe::Unevaluable(error) = probe_json(malformed) else {
+            panic!("a malformed JSON-like root must retain its unsafe selector state");
+        };
+        assert!(error.is_unevaluable(), "{error}");
+        assert!(
+            try_request_guardrail_text(PassthroughProtocol::Raw, malformed)
+                .expect_err("a malformed JSON-like Raw body cannot be source-scanned")
+                .is_unevaluable()
+        );
+
+        let plain = b"plain raw BLOCKME";
+        assert!(matches!(probe_json(plain), JsonProbe::Raw));
+        let error = try_request_guardrail_text(PassthroughProtocol::Raw, plain)
+            .expect_err("plain text is not JSON");
+        assert!(!error.is_unevaluable(), "{error}");
+        assert!(
+            request_guardrail_text(PassthroughProtocol::Raw, plain).contains("BLOCKME"),
+            "ordinary non-JSON Raw bodies retain their text fallback"
+        );
+    }
+
+    #[test]
+    fn wide_typed_carriers_exceeding_selector_budgets_are_unevaluable() {
+        let assert_unevaluable = |body: &[u8]| {
+            assert_eq!(detect_protocol(body), PassthroughProtocol::OpenaiChat);
+            let error = try_request_guardrail_text(PassthroughProtocol::OpenaiChat, body)
+                .expect_err("a bounded typed selector must fail closed");
+            assert!(error.is_unevaluable(), "{error}");
+        };
+
+        let repeated_messages = format!(
+            "{{{}\"messages\":[]}}",
+            "\"messages\":[],".repeat(MAX_RAW_SELECTOR_ITEMS),
+        );
+        assert_unevaluable(repeated_messages.as_bytes());
+
+        let message = r#"{"role":"user","content":"safe"}"#;
+        let wide_messages = format!(
+            r#"{{"messages":[{}]}}"#,
+            format!("{message},").repeat(MAX_RAW_SELECTOR_ITEMS) + message,
+        );
+        assert_unevaluable(wide_messages.as_bytes());
+
+        let part = r#"{"type":"text","text":"safe"}"#;
+        let wide_content = format!(
+            r#"{{"messages":[{{"role":"user","content":[{}]}}]}}"#,
+            format!("{part},").repeat(MAX_RAW_SELECTOR_ITEMS) + part,
+        );
+        assert_unevaluable(wide_content.as_bytes());
+
+        let sibling = r#"{"type":"text","text":"safe"}"#;
+        let nested_work = format!(
+            r#"{{"messages":[{{"role":"user","content":[{{"type":"tool_result","content":"safe","content":"safe"}},{}]}}]}}"#,
+            format!("{sibling},").repeat(MAX_RAW_SELECTOR_ITEMS - 2) + sibling,
+        );
+        assert_unevaluable(nested_work.as_bytes());
+
+        let large_text = "x".repeat(MAX_RAW_SELECTOR_BYTES + 1);
+        let wide_bytes = format!(r#"{{"messages":[{{"role":"user","content":"{large_text}"}}]}}"#);
+        assert_unevaluable(wide_bytes.as_bytes());
+    }
+
+    #[test]
+    fn json_text_and_typed_output_selector_caps_are_unevaluable() {
+        let raw = format!(
+            r#"{{"state":"{}"}}"#,
+            "x".repeat(MAX_RAW_SELECTOR_BYTES + 1),
+        );
+        assert!(matches!(probe_json(raw.as_bytes()), JsonProbe::Raw));
+        let error = try_request_guardrail_text(PassthroughProtocol::Raw, raw.as_bytes())
+            .expect_err("JSON-like Raw text over the cap must not fall back to source bytes");
+        assert!(error.is_unevaluable(), "{error}");
+        let raw_stream = format!(r#""{}""#, "x".repeat(MAX_RAW_SELECTOR_BYTES + 1));
+        assert!(matches!(
+            stream_source_continuations(PassthroughProtocol::Raw, raw_stream.as_bytes()),
+            SourceContinuations::Unevaluable
+        ));
+
+        let assert_output_unevaluable = |protocol, body: &str| {
+            let error = try_response_guardrail_text(protocol, body.as_bytes())
+                .expect_err("a capped typed output selector must fail closed");
+            assert!(error.is_unevaluable(), "{protocol:?}: {error}");
+            assert!(
+                !response_guardrail_text(protocol, body.as_bytes()).contains("BLOCKME"),
+                "{protocol:?} output must not fall back to opaque source",
+            );
+        };
+
+        let choice = r#"{"message":{"content":"safe"}}"#;
+        let wide_choices = format!(
+            r#"{{"choices":[{}]}}"#,
+            format!("{choice},").repeat(MAX_RAW_SELECTOR_ITEMS) + choice,
+        );
+        assert_output_unevaluable(PassthroughProtocol::OpenaiChat, &wide_choices);
+
+        let part = r#"{"type":"text","text":"safe"}"#;
+        let wide_content = format!(
+            r#"{{"choices":[{{"message":{{"content":[{}]}}}}]}}"#,
+            format!("{part},").repeat(MAX_RAW_SELECTOR_ITEMS) + part,
+        );
+        assert_output_unevaluable(PassthroughProtocol::OpenaiChat, &wide_content);
+
+        let item = r#"{"type":"message","content":"safe"}"#;
+        let wide_output = format!(
+            r#"{{"output":[{}]}}"#,
+            format!("{item},").repeat(MAX_RAW_SELECTOR_ITEMS) + item,
+        );
+        assert_output_unevaluable(PassthroughProtocol::OpenaiResponses, &wide_output);
+
+        let overflowing_type_part = format!(
+            r#"{{{}"text":"BLOCKME"}}"#,
+            r#""type":"text","#.repeat(MAX_RAW_SELECTOR_ITEMS + 1),
+        );
+        let chat =
+            format!(r#"{{"choices":[{{"message":{{"content":[{overflowing_type_part}]}}}}]}}"#);
+        assert_output_unevaluable(PassthroughProtocol::OpenaiChat, &chat);
+        let responses =
+            format!(r#"{{"output":[{{"type":"message","content":[{overflowing_type_part}]}}]}}"#);
+        assert_output_unevaluable(PassthroughProtocol::OpenaiResponses, &responses);
+
+        let request =
+            format!(r#"{{"input":[{{"type":"message","content":[{overflowing_type_part}]}}]}}"#);
+        let error =
+            try_request_guardrail_text(PassthroughProtocol::OpenaiResponses, request.as_bytes())
+                .expect_err(
+                    "a strict typed input part cannot treat a capped type selector as absent",
+                );
+        assert!(error.is_unevaluable(), "{error}");
     }
 
     /// Buffered Anthropic and Responses replies are read slot by slot:

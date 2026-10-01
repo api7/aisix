@@ -98,6 +98,55 @@ impl SpliceError {
 /// passthrough body. It remains well beyond serde_json's usual recursion cap.
 pub(crate) const MAX_JSON_DEPTH: usize = 4_096;
 
+/// Bounded collection policy for decoded JSON text passed to guardrails.
+/// Source selectors use the same limits so a wide document cannot shift its
+/// allocation from selector bookkeeping into decoded scan text.
+pub(crate) const MAX_JSON_SCAN_VALUES: usize = 1_024;
+pub(crate) const MAX_JSON_SCAN_TEXT_BYTES: usize = 256 * 1024;
+
+/// Validate JSON-number syntax without materializing the value. serde_json
+/// can reject a syntactically valid number outside its runtime numeric range.
+pub(crate) fn is_json_number(token: &[u8]) -> bool {
+    let mut pos = 0;
+    if token.get(pos) == Some(&b'-') {
+        pos += 1;
+    }
+    match token.get(pos) {
+        Some(b'0') => pos += 1,
+        Some(b'1'..=b'9') => {
+            pos += 1;
+            while token.get(pos).is_some_and(|byte| byte.is_ascii_digit()) {
+                pos += 1;
+            }
+        }
+        _ => return false,
+    }
+    if token.get(pos) == Some(&b'.') {
+        pos += 1;
+        let fraction_start = pos;
+        while token.get(pos).is_some_and(|byte| byte.is_ascii_digit()) {
+            pos += 1;
+        }
+        if pos == fraction_start {
+            return false;
+        }
+    }
+    if matches!(token.get(pos), Some(b'e' | b'E')) {
+        pos += 1;
+        if matches!(token.get(pos), Some(b'+' | b'-')) {
+            pos += 1;
+        }
+        let exponent_start = pos;
+        while token.get(pos).is_some_and(|byte| byte.is_ascii_digit()) {
+            pos += 1;
+        }
+        if pos == exponent_start {
+            return false;
+        }
+    }
+    pos == token.len()
+}
+
 /// Rewrite the string values of `input` selected by `should_rewrite`,
 /// leaving every other byte untouched.
 ///
@@ -122,6 +171,7 @@ pub fn rewrite_string_values(
         at,
         kind: SpliceErrorKind::Invalid,
     };
+    std::str::from_utf8(input).map_err(|error| err(error.valid_up_to()))?;
     let mut splices: Vec<(Range<usize>, String)> = Vec::new();
     let mut path: Vec<PathSeg> = Vec::new();
     let mut frames: Vec<Frame> = Vec::new();
@@ -138,15 +188,25 @@ pub fn rewrite_string_values(
         let mut i = start + 1;
         while i < input.len() {
             match input[i] {
-                b'\\' => i += 2, // skips the escaped byte; `\uXXXX` needs no care (hex only)
+                b'\\' => match input.get(i + 1).copied() {
+                    Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => i += 2,
+                    Some(b'u') => {
+                        let Some(hex) = input.get(i + 2..i + 6) else {
+                            return Err(err(i));
+                        };
+                        if !hex.iter().all(|byte| byte.is_ascii_hexdigit()) {
+                            return Err(err(i));
+                        }
+                        i += 6;
+                    }
+                    _ => return Err(err(i)),
+                },
                 b'"' => return Ok(i + 1),
+                0..=0x1f => return Err(err(i)),
                 _ => i += 1,
             }
         }
-        Err(SpliceError {
-            at: start,
-            kind: SpliceErrorKind::Invalid,
-        })
+        Err(err(start))
     };
     let decode_str = |range: Range<usize>| -> Result<String, SpliceError> {
         let at = range.start;
@@ -223,15 +283,22 @@ pub fn rewrite_string_values(
                 }
                 pos = end;
             }
-            // Number / true / false / null. The scanner does not
-            // re-validate the token — the bytes already parsed upstream —
-            // it only needs the token's extent.
+            // Number / true / false / null.
             b'-' | b'0'..=b'9' | b't' | b'f' | b'n' => {
+                let start = pos;
                 while pos < input.len()
                     && matches!(input[pos],
                         b'-' | b'+' | b'.' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
                 {
                     pos += 1;
+                }
+                let token = &input[start..pos];
+                if token != b"true"
+                    && token != b"false"
+                    && token != b"null"
+                    && !is_json_number(token)
+                {
+                    return Err(err(start));
                 }
             }
             _ => return Err(err(pos)),
@@ -315,6 +382,12 @@ pub fn collect_string_values(input: &[u8]) -> Result<String, SpliceError> {
     collect_string_values_where(input, |_| true)
 }
 
+/// Validate one UTF-8 JSON document with the same iterative depth limit as
+/// the guardrail selector, without retaining any of its string values.
+pub(crate) fn validate_json(input: &[u8]) -> Result<(), SpliceError> {
+    rewrite_string_values(input, |_| false, |_| None).map(|_| ())
+}
+
 /// Decode and collect selected JSON string **values** in source order.
 ///
 /// Like [`collect_string_values`], this preserves duplicate keys and stays
@@ -325,18 +398,36 @@ pub fn collect_string_values_where(
     mut include: impl FnMut(&[PathSeg]) -> bool,
 ) -> Result<String, SpliceError> {
     let mut out = String::new();
+    let mut collect_error = None;
     rewrite_string_values(
         input,
         |path| include(path),
         |value| {
-            if !out.is_empty() {
-                out.push('\n');
+            if collect_error.is_none() {
+                let separator = if out.is_empty() { 0 } else { 1 };
+                let Some(next_len) = out
+                    .len()
+                    .checked_add(separator)
+                    .and_then(|len| len.checked_add(value.len()))
+                else {
+                    collect_error = Some(SpliceError::unevaluable());
+                    return None;
+                };
+                if next_len > MAX_JSON_SCAN_TEXT_BYTES
+                    || out.try_reserve(next_len - out.len()).is_err()
+                {
+                    collect_error = Some(SpliceError::unevaluable());
+                    return None;
+                }
+                if separator != 0 {
+                    out.push('\n');
+                }
+                out.push_str(value);
             }
-            out.push_str(value);
             None
         },
     )?;
-    Ok(out)
+    collect_error.map_or(Ok(out), Err)
 }
 
 /// Decode selected JSON string values as separate source-order entries.
@@ -349,15 +440,37 @@ pub fn collect_string_values_where_vec(
     mut include: impl FnMut(&[PathSeg]) -> bool,
 ) -> Result<Vec<String>, SpliceError> {
     let mut out = Vec::new();
+    let mut source_bytes = 0usize;
+    let mut collect_error = None;
     rewrite_string_values(
         input,
         |path| include(path),
         |value| {
-            out.push(value.to_string());
+            if collect_error.is_none() {
+                let Some(next_bytes) = source_bytes.checked_add(value.len()) else {
+                    collect_error = Some(SpliceError::unevaluable());
+                    return None;
+                };
+                if out.len() >= MAX_JSON_SCAN_VALUES
+                    || next_bytes > MAX_JSON_SCAN_TEXT_BYTES
+                    || out.try_reserve(1).is_err()
+                {
+                    collect_error = Some(SpliceError::unevaluable());
+                    return None;
+                }
+                let mut decoded = String::new();
+                if decoded.try_reserve(value.len()).is_err() {
+                    collect_error = Some(SpliceError::unevaluable());
+                    return None;
+                }
+                decoded.push_str(value);
+                source_bytes = next_bytes;
+                out.push(decoded);
+            }
             None
         },
     )?;
-    Ok(out)
+    collect_error.map_or(Ok(out), Err)
 }
 
 #[cfg(test)]
@@ -388,6 +501,11 @@ mod tests {
         assert!(rewrite_string_values(doc.as_bytes(), |_| true, |_| None)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn validates_large_exponent_without_materializing_a_number() {
+        assert!(validate_json(br#"{"n":1e400}"#).is_ok());
     }
 
     #[test]
@@ -470,6 +588,25 @@ mod tests {
             .unwrap(),
             vec!["FOR", "ok"]
         );
+    }
+
+    #[test]
+    fn collected_json_text_over_the_shared_cap_is_unevaluable() {
+        let doc = format!(
+            r#"{{"text":"{}"}}"#,
+            "x".repeat(MAX_JSON_SCAN_TEXT_BYTES + 1)
+        );
+        let error = collect_string_values(doc.as_bytes())
+            .expect_err("a JSON text collection must stay bounded");
+        assert!(error.is_unevaluable(), "{error}");
+        let error = collect_string_values_where_vec(doc.as_bytes(), |_| true)
+            .expect_err("vector collection shares the text cap");
+        assert!(error.is_unevaluable(), "{error}");
+
+        let values = format!("[{}]", "\"\",".repeat(MAX_JSON_SCAN_VALUES) + "\"\"",);
+        let error = collect_string_values_where_vec(values.as_bytes(), |_| true)
+            .expect_err("vector collection also bounds empty values");
+        assert!(error.is_unevaluable(), "{error}");
     }
 
     #[test]

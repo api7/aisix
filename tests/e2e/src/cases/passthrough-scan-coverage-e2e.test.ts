@@ -45,6 +45,8 @@ const RAW_PREFIX_SSE = `"FOR"`;
 const RAW_UNEVALUABLE_SSE = String.raw`{"state":"safe"}`;
 const RAW_SUFFIX_SSE = `"BIDDEN"`;
 const RAW_HELD_BLOCK_SSE = `"FORBIDDEN"`;
+const UPSTREAM_502_HTML = `<html><body>${OUT_LIT}</body></html>`;
+const UPSTREAM_502_SSE = `event: upstream_error\ndata: {"message":"${OUT_LIT}"}\n\n`;
 const deepEscapedBlockJSON = (depth: number) =>
   `${'{"v":'.repeat(depth)}"${String.raw`\u0042LOCKME`}"${'}'.repeat(depth)}`;
 const deepLiteralBlockJSON = (depth: number) =>
@@ -178,6 +180,23 @@ describe("passthrough guardrail scan coverage", () => {
     }
     upstreams.input = await startOpenAiUpstream({
       nonStreamBody: { id: "c", object: "chat.completion", choices: [] },
+    });
+    upstreams["html-502"] = await startOpenAiUpstream({
+      status: 502,
+      rawErrorBody: UPSTREAM_502_HTML,
+      responseHeaders: {
+        "content-type": "text/html; charset=utf-8",
+        "x-upstream-error": "edge-502",
+      },
+    });
+    upstreams["sse-502"] = await startOpenAiUpstream({
+      status: 502,
+      rawErrorBody: UPSTREAM_502_SSE,
+      responseHeaders: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache",
+        "x-upstream-error": "edge-sse-502",
+      },
     });
     upstreams["raw-output"] = await startOpenAiUpstream({
       rawBody: ESCAPED_BLOCK_JSON,
@@ -330,7 +349,46 @@ describe("passthrough guardrail scan coverage", () => {
     ["responses-tool", "/v1/responses", responsesBody],
   ] as const)("output: %s is scanned", async ([route, path, body], ctx) => {
     if (!ready(ctx)) return;
+    const upstream = upstreams[route];
+    if (!upstream) throw new Error(`missing ${route} upstream`);
+    const before = upstream.receivedRequests.length;
     await expectBlocked(await call(route, path, body));
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("output: upstream 502 HTML bypasses fail-closed output guardrails", async (ctx) => {
+    if (!ready(ctx)) return;
+    const upstream = upstreams["html-502"];
+    if (!upstream) throw new Error("missing html-502 upstream");
+    const before = upstream.receivedRequests.length;
+    const res = await callRaw(
+      "html-502",
+      "/v1/any",
+      `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"clean"}]}`,
+    );
+    expect(res.status).toBe(502);
+    expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(res.headers.get("x-upstream-error")).toBe("edge-502");
+    expect(await res.text()).toBe(UPSTREAM_502_HTML);
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("output: upstream 502 SSE bypasses guardrails and preserves the error stream", async (ctx) => {
+    if (!ready(ctx)) return;
+    const upstream = upstreams["sse-502"];
+    if (!upstream) throw new Error("missing sse-502 upstream");
+    const before = upstream.receivedRequests.length;
+    const res = await callRaw(
+      "sse-502",
+      "/v1/any",
+      `{"state":"clean"}`,
+    );
+    expect(res.status).toBe(502);
+    expect(res.headers.get("content-type")).toBe("text/event-stream; charset=utf-8");
+    expect(res.headers.get("cache-control")).toBe("no-cache");
+    expect(res.headers.get("x-upstream-error")).toBe("edge-sse-502");
+    expect(await res.text()).toBe(UPSTREAM_502_SSE);
+    expect(upstream.receivedRequests.length).toBe(before + 1);
   });
 
   test("output: generated thinking is not scanned", async (ctx) => {
@@ -569,6 +627,19 @@ describe("passthrough guardrail scan coverage", () => {
       expect(upstreams.input!.receivedRequests.length).toBe(before);
     },
   );
+
+  test("input: malformed JSON after typed media fails closed instead of becoming Raw", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams.input!.receivedRequests.length;
+    const body = `{"model":"gpt-4o-mini","messages":[{"role":"user","content":[{"type":"image","source":{"data":"${ESCAPED_BLOCK}"}}]}],"broken":`;
+    const res = await callRaw("input", "/v1/any", body);
+    expect(res.status).toBe(422);
+    const response = await res.text();
+    expect(response).toContain("guardrail_unavailable");
+    expect(response).toContain("unscannable_body");
+    expect(response).not.toContain(ESCAPED_BLOCK);
+    expect(upstreams.input!.receivedRequests.length).toBe(before);
+  });
 
   test.for([
     ["ASCII", ESCAPED_BLOCK_JSON],
