@@ -9,8 +9,11 @@
 //! `embedding_model`, scores it against each route's example embeddings
 //! (cosine, aggregated per route), and dispatches to the highest route
 //! whose score clears its threshold — or to `default` when none does.
-//! Route example vectors are computed once at apply time and cached, so
-//! the per-request cost is a single embedding call plus local arithmetic.
+//! Route example vectors are populated lazily during request handling and
+//! cached. A cold route request passes its prompt and every distinct uncached
+//! route-example text as one logical embedding batch. Providers without batch
+//! support may issue multiple upstream calls (Bedrock Titan does). In steady
+//! state, the batch contains only the prompt, followed by local arithmetic.
 //!
 //! A router that carries a `classifier` block decides differently: the
 //! latest user message is sent once to a hosted decision model, which
@@ -81,10 +84,12 @@ pub struct SemanticRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub description: Option<String>,
-    /// Example utterances that define this route. AISIX embeds each example
-    /// when applying the configuration and caches the vector. A request is
-    /// matched against these examples. Required, with at least one example,
-    /// when the router has no `classifier`; not accepted when it has one.
+    /// Example utterances that define this route. AISIX caches their vectors
+    /// lazily. A cold route request passes its prompt and every distinct
+    /// uncached example text as one logical embedding batch. Providers without
+    /// batch support may issue multiple upstream calls (Bedrock Titan does).
+    /// Required, with at least one example, when the router has no
+    /// `classifier`; not accepted when it has one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(min = 1), inner(length(min = 1)))]
     pub examples: Vec<String>,
@@ -248,7 +253,8 @@ pub struct Semantic {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classifier: Option<SemanticClassifier>,
     /// Alias of an `embedding`-modality Model used to embed the request
-    /// and (at apply time) the route examples. Read only when
+    /// and, lazily on the first request that needs them, the route examples.
+    /// Read only when
     /// `embedding_model_id` is absent. Required, under this name or as
     /// `embedding_model_id`, when there is no `classifier`.
     #[serde(default, skip_serializing_if = "String::is_empty")]

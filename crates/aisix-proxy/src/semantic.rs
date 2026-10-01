@@ -27,8 +27,11 @@ use aisix_core::models::{
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, Model};
-use aisix_gateway::{EmbeddingRequest, EmbeddingVector};
-use aisix_obs::{SemanticAccessLog, SemanticFallback};
+use aisix_gateway::{EmbeddingRequest, EmbeddingUsageSource, EmbeddingVector};
+use aisix_obs::{
+    GatewayEmbeddingCall, GatewayEmbeddingOutcome, GatewayEmbeddingPurpose,
+    GatewayEmbeddingUsageSource, SemanticAccessLog, SemanticFallback,
+};
 
 use crate::error::ProxyError;
 use crate::routing::AttemptModel;
@@ -111,7 +114,7 @@ pub(crate) fn failure_target<'a>(
 
 /// Per-instance cache of route example-utterance embeddings, populated
 /// lazily on the first request that needs them and reused across requests
-/// so the steady-state per-request cost is a single embedding call for the
+/// so a steady-state request's logical embedding batch contains only the
 /// prompt. Keyed by `(embedding_model_id, dimensions, example_text)` —
 /// changing the embedding model or its dimensions auto-invalidates, since
 /// a stale vector of the wrong dimension must never be served.
@@ -309,8 +312,9 @@ async fn decide_by_embedding(
         .map(|e| e.dimensions)
         .unwrap_or(0);
 
-    // Batch the prompt (index 0) with every uncached example text in one
-    // embedding call. Steady state: only the prompt is uncached.
+    // Assemble the prompt (index 0) with every uncached example text as one
+    // logical embedding batch. Providers without batch input may split it
+    // into multiple upstream calls. Steady state: only the prompt is uncached.
     let mut pending: Vec<String> = Vec::new();
     for route in &semantic.routes {
         for ex in &route.examples {
@@ -341,6 +345,7 @@ async fn decide_by_embedding(
         &embed_entry,
         embed_deadline,
         request_id,
+        GatewayEmbeddingPurpose::SemanticRoute,
         &to_embed,
     )
     .await
@@ -685,6 +690,7 @@ pub(crate) async fn embed_texts(
     embed_entry: &ResourceEntry<Model>,
     timeout: Option<std::time::Duration>,
     request_id: &str,
+    purpose: GatewayEmbeddingPurpose,
     texts: &[String],
 ) -> Result<Vec<Vec<f32>>, ProxyError> {
     // Detached: this is a dispatch the GATEWAY decided to make — for a
@@ -700,6 +706,7 @@ pub(crate) async fn embed_texts(
         embed_entry,
         timeout,
         request_id,
+        purpose,
         texts,
     ))
     .await
@@ -711,6 +718,7 @@ async fn embed_texts_inner(
     embed_entry: &ResourceEntry<Model>,
     timeout: Option<std::time::Duration>,
     request_id: &str,
+    purpose: GatewayEmbeddingPurpose,
     texts: &[String],
 ) -> Result<Vec<Vec<f32>>, ProxyError> {
     let model = &embed_entry.value;
@@ -719,6 +727,7 @@ async fn embed_texts_inner(
     let bridge = crate::dispatch::resolve_bridge(hub, &pk_entry.value)
         .ok_or(ProxyError::ProviderUnavailable)?;
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+    let audit_model_id = crate::attribution::capped_gateway_embedding_model_id(&embed_entry.id);
     let dimensions = model.embedding.as_ref().map(|e| e.dimensions);
 
     let req = EmbeddingRequest {
@@ -743,7 +752,44 @@ async fn embed_texts_inner(
         }
     };
 
-    let resp = bridge.embed(&req, &ctx).await.map_err(ProxyError::Bridge)?;
+    // Keep this guard alive across the bridge await. If the downstream client
+    // cancels this parent request while the bridge is pending, its Drop writes
+    // a failed child audit directly to the shared parent ledger before the
+    // cancel emitter takes that ledger into the terminal 499 event.
+    let mut audit_call = crate::attribution::begin_gateway_embedding_call(purpose, &audit_model_id);
+    let response = bridge.embed(&req, &ctx).await;
+    let latency_ms = audit_call.settle();
+    let resp = match response {
+        Ok(resp) => {
+            crate::attribution::note_gateway_embedding_call(GatewayEmbeddingCall {
+                count: 1,
+                purpose,
+                embedding_model_id: audit_model_id.clone(),
+                prompt_tokens: resp.usage.prompt_tokens,
+                total_tokens: resp.usage.total_tokens,
+                usage_source: match resp.usage.source {
+                    EmbeddingUsageSource::Reported => GatewayEmbeddingUsageSource::Reported,
+                    EmbeddingUsageSource::Unavailable => GatewayEmbeddingUsageSource::Unavailable,
+                },
+                latency_ms,
+                outcome: GatewayEmbeddingOutcome::Succeeded,
+            });
+            resp
+        }
+        Err(err) => {
+            crate::attribution::note_gateway_embedding_call(GatewayEmbeddingCall {
+                count: 1,
+                purpose,
+                embedding_model_id: audit_model_id,
+                prompt_tokens: 0,
+                total_tokens: 0,
+                usage_source: GatewayEmbeddingUsageSource::Unavailable,
+                latency_ms,
+                outcome: GatewayEmbeddingOutcome::Failed,
+            });
+            return Err(ProxyError::Bridge(err));
+        }
+    };
     let mut data = resp.data;
     data.sort_by_key(|d| d.index);
     let expected_dims = dimensions.map(|d| d as usize);
@@ -870,6 +916,7 @@ mod tests {
                 &embed_entry,
                 None,
                 "req-embed",
+                GatewayEmbeddingPurpose::SemanticRoute,
                 &["scan me".to_string()],
             )
             .await

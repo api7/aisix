@@ -894,7 +894,7 @@
           ]
         },
         "embedding_model": {
-          "description": "Alias of an `embedding`-modality Model used to embed the request and (at apply time) the route examples. Read only when `embedding_model_id` is absent. Required, under this name or as `embedding_model_id`, when there is no `classifier`.",
+          "description": "Alias of an `embedding`-modality Model used to embed the request and, lazily on the first request that needs them, the route examples. Read only when `embedding_model_id` is absent. Required, under this name or as `embedding_model_id`, when there is no `classifier`.",
           "minLength": 1,
           "type": "string"
         },
@@ -1066,7 +1066,7 @@
           "type": "string"
         },
         "examples": {
-          "description": "Example utterances that define this route. AISIX embeds each example when applying the configuration and caches the vector. A request is matched against these examples. Required, with at least one example, when the router has no `classifier`; not accepted when it has one.",
+          "description": "Example utterances that define this route. AISIX caches their vectors lazily. A cold route request passes its prompt and every distinct uncached example text as one logical embedding batch. Providers without batch support may issue multiple upstream calls (Bedrock Titan does). Required, with at least one example, when the router has no `classifier`; not accepted when it has one.",
           "items": {
             "minLength": 1,
             "type": "string"

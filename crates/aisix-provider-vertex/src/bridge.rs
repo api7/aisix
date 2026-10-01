@@ -30,7 +30,7 @@ use aisix_gateway::{
     },
     Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatFormat,
     ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingUsage, EmbeddingVector, FinishReason, Role, UsageStats,
+    EmbeddingUsage, EmbeddingUsageSource, EmbeddingVector, FinishReason, Role, UsageStats,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -794,9 +794,17 @@ impl Bridge for VertexBridge {
 
             let mut data = Vec::with_capacity(parsed.predictions.len());
             let mut prompt_tokens: u64 = 0;
+            let mut usage_reported = !parsed.predictions.is_empty();
             for (i, p) in parsed.predictions.into_iter().enumerate() {
-                if let Some(stats) = &p.embeddings.statistics {
-                    prompt_tokens += stats.token_count;
+                if let Some(token_count) = p
+                    .embeddings
+                    .statistics
+                    .as_ref()
+                    .and_then(|stats| stats.token_count)
+                {
+                    prompt_tokens += token_count;
+                } else {
+                    usage_reported = false;
                 }
                 data.push(EmbeddingObject {
                     index: i as u32,
@@ -805,6 +813,11 @@ impl Bridge for VertexBridge {
                 });
             }
             let tokens = prompt_tokens.min(u32::MAX as u64) as u32;
+            let source = if usage_reported {
+                EmbeddingUsageSource::Reported
+            } else {
+                EmbeddingUsageSource::Unavailable
+            };
             Ok(EmbeddingResponse {
                 object: "list".to_string(),
                 model: model_echo,
@@ -812,6 +825,7 @@ impl Bridge for VertexBridge {
                 usage: EmbeddingUsage {
                     prompt_tokens: tokens,
                     total_tokens: tokens,
+                    source,
                 },
             })
         })
@@ -841,8 +855,7 @@ struct VertexEmbeddingsPayload {
 
 #[derive(Debug, Deserialize)]
 struct VertexEmbeddingStatistics {
-    #[serde(default)]
-    token_count: u64,
+    token_count: Option<u64>,
 }
 
 impl VertexBridge {
@@ -6232,6 +6245,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             resp.usage.prompt_tokens, 5,
             "token_count sums across predictions"
         );
+        assert_eq!(resp.usage.source, EmbeddingUsageSource::Reported);
 
         // Upstream body: one instance per input, in order, plus the
         // OAuth bearer from the PK secret.
@@ -6253,6 +6267,43 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
                 .and_then(|v| v.to_str().ok()),
             Some("Bearer ya29.test")
         );
+    }
+
+    #[tokio::test]
+    async fn embed_marks_missing_usage_unavailable() {
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/google/models/text-embedding-005:predict",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "predictions": [{"embeddings": {"values": [0.1, 0.2]}}]
+            })))
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("text-embedding-005"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = EmbeddingRequest {
+            model: "customer-facing-name".into(),
+            input: vec!["hello".into()],
+            input_was_single: true,
+            encoding_format: None,
+            dimensions: None,
+        };
+
+        let resp = bridge.embed(&req, &ctx).await.expect("embed dispatch");
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.usage.prompt_tokens, 0);
+        assert_eq!(resp.usage.total_tokens, 0);
+        assert_eq!(resp.usage.source, EmbeddingUsageSource::Unavailable);
     }
 
     #[tokio::test]

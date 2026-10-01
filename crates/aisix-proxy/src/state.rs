@@ -269,8 +269,8 @@ pub struct ProxyStateInner {
     pub cache: Option<CacheBackends>,
     pub routing: Arc<RoutingRegistry>,
     /// Per-instance cache of semantic-router example embeddings, populated
-    /// lazily on first use and reused across requests so semantic routing
-    /// costs one embedding call (the prompt) in steady state.
+    /// lazily on first use and reused across requests so a steady-state
+    /// logical embedding batch contains only the prompt.
     pub semantic_cache: Arc<crate::semantic::SemanticVectorCache>,
     /// Per-request guardrail index. Resolves the applicable chain from
     /// attachment scope + priority on each request. Rebuilds lazily

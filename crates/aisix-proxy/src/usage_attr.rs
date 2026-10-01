@@ -988,6 +988,15 @@ pub(crate) fn emit_usage(
         state.metrics.record_guardrail_blocked_request();
     }
     apply_wildcard_pricing_model(&mut event, surface, dispatched);
+    // Gateway-initiated semantic embeddings are child work of this request,
+    // never attempts for the model the caller addressed. Attach their bounded
+    // ledger only to the one terminal parent event: a retry can emit
+    // non-terminal attempt rows, and a stream's terminal emitter may run much
+    // later, but neither may duplicate or replace the parent's
+    // token/cost/model fields.
+    if terminal {
+        attach_gateway_embedding_audit(&mut event);
+    }
     let emission = trace.map(|bundle| {
         event.trace_id = bundle.trace_id_hex();
         bundle.emission(
@@ -1014,9 +1023,78 @@ pub(crate) fn emit_usage(
     );
 }
 
+/// Move the bounded gateway-embedding child audit to the terminal parent
+/// event. Kept beside the emission chokepoint so no request family can attach
+/// an unbounded or duplicated child trail on an intermediate attempt.
+fn attach_gateway_embedding_audit(event: &mut UsageEvent) {
+    let audit = crate::attribution::take_gateway_embedding_audit();
+    event.gateway_embedding_calls = audit.calls;
+    event.gateway_embedding_calls_dropped = audit.dropped;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn terminal_event_receives_the_bounded_gateway_embedding_audit_once() {
+        let parent = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(parent, async {
+            for index in 0..=crate::attribution::MAX_GATEWAY_EMBEDDING_CALLS {
+                crate::attribution::note_gateway_embedding_call(aisix_obs::GatewayEmbeddingCall {
+                    count: 1,
+                    purpose: aisix_obs::GatewayEmbeddingPurpose::SemanticCache,
+                    embedding_model_id: format!("embed-{index}"),
+                    prompt_tokens: index as u32,
+                    total_tokens: index as u32,
+                    usage_source: aisix_obs::GatewayEmbeddingUsageSource::Reported,
+                    latency_ms: index as u32,
+                    outcome: aisix_obs::GatewayEmbeddingOutcome::Succeeded,
+                });
+            }
+
+            let mut terminal = UsageEvent::default();
+            attach_gateway_embedding_audit(&mut terminal);
+            assert_eq!(
+                terminal.gateway_embedding_calls.len(),
+                crate::attribution::MAX_GATEWAY_EMBEDDING_CALLS,
+            );
+            assert_eq!(
+                terminal.gateway_embedding_calls[0].embedding_model_id,
+                "embed-0"
+            );
+            assert_eq!(terminal.gateway_embedding_calls_dropped, 1);
+
+            let mut duplicate_terminal = UsageEvent::default();
+            attach_gateway_embedding_audit(&mut duplicate_terminal);
+            assert!(duplicate_terminal.gateway_embedding_calls.is_empty());
+            assert_eq!(duplicate_terminal.gateway_embedding_calls_dropped, 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn terminal_usage_event_replaces_an_unsafe_embedding_model_id_with_unknown() {
+        let parent = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(parent, async {
+            crate::attribution::note_gateway_embedding_call(aisix_obs::GatewayEmbeddingCall {
+                count: 1,
+                purpose: aisix_obs::GatewayEmbeddingPurpose::SemanticRoute,
+                embedding_model_id: "界".repeat(100),
+                prompt_tokens: 1,
+                total_tokens: 1,
+                usage_source: aisix_obs::GatewayEmbeddingUsageSource::Reported,
+                latency_ms: 1,
+                outcome: aisix_obs::GatewayEmbeddingOutcome::Succeeded,
+            });
+
+            let mut terminal = UsageEvent::default();
+            attach_gateway_embedding_audit(&mut terminal);
+            let model_id = &terminal.gateway_embedding_calls[0].embedding_model_id;
+            assert_eq!(model_id, "unknown");
+        })
+        .await;
+    }
 
     #[test]
     fn metric_model_label_three_outcomes() {
