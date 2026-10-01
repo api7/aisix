@@ -26,6 +26,11 @@ const WILDCARD_ALIAS = "openrouter/*";
 const KNOWN_MODEL = "openai/gpt-4o-mini";
 const UNKNOWN_MODEL = "unknown/provider-model";
 const PRICING_AUTHORITY_ID = "a3ebdc63-e921-4323-a75c-3b911f950046";
+const EMBEDDING_WILDCARD_ALIAS = "embedding/*";
+const EMBEDDING_REQUEST_MODEL = "embedding/embedding-3-small";
+const EMBEDDING_UPSTREAM_MODEL = "text-embedding-3-small";
+const EMBEDDING_INPUT = "price this embedding";
+const EMBEDDING_VECTOR = [0.1, 0.2, 0.3];
 
 function upstreamResponse() {
   return {
@@ -40,11 +45,24 @@ function upstreamResponse() {
   };
 }
 
+function embeddingUpstreamResponse() {
+  return {
+    object: "list",
+    // Pricing must come from wildcard dispatch attribution rather than the
+    // provider response's optional model field.
+    model: "provider-response-embedding-model",
+    data: [{ object: "embedding", index: 0, embedding: EMBEDDING_VECTOR }],
+    usage: { prompt_tokens: 7, total_tokens: 7 },
+  };
+}
+
 describe("wildcard pricing telemetry e2e", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
   let upstream: OpenAiUpstream | undefined;
+  let embeddingUpstream: OpenAiUpstream | undefined;
   let wildcardID = "";
+  let embeddingWildcardID = "";
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -54,6 +72,7 @@ describe("wildcard pricing telemetry e2e", () => {
 
     sls = await startMockSls();
     upstream = await startOpenAiUpstream({ nonStreamBody: upstreamResponse() });
+    embeddingUpstream = await startOpenAiUpstream({ nonStreamBody: embeddingUpstreamResponse() });
     app = await spawnApp({
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
@@ -86,6 +105,22 @@ describe("wildcard pricing telemetry e2e", () => {
       pricing_authority_id: PRICING_AUTHORITY_ID,
     });
     wildcardID = wildcard.id;
+    const embeddingProviderKey = await seed.createProviderKey({
+      display_name: "wildcard-pricing-embedding-pk",
+      provider: "openai",
+      adapter: "openai",
+      secret: "sk-mock",
+      api_base: `${embeddingUpstream.baseUrl}/v1`,
+    });
+    const embeddingWildcard = await seed.createModel({
+      display_name: EMBEDDING_WILDCARD_ALIAS,
+      provider: "openai",
+      model_name: "text-*",
+      provider_key_id: embeddingProviderKey.id,
+      pricing_authority_id: PRICING_AUTHORITY_ID,
+      embedding: { dimensions: EMBEDDING_VECTOR.length },
+    });
+    embeddingWildcardID = embeddingWildcard.id;
 
     // Seeded last: a successful models-list gate proves that all preceding
     // resources, including the exporter, are in the same gateway snapshot.
@@ -102,6 +137,7 @@ describe("wildcard pricing telemetry e2e", () => {
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
+    await embeddingUpstream?.close();
     await sls?.close();
   });
 
@@ -156,5 +192,50 @@ describe("wildcard pricing telemetry e2e", () => {
     expect(unknown.get("model_id")).toBe(wildcardID);
     expect(unknown.get("pricing_authority_id")).toBe(PRICING_AUTHORITY_ID);
     expect(unknown.get("resolved_pricing_model")).toBe(UNKNOWN_MODEL);
+  });
+
+  test("direct embedding wildcard dispatch exports its concrete pricing identity", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !embeddingUpstream || !embeddingWildcardID) {
+      ctx.skip();
+      return;
+    }
+
+    const baseline = embeddingUpstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/embeddings`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: EMBEDDING_REQUEST_MODEL, input: EMBEDDING_INPUT }),
+    });
+    const body = await res.text();
+    expect(res.status, body).toBe(200);
+    expect(JSON.parse(body)).toMatchObject({
+      object: "list",
+      model: EMBEDDING_REQUEST_MODEL,
+      data: [{ object: "embedding", index: 0, embedding: EMBEDDING_VECTOR }],
+      usage: { prompt_tokens: 7, total_tokens: 7 },
+    });
+
+    const calls = embeddingUpstream.receivedRequests.slice(baseline);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.path).toBe("/v1/embeddings");
+    expect(JSON.parse(calls[0]!.body)).toMatchObject({
+      model: EMBEDDING_UPSTREAM_MODEL,
+      input: EMBEDDING_INPUT,
+    });
+
+    const event = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (log) => log.get("requested_model") === EMBEDDING_REQUEST_MODEL,
+      `usage event for ${EMBEDDING_REQUEST_MODEL}`,
+    );
+    expect(event.get("model_id")).toBe(embeddingWildcardID);
+    expect(event.get("pricing_authority_id")).toBe(PRICING_AUTHORITY_ID);
+    expect(event.get("resolved_pricing_model")).toBe(EMBEDDING_UPSTREAM_MODEL);
+    expect(event.get("prompt_tokens")).toBe("7");
   });
 });
