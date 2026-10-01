@@ -1549,6 +1549,47 @@ fn raw_top_level_values(
     Some(values)
 }
 
+/// Borrowed source values of all occurrences of one top-level key. This is
+/// for traversals which revisit nested carriers: retaining a reference avoids
+/// copying every remaining `tool_result.content` suffix at each level.
+fn raw_top_level_value_refs<'a>(
+    body: &'a [u8],
+    wanted_key: &str,
+) -> Option<Vec<&'a serde_json::value::RawValue>> {
+    struct Values<'a> {
+        wanted_key: &'a str,
+    }
+
+    impl<'de> serde::de::Visitor<'de> for Values<'_> {
+        type Value = Vec<&'de serde_json::value::RawValue>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON object")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut values = Vec::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if key == self.wanted_key {
+                    values.push(map.next_value::<&'de serde_json::value::RawValue>()?);
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+            Ok(values)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let values =
+        serde::de::Deserializer::deserialize_map(&mut deserializer, Values { wanted_key }).ok()?;
+    deserializer.end().ok()?;
+    Some(values)
+}
+
 /// Source values of top-level keys other than `excluded`. Values are captured
 /// as raw JSON before filtering so a known opaque carrier can be skipped
 /// without recursively deserializing its payload.
@@ -1610,6 +1651,12 @@ fn raw_is_object(raw: &serde_json::value::RawValue) -> bool {
 fn raw_array_items(
     raw: &serde_json::value::RawValue,
 ) -> Option<Vec<Box<serde_json::value::RawValue>>> {
+    serde_json::from_str(raw.get()).ok()
+}
+
+fn raw_array_item_refs<'a>(
+    raw: &'a serde_json::value::RawValue,
+) -> Option<Vec<&'a serde_json::value::RawValue>> {
     serde_json::from_str(raw.get()).ok()
 }
 
@@ -1775,16 +1822,16 @@ fn append_raw_text_value(out: &mut String, raw: &serde_json::value::RawValue) ->
 /// duplicate `type` is scanned as source rather than becoming a bypass.
 fn append_chat_request_content_strings(
     out: &mut String,
-    content: Box<serde_json::value::RawValue>,
+    content: &serde_json::value::RawValue,
     scan_error: &mut Option<crate::json_splice::SpliceError>,
 ) -> Option<()> {
-    enum Work {
+    enum Work<'a> {
         Content {
-            value: Box<serde_json::value::RawValue>,
+            value: &'a serde_json::value::RawValue,
             depth: usize,
         },
         Block {
-            value: Box<serde_json::value::RawValue>,
+            value: &'a serde_json::value::RawValue,
             depth: usize,
         },
     }
@@ -1792,10 +1839,11 @@ fn append_chat_request_content_strings(
     // `tool_result.content` can itself contain another `tool_result`. Keep
     // that caller-controlled nesting off the Rust call stack. This measures
     // the content-carrier depth, while a wide valid array stays valid just as
-    // it does for the byte scanner's frame stack.
+    // it does for the byte scanner's frame stack. A carrier at the cap still
+    // scans; only one more nested carrier is unevaluable.
     let mut work = vec![Work::Content {
         value: content,
-        depth: 1,
+        depth: 0,
     }];
     while let Some(work_item) = work.pop() {
         match work_item {
@@ -1810,7 +1858,7 @@ fn append_chat_request_content_strings(
                 }
                 // Push backwards so the LIFO work stack preserves the
                 // previous depth-first, source-order traversal.
-                for block in raw_array_items(&value)?.into_iter().rev() {
+                for block in raw_array_item_refs(value)?.into_iter().rev() {
                     work.push(Work::Block {
                         value: block,
                         depth,
@@ -1837,7 +1885,7 @@ fn append_chat_request_content_strings(
                 match kind.as_deref() {
                     Some("redacted_thinking") => {}
                     Some("tool_result") => {
-                        let nested = raw_top_level_values(block_body, "content")?;
+                        let nested = raw_top_level_value_refs(block_body, "content")?;
                         if nested.is_empty() {
                             continue;
                         }
@@ -1896,7 +1944,7 @@ fn append_chat_request_message_strings(
         )?,
     );
     for content in raw_top_level_values(message_body, "content")? {
-        append_chat_request_content_strings(out, content, scan_error)?;
+        append_chat_request_content_strings(out, &content, scan_error)?;
     }
     for tool_calls in raw_top_level_values(message_body, "tool_calls")? {
         append_scan_text(
@@ -1918,7 +1966,7 @@ fn decoded_chat_request_string_values(
         scan_error,
     )?;
     for system in raw_top_level_values(body, "system")? {
-        append_chat_request_content_strings(&mut out, system, scan_error)?;
+        append_chat_request_content_strings(&mut out, &system, scan_error)?;
     }
     for array in raw_top_level_values(body, "messages")? {
         // The selected (last) carrier made this a Chat envelope. Preserve
@@ -5698,9 +5746,10 @@ mod tests {
         json.into_bytes()
     }
 
-    fn nested_anthropic_tool_result_request(depth: usize) -> Vec<u8> {
+    fn nested_anthropic_tool_result_request(depth: usize, text: &str) -> Vec<u8> {
+        let text = serde_json::to_string(text).expect("test text serializes");
         let content = format!(
-            "{}[{{\"type\":\"text\",\"text\":\"safe\"}}]{}",
+            "{}[{{\"type\":\"text\",\"text\":{text}}}]{}",
             r#"[{"type":"tool_result","tool_use_id":"t","content":"#.repeat(depth),
             "}]".repeat(depth),
         );
@@ -8632,8 +8681,29 @@ mod tests {
     }
 
     #[test]
+    fn nested_anthropic_tool_result_content_keeps_duplicate_source_order() {
+        let body = br#"{"model":"claude","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"text","text":"FIRST"}],"content":[{"type":"text","text":"SECOND"}]}]}]}"#;
+        let text = request_guardrail_text(PassthroughProtocol::OpenaiChat, body);
+        let first = text.find("FIRST").expect("first content field is scanned");
+        let second = text
+            .find("SECOND")
+            .expect("second content field is scanned");
+        assert!(first < second, "{text}");
+    }
+
+    #[test]
+    fn nested_anthropic_tool_result_content_at_depth_cap_is_scanned() {
+        let body =
+            nested_anthropic_tool_result_request(crate::json_splice::MAX_JSON_DEPTH, "BLOCKME");
+        let text = try_request_guardrail_text(PassthroughProtocol::OpenaiChat, &body)
+            .expect("nested tool results at the shared JSON depth cap remain evaluable");
+        assert!(text.contains("BLOCKME"), "{text}");
+    }
+
+    #[test]
     fn nested_anthropic_tool_result_content_beyond_depth_cap_is_unevaluable() {
-        let body = nested_anthropic_tool_result_request(crate::json_splice::MAX_JSON_DEPTH + 1);
+        let body =
+            nested_anthropic_tool_result_request(crate::json_splice::MAX_JSON_DEPTH + 1, "safe");
         let error = try_request_guardrail_text(PassthroughProtocol::OpenaiChat, &body)
             .expect_err("nested tool results beyond the shared JSON depth cap must not recurse");
         assert!(error.is_depth_exceeded(), "{error}");

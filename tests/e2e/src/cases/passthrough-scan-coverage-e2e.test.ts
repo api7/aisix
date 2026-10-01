@@ -68,6 +68,10 @@ const DEEP_ESCAPED_BLOCK_JSON = deepEscapedBlockJSON(160);
 const JSON_DEPTH_CAP = 4_096;
 const OVER_DEPTH_ESCAPED_BLOCK_JSON = deepEscapedBlockJSON(JSON_DEPTH_CAP + 1);
 const OVER_DEPTH_OPAQUE_BLOCK_JSON = deepLiteralBlockJSON(JSON_DEPTH_CAP + 1);
+const AT_DEPTH_ANTHROPIC_TOOL_RESULT_INPUT = deeplyNestedAnthropicToolResultRequest(
+  JSON_DEPTH_CAP,
+  "nested-tool-result-at-depth-cap",
+);
 const OVER_DEPTH_ANTHROPIC_TOOL_RESULT_INPUT = deeplyNestedAnthropicToolResultRequest(
   JSON_DEPTH_CAP + 1,
   "nested-tool-result-fail-closed",
@@ -574,6 +578,19 @@ describe("passthrough guardrail scan coverage", () => {
     const body = await res.text();
     expect(body).toContain("guardrail_unavailable");
     expect(body).toContain("unscannable_body");
+    expect(body).not.toContain(ESCAPED_BLOCK);
+    expect(upstreams.input!.receivedRequests.length).toBe(before);
+  });
+
+  test("input: nested Anthropic tool results at the scanner depth cap are blocked", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstreams.input!.receivedRequests.length;
+    const res = await callRaw("input", "/v1/any", AT_DEPTH_ANTHROPIC_TOOL_RESULT_INPUT);
+    expect(res.status).toBe(422);
+    const body = await res.text();
+    expect(body).toContain("pt-scan-input");
+    expect(body).not.toContain("guardrail_unavailable");
+    expect(body).not.toContain("unscannable_body");
     expect(body).not.toContain(ESCAPED_BLOCK);
     expect(upstreams.input!.receivedRequests.length).toBe(before);
   });
