@@ -1600,16 +1600,6 @@ fn try_raw_json_string_values(body: &[u8]) -> Result<String, crate::json_splice:
         .map_err(|error| raw_json_scan_error(body, error))
 }
 
-#[cfg(test)]
-fn decoded_json_string_values_where(
-    body: &[u8],
-    include: impl FnMut(&[crate::json_splice::PathSeg]) -> bool,
-) -> Option<String> {
-    crate::json_splice::collect_string_values_where(body, include)
-        .ok()
-        .filter(|out| !out.is_empty())
-}
-
 fn decoded_json_string_values_vec_where(
     body: &[u8],
     include: impl FnMut(&[crate::json_splice::PathSeg]) -> bool,
