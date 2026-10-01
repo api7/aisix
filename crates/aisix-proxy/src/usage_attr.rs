@@ -447,11 +447,15 @@ pub(crate) fn metric_model_label_pair<'a>(
 /// has no upstream call to price. Detached gateway work has no caller
 /// attribution and therefore cannot price itself as the parent request.
 fn apply_wildcard_pricing_model(event: &mut UsageEvent, surface: Surface, dispatched: bool) {
-    // Batch-management rows are observable upstream management requests, not
-    // the batch's model inference. They stay unpriced even when their route
-    // resolves through a wildcard alias; batch completion accounting is a
-    // separate surface with its own attribution rules.
-    if surface == crate::operation::BATCHES || !dispatched {
+    // Files, batches, and fine-tuning rows are observable zero-token
+    // management requests, not model inference. They stay unpriced even when
+    // their route resolves through a wildcard alias; batch completion
+    // accounting is a separate surface with its own attribution rules.
+    if !dispatched
+        || surface == crate::operation::FILES
+        || surface == crate::operation::BATCHES
+        || surface == crate::operation::FINE_TUNING
+    {
         return;
     }
     let Some(resolved) = crate::attribution::current() else {
@@ -1198,17 +1202,29 @@ mod tests {
                 );
                 assert_eq!(event.resolved_pricing_model, "gpt-4o-2024-08-06");
 
-                let mut batch_event = UsageEvent {
-                    // NO-GUARDRAIL-CHAIN: this focused unit test constructs
-                    // a synthetic pricing event, not a gateway request.
-                    model_id: "wildcard".to_string(),
-                    guardrail_bypassed_reason: String::new(),
-                    applied_guardrails: Vec::new(),
-                    ..Default::default()
-                };
-                apply_wildcard_pricing_model(&mut batch_event, crate::operation::BATCHES, true);
-                assert!(batch_event.pricing_authority_id.is_empty());
-                assert!(batch_event.resolved_pricing_model.is_empty());
+                for (surface, management_kind) in [
+                    (crate::operation::FILES, "file"),
+                    (crate::operation::BATCHES, "batch"),
+                    (crate::operation::FINE_TUNING, "fine-tuning"),
+                ] {
+                    let mut management_event = UsageEvent {
+                        // NO-GUARDRAIL-CHAIN: this focused unit test constructs
+                        // a synthetic pricing event, not a gateway request.
+                        model_id: "wildcard".to_string(),
+                        guardrail_bypassed_reason: String::new(),
+                        applied_guardrails: Vec::new(),
+                        ..Default::default()
+                    };
+                    apply_wildcard_pricing_model(&mut management_event, surface, true);
+                    assert!(
+                        management_event.pricing_authority_id.is_empty(),
+                        "{management_kind} management event must not select wildcard pricing"
+                    );
+                    assert!(
+                        management_event.resolved_pricing_model.is_empty(),
+                        "{management_kind} management event must not select wildcard pricing"
+                    );
+                }
 
                 crate::attribution::note_cache_hit_entry(&cache_entry, "exact");
                 let cached_attribution =

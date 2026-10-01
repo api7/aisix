@@ -2421,6 +2421,90 @@ mod tests {
         assert_eq!(&bytes[..], b"{\"custom_id\":\"r1\"}\n");
     }
 
+    #[tokio::test]
+    async fn wildcard_selected_file_and_fine_tuning_management_events_are_unpriced() {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/files/file-abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "file-abc",
+                "object": "file"
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/fine_tuning/jobs/ftjob-9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "ftjob-9",
+                "object": "fine_tuning.job"
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        let wildcard: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "jobs/*",
+            "provider": "openai",
+            "model_name": "*",
+            "provider_key_id": PK_A,
+            "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046",
+        }))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("wildcard", wildcard, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let (app, mut rx) = build_app_with_sink(snap);
+
+        for (management_kind, path, operation) in [
+            (
+                "file",
+                format!(
+                    "/v1/files/{}",
+                    encode_routed_id("file-abc", "jobs/gpt-4o-2024-08-06")
+                ),
+                "files",
+            ),
+            (
+                "fine-tuning",
+                format!(
+                    "/v1/fine_tuning/jobs/{}",
+                    encode_routed_id("ftjob-9", "jobs/gpt-4o-2024-08-06")
+                ),
+                "fine_tuning",
+            ),
+        ] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(path)
+                .header("authorization", "Bearer sk-caller")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{management_kind}");
+
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("management usage event must arrive")
+                .expect("usage sink must remain open");
+            assert_eq!(event.model_id, "wildcard", "{management_kind}");
+            assert_eq!(event.requested_model, "jobs/*", "{management_kind}");
+            assert_eq!(event.operation, operation, "{management_kind}");
+            assert_eq!(event.prompt_tokens, 0, "{management_kind}");
+            assert_eq!(event.completion_tokens, 0, "{management_kind}");
+            assert!(
+                event.pricing_authority_id.is_empty(),
+                "{management_kind} management event must not select wildcard pricing"
+            );
+            assert!(
+                event.resolved_pricing_model.is_empty(),
+                "{management_kind} management event must not select wildcard pricing"
+            );
+        }
+    }
+
     // ---- batches ----
 
     #[tokio::test]
