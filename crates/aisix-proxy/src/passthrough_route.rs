@@ -1559,11 +1559,14 @@ fn response_top_level_array_values<'a>(
     if values.is_empty() {
         return Ok(None);
     }
-    values
+    if values
         .iter()
         .all(|value| value.get().trim_start().starts_with('['))
-        .then_some(values)
-        .ok_or(())
+    {
+        Ok(Some(values))
+    } else {
+        Err(())
+    }
 }
 
 /// `choices[].message` and `choices[].text` are mutually exclusive response
