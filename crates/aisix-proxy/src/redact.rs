@@ -986,7 +986,8 @@ fn responses_item_is_system(item: &Value) -> bool {
 }
 
 /// One `/v1/responses` input/output item. `message` items carry
-/// string-or-parts content (`input_text` / `output_text` / plain `text`);
+/// string-or-parts content (`input_text` / `output_text` / plain `text` /
+/// `refusal`);
 /// `function_call` carries JSON-encoded `arguments`;
 /// `function_call_output` carries a string `output`.
 fn redact_responses_item(
@@ -1001,13 +1002,17 @@ fn redact_responses_item(
             Some(v @ Value::String(_)) => apply_to_value_string(chain, dir, v, counts),
             Some(Value::Array(parts)) => {
                 for part in parts {
-                    if matches!(
-                        part.get("type").and_then(Value::as_str),
-                        Some("input_text") | Some("output_text") | Some("text")
-                    ) {
-                        if let Some(text) = part.get_mut("text") {
-                            apply_to_value_string(chain, dir, text, counts);
+                    let field = match part.get("type").and_then(Value::as_str) {
+                        Some("input_text" | "output_text" | "text") => Some("text"),
+                        Some("refusal")
+                            if matches!(dir, Direction::Output | Direction::OutputEcho) =>
+                        {
+                            Some("refusal")
                         }
+                        _ => None,
+                    };
+                    if let Some(field) = field.and_then(|field| part.get_mut(field)) {
+                        apply_to_value_string(chain, dir, field, counts);
                     }
                 }
             }
@@ -1146,12 +1151,11 @@ fn apply_to_text_slot(
 }
 
 /// Mask a `/v1/responses` non-streaming RESPONSE body in place — the same
-/// surface the output check scans: message `output_text`, `text` and
-/// `input_text` parts, and each item's tool-call `name` (scan-only) /
-/// `arguments` / `input`. Hosted-tool results (`mcp_call.output`,
-/// `file_search_call` results, `code_interpreter_call` logs), `refusal`
-/// parts, and hosted-tool code or action text are neither scanned nor
-/// masked.
+/// surface the output check scans: message `output_text`, `text`,
+/// `input_text`, and `refusal` parts, and each item's tool-call `name`
+/// (scan-only) / `arguments` / `input`. Hosted-tool results
+/// (`mcp_call.output`, `file_search_call` results, `code_interpreter_call`
+/// logs) and hosted-tool code or action text are neither scanned nor masked.
 pub fn redact_responses_response(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_output() {
@@ -2026,9 +2030,9 @@ pub fn anthropic_sse_text(raw: &[u8]) -> String {
     channels.into_values().collect()
 }
 
-/// The concatenated `output_text` delta content of a buffered
-/// `/v1/responses` SSE stream (channel order). Same capture-rebuild role
-/// as [`anthropic_sse_text`].
+/// The concatenated client-visible delta content of a buffered `/v1/responses`
+/// SSE stream (channel order). Same capture-rebuild role as
+/// [`anthropic_sse_text`].
 pub fn responses_sse_text(raw: &[u8]) -> String {
     let (frames, _) = split_sse_frames(raw);
     // First-seen channel order (NOT key order): the rebuilt capture must
@@ -2038,21 +2042,22 @@ pub fn responses_sse_text(raw: &[u8]) -> String {
         let Some(data) = frame.data.as_ref() else {
             continue;
         };
-        if data.get("type").and_then(Value::as_str) != Some("response.output_text.delta") {
-            continue;
-        }
+        let kind = match data.get("type").and_then(Value::as_str) {
+            Some(kind @ ("response.output_text.delta" | "response.refusal.delta")) => kind,
+            _ => continue,
+        };
         let Some(t) = data.get("delta").and_then(Value::as_str) else {
             continue;
         };
         let key = match data.get("item_id").and_then(Value::as_str) {
             Some(id) => format!(
-                "{id}/{}",
+                "{kind}/{id}/{}",
                 data.get("content_index")
                     .and_then(Value::as_u64)
                     .unwrap_or(0)
             ),
             None => format!(
-                "{}/{}",
+                "{kind}/{}/{}",
                 data.get("output_index")
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
@@ -2073,7 +2078,7 @@ pub fn responses_sse_text(raw: &[u8]) -> String {
 
 /// Mask a fully-buffered Responses-API SSE byte stream (the `/v1/responses`
 /// verbatim hold-back and the cross-provider bridge release). Delta events
-/// are reassembled per channel (`output_text.delta`,
+/// are reassembled per channel (`output_text.delta`, `refusal.delta`,
 /// `function_call_arguments.delta`, `mcp_call_arguments.delta`,
 /// `custom_tool_call_input.delta`, each by item), masked once, and
 /// re-emitted on the channel's first frame; the aggregate events carry
@@ -2081,8 +2086,8 @@ pub fn responses_sse_text(raw: &[u8]) -> String {
 /// event by its own arm, and `output_item.done` / `response.completed`
 /// (`.incomplete`, `.failed`) through [`redact_responses_item`], so the
 /// latter cover the same slots as [`redact_responses_response`] and no
-/// more. Deterministic masking keeps them consistent with the delta
-/// channels.
+/// more. Both `*.added` and `*.done` aggregate forms are authoritative;
+/// deterministic masking keeps them consistent with the delta channels.
 /// `None` = nothing matched, forward the original bytes byte-identical.
 pub fn redact_responses_sse(
     chain: &dyn Guardrail,
@@ -2125,13 +2130,16 @@ pub fn redact_responses_sse(
             continue;
         };
         match data.get("type").and_then(Value::as_str) {
-            Some("response.output_text.delta") => {
+            Some(ty @ ("response.output_text.delta" | "response.refusal.delta")) => {
                 if data
                     .get("delta")
                     .and_then(Value::as_str)
                     .is_some_and(|t| !t.is_empty())
                 {
-                    text_channels.entry(channel_key(data)).or_default().push(fi);
+                    text_channels
+                        .entry(format!("{ty}/{}", channel_key(data)))
+                        .or_default()
+                        .push(fi);
                 }
             }
             // MCP tool calls stream their JSON-encoded arguments on their
@@ -2248,19 +2256,30 @@ pub fn redact_responses_sse(
                     apply_to_value_string(chain, aggregate, text, &mut local);
                 }
             }
+            "response.refusal.done" => {
+                if let Some(refusal) = data.get_mut("refusal") {
+                    apply_to_value_string(chain, aggregate, refusal, &mut local);
+                }
+            }
             // The part union also carries `reasoning_text` (a reasoning
             // item's content), which is generated reasoning and out of the
             // output scope — the same part types `redact_responses_item`
             // walks on a message, and no others.
-            "response.content_part.done" => {
-                let part = data.get_mut("part").filter(|p| {
-                    matches!(
-                        p.get("type").and_then(Value::as_str),
-                        Some("output_text" | "text" | "input_text")
-                    )
-                });
-                if let Some(text) = part.and_then(|p| p.get_mut("text")) {
-                    apply_to_value_string(chain, aggregate, text, &mut local);
+            "response.content_part.added" | "response.content_part.done" => {
+                let part = data.get_mut("part");
+                let field = part
+                    .as_deref()
+                    .and_then(|part| part.get("type"))
+                    .and_then(Value::as_str)
+                    .and_then(|kind| match kind {
+                        "output_text" | "text" | "input_text" => Some("text"),
+                        "refusal" => Some("refusal"),
+                        _ => None,
+                    });
+                if let Some(slot) =
+                    field.and_then(|field| part.and_then(|part| part.get_mut(field)))
+                {
+                    apply_to_value_string(chain, aggregate, slot, &mut local);
                 }
             }
             "response.function_call_arguments.done" | "response.mcp_call_arguments.done" => {
@@ -2275,7 +2294,7 @@ pub fn redact_responses_sse(
                     apply_to_value_string(chain, aggregate, input, &mut local);
                 }
             }
-            "response.output_item.done" => {
+            "response.output_item.added" | "response.output_item.done" => {
                 if let Some(item) = data.get_mut("item") {
                     redact_responses_item(chain, aggregate, item, &mut local);
                 }
@@ -3226,6 +3245,34 @@ mod tests {
         assert_eq!(counts.get("email"), Some(&1));
     }
 
+    #[test]
+    fn responses_sse_masks_refusal_delta_and_aggregate_events() {
+        let chain = both();
+        let raw = concat!(
+            "event: response.refusal.delta\ndata: {\"type\":\"response.refusal.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"mail a@\"}\n\n",
+            "event: response.refusal.delta\ndata: {\"type\":\"response.refusal.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"x.com now\"}\n\n",
+            "event: response.refusal.done\ndata: {\"type\":\"response.refusal.done\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"refusal\":\"mail a@x.com now\"}\n\n",
+            "event: response.content_part.done\ndata: {\"type\":\"response.content_part.done\",\"part\":{\"type\":\"refusal\",\"refusal\":\"mail a@x.com now\"}}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"mail a@x.com now\"}]}]}}\n\n",
+        );
+        let (out, counts) = redact_responses_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "original must be gone: {out}");
+        assert!(
+            out.contains("\"delta\":\"mail [EMAIL_REDACTED] now\""),
+            "out: {out}"
+        );
+        assert!(
+            out.contains("\"refusal\":\"mail [EMAIL_REDACTED] now\""),
+            "out: {out}"
+        );
+        assert_eq!(
+            responses_sse_text(out.as_bytes()),
+            "mail [EMAIL_REDACTED] now"
+        );
+        assert_eq!(counts.get("email"), Some(&1));
+    }
+
     /// #1027: a Responses stream restates each delta channel on its
     /// aggregate events. The mask pass counts a span once, so a collector
     /// must tell the restatements apart — or a monitor preview counts the
@@ -4004,7 +4051,8 @@ mod tests {
             "id": "resp_1",
             "output": [
                 {"type": "message", "role": "assistant", "content": [
-                    {"type": "output_text", "text": "mail a@x.com"}
+                    {"type": "output_text", "text": "mail a@x.com"},
+                    {"type": "refusal", "refusal": "mail c@z.io"}
                 ]},
                 {"type": "function_call", "call_id": "c", "name": "send",
                  "arguments": "{\"to\":\"b@y.org\"}"}
@@ -4016,10 +4064,14 @@ mod tests {
             "mail [EMAIL_REDACTED]"
         );
         assert_eq!(
+            body["output"][0]["content"][1]["refusal"],
+            "mail [EMAIL_REDACTED]"
+        );
+        assert_eq!(
             body["output"][1]["arguments"],
             "{\"to\":\"[EMAIL_REDACTED]\"}"
         );
-        assert_eq!(counts.get("email"), Some(&2));
+        assert_eq!(counts.get("email"), Some(&3));
     }
 
     #[test]

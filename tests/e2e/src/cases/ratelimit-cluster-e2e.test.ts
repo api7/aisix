@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { request, type IncomingMessage } from "node:http";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
@@ -7,9 +8,12 @@ import {
   SeedClient,
   ProxyClient,
   spawnApp,
+  startMockSls,
   startOpenAiUpstream,
   awaitWindowHeadroom,
   waitConfigPropagation,
+  waitForSlsLog,
+  type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -33,6 +37,23 @@ const CALLER_PLAINTEXT = "sk-rl-cluster-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
+const PASSTHROUGH_CALLER_PLAINTEXT = "sk-rl-cluster-passthrough-caller";
+const PASSTHROUGH_CALLER_KEY_HASH = createHash("sha256")
+  .update(PASSTHROUGH_CALLER_PLAINTEXT)
+  .digest("hex");
+const PASSTHROUGH_ROUTE = "rl-cluster-passthrough";
+const PASSTHROUGH_PREFIX = "/rl-cluster-passthrough";
+// Short enough to prove a live stream renews its lease, while leaving a
+// generous interval for CI scheduling around the three-second assertion.
+const PASSTHROUGH_CONCURRENCY_TTL_SECS = 1;
+const PASSTHROUGH_WAIT_BEYOND_TTL_MS = 3_000;
+const PASSTHROUGH_502_SSE = 'event: upstream_error\ndata: {"message":"still-live"}\n\n';
+// Keep a full CI-scheduling cushion after the cross-TTL probe, then wait for
+// this explicit EOF before asserting that the shared slot is released.
+const PASSTHROUGH_502_EOF_DELAY_MS = PASSTHROUGH_WAIT_BEYOND_TTL_MS + 3_000;
+const LEASE_LOSS_SLS_CREDENTIAL_REF = "rate_limit_lease_loss";
+const LEASE_LOSS_SLS_PROJECT = "aisix-e2e-obs";
+const LEASE_LOSS_SLS_LOGSTORE = "rate-limit-lease-loss";
 
 const ETCD_ENDPOINT = etcdEndpoint();
 const REDIS_URL = process.env.AISIX_E2E_REDIS ?? "redis://127.0.0.1:6379";
@@ -59,10 +80,9 @@ async function redisPing(url: string): Promise<boolean> {
 /**
  * One command over a fresh RESP connection, as an array of bulk strings.
  *
- * Only used to manage an ACL user: the refusal case needs a credential
- * the server rejects and then accepts, and `requirepass` is server-wide
- * while every other file in this suite shares the same Redis. An ACL
- * user is scoped to itself and named per run.
+ * Used only for isolated Redis state in this suite. The ACL case needs a
+ * credential the server rejects and then accepts, and the lease-loss cases
+ * remove a member from their unique per-run concurrency bucket.
  */
 async function redisCommand(url: string, args: string[]): Promise<string> {
   const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(url);
@@ -111,6 +131,46 @@ function chatRequest(proxyUrl: string, model: string): Promise<Response> {
       model,
       messages: [{ role: "user", content: "hello" }],
     }),
+  });
+}
+
+function rawPost(
+  url: string,
+  headers: Record<string, string>,
+  body: string,
+): Promise<IncomingMessage> {
+  return new Promise((resolve, reject) => {
+    const req = request(url, { method: "POST", headers }, resolve);
+    req.once("error", reject);
+    req.end(body);
+  });
+}
+
+function readRawBody(response: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    response.on("data", (chunk: Buffer) => chunks.push(chunk));
+    response.once("error", reject);
+    response.once("end", () => resolve(Buffer.concat(chunks)));
+  });
+}
+
+function beforeTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`stream did not terminate within ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    void promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
   });
 }
 
@@ -203,6 +263,384 @@ describe("rate limit is shared across replicas with backend=redis (#798)", () =>
     expect(second.headers.get("retry-after")).toBeTruthy();
     await second.body?.cancel();
   });
+});
+
+// E2E for #1737: a route's SSE response has already returned headers when
+// its body remains live. The shared Redis semaphore must therefore stay held
+// beyond its short crash-recovery TTL, across a different gateway process.
+describe("passthrough SSE concurrency is shared and renewed across Redis replicas (#1737)", () => {
+  let appA: SpawnedApp | undefined;
+  let appB: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let sls: MockSls | undefined;
+  let infraReady = false;
+  let apiKeyId = "";
+  const prefix = `/aisix-e2e-rl-passthrough-${randomUUID()}`;
+
+  const headers = {
+    authorization: `Bearer ${PASSTHROUGH_CALLER_PLAINTEXT}`,
+    "content-type": "application/json",
+  };
+  const call = (proxyUrl: string) =>
+    fetch(`${proxyUrl}${PASSTHROUGH_PREFIX}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: "hold this stream open" }],
+        stream: true,
+      }),
+    });
+
+  beforeAll(async () => {
+    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    if (!infraReady) return;
+
+    sls = await startMockSls();
+    const streamEvents = [
+      JSON.stringify({ choices: [{ delta: { content: "released" } }] }),
+      "[DONE]",
+    ];
+    upstream = await startOpenAiUpstream({
+      scriptedResponses: [
+        // This stream flushes headers then stays open through the TTL
+        // boundary. The post-cancel request ends normally.
+        { streamEvents, firstEventDelayMs: 10_000 },
+        { streamEvents },
+        // The third request stays idle until the test removes its live Redis
+        // member. A fourth request proves another replica can reuse the slot
+        // only after the first body has been terminated.
+        { streamEvents, firstEventDelayMs: 10_000 },
+        { streamEvents },
+      ],
+    });
+    const extra = {
+      etcd: sharedEtcd(prefix),
+      ratelimit: {
+        backend: "redis",
+        redis: { url: REDIS_URL },
+        concurrency_ttl_secs: PASSTHROUGH_CONCURRENCY_TTL_SECS,
+      },
+    };
+    const extraEnv = {
+      [`SLS_CRED_${LEASE_LOSS_SLS_CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
+      [`SLS_CRED_${LEASE_LOSS_SLS_CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",
+    };
+    appA = await spawnApp({ extra, extraEnv });
+    appB = await spawnApp({ extra, extraEnv });
+
+    const seed = new SeedClient(new EtcdClient(), prefix);
+    const providerKey = await seed.createProviderKey({
+      display_name: "rl-cluster-passthrough-pk",
+      secret: "sk-mock",
+      api_base: "http://unused-on-passthrough-route",
+    });
+    await seed.createPassthroughRoute({
+      name: PASSTHROUGH_ROUTE,
+      path_prefix: PASSTHROUGH_PREFIX,
+      target_url: upstream.baseUrl,
+      provider_key_id: providerKey.id,
+    });
+    await seed.createObservabilityExporter({
+      name: "rate-limit-lease-loss-sls",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: LEASE_LOSS_SLS_PROJECT,
+      logstore: LEASE_LOSS_SLS_LOGSTORE,
+      credential_ref: LEASE_LOSS_SLS_CREDENTIAL_REF,
+      content_mode: "metadata_only",
+    });
+    // Write the caller last, then wait for its local models surface on each
+    // replica. That proves the route and its ProviderKey reached the same
+    // snapshot without consuming either scripted stream.
+    const apiKey = await seed.createApiKey({
+      key_hash: PASSTHROUGH_CALLER_KEY_HASH,
+      allowed_models: ["*"],
+      allowed_routes: [PASSTHROUGH_ROUTE],
+      rate_limit: { concurrency: 1 },
+    });
+    apiKeyId = apiKey.id;
+
+    for (const app of [appA!, appB!]) {
+      const probe = new ProxyClient(app.proxyUrl, PASSTHROUGH_CALLER_PLAINTEXT);
+      await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
+    }
+  });
+
+  afterAll(async () => {
+    await appA?.exit();
+    await appB?.exit();
+    await upstream?.close();
+    await sls?.close();
+    if (infraReady) await new EtcdClient().deletePrefix(prefix);
+  });
+
+  test(
+    "a live stream blocks the other replica past the TTL, then cancellation frees it",
+    async (ctx) => {
+      if (!infraReady || !appA || !appB || !upstream || !sls) {
+        ctx.skip();
+        return;
+      }
+
+      // The first response has headers but no event yet, so leaving its body
+      // unread precisely models a client consuming a still-live SSE stream.
+      const first = await call(appA.proxyUrl);
+      expect(first.status).toBe(200);
+      expect(first.headers.get("content-type") ?? "").toContain("text/event-stream");
+      const upstreamCallsWhileHeld = upstream.receivedRequests.length;
+      expect(upstreamCallsWhileHeld).toBe(1);
+
+      // A stale lease would be reclaimed after one second. Keep the stream
+      // alive much longer, then prove B still sees the same global cap.
+      await new Promise((resolve) =>
+        setTimeout(resolve, PASSTHROUGH_WAIT_BEYOND_TTL_MS),
+      );
+      const blocked = await call(appB.proxyUrl);
+      expect(blocked.status).toBe(429);
+      expect(blocked.headers.get("x-ratelimit-scope")).toBe("concurrency");
+      await blocked.text();
+      expect(upstream.receivedRequests).toHaveLength(upstreamCallsWhileHeld);
+
+      // Client cancellation releases the remote lease. Polling B rules out a
+      // locally released A-only hold and waits for the Redis release to land.
+      expect(first.body).not.toBeNull();
+      await first.body!.cancel();
+      let admitted: Response | undefined;
+      await waitConfigPropagation(async () => {
+        const response = await call(appB!.proxyUrl);
+        if (response.status !== 200) {
+          await response.text();
+          return false;
+        }
+        admitted = response;
+        return true;
+      }, 5_000);
+      expect(admitted).toBeDefined();
+      expect(admitted!.headers.get("content-type") ?? "").toContain("text/event-stream");
+      expect(await admitted!.text()).toContain("[DONE]");
+      expect(upstream.receivedRequests).toHaveLength(upstreamCallsWhileHeld + 1);
+
+      // A successful Redis response that says the member is absent is not a
+      // backend outage. Stop this idle body rather than let a second replica
+      // use the freed semaphore slot while it still forwards provider bytes.
+      let leaseLost: Response | undefined;
+      await waitConfigPropagation(async () => {
+        const response = await call(appA!.proxyUrl);
+        if (response.status !== 200) {
+          await response.text();
+          return false;
+        }
+        leaseLost = response;
+        return true;
+      }, 5_000);
+      expect(leaseLost).toBeDefined();
+      const leaseLossRequestId = leaseLost!.headers.get("x-aisix-request-id") ?? "";
+      expect(leaseLossRequestId).not.toBe("");
+      expect(
+        await redisCommand(REDIS_URL, ["DEL", `aisix:rl:{${apiKeyId}}:conc`]),
+      ).toBe(":1\r\n");
+      expect(await beforeTimeout(leaseLost!.text(), 2_000)).toBe("");
+      const leaseLossLog = await waitForSlsLog(
+        sls,
+        LEASE_LOSS_SLS_LOGSTORE,
+        (log) => log.get("request_id") === leaseLossRequestId,
+        `lease-loss telemetry for ${leaseLossRequestId}`,
+        20_000,
+      );
+      expect(leaseLossLog.get("status_code")).toBe("429");
+      expect(leaseLossLog.get("error_class")).toBe("rate_limit_lease_lost");
+
+      let admittedAfterLeaseLoss: Response | undefined;
+      await waitConfigPropagation(async () => {
+        const response = await call(appB!.proxyUrl);
+        if (response.status !== 200) {
+          await response.text();
+          return false;
+        }
+        admittedAfterLeaseLoss = response;
+        return true;
+      }, 5_000);
+      expect(admittedAfterLeaseLoss).toBeDefined();
+      expect(await admittedAfterLeaseLoss!.text()).toContain("[DONE]");
+      expect(upstream.receivedRequests).toHaveLength(upstreamCallsWhileHeld + 3);
+    },
+    30_000,
+  );
+});
+
+// Non-success SSE bodies use the same streaming handoff as successful ones.
+// This needs its own E2E because a 502 must keep the distributed slot until
+// the upstream error body's EOF without rewriting its bytes.
+describe("passthrough 502 SSE concurrency is shared through delayed EOF (#1737)", () => {
+  let appA: SpawnedApp | undefined;
+  let appB: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let infraReady = false;
+  let apiKeyId = "";
+  const prefix = `/aisix-e2e-rl-passthrough-502-${randomUUID()}`;
+  const route = "rl-cluster-passthrough-502";
+  const routePrefix = `/${route}`;
+  const caller = "sk-rl-cluster-passthrough-502";
+  const callerHash = createHash("sha256").update(caller).digest("hex");
+  const headers = {
+    authorization: `Bearer ${caller}`,
+    "content-type": "application/json",
+  };
+  const body = JSON.stringify({ model: "gpt-4o-mini", stream: true });
+  const call = (proxyUrl: string) => rawPost(`${proxyUrl}${routePrefix}/v1/any`, headers, body);
+
+  beforeAll(async () => {
+    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    if (!infraReady) return;
+
+    upstream = await startOpenAiUpstream({
+      scriptedResponses: [
+        {
+          status: 502,
+          rawErrorBodyChunks: [PASSTHROUGH_502_SSE],
+          eventDelayMs: PASSTHROUGH_502_EOF_DELAY_MS,
+          responseHeaders: { "content-type": "text/event-stream; charset=utf-8" },
+        },
+        {
+          status: 502,
+          rawErrorBody: PASSTHROUGH_502_SSE,
+          responseHeaders: { "content-type": "text/event-stream; charset=utf-8" },
+        },
+        {
+          status: 502,
+          rawErrorBodyChunks: [PASSTHROUGH_502_SSE],
+          eventDelayMs: PASSTHROUGH_502_EOF_DELAY_MS,
+          responseHeaders: { "content-type": "text/event-stream; charset=utf-8" },
+        },
+        {
+          status: 502,
+          rawErrorBody: PASSTHROUGH_502_SSE,
+          responseHeaders: { "content-type": "text/event-stream; charset=utf-8" },
+        },
+      ],
+    });
+    const extra = {
+      etcd: sharedEtcd(prefix),
+      ratelimit: {
+        backend: "redis",
+        redis: { url: REDIS_URL },
+        concurrency_ttl_secs: PASSTHROUGH_CONCURRENCY_TTL_SECS,
+      },
+    };
+    appA = await spawnApp({ extra });
+    appB = await spawnApp({ extra });
+
+    const seed = new SeedClient(new EtcdClient(), prefix);
+    const providerKey = await seed.createProviderKey({
+      display_name: "rl-cluster-passthrough-502-pk",
+      secret: "sk-mock",
+      api_base: "http://unused-on-passthrough-route",
+    });
+    await seed.createPassthroughRoute({
+      name: route,
+      path_prefix: routePrefix,
+      target_url: upstream.baseUrl,
+      provider_key_id: providerKey.id,
+    });
+    const apiKey = await seed.createApiKey({
+      key_hash: callerHash,
+      allowed_models: ["*"],
+      allowed_routes: [route],
+      rate_limit: { concurrency: 1 },
+    });
+    apiKeyId = apiKey.id;
+    for (const app of [appA!, appB!]) {
+      const probe = new ProxyClient(app.proxyUrl, caller);
+      await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
+    }
+  });
+
+  afterAll(async () => {
+    await appA?.exit();
+    await appB?.exit();
+    await upstream?.close();
+    if (infraReady) await new EtcdClient().deletePrefix(prefix);
+  });
+
+  test(
+    "an unread 502 SSE holds the shared slot beyond TTL, then EOF releases it without changing bytes",
+    async (ctx) => {
+      if (!infraReady || !appA || !appB || !upstream) {
+        ctx.skip();
+        return;
+      }
+
+      const first = await call(appA.proxyUrl);
+      expect(first.statusCode).toBe(502);
+      expect(first.headers["content-type"]).toBe("text/event-stream; charset=utf-8");
+      const upstreamCallsWhileHeld = upstream.receivedRequests.length;
+      expect(upstreamCallsWhileHeld).toBe(1);
+
+      // The client has response headers but no body reader. The source's
+      // delayed EOF crosses the one-second distributed lease TTL.
+      await new Promise((resolve) => setTimeout(resolve, PASSTHROUGH_WAIT_BEYOND_TTL_MS));
+      const blocked = await call(appB.proxyUrl);
+      expect(blocked.statusCode).toBe(429);
+      expect(blocked.headers["x-ratelimit-scope"]).toBe("concurrency");
+      await readRawBody(blocked);
+      expect(upstream.receivedRequests).toHaveLength(upstreamCallsWhileHeld);
+
+      expect(await readRawBody(first)).toEqual(Buffer.from(PASSTHROUGH_502_SSE));
+      let released: IncomingMessage | undefined;
+      await waitConfigPropagation(async () => {
+        const response = await call(appB!.proxyUrl);
+        if (response.statusCode !== 502) {
+          await readRawBody(response);
+          return false;
+        }
+        released = response;
+        return true;
+      }, 5_000);
+      expect(released).toBeDefined();
+      expect(await readRawBody(released!)).toEqual(Buffer.from(PASSTHROUGH_502_SSE));
+      expect(upstream.receivedRequests).toHaveLength(upstreamCallsWhileHeld + 1);
+
+      // Opaque error representations must remain byte-for-byte upstream
+      // data. A definitive loss ends at EOF; it must not inject an SSE or
+      // JSON error into the provider's 502 body.
+      let leaseLost: IncomingMessage | undefined;
+      await waitConfigPropagation(async () => {
+        const response = await call(appA!.proxyUrl);
+        if (response.statusCode !== 502) {
+          await readRawBody(response);
+          return false;
+        }
+        leaseLost = response;
+        return true;
+      }, 5_000);
+      expect(leaseLost).toBeDefined();
+      expect(
+        await redisCommand(REDIS_URL, ["DEL", `aisix:rl:{${apiKeyId}}:conc`]),
+      ).toBe(":1\r\n");
+      expect(await beforeTimeout(readRawBody(leaseLost!), 2_000)).toEqual(
+        Buffer.from(PASSTHROUGH_502_SSE),
+      );
+
+      let admittedAfterLeaseLoss: IncomingMessage | undefined;
+      await waitConfigPropagation(async () => {
+        const response = await call(appB!.proxyUrl);
+        if (response.statusCode !== 502) {
+          await readRawBody(response);
+          return false;
+        }
+        admittedAfterLeaseLoss = response;
+        return true;
+      }, 5_000);
+      expect(admittedAfterLeaseLoss).toBeDefined();
+      expect(await readRawBody(admittedAfterLeaseLoss!)).toEqual(
+        Buffer.from(PASSTHROUGH_502_SSE),
+      );
+      expect(upstream.receivedRequests).toHaveLength(upstreamCallsWhileHeld + 3);
+    },
+    30_000,
+  );
 });
 
 describe("rate limit is NOT shared with backend=memory (per-replica, the #798 bug)", () => {

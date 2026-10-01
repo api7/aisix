@@ -26,5 +26,5 @@ pub use limiter::{
 };
 pub use store::local::LocalStore;
 pub use store::redis::RedisStore;
-pub use store::RateStore;
+pub use store::{RateStore, StreamLeaseRefresh};
 pub use window::{FixedWindowCounter, WindowCheck};

@@ -14,11 +14,11 @@
 //! data — same rule as `collect_string_leaves` in the MCP scan path),
 //! but they ARE decoded to build the path handed to the predicate.
 //!
-//! The scanner assumes syntactically valid JSON (callers run it on
-//! bytes `serde_json` has already parsed) and still fails safe: any
-//! unexpected byte, overrun, or depth blow-up returns an error rather
-//! than a partially rewritten document. Callers decide the failure
-//! policy (the MCP output hook fails closed).
+//! The scanner is iterative, so deeply nested JSON does not consume the
+//! Rust call stack. [`MAX_JSON_DEPTH`] bounds its per-request traversal
+//! allocations. It still fails safe: any unexpected byte, overrun, or
+//! depth excess returns an error rather than a partially rewritten document.
+//! Callers decide the failure policy (the MCP output hook fails closed).
 
 use std::ops::Range;
 
@@ -40,16 +40,112 @@ impl PathSeg {
 
 /// Scanner failure. Carries no document content (the byte offset only),
 /// so an error can be logged without leaking the payload.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpliceErrorKind {
+    Invalid,
+    DepthExceeded,
+    Unevaluable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("json splice scan failed at byte {at}")]
 pub struct SpliceError {
     at: usize,
+    kind: SpliceErrorKind,
 }
 
-/// Depth cap. `serde_json` refuses documents deeper than 128, so bytes
-/// that reached a splice call can never hit this; it bounds the scanner
-/// on its own anyway.
-const MAX_DEPTH: usize = 256;
+impl SpliceError {
+    /// Whether the scanner stopped at its bounded traversal limit rather than
+    /// because the input was malformed.
+    pub(crate) fn is_depth_exceeded(self) -> bool {
+        self.kind == SpliceErrorKind::DepthExceeded
+    }
+
+    /// Whether source selection could not safely establish the fields a
+    /// guardrail is allowed to inspect. Unlike an invalid raw JSON document,
+    /// this must not fall back to scanning the whole body: that could expose
+    /// an opaque media carrier to an external guardrail.
+    pub(crate) fn is_unevaluable(self) -> bool {
+        matches!(
+            self.kind,
+            SpliceErrorKind::DepthExceeded | SpliceErrorKind::Unevaluable
+        )
+    }
+
+    /// Report an exhausted JSON traversal budget from a selector which uses
+    /// the same bounded raw-JSON policy as this scanner. Selectors retain raw
+    /// fragments rather than source offsets, so the synthetic error uses the
+    /// start of that fragment as its safe, non-payload-bearing location.
+    pub(crate) fn depth_exceeded() -> Self {
+        Self {
+            at: 0,
+            kind: SpliceErrorKind::DepthExceeded,
+        }
+    }
+
+    /// Report a typed carrier that cannot be safely selected without falling
+    /// back to raw source text.
+    pub(crate) fn unevaluable() -> Self {
+        Self {
+            at: 0,
+            kind: SpliceErrorKind::Unevaluable,
+        }
+    }
+}
+
+/// Traversal depth cap. This keeps the iterative scanner stack-safe without
+/// allowing an unbounded JSON path/frame allocation from an unbounded raw
+/// passthrough body. It remains well beyond serde_json's usual recursion cap.
+pub(crate) const MAX_JSON_DEPTH: usize = 4_096;
+
+/// Bounded collection policy for decoded JSON text passed to guardrails.
+/// Source selectors use the same limits so a wide document cannot shift its
+/// allocation from selector bookkeeping into decoded scan text.
+pub(crate) const MAX_JSON_SCAN_VALUES: usize = 1_024;
+pub(crate) const MAX_JSON_SCAN_TEXT_BYTES: usize = 256 * 1024;
+
+/// Validate JSON-number syntax without materializing the value. serde_json
+/// can reject a syntactically valid number outside its runtime numeric range.
+pub(crate) fn is_json_number(token: &[u8]) -> bool {
+    let mut pos = 0;
+    if token.get(pos) == Some(&b'-') {
+        pos += 1;
+    }
+    match token.get(pos) {
+        Some(b'0') => pos += 1,
+        Some(b'1'..=b'9') => {
+            pos += 1;
+            while token.get(pos).is_some_and(|byte| byte.is_ascii_digit()) {
+                pos += 1;
+            }
+        }
+        _ => return false,
+    }
+    if token.get(pos) == Some(&b'.') {
+        pos += 1;
+        let fraction_start = pos;
+        while token.get(pos).is_some_and(|byte| byte.is_ascii_digit()) {
+            pos += 1;
+        }
+        if pos == fraction_start {
+            return false;
+        }
+    }
+    if matches!(token.get(pos), Some(b'e' | b'E')) {
+        pos += 1;
+        if matches!(token.get(pos), Some(b'+' | b'-')) {
+            pos += 1;
+        }
+        let exponent_start = pos;
+        while token.get(pos).is_some_and(|byte| byte.is_ascii_digit()) {
+            pos += 1;
+        }
+        if pos == exponent_start {
+            return false;
+        }
+    }
+    pos == token.len()
+}
 
 /// Rewrite the string values of `input` selected by `should_rewrite`,
 /// leaving every other byte untouched.
@@ -71,7 +167,11 @@ pub fn rewrite_string_values(
         Array,
     }
 
-    let err = |at: usize| SpliceError { at };
+    let err = |at: usize| SpliceError {
+        at,
+        kind: SpliceErrorKind::Invalid,
+    };
+    std::str::from_utf8(input).map_err(|error| err(error.valid_up_to()))?;
     let mut splices: Vec<(Range<usize>, String)> = Vec::new();
     let mut path: Vec<PathSeg> = Vec::new();
     let mut frames: Vec<Frame> = Vec::new();
@@ -88,16 +188,32 @@ pub fn rewrite_string_values(
         let mut i = start + 1;
         while i < input.len() {
             match input[i] {
-                b'\\' => i += 2, // skips the escaped byte; `\uXXXX` needs no care (hex only)
+                b'\\' => match input.get(i + 1).copied() {
+                    Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => i += 2,
+                    Some(b'u') => {
+                        let Some(hex) = input.get(i + 2..i + 6) else {
+                            return Err(err(i));
+                        };
+                        if !hex.iter().all(|byte| byte.is_ascii_hexdigit()) {
+                            return Err(err(i));
+                        }
+                        i += 6;
+                    }
+                    _ => return Err(err(i)),
+                },
                 b'"' => return Ok(i + 1),
+                0..=0x1f => return Err(err(i)),
                 _ => i += 1,
             }
         }
-        Err(SpliceError { at: start })
+        Err(err(start))
     };
     let decode_str = |range: Range<usize>| -> Result<String, SpliceError> {
         let at = range.start;
-        serde_json::from_slice::<String>(&input[range]).map_err(|_| SpliceError { at })
+        serde_json::from_slice::<String>(&input[range]).map_err(|_| SpliceError {
+            at,
+            kind: SpliceErrorKind::Invalid,
+        })
     };
 
     // `true` → the loop continues at a VALUE position; `false` → the
@@ -108,8 +224,11 @@ pub fn rewrite_string_values(
         match b {
             b'{' => {
                 frames.push(Frame::Object);
-                if frames.len() > MAX_DEPTH {
-                    return Err(err(pos));
+                if frames.len() > MAX_JSON_DEPTH {
+                    return Err(SpliceError {
+                        at: pos,
+                        kind: SpliceErrorKind::DepthExceeded,
+                    });
                 }
                 pos += 1;
                 skip_ws(&mut pos);
@@ -135,8 +254,11 @@ pub fn rewrite_string_values(
             }
             b'[' => {
                 frames.push(Frame::Array);
-                if frames.len() > MAX_DEPTH {
-                    return Err(err(pos));
+                if frames.len() > MAX_JSON_DEPTH {
+                    return Err(SpliceError {
+                        at: pos,
+                        kind: SpliceErrorKind::DepthExceeded,
+                    });
                 }
                 pos += 1;
                 skip_ws(&mut pos);
@@ -161,15 +283,22 @@ pub fn rewrite_string_values(
                 }
                 pos = end;
             }
-            // Number / true / false / null. The scanner does not
-            // re-validate the token — the bytes already parsed upstream —
-            // it only needs the token's extent.
+            // Number / true / false / null.
             b'-' | b'0'..=b'9' | b't' | b'f' | b'n' => {
+                let start = pos;
                 while pos < input.len()
                     && matches!(input[pos],
                         b'-' | b'+' | b'.' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
                 {
                     pos += 1;
+                }
+                let token = &input[start..pos];
+                if token != b"true"
+                    && token != b"false"
+                    && token != b"null"
+                    && !is_json_number(token)
+                {
+                    return Err(err(start));
                 }
             }
             _ => return Err(err(pos)),
@@ -242,6 +371,108 @@ pub fn rewrite_string_values(
     Ok(Some(out))
 }
 
+/// Decode and collect every JSON string **value** in source order.
+///
+/// This reuses the iterative splice scanner with a no-op rewrite, so it
+/// preserves duplicate keys and works beyond serde_json's default
+/// container-recursion limit, up to [`MAX_JSON_DEPTH`]. Object keys are
+/// decoded only to maintain the scanner's structure and are never included in
+/// the returned text.
+pub fn collect_string_values(input: &[u8]) -> Result<String, SpliceError> {
+    collect_string_values_where(input, |_| true)
+}
+
+/// Validate one UTF-8 JSON document with the same iterative depth limit as
+/// the guardrail selector, without retaining any of its string values.
+pub(crate) fn validate_json(input: &[u8]) -> Result<(), SpliceError> {
+    rewrite_string_values(input, |_| false, |_| None).map(|_| ())
+}
+
+/// Decode and collect selected JSON string **values** in source order.
+///
+/// Like [`collect_string_values`], this preserves duplicate keys and stays
+/// stack-safe within the bounded nesting limit. The predicate sees the
+/// decoded path of each string value, never an object key.
+pub fn collect_string_values_where(
+    input: &[u8],
+    mut include: impl FnMut(&[PathSeg]) -> bool,
+) -> Result<String, SpliceError> {
+    let mut out = String::new();
+    let mut collect_error = None;
+    rewrite_string_values(
+        input,
+        |path| include(path),
+        |value| {
+            if collect_error.is_none() {
+                let separator = if out.is_empty() { 0 } else { 1 };
+                let Some(next_len) = out
+                    .len()
+                    .checked_add(separator)
+                    .and_then(|len| len.checked_add(value.len()))
+                else {
+                    collect_error = Some(SpliceError::unevaluable());
+                    return None;
+                };
+                if next_len > MAX_JSON_SCAN_TEXT_BYTES
+                    || out.try_reserve(next_len - out.len()).is_err()
+                {
+                    collect_error = Some(SpliceError::unevaluable());
+                    return None;
+                }
+                if separator != 0 {
+                    out.push('\n');
+                }
+                out.push_str(value);
+            }
+            None
+        },
+    )?;
+    collect_error.map_or(Ok(out), Err)
+}
+
+/// Decode selected JSON string values as separate source-order entries.
+///
+/// Stream guardrails use this form to keep separate repeated carrier fields
+/// in independent continuation channels rather than inserting separators
+/// into a literal split across frames.
+pub fn collect_string_values_where_vec(
+    input: &[u8],
+    mut include: impl FnMut(&[PathSeg]) -> bool,
+) -> Result<Vec<String>, SpliceError> {
+    let mut out = Vec::new();
+    let mut source_bytes = 0usize;
+    let mut collect_error = None;
+    rewrite_string_values(
+        input,
+        |path| include(path),
+        |value| {
+            if collect_error.is_none() {
+                let Some(next_bytes) = source_bytes.checked_add(value.len()) else {
+                    collect_error = Some(SpliceError::unevaluable());
+                    return None;
+                };
+                if out.len() >= MAX_JSON_SCAN_VALUES
+                    || next_bytes > MAX_JSON_SCAN_TEXT_BYTES
+                    || out.try_reserve(1).is_err()
+                {
+                    collect_error = Some(SpliceError::unevaluable());
+                    return None;
+                }
+                let mut decoded = String::new();
+                if decoded.try_reserve(value.len()).is_err() {
+                    collect_error = Some(SpliceError::unevaluable());
+                    return None;
+                }
+                decoded.push_str(value);
+                source_bytes = next_bytes;
+                out.push(decoded);
+            }
+            None
+        },
+    )?;
+    collect_error.map_or(Ok(out), Err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +501,11 @@ mod tests {
         assert!(rewrite_string_values(doc.as_bytes(), |_| true, |_| None)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn validates_large_exponent_without_materializing_a_number() {
+        assert!(validate_json(br#"{"n":1e400}"#).is_ok());
     }
 
     #[test]
@@ -318,6 +554,59 @@ mod tests {
         .unwrap();
         // "z" (outside params.arguments) is filtered by the predicate.
         assert_eq!(seen, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn collects_deep_string_values_without_recursion() {
+        let depth = 512;
+        let mut doc = "{\"v\":".repeat(depth);
+        doc.push_str(r#""\u0042LOCKME""#);
+        doc.push_str(&"}".repeat(depth));
+
+        assert_eq!(collect_string_values(doc.as_bytes()).unwrap(), "BLOCKME");
+    }
+
+    #[test]
+    fn collects_selected_paths_with_duplicate_keys_and_nested_values() {
+        let doc = r#"{"model":"routing-only","messages":[{"content":"first","metadata":{"note":"nested"}}],"messages":[{"content":"second"}]}"#;
+        assert_eq!(
+            collect_string_values_where(doc.as_bytes(), |path| {
+                !path.first().is_some_and(|segment| segment.is_key("model"))
+            })
+            .unwrap(),
+            "first\nnested\nsecond"
+        );
+    }
+
+    #[test]
+    fn collects_selected_values_as_separate_source_ordered_entries() {
+        let doc = r#"{"type":"response.output_text.delta","delta":"FOR","delta":"ok"}"#;
+        assert_eq!(
+            collect_string_values_where_vec(doc.as_bytes(), |path| {
+                path.first().is_some_and(|segment| segment.is_key("delta"))
+            })
+            .unwrap(),
+            vec!["FOR", "ok"]
+        );
+    }
+
+    #[test]
+    fn collected_json_text_over_the_shared_cap_is_unevaluable() {
+        let doc = format!(
+            r#"{{"text":"{}"}}"#,
+            "x".repeat(MAX_JSON_SCAN_TEXT_BYTES + 1)
+        );
+        let error = collect_string_values(doc.as_bytes())
+            .expect_err("a JSON text collection must stay bounded");
+        assert!(error.is_unevaluable(), "{error}");
+        let error = collect_string_values_where_vec(doc.as_bytes(), |_| true)
+            .expect_err("vector collection shares the text cap");
+        assert!(error.is_unevaluable(), "{error}");
+
+        let values = format!("[{}]", "\"\",".repeat(MAX_JSON_SCAN_VALUES) + "\"\"",);
+        let error = collect_string_values_where_vec(values.as_bytes(), |_| true)
+            .expect_err("vector collection also bounds empty values");
+        assert!(error.is_unevaluable(), "{error}");
     }
 
     #[test]
@@ -399,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn depth_cap_errors() {
+    fn deep_nesting_is_stack_safe() {
         let mut doc = String::new();
         for _ in 0..300 {
             doc.push('[');
@@ -407,6 +696,16 @@ mod tests {
         for _ in 0..300 {
             doc.push(']');
         }
-        assert!(rewrite_string_values(doc.as_bytes(), |_| true, |_| None).is_err());
+        assert!(rewrite_string_values(doc.as_bytes(), |_| true, |_| None)
+            .expect("valid deep JSON")
+            .is_none());
+    }
+
+    #[test]
+    fn nesting_beyond_the_cap_errors() {
+        let depth = MAX_JSON_DEPTH + 1;
+        let doc = format!("{}\"value\"{}", "[".repeat(depth), "]".repeat(depth));
+        let err = rewrite_string_values(doc.as_bytes(), |_| true, |_| None).unwrap_err();
+        assert!(err.is_depth_exceeded());
     }
 }

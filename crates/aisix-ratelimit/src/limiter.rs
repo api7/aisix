@@ -29,7 +29,7 @@ use aisix_core::RateLimit;
 use crate::clock::Clock;
 use crate::error::RateLimitError;
 use crate::store::local::LocalStore;
-use crate::store::RateStore;
+use crate::store::{RateStore, StreamLeaseRefresh};
 
 /// Current window state for a single key, returned by [`Limiter::peek`].
 /// Used by the proxy handlers to inject the `x-ratelimit-*` response
@@ -106,10 +106,25 @@ impl Limiter {
     ) -> Result<Reservation, RateLimitError> {
         let member = self.next_member();
         self.store.acquire(key, limits, &member).await?;
+        let has_concurrency_slot = limits.concurrency.is_some();
+        // Keep this state from acquire onward. A slow upstream-header phase
+        // can discover a missing Redis member before the response is known
+        // to be SSE; `into_stream_hold` forwards the stored value later.
+        let (lease_loss, _) = tokio::sync::watch::channel(false);
+        let refresh_task = spawn_lease_refresh(
+            Arc::clone(&self.store),
+            key.to_string(),
+            member.clone(),
+            has_concurrency_slot,
+            Some(lease_loss.clone()),
+        );
         Ok(Reservation {
             store: Arc::clone(&self.store),
             key: key.to_string(),
             member,
+            has_concurrency_slot,
+            refresh_task,
+            lease_loss,
             committed: false,
         })
     }
@@ -135,6 +150,71 @@ impl Limiter {
     }
 }
 
+/// Keep a distributed concurrency member alive from acquisition until the
+/// request either commits, drops, or transfers the member to a stream hold.
+///
+/// A request can spend longer than the Redis concurrency TTL waiting for
+/// upstream response headers. Starting at acquire, rather than only after
+/// the SSE handoff, keeps that still-live request from being pruned first.
+/// Local stores opt out, and callers outside a Tokio runtime retain the
+/// backend's normal stale-lease recovery behavior.
+fn spawn_lease_refresh(
+    store: Arc<dyn RateStore>,
+    key: String,
+    member: String,
+    has_concurrency_slot: bool,
+    lease_loss: Option<tokio::sync::watch::Sender<bool>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !has_concurrency_slot {
+        return None;
+    }
+    let interval = store.stream_lease_refresh_interval()?;
+    tokio::runtime::Handle::try_current().ok().map(|handle| {
+        handle.spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if matches!(
+                    store.refresh_stream_lease_outcome(&key, &member).await,
+                    StreamLeaseRefresh::Missing
+                ) {
+                    if let Some(lease_loss) = &lease_loss {
+                        // The response body may not have been polled yet, so
+                        // no receiver may be subscribed at the exact moment
+                        // Redis proves the member disappeared. Preserve this
+                        // one-way state for the later body handoff instead of
+                        // dropping a `watch::send` notification with zero
+                        // receivers.
+                        lease_loss.send_replace(true);
+                    }
+                    return;
+                }
+            }
+        })
+    })
+}
+
+/// Relay each reservation's durable lease-loss state into the one receiver a
+/// streamed response selects on. A multi-layer reservation must stop when any
+/// of its shared concurrency members disappears.
+fn spawn_lease_loss_forwarder(
+    mut source: tokio::sync::watch::Receiver<bool>,
+    target: tokio::sync::watch::Sender<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    tokio::runtime::Handle::try_current().ok().map(|handle| {
+        handle.spawn(async move {
+            loop {
+                if *source.borrow_and_update() {
+                    target.send_replace(true);
+                    return;
+                }
+                if source.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+    })
+}
+
 impl Default for Limiter {
     fn default() -> Self {
         Self::new()
@@ -147,6 +227,14 @@ pub struct Reservation {
     store: Arc<dyn RateStore>,
     key: String,
     member: String,
+    has_concurrency_slot: bool,
+    /// Starts at successful acquire, rather than at the later SSE handoff:
+    /// a slow header phase is still an active request that owns this slot.
+    refresh_task: Option<tokio::task::JoinHandle<()>>,
+    /// Durable across the response-header / streaming-body handoff. A
+    /// `watch::send` would drop a pre-body notification with no subscriber,
+    /// while `send_replace` keeps the terminal state for the later hold.
+    lease_loss: tokio::sync::watch::Sender<bool>,
     committed: bool,
 }
 
@@ -160,9 +248,16 @@ impl std::fmt::Debug for Reservation {
 }
 
 impl Reservation {
+    fn stop_refresh(&mut self) {
+        if let Some(task) = self.refresh_task.take() {
+            task.abort();
+        }
+    }
+
     /// Post-deduct phase. Records the actual token cost against TPM/TPD
     /// and releases the concurrency slot.
     pub async fn commit_tokens(mut self, tokens: u64) {
+        self.stop_refresh();
         self.store.commit(&self.key, tokens, &self.member).await;
         self.committed = true;
     }
@@ -170,6 +265,7 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
+        self.stop_refresh();
         if self.committed {
             return;
         }
@@ -213,8 +309,9 @@ impl MultiReservation {
     /// Convert into an owned [`StreamConcurrencyGuard`] for the streaming
     /// path. The per-layer concurrency slots stay held — they are NOT
     /// released here — and are released only when the returned guard drops,
-    /// i.e. at stream completion or cancellation. Token accounting still
-    /// happens via [`Limiter::add_tokens_post_stream`].
+    /// i.e. at stream completion or cancellation. Shared stores renew their
+    /// live leases while the guard exists. Token accounting still happens via
+    /// [`Limiter::add_tokens_post_stream`].
     ///
     /// A borrow-based reservation couldn't outlive the request handler, so
     /// the pre-fix streaming path dropped it at handler return; that
@@ -223,6 +320,9 @@ impl MultiReservation {
     #[must_use = "dropping the returned guard immediately releases the concurrency \
                   slot, recreating the early-release bug this fixes"]
     pub fn into_stream_hold(mut self) -> StreamConcurrencyGuard {
+        let mut refresh_tasks = Vec::new();
+        let mut lease_loss_tasks = Vec::new();
+        let (lease_loss, _) = tokio::sync::watch::channel(false);
         let holds = self
             .reservations
             .iter_mut()
@@ -230,11 +330,36 @@ impl MultiReservation {
                 // Defuse each reservation's Drop so it doesn't release the
                 // slot now; the returned guard owns release from here on.
                 r.committed = true;
-                (Arc::clone(&r.store), r.key.clone(), r.member.clone())
+                let store = Arc::clone(&r.store);
+                // Keep the acquisition-time worker: it may already have
+                // observed a missing lease while upstream response headers
+                // were pending. A per-layer watcher forwards that durable
+                // state into the one response-body receiver below.
+                if let Some(task) = r.refresh_task.take().or_else(|| {
+                    spawn_lease_refresh(
+                        Arc::clone(&store),
+                        r.key.clone(),
+                        r.member.clone(),
+                        r.has_concurrency_slot,
+                        Some(r.lease_loss.clone()),
+                    )
+                }) {
+                    refresh_tasks.push(task);
+                }
+                let mut source = r.lease_loss.subscribe();
+                if *source.borrow_and_update() {
+                    lease_loss.send_replace(true);
+                } else if let Some(task) = spawn_lease_loss_forwarder(source, lease_loss.clone()) {
+                    lease_loss_tasks.push(task);
+                }
+                (store, r.key.clone(), r.member.clone())
             })
             .collect();
         StreamConcurrencyGuard {
             holds,
+            refresh_tasks,
+            lease_loss_tasks,
+            lease_loss,
             released: false,
         }
     }
@@ -255,15 +380,38 @@ impl std::fmt::Debug for MultiReservation {
 pub struct StreamConcurrencyGuard {
     /// `(store, key, member)` per held layer.
     holds: Vec<(Arc<dyn RateStore>, String, String)>,
+    /// Renews the lease used by shared stores while this guard owns a live
+    /// stream. These tasks began at reservation acquisition and are stopped
+    /// before terminal release to prevent a late renewal from racing teardown.
+    refresh_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Bridges each held layer's pre-handoff watch into `lease_loss`.
+    lease_loss_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// One-way notification that a Redis refresh found one of this stream's
+    /// members missing. Passthrough SSE response bodies use it to stop before
+    /// another replica can reuse the now-free shared concurrency slot.
+    lease_loss: tokio::sync::watch::Sender<bool>,
     released: bool,
 }
 
 impl StreamConcurrencyGuard {
+    /// Subscribe from a passthrough SSE response body before moving this hold
+    /// into it. Local stores keep the channel at `false`, so the receiver
+    /// remains pending without changing their historical behavior.
+    pub fn lease_loss_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.lease_loss.subscribe()
+    }
+
     fn release_now(&mut self) {
         if self.released {
             return;
         }
         self.released = true;
+        for task in self.refresh_tasks.drain(..) {
+            task.abort();
+        }
+        for task in self.lease_loss_tasks.drain(..) {
+            task.abort();
+        }
         for (store, key, member) in &self.holds {
             store.release(key, member);
         }
@@ -274,6 +422,8 @@ impl std::fmt::Debug for StreamConcurrencyGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamConcurrencyGuard")
             .field("layers", &self.holds.len())
+            .field("refreshing", &!self.refresh_tasks.is_empty())
+            .field("lease_loss_watchers", &self.lease_loss_tasks.len())
             .field("released", &self.released)
             .finish()
     }
@@ -289,6 +439,66 @@ impl Drop for StreamConcurrencyGuard {
 mod tests {
     use super::*;
     use crate::clock::TestClock;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    struct LeaseRefreshStore {
+        inner: LocalStore<TestClock>,
+        refreshes: AtomicU64,
+        outcome: StreamLeaseRefresh,
+    }
+
+    impl LeaseRefreshStore {
+        fn new(outcome: StreamLeaseRefresh) -> Self {
+            Self {
+                inner: LocalStore::with_clock(TestClock::new(100)),
+                refreshes: AtomicU64::new(0),
+                outcome,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RateStore for LeaseRefreshStore {
+        async fn acquire(
+            &self,
+            key: &str,
+            limits: &RateLimit,
+            member: &str,
+        ) -> Result<(), RateLimitError> {
+            self.inner.acquire(key, limits, member).await
+        }
+
+        async fn commit(&self, key: &str, tokens: u64, member: &str) {
+            self.inner.commit(key, tokens, member).await;
+        }
+
+        fn release(&self, key: &str, member: &str) {
+            self.inner.release(key, member);
+        }
+
+        fn add_tokens(&self, key: &str, tokens: u64) {
+            self.inner.add_tokens(key, tokens);
+        }
+
+        fn stream_lease_refresh_interval(&self) -> Option<Duration> {
+            Some(Duration::from_millis(5))
+        }
+
+        async fn refresh_stream_lease_outcome(
+            &self,
+            _key: &str,
+            _member: &str,
+        ) -> StreamLeaseRefresh {
+            self.refreshes.fetch_add(1, Ordering::Relaxed);
+            self.outcome
+        }
+
+        async fn peek(&self, key: &str, limits: &RateLimit) -> Option<RateLimitStatus> {
+            self.inner.peek(key, limits).await
+        }
+    }
 
     fn limits(rpm: Option<u64>, tpm: Option<u64>, concurrency: Option<u32>) -> RateLimit {
         RateLimit {
@@ -799,6 +1009,62 @@ mod tests {
         // Stream completes/cancels → guard drops → slot released.
         drop(hold);
         assert!(limiter.pre_commit("k", &l).await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_stream_lease_refresh_keeps_the_stream_hold_open() {
+        let store = Arc::new(LeaseRefreshStore::new(StreamLeaseRefresh::Unavailable));
+        let limiter = Limiter::with_store(store.clone());
+        let limits = limits(None, None, Some(1));
+        let hold = MultiReservation::new(vec![limiter.pre_commit("k", &limits).await.unwrap()])
+            .into_stream_hold();
+        let mut lost = hold.lease_loss_receiver();
+
+        // Let the replacement stream worker register its first timer before
+        // advancing paused time. Two unavailable results prove it keeps
+        // retrying, rather than treating an outage as a confirmed loss.
+        tokio::task::yield_now().await;
+        for expected in 1..=2 {
+            tokio::time::advance(Duration::from_millis(5)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(store.refreshes.load(Ordering::Relaxed), expected);
+        }
+        assert!(
+            !*lost.borrow_and_update(),
+            "an unavailable backend is fail-open, not a definitive lost lease"
+        );
+        assert!(
+            !lost
+                .has_changed()
+                .expect("the hold retains the watch sender"),
+            "unavailable refreshes must not terminate a live stream"
+        );
+
+        drop(hold);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_lease_before_stream_handoff_is_preserved() {
+        let store = Arc::new(LeaseRefreshStore::new(StreamLeaseRefresh::Missing));
+        let limiter = Limiter::with_store(store.clone());
+        let limits = limits(None, None, Some(1));
+        let reservation = limiter.pre_commit("k", &limits).await.unwrap();
+
+        // The worker observes Missing before anyone knows the upstream is
+        // streaming. The later handoff must see that stored state without
+        // waiting for another refresh interval.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(store.refreshes.load(Ordering::Relaxed), 1);
+
+        let hold = MultiReservation::new(vec![reservation]).into_stream_hold();
+        let mut lost = hold.lease_loss_receiver();
+        assert!(
+            *lost.borrow_and_update(),
+            "the response-body handoff must retain a pre-header Missing result"
+        );
+        drop(hold);
     }
 
     #[tokio::test]

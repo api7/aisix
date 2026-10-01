@@ -34,7 +34,12 @@ export interface OpenAiUpstreamOptions {
    * Error body written VERBATIM instead of JSON-encoding `errorBody` — an
    * empty string reproduces an upstream that answers with no body at all.
    */
-  rawErrorBody?: string;
+  rawErrorBody?: string | Buffer;
+  /**
+   * Error body chunks written verbatim after headers. Together with
+   * `eventDelayMs`, this models a non-2xx SSE response whose EOF is delayed.
+   */
+  rawErrorBodyChunks?: Array<string | Buffer>;
   /**
    * Content-Type for the error body (default `application/json`). Lets
    * tests reproduce upstreams / edge layers that return a JSON error
@@ -52,7 +57,7 @@ export interface OpenAiUpstreamOptions {
    * gateway streams provider bytes back and injected the provider bearer on
    * the content GET.
    */
-  rawBody?: string;
+  rawBody?: string | Buffer;
   /**
    * `rawBody` split into chunks written one at a time, `eventDelayMs`
    * apart, so a spec can tell a relayed body from a buffered one: an
@@ -60,7 +65,7 @@ export interface OpenAiUpstreamOptions {
    * downstream if the gateway forwards them as they arrive. Takes
    * precedence over `rawBody`; no Content-Length is sent.
    */
-  rawBodyChunks?: string[];
+  rawBodyChunks?: Array<string | Buffer>;
   /** Content-Type for `rawBody` (default `application/octet-stream`). */
   rawContentType?: string;
   /** Per-request response script; used in order before static opts. */
@@ -92,16 +97,18 @@ export interface OpenAiUpstreamStep {
   status?: number;
   errorBody?: unknown;
   /** See `OpenAiUpstreamOptions.rawErrorBody`. */
-  rawErrorBody?: string;
+  rawErrorBody?: string | Buffer;
+  /** See `OpenAiUpstreamOptions.rawErrorBodyChunks`. */
+  rawErrorBodyChunks?: Array<string | Buffer>;
   /** Content-Type for the error body (default `application/json`). See #543. */
   errorContentType?: string;
   disconnectAfterEvents?: number;
   /** Extra response headers, same semantics as on the top-level options. */
   responseHeaders?: Record<string, string>;
   /** Raw (non-JSON) 200 body — see `OpenAiUpstreamOptions.rawBody`. */
-  rawBody?: string;
+  rawBody?: string | Buffer;
   /** See `OpenAiUpstreamOptions.rawBodyChunks`. */
-  rawBodyChunks?: string[];
+  rawBodyChunks?: Array<string | Buffer>;
   /** Content-Type for `rawBody` (default `application/octet-stream`). */
   rawContentType?: string;
 }
@@ -181,6 +188,22 @@ export async function startOpenAiUpstream(
       const status = step.status ?? 200;
       if (status >= 300) {
         res.statusCode = status;
+        if (step.rawErrorBodyChunks !== undefined) {
+          if (!res.hasHeader("content-type")) {
+            res.setHeader(
+              "content-type",
+              step.errorContentType ?? opts.errorContentType ?? "application/json",
+            );
+          }
+          res.flushHeaders();
+          for (const chunk of step.rawErrorBodyChunks) {
+            if (res.writableEnded || res.destroyed) return;
+            res.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            if (step.eventDelayMs) await sleep(step.eventDelayMs);
+          }
+          if (!res.writableEnded && !res.destroyed) res.end();
+          return;
+        }
         if (step.rawErrorBody !== undefined) {
           res.end(step.rawErrorBody);
           return;

@@ -11,13 +11,13 @@
 //! Cluster slot, keeping the per-bucket Lua atomic):
 //! - `aisix:rl:{<bucket>}:<rps|rpm|rph|rpd|tpm|tpd>:<window_start>` — plain
 //!   `INCR`/`GET` counters, `EXPIRE = window + grace`.
-//! - `aisix:rl:{<bucket>}:conc` — a ZSET (`member → score=now`) acting as a
-//!   crash-safe distributed semaphore: acquire prunes entries older than
-//!   `conc_ttl` then counts, so a slot leaked by a crashed/hung replica is
-//!   reclaimed within `conc_ttl`. (LiteLLM's latest tracks parallel
-//!   requests as a window-TTL counter; we use a ZSET with a request-
-//!   lifetime ttl because our streaming requests can outlive a 60s window
-//!   — the same reason `StreamConcurrencyGuard`/#450 exists.)
+//! - `aisix:rl:{<bucket>}:conc` — a ZSET (`member → last-refresh time`) acting
+//!   as a crash-safe distributed semaphore: acquire prunes stale entries then
+//!   counts, so a slot leaked by a crashed/hung replica is reclaimed after its
+//!   `conc_ttl` (with at most one extra second for rolling-upgrade safety).
+//!   Live streams renew their member while their `StreamConcurrencyGuard`
+//!   exists, so a deliberately long SSE response is not mistaken for a
+//!   crashed replica.
 //!
 //! `now` is read from `redis.call('TIME')` inside every script so window
 //! boundaries are identical across replicas regardless of host clock skew.
@@ -43,9 +43,10 @@ use aisix_core::{RateLimit, RedisConnConfig};
 use aisix_obs::metrics::Metrics;
 use aisix_redis::{ConnSlot, FailurePolicy};
 use async_trait::async_trait;
+use dashmap::DashMap;
 use redis::Script;
 
-use super::{local::LocalStore, token_dims, Dim, RateStore};
+use super::{local::LocalStore, token_dims, Dim, RateStore, StreamLeaseRefresh};
 use crate::error::{LimitDetail, RateLimitError};
 use crate::limiter::RateLimitStatus;
 
@@ -77,6 +78,17 @@ const CODE_CONCURRENCY: i64 = 1;
 const CODE_TOKENS: i64 = 2;
 const CODE_REQUESTS: i64 = 3;
 
+/// What this process knows about one live concurrency member. A Redis command
+/// can fail after the server applies its Lua mutation but before the client
+/// receives a reply, so "not confirmed" is not always the same as "local
+/// only".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaseOwnership {
+    ConfirmedRedis,
+    LocalOnly,
+    Unknown,
+}
+
 /// Atomic per-bucket acquire: concurrency gate + token check-only +
 /// request check-and-increment, all-or-nothing. See module docs for the
 /// key layout. Returns `{code, retry_after}`.
@@ -85,20 +97,29 @@ local prefix = ARGV[1]
 local member = ARGV[2]
 local conc_max = tonumber(ARGV[3])
 local conc_ttl = tonumber(ARGV[4])
-local grace = tonumber(ARGV[5])
+local conc_key_ttl = tonumber(ARGV[5])
+local grace = tonumber(ARGV[6])
 local t = redis.call('TIME')
 local now = tonumber(t[1])
+-- Keep the score in seconds so rolling upgrades still understand existing
+-- integer-second members, but retain Redis TIME's sub-second precision for
+-- a live lease.
+local conc_now = now + tonumber(t[2]) / 1000000
+-- Old nodes wrote integer-second scores. Prune at a whole-second boundary so
+-- a new node cannot mistake an old member acquired late in that second for a
+-- stale member; the safe cost is at most one extra second of retention.
+local conc_prune_before = math.floor(conc_now) - conc_ttl
 
 local conc_key = prefix .. ':conc'
 if conc_max >= 0 then
-  redis.call('ZREMRANGEBYSCORE', conc_key, 0, now - conc_ttl)
+  redis.call('ZREMRANGEBYSCORE', conc_key, 0, '(' .. conc_prune_before)
   local in_flight = redis.call('ZCARD', conc_key)
   if in_flight >= conc_max then
     return {1, 0, 0, conc_max, in_flight}
   end
 end
 
-local idx = 6
+local idx = 7
 local nreq = tonumber(ARGV[idx]); idx = idx + 1
 local req = {}
 for i = 1, nreq do
@@ -143,10 +164,28 @@ for i = 1, nreq do
   end
 end
 if conc_max >= 0 then
-  redis.call('ZADD', conc_key, now, member)
-  redis.call('EXPIRE', conc_key, conc_ttl)
+  redis.call('ZADD', conc_key, conc_now, member)
+  redis.call('EXPIRE', conc_key, conc_key_ttl)
 end
 return {0, 0, 0, 0, 0}
+"#;
+
+/// Refresh one live streaming member's concurrency lease. The member must
+/// already exist: refresh racing stream teardown must not resurrect a member
+/// after `release` removed it. ARGV: prefix, member, conc_key_ttl.
+const REFRESH_CONCURRENCY_LUA: &str = r#"
+local prefix = ARGV[1]
+local member = ARGV[2]
+local conc_key_ttl = tonumber(ARGV[3])
+local conc_key = prefix .. ':conc'
+if not redis.call('ZSCORE', conc_key, member) then
+  return 0
+end
+local t = redis.call('TIME')
+local conc_now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+redis.call('ZADD', conc_key, 'XX', conc_now, member)
+redis.call('EXPIRE', conc_key, conc_key_ttl)
+return 1
 "#;
 
 /// Post-deduct: add `tokens` to the tpm/tpd windows AND release the
@@ -201,10 +240,14 @@ local prefix = ARGV[1]
 local conc_ttl = tonumber(ARGV[2])
 local t = redis.call('TIME')
 local now = tonumber(t[1])
+local conc_now = now + tonumber(t[2]) / 1000000
+-- See ACQUIRE_LUA: use the same conservative boundary so header reads do not
+-- prune a live member while a rolling upgrade is in progress.
+local conc_prune_before = math.floor(conc_now) - conc_ttl
 local ws = now - (now % 60)
 local rpm = tonumber(redis.call('GET', prefix .. ':rpm:' .. ws) or '0')
 local tpm = tonumber(redis.call('GET', prefix .. ':tpm:' .. ws) or '0')
-redis.call('ZREMRANGEBYSCORE', prefix .. ':conc', 0, now - conc_ttl)
+redis.call('ZREMRANGEBYSCORE', prefix .. ':conc', 0, '(' .. conc_prune_before)
 local inflight = redis.call('ZCARD', prefix .. ':conc')
 return {rpm, tpm, inflight, 60 - (now % 60)}
 "#;
@@ -216,6 +259,10 @@ pub struct RedisStore {
     grace: u64,
     /// Per-process fallback used when Redis is unreachable (fail-open).
     local: Arc<LocalStore>,
+    /// Per-reservation ownership provenance for stream lease refreshes.
+    /// Only a `ConfirmedRedis` member may turn a healthy ZSET miss into a
+    /// terminal signal; a timeout after dispatch is deliberately `Unknown`.
+    lease_members: DashMap<(String, String), LeaseOwnership>,
     /// One-shot guard so the degradation warning is logged once, not per
     /// request, while Redis stays down. Shared with the boot attach task,
     /// which starts it already set (the boot WARN said it) and clears it
@@ -309,6 +356,7 @@ impl RedisStore {
             conc_ttl: DEFAULT_CONC_TTL_SECS,
             grace: DEFAULT_GRACE_SECS,
             local: Arc::new(LocalStore::new()),
+            lease_members: DashMap::new(),
             degraded_logged,
             metrics: None,
         }
@@ -502,6 +550,9 @@ impl RateStore for RedisStore {
             member.to_string(),
             limits.concurrency.map(i64::from).unwrap_or(-1).to_string(),
             self.conc_ttl.to_string(),
+            // Pruning retains a pre-upgrade integer-second member through its
+            // boundary, so the key must survive for the same extra second.
+            self.conc_ttl.saturating_add(1).to_string(),
             self.grace.to_string(),
         ];
         push_dims(&mut args, &super::request_dims(limits));
@@ -519,7 +570,14 @@ impl RateStore for RedisStore {
             Ok(c) => c,
             Err(e) => {
                 self.note_failure("acquire", &e);
-                return self.local.acquire(key, limits, member).await;
+                let acquired = self.local.acquire(key, limits, member).await;
+                if acquired.is_ok() && limits.concurrency.is_some() {
+                    self.lease_members.insert(
+                        (key.to_string(), member.to_string()),
+                        LeaseOwnership::LocalOnly,
+                    );
+                }
+                return acquired;
             }
         };
         match invocation.invoke_async::<Vec<i64>>(&mut conn).await {
@@ -544,7 +602,15 @@ impl RateStore for RedisStore {
                     LimitDetail::window(name, limit, used, retry)
                 };
                 match code {
-                    CODE_OK => Ok(()),
+                    CODE_OK => {
+                        if limits.concurrency.is_some() {
+                            self.lease_members.insert(
+                                (key.to_string(), member.to_string()),
+                                LeaseOwnership::ConfirmedRedis,
+                            );
+                        }
+                        Ok(())
+                    }
                     CODE_CONCURRENCY => {
                         let limit = reply.get(3).copied().unwrap_or(0).max(0) as u64;
                         let in_flight = reply.get(4).copied().unwrap_or(0).max(0) as u64;
@@ -566,12 +632,24 @@ impl RateStore for RedisStore {
             Err(e) => {
                 self.note_failure("acquire", &e);
                 self.conn.note_error().await;
-                self.local.acquire(key, limits, member).await
+                let acquired = self.local.acquire(key, limits, member).await;
+                if acquired.is_ok() && limits.concurrency.is_some() {
+                    // A reply can be lost after Redis has already applied the
+                    // Lua acquire. Probe on refresh rather than assuming the
+                    // local fallback was the only reservation.
+                    self.lease_members.insert(
+                        (key.to_string(), member.to_string()),
+                        LeaseOwnership::Unknown,
+                    );
+                }
+                acquired
             }
         }
     }
 
     async fn commit(&self, key: &str, tokens: u64, member: &str) {
+        self.lease_members
+            .remove(&(key.to_string(), member.to_string()));
         let prefix = self.bucket_prefix(key);
         let mut conn = match self.conn.acquire().await {
             Ok(c) => c,
@@ -624,6 +702,8 @@ impl RateStore for RedisStore {
     }
 
     fn release(&self, key: &str, member: &str) {
+        self.lease_members
+            .remove(&(key.to_string(), member.to_string()));
         // Drop the local slot first (a cheap no-op when the bucket was
         // never acquired locally); covers the degraded-acquire case.
         self.local.release(key, member);
@@ -689,6 +769,87 @@ impl RateStore for RedisStore {
                     conn.note_error().await;
                 }
             });
+        }
+    }
+
+    fn stream_lease_refresh_interval(&self) -> Option<std::time::Duration> {
+        let millis = self
+            .conc_ttl
+            .saturating_mul(1_000)
+            .saturating_div(3)
+            .clamp(100, 60_000);
+        Some(std::time::Duration::from_millis(millis))
+    }
+
+    async fn refresh_stream_lease(&self, key: &str, member: &str) {
+        let _ = self.refresh_stream_lease_outcome(key, member).await;
+    }
+
+    async fn refresh_stream_lease_outcome(&self, key: &str, member: &str) -> StreamLeaseRefresh {
+        let ownership = self
+            .lease_members
+            .get(&(key.to_string(), member.to_string()))
+            .map(|entry| *entry);
+        let Some(ownership) = ownership else {
+            // The member was already released, or this store never admitted
+            // it. It is not a live shared lease that can be conclusively lost.
+            return StreamLeaseRefresh::Unavailable;
+        };
+        if matches!(ownership, LeaseOwnership::LocalOnly) {
+            // `conn.acquire` failed before a command could be dispatched.
+            // This member exists solely in the local fail-open fallback.
+            return StreamLeaseRefresh::Unavailable;
+        }
+        let prefix = self.bucket_prefix(key);
+        let mut conn = match self.conn.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.note_failure("refresh", &e);
+                // A post-dispatch I/O failure opens the shared Redis breaker.
+                // While it short-circuits, Unknown stays fail-open; only a
+                // later successful refresh can promote it to confirmed Redis
+                // ownership.
+                return StreamLeaseRefresh::Unavailable;
+            }
+        };
+        let res: Result<i64, redis::RedisError> = Script::new(REFRESH_CONCURRENCY_LUA)
+            .key(&prefix)
+            .arg(&prefix)
+            .arg(member)
+            .arg(self.conc_ttl.saturating_add(1))
+            .invoke_async(&mut conn)
+            .await;
+        match res {
+            Ok(1) => {
+                self.mark_ok();
+                if matches!(ownership, LeaseOwnership::Unknown) {
+                    self.lease_members.insert(
+                        (key.to_string(), member.to_string()),
+                        LeaseOwnership::ConfirmedRedis,
+                    );
+                }
+                StreamLeaseRefresh::Renewed
+            }
+            Ok(0) => {
+                // Redis did answer: the member itself is gone. This is not a
+                // backend outage, so clear any prior degradation marker while
+                // returning the definitive loss to the stream hold.
+                self.mark_ok();
+                if matches!(ownership, LeaseOwnership::ConfirmedRedis) {
+                    StreamLeaseRefresh::Missing
+                } else {
+                    // A command may have failed before Redis ever saw it, so
+                    // an Unknown member's absence is fail-open, not proof of
+                    // an externally released live lease.
+                    StreamLeaseRefresh::Unavailable
+                }
+            }
+            Ok(_) => StreamLeaseRefresh::Unavailable,
+            Err(e) => {
+                self.note_failure("refresh", &e);
+                self.conn.note_error().await;
+                StreamLeaseRefresh::Unavailable
+            }
         }
     }
 

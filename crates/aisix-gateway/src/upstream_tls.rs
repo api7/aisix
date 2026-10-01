@@ -211,6 +211,12 @@ pub fn reqwest_material() -> &'static ReqwestTlsMaterial {
 static PK_CLIENTS: OnceLock<dashmap::DashMap<UpstreamConnection, reqwest::Client>> =
     OnceLock::new();
 
+/// The raw-relay counterpart to [`PK_CLIENTS`]. Reqwest's content decoders
+/// are client settings, so a passthrough relay that promises provider bytes
+/// needs a separate pool even when it has the same TLS/resolve override.
+static RAW_PK_CLIENTS: OnceLock<dashmap::DashMap<UpstreamConnection, reqwest::Client>> =
+    OnceLock::new();
+
 /// Clients built for Provider Key connection overrides so far.
 pub fn provider_key_client_count() -> u64 {
     PK_CLIENTS.get().map_or(0, |clients| clients.len() as u64)
@@ -225,6 +231,11 @@ thread_local! {
     /// This worker's upstream pool, built on first dispatch. `None` once
     /// a build failure has been reported for this thread.
     static WORKER_CLIENT: std::cell::OnceCell<Option<reqwest::Client>> =
+        const { std::cell::OnceCell::new() };
+
+    /// The worker-owned raw-relay pool. It has the same TLS and connection
+    /// settings as `WORKER_CLIENT`, but no automatic content decoding.
+    static RAW_WORKER_CLIENT: std::cell::OnceCell<Option<reqwest::Client>> =
         const { std::cell::OnceCell::new() };
 }
 
@@ -270,6 +281,54 @@ fn worker_client() -> Option<reqwest::Client> {
     })
 }
 
+/// Build a client that relays response bytes exactly as received. In
+/// particular, reqwest otherwise transparently decodes `gzip`, `br`,
+/// `deflate`, and `zstd`, while removing the matching response headers.
+fn raw_client_builder() -> reqwest::ClientBuilder {
+    // This workspace enables only reqwest's `gzip` decoder (see the
+    // workspace dependency declaration). The remaining decoder features are
+    // not compiled in, so disabling gzip is sufficient to preserve every
+    // representation this binary could otherwise transform.
+    crate::upstream_http::client_builder()
+        .no_gzip()
+        // The passthrough target is validated before dispatch. Following an
+        // upstream Location would make a second, unchecked request and could
+        // carry the injected provider credential beyond that boundary.
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+fn raw_client() -> &'static reqwest::Client {
+    static RAW_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    // The same builder's TLS material is validated at boot. Do not fall back
+    // to a bare client here: that could make a raw relay silently trust less
+    // than the deployment configured.
+    RAW_CLIENT.get_or_init(|| {
+        raw_client_builder()
+            .build()
+            .expect("configured raw passthrough HTTP client builds")
+    })
+}
+
+fn raw_worker_client() -> Option<reqwest::Client> {
+    if !IS_WORKER_THREAD.get() {
+        return None;
+    }
+    RAW_WORKER_CLIENT.with(|cell| {
+        cell.get_or_init(|| match raw_client_builder().build() {
+            Ok(client) => Some(client),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "per-worker raw passthrough upstream pool could not be built; this worker \
+                     dispatches on the shared raw pool"
+                );
+                None
+            }
+        })
+        .clone()
+    })
+}
+
 /// The client to dispatch this Provider Key's request on.
 ///
 /// Returns `shared` unchanged whenever the key sets no override, which
@@ -294,11 +353,33 @@ pub fn client_for_provider_key(
         // the shared pool is used, as it always was.
         return worker_client().unwrap_or_else(|| shared.clone());
     };
-    let cache = PK_CLIENTS.get_or_init(dashmap::DashMap::new);
+    client_for_provider_key_override(shared, conn, &PK_CLIENTS, build_provider_key_client)
+}
+
+/// The byte-preserving client for a passthrough raw relay. It applies the
+/// same deployment TLS, per-ProviderKey CA, certificate-verification, and
+/// address-resolution rules as [`client_for_provider_key`], but opts out of
+/// every reqwest content decoder so a relay may retain both encoded bytes and
+/// `Content-Encoding` / `Content-Length` headers.
+pub fn raw_client_for_provider_key(conn: Option<&UpstreamConnection>) -> reqwest::Client {
+    let shared = raw_client();
+    let Some(conn) = conn.filter(|c| !c.is_noop()) else {
+        return raw_worker_client().unwrap_or_else(|| shared.clone());
+    };
+    client_for_provider_key_override(shared, conn, &RAW_PK_CLIENTS, build_raw_provider_key_client)
+}
+
+fn client_for_provider_key_override(
+    shared: &reqwest::Client,
+    conn: &UpstreamConnection,
+    cache: &OnceLock<dashmap::DashMap<UpstreamConnection, reqwest::Client>>,
+    build: fn(&UpstreamConnection) -> Result<reqwest::Client, String>,
+) -> reqwest::Client {
+    let cache = cache.get_or_init(dashmap::DashMap::new);
     if let Some(existing) = cache.get(conn) {
         return existing.clone();
     }
-    match build_provider_key_client(conn) {
+    match build(conn) {
         Ok(client) => cache.entry(conn.clone()).or_insert(client).clone(),
         Err(e) if conn.resolve.is_empty() => {
             tracing::error!(
@@ -333,7 +414,7 @@ pub fn client_for_provider_key(
             // `resolve_to_addrs` cannot fail, so the only way this second
             // build fails is a TLS backend that would not initialise —
             // which `shared` could not have been built over either.
-            build_provider_key_client(&resolution_only)
+            build(&resolution_only)
                 .map(|client| cache.entry(resolution_only).or_insert(client).clone())
                 .unwrap_or_else(|_| shared.clone())
         }
@@ -341,11 +422,21 @@ pub fn client_for_provider_key(
 }
 
 fn build_provider_key_client(conn: &UpstreamConnection) -> Result<reqwest::Client, String> {
+    build_provider_key_client_with(conn, crate::upstream_http::client_builder())
+}
+
+fn build_raw_provider_key_client(conn: &UpstreamConnection) -> Result<reqwest::Client, String> {
+    build_provider_key_client_with(conn, raw_client_builder())
+}
+
+fn build_provider_key_client_with(
+    conn: &UpstreamConnection,
+    mut builder: reqwest::ClientBuilder,
+) -> Result<reqwest::Client, String> {
     // Layer the key's override ON TOP of the deployment settings rather
     // than replacing them: a deployment CA and a per-key CA are both
     // trust roots, and a client presenting the deployment's mTLS
     // identity must keep presenting it.
-    let mut builder = crate::upstream_http::client_builder();
     if let Some(tls) = conn.tls.as_ref() {
         if let Some(pem) = tls.ca_cert.as_ref().filter(|p| !p.trim().is_empty()) {
             let roots = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
@@ -804,6 +895,12 @@ mod tests {
             .is_some_and(|cache| cache.contains_key(conn))
     }
 
+    fn raw_cached(conn: &UpstreamConnection) -> bool {
+        RAW_PK_CLIENTS
+            .get()
+            .is_some_and(|cache| cache.contains_key(conn))
+    }
+
     /// A key carrying only `tls`, in the shape the dispatch sites derive.
     fn tls_conn(tls: ProviderKeyTls) -> UpstreamConnection {
         UpstreamConnection {
@@ -876,6 +973,16 @@ mod tests {
         );
         let _ = client_for_provider_key(&shared_client(), Some(&conn));
         assert!(cached(&conn));
+    }
+
+    #[test]
+    fn raw_relay_keeps_provider_key_connection_overrides() {
+        let conn = resolve_conn("vendor-raw-relay.invalid", &["192.0.2.12"]);
+        let _ = raw_client_for_provider_key(Some(&conn));
+        assert!(
+            raw_cached(&conn),
+            "the raw relay must not discard a ProviderKey's address override"
+        );
     }
 
     /// Two keys pointing the same hostname at different addresses must not

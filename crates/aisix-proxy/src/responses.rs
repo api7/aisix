@@ -1461,6 +1461,10 @@ async fn responses_to_target(
             // which `max_buffer_bytes` caps (the SSE/JSON envelope is not
             // counted), and every raw byte, unterminated tail included.
             let mut held_content = crate::held_content::HeldBuffer::default();
+            // A Responses stream repeats one logical output carrier in
+            // delta, done, part, item, and terminal events. Keep that
+            // bounded identity ledger across the entire held response.
+            let mut responses_held_content = crate::held_content::ResponsesHeldContent::default();
             let mut counted_upto = 0usize;
             let mut exceeded = false;
             loop {
@@ -1520,9 +1524,9 @@ async fn responses_to_target(
                 }
                 let end = counted_upto + crate::redact::last_frame_end(&buf[counted_upto..]);
                 held_content.hold(
-                    crate::held_content::sse_frames(
+                    crate::held_content::responses_sse_held_frames(
+                        &mut responses_held_content,
                         &buf[counted_upto..end],
-                        crate::held_content::responses_event,
                     ),
                     chunk.len(),
                 );
@@ -1535,9 +1539,9 @@ async fn responses_to_target(
             // A final frame the upstream never terminated is held content too.
             if !exceeded && counted_upto < buf.len() {
                 held_content.hold(
-                    crate::held_content::sse_frames(
+                    crate::held_content::responses_sse_held_frames(
+                        &mut responses_held_content,
                         &buf[counted_upto..],
-                        crate::held_content::responses_event,
                     ),
                     0,
                 );
@@ -1691,7 +1695,7 @@ async fn responses_to_target(
                     usage.usage_estimated = true;
                 }
             }
-            let mut out_text = responses_sse_output_text(&buf);
+            let mut out_text = responses_sse_guardrail_text(&buf);
             // #1100: an excised frame is not released, but a forbidden
             // literal inside it must still block the response — the block
             // pass reads raw text, so it can scan a payload nothing could
@@ -3178,6 +3182,11 @@ struct SseTextCapture {
     /// the end-of-stream scan rebuilds from it the slots the buffered
     /// branch's mask walker would rewrite (#1027).
     terminal_response: Option<Value>,
+    /// A standalone visible event occurred before (or without) a terminal
+    /// snapshot. Its text must join the monitor scan even when the terminal
+    /// response is present, because an upstream can send a mismatching
+    /// authoritative aggregate after clean deltas.
+    saw_non_terminal_visible: bool,
 }
 
 impl SseTextCapture {
@@ -3187,11 +3196,15 @@ impl SseTextCapture {
             deltas: String::new(),
             terminal: None,
             terminal_response: None,
+            saw_non_terminal_visible: false,
         }
     }
 
     /// The local-kind segments of the terminal response, when it was kept.
     fn terminal_segments(&self) -> Option<Vec<aisix_guardrails::ScanSegment>> {
+        if self.saw_non_terminal_visible {
+            return None;
+        }
         let mut resp = self.terminal_response.clone()?;
         Some(crate::redact::collect_segments(|g| {
             let _ = crate::redact::redact_responses_response(g, &mut resp);
@@ -3210,19 +3223,15 @@ impl SseTextCapture {
                     }
                 }
             }
-            Some(
-                "response.output_text.delta"
-                | "response.function_call_arguments.delta"
-                | "response.mcp_call_arguments.delta"
-                | "response.custom_tool_call_input.delta",
-            ) => {
-                if let Some(d) = json.get("delta").and_then(|d| d.as_str()) {
+            _ => {
+                let text = responses_stream_event_text(json);
+                if !text.is_empty() {
+                    self.saw_non_terminal_visible = true;
                     if self.deltas.len() < self.cap {
-                        self.deltas.push_str(d);
+                        self.deltas.push_str(&text);
                     }
                 }
             }
-            _ => {}
         }
     }
 
@@ -3232,12 +3241,19 @@ impl SseTextCapture {
         self.terminal.unwrap_or(self.deltas)
     }
 
-    /// [`Self::into_text`] without consuming — the end-of-stream scan reads
-    /// the text while the completion guard stays armed (a client disconnect
-    /// mid-scan must still fire the guard's Drop emit with the captured
-    /// text), so it clones instead of taking.
-    fn text(&self) -> String {
-        self.terminal.clone().unwrap_or_else(|| self.deltas.clone())
+    /// All authoritative output carriers for the end-of-stream monitor.
+    /// Capture retains its terminal preference, but a monitor must observe a
+    /// visible standalone `.done`/item/part event even if the terminal
+    /// snapshot later disagrees with it.
+    fn scan_text(&self) -> String {
+        let mut text = self.deltas.clone();
+        if let Some(terminal) = &self.terminal {
+            if !text.is_empty() && !terminal.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(terminal);
+        }
+        text
     }
 }
 
@@ -3493,7 +3509,10 @@ where
         let hits = match eos_scan {
             Some(scan) => {
                 let capture = guard.parts().1;
-                let text = capture.as_ref().map(|c| c.text()).unwrap_or_default();
+                let text = capture
+                    .as_ref()
+                    .map(|c| c.scan_text())
+                    .unwrap_or_default();
                 let segments = capture.and_then(|c| c.terminal_segments());
                 scan.observe(&text, segments).await
             }
@@ -3531,24 +3550,30 @@ pub(crate) fn responses_output_text(resp: &Value) -> String {
     let Some(items) = resp.get("output").and_then(|v| v.as_array()) else {
         return String::new();
     };
+    items
+        .iter()
+        .map(responses_output_item_text)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The client-visible text on one Responses output item. This is shared by
+/// terminal `response.*` snapshots and standalone `response.output_item.*`
+/// stream events so either wire form receives the same output protection.
+fn responses_output_item_text(item: &Value) -> String {
+    if item.get("type").and_then(|t| t.as_str()) == Some("reasoning") {
+        return String::new();
+    }
     let mut parts: Vec<&str> = Vec::new();
-    for it in items {
-        if it.get("type").and_then(|t| t.as_str()) == Some("reasoning") {
-            continue;
-        }
-        if let Some(content) = it.get("content").and_then(|c| c.as_array()) {
-            parts.extend(
-                content
-                    .iter()
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str())),
-            );
-        }
-        // Tool-call items carry caller-visible model output under top-level
-        // `name`/`arguments` (function_call) or `name`/`input` (custom tool).
-        for key in ["name", "arguments", "input"] {
-            if let Some(s) = it.get(key).and_then(|v| v.as_str()) {
-                parts.push(s);
-            }
+    if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+        parts.extend(content.iter().filter_map(responses_visible_part_text));
+    }
+    // Tool-call items carry caller-visible model output under top-level
+    // `name`/`arguments` (function_call) or `name`/`input` (custom tool).
+    for key in ["name", "arguments", "input"] {
+        if let Some(s) = item.get(key).and_then(|v| v.as_str()) {
+            parts.push(s);
         }
     }
     parts
@@ -3558,6 +3583,60 @@ pub(crate) fn responses_output_text(resp: &Value) -> String {
         .join("\n")
 }
 
+/// One client-visible Responses message part. A refusal has its own field,
+/// unlike the ordinary text part types.
+fn responses_visible_part_text(part: &Value) -> Option<&str> {
+    match part.get("type").and_then(Value::as_str) {
+        Some("output_text" | "text" | "input_text") => part.get("text").and_then(Value::as_str),
+        Some("refusal") => part.get("refusal").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+/// Client-visible text from one official Responses streaming event. A
+/// standalone aggregate is authoritative: providers may omit deltas and end
+/// after this frame, so it cannot rely on a later terminal snapshot for
+/// output enforcement.
+fn responses_stream_event_text(event: &Value) -> String {
+    let fields = |fields: &[&str]| {
+        fields
+            .iter()
+            .filter_map(|field| event.get(*field).and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    match event.get("type").and_then(Value::as_str) {
+        Some(
+            "response.output_text.delta"
+            | "response.refusal.delta"
+            | "response.function_call_arguments.delta"
+            | "response.mcp_call_arguments.delta"
+            | "response.custom_tool_call_input.delta",
+        ) => fields(&["delta"]),
+        Some("response.output_text.done") => fields(&["text"]),
+        Some("response.refusal.done") => fields(&["refusal"]),
+        Some("response.function_call_arguments.done" | "response.mcp_call_arguments.done") => {
+            fields(&["name", "arguments"])
+        }
+        Some("response.custom_tool_call_input.done") => fields(&["name", "input"]),
+        Some("response.content_part.added" | "response.content_part.done") => event
+            .get("part")
+            .and_then(responses_visible_part_text)
+            .unwrap_or_default()
+            .to_owned(),
+        Some("response.output_item.added" | "response.output_item.done") => event
+            .get("item")
+            .map(responses_output_item_text)
+            .unwrap_or_default(),
+        Some("response.completed" | "response.incomplete" | "response.failed") => event
+            .get("response")
+            .map(responses_output_text)
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 /// Collect the assistant's streamed output text from a buffered
 /// Responses-API SSE response (#719/#546). Prefers the authoritative full
 /// output carried on a terminal `response` event — `response.completed`,
@@ -3565,7 +3644,8 @@ pub(crate) fn responses_output_text(resp: &Value) -> String {
 /// same full `output[]` (incl. tool-call items) and fire routinely (e.g.
 /// `max_output_tokens` truncation). Falls back to concatenating the streamed
 /// deltas when no terminal `response` object is present (truncated/aborted):
-/// both `response.output_text.delta` (assistant text) and
+/// both `response.output_text.delta` / `response.refusal.delta` (assistant
+/// text or refusal) and
 /// `response.function_call_arguments.delta` (tool-call args stream via their
 /// own event, NOT output_text) — otherwise blocked tool-call args would leak
 /// on a stream that never reaches a terminal object. The `type` field on each
@@ -3595,7 +3675,7 @@ fn responses_sse_output_text(bytes: &[u8]) -> String {
                     }
                 }
             }
-            Some("response.output_text.delta") => {
+            Some("response.output_text.delta" | "response.refusal.delta") => {
                 if let Some(d) = json.get("delta").and_then(|d| d.as_str()) {
                     deltas.push_str(d);
                 }
@@ -3621,6 +3701,46 @@ fn responses_sse_output_text(bytes: &[u8]) -> String {
         }
     }
     deltas
+}
+
+/// The text the buffered output guardrail evaluates. Unlike content capture
+/// and token estimation, it deliberately retains every authoritative stream
+/// carrier: a clean delta followed by a malicious `.done`, item, part, or
+/// terminal snapshot must still block rather than being hidden by terminal
+/// precedence.
+fn responses_sse_guardrail_text(bytes: &[u8]) -> String {
+    let mut text = String::new();
+    let mut previous_was_delta = false;
+    for payload in crate::redact::sse_frame_payloads(bytes) {
+        let data = payload.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        let kind = event.get("type").and_then(Value::as_str);
+        let is_delta = matches!(
+            kind,
+            Some(
+                "response.output_text.delta"
+                    | "response.refusal.delta"
+                    | "response.function_call_arguments.delta"
+                    | "response.mcp_call_arguments.delta"
+                    | "response.custom_tool_call_input.delta"
+            )
+        );
+        let event_text = responses_stream_event_text(&event);
+        if event_text.is_empty() {
+            continue;
+        }
+        if !(text.is_empty() || previous_was_delta && is_delta) {
+            text.push('\n');
+        }
+        text.push_str(&event_text);
+        previous_was_delta = is_delta;
+    }
+    text
 }
 
 /// Copy the upstream `content-type` onto the client response and stamp the
@@ -4900,6 +5020,49 @@ mod tests {
         );
     }
 
+    /// A Responses refusal is client-visible assistant output, but it uses a
+    /// `refusal` field instead of a `text` field. It must not bypass output
+    /// guardrails on the non-streaming route.
+    #[tokio::test]
+    async fn output_guardrail_blocks_non_streaming_refusal_response() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_refusal",
+                "object": "response",
+                "output": [{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"sure: BLOCKME here"}]}],
+                "usage": {"input_tokens": 5, "output_tokens": 4}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+        assert!(
+            !v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("BLOCKME"),
+            "model refusal leaked in error: {v}"
+        );
+    }
+
     /// #719 companion: a clean non-streaming response with an output
     /// guardrail configured passes through unchanged → 200 with body.
     #[tokio::test]
@@ -4975,6 +5138,93 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&bytes).contains("BLOCKME"),
             "streamed content leaked despite output block",
+        );
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+    }
+
+    /// Streaming refusals use their own delta and aggregate events. The
+    /// held-back stream must block before any refusal text reaches the wire.
+    #[tokio::test]
+    async fn output_guardrail_blocks_streaming_refusal_response_holds_back() {
+        let upstream = MockServer::start().await;
+        let sse = "event: response.refusal.delta\n\
+                   data: {\"type\":\"response.refusal.delta\",\"item_id\":\"msg_refusal\",\"output_index\":0,\"content_index\":0,\"delta\":\"sure: BLOCKME\"}\n\n\
+                   event: response.refusal.done\n\
+                   data: {\"type\":\"response.refusal.done\",\"item_id\":\"msg_refusal\",\"output_index\":0,\"content_index\":0,\"refusal\":\"sure: BLOCKME\"}\n\n\
+                   event: response.completed\n\
+                   data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"sure: BLOCKME\"}]}]}}\n\n\
+                   data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("BLOCKME"),
+            "streamed refusal leaked despite output block",
+        );
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+    }
+
+    /// A Responses provider may emit only the final refusal event, without a
+    /// delta or terminal response snapshot. The typed `/v1/responses` path
+    /// must still hold and block it before it reaches the client.
+    #[tokio::test]
+    async fn output_guardrail_blocks_done_only_streaming_refusal() {
+        let upstream = MockServer::start().await;
+        let sse = "event: response.refusal.done\n\
+                   data: {\"type\":\"response.refusal.done\",\"item_id\":\"msg_refusal\",\"output_index\":0,\"content_index\":0,\"refusal\":\"sure: BLOCKME\"}\n\n\
+                   data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("BLOCKME"),
+            "done-only refusal leaked despite output block",
         );
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "content_filter");
@@ -6900,6 +7150,50 @@ data: [DONE]\n\n";
         // One push may land after the buffer crosses the cap; the point is
         // the accumulation stops near the cap instead of growing 100x.
         assert!(text.len() <= 20, "delta buffer must stay near the cap");
+    }
+
+    #[test]
+    fn responses_stream_event_text_reads_every_authoritative_output_carrier() {
+        let cases = [
+            (
+                serde_json::json!({"type":"response.output_text.done","text":"OUTPUT_DONE"}),
+                "OUTPUT_DONE",
+            ),
+            (
+                serde_json::json!({"type":"response.refusal.done","refusal":"REFUSAL_DONE"}),
+                "REFUSAL_DONE",
+            ),
+            (
+                serde_json::json!({"type":"response.function_call_arguments.done","name":"lookup","arguments":"FUNCTION_DONE"}),
+                "FUNCTION_DONE",
+            ),
+            (
+                serde_json::json!({"type":"response.mcp_call_arguments.done","arguments":"MCP_DONE"}),
+                "MCP_DONE",
+            ),
+            (
+                serde_json::json!({"type":"response.custom_tool_call_input.done","input":"CUSTOM_DONE"}),
+                "CUSTOM_DONE",
+            ),
+            (
+                serde_json::json!({"type":"response.content_part.added","part":{"type":"refusal","refusal":"PART_ADDED"}}),
+                "PART_ADDED",
+            ),
+            (
+                serde_json::json!({"type":"response.output_item.done","item":{"type":"message","content":[{"type":"refusal","refusal":"ITEM_DONE"}]}}),
+                "ITEM_DONE",
+            ),
+            (
+                serde_json::json!({"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"refusal","refusal":"TERMINAL"}]}]}}),
+                "TERMINAL",
+            ),
+        ];
+        for (event, expected) in cases {
+            assert!(
+                super::responses_stream_event_text(&event).contains(expected),
+                "{event}",
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────
