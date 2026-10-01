@@ -31,6 +31,9 @@ const EMBEDDING_REQUEST_MODEL = "embedding/embedding-3-small";
 const EMBEDDING_UPSTREAM_MODEL = "text-embedding-3-small";
 const EMBEDDING_INPUT = "price this embedding";
 const EMBEDDING_VECTOR = [0.1, 0.2, 0.3];
+const COUNT_TOKENS_WILDCARD_ALIAS = "anthropic/*";
+const COUNT_TOKENS_REQUEST_MODEL = "anthropic/claude-haiku-4-5-20251001";
+const COUNT_TOKENS_UPSTREAM_MODEL = "claude-haiku-4-5-20251001";
 
 function upstreamResponse() {
   return {
@@ -65,8 +68,10 @@ describe("wildcard pricing telemetry e2e", () => {
   let sls: MockSls | undefined;
   let upstream: OpenAiUpstream | undefined;
   let embeddingUpstream: OpenAiUpstream | undefined;
+  let countTokensUpstream: OpenAiUpstream | undefined;
   let wildcardID = "";
   let embeddingWildcardID = "";
+  let countTokensWildcardID = "";
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -77,6 +82,7 @@ describe("wildcard pricing telemetry e2e", () => {
     sls = await startMockSls();
     upstream = await startOpenAiUpstream({ nonStreamBody: upstreamResponse() });
     embeddingUpstream = await startOpenAiUpstream({ nonStreamBody: embeddingUpstreamResponse() });
+    countTokensUpstream = await startOpenAiUpstream({ nonStreamBody: { input_tokens: 42 } });
     app = await spawnApp({
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
@@ -125,6 +131,23 @@ describe("wildcard pricing telemetry e2e", () => {
       embedding: { dimensions: EMBEDDING_VECTOR.length },
     });
     embeddingWildcardID = embeddingWildcard.id;
+    const countTokensProviderKey = await seed.createProviderKey({
+      display_name: "wildcard-pricing-count-tokens-pk",
+      provider: "anthropic",
+      adapter: "anthropic",
+      secret: "sk-mock",
+      // The Anthropic bridge appends `/v1/messages/count_tokens` to its
+      // bare provider base URL.
+      api_base: countTokensUpstream.baseUrl,
+    });
+    const countTokensWildcard = await seed.createModel({
+      display_name: COUNT_TOKENS_WILDCARD_ALIAS,
+      provider: "anthropic",
+      model_name: "*",
+      provider_key_id: countTokensProviderKey.id,
+      pricing_authority_id: PRICING_AUTHORITY_ID,
+    });
+    countTokensWildcardID = countTokensWildcard.id;
 
     // Seeded last: a successful models-list gate proves that all preceding
     // resources, including the exporter, are in the same gateway snapshot.
@@ -142,6 +165,7 @@ describe("wildcard pricing telemetry e2e", () => {
     await app?.exit();
     await upstream?.close();
     await embeddingUpstream?.close();
+    await countTokensUpstream?.close();
     await sls?.close();
   });
 
@@ -241,6 +265,56 @@ describe("wildcard pricing telemetry e2e", () => {
     expect(event.get("pricing_authority_id")).toBe(PRICING_AUTHORITY_ID);
     expect(event.get("resolved_pricing_model")).toBe(EMBEDDING_UPSTREAM_MODEL);
     expect(event.get("prompt_tokens")).toBe("7");
+  });
+
+  test("wildcard count_tokens remains unpriced after a real Anthropic dispatch", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !countTokensUpstream || !countTokensWildcardID) {
+      ctx.skip();
+      return;
+    }
+
+    const baseline = countTokensUpstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/messages/count_tokens`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": CALLER_PLAINTEXT,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: COUNT_TOKENS_REQUEST_MODEL,
+        messages: [{ role: "user", content: "count this prompt" }],
+      }),
+    });
+    const body = await res.text();
+    expect(res.status, body).toBe(200);
+    expect(JSON.parse(body)).toMatchObject({ input_tokens: 42 });
+
+    const calls = countTokensUpstream.receivedRequests.slice(baseline);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.path).toBe("/v1/messages/count_tokens");
+    expect(JSON.parse(calls[0]!.body)).toMatchObject({
+      model: COUNT_TOKENS_UPSTREAM_MODEL,
+      messages: [{ role: "user", content: "count this prompt" }],
+    });
+
+    const event = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (log) =>
+        log.get("operation") === "count_tokens" &&
+        log.get("requested_model") === COUNT_TOKENS_REQUEST_MODEL,
+      `usage event for ${COUNT_TOKENS_REQUEST_MODEL}`,
+    );
+    expect(event.get("model_id")).toBe(countTokensWildcardID);
+    expect(event.get("prompt_tokens")).toBe("0");
+    expect(event.get("completion_tokens")).toBe("0");
+    expect(event.get("cached_prompt_tokens")).toBeUndefined();
+    expect(event.get("reasoning_tokens")).toBeUndefined();
+    expect(event.get("total_tokens")).toBeUndefined();
+    expect(event.get("pricing_authority_id")).toBeUndefined();
+    expect(event.get("resolved_pricing_model")).toBeUndefined();
   });
 
   test("wildcard-routed job management events remain unpriced", async (ctx) => {

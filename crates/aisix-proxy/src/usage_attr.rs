@@ -1172,6 +1172,48 @@ mod tests {
         assert_eq!((m.as_ref(), u.as_ref()), ("no-such/model", "raw-upstream"));
     }
 
+    #[test]
+    fn billable_inference_surface_allowlist_is_exhaustive() {
+        for surface in [
+            crate::operation::CHAT,
+            crate::operation::COMPLETIONS,
+            crate::operation::MESSAGES,
+            crate::operation::RESPONSES,
+            crate::operation::EMBEDDINGS,
+            crate::operation::RERANK,
+            crate::operation::REALTIME,
+            crate::operation::IMAGE_GENERATION,
+            crate::operation::IMAGE_EDIT,
+            crate::operation::TRANSCRIPTION,
+            crate::operation::TRANSLATION,
+            crate::operation::SPEECH,
+            crate::operation::VIDEO_GENERATION,
+        ] {
+            assert!(
+                is_billable_inference_surface(surface),
+                "{} must retain wildcard pricing attribution",
+                surface.operation,
+            );
+        }
+
+        for surface in [
+            crate::operation::COUNT_TOKENS,
+            crate::operation::FILES,
+            crate::operation::BATCHES,
+            crate::operation::FINE_TUNING,
+            crate::operation::MCP,
+            crate::operation::A2A,
+            crate::operation::PASSTHROUGH,
+            crate::operation::BATCH_COMPLETION,
+        ] {
+            assert!(
+                !is_billable_inference_surface(surface),
+                "{} must not select a wildcard pricing identity",
+                surface.operation,
+            );
+        }
+    }
+
     #[tokio::test]
     async fn request_attribution_stamps_only_concrete_wildcard_pricing_authorities() {
         use aisix_core::resource::ResourceEntry;
