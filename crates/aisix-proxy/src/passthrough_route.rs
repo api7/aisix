@@ -582,7 +582,7 @@ async fn dispatch(
     if !resolved_chain.is_empty() {
         let text = match try_request_guardrail_text(protocol, &body_bytes) {
             Ok(text) => Some(text),
-            Err(err) if !err.is_depth_exceeded() => {
+            Err(err) if !err.is_unevaluable() => {
                 Some(request_guardrail_text(protocol, &body_bytes))
             }
             Err(err)
@@ -592,7 +592,7 @@ async fn dispatch(
                     guardrail_hook = "input",
                     route = %route.name,
                     error = %err,
-                    "cannot scan passthrough-route request to its bounded depth; nothing attached both reads the request and fails closed",
+                    "cannot safely select passthrough-route request text; resolved chain does not fail closed",
                 );
                 resolved_chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
                 None
@@ -602,7 +602,7 @@ async fn dispatch(
                     guardrail_hook = "input",
                     route = %route.name,
                     error = %err,
-                    "cannot scan passthrough-route request to its bounded depth; blocking",
+                    "cannot safely select passthrough-route request text; blocking",
                 );
                 return Err(RouteError::of(
                     crate::error::guardrail_block_error(
@@ -998,7 +998,7 @@ async fn dispatch(
     if !resolved_chain.is_empty() {
         let text = match try_response_guardrail_text(protocol, &resp_body) {
             Ok(text) => Some(text),
-            Err(err) if !err.is_depth_exceeded() => {
+            Err(err) if !err.is_unevaluable() => {
                 Some(response_guardrail_text(protocol, &resp_body))
             }
             Err(err)
@@ -1008,7 +1008,7 @@ async fn dispatch(
                     guardrail_hook = "output",
                     route = %route.name,
                     error = %err,
-                    "cannot scan passthrough-route response to its bounded depth; nothing attached both reads the response and fails closed",
+                    "cannot safely select passthrough-route response text; resolved chain does not fail closed",
                 );
                 resolved_chain.record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
                 None
@@ -1018,7 +1018,7 @@ async fn dispatch(
                     guardrail_hook = "output",
                     route = %route.name,
                     error = %err,
-                    "cannot scan passthrough-route response to its bounded depth; blocking",
+                    "cannot safely select passthrough-route response text; blocking",
                 );
                 telemetry.guardrail_blocked = true;
                 telemetry.emitted = true;
@@ -1345,8 +1345,9 @@ enum PassthroughProtocol {
 fn detect_protocol(body: &[u8]) -> PassthroughProtocol {
     // Do not materialize the entire document just to inspect its envelope:
     // a valid request can exceed serde_json::Value's nesting limit in an
-    // unrelated forwarded field. `RawValue` keeps the chosen top-level
-    // carrier shallow while preserving the last-key behavior of a JSON map.
+    // unrelated forwarded field. The shallow source selector keeps the
+    // chosen top-level carrier bounded while preserving the last-key behavior
+    // of a JSON map.
     if raw_top_level_last_has_shape(body, "messages", false) {
         PassthroughProtocol::OpenaiChat
     } else if raw_top_level_last_has_shape(body, "input", true) {
@@ -1489,6 +1490,15 @@ fn decoded_json_string_values_including_empty(
     }
 }
 
+fn mark_unevaluable(scan_error: &mut Option<crate::json_splice::SpliceError>) {
+    // A malformed typed carrier is not safe for a raw-body fallback either.
+    // Preserve a depth error for observability, but turn every other selector
+    // failure into the fail-closed class used at the dispatch boundary.
+    if !scan_error.is_some_and(crate::json_splice::SpliceError::is_depth_exceeded) {
+        *scan_error = Some(crate::json_splice::SpliceError::unevaluable());
+    }
+}
+
 fn decoded_json_string_values_except_root_keys(
     body: &[u8],
     excluded: &[&str],
@@ -1509,124 +1519,190 @@ fn decoded_json_string_values_except_root_keys(
     Some(out)
 }
 
-/// Source values of all occurrences of one top-level key. `RawValue` keeps
-/// repeated keys separate, unlike `serde_json::Value`.
-fn raw_top_level_values(
-    body: &[u8],
-    wanted_key: &str,
-) -> Option<Vec<Box<serde_json::value::RawValue>>> {
-    struct Values<'a> {
-        wanted_key: &'a str,
+/// A source fragment selected without asking serde to recursively skip an
+/// arbitrary caller-controlled value. The shallow parser below uses bounded
+/// stack space while crossing opaque image/document/reasoning payloads; a
+/// fragment is only walked with `json_splice` once it is eligible for a
+/// guardrail scan, which is where [`crate::json_splice::MAX_JSON_DEPTH`]
+/// applies.
+#[derive(Clone, Copy)]
+struct RawJson<'a> {
+    source: &'a str,
+}
+
+impl<'a> RawJson<'a> {
+    fn get(self) -> &'a str {
+        self.source
     }
+}
 
-    impl<'de> serde::de::Visitor<'de> for Values<'_> {
-        type Value = Vec<Box<serde_json::value::RawValue>>;
+fn raw_skip_ws(bytes: &[u8], pos: &mut usize) {
+    while bytes
+        .get(*pos)
+        .is_some_and(|byte| matches!(*byte, b' ' | b'\t' | b'\n' | b'\r'))
+    {
+        *pos += 1;
+    }
+}
 
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a JSON object")
+fn raw_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    (bytes.get(start) == Some(&b'"')).then_some(())?;
+    let mut pos = start + 1;
+    while let Some(&byte) = bytes.get(pos) {
+        match byte {
+            b'"' => return Some(pos + 1),
+            b'\\' => match bytes.get(pos + 1).copied()? {
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => pos += 2,
+                b'u' => {
+                    let hex = bytes.get(pos + 2..pos + 6)?;
+                    hex.iter().all(u8::is_ascii_hexdigit).then_some(())?;
+                    pos += 6;
+                }
+                _ => return None,
+            },
+            0..=0x1f => return None,
+            _ => pos += 1,
         }
+    }
+    None
+}
 
-        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-        where
-            A: serde::de::MapAccess<'de>,
-        {
-            let mut values = Vec::new();
-            while let Some(key) = map.next_key::<String>()? {
-                if key == self.wanted_key {
-                    values.push(map.next_value::<Box<serde_json::value::RawValue>>()?);
-                } else {
-                    map.next_value::<serde::de::IgnoredAny>()?;
+/// Find one raw JSON value's end without recursively deserializing it. The
+/// caller enforces object/array separators around the returned span. The
+/// pairing stack is capped at the guardrail traversal bound; farther opaque
+/// descendants keep only a depth count so an image/document can remain
+/// source-preserved without allocating one selector frame per nested value.
+fn raw_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    match bytes.get(start).copied()? {
+        b'"' => raw_string_end(bytes, start),
+        b'{' | b'[' => {
+            let mut pos = start;
+            let mut frames = Vec::new();
+            let mut opaque_depth = 0usize;
+            while let Some(&byte) = bytes.get(pos) {
+                match byte {
+                    b'"' => pos = raw_string_end(bytes, pos)?,
+                    b'{' | b'[' => {
+                        if frames.len() < crate::json_splice::MAX_JSON_DEPTH {
+                            frames.push(byte);
+                        } else {
+                            opaque_depth = opaque_depth.checked_add(1)?;
+                        }
+                        pos += 1;
+                    }
+                    b'}' | b']' => {
+                        if opaque_depth > 0 {
+                            opaque_depth -= 1;
+                        } else {
+                            let opener = frames.pop()?;
+                            if !matches!((opener, byte), (b'{', b'}') | (b'[', b']')) {
+                                return None;
+                            }
+                        }
+                        pos += 1;
+                        if frames.is_empty() && opaque_depth == 0 {
+                            return Some(pos);
+                        }
+                    }
+                    _ => pos += 1,
                 }
             }
-            Ok(values)
+            None
+        }
+        _ => {
+            let mut pos = start;
+            while bytes.get(pos).is_some_and(|byte| {
+                !matches!(*byte, b',' | b']' | b'}' | b' ' | b'\t' | b'\n' | b'\r')
+            }) {
+                pos += 1;
+            }
+            let token = bytes.get(start..pos)?;
+            if token == b"true" || token == b"false" || token == b"null" {
+                Some(pos)
+            } else {
+                serde_json::from_slice::<serde_json::Number>(token)
+                    .ok()
+                    .map(|_| pos)
+            }
         }
     }
+}
 
-    let mut deserializer = serde_json::Deserializer::from_slice(body);
-    let values =
-        serde::de::Deserializer::deserialize_map(&mut deserializer, Values { wanted_key }).ok()?;
-    deserializer.end().ok()?;
+/// Visit a root object's source members without `RawValue` / `IgnoredAny`.
+/// The caller-facing relay keeps opaque payloads raw, and this parser must do
+/// the same rather than making their nesting a guardrail traversal.
+fn raw_object_members<'a>(body: &'a [u8], mut visit: impl FnMut(&str, RawJson<'a>)) -> Option<()> {
+    let source = std::str::from_utf8(body).ok()?;
+    let bytes = source.as_bytes();
+    let mut pos = 0;
+    raw_skip_ws(bytes, &mut pos);
+    (bytes.get(pos) == Some(&b'{')).then_some(())?;
+    pos += 1;
+    loop {
+        raw_skip_ws(bytes, &mut pos);
+        if bytes.get(pos) == Some(&b'}') {
+            pos += 1;
+            raw_skip_ws(bytes, &mut pos);
+            return (pos == bytes.len()).then_some(());
+        }
+        let key_start = pos;
+        let key_end = raw_string_end(bytes, key_start)?;
+        let key = serde_json::from_slice::<String>(&bytes[key_start..key_end]).ok()?;
+        pos = key_end;
+        raw_skip_ws(bytes, &mut pos);
+        (bytes.get(pos) == Some(&b':')).then_some(())?;
+        pos += 1;
+        raw_skip_ws(bytes, &mut pos);
+        let value_start = pos;
+        let value_end = raw_value_end(bytes, value_start)?;
+        visit(
+            &key,
+            RawJson {
+                source: &source[value_start..value_end],
+            },
+        );
+        pos = value_end;
+        raw_skip_ws(bytes, &mut pos);
+        match bytes.get(pos) {
+            Some(b',') => pos += 1,
+            Some(b'}') => {
+                pos += 1;
+                raw_skip_ws(bytes, &mut pos);
+                return (pos == bytes.len()).then_some(());
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Source values of all occurrences of one top-level key. The shallow source
+/// selector keeps repeated keys separate without recursively deserializing
+/// unrelated forwarded fields.
+fn raw_top_level_values<'a>(body: &'a [u8], wanted_key: &str) -> Option<Vec<RawJson<'a>>> {
+    let mut values = Vec::new();
+    raw_object_members(body, |key, value| {
+        if key == wanted_key {
+            values.push(value);
+        }
+    })?;
     Some(values)
 }
 
-/// Borrowed source values of all occurrences of one top-level key. This is
-/// for traversals which revisit nested carriers: retaining a reference avoids
-/// copying every remaining `tool_result.content` suffix at each level.
-fn raw_top_level_value_refs<'a>(
-    body: &'a [u8],
-    wanted_key: &str,
-) -> Option<Vec<&'a serde_json::value::RawValue>> {
-    struct Values<'a> {
-        wanted_key: &'a str,
-    }
-
-    impl<'de> serde::de::Visitor<'de> for Values<'_> {
-        type Value = Vec<&'de serde_json::value::RawValue>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a JSON object")
-        }
-
-        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-        where
-            A: serde::de::MapAccess<'de>,
-        {
-            let mut values = Vec::new();
-            while let Some(key) = map.next_key::<String>()? {
-                if key == self.wanted_key {
-                    values.push(map.next_value::<&'de serde_json::value::RawValue>()?);
-                } else {
-                    map.next_value::<serde::de::IgnoredAny>()?;
-                }
-            }
-            Ok(values)
-        }
-    }
-
-    let mut deserializer = serde_json::Deserializer::from_slice(body);
-    let values =
-        serde::de::Deserializer::deserialize_map(&mut deserializer, Values { wanted_key }).ok()?;
-    deserializer.end().ok()?;
-    Some(values)
+/// Retaining a source fragment is a pointer copy, so nested carrier walks do
+/// not copy their remaining `tool_result.content` suffixes.
+fn raw_top_level_value_refs<'a>(body: &'a [u8], wanted_key: &str) -> Option<Vec<RawJson<'a>>> {
+    raw_top_level_values(body, wanted_key)
 }
 
-/// Source values of top-level keys other than `excluded`. Values are captured
-/// as raw JSON before filtering so a known opaque carrier can be skipped
-/// without recursively deserializing its payload.
-fn raw_top_level_values_except(
-    body: &[u8],
-    excluded: &[&str],
-) -> Option<Vec<Box<serde_json::value::RawValue>>> {
-    struct Values<'a> {
-        excluded: &'a [&'a str],
-    }
-
-    impl<'de> serde::de::Visitor<'de> for Values<'_> {
-        type Value = Vec<Box<serde_json::value::RawValue>>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a JSON object")
+/// Source values of top-level keys other than `excluded`. Known opaque
+/// carriers are skipped before their internals are traversed for a scan.
+fn raw_top_level_values_except<'a>(body: &'a [u8], excluded: &[&str]) -> Option<Vec<RawJson<'a>>> {
+    let mut values = Vec::new();
+    raw_object_members(body, |key, value| {
+        if !excluded.iter().any(|excluded| key == *excluded) {
+            values.push(value);
         }
-
-        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-        where
-            A: serde::de::MapAccess<'de>,
-        {
-            let mut values = Vec::new();
-            while let Some(key) = map.next_key::<String>()? {
-                let value = map.next_value::<Box<serde_json::value::RawValue>>()?;
-                if !self.excluded.iter().any(|excluded| key == *excluded) {
-                    values.push(value);
-                }
-            }
-            Ok(values)
-        }
-    }
-
-    let mut deserializer = serde_json::Deserializer::from_slice(body);
-    let values =
-        serde::de::Deserializer::deserialize_map(&mut deserializer, Values { excluded }).ok()?;
-    deserializer.end().ok()?;
+    })?;
     Some(values)
 }
 
@@ -1644,26 +1720,52 @@ fn raw_top_level_last_has_shape(body: &[u8], key: &str, allow_string: bool) -> b
         })
 }
 
-fn raw_is_object(raw: &serde_json::value::RawValue) -> bool {
+fn raw_is_object(raw: &RawJson<'_>) -> bool {
     raw.get().trim_start().starts_with('{')
 }
 
-fn raw_array_items(
-    raw: &serde_json::value::RawValue,
-) -> Option<Vec<Box<serde_json::value::RawValue>>> {
-    serde_json::from_str(raw.get()).ok()
+fn raw_array_items<'a>(raw: &RawJson<'a>) -> Option<Vec<RawJson<'a>>> {
+    let source = raw.get();
+    let bytes = source.as_bytes();
+    let mut pos = 0;
+    raw_skip_ws(bytes, &mut pos);
+    (bytes.get(pos) == Some(&b'[')).then_some(())?;
+    pos += 1;
+    let mut values = Vec::new();
+    loop {
+        raw_skip_ws(bytes, &mut pos);
+        if bytes.get(pos) == Some(&b']') {
+            pos += 1;
+            raw_skip_ws(bytes, &mut pos);
+            return (pos == bytes.len()).then_some(values);
+        }
+        let value_start = pos;
+        let value_end = raw_value_end(bytes, value_start)?;
+        values.push(RawJson {
+            source: &source[value_start..value_end],
+        });
+        pos = value_end;
+        raw_skip_ws(bytes, &mut pos);
+        match bytes.get(pos) {
+            Some(b',') => pos += 1,
+            Some(b']') => {
+                pos += 1;
+                raw_skip_ws(bytes, &mut pos);
+                return (pos == bytes.len()).then_some(values);
+            }
+            _ => return None,
+        }
+    }
 }
 
-fn raw_array_item_refs(
-    raw: &serde_json::value::RawValue,
-) -> Option<Vec<&serde_json::value::RawValue>> {
-    serde_json::from_str(raw.get()).ok()
+fn raw_array_item_refs<'a>(raw: &RawJson<'a>) -> Option<Vec<RawJson<'a>>> {
+    raw_array_items(raw)
 }
 
 /// `true` only for an unambiguous typed item. Conflicting or non-string
 /// duplicate `type` fields stay in the output scan rather than becoming a
 /// way to hide content.
-fn raw_object_has_only_types(raw: &serde_json::value::RawValue, allowed: &[&str]) -> bool {
+fn raw_object_has_only_types(raw: &RawJson<'_>, allowed: &[&str]) -> bool {
     let Some(values) = raw_top_level_values(raw.get().as_bytes(), "type") else {
         return false;
     };
@@ -1713,7 +1815,7 @@ fn raw_top_level_items_have_only_types(body: &[u8], key: &str, allowed: &[&str])
     )
 }
 
-fn append_raw_string_value(out: &mut String, raw: &serde_json::value::RawValue) -> Option<()> {
+fn append_raw_string_value(out: &mut String, raw: &RawJson<'_>) -> Option<()> {
     append_scan_text(out, &serde_json::from_str::<String>(raw.get()).ok()?);
     Some(())
 }
@@ -1759,10 +1861,7 @@ fn raw_top_level_unique_index(body: &[u8], key: &str) -> Result<Option<usize>, (
     }
 }
 
-fn raw_top_level_unique_object(
-    body: &[u8],
-    key: &str,
-) -> Result<Option<Box<serde_json::value::RawValue>>, ()> {
+fn raw_top_level_unique_object<'a>(body: &'a [u8], key: &str) -> Result<Option<RawJson<'a>>, ()> {
     let mut values = raw_top_level_values(body, key).ok_or(())?;
     match values.len() {
         0 => Ok(None),
@@ -1774,10 +1873,7 @@ fn raw_top_level_unique_object(
     }
 }
 
-fn raw_top_level_unique_array(
-    body: &[u8],
-    key: &str,
-) -> Result<Option<Box<serde_json::value::RawValue>>, ()> {
+fn raw_top_level_unique_array<'a>(body: &'a [u8], key: &str) -> Result<Option<RawJson<'a>>, ()> {
     let mut values = raw_top_level_values(body, key).ok_or(())?;
     match values.len() {
         0 => Ok(None),
@@ -1798,7 +1894,7 @@ fn raw_top_level_unique_array(
 /// The typed content extractors inspect a bare string or the direct `text`
 /// field of typed parts. Keep that boundary when walking raw source, so image
 /// and document payloads never reach external guardrails as text.
-fn append_raw_text_value(out: &mut String, raw: &serde_json::value::RawValue) -> Option<()> {
+fn append_raw_text_value(out: &mut String, raw: &RawJson<'_>) -> Option<()> {
     let value = raw.get().trim_start();
     if value.starts_with('"') {
         return append_raw_string_value(out, raw);
@@ -1822,18 +1918,12 @@ fn append_raw_text_value(out: &mut String, raw: &serde_json::value::RawValue) ->
 /// duplicate `type` is scanned as source rather than becoming a bypass.
 fn append_chat_request_content_strings(
     out: &mut String,
-    content: &serde_json::value::RawValue,
+    content: &RawJson<'_>,
     scan_error: &mut Option<crate::json_splice::SpliceError>,
 ) -> Option<()> {
     enum Work<'a> {
-        Content {
-            value: &'a serde_json::value::RawValue,
-            depth: usize,
-        },
-        Block {
-            value: &'a serde_json::value::RawValue,
-            depth: usize,
-        },
+        Content { value: RawJson<'a>, depth: usize },
+        Block { value: RawJson<'a>, depth: usize },
     }
 
     // `tool_result.content` can itself contain another `tool_result`. Keep
@@ -1842,7 +1932,7 @@ fn append_chat_request_content_strings(
     // it does for the byte scanner's frame stack. A carrier at the cap still
     // scans; only one more nested carrier is unevaluable.
     let mut work = vec![Work::Content {
-        value: content,
+        value: *content,
         depth: 0,
     }];
     while let Some(work_item) = work.pop() {
@@ -1850,15 +1940,26 @@ fn append_chat_request_content_strings(
             Work::Content { value, depth } => {
                 let value_text = value.get().trim_start();
                 if value_text.starts_with('"') {
-                    append_raw_string_value(out, value)?;
+                    append_raw_string_value(out, &value)?;
                     continue;
                 }
                 if !value_text.starts_with('[') {
+                    // `null` is the normal empty assistant-content shape;
+                    // every other non-string/non-array carrier cannot be
+                    // selected without treating arbitrary source as text.
+                    if value_text != "null" {
+                        mark_unevaluable(scan_error);
+                        return None;
+                    }
                     continue;
                 }
                 // Push backwards so the LIFO work stack preserves the
                 // previous depth-first, source-order traversal.
-                for block in raw_array_item_refs(value)?.into_iter().rev() {
+                let Some(blocks) = raw_array_item_refs(&value) else {
+                    mark_unevaluable(scan_error);
+                    return None;
+                };
+                for block in blocks.into_iter().rev() {
                     work.push(Work::Block {
                         value: block,
                         depth,
@@ -1869,11 +1970,15 @@ fn append_chat_request_content_strings(
                 value: block,
                 depth,
             } => {
-                if !raw_is_object(block) {
-                    continue;
+                if !raw_is_object(&block) {
+                    mark_unevaluable(scan_error);
+                    return None;
                 }
                 let block_body = block.get().as_bytes();
-                let types = raw_top_level_values(block_body, "type")?;
+                let Some(types) = raw_top_level_values(block_body, "type") else {
+                    mark_unevaluable(scan_error);
+                    return None;
+                };
                 let kind = raw_top_level_unique_type(block_body);
                 if !types.is_empty() && kind.is_none() {
                     append_scan_text(
@@ -1885,7 +1990,10 @@ fn append_chat_request_content_strings(
                 match kind.as_deref() {
                     Some("redacted_thinking") => {}
                     Some("tool_result") => {
-                        let nested = raw_top_level_value_refs(block_body, "content")?;
+                        let Some(nested) = raw_top_level_value_refs(block_body, "content") else {
+                            mark_unevaluable(scan_error);
+                            return None;
+                        };
                         if nested.is_empty() {
                             continue;
                         }
@@ -1907,7 +2015,11 @@ fn append_chat_request_content_strings(
                         }
                     }
                     Some("tool_use") => {
-                        for input in raw_top_level_values(block_body, "input")? {
+                        let Some(inputs) = raw_top_level_values(block_body, "input") else {
+                            mark_unevaluable(scan_error);
+                            return None;
+                        };
+                        for input in inputs {
                             append_scan_text(
                                 out,
                                 &decoded_json_string_values_including_empty(
@@ -1928,11 +2040,12 @@ fn append_chat_request_content_strings(
 
 fn append_chat_request_message_strings(
     out: &mut String,
-    message: &serde_json::value::RawValue,
+    message: &RawJson<'_>,
     scan_error: &mut Option<crate::json_splice::SpliceError>,
 ) -> Option<()> {
     if !raw_is_object(message) {
-        return Some(());
+        mark_unevaluable(scan_error);
+        return None;
     }
     let message_body = message.get().as_bytes();
     append_scan_text(
@@ -1943,10 +2056,18 @@ fn append_chat_request_message_strings(
             scan_error,
         )?,
     );
-    for content in raw_top_level_values(message_body, "content")? {
+    let Some(contents) = raw_top_level_values(message_body, "content") else {
+        mark_unevaluable(scan_error);
+        return None;
+    };
+    for content in contents {
         append_chat_request_content_strings(out, &content, scan_error)?;
     }
-    for tool_calls in raw_top_level_values(message_body, "tool_calls")? {
+    let Some(tool_calls) = raw_top_level_values(message_body, "tool_calls") else {
+        mark_unevaluable(scan_error);
+        return None;
+    };
+    for tool_calls in tool_calls {
         append_scan_text(
             out,
             &decoded_json_string_values_including_empty(tool_calls.get().as_bytes(), scan_error)?,
@@ -1965,15 +2086,24 @@ fn decoded_chat_request_string_values(
         &["model", "system", "messages"],
         scan_error,
     )?;
-    for system in raw_top_level_values(body, "system")? {
+    let Some(system_values) = raw_top_level_values(body, "system") else {
+        mark_unevaluable(scan_error);
+        return None;
+    };
+    for system in system_values {
         append_chat_request_content_strings(&mut out, &system, scan_error)?;
     }
-    for array in raw_top_level_values(body, "messages")? {
+    let Some(message_values) = raw_top_level_values(body, "messages") else {
+        mark_unevaluable(scan_error);
+        return None;
+    };
+    for array in message_values {
         // The selected (last) carrier made this a Chat envelope. Preserve
         // other duplicate source values without turning a malformed earlier
         // carrier into a whole-body fallback that exposes opaque media.
         let Some(messages) = raw_array_items(&array) else {
-            continue;
+            mark_unevaluable(scan_error);
+            return None;
         };
         for message in messages {
             append_chat_request_message_strings(&mut out, &message, scan_error)?;
@@ -1984,7 +2114,7 @@ fn decoded_chat_request_string_values(
 
 fn append_responses_item_strings(
     out: &mut String,
-    item: &serde_json::value::RawValue,
+    item: &RawJson<'_>,
     scan_error: &mut Option<crate::json_splice::SpliceError>,
 ) -> Option<()> {
     if !raw_is_object(item) {
@@ -2071,13 +2201,27 @@ fn request_guardrail_text_with_scan_error(
     match protocol {
         PassthroughProtocol::Raw => decoded_json_string_values(body).unwrap_or_else(raw),
         PassthroughProtocol::OpenaiChat => {
-            decoded_chat_request_string_values(body, scan_error).unwrap_or_else(raw)
+            // A malformed Chat carrier is unevaluable rather than a reason
+            // to send its opaque media source through an input guardrail.
+            match decoded_chat_request_string_values(body, scan_error) {
+                Some(text) => text,
+                None => {
+                    mark_unevaluable(scan_error);
+                    String::new()
+                }
+            }
         }
         PassthroughProtocol::OpenaiCompletions => {
             decoded_completions_request_string_values(body, scan_error).unwrap_or_else(raw)
         }
         PassthroughProtocol::OpenaiResponses => {
-            decoded_responses_request_string_values(body, scan_error).unwrap_or_else(raw)
+            match decoded_responses_request_string_values(body, scan_error) {
+                Some(text) => text,
+                None => {
+                    mark_unevaluable(scan_error);
+                    String::new()
+                }
+            }
         }
     }
 }
@@ -2116,10 +2260,7 @@ fn chat_visible_content_part_field(kind: &str) -> Option<&'static str> {
 /// A bare string is the Chat response's ordinary text shape; array entries
 /// need one unambiguous known discriminator before their text or refusal
 /// field may cross the output-guardrail boundary.
-fn append_chat_visible_content_strings(
-    out: &mut String,
-    content: &serde_json::value::RawValue,
-) -> Option<()> {
+fn append_chat_visible_content_strings(out: &mut String, content: &RawJson<'_>) -> Option<()> {
     let value = content.get().trim_start();
     if value.starts_with('"') {
         return append_raw_string_value(out, content);
@@ -2155,10 +2296,7 @@ fn chat_tool_continuation_fields(body: &[u8]) -> Option<&'static [(&'static str,
     }
 }
 
-fn append_chat_tool_call_strings(
-    out: &mut String,
-    tool_calls: &serde_json::value::RawValue,
-) -> Option<()> {
+fn append_chat_tool_call_strings(out: &mut String, tool_calls: &RawJson<'_>) -> Option<()> {
     if !tool_calls.get().trim_start().starts_with('[') {
         return Some(());
     }
@@ -2185,7 +2323,7 @@ fn append_chat_tool_call_strings(
 /// response walk beyond its explicit `name` and `arguments` fields.
 fn append_chat_legacy_function_call_strings(
     out: &mut String,
-    function_call: &serde_json::value::RawValue,
+    function_call: &RawJson<'_>,
 ) -> Option<()> {
     if !raw_is_object(function_call) {
         return Some(());
@@ -2196,10 +2334,7 @@ fn append_chat_legacy_function_call_strings(
     Some(())
 }
 
-fn append_chat_output_message_strings(
-    out: &mut String,
-    message: &serde_json::value::RawValue,
-) -> Option<()> {
+fn append_chat_output_message_strings(out: &mut String, message: &RawJson<'_>) -> Option<()> {
     if !raw_is_object(message) {
         return Some(());
     }
@@ -2224,7 +2359,7 @@ fn append_chat_output_message_strings(
 /// content-block kinds remain opaque.
 fn append_anthropic_output_content_strings(
     out: &mut String,
-    content: &serde_json::value::RawValue,
+    content: &RawJson<'_>,
     scan_error: &mut Option<crate::json_splice::SpliceError>,
 ) -> Option<()> {
     if !content.get().trim_start().starts_with('[') {
@@ -2300,10 +2435,7 @@ const RESPONSES_VISIBLE_TEXT_PART_TYPES: &[&str] = &["output_text", "text", "inp
 /// content-part walk. A missing or conflicting discriminator is opaque: a
 /// media item can use any string-shaped field, so only a unique known text
 /// part may cross the external guardrail boundary.
-fn append_responses_visible_part_strings(
-    out: &mut String,
-    part: &serde_json::value::RawValue,
-) -> Option<()> {
+fn append_responses_visible_part_strings(out: &mut String, part: &RawJson<'_>) -> Option<()> {
     let part_body = part.get().as_bytes();
     match raw_top_level_unique_type(part_body).as_deref() {
         Some(kind) if RESPONSES_VISIBLE_TEXT_PART_TYPES.contains(&kind) => {
@@ -2314,10 +2446,7 @@ fn append_responses_visible_part_strings(
     Some(())
 }
 
-fn append_responses_visible_content_strings(
-    out: &mut String,
-    content: &serde_json::value::RawValue,
-) -> Option<()> {
+fn append_responses_visible_content_strings(out: &mut String, content: &RawJson<'_>) -> Option<()> {
     let value = content.get().trim_start();
     if value.starts_with('"') {
         return append_raw_string_value(out, content);
@@ -2339,10 +2468,7 @@ fn append_responses_visible_content_strings(
 /// typed output guardrail already reads. A missing or conflicting item type
 /// is opaque rather than a generic raw fallback: without a unique item kind,
 /// `text`, `arguments`, and `input` could be an image/audio/file payload.
-fn append_responses_output_item_strings(
-    out: &mut String,
-    item: &serde_json::value::RawValue,
-) -> Option<()> {
+fn append_responses_output_item_strings(out: &mut String, item: &RawJson<'_>) -> Option<()> {
     let item_body = item.get().as_bytes();
     match raw_top_level_unique_type(item_body).as_deref() {
         Some("reasoning") => {}
@@ -2401,7 +2527,13 @@ fn response_guardrail_text_with_scan_error(
             // A detected Chat response can carry opaque multimodal values.
             // Without a successful type-aware selection, relay it but do not
             // send a raw fallback to an external output guardrail.
-            decoded_chat_response_string_values(body, scan_error).unwrap_or_default()
+            match decoded_chat_response_string_values(body, scan_error) {
+                Some(text) => text,
+                None => {
+                    mark_unevaluable(scan_error);
+                    String::new()
+                }
+            }
         }
         PassthroughProtocol::OpenaiCompletions => {
             decoded_non_model_json_string_values(body).unwrap_or_else(raw)
@@ -2443,7 +2575,8 @@ fn try_response_guardrail_text(
             let text = response_guardrail_text_with_scan_error(protocol, body, &mut scan_error);
             scan_error.map_or(Ok(text), Err)
         }
-        PassthroughProtocol::OpenaiResponses => Ok(response_guardrail_text(protocol, body)),
+        PassthroughProtocol::OpenaiResponses => decoded_responses_response_string_values(body)
+            .ok_or_else(crate::json_splice::SpliceError::unevaluable),
     }
 }
 
@@ -5757,6 +5890,18 @@ mod tests {
             .into_bytes()
     }
 
+    fn nested_chat_messages_payload(depth: usize) -> Vec<u8> {
+        let metadata = format!(
+            "{}\"safe\"{}",
+            r#"{"next":"#.repeat(depth),
+            "}".repeat(depth),
+        );
+        format!(
+            r#"{{"model":"chat","messages":[{{"role":"user","content":"safe","metadata":{metadata}}}]}}"#
+        )
+        .into_bytes()
+    }
+
     fn provider_key_entry(api_base_unused: &str) -> ResourceEntry<ProviderKey> {
         let json = format!(
             r#"{{"display_name":"openai-up","secret":"sk-upstream","api_base":"{api_base_unused}","provider":"openai","adapter":"openai"}}"#
@@ -8707,6 +8852,44 @@ mod tests {
         let error = try_request_guardrail_text(PassthroughProtocol::OpenaiChat, &body)
             .expect_err("nested tool results beyond the shared JSON depth cap must not recurse");
         assert!(error.is_depth_exceeded(), "{error}");
+    }
+
+    #[test]
+    fn over_depth_chat_messages_payload_is_unevaluable_before_source_selection() {
+        let body = nested_chat_messages_payload(crate::json_splice::MAX_JSON_DEPTH + 1);
+        assert_eq!(detect_protocol(&body), PassthroughProtocol::OpenaiChat);
+        let error = try_request_guardrail_text(PassthroughProtocol::OpenaiChat, &body)
+            .expect_err("a messages payload beyond the shared depth cap must not be selected");
+        assert!(error.is_depth_exceeded(), "{error}");
+    }
+
+    #[test]
+    fn malformed_chat_carriers_are_unevaluable_without_raw_fallback() {
+        let cases: [&[u8]; 2] = [
+            br#"{"messages":["forbidden"]}"#,
+            br#"{"messages":[{"role":"user","content":["forbidden"]}]}"#,
+        ];
+        for body in cases {
+            let error = try_request_guardrail_text(PassthroughProtocol::OpenaiChat, body)
+                .expect_err("a malformed Chat carrier must not be treated as an empty scan");
+            assert!(error.is_unevaluable(), "{error}");
+            assert!(!error.is_depth_exceeded(), "{error}");
+            assert!(
+                !request_guardrail_text(PassthroughProtocol::OpenaiChat, body)
+                    .contains("forbidden"),
+                "opaque carrier source must not become guardrail text"
+            );
+        }
+    }
+
+    #[test]
+    fn shallow_source_selector_makes_mismatched_or_invalid_json_unevaluable() {
+        let cases: [&[u8]; 2] = [br#"{"messages":[}]"#, br#"{"messages":[forbidden]}"#];
+        for body in cases {
+            let error = try_request_guardrail_text(PassthroughProtocol::OpenaiChat, body)
+                .expect_err("a malformed source selector must not produce an empty scan");
+            assert!(error.is_unevaluable(), "{error}");
+        }
     }
 
     /// Buffered Anthropic and Responses replies are read slot by slot:

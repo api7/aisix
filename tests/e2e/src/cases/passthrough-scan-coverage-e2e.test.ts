@@ -550,6 +550,27 @@ describe("passthrough guardrail scan coverage", () => {
   });
 
   test.for([
+    ["messages", `{"model":"gpt-4o-mini","messages":["forbidden"]}`],
+    [
+      "content",
+      `{"model":"gpt-4o-mini","messages":[{"role":"user","content":["forbidden"]}]}`,
+    ],
+  ] as const)(
+    "input: malformed Chat %s carrier fails closed without raw-scanning it",
+    async ([, body], ctx) => {
+      if (!ready(ctx)) return;
+      const before = upstreams.input!.receivedRequests.length;
+      const res = await callRaw("input", "/v1/any", body);
+      expect(res.status).toBe(422);
+      const response = await res.text();
+      expect(response).toContain("guardrail_unavailable");
+      expect(response).toContain("unscannable_body");
+      expect(response).not.toContain("forbidden");
+      expect(upstreams.input!.receivedRequests.length).toBe(before);
+    },
+  );
+
+  test.for([
     ["ASCII", ESCAPED_BLOCK_JSON],
     ["CJK", ESCAPED_CJK_JSON],
   ] as const)("input: raw JSON %s escapes are decoded before scanning", async ([, body], ctx) => {

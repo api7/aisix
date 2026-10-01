@@ -44,6 +44,7 @@ impl PathSeg {
 enum SpliceErrorKind {
     Invalid,
     DepthExceeded,
+    Unevaluable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -60,6 +61,17 @@ impl SpliceError {
         self.kind == SpliceErrorKind::DepthExceeded
     }
 
+    /// Whether source selection could not safely establish the fields a
+    /// guardrail is allowed to inspect. Unlike an invalid raw JSON document,
+    /// this must not fall back to scanning the whole body: that could expose
+    /// an opaque media carrier to an external guardrail.
+    pub(crate) fn is_unevaluable(self) -> bool {
+        matches!(
+            self.kind,
+            SpliceErrorKind::DepthExceeded | SpliceErrorKind::Unevaluable
+        )
+    }
+
     /// Report an exhausted JSON traversal budget from a selector which uses
     /// the same bounded raw-JSON policy as this scanner. Selectors retain raw
     /// fragments rather than source offsets, so the synthetic error uses the
@@ -68,6 +80,15 @@ impl SpliceError {
         Self {
             at: 0,
             kind: SpliceErrorKind::DepthExceeded,
+        }
+    }
+
+    /// Report a typed carrier that cannot be safely selected without falling
+    /// back to raw source text.
+    pub(crate) fn unevaluable() -> Self {
+        Self {
+            at: 0,
+            kind: SpliceErrorKind::Unevaluable,
         }
     }
 }
