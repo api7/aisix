@@ -445,9 +445,10 @@ pub(crate) fn metric_model_label_pair<'a>(
 /// This is intentionally an allowlist rather than a list of the management
 /// surfaces we currently know about. A new zero-token or control-plane route
 /// must remain unpriced until it explicitly establishes the same billing
-/// contract as a model-inference surface. Batch completion is also absent:
-/// it represents detached, after-the-fact output aggregation and has no live
-/// request attribution from which to take a wildcard identity.
+/// contract as a model-inference surface. `BATCH_COMPLETION` is the one
+/// detached terminal surface: it may use an identity captured from the
+/// completed batch's dispatch request, while the `BATCHES` management route
+/// remains unpriced.
 fn is_billable_inference_surface(surface: Surface) -> bool {
     [
         crate::operation::CHAT,
@@ -463,8 +464,65 @@ fn is_billable_inference_surface(surface: Surface) -> bool {
         crate::operation::TRANSLATION,
         crate::operation::SPEECH,
         crate::operation::VIDEO_GENERATION,
+        crate::operation::BATCH_COMPLETION,
     ]
     .contains(&surface)
+}
+
+/// A complete wildcard pricing selection captured at dispatch time.
+///
+/// Detached terminal work cannot depend on a Tokio task-local surviving past
+/// its originating request. Keep only the price-selection tuple: unlike the
+/// rest of request attribution, it is safe and necessary to carry to the
+/// terminal event, and its `model_id` prevents it being applied to another
+/// attempt or model row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WildcardPricingIdentity {
+    model_id: String,
+    pricing_authority_id: String,
+    resolved_pricing_model: String,
+}
+
+/// Snapshot the current request's dispatch-time wildcard price selection for
+/// a detached terminal emitter. Cache hits, fixed rows, incomplete legacy
+/// projections, and code outside a request scope intentionally yield `None`.
+pub(crate) fn capture_wildcard_pricing_identity() -> Option<WildcardPricingIdentity> {
+    let resolved = crate::attribution::current()?;
+    if resolved.cache_hit_layer.is_some()
+        || resolved.wildcard_pricing_model_id.is_empty()
+        || resolved.wildcard_pricing_authority_id.is_empty()
+        || resolved.wildcard_pricing_model.is_empty()
+    {
+        return None;
+    }
+    Some(WildcardPricingIdentity {
+        model_id: resolved.wildcard_pricing_model_id,
+        pricing_authority_id: resolved.wildcard_pricing_authority_id,
+        resolved_pricing_model: resolved.wildcard_pricing_model,
+    })
+}
+
+/// Apply a wildcard pricing identity captured at dispatch time. The caller
+/// still has to prove that this terminal event describes an upstream dispatch
+/// on a priced inference surface; a captured tuple can never price a
+/// management, cached, failed-before-dispatch, or different-model event.
+pub(crate) fn apply_captured_wildcard_pricing_identity(
+    event: &mut UsageEvent,
+    surface: Surface,
+    dispatched: bool,
+    identity: Option<&WildcardPricingIdentity>,
+) {
+    if !dispatched || !is_billable_inference_surface(surface) {
+        return;
+    }
+    let Some(identity) = identity else {
+        return;
+    };
+    if identity.model_id != event.model_id {
+        return;
+    }
+    event.pricing_authority_id = identity.pricing_authority_id.clone();
+    event.resolved_pricing_model = identity.resolved_pricing_model.clone();
 }
 
 /// Fill the optional DP-to-CP wildcard-pricing authority at the one usage
@@ -475,21 +533,8 @@ fn is_billable_inference_surface(surface: Surface) -> bool {
 /// has no upstream call to price. Detached gateway work has no caller
 /// attribution and therefore cannot price itself as the parent request.
 fn apply_wildcard_pricing_model(event: &mut UsageEvent, surface: Surface, dispatched: bool) {
-    if !dispatched || !is_billable_inference_surface(surface) {
-        return;
-    }
-    let Some(resolved) = crate::attribution::current() else {
-        return;
-    };
-    if resolved.cache_hit_layer.is_some() || resolved.wildcard_pricing_model_id != event.model_id {
-        return;
-    }
-    if !resolved.wildcard_pricing_authority_id.is_empty()
-        && !resolved.wildcard_pricing_model.is_empty()
-    {
-        event.pricing_authority_id = resolved.wildcard_pricing_authority_id;
-        event.resolved_pricing_model = resolved.wildcard_pricing_model;
-    }
+    let identity = capture_wildcard_pricing_identity();
+    apply_captured_wildcard_pricing_identity(event, surface, dispatched, identity.as_ref());
 }
 
 /// Stamp the five per-PK attribution fields onto an in-progress UsageEvent,
@@ -1188,6 +1233,7 @@ mod tests {
             crate::operation::TRANSLATION,
             crate::operation::SPEECH,
             crate::operation::VIDEO_GENERATION,
+            crate::operation::BATCH_COMPLETION,
         ] {
             assert!(
                 is_billable_inference_surface(surface),
@@ -1204,12 +1250,71 @@ mod tests {
             crate::operation::MCP,
             crate::operation::A2A,
             crate::operation::PASSTHROUGH,
-            crate::operation::BATCH_COMPLETION,
         ] {
             assert!(
                 !is_billable_inference_surface(surface),
                 "{} must not select a wildcard pricing identity",
                 surface.operation,
+            );
+        }
+    }
+
+    #[test]
+    fn captured_wildcard_pricing_identity_only_prices_the_matching_dispatched_terminal() {
+        let identity = WildcardPricingIdentity {
+            model_id: "wildcard".to_string(),
+            pricing_authority_id: "a3ebdc63-e921-4323-a75c-3b911f950046".to_string(),
+            resolved_pricing_model: "gpt-4o-2024-08-06".to_string(),
+        };
+
+        let mut completed_batch = UsageEvent {
+            model_id: "wildcard".to_string(),
+            ..Default::default()
+        };
+        apply_captured_wildcard_pricing_identity(
+            &mut completed_batch,
+            crate::operation::BATCH_COMPLETION,
+            true,
+            Some(&identity),
+        );
+        assert_eq!(
+            completed_batch.pricing_authority_id,
+            "a3ebdc63-e921-4323-a75c-3b911f950046"
+        );
+        assert_eq!(completed_batch.resolved_pricing_model, "gpt-4o-2024-08-06");
+
+        for (surface, dispatched, model_id, case) in [
+            (crate::operation::BATCHES, true, "wildcard", "management"),
+            (
+                crate::operation::BATCH_COMPLETION,
+                false,
+                "wildcard",
+                "undispatched",
+            ),
+            (
+                crate::operation::BATCH_COMPLETION,
+                true,
+                "other",
+                "different model",
+            ),
+        ] {
+            let mut event = UsageEvent {
+                model_id: model_id.to_string(),
+                ..Default::default()
+            };
+            apply_captured_wildcard_pricing_identity(
+                &mut event,
+                surface,
+                dispatched,
+                Some(&identity),
+            );
+            assert!(
+                event.pricing_authority_id.is_empty(),
+                "{case} event must not select wildcard pricing"
+            );
+            assert!(
+                event.resolved_pricing_model.is_empty(),
+                "{case} event must not select wildcard pricing"
             );
         }
     }
@@ -1294,6 +1399,10 @@ mod tests {
                     crate::attribution::current().expect("in request attribution scope");
                 assert_eq!(cached_attribution.cache_hit_layer, Some("exact"));
                 assert_eq!(cached_attribution.upstream_model, "*");
+                assert!(
+                    capture_wildcard_pricing_identity().is_none(),
+                    "a cache hit must not hand a detached emitter a wildcard price"
+                );
                 // `note_cache_hit_entry` clears the identity above. Restore
                 // one here to pin the separate emission gate too: a cache
                 // hit is never billable as an upstream wildcard dispatch.

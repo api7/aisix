@@ -271,10 +271,10 @@ pub(crate) async fn realtime(
             let state2 = state.clone();
             let client2 = client.clone();
             // `on_upgrade` runs on a new Tokio task, which does not inherit
-            // the request task-local. Copy only the wildcard pricing tuple:
-            // the HTTP cell is already owned by the completed upgrade
-            // response and cannot also own the session's terminal log.
-            let attribution = crate::attribution::current_wildcard_pricing_continuation();
+            // the request task-local. Copy the verified wildcard price
+            // selection now; the HTTP cell is already owned by the completed
+            // upgrade response and cannot own the session terminal event.
+            let wildcard_pricing = crate::usage_attr::capture_wildcard_pricing_identity();
             // `on_upgrade` runs the session on a detached task, so the
             // request span has to be attached to the future rather than
             // inherited — without it the session's guardrail checks log
@@ -290,7 +290,7 @@ pub(crate) async fn realtime(
                         client2,
                         request_id,
                         started,
-                        attribution,
+                        wildcard_pricing,
                     )
                     .await;
                 }
@@ -739,13 +739,18 @@ async fn run_session(
     client: ClientContext,
     request_id: String,
     started: Instant,
-    attribution: Option<std::sync::Arc<crate::attribution::RequestAttribution>>,
+    wildcard_pricing: Option<crate::usage_attr::WildcardPricingIdentity>,
 ) {
-    let session = run_session_inner(state, prep, client_ws, client, request_id, started);
-    match attribution {
-        Some(cell) => crate::attribution::scope(cell, session).await,
-        None => session.await,
-    }
+    run_session_inner(
+        state,
+        prep,
+        client_ws,
+        client,
+        request_id,
+        started,
+        wildcard_pricing,
+    )
+    .await;
 }
 
 async fn run_session_inner(
@@ -755,6 +760,7 @@ async fn run_session_inner(
     client: ClientContext,
     request_id: String,
     started: Instant,
+    wildcard_pricing: Option<crate::usage_attr::WildcardPricingIdentity>,
 ) {
     let Prepared {
         auth,
@@ -1123,6 +1129,12 @@ async fn run_session_inner(
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(&audit),
         ..Default::default()
     };
+    crate::usage_attr::apply_captured_wildcard_pricing_identity(
+        &mut event,
+        crate::operation::REALTIME,
+        /* dispatched */ true,
+        wildcard_pricing.as_ref(),
+    );
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
     crate::usage_attr::apply_caller_identity(
         &mut event,

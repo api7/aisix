@@ -13,10 +13,12 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E for AISIX-Cloud#1746: the configured wildcard row remains the model
-// identity, while the concrete upstream model travels on the usage-export
-// wire as `resolved_pricing_model`. AISIX-Cloud's real PostgreSQL receiver
-// uses that field only when this row's configured model_name is a template.
+// Gateway/exporter boundary regression for AISIX-Cloud#1746: the configured
+// wildcard row remains the model identity, while the concrete upstream model
+// travels on the usage-export wire as `resolved_pricing_model`. This runs a
+// real gateway process but `startMockSls` is only the exporter protocol
+// receiver; it is not evidence for the CP/DPM/PostgreSQL ingestion contract,
+// which belongs to AISIX-Cloud's mTLS telemetry E2E.
 
 const CALLER_PLAINTEXT = "sk-wildcard-pricing-telemetry-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -34,6 +36,11 @@ const EMBEDDING_VECTOR = [0.1, 0.2, 0.3];
 const COUNT_TOKENS_WILDCARD_ALIAS = "anthropic/*";
 const COUNT_TOKENS_REQUEST_MODEL = "anthropic/claude-haiku-4-5-20251001";
 const COUNT_TOKENS_UPSTREAM_MODEL = "claude-haiku-4-5-20251001";
+const STREAMING_WILDCARD_ALIAS = "stream/*";
+const STREAMING_REQUEST_MODEL = "stream/gpt-4o-2024-08-06";
+const STREAMING_UPSTREAM_MODEL = "gpt-4o-2024-08-06";
+const BATCH_WILDCARD_ALIAS = "batch/*";
+const BATCH_REQUEST_MODEL = "batch/gpt-4o-2024-08-06";
 
 function upstreamResponse() {
   return {
@@ -59,6 +66,57 @@ function embeddingUpstreamResponse() {
   };
 }
 
+function streamEvents(): string[] {
+  return [
+    JSON.stringify({
+      id: "chatcmpl-wildcard-stream",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "provider-response-stream-model",
+      choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }],
+    }),
+    JSON.stringify({
+      id: "chatcmpl-wildcard-stream",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "provider-response-stream-model",
+      choices: [],
+      usage: { prompt_tokens: 11, completion_tokens: 6, total_tokens: 17 },
+    }),
+    "[DONE]",
+  ];
+}
+
+function completedBatchResponse() {
+  return {
+    id: "batch-wildcard-completed",
+    object: "batch",
+    status: "completed",
+    input_file_id: "file-wildcard-input",
+    output_file_id: "file-wildcard-output",
+  };
+}
+
+function completedBatchOutput(): string {
+  return `${JSON.stringify({
+    id: "batch-request-1",
+    custom_id: "request-1",
+    response: {
+      status_code: 200,
+      body: {
+        // The provider's response field is deliberately different: it is
+        // diagnostic only and must not override the dispatch price model.
+        model: "provider-reported-batch-model",
+        usage: {
+          prompt_tokens: 13,
+          completion_tokens: 7,
+          prompt_tokens_details: { cached_tokens: 3 },
+        },
+      },
+    },
+  })}\n`;
+}
+
 function routedId(raw: string, model: string): string {
   return `aisix-${Buffer.from(`${raw};model,${model}`).toString("base64url")}`;
 }
@@ -69,9 +127,13 @@ describe("wildcard pricing telemetry e2e", () => {
   let upstream: OpenAiUpstream | undefined;
   let embeddingUpstream: OpenAiUpstream | undefined;
   let countTokensUpstream: OpenAiUpstream | undefined;
+  let streamingUpstream: OpenAiUpstream | undefined;
+  let batchUpstream: OpenAiUpstream | undefined;
   let wildcardID = "";
   let embeddingWildcardID = "";
   let countTokensWildcardID = "";
+  let streamingWildcardID = "";
+  let batchWildcardID = "";
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -83,6 +145,13 @@ describe("wildcard pricing telemetry e2e", () => {
     upstream = await startOpenAiUpstream({ nonStreamBody: upstreamResponse() });
     embeddingUpstream = await startOpenAiUpstream({ nonStreamBody: embeddingUpstreamResponse() });
     countTokensUpstream = await startOpenAiUpstream({ nonStreamBody: { input_tokens: 42 } });
+    streamingUpstream = await startOpenAiUpstream({ streamEvents: streamEvents() });
+    batchUpstream = await startOpenAiUpstream({
+      scriptedResponses: [
+        { nonStreamBody: completedBatchResponse() },
+        { rawBody: completedBatchOutput(), rawContentType: "application/jsonl" },
+      ],
+    });
     app = await spawnApp({
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
@@ -148,6 +217,36 @@ describe("wildcard pricing telemetry e2e", () => {
       pricing_authority_id: PRICING_AUTHORITY_ID,
     });
     countTokensWildcardID = countTokensWildcard.id;
+    const streamingProviderKey = await seed.createProviderKey({
+      display_name: "wildcard-pricing-stream-pk",
+      provider: "openai",
+      adapter: "openai",
+      secret: "sk-mock",
+      api_base: `${streamingUpstream.baseUrl}/v1`,
+    });
+    const streamingWildcard = await seed.createModel({
+      display_name: STREAMING_WILDCARD_ALIAS,
+      provider: "openai",
+      model_name: "*",
+      provider_key_id: streamingProviderKey.id,
+      pricing_authority_id: PRICING_AUTHORITY_ID,
+    });
+    streamingWildcardID = streamingWildcard.id;
+    const batchProviderKey = await seed.createProviderKey({
+      display_name: "wildcard-pricing-batch-pk",
+      provider: "openai",
+      adapter: "openai",
+      secret: "sk-mock",
+      api_base: `${batchUpstream.baseUrl}/v1`,
+    });
+    const batchWildcard = await seed.createModel({
+      display_name: BATCH_WILDCARD_ALIAS,
+      provider: "openai",
+      model_name: "*",
+      provider_key_id: batchProviderKey.id,
+      pricing_authority_id: PRICING_AUTHORITY_ID,
+    });
+    batchWildcardID = batchWildcard.id;
 
     // Seeded last: a successful models-list gate proves that all preceding
     // resources, including the exporter, are in the same gateway snapshot.
@@ -166,6 +265,8 @@ describe("wildcard pricing telemetry e2e", () => {
     await upstream?.close();
     await embeddingUpstream?.close();
     await countTokensUpstream?.close();
+    await streamingUpstream?.close();
+    await batchUpstream?.close();
     await sls?.close();
   });
 
@@ -220,6 +321,51 @@ describe("wildcard pricing telemetry e2e", () => {
     expect(unknown.get("model_id")).toBe(wildcardID);
     expect(unknown.get("pricing_authority_id")).toBe(PRICING_AUTHORITY_ID);
     expect(unknown.get("resolved_pricing_model")).toBe(UNKNOWN_MODEL);
+  });
+
+  test("stream terminal telemetry keeps the wildcard dispatch price after the response scope ends", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !streamingUpstream || !streamingWildcardID) {
+      ctx.skip();
+      return;
+    }
+
+    const before = streamingUpstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: STREAMING_REQUEST_MODEL,
+        stream: true,
+        messages: [{ role: "user", content: "stream this prompt" }],
+      }),
+    });
+    const body = await res.text();
+    expect(res.status, body).toBe(200);
+    expect(body).toContain("[DONE]");
+
+    const calls = streamingUpstream.receivedRequests.slice(before);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.path).toBe("/v1/chat/completions");
+    expect(JSON.parse(calls[0]!.body)).toMatchObject({
+      model: STREAMING_UPSTREAM_MODEL,
+      stream: true,
+    });
+
+    const event = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (log) => log.get("requested_model") === STREAMING_REQUEST_MODEL,
+      `stream terminal usage event for ${STREAMING_REQUEST_MODEL}`,
+    );
+    expect(event.get("model_id")).toBe(streamingWildcardID);
+    expect(event.get("pricing_authority_id")).toBe(PRICING_AUTHORITY_ID);
+    expect(event.get("resolved_pricing_model")).toBe(STREAMING_UPSTREAM_MODEL);
+    expect(event.get("prompt_tokens")).toBe("11");
+    expect(event.get("completion_tokens")).toBe("6");
   });
 
   test("direct embedding wildcard dispatch exports its concrete pricing identity", async (ctx) => {
@@ -370,5 +516,58 @@ describe("wildcard pricing telemetry e2e", () => {
       expect(event.get("pricing_authority_id")).toBeUndefined();
       expect(event.get("resolved_pricing_model")).toBeUndefined();
     }
+  });
+
+  test("completed batch telemetry retains dispatch pricing while its management event stays unpriced", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !batchUpstream || !batchWildcardID) {
+      ctx.skip();
+      return;
+    }
+
+    const before = batchUpstream.receivedRequests.length;
+    const route = routedId("batch-wildcard-completed", BATCH_REQUEST_MODEL);
+    const res = await fetch(`${app.proxyUrl}/v1/batches/${route}`, {
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+    });
+    const body = await res.text();
+    expect(res.status, body).toBe(200);
+    expect(JSON.parse(body)).toMatchObject({
+      output_file_id: routedId("file-wildcard-output", BATCH_REQUEST_MODEL),
+    });
+
+    const management = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (log) =>
+        log.get("operation") === "batches" &&
+        log.get("model_id") === batchWildcardID &&
+        log.get("requested_model") === BATCH_WILDCARD_ALIAS,
+      "wildcard batch management usage event",
+    );
+    expect(management.get("prompt_tokens")).toBe("0");
+    expect(management.get("completion_tokens")).toBe("0");
+    expect(management.get("pricing_authority_id")).toBeUndefined();
+    expect(management.get("resolved_pricing_model")).toBeUndefined();
+
+    const aggregate = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (log) =>
+        log.get("inbound_protocol") === "batch" &&
+        log.get("model_id") === batchWildcardID &&
+        log.get("requested_model") === BATCH_WILDCARD_ALIAS,
+      "completed wildcard batch usage event",
+    );
+    expect(aggregate.get("provider_model_version")).toBe("provider-reported-batch-model");
+    expect(aggregate.get("pricing_authority_id")).toBe(PRICING_AUTHORITY_ID);
+    expect(aggregate.get("resolved_pricing_model")).toBe("gpt-4o-2024-08-06");
+    expect(aggregate.get("prompt_tokens")).toBe("13");
+    expect(aggregate.get("completion_tokens")).toBe("7");
+    expect(aggregate.get("cached_prompt_tokens")).toBe("3");
+
+    const calls = batchUpstream.receivedRequests.slice(before);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toMatchObject({ method: "GET", path: "/v1/batches/batch-wildcard-completed" });
+    expect(calls[1]).toMatchObject({ method: "GET", path: "/v1/files/file-wildcard-output/content" });
   });
 });

@@ -615,21 +615,6 @@ pub(crate) struct RequestAttribution {
 }
 
 impl RequestAttribution {
-    /// A continuation for a detached realtime session. It deliberately copies
-    /// only the wildcard pricing tuple: the HTTP request's body counters and
-    /// pending access log are finalized when its upgrade response completes,
-    /// while the session owns a separate terminal event and access-log line.
-    fn wildcard_pricing_continuation(&self) -> Self {
-        let resolved = self.get();
-        let continuation = Self::default();
-        let mut cell = continuation.lock();
-        cell.resolved.wildcard_pricing_model_id = resolved.wildcard_pricing_model_id;
-        cell.resolved.wildcard_pricing_authority_id = resolved.wildcard_pricing_authority_id;
-        cell.resolved.wildcard_pricing_model = resolved.wildcard_pricing_model;
-        drop(cell);
-        continuation
-    }
-
     /// A sub-call scope that cannot change the parent request's target
     /// attribution but can still account for gateway-initiated embeddings on
     /// the parent's eventual terminal usage event.
@@ -944,18 +929,6 @@ pub(crate) fn note_cache_hit_entry(entry: &Model, hit_layer: &'static str) {
 /// What the current request has resolved, or `None` outside a request.
 pub(crate) fn current() -> Option<Resolved> {
     CURRENT.try_with(|a| a.get()).ok()
-}
-
-/// A fresh attribution cell for a detached realtime session.
-///
-/// A WebSocket upgrade moves its session onto axum's upgrade task, which does
-/// not inherit Tokio task-locals. The session needs a wildcard pricing tuple
-/// captured before the upgrade, but must not reuse the HTTP cell: the latter
-/// owns the completed upgrade response's body counters and access-log line.
-pub(crate) fn current_wildcard_pricing_continuation() -> Option<Arc<RequestAttribution>> {
-    CURRENT
-        .try_with(|parent| Arc::new(parent.wildcard_pricing_continuation()))
-        .ok()
 }
 
 /// Record one actual gateway-initiated embedding bridge call. This is safe
@@ -1382,98 +1355,6 @@ mod tests {
         note_requested_model("gpt-4o");
         note_target(&model("openai", "gpt-4o"), "pk-1");
         assert!(current().is_none());
-    }
-
-    #[test]
-    fn wildcard_pricing_continuation_keeps_only_the_pricing_tuple() {
-        let parent = RequestAttribution::default();
-        parent.track(tracing::info_span!("parent_request"));
-        parent.note_head_written();
-        parent.add_request_bytes(41);
-        parent.note_request_complete();
-        parent.add_response_bytes(17);
-        parent.park_access_log(
-            &aisix_obs::AccessLog {
-                method: "POST",
-                path: "/v1/realtime",
-                status: 101,
-                latency: Duration::from_secs(0),
-                duration: Duration::from_secs(0),
-                provider: Some("openai"),
-                model: Some("realtime/*"),
-                upstream_model: Some("gpt-realtime"),
-                provider_key_id: Some("pk-1"),
-                api_key_id: Some("api-key"),
-                prompt_tokens: Some(1),
-                completion_tokens: Some(2),
-                total_tokens: Some(3),
-                request_id: "req-parent",
-                provider_request_id: Some("resp-parent"),
-                served_by_model: None,
-                routing_attempt_count: None,
-                routing_fallback_count: None,
-                error_kind: None,
-                error: None,
-                mcp: None,
-                cache: None,
-                request_body_bytes: None,
-                response_body_bytes: None,
-            },
-            None,
-        );
-        {
-            let mut cell = parent.lock();
-            cell.resolved = Resolved {
-                requested_model: "realtime/customer-model".into(),
-                provider: "openai".into(),
-                upstream_model: "gpt-realtime".into(),
-                provider_key_id: "pk-1".into(),
-                wildcard_pricing_model_id: "wildcard-row".into(),
-                wildcard_pricing_authority_id: "a3ebdc63-e921-4323-a75c-3b911f950046".into(),
-                wildcard_pricing_model: "gpt-realtime".into(),
-                cache_hit_layer: Some("exact"),
-            };
-            cell.cancel.api_key_id = "api-key".into();
-            cell.cancel.emitted_terminal = true;
-            cell.pending_log = Some(PendingAccessLog::new(
-                "POST",
-                "/v1/realtime",
-                "req-parent",
-                "api-key",
-                Instant::now(),
-            ));
-            cell.stream_owns_log = true;
-            cell.finished = true;
-            assert!(
-                cell.ready_line.is_some(),
-                "premise: parent owns a pending access log"
-            );
-        }
-
-        let continuation = parent.wildcard_pricing_continuation();
-        let resolved = continuation.get();
-        assert_eq!(resolved.wildcard_pricing_model_id, "wildcard-row");
-        assert_eq!(
-            resolved.wildcard_pricing_authority_id,
-            "a3ebdc63-e921-4323-a75c-3b911f950046"
-        );
-        assert_eq!(resolved.wildcard_pricing_model, "gpt-realtime");
-        assert!(resolved.requested_model.is_empty());
-        assert!(resolved.provider.is_empty());
-        assert!(resolved.upstream_model.is_empty());
-        assert!(resolved.provider_key_id.is_empty());
-        assert!(resolved.cache_hit_layer.is_none());
-        assert_eq!(continuation.body_sizes(true), (None, Some(0)));
-
-        let cell = continuation.lock();
-        assert!(cell.cancel.api_key_id.is_empty());
-        assert!(!cell.cancel.emitted_terminal);
-        assert!(cell.pending_log.is_none());
-        assert!(!cell.stream_owns_log);
-        assert!(cell.request_span.is_none());
-        assert!(!cell.head_written);
-        assert!(!cell.finished);
-        assert!(cell.ready_line.is_none());
     }
 
     /// A gateway-owned embedding must retain the caller's actual target while
