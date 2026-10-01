@@ -192,6 +192,7 @@ fn wildcard_pricing_eligible(model: &Model, upstream: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aisix_core::models::EmbeddingConfig;
     use aisix_core::snapshot::ResourceTable;
 
     fn direct_model(display_name: &str, model_name: Option<&str>) -> Model {
@@ -286,7 +287,7 @@ mod tests {
         use std::sync::Arc;
 
         let mut embedding = priced_direct_model("embedding", Some("text-embedding-3-small"));
-        embedding.embedding = Some(aisix_core::EmbeddingConfig {
+        embedding.embedding = Some(EmbeddingConfig {
             dimensions: 4,
             normalize: true,
         });
