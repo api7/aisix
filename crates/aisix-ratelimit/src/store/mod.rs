@@ -47,6 +47,21 @@ pub(crate) const DIM_RPD: &str = "rpd";
 pub(crate) const DIM_TPM: &str = "tpm";
 pub(crate) const DIM_TPD: &str = "tpd";
 
+/// Result of trying to renew a distributed streaming concurrency lease.
+///
+/// Only [`StreamLeaseRefresh::Missing`] is definitive: the member was no
+/// longer present in the shared semaphore. The passthrough SSE relay uses
+/// that signal to end an already-headed response rather than continue outside
+/// its configured concurrency limit. `Unavailable` includes backends that
+/// cannot report an outcome and Redis transport failures; those retain the
+/// rate limiter's established fail-open behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamLeaseRefresh {
+    Renewed,
+    Missing,
+    Unavailable,
+}
+
 /// A windowed request/token dimension active on a [`RateLimit`]:
 /// `(name, window_secs, limit)`. Shared by both stores so the Redis key
 /// layout and the local counter set never drift.
@@ -139,6 +154,15 @@ pub trait RateStore: Send + Sync + 'static {
     /// Implementations must never recreate a member that has already been
     /// released: a final refresh racing with stream teardown must be a no-op.
     async fn refresh_stream_lease(&self, _key: &str, _member: &str) {}
+
+    /// Refresh a streaming lease while reporting whether its member still
+    /// exists. This preserves the legacy [`RateStore::refresh_stream_lease`]
+    /// hook for external stores: an implementation that only provides that
+    /// hook remains fail-open because it cannot prove that its member vanished.
+    async fn refresh_stream_lease_outcome(&self, key: &str, member: &str) -> StreamLeaseRefresh {
+        self.refresh_stream_lease(key, member).await;
+        StreamLeaseRefresh::Unavailable
+    }
 
     /// Read-only snapshot for the `x-ratelimit-*` headers. Returns `None`
     /// when there is nothing meaningful to report for the bucket.

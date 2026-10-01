@@ -20,3 +20,8 @@ tracing.workspace = true
 async-trait.workspace = true
 redis.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# Paused Tokio time makes the unavailable-lease fail-open regression
+# deterministic without introducing a wall-clock scheduling race in CI.
+tokio = { workspace = true, features = ["test-util"] }

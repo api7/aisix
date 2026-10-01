@@ -344,6 +344,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
       "../models",
       "%2e%2e/models",
       "%2E%2E/models",
+      "%2E./models",
       "..\\models",
     ]) {
       const status = await rawHttpStatus(

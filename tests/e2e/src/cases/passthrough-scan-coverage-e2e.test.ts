@@ -111,6 +111,7 @@ const SPLIT_BLOCK = "FORBIDDEN";
 const SPLIT_BLOCK_REGEX = String.raw`FOR\s*BIDDEN`;
 const KNOWN_CHAT_OUTPUT = String.raw`{"model":"routing-only","choices":[{"message":{"content":"\u0042LOCKME","metadata":{"note":"${OUT_LIT}"}}}],"choices":[{"message":{"content":"clean"}}]}`;
 const KNOWN_RESPONSES_OUTPUT = String.raw`{"output":[{"type":"message","content":[{"type":"output_text","text":"\u0042LOCKME","metadata":{"note":"${OUT_LIT}"}}]}],"output":[{"type":"message","content":[{"type":"output_text","text":"clean"}]}]}`;
+const UNKNOWN_TYPED_BUFFERED_OUTPUT = String.raw`{"object":"chat.completion","result":{"text":"\u0042LOCKME"}}`;
 const RESPONSES_REFUSAL_OUTPUT = JSON.stringify({
   output: [
     {
@@ -371,6 +372,10 @@ describe("passthrough guardrail scan coverage", () => {
     });
     upstreams["known-responses-buffered-output"] = await startOpenAiUpstream({
       rawBody: KNOWN_RESPONSES_OUTPUT,
+      rawContentType: "application/json",
+    });
+    upstreams["unknown-typed-buffered-output"] = await startOpenAiUpstream({
+      rawBody: UNKNOWN_TYPED_BUFFERED_OUTPUT,
       rawContentType: "application/json",
     });
     upstreams["responses-refusal-buffered"] = await startOpenAiUpstream({
@@ -770,16 +775,16 @@ describe("passthrough guardrail scan coverage", () => {
   });
   test.for([
     [
-      "chat",
+      "Chat response to a Responses request",
       "known-chat-buffered-output",
-      `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"go"}]}`,
-    ],
-    [
-      "Responses",
-      "known-responses-buffered-output",
       `{"model":"gpt-4o-mini","input":"go"}`,
     ],
-  ] as const)("output: known %s envelope is source-scanned when buffered", async ([, route, body], ctx) => {
+    [
+      "Responses response to a Completions request",
+      "known-responses-buffered-output",
+      `{"model":"gpt-4o-mini","prompt":"go"}`,
+    ],
+  ] as const)("output: known %s is source-scanned when buffered", async ([, route, body], ctx) => {
     if (!ready(ctx)) return;
     const upstream = upstreams[route];
     if (!upstream) throw new Error(`missing ${route} upstream`);
@@ -790,6 +795,26 @@ describe("passthrough guardrail scan coverage", () => {
     expect(response).toContain("pt-scan-output");
     expect(response).not.toContain(ESCAPED_BLOCK);
     expect(response).not.toContain(String.raw`\u0042LOCKME`);
+    expect(upstream.receivedRequests.length).toBe(before + 1);
+  });
+
+  test("output: an unknown typed buffered response fails closed instead of using the request hint", async (ctx) => {
+    if (!ready(ctx)) return;
+    const route = "unknown-typed-buffered-output";
+    const upstream = upstreams[route];
+    if (!upstream) throw new Error(`missing ${route} upstream`);
+    const before = upstream.receivedRequests.length;
+    const res = await callRaw(
+      route,
+      "/v1/completions",
+      `{"model":"gpt-4o-mini","prompt":"go"}`,
+    );
+    const body = await res.text();
+    expect(res.status, body).toBe(422);
+    expect(body).toContain("guardrail_unavailable");
+    expect(body).toContain("unscannable_body");
+    expect(body).not.toContain(ESCAPED_BLOCK);
+    expect(body).not.toContain(String.raw`\u0042LOCKME`);
     expect(upstream.receivedRequests.length).toBe(before + 1);
   });
 
@@ -1506,17 +1531,19 @@ describe("passthrough supplemental selector fail-closed", () => {
 
 // This is intentionally a separate DP: the main suite has an env-scoped
 // blocking row, so it cannot demonstrate the live fail-open policy on either
-// an unevaluable Raw input or output stream.
-describe("passthrough Raw stream unevaluable-output fail-open", () => {
+// an unevaluable Raw input or a typed output response.
+describe("passthrough unevaluable-output fail-open", () => {
   const caller = "sk-pt-scan-fail-open";
   const callerHash = createHash("sha256").update(caller).digest("hex");
   const route = "pt-scan-fail-open";
   const depthInputRoute = "pt-scan-depth-fail-open-input";
+  const unknownTypedRoute = "pt-scan-unknown-typed-fail-open";
   const logstore = "pt-scan-fail-open";
   const credentialRef = "pt_scan_open";
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let depthInputUpstream: OpenAiUpstream | undefined;
+  let unknownTypedUpstream: OpenAiUpstream | undefined;
   let sls: MockSls | undefined;
   let etcdReachable = false;
 
@@ -1536,6 +1563,10 @@ describe("passthrough Raw stream unevaluable-output fail-open", () => {
     });
     depthInputUpstream = await startOpenAiUpstream({
       rawBody: SAFE_ESCAPED_JSON,
+      rawContentType: "application/json",
+    });
+    unknownTypedUpstream = await startOpenAiUpstream({
+      rawBody: UNKNOWN_TYPED_BUFFERED_OUTPUT,
       rawContentType: "application/json",
     });
     app = await spawnApp({
@@ -1569,6 +1600,12 @@ describe("passthrough Raw stream unevaluable-output fail-open", () => {
       name: depthInputRoute,
       path_prefix: `/${depthInputRoute}`,
       target_url: depthInputUpstream.baseUrl,
+      provider_key_id: providerKey.id,
+    });
+    await seed.createPassthroughRoute({
+      name: unknownTypedRoute,
+      path_prefix: `/${unknownTypedRoute}`,
+      target_url: unknownTypedUpstream.baseUrl,
       provider_key_id: providerKey.id,
     });
     await seed.createGuardrail({
@@ -1606,6 +1643,7 @@ describe("passthrough Raw stream unevaluable-output fail-open", () => {
     await app?.exit();
     await upstream?.close();
     await depthInputUpstream?.close();
+    await unknownTypedUpstream?.close();
     await sls?.close();
   });
 
@@ -1627,6 +1665,33 @@ describe("passthrough Raw stream unevaluable-output fail-open", () => {
       logstore,
       (entry) => entry.get("passthrough_route_name") === depthInputRoute,
       "fail-open depth-capped passthrough usage event",
+    );
+    expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
+    expect(log.get("guardrail_bypassed_reason")).toBe("unscannable_body");
+  });
+
+  test("forwards an unknown typed buffered response only under output fail_open", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !unknownTypedUpstream) return ctx.skip();
+
+    const before = unknownTypedUpstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/${unknownTypedRoute}/v1/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${caller}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-4o-mini", prompt: "go" }),
+    });
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    expect(requestId).toBeTruthy();
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(UNKNOWN_TYPED_BUFFERED_OUTPUT);
+    expect(unknownTypedUpstream.receivedRequests.length).toBe(before + 1);
+
+    const log = await waitForSlsLog(
+      sls,
+      logstore,
+      (entry) =>
+        entry.get("passthrough_route_name") === unknownTypedRoute &&
+        entry.get("request_id") === requestId,
+      "fail-open unknown typed passthrough usage event",
     );
     expect(log.get("guardrail_blocked") ?? "false").not.toBe("true");
     expect(log.get("guardrail_bypassed_reason")).toBe("unscannable_body");

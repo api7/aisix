@@ -539,14 +539,14 @@ describe("Chat passthrough keeps media out of external output guardrails", () =>
     );
   });
 
-  test("buffered Completions sends only choices text to the external guardrail", async (ctx) => {
+  test("a Chat request with a buffered Completions response sends only choices text to the external guardrail", async (ctx) => {
     if (!etcdReachable || !app || !bufferedCompletionsUpstream || !moderation) {
       ctx.skip();
       return;
     }
     const upstreamBefore = bufferedCompletionsUpstream.receivedRequests.length;
     const moderationBefore = moderation.inputs.length;
-    const response = await completionsRequest("completions-buffered", false);
+    const response = await request("completions-buffered", false);
     const body = await response.text();
     expect(response.status, body).toBe(200);
     expect(body).toContain(COMPLETIONS_VISIBLE);

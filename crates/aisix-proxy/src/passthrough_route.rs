@@ -1107,12 +1107,9 @@ async fn dispatch(
     // Output guardrails govern generated successful answers. A provider's
     // non-success body is its error contract, so preserve its status, headers,
     // and bytes instead of replacing a 4xx/5xx with a local guardrail 422.
-    if status.is_success() && !bypass_uninspectable_output && !resolved_chain.is_empty() {
-        let text = match try_response_guardrail_text(protocol, &resp_body) {
+    if status.is_success() && !bypass_uninspectable_output && output_guardrail_active {
+        let text = match try_buffered_response_guardrail_text(protocol, &resp_body) {
             Ok(text) => Some(text),
-            Err(err) if !err.is_unevaluable() => {
-                Some(response_guardrail_text(protocol, &resp_body))
-            }
             Err(err)
                 if !aisix_guardrails::Guardrail::refuses_unevaluable_output(&resolved_chain) =>
             {
@@ -1413,9 +1410,10 @@ fn anthropic_message_output_text(v: &serde_json::Value) -> String {
 
 /// The body envelope detected for one exchange. Not configuration:
 /// detected per request from the body's top-level keys
-/// ([`detect_protocol`]) and sticky for the exchange — the buffered
-/// response and every stream frame are read with the same detection. It
-/// drives extraction (guardrail text, capture, usage) only; the relay
+/// ([`detect_protocol`]) and sticky for request extraction, stream frames,
+/// capture, and usage. Buffered output guardrails independently classify the
+/// response envelope, because a provider can return a different compatible
+/// envelope than the request. Detection drives extraction only; the relay
 /// forwards bytes verbatim regardless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PassthroughProtocol {
@@ -1480,6 +1478,142 @@ fn detect_protocol(body: &[u8]) -> PassthroughProtocol {
     } else {
         PassthroughProtocol::Raw
     }
+}
+
+/// The concrete envelope carried by a buffered provider response. This is
+/// intentionally distinct from [`detect_protocol`]: a Chat request may
+/// receive a Responses body (and vice versa), so an output guardrail must
+/// select visible text from what the provider actually returned.
+fn resolve_buffered_response_protocol(
+    request_protocol: PassthroughProtocol,
+    body: &[u8],
+) -> Result<PassthroughProtocol, crate::json_splice::SpliceError> {
+    if matches!(request_protocol, PassthroughProtocol::Raw) {
+        // Raw traffic deliberately retains its broad decoded-string scan.
+        return Ok(PassthroughProtocol::Raw);
+    }
+
+    detect_buffered_response_protocol(body)
+        .map_err(|_| crate::json_splice::SpliceError::unevaluable())?
+        .ok_or_else(crate::json_splice::SpliceError::unevaluable)
+}
+
+/// Classify only providers' known response carriers. This uses source slices
+/// rather than `Value`, so duplicate response carriers remain visible to the
+/// existing selectors and opaque nested data never needs full deserialization.
+fn detect_buffered_response_protocol(body: &[u8]) -> Result<Option<PassthroughProtocol>, ()> {
+    let object_label = raw_top_level_unique_string(body, "object")?;
+    let output = response_top_level_array_values(body, "output")?
+        .map(|_| PassthroughProtocol::OpenaiResponses);
+    let (has_choices, choices) = buffered_choices_response_protocol(body, object_label.as_deref())?;
+    if output.is_some() && has_choices {
+        // The two carriers name incompatible envelope families. Neither a
+        // request hint nor an empty `choices` array may choose between them.
+        return Err(());
+    }
+    let object = match object_label.as_deref() {
+        // An object label only disambiguates an otherwise empty concrete
+        // carrier. A bare label could be an opaque provider extension and
+        // must not turn a typed fail-closed scan into an empty selector.
+        Some("response") if output.is_some() => Some(PassthroughProtocol::OpenaiResponses),
+        Some("chat.completion") if has_choices => Some(PassthroughProtocol::OpenaiChat),
+        Some("text_completion") if has_choices => Some(PassthroughProtocol::OpenaiCompletions),
+        Some("response" | "chat.completion" | "text_completion") => return Err(()),
+        Some(_) | None => None,
+    };
+    let anthropic = match raw_top_level_unique_type(body)?.as_deref() {
+        Some("message") => response_top_level_array_values(body, "content")?
+            .is_some()
+            .then_some(PassthroughProtocol::OpenaiChat)
+            .ok_or(())?,
+        Some(_) | None => return select_buffered_response_protocol([output, choices, object]),
+    };
+
+    select_buffered_response_protocol([output, choices, object, Some(anthropic)])
+}
+
+fn select_buffered_response_protocol<const N: usize>(
+    candidates: [Option<PassthroughProtocol>; N],
+) -> Result<Option<PassthroughProtocol>, ()> {
+    let mut selected = None;
+    for candidate in candidates.into_iter().flatten() {
+        if let Some(previous) = selected {
+            if previous != candidate {
+                return Err(());
+            }
+        } else {
+            selected = Some(candidate);
+        }
+    }
+    Ok(selected)
+}
+
+/// Return every occurrence of a response carrier only when all values are
+/// arrays. Repeated Responses and Chat carriers are deliberately retained:
+/// the downstream selector scans every client-visible occurrence.
+fn response_top_level_array_values<'a>(
+    body: &'a [u8],
+    key: &str,
+) -> Result<Option<Vec<RawJson<'a>>>, ()> {
+    let values = raw_top_level_value_refs(body, key).ok_or(())?;
+    if values.is_empty() {
+        return Ok(None);
+    }
+    values
+        .iter()
+        .all(|value| value.get().trim_start().starts_with('['))
+        .then_some(values)
+        .ok_or(())
+}
+
+/// `choices[].message` and `choices[].text` are mutually exclusive response
+/// envelopes. Empty choices need an explicit root `object` hint; they cannot
+/// safely inherit the request's protocol.
+fn buffered_choices_response_protocol(
+    body: &[u8],
+    object_label: Option<&str>,
+) -> Result<(bool, Option<PassthroughProtocol>), ()> {
+    let Some(arrays) = response_top_level_array_values(body, "choices")? else {
+        return Ok((false, None));
+    };
+    let mut selected = None;
+    for array in &arrays {
+        for choice in raw_array_item_refs(array).ok_or(())? {
+            if !raw_is_object(&choice) {
+                return Err(());
+            }
+            let choice_body = choice.get().as_bytes();
+            let message = raw_top_level_unique_object(choice_body, "message")?.is_some();
+            let text = raw_top_level_unique_string(choice_body, "text")?.is_some();
+            let candidate = match (message, text) {
+                (true, false) => Some(PassthroughProtocol::OpenaiChat),
+                (false, true) => Some(PassthroughProtocol::OpenaiCompletions),
+                (false, false) => None,
+                // Some compatibility Chat replies retain their legacy
+                // `text` alongside the structured message. The response
+                // label is the only safe disambiguator; a bare mixed choice
+                // remains unevaluable rather than inheriting the request.
+                (true, true) => match object_label {
+                    Some("chat.completion") => Some(PassthroughProtocol::OpenaiChat),
+                    Some("text_completion") => Some(PassthroughProtocol::OpenaiCompletions),
+                    _ => return Err(()),
+                },
+            };
+            if let Some(candidate) = candidate {
+                if let Some(previous) = selected {
+                    if previous != candidate {
+                        return Err(());
+                    }
+                } else {
+                    selected = Some(candidate);
+                }
+            }
+        }
+    }
+    if matches!(selected, Some(PassthroughProtocol::OpenaiCompletions)) && arrays.len() != 1 {
+        return Err(());
+    }
+    Ok((true, selected))
 }
 
 fn raw_json_container_like(body: &[u8]) -> bool {
@@ -3089,6 +3223,23 @@ fn try_response_guardrail_text(
         }
         PassthroughProtocol::OpenaiResponses => decoded_responses_response_string_values(body)
             .ok_or_else(crate::json_splice::SpliceError::unevaluable),
+    }
+}
+
+/// Select buffered output from the response envelope itself before scanning.
+/// Request detection stays authoritative for request processing and streams;
+/// this one boundary prevents a compatible provider response from becoming an
+/// empty typed selector under the request's different protocol hint.
+fn try_buffered_response_guardrail_text(
+    request_protocol: PassthroughProtocol,
+    body: &[u8],
+) -> Result<String, crate::json_splice::SpliceError> {
+    let response_protocol = resolve_buffered_response_protocol(request_protocol, body)?;
+    match try_response_guardrail_text(response_protocol, body) {
+        Err(error) if !error.is_unevaluable() => {
+            Ok(response_guardrail_text(response_protocol, body))
+        }
+        result => result,
     }
 }
 
@@ -5349,6 +5500,21 @@ fn anthropic_stream_frame(frame: &[u8]) -> Option<bool> {
     }
 }
 
+/// Wait until a distributed stream-concurrency renewal proves that this
+/// stream's member has disappeared from Redis. A backend outage is
+/// deliberately not a signal: rate limiting remains fail-open when Redis
+/// cannot establish whether the lease exists.
+async fn wait_for_stream_lease_loss(receiver: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *receiver.borrow_and_update() {
+            return;
+        }
+        if receiver.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 /// Relay an opaque upstream SSE representation without parsing or mutating
 /// its frames. This covers non-success error contracts and encoded successful
 /// replies intentionally bypassed by an output fail-open policy. The telemetry
@@ -5366,6 +5532,7 @@ fn stream_opaque_response(
     use futures::StreamExt;
 
     let route_name = telemetry.route_name.clone();
+    let mut lease_loss = stream_hold.lease_loss_receiver();
     let stream = async_stream::stream! {
         let _stream_hold = stream_hold;
         let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
@@ -5374,7 +5541,20 @@ fn stream_opaque_response(
             stream_read_timeout,
             read_timeout.clone(),
         ));
-        while let Some(chunk) = upstream.next().await {
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = wait_for_stream_lease_loss(&mut lease_loss) => {
+                    telemetry.record_rate_limit_lease_lost();
+                    telemetry.stream_reached_end = true;
+                    telemetry.emit();
+                    return;
+                }
+                chunk = upstream.next() => chunk,
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             match chunk {
                 Ok(chunk) => {
                     if telemetry.upstream_ttft_ms == 0 {
@@ -5447,7 +5627,8 @@ fn stream_response(
     use aisix_guardrails::{Guardrail as _, GuardrailVerdict, StreamOutputPolicy};
     use futures::StreamExt;
 
-    let policy = if chain.is_empty() {
+    let output_guardrail_active = aisix_guardrails::Guardrail::runs_on_output(&chain);
+    let policy = if !output_guardrail_active {
         StreamOutputPolicy::EndOfStreamCheck
     } else {
         chain.stream_output_policy()
@@ -5458,6 +5639,7 @@ fn stream_response(
         .hold_cap()
         .map(|(cap, _)| cap.saturating_mul(crate::held_content::RAW_HOLD_FACTOR))
         .unwrap_or(MAX_HELD_STREAM_BYTES);
+    let mut lease_loss = stream_hold.lease_loss_receiver();
 
     let stream = async_stream::stream! {
         // The rate limiter's reservation becomes an owned hold at the handoff
@@ -5507,7 +5689,16 @@ fn stream_response(
         let mut anthropic: Option<bool> = None;
 
         'outer: loop {
-            let chunk = match upstream.next().await {
+            let chunk = match tokio::select! {
+                biased;
+                _ = wait_for_stream_lease_loss(&mut lease_loss) => {
+                    telemetry.record_rate_limit_lease_lost();
+                    telemetry.stream_reached_end = true;
+                    telemetry.emit();
+                    return;
+                }
+                chunk = upstream.next() => chunk,
+            } {
                 Some(Ok(c)) => c,
                 Some(Err(err)) => {
                     // The response head is already on the wire, so there is
@@ -5634,7 +5825,7 @@ fn stream_response(
                         }
                     }
                 }
-                let guardrail_text = (!chain.is_empty() && !scan_budget_exhausted && !fail_opened)
+                let guardrail_text = (output_guardrail_active && !scan_budget_exhausted && !fail_opened)
                     .then(|| stream_guardrail_text(protocol, &frame, delta.clone()));
                 let unevaluable_output = guardrail_text.as_ref().is_some_and(|text| {
                     text.unevaluable
@@ -5996,7 +6187,7 @@ fn stream_response(
                     }
                     None => {
                         let guardrail_text =
-                            (!chain.is_empty() && !scan_budget_exhausted && !fail_opened)
+                            (output_guardrail_active && !scan_budget_exhausted && !fail_opened)
                                 .then(|| stream_guardrail_text(protocol, &rest, delta.clone()));
                         let unevaluable_output = guardrail_text.as_ref().is_some_and(|text| {
                     text.unevaluable
@@ -6120,7 +6311,7 @@ fn stream_response(
                 }
                 }
             }
-            if !fail_opened {
+            if output_guardrail_active && !fail_opened {
                 if !scan_budget_exhausted {
                     let candidates = stream_guardrail_scan_text(
                         &continuation_tails,
@@ -6138,7 +6329,7 @@ fn stream_response(
                     }
                 }
                 for candidates in sealed_guardrail_epochs {
-                    if !chain.is_empty() {
+                    if output_guardrail_active {
                         if let GuardrailVerdict::Block {
                             reason,
                             guardrail_name,
@@ -6375,6 +6566,20 @@ impl RouteTelemetry {
         self.error_class = failure.error_class.to_string();
         self.error_message = failure.error_message;
         self.failure_status = Some(failure.status);
+    }
+
+    /// A successful renewal can prove a stream still owns its shared
+    /// concurrency member; a missing member proves the opposite. The HTTP
+    /// response head has already been sent, so terminate at EOF and record a
+    /// distinct rate-limit outcome instead of misclassifying it as client
+    /// cancellation or an upstream transport failure.
+    fn record_rate_limit_lease_lost(&mut self) {
+        if self.failure_status.is_some() {
+            return;
+        }
+        self.error_class = "rate_limit_lease_lost".to_string();
+        self.error_message = "distributed concurrency lease was lost".to_string();
+        self.failure_status = Some(429);
     }
 
     /// Stamp the caller's wait at the first RELAYED frame handed
@@ -7744,6 +7949,98 @@ mod tests {
         let text = response_guardrail_text(PassthroughProtocol::OpenaiChat, resp);
         assert!(text.contains("sure"));
         assert!(text.contains("SECRET"), "tool-call output scanned: {text}");
+    }
+
+    #[test]
+    fn buffered_output_guardrail_uses_the_response_envelope_not_the_request_hint() {
+        let cases = [
+            (
+                PassthroughProtocol::OpenaiChat,
+                br#"{"output":[{"type":"message","content":[{"type":"output_text","text":"BLOCKME"},{"type":"output_image","image_url":"MEDIA_SENTINEL"}]}]}"#
+                    .as_slice(),
+            ),
+            (
+                PassthroughProtocol::OpenaiCompletions,
+                br#"{"choices":[{"message":{"content":"BLOCKME","metadata":{"image":"MEDIA_SENTINEL"}}}]}"#
+                    .as_slice(),
+            ),
+            (
+                PassthroughProtocol::OpenaiResponses,
+                br#"{"choices":[{"text":"BLOCKME","metadata":{"image":"MEDIA_SENTINEL"}}]}"#
+                    .as_slice(),
+            ),
+        ];
+        for (request_protocol, body) in cases {
+            let text = try_buffered_response_guardrail_text(request_protocol, body)
+                .expect("a known response envelope must select its visible output");
+            assert!(text.contains("BLOCKME"), "{request_protocol:?}: {text:?}");
+            assert!(
+                !text.contains("MEDIA_SENTINEL"),
+                "{request_protocol:?} must not fall back to opaque media: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn buffered_chat_response_uses_object_to_resolve_legacy_text() {
+        let text = try_buffered_response_guardrail_text(
+            PassthroughProtocol::OpenaiCompletions,
+            br#"{"object":"chat.completion","choices":[{"message":{"content":"BLOCKME"},"text":"legacy"}]}"#,
+        )
+        .expect("a Chat response label resolves its structured message over legacy text");
+        assert!(text.contains("BLOCKME"), "{text:?}");
+        assert!(!text.contains("legacy"), "{text:?}");
+
+        let error = try_buffered_response_guardrail_text(
+            PassthroughProtocol::OpenaiChat,
+            br#"{"choices":[{"message":{"content":"safe"},"text":"BLOCKME"}]}"#,
+        )
+        .expect_err("mixed response carriers without a recognized label stay unevaluable");
+        assert!(error.is_unevaluable(), "{error}");
+    }
+
+    #[test]
+    fn buffered_typed_output_without_one_response_envelope_is_unevaluable() {
+        for (request_protocol, body) in [
+            (
+                PassthroughProtocol::OpenaiChat,
+                br#"{"result":{"text":"BLOCKME"}}"#.as_slice(),
+            ),
+            (
+                PassthroughProtocol::OpenaiCompletions,
+                br#"{"object":"chat.completion","result":{"text":"BLOCKME"}}"#.as_slice(),
+            ),
+            (
+                PassthroughProtocol::OpenaiChat,
+                br#"{"output":[],"choices":[]}"#.as_slice(),
+            ),
+            (
+                PassthroughProtocol::OpenaiChat,
+                br#"{"choices":[{"message":{"content":"safe"},"text":"BLOCKME"}]}"#.as_slice(),
+            ),
+        ] {
+            let error = try_buffered_response_guardrail_text(request_protocol, body).expect_err(
+                "a typed request must not choose an unknown or ambiguous response envelope",
+            );
+            assert!(error.is_unevaluable(), "{error}");
+        }
+
+        let raw = try_buffered_response_guardrail_text(
+            PassthroughProtocol::Raw,
+            br#"{"result":{"text":"BLOCKME"}}"#,
+        )
+        .expect("Raw requests retain their broad decoded-string scan");
+        assert!(raw.contains("BLOCKME"), "{raw:?}");
+    }
+
+    #[test]
+    fn buffered_response_envelope_ignores_opaque_sibling_size() {
+        let opaque = "x".repeat(MAX_RAW_SELECTOR_BYTES + 1);
+        let body = format!(r#"{{"choices":[{{"text":"BLOCKME","opaque":"{opaque}"}}]}}"#);
+        let text =
+            try_buffered_response_guardrail_text(PassthroughProtocol::OpenaiChat, body.as_bytes())
+                .expect("a small visible completion stays scannable beside opaque data");
+        assert_eq!(text, "BLOCKME");
     }
 
     #[test]

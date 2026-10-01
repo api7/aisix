@@ -13,6 +13,7 @@ use aisix_core::{RateLimit, RateLimitScope, RedisConnConfig, RedisMode};
 use aisix_obs::metrics::Metrics;
 use aisix_ratelimit::{
     store::redis::DEFAULT_PREFIX, Limiter, MultiReservation, RateStore, RedisStore,
+    StreamLeaseRefresh,
 };
 
 fn redis_url() -> Option<String> {
@@ -417,10 +418,15 @@ async fn refreshing_released_member_does_not_recreate_slot() {
     a.acquire(&key, &limits, "a-stream")
         .await
         .expect("first stream allowed");
-    // `commit` removes the member synchronously in Redis. A queued lease
-    // refresh that follows must see it missing rather than add it back.
+    // `commit` removes the member synchronously in Redis and clears the
+    // store's ownership record. A queued refresh must neither recreate it
+    // nor convert this normal teardown into a terminal stream signal.
     a.commit(&key, 0, "a-stream").await;
-    a.refresh_stream_lease(&key, "a-stream").await;
+    assert_eq!(
+        a.refresh_stream_lease_outcome(&key, "a-stream").await,
+        StreamLeaseRefresh::Unavailable,
+        "a released member is no longer a live shared lease"
+    );
 
     b.acquire(&key, &limits, "b-stream")
         .await
@@ -532,6 +538,64 @@ async fn stream_hold_renews_redis_lease_until_drop() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(acquired, "slot must free cluster-wide when the stream ends");
+}
+
+#[tokio::test]
+async fn stream_hold_reports_a_definitively_missing_redis_lease() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let a = Limiter::with_store(Arc::new(store(&url).await.with_conc_ttl(1)));
+    let key = unique_key("conc-stream-lease-loss");
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..rl()
+    };
+    let hold =
+        MultiReservation::new(vec![a.pre_commit(&key, &limits).await.unwrap()]).into_stream_hold();
+
+    let client = redis::Client::open(url.as_str()).expect("raw Redis client");
+    let mut raw = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw Redis connection");
+    let conc_key = format!("{DEFAULT_PREFIX}:{{{key}}}:conc");
+    let members: Vec<String> = redis::cmd("ZRANGE")
+        .arg(&conc_key)
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut raw)
+        .await
+        .expect("read live stream member");
+    assert_eq!(members.len(), 1, "one stream hold owns one Redis member");
+    let removed: i64 = redis::cmd("ZREM")
+        .arg(&conc_key)
+        .arg(&members[0])
+        .query_async(&mut raw)
+        .await
+        .expect("remove live stream member");
+    assert_eq!(removed, 1, "remove the member the hold is renewing");
+
+    // The response body normally subscribes only after headers are sent. Let
+    // the heartbeat observe `Missing` before this test subscribes, then prove
+    // the one-way state survives that handoff with no receiver present.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut lost = hold.lease_loss_receiver();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if *lost.borrow_and_update() {
+                return;
+            }
+            lost.changed()
+                .await
+                .expect("stream hold retains the lease-loss sender");
+        }
+    })
+    .await
+    .expect("next Redis renewal must report the missing member");
+
+    drop(hold);
 }
 
 /// The response-header phase can outlive Redis's crash-recovery TTL before
@@ -729,10 +793,16 @@ async fn env_namespace_isolates_model_alias_bucket() {
 ///   container, a downed host or a partitioned network looks like from
 ///   the client end. Nothing arrives, nothing is refused, and without a
 ///   command budget the caller waits on TCP retransmission for minutes.
+/// - [`fail_next_reply_after_apply`](RedisCutoff::fail_next_reply_after_apply)
+///   — forward one command to Redis, replace its successful reply with a
+///   local Redis error, then keep the TCP session usable. This models the
+///   post-dispatch ambiguity without opening the client's connectivity
+///   breaker, so the next refresh can prove ownership deterministically.
 struct RedisCutoff {
     port: u16,
     cut: std::sync::Arc<std::sync::atomic::AtomicBool>,
     hole: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    fail_reply_after_apply: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RedisCutoff {
@@ -746,8 +816,10 @@ impl RedisCutoff {
         let port = listener.local_addr().unwrap().port();
         let cut = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hole = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail_reply_after_apply = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = cut.clone();
         let hole_flag = hole.clone();
+        let fail_reply_after_apply_flag = fail_reply_after_apply.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut client, _)) = listener.accept().await else {
@@ -758,6 +830,7 @@ impl RedisCutoff {
                 };
                 let flag = flag.clone();
                 let hole_flag = hole_flag.clone();
+                let fail_reply_after_apply_flag = fail_reply_after_apply_flag.clone();
                 tokio::spawn(async move {
                     let mut from_client = [0u8; 8192];
                     let mut from_server = [0u8; 8192];
@@ -794,6 +867,24 @@ impl RedisCutoff {
                                 if hole_flag.load(std::sync::atomic::Ordering::Relaxed) {
                                     continue;
                                 }
+                                if fail_reply_after_apply_flag
+                                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    // Redis applied this command, but the
+                                    // client receives an error instead of
+                                    // its success reply. Keeping the socket
+                                    // alive avoids tripping the 30s network
+                                    // breaker and leaves a deterministic
+                                    // post-dispatch ambiguity to resolve.
+                                    if client
+                                        .write_all(b"-ERR simulated lost redis reply\r\n")
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
                                 if client.write_all(&from_server[..n]).await.is_err() {
                                     return;
                                 }
@@ -803,7 +894,12 @@ impl RedisCutoff {
                 });
             }
         });
-        Self { port, cut, hole }
+        Self {
+            port,
+            cut,
+            hole,
+            fail_reply_after_apply,
+        }
     }
 
     fn url(&self) -> String {
@@ -818,11 +914,17 @@ impl RedisCutoff {
         self.hole.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    fn fail_next_reply_after_apply(&self) {
+        self.fail_reply_after_apply
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Forward again. Connections opened from now on work; the ones the
     /// blackhole swallowed mid-handshake were abandoned by the client
     /// when its own budget expired, which is what a Redis coming back up
     /// looks like from the caller's end.
     fn heal(&self) {
+        self.cut.store(false, std::sync::atomic::Ordering::Relaxed);
         self.hole.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -889,6 +991,145 @@ async fn a_redis_outage_counts_every_failed_operation() {
         counter_value(&metrics.render(), "ratelimit_acquire") > first,
         "each failed operation counts, not only the one that logged",
     );
+}
+
+/// A stream admitted by the local fail-open fallback never had a Redis ZSET
+/// member. When Redis comes back, that absence must remain `Unavailable`, not
+/// become a terminal `Missing` signal that truncates the still-live stream.
+#[tokio::test]
+async fn a_fallback_stream_lease_stays_open_after_redis_recovers() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let relay = RedisCutoff::start(&url).await;
+    let store = Arc::new(
+        RedisStore::connect(&single(&relay.url()))
+            .await
+            .expect("connect through relay")
+            .with_conc_ttl(1),
+    );
+    let limiter = Limiter::with_store(store.clone());
+    let key = unique_key("fallback-stream-recovery");
+    let fallback_key = unique_key("fallback-stream-recovery-direct");
+    let fallback_member = "fallback-stream-member";
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..rl()
+    };
+
+    relay.cut();
+    store
+        .acquire(&fallback_key, &limits, fallback_member)
+        .await
+        .expect("the local fallback admits while Redis is down");
+    let hold = MultiReservation::new(vec![limiter.pre_commit(&key, &limits).await.unwrap()])
+        .into_stream_hold();
+    let mut lost = hold.lease_loss_receiver();
+
+    // A fresh connection through the healed relay proves Redis is serving
+    // again. The first stream still has only its local fallback reservation.
+    relay.heal();
+    let peer = RedisStore::connect(&single(&relay.url()))
+        .await
+        .expect("Redis recovers through the relay");
+    let probe_key = unique_key("fallback-stream-recovery-probe");
+    peer.acquire(&probe_key, &limits, "recovered-peer")
+        .await
+        .expect("the recovered Redis accepts a shared reservation");
+    peer.release(&probe_key, "recovered-peer");
+
+    assert_eq!(
+        store
+            .refresh_stream_lease_outcome(&fallback_key, fallback_member)
+            .await,
+        StreamLeaseRefresh::Unavailable,
+        "a local-only member is never a definitive Redis lease loss"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !*lost.borrow_and_update(),
+        "Redis recovery must not truncate a fallback-admitted stream"
+    );
+    assert!(
+        !lost
+            .has_changed()
+            .expect("the stream hold retains its lease-loss sender"),
+        "fallback refreshes remain fail-open after recovery"
+    );
+
+    drop(hold);
+    store.release(&fallback_key, fallback_member);
+}
+
+/// A lost Redis reply leaves acquire provenance ambiguous: the server may
+/// have added the member even though the client fell back locally. Refresh
+/// must probe and promote that member when Redis confirms it, not let it age
+/// out as if the fallback were certainly local-only.
+#[tokio::test]
+async fn an_ambiguous_acquire_promotes_when_redis_confirms_the_member() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let relay = RedisCutoff::start(&url).await;
+    let store = RedisStore::connect(&single(&relay.url()))
+        .await
+        .expect("connect through relay")
+        .with_conc_ttl(1);
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..rl()
+    };
+
+    // `Script::invoke_async` can load this Lua script with a NOSCRIPT retry
+    // before its first real execution. Warm it before replacing a reply so
+    // the injected error follows a Redis-applied ZADD on every clean CI DB.
+    let warmup_key = unique_key("ambiguous-stream-acquire-warmup");
+    store
+        .acquire(&warmup_key, &limits, "warmup")
+        .await
+        .expect("warm acquire loads the Lua script");
+    store.commit(&warmup_key, 0, "warmup").await;
+
+    let key = unique_key("ambiguous-stream-acquire");
+    let member = "ambiguous-stream-member";
+
+    relay.fail_next_reply_after_apply();
+    store
+        .acquire(&key, &limits, member)
+        .await
+        .expect("a lost acquire reply falls back locally");
+
+    // The reply disappeared only after Redis processed it, so a different
+    // replica sees the shared slot and proves the member exists remotely.
+    let peer = RedisStore::connect(&single(&relay.url()))
+        .await
+        .expect("peer connects through relay");
+    assert!(
+        matches!(
+            peer.acquire(&key, &limits, "peer-member").await,
+            Err(aisix_ratelimit::RateLimitError::Concurrency { .. })
+        ),
+        "the ambiguous member must be present in Redis"
+    );
+
+    let refreshed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match store.refresh_stream_lease_outcome(&key, member).await {
+                StreamLeaseRefresh::Renewed => return StreamLeaseRefresh::Renewed,
+                StreamLeaseRefresh::Unavailable => {
+                    tokio::time::sleep(Duration::from_millis(20)).await
+                }
+                StreamLeaseRefresh::Missing => return StreamLeaseRefresh::Missing,
+            }
+        }
+    })
+    .await
+    .expect("the recovered connection must confirm the ambiguous member");
+    assert_eq!(refreshed, StreamLeaseRefresh::Renewed);
+
+    store.release(&key, member);
 }
 
 /// A Redis that stops answering without closing the socket must degrade

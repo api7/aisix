@@ -43,9 +43,10 @@ use aisix_core::{RateLimit, RedisConnConfig};
 use aisix_obs::metrics::Metrics;
 use aisix_redis::{ConnSlot, FailurePolicy};
 use async_trait::async_trait;
+use dashmap::DashMap;
 use redis::Script;
 
-use super::{local::LocalStore, token_dims, Dim, RateStore};
+use super::{local::LocalStore, token_dims, Dim, RateStore, StreamLeaseRefresh};
 use crate::error::{LimitDetail, RateLimitError};
 use crate::limiter::RateLimitStatus;
 
@@ -76,6 +77,17 @@ const CODE_OK: i64 = 0;
 const CODE_CONCURRENCY: i64 = 1;
 const CODE_TOKENS: i64 = 2;
 const CODE_REQUESTS: i64 = 3;
+
+/// What this process knows about one live concurrency member. A Redis command
+/// can fail after the server applies its Lua mutation but before the client
+/// receives a reply, so "not confirmed" is not always the same as "local
+/// only".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaseOwnership {
+    ConfirmedRedis,
+    LocalOnly,
+    Unknown,
+}
 
 /// Atomic per-bucket acquire: concurrency gate + token check-only +
 /// request check-and-increment, all-or-nothing. See module docs for the
@@ -247,6 +259,10 @@ pub struct RedisStore {
     grace: u64,
     /// Per-process fallback used when Redis is unreachable (fail-open).
     local: Arc<LocalStore>,
+    /// Per-reservation ownership provenance for stream lease refreshes.
+    /// Only a `ConfirmedRedis` member may turn a healthy ZSET miss into a
+    /// terminal signal; a timeout after dispatch is deliberately `Unknown`.
+    lease_members: DashMap<(String, String), LeaseOwnership>,
     /// One-shot guard so the degradation warning is logged once, not per
     /// request, while Redis stays down. Shared with the boot attach task,
     /// which starts it already set (the boot WARN said it) and clears it
@@ -340,6 +356,7 @@ impl RedisStore {
             conc_ttl: DEFAULT_CONC_TTL_SECS,
             grace: DEFAULT_GRACE_SECS,
             local: Arc::new(LocalStore::new()),
+            lease_members: DashMap::new(),
             degraded_logged,
             metrics: None,
         }
@@ -553,7 +570,14 @@ impl RateStore for RedisStore {
             Ok(c) => c,
             Err(e) => {
                 self.note_failure("acquire", &e);
-                return self.local.acquire(key, limits, member).await;
+                let acquired = self.local.acquire(key, limits, member).await;
+                if acquired.is_ok() && limits.concurrency.is_some() {
+                    self.lease_members.insert(
+                        (key.to_string(), member.to_string()),
+                        LeaseOwnership::LocalOnly,
+                    );
+                }
+                return acquired;
             }
         };
         match invocation.invoke_async::<Vec<i64>>(&mut conn).await {
@@ -578,7 +602,15 @@ impl RateStore for RedisStore {
                     LimitDetail::window(name, limit, used, retry)
                 };
                 match code {
-                    CODE_OK => Ok(()),
+                    CODE_OK => {
+                        if limits.concurrency.is_some() {
+                            self.lease_members.insert(
+                                (key.to_string(), member.to_string()),
+                                LeaseOwnership::ConfirmedRedis,
+                            );
+                        }
+                        Ok(())
+                    }
                     CODE_CONCURRENCY => {
                         let limit = reply.get(3).copied().unwrap_or(0).max(0) as u64;
                         let in_flight = reply.get(4).copied().unwrap_or(0).max(0) as u64;
@@ -600,12 +632,24 @@ impl RateStore for RedisStore {
             Err(e) => {
                 self.note_failure("acquire", &e);
                 self.conn.note_error().await;
-                self.local.acquire(key, limits, member).await
+                let acquired = self.local.acquire(key, limits, member).await;
+                if acquired.is_ok() && limits.concurrency.is_some() {
+                    // A reply can be lost after Redis has already applied the
+                    // Lua acquire. Probe on refresh rather than assuming the
+                    // local fallback was the only reservation.
+                    self.lease_members.insert(
+                        (key.to_string(), member.to_string()),
+                        LeaseOwnership::Unknown,
+                    );
+                }
+                acquired
             }
         }
     }
 
     async fn commit(&self, key: &str, tokens: u64, member: &str) {
+        self.lease_members
+            .remove(&(key.to_string(), member.to_string()));
         let prefix = self.bucket_prefix(key);
         let mut conn = match self.conn.acquire().await {
             Ok(c) => c,
@@ -658,6 +702,8 @@ impl RateStore for RedisStore {
     }
 
     fn release(&self, key: &str, member: &str) {
+        self.lease_members
+            .remove(&(key.to_string(), member.to_string()));
         // Drop the local slot first (a cheap no-op when the bucket was
         // never acquired locally); covers the degraded-acquire case.
         self.local.release(key, member);
@@ -736,12 +782,34 @@ impl RateStore for RedisStore {
     }
 
     async fn refresh_stream_lease(&self, key: &str, member: &str) {
+        let _ = self.refresh_stream_lease_outcome(key, member).await;
+    }
+
+    async fn refresh_stream_lease_outcome(&self, key: &str, member: &str) -> StreamLeaseRefresh {
+        let ownership = self
+            .lease_members
+            .get(&(key.to_string(), member.to_string()))
+            .map(|entry| *entry);
+        let Some(ownership) = ownership else {
+            // The member was already released, or this store never admitted
+            // it. It is not a live shared lease that can be conclusively lost.
+            return StreamLeaseRefresh::Unavailable;
+        };
+        if matches!(ownership, LeaseOwnership::LocalOnly) {
+            // `conn.acquire` failed before a command could be dispatched.
+            // This member exists solely in the local fail-open fallback.
+            return StreamLeaseRefresh::Unavailable;
+        }
         let prefix = self.bucket_prefix(key);
         let mut conn = match self.conn.acquire().await {
             Ok(c) => c,
             Err(e) => {
                 self.note_failure("refresh", &e);
-                return;
+                // A post-dispatch I/O failure opens the shared Redis breaker.
+                // While it short-circuits, Unknown stays fail-open; only a
+                // later successful refresh can promote it to confirmed Redis
+                // ownership.
+                return StreamLeaseRefresh::Unavailable;
             }
         };
         let res: Result<i64, redis::RedisError> = Script::new(REFRESH_CONCURRENCY_LUA)
@@ -752,10 +820,35 @@ impl RateStore for RedisStore {
             .invoke_async(&mut conn)
             .await;
         match res {
-            Ok(_) => self.mark_ok(),
+            Ok(1) => {
+                self.mark_ok();
+                if matches!(ownership, LeaseOwnership::Unknown) {
+                    self.lease_members.insert(
+                        (key.to_string(), member.to_string()),
+                        LeaseOwnership::ConfirmedRedis,
+                    );
+                }
+                StreamLeaseRefresh::Renewed
+            }
+            Ok(0) => {
+                // Redis did answer: the member itself is gone. This is not a
+                // backend outage, so clear any prior degradation marker while
+                // returning the definitive loss to the stream hold.
+                self.mark_ok();
+                if matches!(ownership, LeaseOwnership::ConfirmedRedis) {
+                    StreamLeaseRefresh::Missing
+                } else {
+                    // A command may have failed before Redis ever saw it, so
+                    // an Unknown member's absence is fail-open, not proof of
+                    // an externally released live lease.
+                    StreamLeaseRefresh::Unavailable
+                }
+            }
+            Ok(_) => StreamLeaseRefresh::Unavailable,
             Err(e) => {
                 self.note_failure("refresh", &e);
                 self.conn.note_error().await;
+                StreamLeaseRefresh::Unavailable
             }
         }
     }
