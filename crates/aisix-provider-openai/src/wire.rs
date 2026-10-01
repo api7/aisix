@@ -29,7 +29,8 @@
 
 use aisix_gateway::{
     ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest,
-    EmbeddingResponse, EmbeddingUsage, EmbeddingVector, FinishReason, Role, UsageStats,
+    EmbeddingResponse, EmbeddingUsage, EmbeddingUsageSource, EmbeddingVector, FinishReason, Role,
+    UsageStats,
 };
 use serde::{Deserialize, Serialize};
 
@@ -558,12 +559,14 @@ pub(crate) struct OpenAiEmbeddingObject {
 /// Usage block from OpenAI's embeddings response. `#[serde(default)]`
 /// so a provider that returns only `total_tokens` (e.g. Jina) — or omits
 /// usage fields entirely — still deserializes instead of failing with
-/// `502 upstream_decode_error` (#474).
+/// `502 upstream_decode_error` (#474). The `Option` shape preserves that
+/// absence for gateway-child telemetry, whose `usage_source` must not present
+/// a gateway-defaulted zero as a provider-reported count.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct OpenAiEmbedUsage {
-    pub prompt_tokens: u32,
-    pub total_tokens: u32,
+    pub prompt_tokens: Option<u32>,
+    pub total_tokens: Option<u32>,
 }
 
 /// Full response body from OpenAI `/v1/embeddings`.
@@ -607,12 +610,31 @@ pub(crate) fn embed_request_body<'a>(
 }
 
 pub(crate) fn embed_response_into(raw: OpenAiEmbedResponse) -> EmbeddingResponse {
-    let usage = raw.usage.unwrap_or_default();
+    let OpenAiEmbedResponse {
+        object,
+        model,
+        data,
+        usage,
+    } = raw;
+    let (prompt_tokens, total_tokens, source) = match usage {
+        Some(usage) => {
+            let source = if usage.prompt_tokens.is_some() && usage.total_tokens.is_some() {
+                EmbeddingUsageSource::Reported
+            } else {
+                EmbeddingUsageSource::Unavailable
+            };
+            (
+                usage.prompt_tokens.unwrap_or_default(),
+                usage.total_tokens.unwrap_or_default(),
+                source,
+            )
+        }
+        None => (0, 0, EmbeddingUsageSource::Unavailable),
+    };
     EmbeddingResponse {
-        object: raw.object,
-        model: raw.model,
-        data: raw
-            .data
+        object,
+        model,
+        data: data
             .into_iter()
             .map(|e| EmbeddingObject {
                 index: e.index,
@@ -621,8 +643,9 @@ pub(crate) fn embed_response_into(raw: OpenAiEmbedResponse) -> EmbeddingResponse
             })
             .collect(),
         usage: EmbeddingUsage {
-            prompt_tokens: usage.prompt_tokens,
-            total_tokens: usage.total_tokens,
+            prompt_tokens,
+            total_tokens,
+            source,
         },
     }
 }
@@ -1549,6 +1572,7 @@ mod tests {
             serde_json::from_str(body).expect("float-array embedding must deserialize");
         let resp = embed_response_into(raw);
         assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.usage.source, EmbeddingUsageSource::Reported);
         match &resp.data[0].embedding {
             EmbeddingVector::Float(v) => {
                 assert_eq!(v.len(), 3);
@@ -1580,6 +1604,26 @@ mod tests {
         let resp = embed_response_into(raw);
         assert_eq!(resp.usage.prompt_tokens, 0);
         assert_eq!(resp.usage.total_tokens, 6);
+        assert_eq!(resp.usage.source, EmbeddingUsageSource::Unavailable);
+    }
+
+    #[test]
+    fn embeddings_response_marks_absent_usage_unavailable() {
+        let body = r#"{
+            "object": "list",
+            "model": "usage-less-embedder",
+            "data": [{
+                "index": 0,
+                "object": "embedding",
+                "embedding": [0.1]
+            }]
+        }"#;
+        let raw: OpenAiEmbedResponse =
+            serde_json::from_str(body).expect("embedding without usage must deserialize");
+        let resp = embed_response_into(raw);
+        assert_eq!(resp.usage.prompt_tokens, 0);
+        assert_eq!(resp.usage.total_tokens, 0);
+        assert_eq!(resp.usage.source, EmbeddingUsageSource::Unavailable);
     }
 
     #[test]
