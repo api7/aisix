@@ -270,6 +270,11 @@ pub(crate) async fn realtime(
         Ok((ws, prep)) => {
             let state2 = state.clone();
             let client2 = client.clone();
+            // `on_upgrade` runs on a new Tokio task, which does not inherit
+            // the request task-local. Copy the verified wildcard price
+            // selection now; the HTTP cell is already owned by the completed
+            // upgrade response and cannot own the session terminal event.
+            let wildcard_pricing = crate::usage_attr::capture_wildcard_pricing_identity();
             // `on_upgrade` runs the session on a detached task, so the
             // request span has to be attached to the future rather than
             // inherited — without it the session's guardrail checks log
@@ -278,7 +283,16 @@ pub(crate) async fn realtime(
             ws.protocols(["realtime"]).on_upgrade(move |socket| {
                 use tracing::Instrument as _;
                 async move {
-                    run_session(state2, prep, socket, client2, request_id, started).await;
+                    run_session(
+                        state2,
+                        prep,
+                        socket,
+                        client2,
+                        request_id,
+                        started,
+                        wildcard_pricing,
+                    )
+                    .await;
                 }
                 .instrument(span)
             })
@@ -725,6 +739,28 @@ async fn run_session(
     client: ClientContext,
     request_id: String,
     started: Instant,
+    wildcard_pricing: Option<crate::usage_attr::WildcardPricingIdentity>,
+) {
+    run_session_inner(
+        state,
+        prep,
+        client_ws,
+        client,
+        request_id,
+        started,
+        wildcard_pricing,
+    )
+    .await;
+}
+
+async fn run_session_inner(
+    state: ProxyState,
+    prep: Prepared,
+    client_ws: WebSocket,
+    client: ClientContext,
+    request_id: String,
+    started: Instant,
+    wildcard_pricing: Option<crate::usage_attr::WildcardPricingIdentity>,
 ) {
     let Prepared {
         auth,
@@ -1093,6 +1129,12 @@ async fn run_session(
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(&audit),
         ..Default::default()
     };
+    crate::usage_attr::apply_captured_wildcard_pricing_identity(
+        &mut event,
+        crate::operation::REALTIME,
+        /* dispatched */ true,
+        wildcard_pricing.as_ref(),
+    );
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
     crate::usage_attr::apply_caller_identity(
         &mut event,
@@ -1580,6 +1622,60 @@ mod tests {
         assert_eq!(ev.cached_prompt_tokens, 1);
         assert_eq!(ev.requested_model, "rt-model");
         assert_eq!(ev.api_key_id, "k-1");
+    }
+
+    /// `on_upgrade` moves the session to a task that does not inherit the
+    /// request task-local. A wildcard model resolved before the upgrade must
+    /// still reach its terminal session UsageEvent as the concrete provider
+    /// pricing identity, rather than being lost when the HTTP handler ends.
+    #[tokio::test]
+    async fn terminal_realtime_usage_keeps_wildcard_pricing_identity() {
+        let (up_addr, _handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
+        let wildcard: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "rt-*",
+            "provider": "openai",
+            "model_name": "gpt-realtime-*",
+            "provider_key_id": PK_ID,
+            "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046",
+        }))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-rt", wildcard, 2));
+        let (addr, _state, mut rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-2026-01-01")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("handshake");
+        let (mut tx, mut client_rx) = ws.split();
+        tx.send(TgMessage::Text(
+            serde_json::json!({"type": "session.update", "session": {"instructions": "hi"}})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+
+        while let Some(Ok(message)) = client_rx.next().await {
+            if matches!(message, TgMessage::Close(_)) {
+                break;
+            }
+        }
+
+        let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("terminal usage event expected")
+            .expect("usage sink closed");
+        assert_eq!(event.model_id, "m-rt");
+        assert_eq!(event.requested_model, "rt-2026-01-01");
+        assert_eq!(
+            event.pricing_authority_id,
+            "a3ebdc63-e921-4323-a75c-3b911f950046"
+        );
+        assert_eq!(event.resolved_pricing_model, "gpt-realtime-2026-01-01");
     }
 
     /// `/v1/realtime` builds its upstream handshake by hand rather than

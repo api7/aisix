@@ -1061,6 +1061,10 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
             "/oneOf/3/not/anyOf",
             "/properties/effort_mapping/additionalProperties/minLength",
             "/properties/effort_mapping/properties//minLength",
+            // CP may have projected an older nil authority. The strict contract
+            // rejects it, while a DP must keep loading that row and emit its
+            // usage unpriced during a rolling upgrade.
+            "/properties/pricing_authority_id/not",
         ],
     ),
 ];

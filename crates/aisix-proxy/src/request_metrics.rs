@@ -171,7 +171,9 @@ impl Default for Upstream<'_> {
 /// Whether the caller addressed an ensemble model. See [`LastTarget::new`].
 fn is_ensemble(snap: &AisixSnapshot, requested_model: &str) -> bool {
     !requested_model.is_empty()
-        && crate::model_resolve::resolve_model(snap, requested_model)
+        && snap
+            .models
+            .get_by_name(requested_model)
             .is_some_and(|entry| entry.value.is_ensemble())
 }
 
@@ -702,6 +704,9 @@ mod tests {
             provider: "OpenAI".to_string(),
             upstream_model: "gpt-4o-mini".to_string(),
             provider_key_id: "pk-1".to_string(),
+            wildcard_pricing_model_id: String::new(),
+            wildcard_pricing_authority_id: String::new(),
+            wildcard_pricing_model: String::new(),
             cache_hit_layer: None,
         }
     }
@@ -751,6 +756,62 @@ mod tests {
         assert_eq!(upstream.upstream_model, UNKNOWN);
         assert_eq!(upstream.pk.id(), UNKNOWN);
         assert_eq!(upstream.pk.name(), UNKNOWN);
+    }
+
+    /// E2E metric recording loads the latest snapshot after dispatch. Its
+    /// ensemble check is classification only: resolving a wildcard again
+    /// there would replace the concrete pricing identity captured from the
+    /// snapshot that actually dispatched the request.
+    #[tokio::test]
+    async fn ensemble_metric_check_does_not_replace_captured_wildcard_identity() {
+        use std::sync::Arc;
+
+        let dispatched = snapshot_with(
+            "wildcard",
+            serde_json::json!({
+                "display_name": "openrouter/*",
+                "provider": "openai",
+                "model_name": "*",
+                "provider_key_id": "pk-1",
+                "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046",
+            }),
+        );
+        let refreshed = snapshot_with(
+            "wildcard",
+            serde_json::json!({
+                "display_name": "openrouter/*",
+                "provider": "openai",
+                "model_name": "replacement-*",
+                "provider_key_id": "pk-1",
+            }),
+        );
+
+        crate::attribution::scope(
+            Arc::new(crate::attribution::RequestAttribution::default()),
+            async {
+                crate::model_resolve::resolve_model(&dispatched, "openrouter/gpt-4o")
+                    .expect("wildcard model resolves at dispatch");
+                let captured =
+                    crate::attribution::current().expect("request attribution is installed");
+                assert_eq!(captured.wildcard_pricing_model_id, "wildcard");
+                assert_eq!(
+                    captured.wildcard_pricing_authority_id,
+                    "a3ebdc63-e921-4323-a75c-3b911f950046"
+                );
+                assert_eq!(captured.wildcard_pricing_model, "gpt-4o");
+
+                assert!(!is_ensemble(&refreshed, "openrouter/gpt-4o"));
+                let after_metrics =
+                    crate::attribution::current().expect("request attribution is installed");
+                assert_eq!(after_metrics.wildcard_pricing_model_id, "wildcard");
+                assert_eq!(
+                    after_metrics.wildcard_pricing_authority_id,
+                    "a3ebdc63-e921-4323-a75c-3b911f950046"
+                );
+                assert_eq!(after_metrics.wildcard_pricing_model, "gpt-4o");
+            },
+        )
+        .await;
     }
 
     /// A request that never selected a target keeps the placeholder, and the

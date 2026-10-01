@@ -5309,7 +5309,7 @@ data: [DONE]\n\n";
     }
 
     #[tokio::test]
-    async fn non_anthropic_streaming_records_anthropic_usage_event_with_ttft() {
+    async fn wildcard_streaming_records_anthropic_usage_event_with_pricing_authority_and_ttft() {
         use aisix_obs::UsageSink;
         use aisix_provider_openai::OpenAiBridge;
 
@@ -5331,7 +5331,16 @@ data: [DONE]\n\n";
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let snap = new_snap_openai(&upstream.uri());
-        snap.models.insert(openai_model("my-claude-alias"));
+        let wildcard: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "my-claude/*",
+            "provider": "openai",
+            "model_name": "*",
+            "provider_key_id": OPENAI_PK_ID,
+            "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046",
+        }))
+        .expect("wildcard model parses");
+        snap.models
+            .insert(ResourceEntry::new("m-wildcard", wildcard, 1));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let hub = Arc::new(Hub::new());
@@ -5344,7 +5353,7 @@ data: [DONE]\n\n";
         let app = crate::build_router(state);
 
         let body = serde_json::json!({
-            "model": "my-claude-alias",
+            "model": "my-claude/gpt-4o-2024-08-06",
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 100,
             "stream": true,
@@ -5361,6 +5370,12 @@ data: [DONE]\n\n";
             .expect("usage event was never emitted")
             .expect("usage event sender dropped");
         assert_eq!(event.inbound_protocol, "anthropic");
+        assert_eq!(event.model_id, "m-wildcard");
+        assert_eq!(
+            event.pricing_authority_id,
+            "a3ebdc63-e921-4323-a75c-3b911f950046"
+        );
+        assert_eq!(event.resolved_pricing_model, "gpt-4o-2024-08-06");
         assert_eq!(event.prompt_tokens, 13);
         assert_eq!(event.completion_tokens, 4);
         assert_eq!(event.provider_request_id, "cmpl-359");

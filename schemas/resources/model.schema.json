@@ -1191,6 +1191,11 @@
           },
           {
             "required": [
+              "pricing_authority_id"
+            ]
+          },
+          {
+            "required": [
               "effort_mapping"
             ]
           }
@@ -1307,6 +1312,11 @@
           },
           {
             "required": [
+              "pricing_authority_id"
+            ]
+          },
+          {
+            "required": [
               "effort_mapping"
             ]
           }
@@ -1372,6 +1382,11 @@
           {
             "required": [
               "pricing_key"
+            ]
+          },
+          {
+            "required": [
+              "pricing_authority_id"
             ]
           },
           {
@@ -1469,6 +1484,16 @@
     "model_name": {
       "description": "Upstream model identifier sent in provider requests. Routing and ensemble models leave this field unset.",
       "minLength": 1,
+      "type": "string"
+    },
+    "pricing_authority_id": {
+      "description": "Opaque control-plane-issued canonical, non-nil UUID that authorizes a concrete wildcard-upstream model name for pricing. It is relevant only to a direct-shaped wildcard model (chat or embedding); without it the data plane deliberately omits the resolved model from terminal telemetry so the control plane can leave the call unpriced rather than trust mutable configuration.",
+      "maxLength": 64,
+      "minLength": 36,
+      "not": {
+        "const": "00000000-0000-0000-0000-000000000000"
+      },
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
     "pricing_key": {

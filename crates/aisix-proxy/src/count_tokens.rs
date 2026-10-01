@@ -1242,6 +1242,79 @@ mod tests {
         );
     }
 
+    /// A wildcard alias still resolves and dispatches on the counting route,
+    /// but token counting measures a later inference request rather than
+    /// consuming model tokens itself. Its zero-token row therefore must not
+    /// carry the wildcard row's concrete pricing authority.
+    #[tokio::test]
+    async fn wildcard_count_tokens_routes_upstream_without_pricing_identity() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 42})),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        let wildcard: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "anthropic/*",
+            "provider": "anthropic",
+            "model_name": "*",
+            "provider_key_id": PK_ID,
+            "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046",
+        }))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("wildcard", wildcard, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized(
+            "anthropic",
+            Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
+        );
+        let handle = SnapshotHandle::new(snap);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+
+        let requested_model = "anthropic/claude-haiku-4-5-20251001";
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": requested_model,
+                "messages": [{"role": "user", "content": "hello"}],
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].url.path(), "/v1/messages/count_tokens");
+        let sent: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(sent["model"], "claude-haiku-4-5-20251001");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("count_tokens must emit a usage event")
+            .expect("channel open");
+        assert_eq!(event.operation, "count_tokens");
+        assert_eq!(event.model_id, "wildcard");
+        assert_eq!(event.requested_model, requested_model);
+        assert_eq!(event.prompt_tokens, 0);
+        assert_eq!(event.completion_tokens, 0);
+        assert!(event.pricing_authority_id.is_empty());
+        assert!(event.resolved_pricing_model.is_empty());
+    }
+
     /// Same gate as `/v1/messages`: a body the scan parser rejects is
     /// refused only when a guardrail would have read it. An output-hook-only
     /// row resolves into the chain but never sees the request, so the body

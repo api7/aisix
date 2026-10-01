@@ -1,0 +1,573 @@
+import { createHash } from "node:crypto";
+import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import {
+  EtcdClient,
+  SeedClient,
+  spawnApp,
+  startMockSls,
+  startOpenAiUpstream,
+  waitConfigPropagation,
+  waitForSlsLog,
+  type MockSls,
+  type OpenAiUpstream,
+  type SpawnedApp,
+} from "../harness/index.js";
+
+// Gateway/exporter boundary regression for AISIX-Cloud#1746: the configured
+// wildcard row remains the model identity, while the concrete upstream model
+// travels on the usage-export wire as `resolved_pricing_model`. This runs a
+// real gateway process but `startMockSls` is only the exporter protocol
+// receiver; it is not evidence for the CP/DPM/PostgreSQL ingestion contract,
+// which belongs to AISIX-Cloud's mTLS telemetry E2E.
+
+const CALLER_PLAINTEXT = "sk-wildcard-pricing-telemetry-caller";
+const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
+const CREDENTIAL_REF = "wildcardpricing";
+const LOGSTORE = "wildcard-pricing-telemetry";
+const WILDCARD_ALIAS = "openrouter/*";
+const KNOWN_MODEL = "openai/gpt-4o-mini";
+const UNKNOWN_MODEL = "unknown/provider-model";
+const PRICING_AUTHORITY_ID = "a3ebdc63-e921-4323-a75c-3b911f950046";
+const EMBEDDING_WILDCARD_ALIAS = "embedding/*";
+const EMBEDDING_REQUEST_MODEL = "embedding/embedding-3-small";
+const EMBEDDING_UPSTREAM_MODEL = "text-embedding-3-small";
+const EMBEDDING_INPUT = "price this embedding";
+const EMBEDDING_VECTOR = [0.1, 0.2, 0.3];
+const COUNT_TOKENS_WILDCARD_ALIAS = "anthropic/*";
+const COUNT_TOKENS_REQUEST_MODEL = "anthropic/claude-haiku-4-5-20251001";
+const COUNT_TOKENS_UPSTREAM_MODEL = "claude-haiku-4-5-20251001";
+const STREAMING_WILDCARD_ALIAS = "stream/*";
+const STREAMING_REQUEST_MODEL = "stream/gpt-4o-2024-08-06";
+const STREAMING_UPSTREAM_MODEL = "gpt-4o-2024-08-06";
+const BATCH_WILDCARD_ALIAS = "batch/*";
+const BATCH_REQUEST_MODEL = "batch/gpt-4o-2024-08-06";
+
+function upstreamResponse() {
+  return {
+    id: "chatcmpl-wildcard-pricing",
+    object: "chat.completion",
+    created: 0,
+    // Pricing must come from the dispatch attribution, never a provider
+    // response field that happens to look like a model identity.
+    model: "provider-response-model",
+    choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+  };
+}
+
+function embeddingUpstreamResponse() {
+  return {
+    object: "list",
+    // Pricing must come from wildcard dispatch attribution rather than the
+    // provider response's optional model field.
+    model: "provider-response-embedding-model",
+    data: [{ object: "embedding", index: 0, embedding: EMBEDDING_VECTOR }],
+    usage: { prompt_tokens: 7, total_tokens: 7 },
+  };
+}
+
+function streamEvents(): string[] {
+  return [
+    JSON.stringify({
+      id: "chatcmpl-wildcard-stream",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "provider-response-stream-model",
+      choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }],
+    }),
+    JSON.stringify({
+      id: "chatcmpl-wildcard-stream",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "provider-response-stream-model",
+      choices: [],
+      usage: { prompt_tokens: 11, completion_tokens: 6, total_tokens: 17 },
+    }),
+    "[DONE]",
+  ];
+}
+
+function completedBatchResponse() {
+  return {
+    id: "batch-wildcard-completed",
+    object: "batch",
+    status: "completed",
+    input_file_id: "file-wildcard-input",
+    output_file_id: "file-wildcard-output",
+  };
+}
+
+function completedBatchOutput(): string {
+  return `${JSON.stringify({
+    id: "batch-request-1",
+    custom_id: "request-1",
+    response: {
+      status_code: 200,
+      body: {
+        // The provider's response field is deliberately different: it is
+        // diagnostic only and must not override the dispatch price model.
+        model: "provider-reported-batch-model",
+        usage: {
+          prompt_tokens: 13,
+          completion_tokens: 7,
+          prompt_tokens_details: { cached_tokens: 3 },
+        },
+      },
+    },
+  })}\n`;
+}
+
+function routedId(raw: string, model: string): string {
+  return `aisix-${Buffer.from(`${raw};model,${model}`).toString("base64url")}`;
+}
+
+describe("wildcard pricing telemetry e2e", () => {
+  let app: SpawnedApp | undefined;
+  let sls: MockSls | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let embeddingUpstream: OpenAiUpstream | undefined;
+  let countTokensUpstream: OpenAiUpstream | undefined;
+  let streamingUpstream: OpenAiUpstream | undefined;
+  let batchUpstream: OpenAiUpstream | undefined;
+  let wildcardID = "";
+  let embeddingWildcardID = "";
+  let countTokensWildcardID = "";
+  let streamingWildcardID = "";
+  let batchWildcardID = "";
+  let etcdReachable = false;
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    sls = await startMockSls();
+    upstream = await startOpenAiUpstream({ nonStreamBody: upstreamResponse() });
+    embeddingUpstream = await startOpenAiUpstream({ nonStreamBody: embeddingUpstreamResponse() });
+    countTokensUpstream = await startOpenAiUpstream({ nonStreamBody: { input_tokens: 42 } });
+    streamingUpstream = await startOpenAiUpstream({ streamEvents: streamEvents() });
+    batchUpstream = await startOpenAiUpstream({
+      scriptedResponses: [
+        { nonStreamBody: completedBatchResponse() },
+        { rawBody: completedBatchOutput(), rawContentType: "application/jsonl" },
+      ],
+    });
+    app = await spawnApp({
+      extraEnv: {
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",
+      },
+    });
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createObservabilityExporter({
+      name: "wildcard-pricing-sls",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: "aisix-e2e-obs",
+      logstore: LOGSTORE,
+      credential_ref: CREDENTIAL_REF,
+      content_mode: "metadata_only",
+    });
+    const providerKey = await seed.createProviderKey({
+      display_name: "wildcard-pricing-pk",
+      provider: "openrouter",
+      adapter: "openai",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    const wildcard = await seed.createModel({
+      display_name: WILDCARD_ALIAS,
+      provider: "openrouter",
+      model_name: "*",
+      provider_key_id: providerKey.id,
+      pricing_authority_id: PRICING_AUTHORITY_ID,
+    });
+    wildcardID = wildcard.id;
+    const embeddingProviderKey = await seed.createProviderKey({
+      display_name: "wildcard-pricing-embedding-pk",
+      provider: "openai",
+      adapter: "openai",
+      secret: "sk-mock",
+      api_base: `${embeddingUpstream.baseUrl}/v1`,
+    });
+    const embeddingWildcard = await seed.createModel({
+      display_name: EMBEDDING_WILDCARD_ALIAS,
+      provider: "openai",
+      model_name: "text-*",
+      provider_key_id: embeddingProviderKey.id,
+      pricing_authority_id: PRICING_AUTHORITY_ID,
+      embedding: { dimensions: EMBEDDING_VECTOR.length },
+    });
+    embeddingWildcardID = embeddingWildcard.id;
+    const countTokensProviderKey = await seed.createProviderKey({
+      display_name: "wildcard-pricing-count-tokens-pk",
+      provider: "anthropic",
+      adapter: "anthropic",
+      secret: "sk-mock",
+      // The Anthropic bridge appends `/v1/messages/count_tokens` to its
+      // bare provider base URL.
+      api_base: countTokensUpstream.baseUrl,
+    });
+    const countTokensWildcard = await seed.createModel({
+      display_name: COUNT_TOKENS_WILDCARD_ALIAS,
+      provider: "anthropic",
+      model_name: "*",
+      provider_key_id: countTokensProviderKey.id,
+      pricing_authority_id: PRICING_AUTHORITY_ID,
+    });
+    countTokensWildcardID = countTokensWildcard.id;
+    const streamingProviderKey = await seed.createProviderKey({
+      display_name: "wildcard-pricing-stream-pk",
+      provider: "openai",
+      adapter: "openai",
+      secret: "sk-mock",
+      api_base: `${streamingUpstream.baseUrl}/v1`,
+    });
+    const streamingWildcard = await seed.createModel({
+      display_name: STREAMING_WILDCARD_ALIAS,
+      provider: "openai",
+      model_name: "*",
+      provider_key_id: streamingProviderKey.id,
+      pricing_authority_id: PRICING_AUTHORITY_ID,
+    });
+    streamingWildcardID = streamingWildcard.id;
+    const batchProviderKey = await seed.createProviderKey({
+      display_name: "wildcard-pricing-batch-pk",
+      provider: "openai",
+      adapter: "openai",
+      secret: "sk-mock",
+      api_base: `${batchUpstream.baseUrl}/v1`,
+    });
+    const batchWildcard = await seed.createModel({
+      display_name: BATCH_WILDCARD_ALIAS,
+      provider: "openai",
+      model_name: "*",
+      provider_key_id: batchProviderKey.id,
+      pricing_authority_id: PRICING_AUTHORITY_ID,
+    });
+    batchWildcardID = batchWildcard.id;
+
+    // Seeded last: a successful models-list gate proves that all preceding
+    // resources, including the exporter, are in the same gateway snapshot.
+    await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      await res.arrayBuffer();
+      return res.status === 200;
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+    await embeddingUpstream?.close();
+    await countTokensUpstream?.close();
+    await streamingUpstream?.close();
+    await batchUpstream?.close();
+    await sls?.close();
+  });
+
+  async function requestModel(model: string): Promise<void> {
+    if (!app) throw new Error("app not ready");
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }),
+    });
+    const body = await res.text();
+    expect(res.status, body).toBe(200);
+  }
+
+  test("wildcard dispatch exports the concrete known and unknown pricing identities", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !upstream || !wildcardID) {
+      ctx.skip();
+      return;
+    }
+
+    const knownRequest = `openrouter/${KNOWN_MODEL}`;
+    await requestModel(knownRequest);
+    expect(upstream.receivedRequests).toHaveLength(1);
+    expect(JSON.parse(upstream.receivedRequests[0]!.body)).toMatchObject({ model: KNOWN_MODEL });
+
+    const known = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (log) => log.get("requested_model") === knownRequest,
+      `usage event for ${knownRequest}`,
+    );
+    expect(known.get("model_id")).toBe(wildcardID);
+    expect(known.get("pricing_authority_id")).toBe(PRICING_AUTHORITY_ID);
+    expect(known.get("resolved_pricing_model")).toBe(KNOWN_MODEL);
+    expect(known.get("prompt_tokens")).toBe("10");
+    expect(known.get("completion_tokens")).toBe("5");
+
+    const unknownRequest = `openrouter/${UNKNOWN_MODEL}`;
+    await requestModel(unknownRequest);
+    expect(upstream.receivedRequests).toHaveLength(2);
+    expect(JSON.parse(upstream.receivedRequests[1]!.body)).toMatchObject({ model: UNKNOWN_MODEL });
+
+    const unknown = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (log) => log.get("requested_model") === unknownRequest,
+      `usage event for ${unknownRequest}`,
+    );
+    expect(unknown.get("model_id")).toBe(wildcardID);
+    expect(unknown.get("pricing_authority_id")).toBe(PRICING_AUTHORITY_ID);
+    expect(unknown.get("resolved_pricing_model")).toBe(UNKNOWN_MODEL);
+  });
+
+  test("stream terminal telemetry keeps the wildcard dispatch price after the response scope ends", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !streamingUpstream || !streamingWildcardID) {
+      ctx.skip();
+      return;
+    }
+
+    const before = streamingUpstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: STREAMING_REQUEST_MODEL,
+        stream: true,
+        messages: [{ role: "user", content: "stream this prompt" }],
+      }),
+    });
+    const body = await res.text();
+    expect(res.status, body).toBe(200);
+    expect(body).toContain("[DONE]");
+
+    const calls = streamingUpstream.receivedRequests.slice(before);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.path).toBe("/v1/chat/completions");
+    expect(JSON.parse(calls[0]!.body)).toMatchObject({
+      model: STREAMING_UPSTREAM_MODEL,
+      stream: true,
+    });
+
+    const event = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (log) => log.get("requested_model") === STREAMING_REQUEST_MODEL,
+      `stream terminal usage event for ${STREAMING_REQUEST_MODEL}`,
+    );
+    expect(event.get("model_id")).toBe(streamingWildcardID);
+    expect(event.get("pricing_authority_id")).toBe(PRICING_AUTHORITY_ID);
+    expect(event.get("resolved_pricing_model")).toBe(STREAMING_UPSTREAM_MODEL);
+    expect(event.get("prompt_tokens")).toBe("11");
+    expect(event.get("completion_tokens")).toBe("6");
+  });
+
+  test("direct embedding wildcard dispatch exports its concrete pricing identity", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !embeddingUpstream || !embeddingWildcardID) {
+      ctx.skip();
+      return;
+    }
+
+    const baseline = embeddingUpstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/embeddings`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: EMBEDDING_REQUEST_MODEL, input: EMBEDDING_INPUT }),
+    });
+    const body = await res.text();
+    expect(res.status, body).toBe(200);
+    expect(JSON.parse(body)).toMatchObject({
+      object: "list",
+      model: EMBEDDING_REQUEST_MODEL,
+      data: [{ object: "embedding", index: 0, embedding: EMBEDDING_VECTOR }],
+      usage: { prompt_tokens: 7, total_tokens: 7 },
+    });
+
+    const calls = embeddingUpstream.receivedRequests.slice(baseline);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.path).toBe("/v1/embeddings");
+    expect(JSON.parse(calls[0]!.body)).toMatchObject({
+      model: EMBEDDING_UPSTREAM_MODEL,
+      input: EMBEDDING_INPUT,
+    });
+
+    const event = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (log) => log.get("requested_model") === EMBEDDING_REQUEST_MODEL,
+      `usage event for ${EMBEDDING_REQUEST_MODEL}`,
+    );
+    expect(event.get("model_id")).toBe(embeddingWildcardID);
+    expect(event.get("pricing_authority_id")).toBe(PRICING_AUTHORITY_ID);
+    expect(event.get("resolved_pricing_model")).toBe(EMBEDDING_UPSTREAM_MODEL);
+    expect(event.get("prompt_tokens")).toBe("7");
+  });
+
+  test("wildcard count_tokens remains unpriced after a real Anthropic dispatch", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !countTokensUpstream || !countTokensWildcardID) {
+      ctx.skip();
+      return;
+    }
+
+    const baseline = countTokensUpstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/messages/count_tokens`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": CALLER_PLAINTEXT,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: COUNT_TOKENS_REQUEST_MODEL,
+        messages: [{ role: "user", content: "count this prompt" }],
+      }),
+    });
+    const body = await res.text();
+    expect(res.status, body).toBe(200);
+    expect(JSON.parse(body)).toMatchObject({ input_tokens: 42 });
+
+    const calls = countTokensUpstream.receivedRequests.slice(baseline);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.path).toBe("/v1/messages/count_tokens");
+    expect(JSON.parse(calls[0]!.body)).toMatchObject({
+      model: COUNT_TOKENS_UPSTREAM_MODEL,
+      messages: [{ role: "user", content: "count this prompt" }],
+    });
+
+    const event = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (log) =>
+        log.get("operation") === "count_tokens" &&
+        log.get("requested_model") === COUNT_TOKENS_REQUEST_MODEL,
+      `usage event for ${COUNT_TOKENS_REQUEST_MODEL}`,
+    );
+    expect(event.get("model_id")).toBe(countTokensWildcardID);
+    expect(event.get("prompt_tokens")).toBe("0");
+    expect(event.get("completion_tokens")).toBe("0");
+    expect(event.get("cached_prompt_tokens")).toBeUndefined();
+    expect(event.get("reasoning_tokens")).toBeUndefined();
+    expect(event.get("total_tokens")).toBeUndefined();
+    expect(event.get("pricing_authority_id")).toBeUndefined();
+    expect(event.get("resolved_pricing_model")).toBeUndefined();
+  });
+
+  test("wildcard-routed job management events remain unpriced", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !upstream || !wildcardID) {
+      ctx.skip();
+      return;
+    }
+
+    const model = `openrouter/${KNOWN_MODEL}`;
+    const calls = [
+      [
+        "file",
+        "files",
+        `/v1/files/${routedId("file-wildcard", model)}`,
+        "/v1/files/file-wildcard",
+      ],
+      [
+        "batch",
+        "batches",
+        `/v1/batches/${routedId("batch-wildcard", model)}`,
+        "/v1/batches/batch-wildcard",
+      ],
+      [
+        "fine-tuning",
+        "fine_tuning",
+        `/v1/fine_tuning/jobs/${routedId("ftjob-wildcard", model)}`,
+        "/v1/fine_tuning/jobs/ftjob-wildcard",
+      ],
+    ] as const;
+
+    for (const [kind, operation, gatewayPath, upstreamPath] of calls) {
+      const before = upstream.receivedRequests.length;
+      const res = await fetch(`${app.proxyUrl}${gatewayPath}`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      const body = await res.text();
+      expect(res.status, `${kind}: ${body}`).toBe(200);
+
+      const forwarded = upstream.receivedRequests.slice(before);
+      expect(forwarded).toHaveLength(1);
+      expect(forwarded[0]!.method).toBe("GET");
+      expect(forwarded[0]!.path).toBe(upstreamPath);
+
+      const event = await waitForSlsLog(
+        sls,
+        LOGSTORE,
+        (log) => log.get("operation") === operation && log.get("model_id") === wildcardID,
+        `${kind} wildcard management usage event`,
+      );
+      expect(event.get("requested_model")).toBe(WILDCARD_ALIAS);
+      expect(event.get("prompt_tokens")).toBe("0");
+      expect(event.get("completion_tokens")).toBe("0");
+      expect(event.get("pricing_authority_id")).toBeUndefined();
+      expect(event.get("resolved_pricing_model")).toBeUndefined();
+    }
+  });
+
+  test("completed batch telemetry retains dispatch pricing while its management event stays unpriced", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !batchUpstream || !batchWildcardID) {
+      ctx.skip();
+      return;
+    }
+
+    const before = batchUpstream.receivedRequests.length;
+    const route = routedId("batch-wildcard-completed", BATCH_REQUEST_MODEL);
+    const res = await fetch(`${app.proxyUrl}/v1/batches/${route}`, {
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+    });
+    const body = await res.text();
+    expect(res.status, body).toBe(200);
+    expect(JSON.parse(body)).toMatchObject({
+      output_file_id: routedId("file-wildcard-output", BATCH_REQUEST_MODEL),
+    });
+
+    const management = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (log) =>
+        log.get("operation") === "batches" &&
+        log.get("model_id") === batchWildcardID &&
+        log.get("requested_model") === BATCH_WILDCARD_ALIAS,
+      "wildcard batch management usage event",
+    );
+    expect(management.get("prompt_tokens")).toBe("0");
+    expect(management.get("completion_tokens")).toBe("0");
+    expect(management.get("pricing_authority_id")).toBeUndefined();
+    expect(management.get("resolved_pricing_model")).toBeUndefined();
+
+    const aggregate = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (log) =>
+        log.get("inbound_protocol") === "batch" &&
+        log.get("model_id") === batchWildcardID &&
+        log.get("requested_model") === BATCH_WILDCARD_ALIAS,
+      "completed wildcard batch usage event",
+    );
+    expect(aggregate.get("provider_model_version")).toBe("provider-reported-batch-model");
+    expect(aggregate.get("pricing_authority_id")).toBe(PRICING_AUTHORITY_ID);
+    expect(aggregate.get("resolved_pricing_model")).toBe("gpt-4o-2024-08-06");
+    expect(aggregate.get("prompt_tokens")).toBe("13");
+    expect(aggregate.get("completion_tokens")).toBe("7");
+    expect(aggregate.get("cached_prompt_tokens")).toBe("3");
+
+    const calls = batchUpstream.receivedRequests.slice(before);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toMatchObject({ method: "GET", path: "/v1/batches/batch-wildcard-completed" });
+    expect(calls[1]).toMatchObject({ method: "GET", path: "/v1/files/file-wildcard-output/content" });
+  });
+});

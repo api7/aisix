@@ -144,6 +144,10 @@ pub(crate) struct JobTarget {
     pub pk_entry: Arc<ResourceEntry<ProviderKey>>,
     pub secret: String,
     pub adapter: Adapter,
+    /// The exact, authorized routing selector that dispatched this request.
+    /// It is embedded in returned resource ids so later batch/file retrievals
+    /// resolve the same concrete wildcard model rather than the `*` row.
+    routing_model: String,
     /// The ProviderKey's rendered `default_headers`, resolved once when the
     /// target is resolved so every round-trip on this surface (upload,
     /// poll, download) sends the same set (AISIX-Cloud#1112).
@@ -160,6 +164,9 @@ pub(crate) struct JobTarget {
 impl JobTarget {
     fn display_name(&self) -> &str {
         &self.model_entry.value.display_name
+    }
+    fn routing_model(&self) -> &str {
+        &self.routing_model
     }
     fn provider_label(&self) -> &str {
         self.model_entry.value.provider.as_deref().unwrap_or("")
@@ -199,6 +206,7 @@ pub(crate) fn resolve_target(
     wanted: Option<&str>,
     client_ctx: &ClientContext,
 ) -> Result<JobTarget, ProxyError> {
+    let routing_model = wanted.map(str::to_string);
     let model_entry = match wanted {
         Some(name) => {
             let entry = crate::model_resolve::resolve_model(snapshot, name)
@@ -265,7 +273,9 @@ pub(crate) fn resolve_target(
     );
     let forwarded_client = aisix_gateway::ForwardedClientHeaders::resolve(&header_ctx);
     let extra_headers = aisix_gateway::resolve_default_headers(&header_ctx);
+    let routing_model = routing_model.unwrap_or_else(|| model.display_name.clone());
     Ok(JobTarget {
+        routing_model,
         model_entry,
         pk_entry,
         secret,
@@ -1035,7 +1045,7 @@ pub(crate) async fn create_file(
             &request_id,
         )
         .await?;
-        let model = target.display_name().to_string();
+        let model = target.routing_model().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
             target,
@@ -1308,7 +1318,7 @@ pub(crate) async fn create_batch(
             &mut applied,
         )
         .await?;
-        let model = target.display_name().to_string();
+        let model = target.routing_model().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
             target,
@@ -1402,7 +1412,7 @@ pub(crate) async fn get_batch(
             }
         }
 
-        let model = target.display_name().to_string();
+        let model = target.routing_model().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
             target,
@@ -1610,7 +1620,7 @@ pub(crate) async fn create_ft_job(
             &mut applied,
         )
         .await?;
-        let model = target.display_name().to_string();
+        let model = target.routing_model().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
             target,
@@ -1841,7 +1851,7 @@ async fn forward_simple(
             }
             resp
         } else {
-            let model = spec.rewrite_ids.then(|| target.display_name().to_string());
+            let model = spec.rewrite_ids.then(|| target.routing_model().to_string());
             json_response(status, &resp_headers, bytes, model.as_deref())
         };
         Ok((resp, target))
@@ -1923,6 +1933,11 @@ fn maybe_attribute_batch(
     let jwt = auth.jwt.clone();
     let model_id = target.model_entry.id.clone();
     let display_name = target.display_name().to_string();
+    // This runs while the retrieval request still owns its attribution
+    // scope. The download/aggregation task below is detached, so it must
+    // carry the verified dispatch-time tuple rather than trying to derive a
+    // price from the provider's output line or a later snapshot.
+    let wildcard_pricing = crate::usage_attr::capture_wildcard_pricing_identity();
     // Resolved before the spawn, off the live snapshot, through the same
     // index `least_cost` ranks with: `pricing_key` first, inline `cost`
     // second. The completed batch is priced at what the model costs when
@@ -1950,6 +1965,7 @@ fn maybe_attribute_batch(
             user_name.as_deref(),
             &model_id,
             &display_name,
+            wildcard_pricing,
             cost.as_ref(),
             &pk_id,
             &secret,
@@ -1984,6 +2000,7 @@ async fn attribute_batch_usage(
     user_name: Option<&str>,
     model_id: &str,
     display_name: &str,
+    wildcard_pricing: Option<crate::usage_attr::WildcardPricingIdentity>,
     cost: Option<&aisix_core::models::model::ModelCost>,
     pk_id: &str,
     secret: &str,
@@ -2028,7 +2045,9 @@ async fn attribute_batch_usage(
     }
     let body = resp.bytes().await.map_err(|e| e.to_string())?;
 
-    // Aggregate per provider-billed model (`response.body.model`).
+    // Keep the provider-reported model only as diagnostic version data. The
+    // captured dispatch tuple, not an upstream output field, selects the
+    // wildcard catalog price for every completed batch slice.
     #[derive(Default)]
     struct Agg {
         prompt: u64,
@@ -2069,8 +2088,6 @@ async fn attribute_batch_usage(
 
     let snap = state.snapshot.load();
     let pk = crate::usage_attr::ResolvedPk::resolve(&snap, pk_id);
-    // Same exporter set for every model slice of one batch.
-    let exporters = crate::usage_attr::live_exporters(state, &snap);
     let multi = per_model.len() > 1;
     for (idx, (provider_model, agg)) in per_model.iter().enumerate() {
         let request_id = batch_attribution_request_id(raw_batch_id, idx, multi);
@@ -2092,29 +2109,35 @@ async fn attribute_batch_usage(
                 .map(|c| c.calculate(agg.prompt, agg.completion))
                 .unwrap_or(0.0),
             inbound_protocol: "batch".to_string(),
-            // Set here rather than by the emit chokepoint: this path
-            // deliberately bypasses it (no live request, so no trace
-            // bundle), and both labels still come from one constant.
-            operation: crate::operation::BATCH_COMPLETION.operation.to_string(),
             ..Default::default()
         };
+        crate::usage_attr::apply_captured_wildcard_pricing_identity(
+            &mut event,
+            crate::operation::BATCH_COMPLETION,
+            /* dispatched */ true,
+            wildcard_pricing.as_ref(),
+        );
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
         // Attribution names the identity that observed completion — the
         // same caller the event's api_key_id already reflects.
         crate::usage_attr::apply_caller_identity(&mut event, jwt, user_id, user_name);
         let usage_model =
             crate::usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();
-        state.usage_sink.try_emit(
-            crate::operation::BATCH_COMPLETION.handler,
-            event.clone(),
+        // Completion attribution is a real terminal inference event even
+        // though it has no live request trace. Send it through the one
+        // chokepoint so CP telemetry and exporter fan-out receive the same
+        // captured pricing tuple.
+        crate::usage_attr::emit_usage(
+            state,
+            &snap,
+            crate::operation::BATCH_COMPLETION,
+            event,
             crate::usage_attr::usage_event_labels(&usage_model, &pk),
+            None,
+            None,
+            /* terminal */ true,
+            /* dispatched */ true,
         );
-        // A background poll attributes usage after the fact — there is no
-        // live request and therefore no trace bundle; the exporter falls
-        // back to the legacy flat span (AISIX-Cloud#1279).
-        state
-            .otlp_fan_out
-            .fan_out(&event, None, None, exporters.iter().map(|e| &e.value));
         tracing::info!(
             batch_id = %raw_batch_id,
             provider_model = %provider_model,
@@ -2419,6 +2442,90 @@ mod tests {
         assert_eq!(&bytes[..], b"{\"custom_id\":\"r1\"}\n");
     }
 
+    #[tokio::test]
+    async fn wildcard_selected_file_and_fine_tuning_management_events_are_unpriced() {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/files/file-abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "file-abc",
+                "object": "file"
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/fine_tuning/jobs/ftjob-9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "ftjob-9",
+                "object": "fine_tuning.job"
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        let wildcard: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "jobs/*",
+            "provider": "openai",
+            "model_name": "*",
+            "provider_key_id": PK_A,
+            "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046",
+        }))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("wildcard", wildcard, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let (app, mut rx) = build_app_with_sink(snap);
+
+        for (management_kind, path, operation) in [
+            (
+                "file",
+                format!(
+                    "/v1/files/{}",
+                    encode_routed_id("file-abc", "jobs/gpt-4o-2024-08-06")
+                ),
+                "files",
+            ),
+            (
+                "fine-tuning",
+                format!(
+                    "/v1/fine_tuning/jobs/{}",
+                    encode_routed_id("ftjob-9", "jobs/gpt-4o-2024-08-06")
+                ),
+                "fine_tuning",
+            ),
+        ] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(path)
+                .header("authorization", "Bearer sk-caller")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{management_kind}");
+
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("management usage event must arrive")
+                .expect("usage sink must remain open");
+            assert_eq!(event.model_id, "wildcard", "{management_kind}");
+            assert_eq!(event.requested_model, "jobs/*", "{management_kind}");
+            assert_eq!(event.operation, operation, "{management_kind}");
+            assert_eq!(event.prompt_tokens, 0, "{management_kind}");
+            assert_eq!(event.completion_tokens, 0, "{management_kind}");
+            assert!(
+                event.pricing_authority_id.is_empty(),
+                "{management_kind} management event must not select wildcard pricing"
+            );
+            assert!(
+                event.resolved_pricing_model.is_empty(),
+                "{management_kind} management event must not select wildcard pricing"
+            );
+        }
+    }
+
     // ---- batches ----
 
     #[tokio::test]
@@ -2445,11 +2552,18 @@ mod tests {
         snap.provider_keys
             .insert(openai_pk(PK_B, &upstream_b.uri()));
         snap.models.insert(model("m-a", "jobs-a", PK_A));
-        snap.models.insert(model("m-b", "jobs-b", PK_B));
+        let wildcard: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "jobs/*",
+            "provider": "openai",
+            "model_name": "*",
+            "provider_key_id": PK_B,
+        }))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-b", wildcard, 1));
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
 
-        let encoded = encode_routed_id("file-realB", "jobs-b");
+        let encoded = encode_routed_id("file-realB", "jobs/gpt-4o-2024-08-06");
         let body = serde_json::json!({
             "input_file_id": encoded,
             "endpoint": "/v1/chat/completions",
@@ -2475,11 +2589,17 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             decode_routed_id(v["id"].as_str().unwrap()),
-            Some(("batch_777".to_string(), "jobs-b".to_string()))
+            Some((
+                "batch_777".to_string(),
+                "jobs/gpt-4o-2024-08-06".to_string()
+            ))
         );
         assert_eq!(
             decode_routed_id(v["input_file_id"].as_str().unwrap()),
-            Some(("file-realB".to_string(), "jobs-b".to_string()))
+            Some((
+                "file-realB".to_string(),
+                "jobs/gpt-4o-2024-08-06".to_string()
+            ))
         );
         assert!(
             upstream_a.received_requests().await.unwrap().is_empty(),
@@ -2505,7 +2625,7 @@ mod tests {
             "id": "batch_req_1",
             "custom_id": "r1",
             "response": {"status_code": 200, "body": {
-                "model": "gpt-4o-2024-08-06",
+                "model": "provider-reported-batch-model",
                 "usage": {"prompt_tokens": 10, "completion_tokens": 5,
                            "prompt_tokens_details": {"cached_tokens": 2}}
             }}
@@ -2514,7 +2634,7 @@ mod tests {
             "id": "batch_req_2",
             "custom_id": "r2",
             "response": {"status_code": 200, "body": {
-                "model": "gpt-4o-2024-08-06",
+                "model": "provider-reported-batch-model",
                 "usage": {"prompt_tokens": 7, "completion_tokens": 3}
             }}
         });
@@ -2529,11 +2649,22 @@ mod tests {
 
         let snap = AisixSnapshot::new();
         snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
-        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        let wildcard: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "jobs/*",
+            "provider": "openai",
+            "model_name": "*",
+            "provider_key_id": PK_A,
+            "pricing_authority_id": "a3ebdc63-e921-4323-a75c-3b911f950046",
+        }))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-a", wildcard, 1));
         snap.apikeys.insert(apikey_entry(&["*"]));
         let (app, mut rx) = build_app_with_sink(snap);
 
-        let encoded = encode_routed_id("batch_1", "jobs-a");
+        // A concrete caller hint enters the wildcard-capture branch. The
+        // zero-token management event must still stay unpriced even though
+        // this GET genuinely contacts the upstream batch API.
+        let encoded = encode_routed_id("batch_1", "jobs/gpt-4o-2024-08-06");
         let mk_req = || {
             Request::builder()
                 .method("GET")
@@ -2550,12 +2681,12 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             decode_routed_id(v["output_file_id"].as_str().unwrap()),
-            Some(("file-out".to_string(), "jobs-a".to_string()))
+            Some(("file-out".to_string(), "jobs/gpt-4o-2024-08-06".to_string()))
         );
 
         // Two events expected: the zero-token management event plus ONE
         // aggregated batch event from the detached attribution task.
-        let mut mgmt = 0u32;
+        let mut mgmt: Option<ObsUsageEvent> = None;
         let mut agg: Option<ObsUsageEvent> = None;
         for _ in 0..2 {
             let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
@@ -2565,10 +2696,21 @@ mod tests {
             if ev.inbound_protocol == "batch" {
                 agg = Some(ev);
             } else {
-                mgmt += 1;
+                assert!(
+                    mgmt.replace(ev).is_none(),
+                    "only one management event expected"
+                );
             }
         }
-        assert_eq!(mgmt, 1);
+        let mgmt = mgmt.expect("management event must be emitted");
+        assert!(
+            mgmt.pricing_authority_id.is_empty(),
+            "a batch-management request must not select wildcard pricing"
+        );
+        assert!(
+            mgmt.resolved_pricing_model.is_empty(),
+            "a batch-management request must not select wildcard pricing"
+        );
         let agg = agg.expect("aggregated batch event must be emitted");
         // cp-api accepts any visible-ASCII request_id since
         // AISIX-Cloud#1288, so this is no longer a wire constraint — but a
@@ -2584,8 +2726,16 @@ mod tests {
         assert_eq!(agg.prompt_tokens, 17);
         assert_eq!(agg.completion_tokens, 8);
         assert_eq!(agg.cached_prompt_tokens, 2);
-        assert_eq!(agg.provider_model_version, "gpt-4o-2024-08-06");
-        assert_eq!(agg.requested_model, "jobs-a");
+        assert_eq!(agg.provider_model_version, "provider-reported-batch-model");
+        assert_eq!(agg.requested_model, "jobs/*");
+        assert_eq!(
+            agg.pricing_authority_id, "a3ebdc63-e921-4323-a75c-3b911f950046",
+            "the aggregate must retain the captured wildcard authority"
+        );
+        assert_eq!(
+            agg.resolved_pricing_model, "gpt-4o-2024-08-06",
+            "the aggregate must use the dispatch model, not provider output"
+        );
 
         // Second retrieve: management event only — the attribution is
         // process-deduped.
