@@ -3734,7 +3734,7 @@ fn responses_sse_guardrail_text(bytes: &[u8]) -> String {
         if event_text.is_empty() {
             continue;
         }
-        if !text.is_empty() && !(previous_was_delta && is_delta) {
+        if !(text.is_empty() || previous_was_delta && is_delta) {
             text.push('\n');
         }
         text.push_str(&event_text);
