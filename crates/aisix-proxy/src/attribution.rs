@@ -615,6 +615,21 @@ pub(crate) struct RequestAttribution {
 }
 
 impl RequestAttribution {
+    /// A continuation for a detached realtime session. It deliberately copies
+    /// only the wildcard pricing tuple: the HTTP request's body counters and
+    /// pending access log are finalized when its upgrade response completes,
+    /// while the session owns a separate terminal event and access-log line.
+    fn wildcard_pricing_continuation(&self) -> Self {
+        let resolved = self.get();
+        let continuation = Self::default();
+        let mut cell = continuation.lock();
+        cell.resolved.wildcard_pricing_model_id = resolved.wildcard_pricing_model_id;
+        cell.resolved.wildcard_pricing_authority_id = resolved.wildcard_pricing_authority_id;
+        cell.resolved.wildcard_pricing_model = resolved.wildcard_pricing_model;
+        drop(cell);
+        continuation
+    }
+
     /// A sub-call scope that cannot change the parent request's target
     /// attribution but can still account for gateway-initiated embeddings on
     /// the parent's eventual terminal usage event.
@@ -931,17 +946,16 @@ pub(crate) fn current() -> Option<Resolved> {
     CURRENT.try_with(|a| a.get()).ok()
 }
 
-/// The current request's attribution cell, for work that continues on a
-/// detached task after the HTTP handler returns.
+/// A fresh attribution cell for a detached realtime session.
 ///
-/// A WebSocket upgrade moves its session onto axum's upgrade task. That task
-/// does not inherit Tokio task-locals, but it is still the same client request:
-/// the terminal session usage row must retain the model identity captured
-/// before the upgrade. Callers install this exact cell with [`scope`] around
-/// their detached continuation; `None` remains correct outside request
-/// middleware (for example, focused unit tests).
-pub(crate) fn current_cell() -> Option<Arc<RequestAttribution>> {
-    CURRENT.try_with(Arc::clone).ok()
+/// A WebSocket upgrade moves its session onto axum's upgrade task, which does
+/// not inherit Tokio task-locals. The session needs a wildcard pricing tuple
+/// captured before the upgrade, but must not reuse the HTTP cell: the latter
+/// owns the completed upgrade response's body counters and access-log line.
+pub(crate) fn current_wildcard_pricing_continuation() -> Option<Arc<RequestAttribution>> {
+    CURRENT
+        .try_with(|parent| Arc::new(parent.wildcard_pricing_continuation()))
+        .ok()
 }
 
 /// Record one actual gateway-initiated embedding bridge call. This is safe

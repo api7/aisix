@@ -271,10 +271,10 @@ pub(crate) async fn realtime(
             let state2 = state.clone();
             let client2 = client.clone();
             // `on_upgrade` runs on a new Tokio task, which does not inherit
-            // the request task-local. Keep the same cell so the terminal
-            // realtime UsageEvent retains the wildcard model identity that
-            // `prepare` resolved before accepting this upgrade.
-            let attribution = crate::attribution::current_cell();
+            // the request task-local. Copy only the wildcard pricing tuple:
+            // the HTTP cell is already owned by the completed upgrade
+            // response and cannot also own the session's terminal log.
+            let attribution = crate::attribution::current_wildcard_pricing_continuation();
             // `on_upgrade` runs the session on a detached task, so the
             // request span has to be attached to the future rather than
             // inherited — without it the session's guardrail checks log

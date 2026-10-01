@@ -25,6 +25,7 @@ const LOGSTORE = "wildcard-pricing-telemetry";
 const WILDCARD_ALIAS = "openrouter/*";
 const KNOWN_MODEL = "openai/gpt-4o-mini";
 const UNKNOWN_MODEL = "unknown/provider-model";
+const PRICING_AUTHORITY_ID = "a3ebdc63-e921-4323-a75c-3b911f950046";
 
 function upstreamResponse() {
   return {
@@ -82,6 +83,7 @@ describe("wildcard pricing telemetry e2e", () => {
       provider: "openrouter",
       model_name: "*",
       provider_key_id: providerKey.id,
+      pricing_authority_id: PRICING_AUTHORITY_ID,
     });
     wildcardID = wildcard.id;
 
@@ -135,6 +137,7 @@ describe("wildcard pricing telemetry e2e", () => {
       `usage event for ${knownRequest}`,
     );
     expect(known.get("model_id")).toBe(wildcardID);
+    expect(known.get("pricing_authority_id")).toBe(PRICING_AUTHORITY_ID);
     expect(known.get("resolved_pricing_model")).toBe(KNOWN_MODEL);
     expect(known.get("prompt_tokens")).toBe("10");
     expect(known.get("completion_tokens")).toBe("5");
@@ -151,6 +154,7 @@ describe("wildcard pricing telemetry e2e", () => {
       `usage event for ${unknownRequest}`,
     );
     expect(unknown.get("model_id")).toBe(wildcardID);
+    expect(unknown.get("pricing_authority_id")).toBe(PRICING_AUTHORITY_ID);
     expect(unknown.get("resolved_pricing_model")).toBe(UNKNOWN_MODEL);
   });
 });
