@@ -1654,9 +1654,9 @@ fn raw_array_items(
     serde_json::from_str(raw.get()).ok()
 }
 
-fn raw_array_item_refs<'a>(
-    raw: &'a serde_json::value::RawValue,
-) -> Option<Vec<&'a serde_json::value::RawValue>> {
+fn raw_array_item_refs(
+    raw: &serde_json::value::RawValue,
+) -> Option<Vec<&serde_json::value::RawValue>> {
     serde_json::from_str(raw.get()).ok()
 }
 
@@ -1850,7 +1850,7 @@ fn append_chat_request_content_strings(
             Work::Content { value, depth } => {
                 let value_text = value.get().trim_start();
                 if value_text.starts_with('"') {
-                    append_raw_string_value(out, &value)?;
+                    append_raw_string_value(out, value)?;
                     continue;
                 }
                 if !value_text.starts_with('[') {
@@ -1869,7 +1869,7 @@ fn append_chat_request_content_strings(
                 value: block,
                 depth,
             } => {
-                if !raw_is_object(&block) {
+                if !raw_is_object(block) {
                     continue;
                 }
                 let block_body = block.get().as_bytes();
