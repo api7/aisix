@@ -1268,6 +1268,8 @@ mod tests {
         };
 
         let mut completed_batch = UsageEvent {
+            // NO-GUARDRAIL-CHAIN: unit-only value used to exercise the
+            // captured-identity gate, not an emitted gateway event.
             model_id: "wildcard".to_string(),
             ..Default::default()
         };
@@ -1299,6 +1301,8 @@ mod tests {
             ),
         ] {
             let mut event = UsageEvent {
+                // NO-GUARDRAIL-CHAIN: unit-only value used to exercise the
+                // captured-identity gate, not an emitted gateway event.
                 model_id: model_id.to_string(),
                 ..Default::default()
             };
