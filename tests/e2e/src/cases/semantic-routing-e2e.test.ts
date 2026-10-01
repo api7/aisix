@@ -3,6 +3,7 @@ import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -16,9 +17,10 @@ import { pickFreePort } from "../harness/ports.js";
 // embeds the latest user message, scores it against each route's example
 // embeddings, and dispatches to the best route's target — or to `default`
 // when none clears its threshold. No CP involved: real `aisix` binary +
-// etcd + a deterministic mock embedding endpoint + mock chat upstreams.
+// etcd + a deterministic local OpenAI-compatible embedding upstream + local
+// chat upstreams.
 //
-// The mock embedding endpoint maps each input string to a one-hot vector
+// The local embedding upstream maps each input string to a one-hot vector
 // by keyword, so routing decisions are fully deterministic and asserted:
 //   contains "contract"/"legal"/"nda" -> [0,0,1,0]  (legal route)
 //   contains "python"/"code"          -> [0,1,0,0]  (code route)
@@ -31,6 +33,12 @@ const CALLER_PLAINTEXT = "sk-semantic-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
+const COLD_ROUTER = "cold-batch-router";
+const COLD_FIRST_PROMPT = "please review this contract in the cold batch";
+const COLD_LATER_PROMPT = "please review this NDA after the batch is warm";
+const COLD_LEGAL_EXAMPLE = "analyze a contract for legal risk";
+const COLD_CODE_EXAMPLE = "write a Python code review";
+const COLD_TRANSLATE_EXAMPLE = "translate this document";
 
 function keywordVector(text: string): number[] {
   const t = text.toLowerCase();
@@ -43,17 +51,17 @@ function keywordVector(text: string): number[] {
 
 interface EmbeddingMock {
   baseUrl: string;
-  callCount(): number;
+  receivedInputs(): string[][];
   close(): Promise<void>;
 }
 
 /**
- * A minimal OpenAI-compatible `/v1/embeddings` mock that returns a
+ * A minimal local OpenAI-compatible `/v1/embeddings` upstream that returns a
  * deterministic keyword vector per input. When `fail` is set, every
  * embeddings call returns 500 (to exercise `on_embedding_failure`).
  */
 async function startEmbeddingMock(opts: { fail?: boolean } = {}): Promise<EmbeddingMock> {
-  let calls = 0;
+  const receivedInputs: string[][] = [];
   const server: Server = createServer((req, res) => {
     res.on("error", () => {});
     let raw = "";
@@ -64,7 +72,6 @@ async function startEmbeddingMock(opts: { fail?: boolean } = {}): Promise<Embedd
         res.end("{}");
         return;
       }
-      calls++;
       if (opts.fail) {
         res.statusCode = 500;
         res.setHeader("content-type", "application/json");
@@ -83,6 +90,7 @@ async function startEmbeddingMock(opts: { fail?: boolean } = {}): Promise<Embedd
       const inputs = Array.isArray(body.input)
         ? body.input
         : [body.input ?? ""];
+      receivedInputs.push([...inputs]);
       const data = inputs.map((text, index) => ({
         object: "embedding",
         index,
@@ -104,7 +112,7 @@ async function startEmbeddingMock(opts: { fail?: boolean } = {}): Promise<Embedd
   await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
   return {
     baseUrl: `http://127.0.0.1:${port}`,
-    callCount: () => calls,
+    receivedInputs: () => receivedInputs.map((inputs) => [...inputs]),
     async close() {
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
@@ -138,6 +146,7 @@ describe("semantic routing e2e", () => {
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
   const embedMocks: EmbeddingMock[] = [];
+  let coldEmbeddingMock: EmbeddingMock | undefined;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -146,10 +155,6 @@ describe("semantic routing e2e", () => {
 
     app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: ["*"],
-    });
 
     // Shared `prod-chat` fixture for the matched + default-fallthrough
     // tests, so neither depends on the other's execution order.
@@ -179,14 +184,44 @@ describe("semantic routing e2e", () => {
       },
     });
 
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await chat("prod-chat", "review the nda contract clauses");
-        return r.status === 200 && r.content === "served-by-legal";
-      } catch {
-        return false;
-      }
+    // Keep a separate router and local protocol embedding upstream cold until
+    // its regression test. Repeated examples prove the cold logical batch is
+    // deduplicated within and across routes; the translate example proves
+    // every route contributes. Both routes use the same target so their tied
+    // score cannot make the observed response nondeterministic.
+    const coldEmbed = await startEmbeddingMock();
+    coldEmbeddingMock = coldEmbed;
+    embedMocks.push(coldEmbed);
+    await createEmbeddingModel("cold-batch-embed", coldEmbed);
+    await seed.createModel({
+      display_name: COLD_ROUTER,
+      semantic: {
+        embedding_model: "cold-batch-embed",
+        routes: [
+          {
+            name: "legal",
+            target: "legal-model",
+            examples: [COLD_LEGAL_EXAMPLE, COLD_LEGAL_EXAMPLE, COLD_CODE_EXAMPLE],
+          },
+          {
+            name: "legal-shared-examples",
+            target: "legal-model",
+            examples: [COLD_LEGAL_EXAMPLE, COLD_CODE_EXAMPLE, COLD_TRANSLATE_EXAMPLE],
+          },
+        ],
+        default: "default-model",
+        match: { threshold: 0.5 },
+      },
     });
+
+    // Seed the caller key last: authenticating it proves every resource above
+    // has reached this DP snapshot, without exercising semantic routing.
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
+    });
+    const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
   });
 
   afterAll(async () => {
@@ -268,6 +303,47 @@ describe("semantic routing e2e", () => {
     };
   }
 
+  async function waitForModel(model: string): Promise<void> {
+    if (!app) throw new Error("app not ready");
+    const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => {
+      const response = await probe.listModels();
+      if (response.status !== 200) return false;
+      const models = (response.body as { data?: Array<{ id?: string }> }).data ?? [];
+      return models.some((candidate) => candidate.id === model);
+    });
+  }
+
+  test("lazily batches a cold prompt with distinct examples and later reuses them", async (ctx) => {
+    if (!etcdReachable || !app || !seed || !coldEmbeddingMock) {
+      ctx.skip();
+      return;
+    }
+
+    // `/v1/models` was the readiness gate, so applying the router has not
+    // called its embedding upstream.
+    expect(coldEmbeddingMock.receivedInputs()).toEqual([]);
+
+    const first = await chat(COLD_ROUTER, COLD_FIRST_PROMPT);
+    expect(first.status).toBe(200);
+    expect(first.content).toBe("served-by-legal");
+    expect(first.route).toBe("legal");
+    // This local OpenAI-compatible upstream supports an input array, making
+    // the logical batch observable as one protocol request.
+    expect(coldEmbeddingMock.receivedInputs()).toEqual([
+      [COLD_FIRST_PROMPT, COLD_LEGAL_EXAMPLE, COLD_CODE_EXAMPLE, COLD_TRANSLATE_EXAMPLE],
+    ]);
+
+    const later = await chat(COLD_ROUTER, COLD_LATER_PROMPT);
+    expect(later.status).toBe(200);
+    expect(later.content).toBe("served-by-legal");
+    expect(later.route).toBe("legal");
+    expect(coldEmbeddingMock.receivedInputs()).toEqual([
+      [COLD_FIRST_PROMPT, COLD_LEGAL_EXAMPLE, COLD_CODE_EXAMPLE, COLD_TRANSLATE_EXAMPLE],
+      [COLD_LATER_PROMPT],
+    ]);
+  });
+
   test("routes a matching prompt to its route target and sets x-aisix-route", async (ctx) => {
     if (!etcdReachable || !app || !seed) {
       ctx.skip();
@@ -326,14 +402,7 @@ describe("semantic routing e2e", () => {
       },
     });
 
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await chat("degrading-router", "anything at all");
-        return r.status === 200 && r.content === "served-by-safe-default";
-      } catch {
-        return false;
-      }
-    });
+    await waitForModel("degrading-router");
 
     const r = await chat("degrading-router", "contract review please");
     expect(r.status).toBe(200);
@@ -372,14 +441,7 @@ describe("semantic routing e2e", () => {
       },
     });
 
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await chat("strict-router", "contract review");
-        return r.status === 503;
-      } catch {
-        return false;
-      }
-    });
+    await waitForModel("strict-router");
 
     const r = await chat("strict-router", "contract review please");
     expect(r.status).toBe(503);
