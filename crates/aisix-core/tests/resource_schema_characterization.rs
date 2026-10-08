@@ -1563,6 +1563,16 @@ const UNKNOWN_FIELD_TOLERANCE: &[Probe] = &[
         pointer: "",
         document: || json!({"key": "openai/gpt-4o", "input_per_1k": 0.005, "output_per_1k": 0.015}),
     },
+    Probe {
+        resource: "team",
+        pointer: "",
+        document: || json!({"name": "Platform"}),
+    },
+    Probe {
+        resource: "user",
+        pointer: "",
+        document: || json!({"name": "Alice Example"}),
+    },
 ];
 
 /// The two resources whose write contract closes NOTHING — not the root, not

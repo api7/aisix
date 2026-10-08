@@ -348,7 +348,7 @@ fn base_event(
                     &mut event,
                     auth.jwt.as_ref(),
                     auth.key().user_id.as_deref(),
-                    auth.key().user_name.as_deref(),
+                    auth.user_name(),
                 );
             }
         }

@@ -989,7 +989,7 @@ async fn dispatch(
         request_id: client.request_id.clone(),
         api_key_id: auth.entry.id.clone(),
         user_id: auth.entry.value.user_id.clone(),
-        user_name: auth.entry.value.user_name.clone(),
+        user_name: auth.user_name().map(str::to_owned),
         jwt: auth.jwt.clone(),
         anonymous: auth.anonymous,
         client_identity,
@@ -1262,11 +1262,7 @@ async fn authenticate(
                 return Err(ProxyError::ApiKeyExpired);
             }
             state.metrics.record_auth_decision("anonymous", true, "");
-            let authed = AuthenticatedKey {
-                entry,
-                jwt: None,
-                anonymous: true,
-            };
+            let authed = AuthenticatedKey::new(snapshot, entry, None, true);
             // Verified credentials are noted inside `authenticate_token`;
             // a minted anonymous principal has to note itself, or a caller
             // that hangs up on an anonymous route files no row at all

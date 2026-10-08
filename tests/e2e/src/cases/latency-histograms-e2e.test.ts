@@ -406,7 +406,7 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
     const body = await scrape();
     for (const line of body.split("\n")) {
       if (!line.startsWith(E2E_SERIES) && !line.startsWith(TTFT_SERIES)) continue;
-      for (const highCard of ["api_key_id", "user_id", "team_id", "provider_key_id", "user_name"]) {
+      for (const highCard of ["api_key_id", "api_key_name", "user_id", "team_id", "team_name", "provider_key_id", "user_name"]) {
         expect(line, `no ${highCard} on SLO series`).not.toContain(`${highCard}="`);
       }
     }

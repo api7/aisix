@@ -220,11 +220,7 @@ pub(crate) fn anonymous_entry(
     }
     state.metrics.record_auth_decision("anonymous", true, "");
     Some(AnonymousEntry {
-        auth: crate::auth::AuthenticatedKey {
-            entry,
-            jwt: None,
-            anonymous: true,
-        },
+        auth: crate::auth::AuthenticatedKey::new(snapshot, entry, None, true),
         allowlist,
     })
 }

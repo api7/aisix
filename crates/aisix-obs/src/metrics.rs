@@ -808,34 +808,74 @@ pub enum GaugeFamily {
 // would replace. Making it sweepable means having the health tracker
 // re-publish on a snapshot change, which is a different change.
 
-fn family_key(family: GaugeFamily) -> &'static str {
-    match family {
-        GaugeFamily::Budget => "budget",
-        GaugeFamily::RatelimitRemaining => "ratelimit_remaining",
+/// One series of a retirable gauge, as it will RENDER: the registry is
+/// keyed on the metric plus the values of the labels its selection keeps
+/// (`observability.metrics.labels`), because that is the series retirement
+/// writes. Keying on the emitted label set instead would let two emitted
+/// sets that project onto one rendered series — a renamed key whose name
+/// label is not selected — retire the live one through the stale one.
+struct RetirableSeries {
+    family: GaugeFamily,
+    /// One metric per entry, so retirement writes only what was actually
+    /// registered. A family's members are not all present for every key: a
+    /// key with no budget reaches `clear_budget_gauges`, which writes the
+    /// presence flag alone, and retiring the family's full list would
+    /// CREATE the four amount series — `metrics::gauge!` registers on first
+    /// use — minting exactly the cardinality `clear_budget_gauges` avoids.
+    metric: &'static str,
+    /// The labels as emitted, before the selection projects them.
+    /// Retirement re-emits these, so the write lands on the same rendered
+    /// series whatever the selection drops.
+    labels: Vec<(&'static str, Box<str>)>,
+    /// Set once the series has been retired, so it is counted once. A
+    /// STALE series stays registered rather than dropped, because a name
+    /// can come back: a rename reverted re-enables a label set whose handle
+    /// every worker still caches, so it would never re-register, and the
+    /// next rename away from it would leave it frozen.
+    retired: bool,
+}
+
+impl RetirableSeries {
+    fn label(&self, name: &str) -> &str {
+        self.labels
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map_or("unknown", |(_, v)| v)
     }
 }
 
-struct RetirableSeries {
-    family: GaugeFamily,
-    /// Label VALUES in the family's fixed order — the same order
-    /// [`LiveGaugeSeries`] destructures them in.
-    labels: Vec<Box<str>>,
-    /// The metrics actually registered under this label set, and the only
-    /// ones retirement writes.
-    ///
-    /// A family's members are not all present for every label set: a key
-    /// with no budget reaches `clear_budget_gauges`, which writes the
-    /// presence flag alone. Retiring the family's full list would then
-    /// CREATE the four amount series — `metrics::gauge!` registers on
-    /// first use — minting exactly the per-key cardinality that
-    /// `clear_budget_gauges` is careful not to.
-    metrics: Vec<&'static str>,
+/// What the configuration says about one tracked series — the answer of
+/// the liveness predicate of [`Metrics::retire_stale_gauges`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GaugeLiveness {
+    /// It still describes the configuration exactly.
+    Live,
+    /// Its resource exists but no longer matches — a rename or a rebind.
+    /// Retired, and kept watching: the same values can come back.
+    Stale,
+    /// Its resource is gone. Retired and forgotten.
+    Gone,
 }
 
-/// One live label set, handed to the liveness predicate of
+/// `true` is [`GaugeLiveness::Live`], `false` is [`GaugeLiveness::Gone`].
+impl From<bool> for GaugeLiveness {
+    fn from(live: bool) -> Self {
+        if live {
+            Self::Live
+        } else {
+            Self::Gone
+        }
+    }
+}
+
+/// One live series, handed to the liveness predicate of
 /// [`Metrics::retire_stale_gauges`]. Variants carry named fields rather
 /// than a slice so a caller cannot silently compare the wrong label
 /// against the wrong resource.
+///
+/// A name label is `None` when the metric's label selection does not keep
+/// it: the rendered series does not carry it, so it cannot make that series
+/// stale, and the predicate must not judge it.
 #[derive(Debug, Clone, Copy)]
 pub enum LiveGaugeSeries<'a> {
     Budget {
@@ -843,6 +883,8 @@ pub enum LiveGaugeSeries<'a> {
         team_id: &'a str,
         user_id: &'a str,
         user_name: &'a str,
+        api_key_name: Option<&'a str>,
+        team_name: Option<&'a str>,
     },
     RatelimitRemaining {
         api_key_id: &'a str,
@@ -850,6 +892,7 @@ pub enum LiveGaugeSeries<'a> {
         /// sent, not a resolved name, so a liveness check must not try to
         /// look it up — see the emit site's note.
         model: &'a str,
+        api_key_name: Option<&'a str>,
     },
 }
 
@@ -869,8 +912,9 @@ struct ConfigLabelState {
 const WORKER_CACHE_CAPACITY: usize = 1024;
 
 /// Cap on the retirable-series registry — the process-wide count of
-/// distinct label sets across the gauge families that can outlive what
-/// they name.
+/// distinct rendered series across the gauge families that can outlive
+/// what they name. One entry per METRIC, so an api key with a budget
+/// takes five.
 ///
 /// The bound that makes one number safe for all of them is that every
 /// dimension is CONFIGURED: api keys, and models collapsed to the
@@ -879,7 +923,7 @@ const WORKER_CACHE_CAPACITY: usize = 1024;
 /// to mint entries per request would fill the cap and silently stop every
 /// other family from being tracked, which is exactly the failure this
 /// whole mechanism exists to prevent.
-const RETIRABLE_CAPACITY: usize = 16_384;
+const RETIRABLE_CAPACITY: usize = 65_536;
 
 /// Separator joining label values into a worker-cache key — a control
 /// byte that no bounded label vocabulary contains. A value that DOES
@@ -1294,35 +1338,33 @@ impl Metrics {
         });
     }
 
-    /// Remember one label set of a retirable gauge family.
+    /// Remember one series of a retirable gauge family.
     ///
     /// Called from the REGISTRATION path only — a worker-cache miss — so
     /// the steady-state emit never takes this lock. Re-registration (a
-    /// second worker, or a cache eviction) is an idempotent no-op.
-    fn track_retirable(&self, family: GaugeFamily, metric: &'static str, labels: &[&str]) {
-        let mut key = String::with_capacity(64);
-        key.push_str(family_key(family));
-        for value in labels {
-            key.push(WORKER_KEY_SEP);
-            key.push_str(value);
-        }
+    /// second worker, a cache eviction, or another emitted label set that
+    /// renders as the same series) is an idempotent no-op.
+    fn track_retirable(
+        &self,
+        family: GaugeFamily,
+        metric: &'static str,
+        labels: &[(&'static str, &str)],
+    ) {
+        let key = self.retirable_key(metric, |name| {
+            labels
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map_or("unknown", |(_, v)| *v)
+        });
         let mut map = self.inner.retirable.lock().expect("retirable registry");
-        if let Some(entry) = map.get_mut(key.as_str()) {
-            // A label set is registered once per metric per worker, and the
-            // members appear at different times — a key gets its presence
-            // flag on the request that finds no budget and its amounts only
-            // once one exists. So an existing entry still has to learn about
-            // a metric it has not seen.
-            if !entry.metrics.contains(&metric) {
-                entry.metrics.push(metric);
-            }
+        if map.contains_key(key.as_str()) {
             return;
         }
         // Safety valve, same reasoning as `WORKER_CACHE_CAPACITY`: these
-        // label sets are bounded by the configured resources, but an
-        // unforeseen unbounded dimension must not pin memory here. Losing
-        // a registration only means that series is not retirable — never
-        // a wrong value.
+        // series are bounded by the configured resources, but an unforeseen
+        // unbounded dimension must not pin memory here. Losing a
+        // registration only means that series is not retirable — never a
+        // wrong value.
         if map.len() >= RETIRABLE_CAPACITY {
             return;
         }
@@ -1330,16 +1372,32 @@ impl Metrics {
             Box::from(key.as_str()),
             RetirableSeries {
                 family,
-                labels: labels.iter().map(|v| Box::from(*v)).collect(),
-                metrics: vec![metric],
+                metric,
+                labels: labels.iter().map(|(n, v)| (*n, Box::from(*v))).collect(),
+                retired: false,
             },
         );
     }
 
-    /// Retire the gauge series whose label set no longer describes
-    /// anything, returning how many were retired this pass.
+    /// The registry key of one rendered series: the metric and the values
+    /// of the labels its selection keeps, in selection order. `env_id` is
+    /// constant per process and stays out of it.
+    fn retirable_key<'v>(&self, metric: &str, value: impl Fn(&str) -> &'v str) -> String {
+        let mut key = String::with_capacity(64);
+        key.push_str(metric);
+        for name in self.inner.recorder.selected_labels(metric) {
+            if name != "env_id" {
+                key.push(WORKER_KEY_SEP);
+                key.push_str(value(name));
+            }
+        }
+        key
+    }
+
+    /// Retire the gauge series that no longer describe anything, returning
+    /// how many were retired this pass.
     ///
-    /// `is_live` answers, for one label set, "does the configuration
+    /// `is_live` answers, for one rendered series, "does the configuration
     /// still contain this exact thing?" — the caller holds the snapshot,
     /// so this crate needs to know nothing about resource lifecycles.
     ///
@@ -1357,109 +1415,83 @@ impl Metrics {
     /// presence flag whose documented cleared value is `0`, and that is
     /// what the guard `details_present == 1` is written against.
     ///
-    /// A retired label set is DROPPED from the registry, so it is marked
-    /// exactly once rather than re-marked every pass. It is not re-tracked
-    /// by a later write either — `with_worker_handle` returns straight out
-    /// of the thread-local cache on a hit and never reaches the
-    /// registration path. That costs nothing in practice: these ids are
-    /// uuids, so an identical label set coming back would need a deleted id
-    /// to be reissued, and the shapes that DO recur (a rebind, a rename)
-    /// produce a different label set, which registers on its own.
-    pub fn retire_stale_gauges(&self, is_live: impl Fn(LiveGaugeSeries<'_>) -> bool) -> usize {
+    /// A retired series is counted once. A [`GaugeLiveness::Gone`] one is
+    /// dropped from the registry. A [`GaugeLiveness::Stale`] one stays
+    /// registered and is re-marked on every sweep while it stays stale:
+    /// a request that resolved the old names before the change can still
+    /// write the old series after it was retired, and a name can come back
+    /// — a rename reverted — and go stale a second time.
+    pub fn retire_stale_gauges<L: Into<GaugeLiveness>>(
+        &self,
+        is_live: impl Fn(LiveGaugeSeries<'_>) -> L,
+    ) -> usize {
         // Take the entries out under the lock and release it before doing
         // any work: `is_live` reads the caller's snapshot and the retire
         // path registers handles on the recorder, and holding this mutex
         // across either puts the sweeper in the request path's way — the
         // registration side takes the same lock on a worker-cache miss.
-        let taken: Vec<RetirableSeries> = {
+        let taken: Vec<(Box<str>, RetirableSeries)> = {
             let mut map = self.inner.retirable.lock().expect("retirable registry");
-            map.drain().map(|(_, v)| v).collect()
+            map.drain().collect()
         };
         let mut retired = 0usize;
-        let mut keep: Vec<RetirableSeries> = Vec::with_capacity(taken.len());
+        let mut keep = Vec::with_capacity(taken.len());
         metrics::with_local_recorder(&self.inner.recorder, || {
-            for series in taken {
-                let l: Vec<&str> = series.labels.iter().map(|v| &**v).collect();
-                let view = match (series.family, l.as_slice()) {
-                    (GaugeFamily::Budget, [api_key_id, team_id, user_id, user_name]) => {
-                        LiveGaugeSeries::Budget {
-                            api_key_id,
-                            team_id,
-                            user_id,
-                            user_name,
-                        }
-                    }
-                    (GaugeFamily::RatelimitRemaining, [api_key_id, model]) => {
-                        LiveGaugeSeries::RatelimitRemaining { api_key_id, model }
-                    }
-                    // Arity is fixed per family at the registration sites;
-                    // a mismatch means a family gained a label without its
-                    // view. Keep rather than retire on a guess.
-                    _ => {
-                        keep.push(series);
-                        continue;
-                    }
+            for (key, mut series) in taken {
+                let selected = self.inner.recorder.selected_labels(series.metric);
+                let name = |label: &str| {
+                    selected
+                        .iter()
+                        .any(|s| s == label)
+                        .then(|| series.label(label))
                 };
-                if is_live(view) {
-                    keep.push(series);
+                let view = match series.family {
+                    GaugeFamily::Budget => LiveGaugeSeries::Budget {
+                        api_key_id: series.label("api_key_id"),
+                        team_id: series.label("team_id"),
+                        user_id: series.label("user_id"),
+                        user_name: series.label("user_name"),
+                        api_key_name: name("api_key_name"),
+                        team_name: name("team_name"),
+                    },
+                    GaugeFamily::RatelimitRemaining => LiveGaugeSeries::RatelimitRemaining {
+                        api_key_id: series.label("api_key_id"),
+                        model: series.label("model"),
+                        api_key_name: name("api_key_name"),
+                    },
+                };
+                let liveness = is_live(view).into();
+                if liveness == GaugeLiveness::Live {
+                    series.retired = false;
+                    keep.push((key, series));
                     continue;
                 }
-                retired += 1;
-                // Only what this label set actually registered. Writing a
-                // family's full list would CREATE the members it never had:
-                // `metrics::gauge!` registers on first use, so retiring a
-                // budgetless key would mint the four amount series that
-                // `clear_budget_gauges` deliberately does not.
-                for metric in &series.metrics {
-                    // The presence flag is boolean and its documented
-                    // cleared value is 0; everything else carries a
-                    // quantity and retires to NaN.
-                    let value = if *metric == M_BUDGET_DETAILS_PRESENT {
-                        0.0
-                    } else {
-                        f64::NAN
-                    };
-                    match view {
-                        LiveGaugeSeries::Budget {
-                            api_key_id,
-                            team_id,
-                            user_id,
-                            user_name,
-                        } => metrics::gauge!(
-                            *metric,
-                            "api_key_id" => api_key_id.to_string(),
-                            "team_id" => team_id.to_string(),
-                            "user_id" => user_id.to_string(),
-                            "user_name" => user_name.to_string(),
-                        )
-                        .set(value),
-                        LiveGaugeSeries::RatelimitRemaining { api_key_id, model } => {
-                            metrics::gauge!(
-                                *metric,
-                                "api_key_id" => api_key_id.to_string(),
-                                "model" => model.to_string(),
-                            )
-                            .set(value)
-                        }
-                    }
+                if !series.retired {
+                    retired += 1;
+                }
+                // The presence flag is boolean and its documented cleared
+                // value is 0; everything else carries a quantity and
+                // retires to NaN.
+                let value = if series.metric == M_BUDGET_DETAILS_PRESENT {
+                    0.0
+                } else {
+                    f64::NAN
+                };
+                let labels: Vec<metrics::Label> = series
+                    .labels
+                    .iter()
+                    .map(|(n, v)| metrics::Label::new(*n, v.to_string()))
+                    .collect();
+                metrics::gauge!(series.metric, labels).set(value);
+                series.retired = true;
+                if liveness == GaugeLiveness::Stale {
+                    keep.push((key, series));
                 }
             }
         });
-        // A retired label set is dropped: nothing writes it any more, so
-        // re-marking it every tick is pure waste, and keeping it would let
-        // dead entries fill `RETIRABLE_CAPACITY` and silently stop NEW
-        // series from ever being tracked — which is the bug this exists to
-        // fix. See `retire_stale_gauges` for why not re-tracking a revived
-        // label set costs nothing.
         let mut map = self.inner.retirable.lock().expect("retirable registry");
-        for series in keep {
-            let mut key = String::with_capacity(64);
-            key.push_str(family_key(series.family));
-            for value in &series.labels {
-                key.push(WORKER_KEY_SEP);
-                key.push_str(value);
-            }
-            map.entry(Box::from(key.as_str())).or_insert(series);
+        for (key, series) in keep {
+            map.entry(key).or_insert(series);
         }
         retired
     }
@@ -1775,8 +1807,17 @@ impl Metrics {
     /// by the configured policy count) and is empty elsewhere.
     /// Recorded at the quota gate, the one point every endpoint funnels
     /// through (AISIX-Cloud#892).
-    pub fn record_ratelimit_rejection(&self, scope: &str, layer: &str, policy_id: Option<&str>) {
-        let policy_id = policy_id.unwrap_or_default();
+    ///
+    /// `policy` is the offending policy's `(id, name)` pair. Both labels
+    /// carry the same empty placeholder when there is none, so the name
+    /// is never a value its id could not have produced.
+    pub fn record_ratelimit_rejection(
+        &self,
+        scope: &str,
+        layer: &str,
+        policy: Option<(&str, &str)>,
+    ) {
+        let (policy_id, policy_name) = policy.unwrap_or_default();
         self.cached_counter(
             M_RATELIMIT_REJECTIONS,
             1,
@@ -1784,6 +1825,7 @@ impl Metrics {
                 k.label(scope);
                 k.label(layer);
                 k.label(policy_id);
+                k.label(policy_name);
             },
             || {
                 metrics::counter!(
@@ -1791,6 +1833,7 @@ impl Metrics {
                     "scope" => scope.to_string(),
                     "layer" => layer.to_string(),
                     "policy_id" => policy_id.to_string(),
+                    "policy_name" => policy_name.to_string(),
                 )
             },
         );
@@ -2174,7 +2217,9 @@ impl Metrics {
                 k.label(labels.provider_key_id);
                 k.label(labels.provider_key_name);
                 k.label(labels.api_key_id);
+                k.label(labels.api_key_name);
                 k.label(labels.team_id);
+                k.label(labels.team_name);
                 k.label(labels.user_id);
                 k.label(labels.user_name);
                 k.label_bool(labels.stream);
@@ -2200,7 +2245,9 @@ impl Metrics {
                 k.label(labels.provider_key_id);
                 k.label(labels.provider_key_name);
                 k.label(labels.api_key_id);
+                k.label(labels.api_key_name);
                 k.label(labels.team_id);
+                k.label(labels.team_name);
                 k.label(labels.user_id);
                 k.label(labels.user_name);
             },
@@ -2436,7 +2483,9 @@ impl Metrics {
                 k.label(labels.provider_key_id);
                 k.label(labels.provider_key_name);
                 k.label(labels.api_key_id);
+                k.label(labels.api_key_name);
                 k.label(labels.team_id);
+                k.label(labels.team_name);
                 k.label(labels.user_id);
                 k.label(labels.user_name);
             },
@@ -2453,7 +2502,9 @@ impl Metrics {
                     "provider_key_id" => labels.provider_key_id.to_string(),
                     "provider_key_name" => labels.provider_key_name.to_string(),
                     "api_key_id" => labels.api_key_id.to_string(),
+                    "api_key_name" => labels.api_key_name.to_string(),
                     "team_id" => labels.team_id.to_string(),
+                    "team_name" => labels.team_name.to_string(),
                     "user_id" => labels.user_id.to_string(),
                     "user_name" => labels.user_name.to_string(),
                 )
@@ -2531,6 +2582,7 @@ impl Metrics {
                 k.label(labels.model);
                 k.label(labels.upstream_model);
                 k.label(labels.provider_key_id);
+                k.label(labels.provider_key_name);
             },
             || {
                 metrics::counter!(
@@ -2539,6 +2591,7 @@ impl Metrics {
                     "model" => labels.model.to_string(),
                     "upstream_model" => labels.upstream_model.to_string(),
                     "provider_key_id" => labels.provider_key_id.to_string(),
+                    "provider_key_name" => labels.provider_key_name.to_string(),
                 )
             },
         );
@@ -2606,6 +2659,7 @@ impl Metrics {
     pub fn set_rate_limit_remaining(
         &self,
         api_key_id: &str,
+        api_key_name: &str,
         model: &str,
         requests: Option<u64>,
         tokens: Option<u64>,
@@ -2616,17 +2670,23 @@ impl Metrics {
                 value as f64,
                 |k| {
                     k.label(api_key_id);
+                    k.label(api_key_name);
                     k.label(model);
                 },
                 || {
                     self.track_retirable(
                         GaugeFamily::RatelimitRemaining,
                         M_RATELIMIT_REMAINING_REQUESTS,
-                        &[api_key_id, model],
+                        &[
+                            ("api_key_id", api_key_id),
+                            ("api_key_name", api_key_name),
+                            ("model", model),
+                        ],
                     );
                     metrics::gauge!(
                         M_RATELIMIT_REMAINING_REQUESTS,
                         "api_key_id" => api_key_id.to_string(),
+                        "api_key_name" => api_key_name.to_string(),
                         "model" => model.to_string(),
                     )
                 },
@@ -2638,17 +2698,23 @@ impl Metrics {
                 value as f64,
                 |k| {
                     k.label(api_key_id);
+                    k.label(api_key_name);
                     k.label(model);
                 },
                 || {
                     self.track_retirable(
                         GaugeFamily::RatelimitRemaining,
                         M_RATELIMIT_REMAINING_TOKENS,
-                        &[api_key_id, model],
+                        &[
+                            ("api_key_id", api_key_id),
+                            ("api_key_name", api_key_name),
+                            ("model", model),
+                        ],
                     );
                     metrics::gauge!(
                         M_RATELIMIT_REMAINING_TOKENS,
                         "api_key_id" => api_key_id.to_string(),
+                        "api_key_name" => api_key_name.to_string(),
                         "model" => model.to_string(),
                     )
                 },
@@ -2663,7 +2729,9 @@ impl Metrics {
             value,
             |k| {
                 k.label(labels.api_key_id);
+                k.label(labels.api_key_name);
                 k.label(labels.team_id);
+                k.label(labels.team_name);
                 k.label(labels.user_id);
                 k.label(labels.user_name);
             },
@@ -2672,16 +2740,20 @@ impl Metrics {
                     GaugeFamily::Budget,
                     metric,
                     &[
-                        labels.api_key_id,
-                        labels.team_id,
-                        labels.user_id,
-                        labels.user_name,
+                        ("api_key_id", labels.api_key_id),
+                        ("api_key_name", labels.api_key_name),
+                        ("team_id", labels.team_id),
+                        ("team_name", labels.team_name),
+                        ("user_id", labels.user_id),
+                        ("user_name", labels.user_name),
                     ],
                 );
                 metrics::gauge!(
                     metric,
                     "api_key_id" => labels.api_key_id.to_string(),
+                    "api_key_name" => labels.api_key_name.to_string(),
                     "team_id" => labels.team_id.to_string(),
+                    "team_name" => labels.team_name.to_string(),
                     "user_id" => labels.user_id.to_string(),
                     "user_name" => labels.user_name.to_string(),
                 )
@@ -2947,7 +3019,9 @@ impl Metrics {
                         "provider_key_id" => labels.details.provider_key_id,
                         "provider_key_name" => labels.details.provider_key_name,
                         "api_key_id" => labels.details.api_key_id,
+                        "api_key_name" => labels.details.api_key_name,
                         "team_id" => labels.details.team_id,
+                        "team_name" => labels.details.team_name,
                         "user_id" => labels.details.user_id,
                         "user_name" => labels.details.user_name,
                         "side" => side,
@@ -2972,7 +3046,9 @@ impl Metrics {
                     "provider_key_id" => labels.details.provider_key_id.to_string(),
                     "provider_key_name" => labels.details.provider_key_name.to_string(),
                     "api_key_id" => labels.details.api_key_id.to_string(),
+                    "api_key_name" => labels.details.api_key_name.to_string(),
                     "team_id" => labels.details.team_id.to_string(),
+                    "team_name" => labels.details.team_name.to_string(),
                     "user_id" => labels.details.user_id.to_string(),
                     "user_name" => labels.details.user_name.to_string(),
                 )
@@ -3289,7 +3365,12 @@ pub struct RequestLabels<'a> {
     /// so it adds no new series; `"unknown"` when unresolved.
     pub provider_key_name: &'a str,
     pub api_key_id: &'a str,
+    /// The API key's display name; `"unknown"` when it has none.
+    pub api_key_name: &'a str,
     pub team_id: &'a str,
+    /// The display name of the team `team_id` names, resolved from its
+    /// `teams` document; `"unknown"` when unresolved.
+    pub team_name: &'a str,
     pub user_id: &'a str,
     /// Readable user display name (#890 req-3). 1:1 with `user_id`;
     /// `"unknown"` until cp-api syncs it onto the api-key config.
@@ -3321,7 +3402,9 @@ impl Default for RequestLabels<'_> {
             provider_key_id: "unknown",
             provider_key_name: "unknown",
             api_key_id: "unknown",
+            api_key_name: "unknown",
             team_id: "unknown",
+            team_name: "unknown",
             user_id: "unknown",
             user_name: "unknown",
             stream: false,
@@ -3345,7 +3428,9 @@ impl RequestLabels<'_> {
             "provider_key_id" => self.provider_key_id.to_string(),
             "provider_key_name" => self.provider_key_name.to_string(),
             "api_key_id" => self.api_key_id.to_string(),
+            "api_key_name" => self.api_key_name.to_string(),
             "team_id" => self.team_id.to_string(),
+            "team_name" => self.team_name.to_string(),
             "user_id" => self.user_id.to_string(),
             "user_name" => self.user_name.to_string(),
             "stream" => bool_str(self.stream),
@@ -3367,7 +3452,9 @@ impl RequestLabels<'_> {
             "provider_key_id" => self.provider_key_id.to_string(),
             "provider_key_name" => self.provider_key_name.to_string(),
             "api_key_id" => self.api_key_id.to_string(),
+            "api_key_name" => self.api_key_name.to_string(),
             "team_id" => self.team_id.to_string(),
+            "team_name" => self.team_name.to_string(),
             "user_id" => self.user_id.to_string(),
             "user_name" => self.user_name.to_string(),
             "stream" => bool_str(self.stream),
@@ -3405,7 +3492,12 @@ pub struct UsageLabels<'a> {
     /// Readable provider-key name (#890 req-3). 1:1 with `provider_key_id`.
     pub provider_key_name: &'a str,
     pub api_key_id: &'a str,
+    /// The API key's display name; `"unknown"` when it has none.
+    pub api_key_name: &'a str,
     pub team_id: &'a str,
+    /// The display name of the team `team_id` names, resolved from its
+    /// `teams` document; `"unknown"` when unresolved.
+    pub team_name: &'a str,
     pub user_id: &'a str,
     /// Readable user display name (#890 req-3). 1:1 with `user_id`.
     pub user_name: &'a str,
@@ -3423,7 +3515,9 @@ impl Default for UsageLabels<'_> {
             provider_key_id: "unknown",
             provider_key_name: "unknown",
             api_key_id: "unknown",
+            api_key_name: "unknown",
             team_id: "unknown",
+            team_name: "unknown",
             user_id: "unknown",
             user_name: "unknown",
         }
@@ -3443,7 +3537,9 @@ impl UsageLabels<'_> {
             "provider_key_id" => self.provider_key_id.to_string(),
             "provider_key_name" => self.provider_key_name.to_string(),
             "api_key_id" => self.api_key_id.to_string(),
+            "api_key_name" => self.api_key_name.to_string(),
             "team_id" => self.team_id.to_string(),
+            "team_name" => self.team_name.to_string(),
             "user_id" => self.user_id.to_string(),
             "user_name" => self.user_name.to_string(),
         )
@@ -3572,6 +3668,11 @@ pub struct DeploymentLabels<'a> {
     pub model: &'a str,
     pub upstream_model: &'a str,
     pub provider_key_id: &'a str,
+    /// Display name of the ProviderKey `provider_key_id` names. Carried by
+    /// the deployment counters only: `aisix_deployment_state` is written on
+    /// a health transition alone, so a renamed key would leave that gauge
+    /// reporting the old name until the next flip.
+    pub provider_key_name: &'a str,
 }
 
 impl Default for DeploymentLabels<'_> {
@@ -3581,6 +3682,7 @@ impl Default for DeploymentLabels<'_> {
             model: "unknown",
             upstream_model: "unknown",
             provider_key_id: "unknown",
+            provider_key_name: "unknown",
         }
     }
 }
@@ -3605,23 +3707,22 @@ impl DeploymentState {
 #[derive(Debug, Clone, Copy)]
 pub struct BudgetLabels<'a> {
     pub api_key_id: &'a str,
+    /// The API key's display name; `"unknown"` when it has none.
+    pub api_key_name: &'a str,
     pub team_id: &'a str,
+    /// The display name of the team `team_id` names, resolved from its
+    /// `teams` document; `"unknown"` when unresolved.
+    pub team_name: &'a str,
     pub user_id: &'a str,
     /// Readable display name of the member `user_id` names
-    /// (AISIX-Cloud#1455), read off the same ApiKey row so the name is
-    /// determined by the id and the pair costs no series over `user_id`
+    /// (AISIX-Cloud#1455), so the pair costs no series over `user_id`
     /// alone. `unknown` whenever `user_id` is.
     ///
     /// These are GAUGES, and this recorder registers no idle timeout, so
-    /// a label set that stops being written stays at its last value: if a
-    /// rename ever does reach the ApiKey row (see [`UsageEventLabels`] —
-    /// it takes a later write of that key), the pre-rename sample stays
-    /// behind, and a `sum` that does not group by the member counts both.
-    /// That is true of every label on this family that can change under a
-    /// fixed `api_key_id`: rebinding a key's team or owner strands its
-    /// samples the same way. `clear_budget_gauges` does not help — it
-    /// zeroes `details_present` for the label set it is handed, which is
-    /// the new one.
+    /// a label set that stops being written stays at its last value. Every
+    /// label here can change under a fixed `api_key_id` — a rebind, or a
+    /// rename of the key, its team or its member — and the series the
+    /// change leaves behind is retired by [`Metrics::retire_stale_gauges`].
     pub user_name: &'a str,
 }
 
@@ -3629,7 +3730,9 @@ impl Default for BudgetLabels<'_> {
     fn default() -> Self {
         Self {
             api_key_id: "unknown",
+            api_key_name: "unknown",
             team_id: "unknown",
+            team_name: "unknown",
             user_id: "unknown",
             user_name: "unknown",
         }
@@ -4183,7 +4286,7 @@ mod tests {
         let m = Metrics::new(false);
         m.record_ratelimit_rejection("requests", "api_key", None);
         m.record_ratelimit_rejection("requests", "api_key", None);
-        m.record_ratelimit_rejection("requests", "policy", Some("pol-1"));
+        m.record_ratelimit_rejection("requests", "policy", Some(("pol-1", "Policy One")));
         let rendered = m.render();
         assert!(rendered.contains(M_RATELIMIT_REJECTIONS));
         assert!(rendered.contains("scope=\"requests\""));
@@ -4326,7 +4429,9 @@ mod tests {
             provider_key_id: "pk-1",
             provider_key_name: "my-openai-key",
             api_key_id: "ak-1",
+            api_key_name: "unknown",
             team_id: "team-1",
+            team_name: "unknown",
             user_id: "user-1",
             user_name: "alice",
             stream: true,
@@ -4344,7 +4449,9 @@ mod tests {
             provider_key_id: "pk-1",
             provider_key_name: "my-openai-key",
             api_key_id: "ak-1",
+            api_key_name: "unknown",
             team_id: "team-1",
+            team_name: "unknown",
             user_id: "user-1",
             user_name: "alice",
         };
@@ -4663,6 +4770,7 @@ mod tests {
             model: "gpt",
             upstream_model: "gpt-4o",
             provider_key_id: "pk-a",
+            provider_key_name: "unknown",
         };
         // Differs ONLY in provider_key_id — the label a key-builder
         // regression is most likely to drop.
@@ -4748,13 +4856,17 @@ mod tests {
         let metrics = Metrics::new(false);
         let key_a = BudgetLabels {
             api_key_id: "ak-a",
+            api_key_name: "unknown",
             team_id: "team-a",
+            team_name: "unknown",
             user_id: "user-a",
             user_name: "alice",
         };
         let key_b = BudgetLabels {
             api_key_id: "ak-b",
+            api_key_name: "unknown",
             team_id: "team-b",
+            team_name: "unknown",
             user_id: "user-b",
             user_name: "bob",
         };
@@ -5116,7 +5228,9 @@ mod tests {
         let m = Metrics::new(false);
         m.clear_budget_gauges(BudgetLabels {
             api_key_id: "ak-1",
+            api_key_name: "unknown",
             team_id: "t",
+            team_name: "unknown",
             user_id: "u",
             user_name: "alice",
         });
@@ -5152,7 +5266,9 @@ mod tests {
         let m = Metrics::new(false);
         let labels = BudgetLabels {
             api_key_id: "ak-1",
+            api_key_name: "unknown",
             team_id: "t",
+            team_name: "unknown",
             user_id: "u",
             user_name: "alice",
         };
@@ -5191,7 +5307,9 @@ mod tests {
         let m = Metrics::new(false);
         let labels = BudgetLabels {
             api_key_id: "ak-1",
+            api_key_name: "unknown",
             team_id: "t",
+            team_name: "unknown",
             user_id: "u",
             user_name: "alice",
         };
@@ -5203,7 +5321,8 @@ mod tests {
                 ..BudgetGauges::default()
             },
         );
-        assert_eq!(m.retire_stale_gauges(|_| false), 1);
+        // The flag and the amount: both registered, both retire.
+        assert_eq!(m.retire_stale_gauges(|_| false), 2);
 
         let rendered = m.render();
         assert!(
@@ -5229,7 +5348,9 @@ mod tests {
         let m = Metrics::new(false);
         let labels = BudgetLabels {
             api_key_id: "ak-gone",
+            api_key_name: "unknown",
             team_id: "t",
+            team_name: "unknown",
             user_id: "u",
             user_name: "alice",
         };
@@ -5244,8 +5365,8 @@ mod tests {
         );
         assert!(m.render().contains("aisix_budget_details_present"));
 
-        // Nothing is live: the key was deleted.
-        assert_eq!(m.retire_stale_gauges(|_| false), 1);
+        // Nothing is live: the key was deleted. One per registered metric.
+        assert_eq!(m.retire_stale_gauges(|_| false), 5);
 
         let rendered = m.render();
         let value = |metric: &str| -> String {
@@ -5278,8 +5399,8 @@ mod tests {
     #[test]
     fn retirement_never_asserts_a_meaningful_zero() {
         let m = Metrics::new(false);
-        m.set_rate_limit_remaining("ak-gone", "gpt-4o", Some(7), Some(900));
-        assert_eq!(m.retire_stale_gauges(|_| false), 1);
+        m.set_rate_limit_remaining("ak-gone", "unknown", "gpt-4o", Some(7), Some(900));
+        assert_eq!(m.retire_stale_gauges(|_| false), 2);
 
         let rendered = m.render();
         for metric in [M_RATELIMIT_REMAINING_REQUESTS, M_RATELIMIT_REMAINING_TOKENS] {
@@ -5306,6 +5427,7 @@ mod tests {
                 model: "gpt-4o",
                 upstream_model: "gpt-4o",
                 provider_key_id: "pk-gone",
+                provider_key_name: "unknown",
             },
             DeploymentState::Down,
         );
@@ -5332,7 +5454,9 @@ mod tests {
         };
         let before = BudgetLabels {
             api_key_id: "ak-1",
+            api_key_name: "unknown",
             team_id: "team-old",
+            team_name: "unknown",
             user_id: "u",
             user_name: "alice",
         };
@@ -5348,7 +5472,8 @@ mod tests {
             LiveGaugeSeries::Budget { team_id, .. } => team_id == "team-new",
             _ => true,
         });
-        assert_eq!(retired, 1);
+        // The old label set's flag and amount.
+        assert_eq!(retired, 2);
 
         let rendered = m.render();
         let line = |team: &str| -> String {
@@ -5371,7 +5496,9 @@ mod tests {
         m.set_budget_gauges(
             BudgetLabels {
                 api_key_id: "ak-live",
+                api_key_name: "unknown",
                 team_id: "t",
+                team_name: "unknown",
                 user_id: "u",
                 user_name: "alice",
             },
@@ -5391,17 +5518,16 @@ mod tests {
         );
     }
 
-    /// A retired label set is DROPPED from the registry, not kept and
-    /// re-marked forever. Keeping it would let dead entries fill
-    /// `RETIRABLE_CAPACITY` over a long-running process and silently stop
-    /// new series from being tracked at all — the very bug this exists to
-    /// fix — and would re-emit the same NaN on every tick.
+    /// A retired series is marked exactly once: a second sweep that still
+    /// finds it stale neither counts nor re-writes it.
     #[test]
-    fn a_retired_series_is_dropped_from_the_registry() {
+    fn a_retired_series_is_marked_once() {
         let m = Metrics::new(false);
         let labels = BudgetLabels {
             api_key_id: "ak-1",
+            api_key_name: "unknown",
             team_id: "t",
+            team_name: "unknown",
             user_id: "u",
             user_name: "alice",
         };
@@ -5412,16 +5538,12 @@ mod tests {
                 ..BudgetGauges::default()
             },
         );
-        assert_eq!(m.retire_stale_gauges(|_| false), 1);
-        // Nothing left to retire: the entry is gone, so the sweep does no
-        // work on it again.
+        assert_eq!(m.retire_stale_gauges(|_| false), 2);
         assert_eq!(m.retire_stale_gauges(|_| false), 0);
     }
 
     /// Rebinding produces a NEW label set, which registers and is
-    /// retirable in its own right — so dropping the old entry does not
-    /// leave the key untracked. (An identical label set coming back would
-    /// need a deleted id to be reissued, which uuids do not do.)
+    /// retirable in its own right.
     #[test]
     fn the_label_set_a_rebind_creates_is_tracked_too() {
         let m = Metrics::new(false);
@@ -5431,12 +5553,14 @@ mod tests {
         };
         let before = BudgetLabels {
             api_key_id: "ak-1",
+            api_key_name: "unknown",
             team_id: "team-old",
+            team_name: "unknown",
             user_id: "u",
             user_name: "alice",
         };
         m.set_budget_gauges(before, spend(40.0));
-        assert_eq!(m.retire_stale_gauges(|_| false), 1);
+        assert_eq!(m.retire_stale_gauges(|_| false), 2);
 
         let after = BudgetLabels {
             team_id: "team-new",
@@ -5445,8 +5569,252 @@ mod tests {
         m.set_budget_gauges(after, spend(45.0));
         assert_eq!(
             m.retire_stale_gauges(|_| false),
-            1,
+            2,
             "the post-rebind label set must be tracked on its own registration"
+        );
+    }
+
+    /// Budget gauges with the caller name labels selected, plus the value
+    /// each rendered `aisix_budget_spent_usd` series carries, by team name.
+    fn named_budget_metrics() -> Metrics {
+        let selected: Vec<String> = [
+            "api_key_id",
+            "api_key_name",
+            "team_id",
+            "team_name",
+            "user_id",
+            "user_name",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let config = [M_BUDGET_SPENT_USD, M_BUDGET_DETAILS_PRESENT]
+            .map(|m| (m.to_owned(), selected.clone()))
+            .into_iter()
+            .collect();
+        Metrics::new_with_labels("env", &HistogramBuckets::default(), &config).unwrap()
+    }
+
+    fn spent_by_team(m: &Metrics) -> Vec<(String, String)> {
+        let rendered = m.render();
+        let mut out: Vec<(String, String)> = series_lines(&rendered, M_BUDGET_SPENT_USD)
+            .into_iter()
+            .map(|l| {
+                let team = l
+                    .split("team_name=\"")
+                    .nth(1)
+                    .and_then(|r| r.split('"').next())
+                    .unwrap_or("<none>")
+                    .to_owned();
+                (team, l.rsplit(' ').next().unwrap().to_owned())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn named(team_name: &str) -> BudgetLabels<'_> {
+        BudgetLabels {
+            api_key_id: "ak-1",
+            api_key_name: "Billing key",
+            team_id: "t-1",
+            team_name,
+            user_id: "u-1",
+            user_name: "alice",
+        }
+    }
+
+    fn spend(v: f64) -> BudgetGauges {
+        BudgetGauges {
+            spent_usd: Some(v),
+            ..BudgetGauges::default()
+        }
+    }
+
+    fn live_team(want: &'static str) -> impl Fn(LiveGaugeSeries<'_>) -> GaugeLiveness {
+        move |series| match series {
+            LiveGaugeSeries::Budget { team_name, .. } if team_name.is_some_and(|n| n != want) => {
+                GaugeLiveness::Stale
+            }
+            _ => GaugeLiveness::Live,
+        }
+    }
+
+    /// With `team_name` selected, a team rename leaves a series under the
+    /// old name; the sweep must retire it and leave the renamed one alone.
+    #[test]
+    fn a_rename_retires_the_series_under_the_old_name() {
+        let m = named_budget_metrics();
+        m.set_budget_gauges(named("Platform"), spend(40.0));
+        m.set_budget_gauges(named("Platform Eng"), spend(45.0));
+        assert_eq!(m.retire_stale_gauges(live_team("Platform Eng")), 2);
+        assert_eq!(
+            spent_by_team(&m),
+            vec![
+                ("Platform".to_owned(), "NaN".to_owned()),
+                ("Platform Eng".to_owned(), "45".to_owned()),
+            ]
+        );
+    }
+
+    /// Without `team_name` selected, both label sets a rename emits render
+    /// as ONE series. The stale one must not be judged on the name it does
+    /// not render — retiring it would write NaN over the live value.
+    #[test]
+    fn an_unselected_name_never_retires_the_series_it_shares() {
+        let m = Metrics::new(false);
+        m.set_budget_gauges(named("Platform"), spend(40.0));
+        m.set_budget_gauges(named("Platform Eng"), spend(45.0));
+        assert_eq!(m.retire_stale_gauges(live_team("Platform Eng")), 0);
+        assert_eq!(
+            spent_by_team(&m),
+            vec![("<none>".to_owned(), "45".to_owned())]
+        );
+    }
+
+    /// A rename reverted brings back a label set every worker still has a
+    /// cached handle for, so it never registers again. It must still be
+    /// watched: renaming away from it a second time retires it again.
+    #[test]
+    fn a_name_that_comes_back_is_retired_again() {
+        let m = named_budget_metrics();
+        m.set_budget_gauges(named("A"), spend(1.0));
+        m.set_budget_gauges(named("B"), spend(2.0));
+        assert_eq!(m.retire_stale_gauges(live_team("B")), 2);
+        // Renamed back: the A handle is a worker-cache hit.
+        m.set_budget_gauges(named("A"), spend(3.0));
+        assert_eq!(m.retire_stale_gauges(live_team("A")), 2);
+        m.set_budget_gauges(named("C"), spend(4.0));
+        assert_eq!(m.retire_stale_gauges(live_team("C")), 2);
+        assert_eq!(
+            spent_by_team(&m),
+            vec![
+                ("A".to_owned(), "NaN".to_owned()),
+                ("B".to_owned(), "NaN".to_owned()),
+                ("C".to_owned(), "4".to_owned()),
+            ]
+        );
+    }
+
+    /// The name labels are selectable only: with no selection configured
+    /// the families that can carry them render exactly what they did
+    /// before, label order included.
+    #[test]
+    fn name_labels_render_only_when_selected() {
+        let m = Metrics::new(false);
+        let usage = UsageLabels {
+            api_key_name: "Key One",
+            team_name: "Team One",
+            ..UsageLabels::default()
+        };
+        m.record_proxy_and_llm_request(
+            RequestLabels {
+                api_key_name: "Key One",
+                team_name: "Team One",
+                ..RequestLabels::default()
+            },
+            Duration::from_millis(5),
+        );
+        m.record_llm_usage(
+            usage,
+            LlmUsage {
+                input_tokens: 1,
+                ..LlmUsage::default()
+            },
+        );
+        m.record_ttft(
+            LatencyLabels {
+                details: usage,
+                ..LatencyLabels::default()
+            },
+            Duration::from_millis(3),
+            Duration::from_millis(4),
+        );
+        m.set_budget_gauges(named("Team One"), spend(1.0));
+        m.set_rate_limit_remaining("ak-1", "Key One", "gpt", Some(1), None);
+        m.record_deployment_request(
+            DeploymentLabels {
+                provider_key_name: "PK One",
+                ..DeploymentLabels::default()
+            },
+            RequestOutcome::Success,
+        );
+        m.record_ratelimit_rejection("requests", "policy", Some(("pol-1", "Policy One")));
+        let rendered = m.render();
+        for label in ["api_key_name=", "team_name=", "policy_name="] {
+            assert!(
+                !rendered.contains(label),
+                "{label} rendered by default:\n{rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("provider_key_name=\"PK One\""),
+            "{rendered}"
+        );
+        assert!(
+            series_lines(&rendered, "aisix_llm_time_to_first_token_seconds_count")
+                .iter()
+                .all(|l| l.contains("_count{side=")),
+            "side keeps its leading position:\n{rendered}"
+        );
+    }
+
+    /// A request that resolved the old names before a rename can write the
+    /// old series AFTER the sweep retired it. While the series stays stale
+    /// the next sweep marks it again rather than leave that value standing.
+    #[test]
+    fn a_stale_series_written_after_retirement_is_retired_again() {
+        let m = named_budget_metrics();
+        m.set_budget_gauges(named("Platform"), spend(40.0));
+        m.set_budget_gauges(named("Platform Eng"), spend(45.0));
+        assert_eq!(m.retire_stale_gauges(live_team("Platform Eng")), 2);
+        // The in-flight request finishes under the old name.
+        m.set_budget_gauges(named("Platform"), spend(41.0));
+        // Already counted, but marked again.
+        assert_eq!(m.retire_stale_gauges(live_team("Platform Eng")), 0);
+        assert_eq!(
+            spent_by_team(&m),
+            vec![
+                ("Platform".to_owned(), "NaN".to_owned()),
+                ("Platform Eng".to_owned(), "45".to_owned()),
+            ]
+        );
+    }
+
+    /// The same for the rate-limit gauges and `api_key_name`.
+    #[test]
+    fn a_key_rename_retires_the_remaining_gauge_under_the_old_name() {
+        let config = [M_RATELIMIT_REMAINING_REQUESTS, M_RATELIMIT_REMAINING_TOKENS]
+            .map(|m| {
+                (
+                    m.to_owned(),
+                    ["api_key_id", "api_key_name", "model"]
+                        .map(str::to_owned)
+                        .to_vec(),
+                )
+            })
+            .into_iter()
+            .collect();
+        let m = Metrics::new_with_labels("env", &HistogramBuckets::default(), &config).unwrap();
+        m.set_rate_limit_remaining("ak-1", "old", "gpt-4o", Some(7), None);
+        m.set_rate_limit_remaining("ak-1", "new", "gpt-4o", Some(6), None);
+        let retired = m.retire_stale_gauges(|series| match series {
+            LiveGaugeSeries::RatelimitRemaining { api_key_name, .. } => api_key_name == Some("new"),
+            _ => true,
+        });
+        assert_eq!(retired, 1);
+        let rendered = m.render();
+        let lines = series_lines(&rendered, M_RATELIMIT_REMAINING_REQUESTS);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("api_key_name=\"old\"") && l.ends_with(" NaN")),
+            "{rendered}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("api_key_name=\"new\"") && l.ends_with(" 6")),
+            "{rendered}"
         );
     }
 
@@ -5455,7 +5823,9 @@ mod tests {
         let m = Metrics::new(false);
         let base = BudgetLabels {
             api_key_id: "ak",
+            api_key_name: "unknown",
             team_id: "t",
+            team_name: "unknown",
             user_id: "u",
             user_name: "n",
         };
@@ -5673,7 +6043,7 @@ mod tests {
         m.record_ratelimit_rejection("requests", "api_key", None);
         m.record_ratelimit_rejection("tokens", "api_key", None);
         m.record_ratelimit_rejection("requests", "model", None);
-        m.record_ratelimit_rejection("requests", "api_key", Some("p1"));
+        m.record_ratelimit_rejection("requests", "api_key", Some(("p1", "P1")));
         assert_one_series_per_label_set(&m.render(), M_RATELIMIT_REJECTIONS, 4);
     }
 

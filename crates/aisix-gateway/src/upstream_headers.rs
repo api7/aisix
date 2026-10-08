@@ -68,9 +68,9 @@ pub struct CallerIdentity {
     pub team_id: Option<String>,
     pub user_id: Option<String>,
     /// Display name of the member `user_id` names, for the `user_name`
-    /// metric label (AISIX-Cloud#1455). Resolved here so it always comes
-    /// off the same ApiKey row as `user_id`, from the one place a request
-    /// reads its caller.
+    /// metric label (AISIX-Cloud#1455), resolved by
+    /// [`aisix_core::KeyOwnerNames`] — the one rule every telemetry label
+    /// and gauge-liveness check shares.
     ///
     /// NOT a header-template variable: `HEADER_TEMPLATE_VARS` lists the
     /// four `request.api_key.*` keys, and `HeaderVars::resolve` matches
@@ -79,14 +79,18 @@ pub struct CallerIdentity {
 }
 
 impl CallerIdentity {
-    /// Read the identity off the authenticated key's snapshot entry.
-    pub fn from_entry(entry: &aisix_core::ResourceEntry<aisix_core::ApiKey>) -> Self {
+    /// Read the identity off the authenticated key's snapshot entry and
+    /// the owner names resolved for it.
+    pub fn from_entry(
+        entry: &aisix_core::ResourceEntry<aisix_core::ApiKey>,
+        owner: &aisix_core::KeyOwnerNames,
+    ) -> Self {
         Self {
             api_key_id: entry.id.clone(),
             api_key_name: entry.value.display_name.clone(),
             team_id: entry.value.team_id.clone(),
             user_id: entry.value.user_id.clone(),
-            user_name: entry.value.user_name.clone(),
+            user_name: owner.user_name(&entry.value).map(str::to_owned),
         }
     }
 }

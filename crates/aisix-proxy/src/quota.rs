@@ -442,11 +442,9 @@ fn reject(
     layer: &'static str,
     policy: Option<(&str, &str)>,
 ) -> ProxyError {
-    state.metrics.record_ratelimit_rejection(
-        &err.scope().to_string(),
-        layer,
-        policy.map(|(id, _)| id),
-    );
+    state
+        .metrics
+        .record_ratelimit_rejection(&err.scope().to_string(), layer, policy);
     match policy {
         Some((id, name)) => ProxyError::PolicyRateLimit {
             source: err,
@@ -485,17 +483,27 @@ pub(crate) async fn enforce_mcp(
     reserve_layers(state, snapshot, auth, None, Some(mcp_server)).await
 }
 
+/// The budget gauge labels of `auth`, shared by every emit site so the
+/// gauge-liveness sweep (`gauge_series_is_live` in the server) can judge
+/// them against one resolution rule.
+pub(crate) fn budget_labels(auth: &AuthenticatedKey) -> aisix_obs::BudgetLabels<'_> {
+    let caller = crate::request_metrics::Caller::new(auth);
+    aisix_obs::BudgetLabels {
+        api_key_id: caller.api_key_id,
+        api_key_name: caller.api_key_name,
+        team_id: caller.team_id,
+        team_name: caller.team_name,
+        user_id: caller.user_id,
+        user_name: caller.user_name,
+    }
+}
+
 /// Budget pre-check shared by the enforce entry points: refreshes the
 /// budget gauges from the cached cp-api decision and rejects the request
 /// when the key is over budget.
 async fn check_budget(state: &ProxyState, auth: &AuthenticatedKey) -> Result<(), ProxyError> {
     let decision = state.budgets.check(&auth.entry.id).await;
-    let budget_labels = aisix_obs::BudgetLabels {
-        api_key_id: &auth.entry.id,
-        team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-        user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
-        user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
-    };
+    let budget_labels = budget_labels(auth);
     if let Some(budget) = decision.budget.as_ref() {
         state.metrics.set_budget_gauges(
             budget_labels,
@@ -678,6 +686,7 @@ mod tests {
                 1,
             )),
             jwt: None,
+            owner: Default::default(),
         }
     }
 

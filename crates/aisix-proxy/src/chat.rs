@@ -344,6 +344,8 @@ pub async fn chat_completions(
                 // caller mint a series per request.
                 state.metrics.set_rate_limit_remaining(
                     &api_key_id,
+                    auth.api_key_name()
+                        .unwrap_or(crate::request_metrics::UNKNOWN),
                     &crate::usage_attr::metric_model_label(&snapshot, &model_name),
                     rl_status.rpm_remaining(),
                     rl_status.tpm_remaining(),
@@ -2189,7 +2191,9 @@ async fn dispatch(
         // #890 req-4: normalised inbound client type, captured for the
         // streaming on_complete metric emission (mirrors the non-streaming
         // `record_success` path).
-        let user_name_for_metrics = auth.key().user_name.clone();
+        let user_name_for_metrics = auth.user_name().map(str::to_owned);
+        let api_key_name_for_metrics = auth.api_key_name().map(str::to_owned);
+        let team_name_for_metrics = auth.team_name().map(str::to_owned);
         let client_type_for_metrics = state
             .client_classifier
             .classify(&client.user_agent)
@@ -2411,7 +2415,9 @@ async fn dispatch(
                     "/v1/chat/completions",
                     crate::request_metrics::Caller {
                         api_key_id: &api_key_id_for_telem,
+                        api_key_name: api_key_name_for_metrics.as_deref().unwrap_or("unknown"),
                         team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
+                        team_name: team_name_for_metrics.as_deref().unwrap_or("unknown"),
                         user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
                         user_name: user_name_for_metrics.as_deref().unwrap_or("unknown"),
                     },
@@ -2455,7 +2461,9 @@ async fn dispatch(
                             provider_key_id: pk.labels().id(),
                             provider_key_name: pk.labels().name(),
                             api_key_id: &api_key_id_for_telem,
+                            api_key_name: api_key_name_for_metrics.as_deref().unwrap_or("unknown"),
                             team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
+                            team_name: team_name_for_metrics.as_deref().unwrap_or("unknown"),
                             user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
                             user_name: user_name_for_metrics.as_deref().unwrap_or("unknown"),
                         },
@@ -2479,7 +2487,9 @@ async fn dispatch(
                             provider_key_id: pk.labels().id(),
                             provider_key_name: pk.labels().name(),
                             api_key_id: &api_key_id_for_telem,
+                            api_key_name: api_key_name_for_metrics.as_deref().unwrap_or("unknown"),
                             team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
+                            team_name: team_name_for_metrics.as_deref().unwrap_or("unknown"),
                             user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
                             user_name: user_name_for_metrics.as_deref().unwrap_or("unknown"),
                         },
@@ -4372,7 +4382,9 @@ async fn dispatch_ensemble(
                             provider_key_id: ensemble_pk.labels().id(),
                             provider_key_name: ensemble_pk.labels().name(),
                             api_key_id: caller.api_key_id,
+                            api_key_name: caller.api_key_name,
                             team_id: caller.team_id,
+                            team_name: caller.team_name,
                             user_id: caller.user_id,
                             user_name: caller.user_name,
                         },
@@ -4397,7 +4409,9 @@ async fn dispatch_ensemble(
                             provider_key_id: ensemble_pk.labels().id(),
                             provider_key_name: ensemble_pk.labels().name(),
                             api_key_id: caller.api_key_id,
+                            api_key_name: caller.api_key_name,
                             team_id: caller.team_id,
+                            team_name: caller.team_name,
                             user_id: caller.user_id,
                             user_name: caller.user_name,
                         },
@@ -4854,12 +4868,7 @@ fn record_budget_gauges(
     auth: &AuthenticatedKey,
     budget: Option<&crate::budget::BudgetDetails>,
 ) {
-    let labels = aisix_obs::BudgetLabels {
-        api_key_id: &auth.entry.id,
-        team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-        user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
-        user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
-    };
+    let labels = crate::quota::budget_labels(auth);
     if let Some(budget) = budget {
         metrics.set_budget_gauges(
             labels,

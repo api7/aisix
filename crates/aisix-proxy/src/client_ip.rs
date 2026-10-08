@@ -227,7 +227,13 @@ where
             request_id,
             headers: Arc::new(parts.headers.clone()),
             caller: api_key
-                .map(|e| aisix_gateway::CallerIdentity::from_entry(e))
+                .map(|e| {
+                    let owner = parts.extensions.get::<aisix_core::KeyOwnerNames>();
+                    aisix_gateway::CallerIdentity::from_entry(
+                        e,
+                        owner.unwrap_or(&Default::default()),
+                    )
+                })
                 .unwrap_or_default(),
             jwt: parts
                 .extensions

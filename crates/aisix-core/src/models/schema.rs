@@ -72,6 +72,8 @@ pub struct Schemas {
     pub passthrough_route: Validator,
     pub mcp_auth_settings: Validator,
     pub pricing: Validator,
+    pub team: Validator,
+    pub user: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile(true)));
@@ -85,7 +87,7 @@ pub static LENIENT_SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::
 /// [`resource_root_schema`] takes. The published schema files and the
 /// validator sets are built from this list, so a new resource cannot reach
 /// one without reaching the other.
-pub const RESOURCES: [&str; 16] = [
+pub const RESOURCES: [&str; 18] = [
     "model",
     "api_key",
     "provider_key",
@@ -102,6 +104,8 @@ pub const RESOURCES: [&str; 16] = [
     "passthrough_route",
     "mcp_auth_settings",
     "pricing",
+    "team",
+    "user",
 ];
 
 /// Whether a resource's write contract closes unknown top-level fields.
@@ -140,6 +144,8 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "passthrough_route" => passthrough_route_root_schema(),
         "mcp_auth_settings" => mcp_auth_settings_root_schema(),
         "pricing" => pricing_root_schema(),
+        "team" => team_root_schema(),
+        "user" => user_root_schema(),
         other => panic!("unknown resource {other:?}"),
     };
     if strict {
@@ -176,6 +182,8 @@ impl Schemas {
             passthrough_route: build("passthrough_route"),
             mcp_auth_settings: build("mcp_auth_settings"),
             pricing: build("pricing"),
+            team: build("team"),
+            user: build("user"),
         }
     }
 }
@@ -755,6 +763,22 @@ pub fn validate_cache_policy_lenient(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_pricing_lenient(value: &Value) -> Result<(), SchemaError> {
     validate(&LENIENT_SCHEMAS.pricing, value)
+}
+
+pub fn validate_team(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.team, value)
+}
+
+pub fn validate_team_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.team, value)
+}
+
+pub fn validate_user(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.user, value)
+}
+
+pub fn validate_user_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.user, value)
 }
 
 pub fn validate_observability_exporter_lenient(value: &Value) -> Result<(), SchemaError> {
@@ -2220,6 +2244,18 @@ pub fn cache_policy_root_schema() -> Value {
 /// both the write and the read path.
 pub fn pricing_root_schema() -> Value {
     struct_root_schema::<crate::models::Pricing>(false)
+}
+
+/// Canonical JSON Schema for the `team` resource, derived from the
+/// [`Team`](crate::models::Team) struct.
+pub fn team_root_schema() -> Value {
+    struct_root_schema::<crate::models::Team>(false)
+}
+
+/// Canonical JSON Schema for the `user` resource, derived from the
+/// [`User`](crate::models::User) struct.
+pub fn user_root_schema() -> Value {
+    struct_root_schema::<crate::models::User>(false)
 }
 
 /// Canonical JSON Schema for the `observability_exporter` resource, derived
