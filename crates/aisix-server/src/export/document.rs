@@ -378,6 +378,31 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
     // guardrail_attachments are emitted above as their own collection, with
     // every id reference rewritten to the identity its collection is keyed by.
 
+    // `teams` / `users` carry only the display names metric labels read.
+    // The resources file has no collection for them — it cannot key a
+    // document by the verbatim ids api keys carry — so they are left out,
+    // and said so: after the move `team_name` reads `unknown` and
+    // `user_name` falls back to each key's inline `user_name`.
+    for (kind, count, effect) in [
+        (
+            "teams",
+            snapshot.teams.len(),
+            "the `team_name` metric label reads `unknown`",
+        ),
+        (
+            "users",
+            snapshot.users.len(),
+            "the `user_name` metric label falls back to each api key's own `user_name`",
+        ),
+    ] {
+        if count > 0 {
+            diag.warnings.push(format!(
+                "{count} {kind} document(s) not exported — a resources file has no `{kind}` \
+                 collection, so on a gateway loading this file {effect}"
+            ));
+        }
+    }
+
     // Two entries whose identities differ only in characters `sanitize`
     // folds to `_` (e.g. `openai-prod` vs `openai.prod`) derive the SAME
     // placeholder variable, so the operator can only supply one value for

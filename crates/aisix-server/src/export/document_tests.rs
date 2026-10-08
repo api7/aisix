@@ -1502,3 +1502,35 @@ fn default_export_emits_no_live_oidc_shared_secret() {
     );
     assert!(revealed.secret_placeholders.is_empty());
 }
+
+#[test]
+fn team_and_user_documents_are_reported_not_dropped_silently() {
+    let snap = AisixSnapshot::new();
+    let team: aisix_core::Team = serde_json::from_value(json!({"name": "Platform"})).unwrap();
+    snap.teams.insert(ResourceEntry::new("t-1", team, 1));
+    let user: aisix_core::User = serde_json::from_value(json!({"name": "Alice"})).unwrap();
+    snap.users
+        .insert(ResourceEntry::new("u-1", user.clone(), 1));
+    snap.users.insert(ResourceEntry::new("u-2", user, 1));
+
+    let doc = build_export_document(&snap, false);
+    assert!(
+        doc.warnings
+            .iter()
+            .any(|w| w.contains("1 teams document") && w.contains("team_name")),
+        "{:?}",
+        doc.warnings
+    );
+    assert!(
+        doc.warnings
+            .iter()
+            .any(|w| w.contains("2 users document") && w.contains("user_name")),
+        "{:?}",
+        doc.warnings
+    );
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+    // Nothing else warns about an empty snapshot.
+    assert!(build_export_document(&AisixSnapshot::new(), false)
+        .warnings
+        .is_empty());
+}
