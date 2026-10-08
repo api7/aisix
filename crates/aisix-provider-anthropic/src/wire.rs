@@ -1299,8 +1299,17 @@ pub enum AnthropicResponseBlock {
         #[serde(default)]
         input: serde_json::Value,
     },
-    /// Future content-block types (e.g. `image` on output, `thinking`
-    /// for reasoning models). Not surfaced today; accepted so unknown
+    /// Extended-thinking output. Its readable text surfaces as the
+    /// OpenAI-shape `message.reasoning_content`; the `signature` has no
+    /// slot on that wire and is not read.
+    /// <https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking>
+    #[serde(rename = "thinking")]
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+    },
+    /// Other content-block types (`redacted_thinking`, server-tool
+    /// blocks, future additions). Not surfaced; accepted so unknown
     /// block types don't fail the whole response parse.
     #[serde(other)]
     Other,
@@ -1388,6 +1397,23 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
         extra.insert(
             "tool_calls".to_string(),
             serde_json::Value::Array(tool_calls),
+        );
+    }
+    let reasoning = raw
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            AnthropicResponseBlock::Thinking { thinking } if !thinking.is_empty() => {
+                Some(thinking.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !reasoning.is_empty() {
+        extra.insert(
+            "reasoning_content".to_string(),
+            serde_json::Value::String(reasoning),
         );
     }
 
@@ -1558,6 +1584,11 @@ pub struct AnthropicStreamStartUsage {
 pub enum AnthropicStreamDelta {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
+    /// Extended-thinking text, surfaced as `delta.reasoning_content`.
+    /// `signature_delta` stays in [`Self::Other`]: the OpenAI wire has no
+    /// slot for it.
+    #[serde(rename = "thinking_delta")]
+    ThinkingDelta { thinking: String },
     #[serde(other)]
     Other,
 }
@@ -1664,6 +1695,20 @@ impl StreamState {
                 finish_reason: None,
                 usage: None,
             }),
+            AnthropicStreamEvent::ContentBlockDelta {
+                delta: AnthropicStreamDelta::ThinkingDelta { thinking },
+            } if !thinking.is_empty() => Some(ChatChunk {
+                id: self.id.clone(),
+                model: self.model.clone(),
+                delta: ChatDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: None,
+                    reasoning_content: Some(thinking.clone()),
+                },
+                finish_reason: None,
+                usage: None,
+            }),
             AnthropicStreamEvent::MessageDelta { delta, usage } => {
                 let finish = delta
                     .stop_reason
@@ -1714,12 +1759,14 @@ impl StreamState {
 // `text`, `image` (base64 + url), `document` (→ image_url data URL, the
 // LiteLLM mapping), assistant `tool_use` (→ OpenAI `tool_calls`), and
 // `tool_result` (→ a `role:"tool"` message; string / single-text /
-// multi-block content forms). `thinking` / `redacted_thinking` history
-// blocks are dropped: the OpenAI chat wire cannot replay another
-// vendor's signed reasoning blocks — LiteLLM's OpenAI provider
-// transform discards them the same way (the top-level `thinking`
-// config key still maps to `reasoning_effort`, see
-// `translate_extras_to_openai_shape`).
+// multi-block content forms). An assistant turn's `thinking` blocks
+// replay as its `reasoning_content` — the slot OpenAI-compatible
+// reasoning models read their own earlier chain-of-thought from, and
+// which some of them require back on every prior turn of a tool-using
+// conversation. Their signatures have no slot there and drop, as do
+// `redacted_thinking` blocks (provider ciphertext, no readable text).
+// The top-level `thinking` config key maps to `reasoning_effort`, see
+// `translate_extras_to_openai_shape`.
 
 #[derive(Debug, thiserror::Error)]
 pub enum AnthropicInboundError {
@@ -1742,10 +1789,10 @@ pub enum AnthropicInboundError {
 /// What a parsed body is going to be used for.
 ///
 /// The two answers differ in exactly one place — an assistant turn's
-/// `thinking` / `redacted_thinking` blocks — and that difference is the
-/// whole reason this enum exists. Dropping them is right for a body being
-/// bridged to a non-Anthropic upstream and wrong for a body being handed
-/// to the guardrail chain, so the two callers must not share one parse.
+/// `thinking` blocks — and that difference is the whole reason this enum
+/// exists. A body bridged to a non-Anthropic upstream carries them as the
+/// turn's `reasoning_content`; a body handed to the guardrail chain reads
+/// them as the turn's text, so the two callers must not share one parse.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InboundUse {
     /// The result is translated onto the OpenAI wire and sent upstream.
@@ -1897,10 +1944,10 @@ pub fn strip_billing_header_attribution(body: &serde_json::Value) -> Cow<'_, ser
 /// Unrecognized top-level keys (`metadata`, `tools`, `tool_choice`, etc.)
 /// flow into `ChatFormat::extra` for `translate_extras_to_openai_shape`.
 ///
-/// Assistant `thinking` / `redacted_thinking` blocks are dropped, because
-/// they are not replayable on the OpenAI wire. Use
-/// [`parse_inbound_request_for_scan`] for a guardrail scan, where dropping
-/// them would leave caller-supplied text unread.
+/// Assistant `thinking` blocks become the turn's `reasoning_content`;
+/// `redacted_thinking` blocks are dropped. Use
+/// [`parse_inbound_request_for_scan`] for a guardrail scan, which reads the
+/// thinking text as part of the turn's text instead.
 pub fn parse_inbound_request(
     body: &serde_json::Value,
 ) -> Result<ChatFormat, AnthropicInboundError> {
@@ -1911,8 +1958,9 @@ pub fn parse_inbound_request(
 /// `thinking` blocks contribute their text.
 ///
 /// Reasoning replayed by the caller is text entering the model like any
-/// other, so the scan has to see it; the dispatch parse still drops it, so
-/// what reaches a non-Anthropic upstream is unchanged. `redacted_thinking`
+/// other, so the scan has to see it; the dispatch parse carries it in
+/// `reasoning_content` instead, which the upstream body needs and the
+/// scan text does not double-count. `redacted_thinking`
 /// carries only the provider's encrypted `data` blob — there is no
 /// plaintext in it for a scan to read, so it contributes nothing here (a
 /// mask-action hit inside either block is forwarded unchanged — see
@@ -2213,13 +2261,14 @@ fn translate_user_blocks(blocks: &[serde_json::Value], out: &mut Vec<ChatMessage
 
 /// Collapse one Anthropic assistant message's content blocks into a
 /// ChatMessage: text concatenates, `tool_use` becomes OpenAI
-/// `tool_calls`, thinking blocks drop for [`InboundUse::Dispatch`]
-/// (non-replayable on the OpenAI wire — see the module comment) and
-/// contribute their text for [`InboundUse::Scan`].
+/// `tool_calls`. `thinking` blocks become the turn's `reasoning_content`
+/// for [`InboundUse::Dispatch`] and contribute to its text for
+/// [`InboundUse::Scan`]; `redacted_thinking` drops for both.
 fn translate_assistant_blocks(blocks: &[serde_json::Value], purpose: InboundUse) -> ChatMessage {
     use serde_json::Value;
     let mut text = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
+    let mut reasoning: Vec<&str> = Vec::new();
 
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
@@ -2238,15 +2287,19 @@ fn translate_assistant_blocks(blocks: &[serde_json::Value], purpose: InboundUse)
                     );
                 }
             }
-            Some("thinking") if purpose == InboundUse::Scan => {
+            Some("thinking") => {
                 if let Some(t) = block.get("thinking").and_then(Value::as_str) {
-                    text.push_str(t);
+                    match purpose {
+                        InboundUse::Scan => text.push_str(t),
+                        InboundUse::Dispatch if !t.is_empty() => reasoning.push(t),
+                        InboundUse::Dispatch => {}
+                    }
                 }
             }
-            Some("thinking") | Some("redacted_thinking") => {
+            Some("redacted_thinking") => {
                 tracing::debug!(
-                    "dropping thinking block on cross-provider dispatch (not replayable \
-                     on the OpenAI wire)",
+                    "dropping redacted_thinking block on cross-provider dispatch (provider \
+                     ciphertext, no readable reasoning)",
                 );
             }
             other => {
@@ -2268,6 +2321,12 @@ fn translate_assistant_blocks(blocks: &[serde_json::Value], purpose: InboundUse)
         msg.extra.insert(
             "tool_calls".to_string(),
             serde_json::Value::Array(tool_calls),
+        );
+    }
+    if !reasoning.is_empty() {
+        msg.extra.insert(
+            "reasoning_content".to_string(),
+            Value::String(reasoning.join("\n")),
         );
     }
     msg
@@ -2348,6 +2407,24 @@ pub fn chat_response_into_anthropic_json(
 
     let mut content: Vec<serde_json::Value> = Vec::new();
 
+    // The upstream's reasoning leads, as Anthropic orders a thinking block
+    // ahead of the text and tool_use it produced. It carries no signature
+    // — the upstream issued none — so `signature` is the empty string the
+    // block shape still requires.
+    if let Some(reasoning) = resp
+        .message
+        .extra
+        .get("reasoning_content")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        content.push(serde_json::json!({
+            "type": "thinking",
+            "thinking": reasoning,
+            "signature": "",
+        }));
+    }
+
     if let Some(text) = resp.message.content.as_deref().filter(|s| !s.is_empty()) {
         content.push(serde_json::json!({"type": "text", "text": text}));
     }
@@ -2391,14 +2468,17 @@ pub fn chat_response_into_anthropic_json(
 // SSE events.
 //
 // State machine:
-//   1. First chunk that carries content or a finish_reason → emit
-//      `message_start`. If it carries content, also emit
-//      `content_block_start` + `content_block_delta`.
-//   2. Mid-stream chunks with content → `content_block_delta`.
-//   3. Chunk carrying `finish_reason` → emit `content_block_stop`
-//      (only if a content block was opened), `message_delta` (with
-//      stop_reason + final usage), then `message_stop`. After
-//      `finished` flips true the encoder is silent.
+//   1. First chunk that carries reasoning, content, tool calls or a
+//      finish_reason → emit `message_start`.
+//   2. Reasoning opens a `thinking` block, text a `text` block, tool
+//      calls `tool_use` blocks, each with its `content_block_start`
+//      followed by deltas. Moving into or out of a thinking block closes
+//      the block before it (`content_block_stop`) and opens the next at
+//      the next index, so indices stay contiguous across all three.
+//   3. Chunk carrying `finish_reason` → emit `content_block_stop` for
+//      every block still open, `message_delta` (with stop_reason + final
+//      usage), then `message_stop`. After `finished` flips true the
+//      encoder is silent.
 //
 // Reference: https://docs.anthropic.com/en/api/streaming
 
@@ -2428,6 +2508,9 @@ struct ToolCallState {
     name: String,
     content_block_index: usize,
     started: bool,
+    /// Closed by a thinking block opening after it; the block cannot be
+    /// reopened, so later argument fragments for it are dropped.
+    closed: bool,
 }
 
 /// State machine for re-encoding a stream of internal `ChatChunk`s as
@@ -2438,10 +2521,13 @@ pub struct AnthropicSseEncoder {
     model_display_name: String,
     initial_input_tokens: u32,
     sent_message_start: bool,
-    /// Index assigned to the text content block (if any).
+    /// Index of the open thinking content block (if any).
+    thinking_block_index: Option<usize>,
+    /// Index of the open text content block (if any).
     text_block_index: Option<usize>,
     finished: bool,
-    /// Next content-block index to assign (shared across text + tool_use blocks).
+    /// Next content-block index to assign (shared across thinking, text
+    /// and tool_use blocks).
     next_block_index: usize,
     /// Per-OpenAI-delta-index tool call state.
     tool_calls: std::collections::BTreeMap<u64, ToolCallState>,
@@ -2482,6 +2568,7 @@ impl AnthropicSseEncoder {
             model_display_name: model_display_name.into(),
             initial_input_tokens,
             sent_message_start: false,
+            thinking_block_index: None,
             text_block_index: None,
             finished: false,
             next_block_index: 0,
@@ -2528,6 +2615,11 @@ impl AnthropicSseEncoder {
 
         let mut events = Vec::new();
 
+        let has_reasoning = chunk
+            .delta
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
         let has_content = chunk
             .delta
             .content
@@ -2540,9 +2632,43 @@ impl AnthropicSseEncoder {
             .is_some_and(|v| !v.is_empty());
         let has_finish = chunk.finish_reason.is_some();
 
-        if !self.sent_message_start && (has_content || has_tool_calls || has_finish) {
+        if !self.sent_message_start
+            && (has_reasoning || has_content || has_tool_calls || has_finish)
+        {
             events.push(self.message_start_event());
             self.sent_message_start = true;
+        }
+
+        // ── Thinking content block ──
+        if has_reasoning {
+            if self.thinking_block_index.is_none() {
+                self.close_open_blocks(&mut events);
+                let idx = self.next_block_index;
+                self.next_block_index += 1;
+                self.thinking_block_index = Some(idx);
+                events.push(AnthropicSseEvent {
+                    event: "content_block_start",
+                    data: serde_json::json!({
+                        "type": "content_block_start",
+                        "index": idx,
+                        "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+                    }),
+                });
+            }
+            events.push(AnthropicSseEvent {
+                event: "content_block_delta",
+                data: serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": self.thinking_block_index,
+                    "delta": {
+                        "type": "thinking_delta",
+                        "thinking": chunk.delta.reasoning_content.as_deref().unwrap_or_default(),
+                    },
+                }),
+            });
+        }
+        if has_content || has_tool_calls {
+            self.close_thinking_block(&mut events);
         }
 
         // ── Text content block ──
@@ -2593,8 +2719,16 @@ impl AnthropicSseEncoder {
                         name: String::new(),
                         content_block_index: block_idx,
                         started: false,
+                        closed: false,
                     }
                 });
+                if state.closed {
+                    tracing::debug!(
+                        tool_call_index = oai_index,
+                        "dropping tool-call fragment for a tool_use block a thinking block closed",
+                    );
+                    continue;
+                }
 
                 if !id.is_empty() {
                     state.id = id.to_string();
@@ -2639,16 +2773,7 @@ impl AnthropicSseEncoder {
 
         // ── Finish ──
         if let Some(fr) = &chunk.finish_reason {
-            // Close text block if open.
-            if let Some(text_idx) = self.text_block_index {
-                events.push(content_block_stop_event(text_idx));
-            }
-            // Close all open tool_use blocks.
-            for state in self.tool_calls.values() {
-                if state.started {
-                    events.push(content_block_stop_event(state.content_block_index));
-                }
-            }
+            self.close_open_blocks(&mut events);
 
             let stop_reason = match fr {
                 FinishReason::Stop => "end_turn",
@@ -2765,16 +2890,30 @@ impl AnthropicSseEncoder {
             events.push(self.message_start_event());
             self.sent_message_start = true;
         }
-        if let Some(text_idx) = self.text_block_index {
-            events.push(content_block_stop_event(text_idx));
-        }
-        for state in self.tool_calls.values() {
-            if state.started {
-                events.push(content_block_stop_event(state.content_block_index));
-            }
-        }
+        self.close_open_blocks(&mut events);
         events.extend(self.closing_pair("end_turn"));
         events
+    }
+
+    fn close_thinking_block(&mut self, events: &mut Vec<AnthropicSseEvent>) {
+        if let Some(idx) = self.thinking_block_index.take() {
+            events.push(content_block_stop_event(idx));
+        }
+    }
+
+    /// Close every open content block, in index order.
+    fn close_open_blocks(&mut self, events: &mut Vec<AnthropicSseEvent>) {
+        let mut open: Vec<usize> = Vec::new();
+        open.extend(self.thinking_block_index.take());
+        open.extend(self.text_block_index.take());
+        for state in self.tool_calls.values_mut() {
+            if state.started && !state.closed {
+                open.push(state.content_block_index);
+            }
+            state.closed = true;
+        }
+        open.sort_unstable();
+        events.extend(open.into_iter().map(content_block_stop_event));
     }
 
     fn message_start_event(&self) -> AnthropicSseEvent {
@@ -6050,6 +6189,196 @@ mod tests {
             vec!["content_block_stop", "message_delta", "message_stop"]
         );
     }
+
+    // ─── AISIX-Cloud#1784: reasoning ↔ thinking blocks ──────────────
+
+    fn reasoning_chunk(text: &str) -> ChatChunk {
+        ChatChunk {
+            id: "cmpl-1".into(),
+            model: "u".into(),
+            delta: ChatDelta {
+                reasoning_content: Some(text.into()),
+                ..ChatDelta::default()
+            },
+            finish_reason: None,
+            usage: None,
+        }
+    }
+
+    fn event_summary(events: &[AnthropicSseEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| match e.event {
+                "content_block_start" => format!(
+                    "start {} {}",
+                    e.data["index"], e.data["content_block"]["type"]
+                ),
+                "content_block_delta" => {
+                    format!("delta {} {}", e.data["index"], e.data["delta"]["type"])
+                }
+                "content_block_stop" => format!("stop {}", e.data["index"]),
+                other => other.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn render_anthropic_response_leads_with_unsigned_thinking_block() {
+        let mut msg = ChatMessage::assistant("42");
+        msg.extra
+            .insert("reasoning_content".into(), "6 times 7".into());
+        msg.extra.insert(
+            "tool_calls".into(),
+            serde_json::json!([{"id": "c1", "type": "function",
+                "function": {"name": "f", "arguments": "{}"}}]),
+        );
+        let resp = ChatResponse {
+            id: "cmpl".into(),
+            model: "u".into(),
+            message: msg,
+            finish_reason: FinishReason::ToolCalls,
+            usage: UsageStats::new(1, 1),
+        };
+        let json = chat_response_into_anthropic_json(&resp, "m");
+        let types: Vec<_> = json["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["thinking", "text", "tool_use"]);
+        assert_eq!(
+            json["content"][0],
+            serde_json::json!({"type": "thinking", "thinking": "6 times 7", "signature": ""})
+        );
+    }
+
+    #[test]
+    fn render_anthropic_response_without_reasoning_has_no_thinking_block() {
+        let mut msg = ChatMessage::assistant("hi");
+        msg.extra.insert("reasoning_content".into(), "".into());
+        let resp = ChatResponse {
+            id: "cmpl".into(),
+            model: "u".into(),
+            message: msg,
+            finish_reason: FinishReason::Stop,
+            usage: UsageStats::new(1, 1),
+        };
+        let json = chat_response_into_anthropic_json(&resp, "m");
+        assert_eq!(
+            json["content"],
+            serde_json::json!([{"type": "text", "text": "hi"}])
+        );
+    }
+
+    #[test]
+    fn sse_encoder_reasoning_first_chunk_opens_thinking_then_text_block() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "m", 0);
+        let mut events = enc.next_events(&reasoning_chunk("step 1"));
+        assert_eq!(
+            events[1].data["content_block"],
+            serde_json::json!({"type": "thinking", "thinking": "", "signature": ""})
+        );
+        assert_eq!(events[2].data["delta"]["thinking"], "step 1");
+        events.extend(enc.next_events(&reasoning_chunk(" step 2")));
+        events.extend(enc.next_events(&delta_chunk("answer")));
+        events.extend(enc.next_events(&finish_chunk(3)));
+        assert_eq!(
+            event_summary(&events),
+            [
+                "message_start",
+                "start 0 \"thinking\"",
+                "delta 0 \"thinking_delta\"",
+                "delta 0 \"thinking_delta\"",
+                "stop 0",
+                "start 1 \"text\"",
+                "delta 1 \"text_delta\"",
+                "stop 1",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert!(events
+            .iter()
+            .all(|e| e.data["delta"]["type"] != "signature_delta"));
+    }
+
+    #[test]
+    fn sse_encoder_thinking_closes_before_tool_use_and_reopens_after_text() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "m", 0);
+        let mut events = enc.next_events(&delta_chunk("hm"));
+        events.extend(enc.next_events(&reasoning_chunk("think")));
+        events.extend(enc.next_events(&tool_call_chunk(0, "c1", "f", "{}")));
+        events.extend(enc.next_events(&tool_finish_chunk()));
+        assert_eq!(
+            event_summary(&events),
+            [
+                "message_start",
+                "start 0 \"text\"",
+                "delta 0 \"text_delta\"",
+                "stop 0",
+                "start 1 \"thinking\"",
+                "delta 1 \"thinking_delta\"",
+                "stop 1",
+                "start 2 \"tool_use\"",
+                "delta 2 \"input_json_delta\"",
+                "stop 2",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+    }
+
+    #[test]
+    fn sse_encoder_force_finish_closes_open_thinking_block() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "m", 0);
+        enc.next_events(&reasoning_chunk("think"));
+        assert_eq!(
+            event_summary(&enc.force_finish()),
+            ["stop 0", "message_delta", "message_stop"]
+        );
+    }
+
+    #[test]
+    fn non_streaming_thinking_blocks_surface_as_reasoning_content() {
+        let body = r#"{
+            "id": "msg_t", "type": "message", "role": "assistant", "model": "claude",
+            "content": [
+                {"type": "thinking", "thinking": "one", "signature": "sig"},
+                {"type": "redacted_thinking", "data": "opaque"},
+                {"type": "thinking", "thinking": "two", "signature": "sig"},
+                {"type": "text", "text": "done"}
+            ]
+        }"#;
+        let out = response_into_chat_response(serde_json::from_str(body).unwrap());
+        assert_eq!(out.message.content_str(), "done");
+        assert_eq!(out.message.extra["reasoning_content"], "one\ntwo");
+    }
+
+    #[test]
+    fn non_streaming_response_without_thinking_has_no_reasoning_content() {
+        let body = r#"{"id": "m", "model": "c", "content": [{"type": "text", "text": "x"}]}"#;
+        let out = response_into_chat_response(serde_json::from_str(body).unwrap());
+        assert!(!out.message.extra.contains_key("reasoning_content"));
+    }
+
+    #[test]
+    fn stream_thinking_delta_becomes_reasoning_content_chunk() {
+        let state = StreamState::default();
+        let ev: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}"#,
+        )
+        .unwrap();
+        let chunk = state.to_chunk(&ev).expect("thinking_delta yields a chunk");
+        assert_eq!(chunk.delta.reasoning_content.as_deref(), Some("hmm"));
+        assert!(chunk.delta.content.is_none());
+        let sig: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"s"}}"#,
+        )
+        .unwrap();
+        assert!(state.to_chunk(&sig).is_none());
+    }
+
     // ─── #722: cross-provider content-block translation ─────────────
 
     #[test]
@@ -6230,30 +6559,59 @@ mod tests {
     }
 
     #[test]
-    fn inbound_thinking_blocks_drop_but_text_and_tools_survive() {
+    fn inbound_thinking_blocks_replay_as_reasoning_content() {
         let body = serde_json::json!({
             "model": "claude",
             "messages": [{"role": "assistant", "content": [
-                {"type": "thinking", "thinking": "secret chain", "signature": "sig"},
+                {"type": "thinking", "thinking": "first chain", "signature": "sig"},
                 {"type": "redacted_thinking", "data": "opaque"},
+                {"type": "thinking", "thinking": "", "signature": "sig"},
+                {"type": "thinking", "thinking": "second chain", "signature": "sig"},
                 {"type": "text", "text": "answer"},
+                {"type": "tool_use", "id": "t1", "name": "search", "input": {}},
             ]}],
         });
         let chat = parse_inbound_request(&body).unwrap();
-        assert_eq!(chat.messages[0].content_str(), "answer");
-        assert!(!chat.messages[0].extra.contains_key("tool_calls"));
-        // The thinking text must not leak into the translated content.
-        assert!(!serde_json::to_string(&chat.messages[0])
-            .unwrap()
-            .contains("secret chain"));
+        let msg = serde_json::to_value(&chat.messages[0]).unwrap();
+        assert_eq!(msg["content"], "answer");
+        assert_eq!(msg["reasoning_content"], "first chain\nsecond chain");
+        assert_eq!(msg["tool_calls"][0]["id"], "t1");
+        // Neither the signatures nor the redacted ciphertext travel.
+        let wire = msg.to_string();
+        assert!(!wire.contains("sig"), "{wire}");
+        assert!(!wire.contains("opaque"), "{wire}");
+    }
+
+    /// A tool-call turn whose only other block is its thinking keeps the
+    /// pure-tool-call `content: null` shape beside its reasoning, and a turn
+    /// without thinking carries no `reasoning_content` key at all.
+    #[test]
+    fn inbound_reasoning_content_only_when_thinking_text_exists() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "call it", "signature": "sig"},
+                    {"type": "tool_use", "id": "t1", "name": "search", "input": {}},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "redacted_thinking", "data": "opaque"},
+                    {"type": "text", "text": "plain"},
+                ]},
+            ],
+        });
+        let chat = parse_inbound_request(&body).unwrap();
+        assert!(chat.messages[0].content.is_none());
+        assert_eq!(chat.messages[0].extra["reasoning_content"], "call it");
+        assert!(!chat.messages[1].extra.contains_key("reasoning_content"));
     }
 
     /// The scan parse is the other half of the pair above: the same body
-    /// that dispatches WITHOUT its thinking text must SCAN with it, or a
+    /// that dispatches its thinking as reasoning must SCAN it as text, or a
     /// caller can park a payload in a replayed `thinking` block and reach
     /// the model past a deny-list the same text trips in `content`.
     #[test]
-    fn scan_parse_keeps_thinking_text_the_dispatch_parse_drops() {
+    fn scan_parse_reads_thinking_text_as_turn_text() {
         let body = serde_json::json!({
             "model": "claude",
             "messages": [{"role": "assistant", "content": [
@@ -6265,11 +6623,15 @@ mod tests {
         let scan = parse_inbound_request_for_scan(&body).unwrap();
         assert_eq!(scan.messages[0].content_str(), "secret chainanswer");
 
-        // …and the dispatch parse is unchanged by that, which is the whole
-        // point of splitting them: what reaches a non-Anthropic upstream
-        // still carries no thinking block.
+        // …while the dispatch parse carries it as reasoning, never as text,
+        // and the scan parse does not count it twice.
         let dispatch = parse_inbound_request(&body).unwrap();
         assert_eq!(dispatch.messages[0].content_str(), "answer");
+        assert_eq!(
+            dispatch.messages[0].extra["reasoning_content"],
+            "secret chain"
+        );
+        assert!(!scan.messages[0].extra.contains_key("reasoning_content"));
     }
 
     /// The two parses differ ONLY on thinking blocks. Anything else that
