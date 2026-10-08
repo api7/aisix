@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "The display name of a team that API keys belong to.\n\nThe document's id is the value API keys carry in `team_id`. The gateway reads the name only to label telemetry, as the `team_name` metric label; it never uses it for authentication, routing, or limits.",
+  "properties": {
+    "name": {
+      "description": "Display name of the team. An empty name is reported as `unknown`.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "name"
+  ],
+  "title": "Team",
+  "type": "object"
+}

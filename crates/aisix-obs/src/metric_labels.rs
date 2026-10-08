@@ -43,9 +43,11 @@ pub static METRIC_VARIABLES: &[MetricVariable] = &[
     variable!("provider_key_id", "The identifier of the selected provider credential. This is an identifier, never its secret."),
     variable!("provider_key_name", "The display name of that same provider credential. Renaming a credential starts a new series when this variable is selected."),
     variable!("api_key_id", "The identifier of the authenticating gateway API key, never its plaintext value."),
+    variable!("api_key_name", "The display name of that same API key; unknown when it has none. Renaming the key starts a new series when this variable is selected."),
     variable!("team_id", "The team associated with the authenticating API key."),
+    variable!("team_name", "The display name of that same team, read from its teams document; unknown when no document names it. Renaming the team starts a new series when this variable is selected."),
     variable!("user_id", "The member associated with the authenticating API key."),
-    variable!("user_name", "The member display name carried by the API key's configuration snapshot."),
+    variable!("user_name", "The display name of that same member, read from its users document, or from the API key's own user_name when no such document exists; unknown when neither names the member."),
     variable!("stream", "Whether the request asked for streaming, encoded as true or false. Used by the detailed request metrics."),
     variable!("streaming", "Whether the observed request is streaming, encoded as true or false. Used by the request latency histograms."),
     variable!("is_fallback", "Whether request attribution identifies a fallback attempt, encoded as true or false."),
@@ -59,6 +61,7 @@ pub static METRIC_VARIABLES: &[MetricVariable] = &[
     variable!("scope", "The scope of the rate-limit decision."),
     variable!("layer", "The layer of the rate-limit decision."),
     variable!("policy_id", "The rate-limit policy identifier, or the metric's missing-policy value."),
+    variable!("policy_name", "The name of that same rate-limit policy, or the same missing-policy value as policy_id."),
     variable!("reason", "The bounded reason code defined by the emitting authentication, guardrail, configuration, or exporter metric."),
     variable!("method", "The authentication method used for the credential decision."),
     variable!("result", "The authentication, guardrail execution, or heap-profile dump result, as defined by the metric."),
@@ -163,6 +166,46 @@ const LATENCY: &[&str] = &[
 const DEPLOYMENT: &[&str] = &["provider", "model", "upstream_model", "provider_key_id"];
 const SIDE_ALWAYS: &[&str] = &["side"];
 const BUDGET: &[&str] = &["api_key_id", "team_id", "user_id", "user_name"];
+/// The readable names of the caller identity, selectable wherever its ids
+/// are. Never defaults: a name is 1:1 with its id, so it adds no series,
+/// but adding it to a default would change every existing scrape.
+const CALLER_NAMES: &[&str] = &["api_key_name", "team_name"];
+/// [`M_LLM_TTFT`]'s default: the usage set with `side` FIRST, the order
+/// the family has always rendered in. A default that names no `side` would
+/// append it last and reorder every existing series.
+const LLM_TTFT: &[&str] = &[
+    "side",
+    "endpoint",
+    "inbound_protocol",
+    "upstream_protocol",
+    "provider",
+    "model",
+    "upstream_model",
+    "provider_key_id",
+    "provider_key_name",
+    "api_key_id",
+    "team_id",
+    "user_id",
+    "user_name",
+];
+/// [`M_REQUEST_E2E_LATENCY_SECONDS`] and [`M_REQUEST_TTFT_SECONDS`] offer
+/// the whole usage label set, names included, as extras.
+const USAGE_EXTRA: &[&str] = &[
+    "endpoint",
+    "inbound_protocol",
+    "upstream_protocol",
+    "provider",
+    "model",
+    "upstream_model",
+    "provider_key_id",
+    "provider_key_name",
+    "api_key_id",
+    "api_key_name",
+    "team_id",
+    "team_name",
+    "user_id",
+    "user_name",
+];
 const COMPONENT: &[&str] = &["component", "exporter"];
 
 macro_rules! metric {
@@ -202,6 +245,15 @@ macro_rules! metric {
             always_labels: $always,
         }
     };
+    ($name:ident, $defaults:expr, extra = $extra:expr, required = $required:expr) => {
+        MetricDefinition {
+            name: $name,
+            default_labels: $defaults,
+            extra_labels: $extra,
+            required_labels: $required,
+            always_labels: &[],
+        }
+    };
     ($name:ident, $defaults:expr, extra = $extra:expr, always = $always:expr) => {
         MetricDefinition {
             name: $name,
@@ -219,22 +271,39 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         &["provider", "model", "status", "outcome"]
     ),
     metric!(M_REQUEST_DURATION, &["provider", "model", "status"]),
-    metric!(M_RATELIMIT_REJECTIONS, &["scope", "layer", "policy_id"]),
+    metric!(
+        M_RATELIMIT_REJECTIONS,
+        &["scope", "layer", "policy_id"],
+        extra = &["policy_name"]
+    ),
     metric!(M_TOKENS_CONSUMED, &["provider", "model"]),
-    metric!(M_LLM_SPEND_MICRO_USD_TOTAL, USAGE),
-    metric!(M_LLM_INPUT_TOKENS_TOTAL, USAGE),
-    metric!(M_LLM_OUTPUT_TOKENS_TOTAL, USAGE),
-    metric!(M_LLM_TOTAL_TOKENS_TOTAL, USAGE),
-    metric!(M_LLM_CACHED_INPUT_TOKENS_TOTAL, USAGE),
-    metric!(M_LLM_CACHE_READ_INPUT_TOKENS_TOTAL, USAGE),
-    metric!(M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL, USAGE),
-    metric!(M_LLM_REQUESTS_TOTAL, REQUEST),
+    metric!(M_LLM_SPEND_MICRO_USD_TOTAL, USAGE, extra = CALLER_NAMES),
+    metric!(M_LLM_INPUT_TOKENS_TOTAL, USAGE, extra = CALLER_NAMES),
+    metric!(M_LLM_OUTPUT_TOKENS_TOTAL, USAGE, extra = CALLER_NAMES),
+    metric!(M_LLM_TOTAL_TOKENS_TOTAL, USAGE, extra = CALLER_NAMES),
+    metric!(M_LLM_CACHED_INPUT_TOKENS_TOTAL, USAGE, extra = CALLER_NAMES),
+    metric!(
+        M_LLM_CACHE_READ_INPUT_TOKENS_TOTAL,
+        USAGE,
+        extra = CALLER_NAMES
+    ),
+    metric!(
+        M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL,
+        USAGE,
+        extra = CALLER_NAMES
+    ),
+    metric!(M_LLM_REQUESTS_TOTAL, REQUEST, extra = CALLER_NAMES),
     metric!(
         M_LLM_REQUEST_DURATION,
         REQUEST_DURATION,
-        extra = &["is_fallback"]
+        extra = &["is_fallback", "api_key_name", "team_name"]
     ),
-    metric!(M_LLM_TTFT, USAGE, always = SIDE_ALWAYS),
+    metric!(
+        M_LLM_TTFT,
+        LLM_TTFT,
+        extra = CALLER_NAMES,
+        always = SIDE_ALWAYS
+    ),
     metric!(
         M_LLM_TOKENS_BY_CLIENT_TOTAL,
         &["client_type", "model", "token_type"]
@@ -244,12 +313,12 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         &["endpoint", "inbound_protocol"],
         required = &["endpoint"]
     ),
-    metric!(M_PROXY_REQUESTS_TOTAL, REQUEST),
-    metric!(M_PROXY_FAILED_REQUESTS_TOTAL, REQUEST),
+    metric!(M_PROXY_REQUESTS_TOTAL, REQUEST, extra = CALLER_NAMES),
+    metric!(M_PROXY_FAILED_REQUESTS_TOTAL, REQUEST, extra = CALLER_NAMES),
     metric!(
         M_PROXY_REQUEST_DURATION,
         REQUEST_DURATION,
-        extra = &["is_fallback"]
+        extra = &["is_fallback", "api_key_name", "team_name"]
     ),
     metric!(
         M_PROXY_CLIENT_CANCELLED_TOTAL,
@@ -259,11 +328,27 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL,
         &["endpoint", "inbound_protocol", "outcome"]
     ),
-    metric!(M_DEPLOYMENT_REQUESTS_TOTAL, DEPLOYMENT),
-    metric!(M_DEPLOYMENT_SUCCESS_TOTAL, DEPLOYMENT),
-    metric!(M_DEPLOYMENT_FAILURE_TOTAL, DEPLOYMENT),
+    metric!(
+        M_DEPLOYMENT_REQUESTS_TOTAL,
+        DEPLOYMENT,
+        extra = &["provider_key_name"]
+    ),
+    metric!(
+        M_DEPLOYMENT_SUCCESS_TOTAL,
+        DEPLOYMENT,
+        extra = &["provider_key_name"]
+    ),
+    metric!(
+        M_DEPLOYMENT_FAILURE_TOTAL,
+        DEPLOYMENT,
+        extra = &["provider_key_name"]
+    ),
     metric!(M_DEPLOYMENT_STATE, DEPLOYMENT, required = DEPLOYMENT),
-    metric!(M_DEPLOYMENT_COOLED_DOWN_TOTAL, DEPLOYMENT),
+    metric!(
+        M_DEPLOYMENT_COOLED_DOWN_TOTAL,
+        DEPLOYMENT,
+        extra = &["provider_key_name"]
+    ),
     metric!(
         M_ROUTING_SUCCESSFUL_FALLBACKS_TOTAL,
         &["model", "fallback_model"]
@@ -275,18 +360,45 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
     metric!(
         M_RATELIMIT_REMAINING_REQUESTS,
         &["api_key_id", "model"],
+        extra = &["api_key_name"],
         required = &["api_key_id", "model"]
     ),
     metric!(
         M_RATELIMIT_REMAINING_TOKENS,
         &["api_key_id", "model"],
+        extra = &["api_key_name"],
         required = &["api_key_id", "model"]
     ),
-    metric!(M_BUDGET_LIMIT_USD, BUDGET, required = BUDGET),
-    metric!(M_BUDGET_SPENT_USD, BUDGET, required = BUDGET),
-    metric!(M_BUDGET_REMAINING_USD, BUDGET, required = BUDGET),
-    metric!(M_BUDGET_RESET_SECONDS, BUDGET, required = BUDGET),
-    metric!(M_BUDGET_DETAILS_PRESENT, BUDGET, required = BUDGET),
+    metric!(
+        M_BUDGET_LIMIT_USD,
+        BUDGET,
+        extra = CALLER_NAMES,
+        required = BUDGET
+    ),
+    metric!(
+        M_BUDGET_SPENT_USD,
+        BUDGET,
+        extra = CALLER_NAMES,
+        required = BUDGET
+    ),
+    metric!(
+        M_BUDGET_REMAINING_USD,
+        BUDGET,
+        extra = CALLER_NAMES,
+        required = BUDGET
+    ),
+    metric!(
+        M_BUDGET_RESET_SECONDS,
+        BUDGET,
+        extra = CALLER_NAMES,
+        required = BUDGET
+    ),
+    metric!(
+        M_BUDGET_DETAILS_PRESENT,
+        BUDGET,
+        extra = CALLER_NAMES,
+        required = BUDGET
+    ),
     metric!(M_REDIS_FAILURES_TOTAL, &["operation"]),
     metric!(
         M_USAGE_EVENT_DROPS_TOTAL,
@@ -339,13 +451,13 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
     metric!(
         M_REQUEST_E2E_LATENCY_SECONDS,
         LATENCY,
-        extra = USAGE,
+        extra = USAGE_EXTRA,
         always = SIDE_ALWAYS
     ),
     metric!(
         M_REQUEST_TTFT_SECONDS,
         LATENCY,
-        extra = USAGE,
+        extra = USAGE_EXTRA,
         always = SIDE_ALWAYS
     ),
     metric!(M_A2A_REQUESTS_TOTAL, &["agent", "operation", "status"]),
@@ -841,6 +953,53 @@ mod tests {
                 LabelSelection::compile(&selection(name, &labels)).is_err(),
                 "{name}: {labels:?}"
             );
+        }
+    }
+
+    /// Every family that can carry an identifier label can carry its
+    /// readable name as well, so nobody has to map ids to names through the
+    /// Admin API. `env_id` is exempt: one process serves one environment.
+    /// `aisix_deployment_state` is exempt for `provider_key_id`: it is
+    /// written only on a health transition, so a renamed credential would
+    /// keep its old name there until the next one.
+    #[test]
+    fn every_identifier_label_can_be_paired_with_its_name() {
+        const EXEMPT: &[(&str, &str)] = &[(M_DEPLOYMENT_STATE, "provider_key_id")];
+        for metric in METRIC_DEFINITIONS {
+            for label in metric
+                .default_labels
+                .iter()
+                .chain(metric.extra_labels)
+                .chain(metric.always_labels)
+            {
+                let Some(base) = label.strip_suffix("_id") else {
+                    continue;
+                };
+                if *label == "env_id" || EXEMPT.contains(&(metric.name, label)) {
+                    continue;
+                }
+                let name = format!("{base}_name");
+                assert!(
+                    metric.supports(&name),
+                    "{} offers {label} but not {name}",
+                    metric.name
+                );
+            }
+        }
+    }
+
+    /// A name label is selectable, never a default: adding one to a
+    /// default would change what every existing deployment scrapes.
+    #[test]
+    fn name_labels_stay_out_of_the_new_default_sets() {
+        for metric in METRIC_DEFINITIONS {
+            for name in ["api_key_name", "team_name", "policy_name"] {
+                assert!(
+                    !metric.default_labels.contains(&name),
+                    "{} defaults to {name}",
+                    metric.name
+                );
+            }
         }
     }
 

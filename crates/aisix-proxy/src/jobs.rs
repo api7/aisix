@@ -684,7 +684,7 @@ fn emit_job_usage_event(
         &mut event,
         auth.jwt.as_ref(),
         auth.key().user_id.as_deref(),
-        auth.key().user_name.as_deref(),
+        auth.user_name(),
     );
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
@@ -1919,7 +1919,7 @@ fn maybe_attribute_batch(
     let state = state.clone();
     let api_key_id = auth.entry.id.clone();
     let user_id = auth.entry.value.user_id.clone();
-    let user_name = auth.entry.value.user_name.clone();
+    let user_name = auth.user_name().map(str::to_owned);
     let jwt = auth.jwt.clone();
     let model_id = target.model_entry.id.clone();
     let display_name = target.display_name().to_string();

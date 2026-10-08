@@ -37,6 +37,12 @@ pub struct AuthenticatedKey {
     /// `usage_attr::apply_auth_type`), or anonymous traffic becomes
     /// indistinguishable from the key's own in the usage record.
     pub anonymous: bool,
+    /// The team and member documents the key's `team_id` / `user_id`
+    /// name, resolved against the snapshot the request authenticated on.
+    /// Read through [`AuthenticatedKey::team_name`] and
+    /// [`AuthenticatedKey::user_name`], never off the key directly — the
+    /// key's own `user_name` is only the fallback.
+    pub owner: aisix_core::KeyOwnerNames,
 }
 
 /// The verified JWT identity a request authenticated as.
@@ -112,8 +118,46 @@ impl LazySourceIp<'_> {
 }
 
 impl AuthenticatedKey {
+    /// A principal resolved from `snapshot`, with its owner names read
+    /// from the same snapshot.
+    pub(crate) fn new(
+        snapshot: &aisix_core::AisixSnapshot,
+        entry: Arc<ResourceEntry<ApiKey>>,
+        jwt: Option<Arc<JwtIdentity>>,
+        anonymous: bool,
+    ) -> Self {
+        Self {
+            owner: aisix_core::KeyOwnerNames::resolve(snapshot, &entry.value),
+            entry,
+            jwt,
+            anonymous,
+        }
+    }
+
     pub fn key(&self) -> &ApiKey {
         &self.entry.value
+    }
+
+    /// Publish the principal to the request's extensions, where
+    /// `ClientContext` reads the key and its resolved owner names.
+    pub(crate) fn publish(&self, parts: &mut Parts) {
+        parts.extensions.insert(self.entry.clone());
+        parts.extensions.insert(self.owner.clone());
+    }
+
+    /// The key's display name, for the `api_key_name` metric label.
+    pub(crate) fn api_key_name(&self) -> Option<&str> {
+        self.key().telemetry_name()
+    }
+
+    /// See [`aisix_core::KeyOwnerNames::team_name`].
+    pub(crate) fn team_name(&self) -> Option<&str> {
+        self.owner.team_name()
+    }
+
+    /// See [`aisix_core::KeyOwnerNames::user_name`].
+    pub(crate) fn user_name(&self) -> Option<&str> {
+        self.owner.user_name(self.key())
     }
 }
 
@@ -226,7 +270,7 @@ where
     // it for the `${request.api_key.*}` header templates
     // (AISIX-Cloud#1112) — which is why every handler declares
     // `auth: AuthenticatedKey` before `client: ClientContext`.
-    parts.extensions.insert(authed.entry.clone());
+    authed.publish(parts);
     // Same for the JWT identity: `ClientContext` carries it to each
     // handler's usage-event emitter for attribution.
     if let Some(jwt) = &authed.jwt {
@@ -318,11 +362,7 @@ async fn authenticate_token_inner(
         ));
     }
     state.metrics.record_auth_decision("api_key", true, "");
-    Ok(AuthenticatedKey {
-        entry,
-        jwt: None,
-        anonymous: false,
-    })
+    Ok(AuthenticatedKey::new(&snapshot, entry, None, false))
 }
 
 /// Record an API-key denial on the decision metric + log. The token itself

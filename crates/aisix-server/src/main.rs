@@ -385,11 +385,14 @@ fn openapi_tool_name_collisions(
 /// Both families are therefore judged on `api_key_id` alone, which is the
 /// one label here that is an id the snapshot can be asked about:
 ///
-/// - The budget family additionally compares the whole member triple. A
-///   bare existence check would call BOTH label sets live after a rebind or
-///   a rename and leave the pre-change sample frozen under the same
-///   `api_key_id`, which is the case it exists to catch. The triple is read
-///   off the same api-key row the emitter reads, so the comparison is exact.
+/// - The budget family additionally compares the whole member triple and
+///   every selected name label. A bare existence check would call BOTH
+///   label sets live after a rebind or a rename and leave the pre-change
+///   sample frozen under the same `api_key_id`, which is the case it exists
+///   to catch. The values are resolved from the api-key row and the team /
+///   member documents exactly as the emitter resolves them
+///   (`aisix_core::KeyOwnerNames`), so the comparison is exact. The
+///   rate-limit family compares its selected `api_key_name` the same way.
 /// - The rate-limit family's `model` is checked because the emit site
 ///   collapses it to the configured set first (`usage_attr::
 ///   metric_model_label`): an exact model name, a wildcard ROW name like
@@ -405,23 +408,41 @@ fn gauge_series_is_live(snap: &AisixSnapshot, series: aisix_obs::LiveGaugeSeries
     // Taken from the emitter's own constant rather than spelled again here:
     // the two drifting apart would silently start retiring live series.
     const UNRESOLVED: &str = aisix_proxy::UNRESOLVED_MODEL_LABEL;
+    // A name label the series' selection does not keep is `None` and is
+    // not judged: that series does not carry it.
+    let name_matches = |label: Option<&str>, current: Option<&str>| {
+        label.is_none_or(|label| current.unwrap_or(UNKNOWN) == label)
+    };
     match series {
         aisix_obs::LiveGaugeSeries::Budget {
             api_key_id,
             team_id,
             user_id,
             user_name,
+            api_key_name,
+            team_name,
         } => {
             let Some(entry) = snap.apikeys.get_by_id(api_key_id) else {
                 return false;
             };
             let key = &entry.value;
+            // The resolution the emitter uses (`quota::budget_labels`).
+            let owner = aisix_core::KeyOwnerNames::resolve(snap, key);
             key.team_id.as_deref().unwrap_or(UNKNOWN) == team_id
                 && key.user_id.as_deref().unwrap_or(UNKNOWN) == user_id
-                && key.user_name.as_deref().unwrap_or(UNKNOWN) == user_name
+                && owner.user_name(key).unwrap_or(UNKNOWN) == user_name
+                && name_matches(api_key_name, key.telemetry_name())
+                && name_matches(team_name, owner.team_name())
         }
-        aisix_obs::LiveGaugeSeries::RatelimitRemaining { api_key_id, model } => {
-            snap.apikeys.get_by_id(api_key_id).is_some()
+        aisix_obs::LiveGaugeSeries::RatelimitRemaining {
+            api_key_id,
+            model,
+            api_key_name,
+        } => {
+            let Some(entry) = snap.apikeys.get_by_id(api_key_id) else {
+                return false;
+            };
+            name_matches(api_key_name, entry.value.telemetry_name())
                 && (model == UNKNOWN
                     || model == UNRESOLVED
                     || snap.models.get_by_name(model).is_some())
@@ -3485,6 +3506,8 @@ mod tests {
                 team_id: "t",
                 user_id: "u",
                 user_name: "alice",
+                api_key_name: None,
+                team_name: None,
             }
         ));
     }
@@ -3500,6 +3523,8 @@ mod tests {
             team_id: team,
             user_id: user,
             user_name: name,
+            api_key_name: None,
+            team_name: None,
         };
         assert!(gauge_series_is_live(&snap, at("team-new", "u", "alice")));
         assert!(!gauge_series_is_live(&snap, at("team-old", "u", "alice")));
@@ -3526,8 +3551,72 @@ mod tests {
                 team_id: "unknown",
                 user_id: "unknown",
                 user_name: "unknown",
+                api_key_name: Some("unknown"),
+                team_name: Some("unknown"),
             }
         ));
+    }
+
+    /// The name labels are judged against the same resolution the emitter
+    /// uses: the key's display name, the team's `teams` document, and the
+    /// member's `users` document ahead of the key's own `user_name`. A name
+    /// the series' selection does not keep (`None`) is not judged at all.
+    #[test]
+    fn name_labels_are_judged_against_the_resolved_names() {
+        let snap = AisixSnapshot::new();
+        let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": "h",
+            "allowed_models": [],
+            "display_name": "Billing key",
+            "team_id": "t-1",
+            "user_id": "u-1",
+            "user_name": "inline name",
+        }))
+        .unwrap();
+        snap.apikeys
+            .insert(aisix_core::resource::ResourceEntry::new("ak-1", key, 1));
+        let team: aisix_core::Team =
+            serde_json::from_value(serde_json::json!({"name": "Platform"})).unwrap();
+        snap.teams
+            .insert(aisix_core::resource::ResourceEntry::new("t-1", team, 1));
+        let user: aisix_core::User =
+            serde_json::from_value(serde_json::json!({"name": "Alice"})).unwrap();
+        snap.users
+            .insert(aisix_core::resource::ResourceEntry::new("u-1", user, 1));
+        let at = |user_name, api_key_name, team_name| aisix_obs::LiveGaugeSeries::Budget {
+            api_key_id: "ak-1",
+            team_id: "t-1",
+            user_id: "u-1",
+            user_name,
+            api_key_name,
+            team_name,
+        };
+        assert!(gauge_series_is_live(
+            &snap,
+            at("Alice", Some("Billing key"), Some("Platform"))
+        ));
+        // The users document wins over the key's inline name.
+        assert!(!gauge_series_is_live(&snap, at("inline name", None, None)));
+        assert!(!gauge_series_is_live(
+            &snap,
+            at("Alice", Some("Old key name"), None)
+        ));
+        assert!(!gauge_series_is_live(
+            &snap,
+            at("Alice", None, Some("Old team"))
+        ));
+        assert!(gauge_series_is_live(&snap, at("Alice", None, None)));
+        let remaining = |api_key_name| aisix_obs::LiveGaugeSeries::RatelimitRemaining {
+            api_key_id: "ak-1",
+            model: "unknown",
+            api_key_name,
+        };
+        assert!(gauge_series_is_live(&snap, remaining(Some("Billing key"))));
+        assert!(!gauge_series_is_live(
+            &snap,
+            remaining(Some("Old key name"))
+        ));
+        assert!(gauge_series_is_live(&snap, remaining(None)));
     }
 
     /// The rate-limit family is judged on BOTH halves of its key, which is
@@ -3549,6 +3638,7 @@ mod tests {
         let at = |key, model| aisix_obs::LiveGaugeSeries::RatelimitRemaining {
             api_key_id: key,
             model,
+            api_key_name: None,
         };
         // The wildcard ROW name is what the emit site stamps for every
         // concrete name that row serves, and it resolves.

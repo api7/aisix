@@ -34,7 +34,9 @@ use aisix_core::models::{
     McpServer, Model, ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey,
     RateLimitPolicy, SchemaError,
 };
-use aisix_core::models::{validate_pricing_lenient, Pricing};
+use aisix_core::models::{
+    validate_pricing_lenient, validate_team_lenient, validate_user_lenient, Pricing, Team, User,
+};
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
 use serde::de::DeserializeOwned;
@@ -498,6 +500,30 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
                     &mut stats,
                 ) {
                     snapshot.mcp_auth_settings.insert(entry);
+                }
+            }
+            "teams" => {
+                if let Some(entry) = validate_and_parse::<Team>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_team_lenient,
+                    &mut stats,
+                ) {
+                    snapshot.teams.insert(entry);
+                }
+            }
+            "users" => {
+                if let Some(entry) = validate_and_parse::<User>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_user_lenient,
+                    &mut stats,
+                ) {
+                    snapshot.users.insert(entry);
                 }
             }
             "pricing" => {
@@ -1726,6 +1752,27 @@ mod tests {
         assert!(err.contains("no operations that can become tools"), "{err}");
         assert!(err.contains("POST /upload"), "{err}");
         reason("/aisix/mcp_servers/bad-header");
+    }
+
+    #[test]
+    fn team_and_user_documents_load_by_their_key_id() {
+        let entries = vec![
+            raw("/aisix/teams/team-1", br#"{"name":"Platform"}"#, 1),
+            raw("/aisix/users/user-1", br#"{"name":"Alice"}"#, 2),
+            // An unknown field is tolerated on read, like every kind.
+            raw("/aisix/users/user-2", br#"{"name":"Bob","email":"b@x"}"#, 3),
+            // `name` is the document; without it the row is rejected.
+            raw("/aisix/teams/team-2", br#"{}"#, 4),
+        ];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+        assert_eq!(stats.accepted, 3, "{:?}", stats.rejections);
+        assert_eq!(
+            snap.teams.get_by_id("team-1").unwrap().value.name,
+            "Platform"
+        );
+        assert_eq!(snap.users.get_by_id("user-1").unwrap().value.name, "Alice");
+        assert!(snap.users.get_by_id("user-2").is_some());
+        assert!(snap.teams.get_by_id("team-2").is_none());
     }
 
     #[test]

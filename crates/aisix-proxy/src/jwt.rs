@@ -675,15 +675,16 @@ pub(crate) async fn authenticate_jwt(
         claim_mapping = ?claim_mapping,
         "jwt authentication succeeded",
     );
-    Ok(AuthenticatedKey {
-        anonymous: false,
+    Ok(AuthenticatedKey::new(
+        snapshot,
         entry,
-        jwt: Some(Arc::new(JwtIdentity::new(
+        Some(Arc::new(JwtIdentity::new(
             subject.to_string(),
             prov.name.clone(),
             claim_mapping,
         ))),
-    })
+        false,
+    ))
 }
 
 /// Cap on attacker-controlled token metadata reproduced in the decision

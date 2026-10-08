@@ -161,7 +161,7 @@ async fn resolve_caller(
             // extractors running after this one — `ClientContext` and
             // the `${request.api_key.*}` header templates — see the
             // caller without re-authenticating.
-            parts.extensions.insert(anon.auth.entry.clone());
+            anon.auth.publish(parts);
             // Including to the attribution cell, which the extractor path
             // below reaches on its own (AISIX-Cloud#1571).
             crate::attribution::note_authenticated(&anon.auth);
@@ -1502,7 +1502,7 @@ fn emit_tool_call_usage(
         &mut event,
         auth.jwt.as_ref(),
         auth.key().user_id.as_deref(),
-        auth.key().user_name.as_deref(),
+        auth.user_name(),
     );
     crate::usage_attr::apply_auth_type(&mut event, auth);
     // A tool call resolves neither a model nor a ProviderKey, so the

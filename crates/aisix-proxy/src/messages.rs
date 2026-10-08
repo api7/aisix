@@ -263,9 +263,7 @@ pub async fn messages(
                 &provider_label,
                 &model_name,
                 &upstream_model,
-                auth.key().team_id.as_deref(),
-                auth.key().user_id.as_deref(),
-                auth.key().user_name.as_deref(),
+                crate::request_metrics::Caller::new(&auth),
                 &client,
                 &applied_guardrails,
                 &routing,
@@ -317,9 +315,7 @@ pub async fn messages(
                     &model_name,
                     &model_name,
                     &upstream_model,
-                    auth.key().team_id.as_deref(),
-                    auth.key().user_id.as_deref(),
-                    auth.key().user_name.as_deref(),
+                    crate::request_metrics::Caller::new(&auth),
                     status,
                     winner_latency,
                     metrics,
@@ -432,9 +428,7 @@ pub async fn messages(
                 "unknown",
                 &model_name,
                 "unknown",
-                auth.key().team_id.as_deref(),
-                auth.key().user_id.as_deref(),
-                auth.key().user_name.as_deref(),
+                crate::request_metrics::Caller::new(&auth),
                 &client,
                 &applied_guardrails,
                 &routing,
@@ -464,9 +458,7 @@ pub async fn messages(
                     &model_name,
                     &model_name,
                     "unknown",
-                    auth.key().team_id.as_deref(),
-                    auth.key().user_id.as_deref(),
-                    auth.key().user_name.as_deref(),
+                    crate::request_metrics::Caller::new(&auth),
                     status,
                     elapsed,
                     AnthropicUsageMetrics::default(),
@@ -511,9 +503,7 @@ fn emit_failed_attempts_anthropic(
     provider: &str,
     model: &str,
     upstream_model: &str,
-    team_id: Option<&str>,
-    user_id: Option<&str>,
-    user_name: Option<&str>,
+    caller: crate::request_metrics::Caller<'_>,
     client: &ClientContext,
     applied_guardrails: &[AppliedGuardrail],
     routing: &RoutingTelemetry,
@@ -562,9 +552,7 @@ fn emit_failed_attempts_anthropic(
             model,
             model,
             upstream_model,
-            team_id,
-            user_id,
-            user_name,
+            caller,
             rec.status,
             Duration::from_millis(u64::from(rec.latency_ms)),
             AnthropicUsageMetrics::default(),
@@ -943,9 +931,6 @@ async fn dispatch(
                 started,
                 attempt_started,
                 &auth.entry.id,
-                auth.key().team_id.clone(),
-                auth.key().user_id.clone(),
-                auth.key().user_name.clone(),
                 resolved_chain.clone(),
                 client,
                 AttemptInfo {
@@ -1091,9 +1076,6 @@ async fn dispatch_to_target(
     // non-streaming winner (`usage.rs` #655 contract).
     attempt_started: Instant,
     api_key_id: &str,
-    team_id: Option<String>,
-    user_id: Option<String>,
-    user_name: Option<String>,
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
     client: &ClientContext,
     // Winning-attempt classification (#655) — used by the streaming paths
@@ -1158,9 +1140,6 @@ async fn dispatch_to_target(
             started,
             attempt_started,
             api_key_id,
-            team_id,
-            user_id,
-            user_name,
             resolved_chain,
             client,
             attempt,
@@ -1186,9 +1165,6 @@ async fn dispatch_to_target(
         started,
         attempt_started,
         api_key_id,
-        team_id,
-        user_id,
-        user_name,
         resolved_chain,
         client,
         attempt,
@@ -1221,9 +1197,6 @@ async fn anthropic_passthrough_dispatch(
     // When THIS attempt began — see `dispatch_to_target`.
     attempt_started: Instant,
     api_key_id: &str,
-    team_id: Option<String>,
-    user_id: Option<String>,
-    user_name: Option<String>,
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
     client_ctx: &ClientContext,
     attempt: AttemptInfo,
@@ -1507,9 +1480,6 @@ async fn anthropic_passthrough_dispatch(
         let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
         let metric_model = metric_model.into_owned();
         let metric_upstream_model = metric_upstream_model.into_owned();
-        let team_id_c = team_id.clone();
-        let user_id_c = user_id.clone();
-        let user_name_c = user_name.clone();
         // #492: log the same client IP/UA on streamed responses.
         let client_ctx_c = client_ctx.clone();
         // Winning-attempt classification (#655) for the stream-end emit.
@@ -1651,9 +1621,7 @@ async fn anthropic_passthrough_dispatch(
                     &model_name_c,
                     &metric_model,
                     &metric_upstream_model,
-                    team_id_c.as_deref(),
-                    user_id_c.as_deref(),
-                    user_name_c.as_deref(),
+                    metric_caller.as_caller(),
                     // A stream the consumer abandoned mid-flight is reported
                     // as 499, matching LiteLLM. The upstream work still
                     // happened, so the event is emitted either way — only
@@ -2118,9 +2086,6 @@ async fn cross_provider_dispatch(
     // When THIS attempt began — see `dispatch_to_target`.
     attempt_started: Instant,
     api_key_id: &str,
-    team_id: Option<String>,
-    user_id: Option<String>,
-    user_name: Option<String>,
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
     client: &ClientContext,
     attempt: AttemptInfo,
@@ -2281,9 +2246,6 @@ async fn cross_provider_dispatch(
         let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
         let metric_model = metric_model.into_owned();
         let metric_upstream_model = metric_upstream_model.into_owned();
-        let team_id_for_telem = team_id;
-        let user_id_for_telem = user_id;
-        let user_name_for_telem = user_name;
         let started_for_telem = started;
         let attempt_started_for_telem = attempt_started;
         // #492: log the same client IP/UA on streamed responses.
@@ -2416,9 +2378,7 @@ async fn cross_provider_dispatch(
                     &model_for_telem,
                     &metric_model,
                     &metric_upstream_model,
-                    team_id_for_telem.as_deref(),
-                    user_id_for_telem.as_deref(),
-                    user_name_for_telem.as_deref(),
+                    metric_caller.as_caller(),
                     // See the sibling passthrough path.
                     anthropic_stream_status(
                         comp.reached_end,
@@ -3336,10 +3296,9 @@ fn emit_anthropic_usage_event(
     model: &str,
     metric_model: &str,
     upstream_model: &str,
-    team_id: Option<&str>,
-    user_id: Option<&str>,
-    // #890 req-3: readable owner name (1:1 with user_id) for the metric label.
-    user_name: Option<&str>,
+    // The caller identity of the metric labels, including the readable
+    // names (#890 req-3) resolved beside their ids.
+    caller: crate::request_metrics::Caller<'_>,
     status_code: u16,
     elapsed: Duration,
     metrics: AnthropicUsageMetrics,
@@ -3474,12 +3433,7 @@ fn emit_anthropic_usage_event(
     crate::request_metrics::record_usage(
         state,
         "/v1/messages",
-        crate::request_metrics::Caller {
-            api_key_id,
-            team_id: team_id.unwrap_or("unknown"),
-            user_id: user_id.unwrap_or("unknown"),
-            user_name: user_name.unwrap_or("unknown"),
-        },
+        caller,
         crate::request_metrics::Upstream {
             provider,
             model: metric_model,
@@ -3521,10 +3475,12 @@ fn emit_anthropic_usage_event(
                     upstream_model: bounded_upstream.as_ref(),
                     provider_key_id: pk.labels().id(),
                     provider_key_name: pk.labels().name(),
-                    api_key_id,
-                    team_id: team_id.unwrap_or("unknown"),
-                    user_id: user_id.unwrap_or("unknown"),
-                    user_name: user_name.unwrap_or("unknown"),
+                    api_key_id: caller.api_key_id,
+                    api_key_name: caller.api_key_name,
+                    team_id: caller.team_id,
+                    team_name: caller.team_name,
+                    user_id: caller.user_id,
+                    user_name: caller.user_name,
                 },
             },
             Duration::from_millis(u64::from(metrics.upstream_ttft_ms)),

@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "The display name of an organization member who owns API keys.\n\nThe document's id is the value API keys carry in `user_id`. The gateway reads the name only to label telemetry, as the `user_name` metric label, where it takes precedence over the key's own `user_name`; it never uses it for authentication, routing, or limits.",
+  "properties": {
+    "name": {
+      "description": "Display name of the member. An empty name is reported as `unknown`.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "name"
+  ],
+  "title": "User",
+  "type": "object"
+}

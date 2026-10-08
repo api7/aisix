@@ -2396,6 +2396,8 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
         mcp_auth_settings,
         pricing,
         global_pricing,
+        teams,
+        users,
     } = src;
     for e in models.entries() {
         dst.models.insert_arc(e);
@@ -2448,6 +2450,12 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
     for e in global_pricing.entries() {
         dst.global_pricing.insert_arc(e);
     }
+    for e in teams.entries() {
+        dst.teams.insert_arc(e);
+    }
+    for e in users.entries() {
+        dst.users.insert_arc(e);
+    }
 }
 
 /// Remove `(kind, id)` from `snap`.
@@ -2475,6 +2483,8 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         mcp_auth_settings,
         pricing,
         global_pricing,
+        teams,
+        users,
     } = snap;
     match kind {
         "models" => {
@@ -2530,6 +2540,12 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         }
         "global_pricing" => {
             global_pricing.remove(id);
+        }
+        "teams" => {
+            teams.remove(id);
+        }
+        "users" => {
+            users.remove(id);
         }
         _ => {}
     }
@@ -2605,6 +2621,8 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         mcp_auth_settings,
         pricing,
         global_pricing,
+        teams,
+        users,
     } = snap;
     match kind {
         "models" => models.get_by_id(id).is_some(),
@@ -2624,6 +2642,8 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         "mcp_auth_settings" => mcp_auth_settings.get_by_id(id).is_some(),
         "pricing" => pricing.get_by_id(id).is_some(),
         "global_pricing" => global_pricing.get_by_id(id).is_some(),
+        "teams" => teams.get_by_id(id).is_some(),
+        "users" => users.get_by_id(id).is_some(),
         _ => false,
     }
 }
@@ -2662,6 +2682,8 @@ fn resource_counts(snap: &AisixSnapshot) -> BTreeMap<String, usize> {
         ("mcp_auth_settings", snap.mcp_auth_settings.len()),
         ("pricing", snap.pricing.len()),
         ("global_pricing", snap.global_pricing.len()),
+        ("teams", snap.teams.len()),
+        ("users", snap.users.len()),
     ] {
         if n > 0 {
             counts.insert(kind.to_string(), n);

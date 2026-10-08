@@ -54,7 +54,7 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
-use aisix_core::AisixSnapshot;
+use aisix_core::{AisixSnapshot, ApiKey};
 use aisix_obs::{LatencySide, LlmUsage, RequestLabels, RequestOutcome, UsageLabels};
 
 use crate::auth::AuthenticatedKey;
@@ -69,7 +69,9 @@ pub(crate) const UNKNOWN: &str = "unknown";
 #[derive(Clone, Copy)]
 pub(crate) struct Caller<'a> {
     pub api_key_id: &'a str,
+    pub api_key_name: &'a str,
     pub team_id: &'a str,
+    pub team_name: &'a str,
     pub user_id: &'a str,
     pub user_name: &'a str,
 }
@@ -79,9 +81,11 @@ impl<'a> Caller<'a> {
         let key = auth.key();
         Self {
             api_key_id: &auth.entry.id,
+            api_key_name: auth.api_key_name().unwrap_or(UNKNOWN),
             team_id: key.team_id.as_deref().unwrap_or(UNKNOWN),
+            team_name: auth.team_name().unwrap_or(UNKNOWN),
             user_id: key.user_id.as_deref().unwrap_or(UNKNOWN),
-            user_name: key.user_name.as_deref().unwrap_or(UNKNOWN),
+            user_name: auth.user_name().unwrap_or(UNKNOWN),
         }
     }
 
@@ -91,11 +95,15 @@ impl<'a> Caller<'a> {
     pub(crate) fn from_api_key_id(snap: &aisix_core::AisixSnapshot, api_key_id: &str) -> Owned {
         let entry = snap.apikeys.get_by_id(api_key_id);
         let key = entry.as_ref().map(|e| &e.value);
+        let owner = key.map(|k| aisix_core::KeyOwnerNames::resolve(snap, k));
+        let owned = |v: Option<&str>| v.map(str::to_owned);
         Owned {
             api_key_id: api_key_id.to_owned(),
+            api_key_name: owned(key.and_then(ApiKey::telemetry_name)),
             team_id: key.and_then(|k| k.team_id.clone()),
+            team_name: owned(owner.as_ref().and_then(|o| o.team_name())),
             user_id: key.and_then(|k| k.user_id.clone()),
-            user_name: key.and_then(|k| k.user_name.clone()),
+            user_name: owned(key.zip(owner.as_ref()).and_then(|(k, o)| o.user_name(k))),
         }
     }
 
@@ -106,7 +114,9 @@ impl<'a> Caller<'a> {
     pub(crate) fn unattributed(api_key_id: Option<&'a str>) -> Self {
         Self {
             api_key_id: api_key_id.unwrap_or(UNKNOWN),
+            api_key_name: UNKNOWN,
             team_id: UNKNOWN,
+            team_name: UNKNOWN,
             user_id: UNKNOWN,
             user_name: UNKNOWN,
         }
@@ -117,7 +127,9 @@ impl<'a> Caller<'a> {
 /// outlive the guard. Call [`Owned::as_caller`] at the emit.
 pub(crate) struct Owned {
     api_key_id: String,
+    api_key_name: Option<String>,
     team_id: Option<String>,
+    team_name: Option<String>,
     user_id: Option<String>,
     user_name: Option<String>,
 }
@@ -126,7 +138,9 @@ impl Owned {
     pub(crate) fn as_caller(&self) -> Caller<'_> {
         Caller {
             api_key_id: &self.api_key_id,
+            api_key_name: self.api_key_name.as_deref().unwrap_or(UNKNOWN),
             team_id: self.team_id.as_deref().unwrap_or(UNKNOWN),
+            team_name: self.team_name.as_deref().unwrap_or(UNKNOWN),
             user_id: self.user_id.as_deref().unwrap_or(UNKNOWN),
             user_name: self.user_name.as_deref().unwrap_or(UNKNOWN),
         }
@@ -388,7 +402,9 @@ pub(crate) fn record(
         provider_key_id: upstream.pk.id(),
         provider_key_name: upstream.pk.name(),
         api_key_id: caller.api_key_id,
+        api_key_name: caller.api_key_name,
         team_id: caller.team_id,
+        team_name: caller.team_name,
         user_id: caller.user_id,
         user_name: caller.user_name,
         stream: upstream.stream,
@@ -460,7 +476,9 @@ fn record_e2e_latency_as(
             provider_key_id: upstream.pk.id(),
             provider_key_name: upstream.pk.name(),
             api_key_id: caller.api_key_id,
+            api_key_name: caller.api_key_name,
             team_id: caller.team_id,
+            team_name: caller.team_name,
             user_id: caller.user_id,
             user_name: caller.user_name,
         },
@@ -522,7 +540,7 @@ pub(crate) struct OwnedLatencyLabels {
     provider: String,
     status: u16,
     streaming: bool,
-    details: [String; 12],
+    details: [String; 14],
 }
 
 impl From<aisix_obs::LatencyLabels<'_>> for OwnedLatencyLabels {
@@ -544,7 +562,9 @@ impl From<aisix_obs::LatencyLabels<'_>> for OwnedLatencyLabels {
                 d.provider_key_id,
                 d.provider_key_name,
                 d.api_key_id,
+                d.api_key_name,
                 d.team_id,
+                d.team_name,
                 d.user_id,
                 d.user_name,
             ]
@@ -572,9 +592,11 @@ impl OwnedLatencyLabels {
                 provider_key_id: &d[6],
                 provider_key_name: &d[7],
                 api_key_id: &d[8],
-                team_id: &d[9],
-                user_id: &d[10],
-                user_name: &d[11],
+                api_key_name: &d[9],
+                team_id: &d[10],
+                team_name: &d[11],
+                user_id: &d[12],
+                user_name: &d[13],
             },
         }
     }
@@ -656,7 +678,9 @@ pub(crate) fn record_usage(
             provider_key_id: upstream.pk.id(),
             provider_key_name: upstream.pk.name(),
             api_key_id: caller.api_key_id,
+            api_key_name: caller.api_key_name,
             team_id: caller.team_id,
+            team_name: caller.team_name,
             user_id: caller.user_id,
             user_name: caller.user_name,
         },

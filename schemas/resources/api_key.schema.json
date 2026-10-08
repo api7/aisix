@@ -366,7 +366,7 @@
       ]
     },
     "user_name": {
-      "description": "Readable display name of the owning member. Used only for telemetry labels alongside `user_id`; never used for authentication or routing. When omitted, telemetry reports the user name as `\"unknown\"`.",
+      "description": "Readable display name of the owning member. Used only for telemetry labels alongside `user_id`; never used for authentication or routing. Read only when no `users` document exists for `user_id`; when one does, its name is used instead. When neither provides a name, telemetry reports the user name as `\"unknown\"`.",
       "type": [
         "string",
         "null"

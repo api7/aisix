@@ -73,7 +73,9 @@ pub struct ApiKey {
 
     /// Readable display name of the owning member. Used only for telemetry
     /// labels alongside `user_id`; never used for authentication or routing.
-    /// When omitted, telemetry reports the user name as `"unknown"`.
+    /// Read only when no `users` document exists for `user_id`; when one
+    /// does, its name is used instead. When neither provides a name,
+    /// telemetry reports the user name as `"unknown"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_name: Option<String>,
 
@@ -172,6 +174,12 @@ pub struct ApiKey {
 }
 
 impl ApiKey {
+    /// The key's display name as the `api_key_name` telemetry label reads
+    /// it: `None` when absent or empty, so both report as `unknown`.
+    pub fn telemetry_name(&self) -> Option<&str> {
+        self.display_name.as_deref().filter(|n| !n.is_empty())
+    }
+
     /// Canonical hash function for converting an `Authorization:
     /// Bearer <plaintext>` value to the form persisted in the
     /// snapshot (and on the cp-api side as `api_keys.key_hash`).

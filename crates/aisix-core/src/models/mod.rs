@@ -11,10 +11,9 @@
 //! - [`Routing`] — virtual-router strategy + targets (§3.5, PR #17)
 //! - [`ProviderKey`] — managed upstream secret (§3.6)
 //!
-//! Team is intentionally absent: it's a SaaS-tier concept owned by
-//! the AISIX-Cloud control plane, not by the standalone gateway.
-//! Standalone deployments do per-key rate-limiting via
-//! `ApiKey::rate_limit`.
+//! [`Team`] and [`User`] carry only the display names telemetry labels
+//! resolve from an API key's `team_id` / `user_id`; team membership and
+//! limits stay owned by the AISIX Cloud control plane.
 
 pub mod a2a_agent;
 pub mod apikey;
@@ -41,6 +40,8 @@ pub mod routing;
 pub mod schema;
 pub mod semantic;
 pub mod snapshot;
+pub mod team;
+pub mod user;
 
 pub use a2a_agent::{A2aAgent, A2aAuthType, A2aProtocolVersion};
 pub use apikey::{ApiKey, McpServerLimit};
@@ -100,10 +101,13 @@ pub use schema::{
     validate_oidc_provider, validate_oidc_provider_lenient, validate_passthrough_route,
     validate_passthrough_route_lenient, validate_pricing, validate_pricing_lenient,
     validate_provider_key, validate_provider_key_lenient, validate_rate_limit_policy,
-    validate_rate_limit_policy_lenient, SchemaError,
+    validate_rate_limit_policy_lenient, validate_team, validate_team_lenient, validate_user,
+    validate_user_lenient, SchemaError,
 };
 pub use semantic::{
     Aggregation, ClassifierType, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure,
     Semantic, SemanticClassifier, SemanticMatch, SemanticRoute, TYPESAFE_PROVIDER,
 };
-pub use snapshot::AisixSnapshot;
+pub use snapshot::{AisixSnapshot, KeyOwnerNames};
+pub use team::Team;
+pub use user::User;

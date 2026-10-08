@@ -873,26 +873,37 @@ impl ModelRuntimeStatusTracker {
         let Some(metrics) = self.metrics.as_ref() else {
             return;
         };
-        let (provider, model, upstream_model, provider_key_id) = self
+        let (provider, model, upstream_model, provider_key_id, provider_key_name) = self
             .snapshot
             .as_ref()
             .and_then(|handle| {
                 let snap = handle.load();
                 let entry = snap.models.get_by_id(model_id)?;
                 let m = &entry.value;
+                let provider_key_id = m
+                    .provider_key_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                // The same resolution the request families use, so the
+                // two name one key alike.
+                let provider_key_name =
+                    crate::usage_attr::ResolvedPk::resolve(&snap, &provider_key_id)
+                        .labels()
+                        .name()
+                        .to_string();
                 Some((
                     m.provider.clone().unwrap_or_else(|| "unknown".to_string()),
                     m.display_name.clone(),
                     m.upstream_model().unwrap_or("unknown").to_string(),
-                    m.provider_key_id
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string()),
+                    provider_key_id,
+                    provider_key_name,
                 ))
             })
             .unwrap_or_else(|| {
                 (
                     "unknown".to_string(),
                     model_id.to_string(),
+                    "unknown".to_string(),
                     "unknown".to_string(),
                     "unknown".to_string(),
                 )
@@ -904,6 +915,7 @@ impl ModelRuntimeStatusTracker {
                 model: &model,
                 upstream_model: &upstream_model,
                 provider_key_id: &provider_key_id,
+                provider_key_name: &provider_key_name,
             },
         );
     }

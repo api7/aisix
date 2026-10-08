@@ -19,7 +19,11 @@ use super::passthrough_route::PassthroughRoute;
 use super::pricing::Pricing;
 use super::provider_key::ProviderKey;
 use super::rate_limit_policy::RateLimitPolicy;
+use super::team::Team;
+use super::user::User;
+use crate::resource::ResourceEntry;
 use crate::snapshot::ResourceTable;
+use std::sync::Arc;
 
 /// Composite of every typed [`ResourceTable`] the gateway reads on the hot
 /// path. Cheap to construct empty; populated by the loader.
@@ -86,6 +90,14 @@ pub struct AisixSnapshot {
     /// one collection the gateway reads from outside its own environment
     /// prefix, and the only kind accepted there.
     pub global_pricing: ResourceTable<Pricing>,
+    /// Team display names: `/aisix/<env>/teams/<team-id>`, keyed by the
+    /// id API keys carry in `team_id`. Read only to label telemetry —
+    /// see [`KeyOwnerNames`].
+    pub teams: ResourceTable<Team>,
+    /// Member display names: `/aisix/<env>/users/<user-id>`, keyed by the
+    /// id API keys carry in `user_id`. Read only to label telemetry —
+    /// see [`KeyOwnerNames`].
+    pub users: ResourceTable<User>,
 }
 
 impl AisixSnapshot {
@@ -113,6 +125,59 @@ impl AisixSnapshot {
             + self.mcp_auth_settings.len()
             + self.pricing.len()
             + self.global_pricing.len()
+            + self.teams.len()
+            + self.users.len()
+    }
+}
+
+/// The team and member documents an API key's `team_id` / `user_id` name,
+/// resolved once per request from the snapshot the request authenticated
+/// against.
+///
+/// The ONE resolution every telemetry label and every gauge-liveness check
+/// goes through: a label minted from one rule and judged live by another
+/// would retire live series or keep dead ones. Holds the rows rather than
+/// copies of their names, so resolving costs two map reads and no
+/// allocation.
+#[derive(Debug, Clone, Default)]
+pub struct KeyOwnerNames {
+    team: Option<Arc<ResourceEntry<Team>>>,
+    user: Option<Arc<ResourceEntry<User>>>,
+}
+
+impl KeyOwnerNames {
+    pub fn resolve(snap: &AisixSnapshot, key: &ApiKey) -> Self {
+        Self {
+            team: key
+                .team_id
+                .as_deref()
+                .and_then(|id| snap.teams.get_by_id(id)),
+            user: key
+                .user_id
+                .as_deref()
+                .and_then(|id| snap.users.get_by_id(id)),
+        }
+    }
+
+    /// The team's display name; `None` when the key names no team, no
+    /// `teams` document exists for it, or the document's name is empty.
+    pub fn team_name(&self) -> Option<&str> {
+        self.team
+            .as_ref()
+            .map(|e| e.value.name.as_str())
+            .filter(|n| !n.is_empty())
+    }
+
+    /// The member's display name. A `users` document for the key's
+    /// `user_id` is authoritative — an empty name there is unresolved, not
+    /// a reason to read the key. Only when no such document exists does the
+    /// key's own inline `user_name` apply, which is what a resources file
+    /// and a control plane that has not projected `users` yet provide.
+    pub fn user_name<'a>(&'a self, key: &'a ApiKey) -> Option<&'a str> {
+        match &self.user {
+            Some(e) => Some(e.value.name.as_str()).filter(|n| !n.is_empty()),
+            None => key.user_name.as_deref(),
+        }
     }
 }
 
@@ -131,6 +196,56 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn owner_names_resolve_from_the_named_documents() {
+        let snap = AisixSnapshot::new();
+        let key = |json: &str| serde_json::from_str::<ApiKey>(json).unwrap();
+        let named = |name: &str| Team {
+            name: name.into(),
+            runtime_id: String::new(),
+        };
+        snap.teams
+            .insert(ResourceEntry::new("t-1", named("Platform"), 1));
+        snap.teams
+            .insert(ResourceEntry::new("t-empty", named(""), 1));
+        snap.users.insert(ResourceEntry::new(
+            "u-1",
+            User {
+                name: "Alice".into(),
+                runtime_id: String::new(),
+            },
+            1,
+        ));
+        snap.users.insert(ResourceEntry::new(
+            "u-empty",
+            User {
+                name: String::new(),
+                runtime_id: String::new(),
+            },
+            1,
+        ));
+
+        let k = key(r#"{"key_hash":"h","team_id":"t-1","user_id":"u-1","user_name":"inline"}"#);
+        let owner = KeyOwnerNames::resolve(&snap, &k);
+        assert_eq!(owner.team_name(), Some("Platform"));
+        // The users document wins over the key's own copy.
+        assert_eq!(owner.user_name(&k), Some("Alice"));
+
+        // No document: the inline name is the fallback; no team name.
+        let k = key(r#"{"key_hash":"h","team_id":"t-x","user_id":"u-x","user_name":"inline"}"#);
+        let owner = KeyOwnerNames::resolve(&snap, &k);
+        assert_eq!(owner.team_name(), None);
+        assert_eq!(owner.user_name(&k), Some("inline"));
+
+        // An empty name in a document is unresolved — not a reason to
+        // fall back to the key.
+        let k =
+            key(r#"{"key_hash":"h","team_id":"t-empty","user_id":"u-empty","user_name":"inline"}"#);
+        let owner = KeyOwnerNames::resolve(&snap, &k);
+        assert_eq!(owner.team_name(), None);
+        assert_eq!(owner.user_name(&k), None);
     }
 
     fn sample_apikey() -> ApiKey {
