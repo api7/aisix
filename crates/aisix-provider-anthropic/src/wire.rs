@@ -2508,8 +2508,9 @@ struct ToolCallState {
     name: String,
     content_block_index: usize,
     started: bool,
-    /// Closed by a thinking block opening after it; the block cannot be
-    /// reopened, so later argument fragments for it are dropped.
+    /// Closed after it started, by a thinking block opening or the finish;
+    /// the block cannot be reopened, so later argument fragments for it
+    /// are dropped.
     closed: bool,
 }
 
@@ -2711,17 +2712,16 @@ impl AnthropicSseEncoder {
                     .and_then(|a| a.as_str())
                     .unwrap_or("");
 
-                let state = self.tool_calls.entry(oai_index).or_insert_with(|| {
-                    let block_idx = self.next_block_index;
-                    self.next_block_index += 1;
-                    ToolCallState {
+                let state = self
+                    .tool_calls
+                    .entry(oai_index)
+                    .or_insert_with(|| ToolCallState {
                         id: String::new(),
                         name: String::new(),
-                        content_block_index: block_idx,
+                        content_block_index: 0,
                         started: false,
                         closed: false,
-                    }
-                });
+                    });
                 if state.closed {
                     tracing::debug!(
                         tool_call_index = oai_index,
@@ -2738,8 +2738,12 @@ impl AnthropicSseEncoder {
                 }
 
                 // Emit content_block_start once id and name are known.
+                // The index is taken here, not when the call is first seen,
+                // so a thinking block opening in between keeps them in order.
                 if !state.started && !state.id.is_empty() && !state.name.is_empty() {
                     state.started = true;
+                    state.content_block_index = self.next_block_index;
+                    self.next_block_index += 1;
                     events.push(AnthropicSseEvent {
                         event: "content_block_start",
                         data: serde_json::json!({
@@ -2909,8 +2913,8 @@ impl AnthropicSseEncoder {
         for state in self.tool_calls.values_mut() {
             if state.started && !state.closed {
                 open.push(state.content_block_index);
+                state.closed = true;
             }
-            state.closed = true;
         }
         open.sort_unstable();
         events.extend(open.into_iter().map(content_block_stop_event));
@@ -6323,6 +6327,32 @@ mod tests {
                 "start 2 \"tool_use\"",
                 "delta 2 \"input_json_delta\"",
                 "stop 2",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+    }
+
+    /// A tool call whose name has not arrived yet has no block to close: a
+    /// thinking block opening in between must not cost it its block, and its
+    /// index follows the thinking block's.
+    #[test]
+    fn sse_encoder_tool_call_named_after_thinking_keeps_its_block() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "m", 0);
+        let mut events = enc.next_events(&tool_call_chunk(0, "c1", "", ""));
+        events.extend(enc.next_events(&reasoning_chunk("think")));
+        events.extend(enc.next_events(&tool_call_chunk(0, "", "f", "{}")));
+        events.extend(enc.next_events(&tool_finish_chunk()));
+        assert_eq!(
+            event_summary(&events),
+            [
+                "message_start",
+                "start 0 \"thinking\"",
+                "delta 0 \"thinking_delta\"",
+                "stop 0",
+                "start 1 \"tool_use\"",
+                "delta 1 \"input_json_delta\"",
+                "stop 1",
                 "message_delta",
                 "message_stop",
             ]
