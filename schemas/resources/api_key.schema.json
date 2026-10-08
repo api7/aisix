@@ -272,7 +272,7 @@
       "type": "boolean"
     },
     "display_name": {
-      "description": "Operator-facing label for this key, as shown in the dashboard. Read only by the `${request.api_key.name}` header template (AISIX-Cloud#1112); never used for authentication or routing.",
+      "description": "Operator-facing label for this key, as shown in the dashboard. Read by the `${request.api_key.name}` header template (AISIX-Cloud#1112) and as the `api_key_name` metric label; never used for authentication or routing.",
       "type": [
         "string",
         "null"
