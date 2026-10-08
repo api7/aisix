@@ -827,9 +827,9 @@ struct RetirableSeries {
     /// Retirement re-emits these, so the write lands on the same rendered
     /// series whatever the selection drops.
     labels: Vec<(&'static str, Box<str>)>,
-    /// Set once the series has been retired, so a later sweep neither
-    /// re-marks it nor forgets it. Kept rather than dropped because a name
-    /// can come BACK: a rename reverted re-enables a label set whose handle
+    /// Set once the series has been retired, so it is counted once. A
+    /// STALE series stays registered rather than dropped, because a name
+    /// can come back: a rename reverted re-enables a label set whose handle
     /// every worker still caches, so it would never re-register, and the
     /// next rename away from it would leave it frozen.
     retired: bool,
@@ -841,6 +841,30 @@ impl RetirableSeries {
             .iter()
             .find(|(n, _)| *n == name)
             .map_or("unknown", |(_, v)| v)
+    }
+}
+
+/// What the configuration says about one tracked series — the answer of
+/// the liveness predicate of [`Metrics::retire_stale_gauges`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GaugeLiveness {
+    /// It still describes the configuration exactly.
+    Live,
+    /// Its resource exists but no longer matches — a rename or a rebind.
+    /// Retired, and kept watching: the same values can come back.
+    Stale,
+    /// Its resource is gone. Retired and forgotten.
+    Gone,
+}
+
+/// `true` is [`GaugeLiveness::Live`], `false` is [`GaugeLiveness::Gone`].
+impl From<bool> for GaugeLiveness {
+    fn from(live: bool) -> Self {
+        if live {
+            Self::Live
+        } else {
+            Self::Gone
+        }
     }
 }
 
@@ -888,8 +912,9 @@ struct ConfigLabelState {
 const WORKER_CACHE_CAPACITY: usize = 1024;
 
 /// Cap on the retirable-series registry — the process-wide count of
-/// distinct label sets across the gauge families that can outlive what
-/// they name.
+/// distinct rendered series across the gauge families that can outlive
+/// what they name. One entry per METRIC, so an api key with a budget
+/// takes five.
 ///
 /// The bound that makes one number safe for all of them is that every
 /// dimension is CONFIGURED: api keys, and models collapsed to the
@@ -898,7 +923,7 @@ const WORKER_CACHE_CAPACITY: usize = 1024;
 /// to mint entries per request would fill the cap and silently stop every
 /// other family from being tracked, which is exactly the failure this
 /// whole mechanism exists to prevent.
-const RETIRABLE_CAPACITY: usize = 16_384;
+const RETIRABLE_CAPACITY: usize = 65_536;
 
 /// Separator joining label values into a worker-cache key — a control
 /// byte that no bounded label vocabulary contains. A value that DOES
@@ -1337,15 +1362,11 @@ impl Metrics {
         }
         // Safety valve, same reasoning as `WORKER_CACHE_CAPACITY`: these
         // series are bounded by the configured resources, but an unforeseen
-        // unbounded dimension must not pin memory here. A retired series is
-        // given up first, since it only waits for a name to come back;
-        // beyond that, losing a registration only means that series is not
-        // retirable — never a wrong value.
+        // unbounded dimension must not pin memory here. Losing a
+        // registration only means that series is not retirable — never a
+        // wrong value.
         if map.len() >= RETIRABLE_CAPACITY {
-            let Some(evict) = map.iter().find(|(_, v)| v.retired).map(|(k, _)| k.clone()) else {
-                return;
-            };
-            map.remove(&evict);
+            return;
         }
         map.insert(
             Box::from(key.as_str()),
@@ -1394,11 +1415,16 @@ impl Metrics {
     /// presence flag whose documented cleared value is `0`, and that is
     /// what the guard `details_present == 1` is written against.
     ///
-    /// A retired series is marked exactly once. It stays registered, so
-    /// that a series whose name comes back — a rename reverted — is
-    /// watched again and retires again when it goes stale a second time;
-    /// see [`RetirableSeries::retired`].
-    pub fn retire_stale_gauges(&self, is_live: impl Fn(LiveGaugeSeries<'_>) -> bool) -> usize {
+    /// A retired series is counted once. A [`GaugeLiveness::Gone`] one is
+    /// dropped from the registry. A [`GaugeLiveness::Stale`] one stays
+    /// registered and is re-marked on every sweep while it stays stale:
+    /// a request that resolved the old names before the change can still
+    /// write the old series after it was retired, and a name can come back
+    /// — a rename reverted — and go stale a second time.
+    pub fn retire_stale_gauges<L: Into<GaugeLiveness>>(
+        &self,
+        is_live: impl Fn(LiveGaugeSeries<'_>) -> L,
+    ) -> usize {
         // Take the entries out under the lock and release it before doing
         // any work: `is_live` reads the caller's snapshot and the retire
         // path registers handles on the recorder, and holding this mutex
@@ -1434,13 +1460,15 @@ impl Metrics {
                         api_key_name: name("api_key_name"),
                     },
                 };
-                let live = is_live(view);
-                if live || series.retired {
-                    series.retired = !live;
+                let liveness = is_live(view).into();
+                if liveness == GaugeLiveness::Live {
+                    series.retired = false;
                     keep.push((key, series));
                     continue;
                 }
-                retired += 1;
+                if !series.retired {
+                    retired += 1;
+                }
                 // The presence flag is boolean and its documented cleared
                 // value is 0; everything else carries a quantity and
                 // retires to NaN.
@@ -1456,7 +1484,9 @@ impl Metrics {
                     .collect();
                 metrics::gauge!(series.metric, labels).set(value);
                 series.retired = true;
-                keep.push((key, series));
+                if liveness == GaugeLiveness::Stale {
+                    keep.push((key, series));
+                }
             }
         });
         let mut map = self.inner.retirable.lock().expect("retirable registry");
@@ -5600,10 +5630,12 @@ mod tests {
         }
     }
 
-    fn live_team(want: &'static str) -> impl Fn(LiveGaugeSeries<'_>) -> bool {
+    fn live_team(want: &'static str) -> impl Fn(LiveGaugeSeries<'_>) -> GaugeLiveness {
         move |series| match series {
-            LiveGaugeSeries::Budget { team_name, .. } => team_name.is_none_or(|n| n == want),
-            _ => true,
+            LiveGaugeSeries::Budget { team_name, .. } if team_name.is_some_and(|n| n != want) => {
+                GaugeLiveness::Stale
+            }
+            _ => GaugeLiveness::Live,
         }
     }
 
@@ -5723,6 +5755,28 @@ mod tests {
                 .iter()
                 .all(|l| l.contains("_count{side=")),
             "side keeps its leading position:\n{rendered}"
+        );
+    }
+
+    /// A request that resolved the old names before a rename can write the
+    /// old series AFTER the sweep retired it. While the series stays stale
+    /// the next sweep marks it again rather than leave that value standing.
+    #[test]
+    fn a_stale_series_written_after_retirement_is_retired_again() {
+        let m = named_budget_metrics();
+        m.set_budget_gauges(named("Platform"), spend(40.0));
+        m.set_budget_gauges(named("Platform Eng"), spend(45.0));
+        assert_eq!(m.retire_stale_gauges(live_team("Platform Eng")), 2);
+        // The in-flight request finishes under the old name.
+        m.set_budget_gauges(named("Platform"), spend(41.0));
+        // Already counted, but marked again.
+        assert_eq!(m.retire_stale_gauges(live_team("Platform Eng")), 0);
+        assert_eq!(
+            spent_by_team(&m),
+            vec![
+                ("Platform".to_owned(), "NaN".to_owned()),
+                ("Platform Eng".to_owned(), "45".to_owned()),
+            ]
         );
     }
 

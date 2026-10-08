@@ -373,8 +373,9 @@ fn openapi_tool_name_collisions(
 /// Is this gauge label set still describing something the configuration
 /// contains?
 ///
-/// The retirement sweep asks this per series; `false` marks the series as
-/// no longer current (see `Metrics::retire_stale_gauges`). Two rules keep
+/// The retirement sweep asks this per series: `Gone` when the api key no
+/// longer exists, `Stale` when it exists but the series no longer matches
+/// it (see `Metrics::retire_stale_gauges`). Two rules keep
 /// it from retiring live data:
 ///
 /// Absence has to be POSITIVE: only a label this can resolve, and whose
@@ -401,7 +402,12 @@ fn openapi_tool_name_collisions(
 ///   raw caller string still reaching the label, this check would retire
 ///   live series every sweep, because a wildcard alias serves concrete
 ///   names that are in no `models` row.
-fn gauge_series_is_live(snap: &AisixSnapshot, series: aisix_obs::LiveGaugeSeries<'_>) -> bool {
+fn gauge_series_is_live(
+    snap: &AisixSnapshot,
+    series: aisix_obs::LiveGaugeSeries<'_>,
+) -> aisix_obs::GaugeLiveness {
+    use aisix_obs::GaugeLiveness::{Gone, Live, Stale};
+    let judge = |matches: bool| if matches { Live } else { Stale };
     const UNKNOWN: &str = "unknown";
     // What `metric_model_label` emits when nothing resolved. It names no
     // row, so it is a placeholder like `unknown` and must never be retired.
@@ -423,16 +429,18 @@ fn gauge_series_is_live(snap: &AisixSnapshot, series: aisix_obs::LiveGaugeSeries
             team_name,
         } => {
             let Some(entry) = snap.apikeys.get_by_id(api_key_id) else {
-                return false;
+                return Gone;
             };
             let key = &entry.value;
             // The resolution the emitter uses (`quota::budget_labels`).
             let owner = aisix_core::KeyOwnerNames::resolve(snap, key);
-            key.team_id.as_deref().unwrap_or(UNKNOWN) == team_id
-                && key.user_id.as_deref().unwrap_or(UNKNOWN) == user_id
-                && owner.user_name(key).unwrap_or(UNKNOWN) == user_name
-                && name_matches(api_key_name, key.telemetry_name())
-                && name_matches(team_name, owner.team_name())
+            judge(
+                key.team_id.as_deref().unwrap_or(UNKNOWN) == team_id
+                    && key.user_id.as_deref().unwrap_or(UNKNOWN) == user_id
+                    && owner.user_name(key).unwrap_or(UNKNOWN) == user_name
+                    && name_matches(api_key_name, key.telemetry_name())
+                    && name_matches(team_name, owner.team_name()),
+            )
         }
         aisix_obs::LiveGaugeSeries::RatelimitRemaining {
             api_key_id,
@@ -440,12 +448,14 @@ fn gauge_series_is_live(snap: &AisixSnapshot, series: aisix_obs::LiveGaugeSeries
             api_key_name,
         } => {
             let Some(entry) = snap.apikeys.get_by_id(api_key_id) else {
-                return false;
+                return Gone;
             };
-            name_matches(api_key_name, entry.value.telemetry_name())
-                && (model == UNKNOWN
-                    || model == UNRESOLVED
-                    || snap.models.get_by_name(model).is_some())
+            judge(
+                name_matches(api_key_name, entry.value.telemetry_name())
+                    && (model == UNKNOWN
+                        || model == UNRESOLVED
+                        || snap.models.get_by_name(model).is_some()),
+            )
         }
     }
 }
@@ -3474,6 +3484,10 @@ mod tests {
         );
     }
 
+    fn live(snap: &AisixSnapshot, series: aisix_obs::LiveGaugeSeries<'_>) -> bool {
+        gauge_series_is_live(snap, series) == aisix_obs::GaugeLiveness::Live
+    }
+
     fn snapshot_with_key(
         id: &str,
         team: Option<&str>,
@@ -3499,7 +3513,7 @@ mod tests {
     #[test]
     fn a_deleted_key_is_not_live() {
         let snap = AisixSnapshot::new();
-        assert!(!gauge_series_is_live(
+        assert!(!live(
             &snap,
             aisix_obs::LiveGaugeSeries::Budget {
                 api_key_id: "ak-gone",
@@ -3526,17 +3540,11 @@ mod tests {
             api_key_name: None,
             team_name: None,
         };
-        assert!(gauge_series_is_live(&snap, at("team-new", "u", "alice")));
-        assert!(!gauge_series_is_live(&snap, at("team-old", "u", "alice")));
-        assert!(!gauge_series_is_live(
-            &snap,
-            at("team-new", "u-old", "alice")
-        ));
+        assert!(live(&snap, at("team-new", "u", "alice")));
+        assert!(!live(&snap, at("team-old", "u", "alice")));
+        assert!(!live(&snap, at("team-new", "u-old", "alice")));
         // A rename strands the old name under the same id, same as a rebind.
-        assert!(!gauge_series_is_live(
-            &snap,
-            at("team-new", "u", "Alice Before")
-        ));
+        assert!(!live(&snap, at("team-new", "u", "Alice Before")));
     }
 
     /// An unbound key projects `unknown` for the member triple; that IS its
@@ -3544,7 +3552,7 @@ mod tests {
     #[test]
     fn an_unbound_key_is_live_under_its_placeholders() {
         let snap = snapshot_with_key("ak-1", None, None, None);
-        assert!(gauge_series_is_live(
+        assert!(live(
             &snap,
             aisix_obs::LiveGaugeSeries::Budget {
                 api_key_id: "ak-1",
@@ -3591,32 +3599,34 @@ mod tests {
             api_key_name,
             team_name,
         };
-        assert!(gauge_series_is_live(
+        assert!(live(
             &snap,
             at("Alice", Some("Billing key"), Some("Platform"))
         ));
         // The users document wins over the key's inline name.
-        assert!(!gauge_series_is_live(&snap, at("inline name", None, None)));
-        assert!(!gauge_series_is_live(
-            &snap,
-            at("Alice", Some("Old key name"), None)
-        ));
-        assert!(!gauge_series_is_live(
-            &snap,
-            at("Alice", None, Some("Old team"))
-        ));
-        assert!(gauge_series_is_live(&snap, at("Alice", None, None)));
+        assert!(!live(&snap, at("inline name", None, None)));
+        assert!(!live(&snap, at("Alice", Some("Old key name"), None)));
+        assert!(!live(&snap, at("Alice", None, Some("Old team"))));
+        assert!(live(&snap, at("Alice", None, None)));
         let remaining = |api_key_name| aisix_obs::LiveGaugeSeries::RatelimitRemaining {
             api_key_id: "ak-1",
             model: "unknown",
             api_key_name,
         };
-        assert!(gauge_series_is_live(&snap, remaining(Some("Billing key"))));
-        assert!(!gauge_series_is_live(
-            &snap,
-            remaining(Some("Old key name"))
-        ));
-        assert!(gauge_series_is_live(&snap, remaining(None)));
+        assert!(live(&snap, remaining(Some("Billing key"))));
+        assert!(!live(&snap, remaining(Some("Old key name"))));
+        assert!(live(&snap, remaining(None)));
+        // A renamed key is stale — watched on, since a name can come back —
+        // and a deleted one is gone.
+        assert_eq!(
+            gauge_series_is_live(&snap, at("Alice", Some("Old key name"), None)),
+            aisix_obs::GaugeLiveness::Stale
+        );
+        snap.apikeys.remove("ak-1");
+        assert_eq!(
+            gauge_series_is_live(&snap, at("Alice", None, None)),
+            aisix_obs::GaugeLiveness::Gone
+        );
     }
 
     /// The rate-limit family is judged on BOTH halves of its key, which is
@@ -3642,13 +3652,13 @@ mod tests {
         };
         // The wildcard ROW name is what the emit site stamps for every
         // concrete name that row serves, and it resolves.
-        assert!(gauge_series_is_live(&snap, at("ak-1", "openai/*")));
+        assert!(live(&snap, at("ak-1", "openai/*")));
         // Placeholders name no row, so they are never retired.
-        assert!(gauge_series_is_live(&snap, at("ak-1", "unresolved")));
-        assert!(gauge_series_is_live(&snap, at("ak-1", "unknown")));
+        assert!(live(&snap, at("ak-1", "unresolved")));
+        assert!(live(&snap, at("ak-1", "unknown")));
         // Either half going away retires the series.
-        assert!(!gauge_series_is_live(&snap, at("ak-gone", "openai/*")));
-        assert!(!gauge_series_is_live(&snap, at("ak-1", "deleted-model")));
+        assert!(!live(&snap, at("ak-gone", "openai/*")));
+        assert!(!live(&snap, at("ak-1", "deleted-model")));
     }
 
     #[tokio::test(start_paused = true)]

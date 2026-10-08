@@ -125,6 +125,7 @@ impl<'a> Caller<'a> {
 
 /// Owning form of [`Caller`], for the snapshot lookup whose strings cannot
 /// outlive the guard. Call [`Owned::as_caller`] at the emit.
+#[derive(Clone)]
 pub(crate) struct Owned {
     api_key_id: String,
     api_key_name: Option<String>,
@@ -135,6 +136,20 @@ pub(crate) struct Owned {
 }
 
 impl Owned {
+    /// The owning form of [`Caller::new`].
+    pub(crate) fn from_auth(auth: &AuthenticatedKey) -> Self {
+        let c = Caller::new(auth);
+        let known = |v: &str| (v != UNKNOWN).then(|| v.to_owned());
+        Self {
+            api_key_id: c.api_key_id.to_owned(),
+            api_key_name: known(c.api_key_name),
+            team_id: known(c.team_id),
+            team_name: known(c.team_name),
+            user_id: known(c.user_id),
+            user_name: known(c.user_name),
+        }
+    }
+
     pub(crate) fn as_caller(&self) -> Caller<'_> {
         Caller {
             api_key_id: &self.api_key_id,

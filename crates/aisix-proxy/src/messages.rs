@@ -931,6 +931,7 @@ async fn dispatch(
                 started,
                 attempt_started,
                 &auth.entry.id,
+                &crate::request_metrics::Owned::from_auth(auth),
                 resolved_chain.clone(),
                 client,
                 AttemptInfo {
@@ -1076,6 +1077,9 @@ async fn dispatch_to_target(
     // non-streaming winner (`usage.rs` #655 contract).
     attempt_started: Instant,
     api_key_id: &str,
+    // The authenticated caller's metric identity, names included —
+    // resolved once from the principal rather than looked up again.
+    caller: &crate::request_metrics::Owned,
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
     client: &ClientContext,
     // Winning-attempt classification (#655) — used by the streaming paths
@@ -1140,6 +1144,7 @@ async fn dispatch_to_target(
             started,
             attempt_started,
             api_key_id,
+            caller,
             resolved_chain,
             client,
             attempt,
@@ -1165,6 +1170,7 @@ async fn dispatch_to_target(
         started,
         attempt_started,
         api_key_id,
+        caller,
         resolved_chain,
         client,
         attempt,
@@ -1197,6 +1203,9 @@ async fn anthropic_passthrough_dispatch(
     // When THIS attempt began — see `dispatch_to_target`.
     attempt_started: Instant,
     api_key_id: &str,
+    // The authenticated caller's metric identity, names included —
+    // resolved once from the principal rather than looked up again.
+    caller: &crate::request_metrics::Owned,
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
     client_ctx: &ClientContext,
     attempt: AttemptInfo,
@@ -1477,7 +1486,7 @@ async fn anthropic_passthrough_dispatch(
         let upstream_model_c = upstream_model.clone();
         let (metric_model, metric_upstream_model) =
             crate::usage_attr::metric_model_label_pair(snapshot, model_name, &upstream_model_c);
-        let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
+        let metric_caller = caller.clone();
         let metric_model = metric_model.into_owned();
         let metric_upstream_model = metric_upstream_model.into_owned();
         // #492: log the same client IP/UA on streamed responses.
@@ -2086,6 +2095,9 @@ async fn cross_provider_dispatch(
     // When THIS attempt began — see `dispatch_to_target`.
     attempt_started: Instant,
     api_key_id: &str,
+    // The authenticated caller's metric identity, names included —
+    // resolved once from the principal rather than looked up again.
+    caller: &crate::request_metrics::Owned,
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
     client: &ClientContext,
     attempt: AttemptInfo,
@@ -2243,7 +2255,7 @@ async fn cross_provider_dispatch(
             model_name,
             &upstream_model_for_telem,
         );
-        let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
+        let metric_caller = caller.clone();
         let metric_model = metric_model.into_owned();
         let metric_upstream_model = metric_upstream_model.into_owned();
         let started_for_telem = started;

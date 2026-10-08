@@ -842,21 +842,23 @@ impl ModelRuntimeStatusTracker {
     /// tuple across all four or an operator cannot join "this deployment is
     /// cooled down" to "this deployment is failing".
     pub(crate) fn record_deployment_attempt(&self, model_id: &str, outcome: RequestOutcome) {
-        self.with_deployment_labels(model_id, |metrics, labels| {
+        self.with_deployment_labels(model_id, true, |metrics, labels| {
             metrics.record_deployment_request(labels, outcome);
         });
     }
 
     /// Bump `aisix_deployment_cooled_down_total` for `model_id`.
     fn record_cooldown(&self, model_id: &str) {
-        self.with_deployment_labels(model_id, |metrics, labels| {
+        self.with_deployment_labels(model_id, true, |metrics, labels| {
             metrics.record_deployment_cooldown(labels);
         });
     }
 
     /// Set the `aisix_deployment_state` gauge for `model_id`.
     fn emit_deployment_state(&self, model_id: &str, state: DeploymentState) {
-        self.with_deployment_labels(model_id, |metrics, labels| {
+        // The state gauge carries no `provider_key_name` (see
+        // `DeploymentLabels`), so it skips resolving one.
+        self.with_deployment_labels(model_id, false, |metrics, labels| {
             metrics.set_deployment_state(labels, state);
         });
     }
@@ -868,6 +870,7 @@ impl ModelRuntimeStatusTracker {
     fn with_deployment_labels(
         &self,
         model_id: &str,
+        with_provider_key_name: bool,
         f: impl FnOnce(&Metrics, DeploymentLabels<'_>),
     ) {
         let Some(metrics) = self.metrics.as_ref() else {
@@ -886,11 +889,14 @@ impl ModelRuntimeStatusTracker {
                     .unwrap_or_else(|| "unknown".to_string());
                 // The same resolution the request families use, so the
                 // two name one key alike.
-                let provider_key_name =
+                let provider_key_name = if with_provider_key_name {
                     crate::usage_attr::ResolvedPk::resolve(&snap, &provider_key_id)
                         .labels()
                         .name()
-                        .to_string();
+                        .to_string()
+                } else {
+                    "unknown".to_string()
+                };
                 Some((
                     m.provider.clone().unwrap_or_else(|| "unknown".to_string()),
                     m.display_name.clone(),

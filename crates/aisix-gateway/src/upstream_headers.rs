@@ -76,10 +76,6 @@ pub struct CallerIdentity {
     /// four `request.api_key.*` keys, and `HeaderVars::resolve` matches
     /// them one by one — this is not among them.
     pub user_name: Option<String>,
-    /// Display name of the team `team_id` names, for the `team_name`
-    /// metric label; resolved, and excluded from header templates, like
-    /// `user_name`.
-    pub team_name: Option<String>,
 }
 
 impl CallerIdentity {
@@ -95,7 +91,6 @@ impl CallerIdentity {
             team_id: entry.value.team_id.clone(),
             user_id: entry.value.user_id.clone(),
             user_name: owner.user_name(&entry.value).map(str::to_owned),
-            team_name: owner.team_name().map(str::to_owned),
         }
     }
 }
