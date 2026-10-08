@@ -31,6 +31,12 @@ import {
 //
 // The upstream issues no signature for reasoning it reports as
 // `reasoning_content`, so the Anthropic block carries `signature: ""`.
+//
+// 3. Anthropic's own API rejects a thinking block whose signature does not
+//    verify, so a replayed unsigned block is dropped before a `/v1/messages`
+//    request reaches it — per target, so a fail-over from another upstream
+//    still lands — while another vendor's Anthropic-compatible endpoint
+//    receives the history as the client sent it.
 
 const CALLER = "sk-thinking-cross-protocol";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
@@ -124,17 +130,30 @@ const ANTHROPIC_STREAM = [
     delta: { type: "signature_delta", signature: "SIGNATURE_BYTES" },
   }),
   JSON.stringify({ type: "content_block_stop", index: 0 }),
+  // A second thinking block: its text must start on a new line, exactly as
+  // the non-streaming response joins two blocks.
   JSON.stringify({
     type: "content_block_start",
     index: 1,
-    content_block: { type: "text", text: "" },
+    content_block: { type: "thinking", thinking: "", signature: "" },
   }),
   JSON.stringify({
     type: "content_block_delta",
     index: 1,
-    delta: { type: "text_delta", text: ANSWER },
+    delta: { type: "thinking_delta", thinking: "Second." },
   }),
   JSON.stringify({ type: "content_block_stop", index: 1 }),
+  JSON.stringify({
+    type: "content_block_start",
+    index: 2,
+    content_block: { type: "text", text: "" },
+  }),
+  JSON.stringify({
+    type: "content_block_delta",
+    index: 2,
+    delta: { type: "text_delta", text: ANSWER },
+  }),
+  JSON.stringify({ type: "content_block_stop", index: 2 }),
   JSON.stringify({
     type: "message_delta",
     delta: { stop_reason: "end_turn" },
@@ -418,7 +437,7 @@ describe("thinking ↔ reasoning_content across protocols (AISIX-Cloud#1784)", (
       .map((c) => c.choices?.[0]?.delta?.reasoning_content ?? "")
       .join("");
     const content = chunks.map((c) => c.choices?.[0]?.delta?.content ?? "").join("");
-    expect(reasoning).toBe("Streamed thought.");
+    expect(reasoning).toBe("Streamed thought.\nSecond.");
     expect(content).toBe(ANSWER);
     // Reasoning precedes the answer, as the upstream produced it.
     const firstReasoning = chunks.findIndex((c) => c.choices?.[0]?.delta?.reasoning_content);
@@ -426,5 +445,199 @@ describe("thinking ↔ reasoning_content across protocols (AISIX-Cloud#1784)", (
     expect(firstReasoning).toBeGreaterThanOrEqual(0);
     expect(firstReasoning).toBeLessThan(firstContent);
     expect(raw).not.toContain("SIGNATURE_BYTES");
+  });
+
+  test("/v1/responses → Anthropic non-streaming: thinking blocks become a leading reasoning item", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    await ready();
+    const res = await post("/v1/responses", { model: MODELS.anthNonStream, input: "say hi" });
+    expect(res.status).toBe(200);
+    const raw = await res.text();
+    const body = JSON.parse(raw) as { output: Array<Record<string, any>> };
+    expect(body.output.map((o) => o.type)).toEqual(["reasoning", "message"]);
+    expect(body.output[0]!.summary).toEqual([
+      { type: "summary_text", text: "First idea.\nSecond idea." },
+    ]);
+    expect(body.output[1]!.content[0].text).toBe(ANSWER);
+    expect(raw).not.toContain("REDACTED_CIPHERTEXT");
+    expect(raw).not.toContain("sig-a");
+  });
+});
+
+// A Claude Code tool loop whose first turn came from an OpenAI-compatible
+// reasoning upstream (unsigned thinking) and an earlier turn from Claude
+// itself (signed thinking + redacted thinking).
+const MIXED_HISTORY = [
+  { role: "user", content: "first" },
+  {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "Signed by Claude.", signature: "SIGNED_SIG" },
+      { type: "redacted_thinking", data: "REDACTED_CIPHERTEXT" },
+      { type: "text", text: "a1" },
+    ],
+  },
+  { role: "user", content: "second" },
+  {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "UNSIGNED_REASONING", signature: "" },
+      { type: "tool_use", id: "call_0", name: "get_time", input: {} },
+    ],
+  },
+  { role: "user", content: [{ type: "tool_result", tool_use_id: "call_0", content: "12:00" }] },
+  {
+    role: "assistant",
+    content: [{ type: "thinking", thinking: "THINKING_ONLY_TURN", signature: "" }],
+  },
+  { role: "user", content: "third" },
+];
+
+function sentMessages(upstream: OpenAiUpstream, baseline: number): Array<Record<string, any>> {
+  const sent = upstream.receivedRequests.slice(baseline).find((r) => r.method === "POST");
+  expect(sent, "upstream received the request").toBeDefined();
+  return (JSON.parse(sent!.body) as { messages: Array<Record<string, any>> }).messages;
+}
+
+describe("unsigned thinking blocks and Anthropic's own API (AISIX-Cloud#1784)", () => {
+  // Reuses nothing from the describe above: each describe owns its app.
+  let app: SpawnedApp | undefined;
+  const ups: Record<string, OpenAiUpstream> = {};
+  let etcdReachable = false;
+  const M = {
+    anthropic: "unsigned-anthropic",
+    thirdParty: "unsigned-third-party",
+    thirdPartyDown: "unsigned-third-party-down",
+    group: "unsigned-failover-group",
+  } as const;
+  const KEY = "sk-unsigned-thinking-strip";
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+    ups.anthropic = await startOpenAiUpstream({ nonStreamBody: ANTHROPIC_NON_STREAM });
+    ups.thirdParty = await startOpenAiUpstream({ nonStreamBody: ANTHROPIC_NON_STREAM });
+    ups.thirdPartyDown = await startOpenAiUpstream({
+      status: 500,
+      errorBody: { type: "error", error: { type: "api_error", message: "down" } },
+    });
+    app = await spawnApp();
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    const anthPk = await seed.createProviderKey({
+      display_name: `${M.anthropic}-pk`,
+      provider: "anthropic",
+      adapter: "anthropic",
+      secret: "sk-anth-mock",
+      api_base: ups.anthropic.baseUrl,
+    });
+    await seed.createModel({
+      display_name: M.anthropic,
+      provider: "anthropic",
+      model_name: "claude-sonnet-4-5",
+      provider_key_id: anthPk.id,
+    });
+    // Another vendor's Anthropic-compatible endpoint, declared on an
+    // OpenAI-adapter key — the way a DeepSeek / Moonshot key reaches it.
+    for (const key of ["thirdParty", "thirdPartyDown"] as const) {
+      const pk = await seed.createProviderKey({
+        display_name: `${M[key]}-pk`,
+        provider: "deepseek",
+        adapter: "openai",
+        secret: "sk-mock",
+        api_base: `${ups[key]!.baseUrl}/v1`,
+        apis: { messages: { base: `${ups[key]!.baseUrl}/anthropic` } },
+      });
+      await seed.createModel({
+        display_name: M[key],
+        provider: "deepseek",
+        model_name: "deepseek-v4-pro",
+        provider_key_id: pk.id,
+      });
+    }
+    await seed.createModel({
+      display_name: M.group,
+      routing: {
+        strategy: "failover",
+        targets: [{ model: M.thirdPartyDown }, { model: M.anthropic }],
+        max_fallbacks: 1,
+      },
+    });
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update(KEY).digest("hex"),
+      allowed_models: Object.values(M),
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    for (const u of Object.values(ups)) await u.close();
+  });
+
+  async function ready(): Promise<void> {
+    const probe = new ProxyClient(app!.proxyUrl, KEY);
+    await waitConfigPropagation(async () => {
+      const res = await probe.listModels();
+      if (res.status !== 200) return false;
+      const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
+      return Object.values(M).every((m) => data.some((e) => e.id === m));
+    });
+  }
+
+  function send(model: string): Promise<Response> {
+    return fetch(`${app!.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "x-api-key": KEY, "content-type": "application/json" },
+      body: JSON.stringify({
+        model,
+        max_tokens: 256,
+        tools: [{ name: "get_time", input_schema: { type: "object", properties: {} } }],
+        messages: MIXED_HISTORY,
+      }),
+    });
+  }
+
+  function expectStripped(messages: Array<Record<string, any>>) {
+    const wire = JSON.stringify(messages);
+    expect(wire).not.toContain("UNSIGNED_REASONING");
+    expect(wire).not.toContain("THINKING_ONLY_TURN");
+    // Signed and redacted blocks reach Anthropic untouched.
+    expect(messages[1]!.content).toEqual(MIXED_HISTORY[1]!.content);
+    // The tool-call turn keeps its tool_use; the thinking-only turn is gone
+    // rather than sent with an empty `content`.
+    expect(messages[3]!.content).toEqual([
+      { type: "tool_use", id: "call_0", name: "get_time", input: {} },
+    ]);
+    expect(messages.map((m) => m.role)).toEqual(["user", "assistant", "user", "assistant", "user", "user"]);
+    expect(messages.every((m) => !Array.isArray(m.content) || m.content.length > 0)).toBe(true);
+  }
+
+  test("Anthropic's own API receives the history without unsigned thinking blocks", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    await ready();
+    const baseline = ups.anthropic!.receivedRequests.length;
+    const res = await send(M.anthropic);
+    expect(res.status).toBe(200);
+    expectStripped(sentMessages(ups.anthropic!, baseline));
+  });
+
+  test("another vendor's Anthropic-compatible endpoint receives the unsigned blocks", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    await ready();
+    const baseline = ups.thirdParty!.receivedRequests.length;
+    const res = await send(M.thirdParty);
+    expect(res.status).toBe(200);
+    expect(sentMessages(ups.thirdParty!, baseline)).toEqual(MIXED_HISTORY);
+  });
+
+  test("fail-over from a third-party target to Anthropic strips per target", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    await ready();
+    const downBase = ups.thirdPartyDown!.receivedRequests.length;
+    const anthBase = ups.anthropic!.receivedRequests.length;
+    const res = await send(M.group);
+    expect(res.status).toBe(200);
+    expect(sentMessages(ups.thirdPartyDown!, downBase)).toEqual(MIXED_HISTORY);
+    expectStripped(sentMessages(ups.anthropic!, anthBase));
   });
 });

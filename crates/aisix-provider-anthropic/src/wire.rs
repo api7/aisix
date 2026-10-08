@@ -1470,7 +1470,13 @@ pub enum AnthropicStreamEvent {
         message: AnthropicStreamStartMessage,
     },
     #[serde(rename = "content_block_delta")]
-    ContentBlockDelta { delta: AnthropicStreamDelta },
+    ContentBlockDelta {
+        /// The content block the delta belongs to. Read only to tell one
+        /// thinking block from the next.
+        #[serde(default)]
+        index: Option<u64>,
+        delta: AnthropicStreamDelta,
+    },
     #[serde(rename = "message_delta")]
     MessageDelta {
         delta: AnthropicStreamMessageDelta,
@@ -1631,6 +1637,11 @@ pub struct StreamState {
     /// onto the terminal usage so the bridge doesn't drop them (#906).
     pub cache_creation_tokens: u32,
     pub cache_read_tokens: u32,
+    /// Index of the last thinking block that produced text, and whether the
+    /// current delta opens a later one — whose text then starts on a new
+    /// line, as the non-streaming path joins blocks with `"\n"`.
+    last_thinking_block: Option<u64>,
+    thinking_block_changed: bool,
 }
 
 impl StreamState {
@@ -1656,6 +1667,14 @@ impl StreamState {
                     .as_ref()
                     .and_then(|u| u.cache_read_input_tokens)
                     .unwrap_or(0);
+            }
+            AnthropicStreamEvent::ContentBlockDelta {
+                index,
+                delta: AnthropicStreamDelta::ThinkingDelta { thinking },
+            } if !thinking.is_empty() => {
+                self.thinking_block_changed =
+                    self.last_thinking_block.is_some() && self.last_thinking_block != *index;
+                self.last_thinking_block = *index;
             }
             // AISIX-Cloud#952: harvest cumulative input/cache counts from
             // the terminal message_delta too (max-wins) — some backends
@@ -1683,6 +1702,7 @@ impl StreamState {
         match event {
             AnthropicStreamEvent::ContentBlockDelta {
                 delta: AnthropicStreamDelta::TextDelta { text },
+                ..
             } => Some(ChatChunk {
                 id: self.id.clone(),
                 model: self.model.clone(),
@@ -1697,6 +1717,7 @@ impl StreamState {
             }),
             AnthropicStreamEvent::ContentBlockDelta {
                 delta: AnthropicStreamDelta::ThinkingDelta { thinking },
+                ..
             } if !thinking.is_empty() => Some(ChatChunk {
                 id: self.id.clone(),
                 model: self.model.clone(),
@@ -1704,7 +1725,11 @@ impl StreamState {
                     role: None,
                     content: None,
                     tool_calls: None,
-                    reasoning_content: Some(thinking.clone()),
+                    reasoning_content: Some(if self.thinking_block_changed {
+                        format!("\n{thinking}")
+                    } else {
+                        thinking.clone()
+                    }),
                 },
                 finish_reason: None,
                 usage: None,
@@ -1850,6 +1875,54 @@ fn without_billing_header_line(text: &str) -> SystemText<'_> {
         // the attribution and nothing else.
         _ => SystemText::Empty,
     }
+}
+
+/// Drop every `thinking` block whose `signature` is the empty string from
+/// an Anthropic `/v1/messages` body, returning it unchanged (borrowed) when
+/// there is none.
+///
+/// Callers apply this only when the resolved upstream is Anthropic's own
+/// API (`dispatch::is_first_party_anthropic`). The gateway renders an
+/// OpenAI-compatible upstream's reasoning as a thinking block with
+/// `signature: ""`, because that upstream issued no signature; a client
+/// replays the block verbatim, and Anthropic rejects any thinking block
+/// whose signature does not verify — anywhere in the history — with a 400.
+/// Signed blocks and `redacted_thinking` are kept. An assistant message
+/// left with no content is removed, since Anthropic rejects an empty
+/// `content` array and combines the consecutive same-role turns its
+/// removal leaves.
+pub fn strip_unsigned_thinking_blocks(body: &serde_json::Value) -> Cow<'_, serde_json::Value> {
+    use serde_json::Value;
+    let is_unsigned = |b: &Value| {
+        b.get("type").and_then(Value::as_str) == Some("thinking")
+            && b.get("signature").and_then(Value::as_str) == Some("")
+    };
+    let carries_one = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|msgs| {
+            msgs.iter().any(|m| {
+                m.get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| blocks.iter().any(is_unsigned))
+            })
+        });
+    if !carries_one {
+        return Cow::Borrowed(body);
+    }
+    let mut body = body.clone();
+    if let Some(msgs) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        msgs.retain_mut(
+            |m| match m.get_mut("content").and_then(Value::as_array_mut) {
+                Some(blocks) if blocks.iter().any(is_unsigned) => {
+                    blocks.retain(|b| !is_unsigned(b));
+                    !blocks.is_empty()
+                }
+                _ => true,
+            },
+        );
+    }
+    Cow::Owned(body)
 }
 
 /// Drop the client's billing-header attribution line from an Anthropic
@@ -2508,10 +2581,6 @@ struct ToolCallState {
     name: String,
     content_block_index: usize,
     started: bool,
-    /// Closed after it started, by a thinking block opening or the finish;
-    /// the block cannot be reopened, so later argument fragments for it
-    /// are dropped.
-    closed: bool,
 }
 
 /// State machine for re-encoding a stream of internal `ChatChunk`s as
@@ -2641,7 +2710,14 @@ impl AnthropicSseEncoder {
         }
 
         // ── Thinking content block ──
-        if has_reasoning {
+        // Reasoning that arrives while a tool_use block is open is dropped:
+        // opening a thinking block would close the tool_use block, and the
+        // call's remaining argument fragments would then have nowhere to go.
+        let tool_block_open = self.tool_calls.values().any(|t| t.started);
+        if has_reasoning && tool_block_open {
+            tracing::debug!("dropping reasoning that arrived inside an open tool_use block");
+        }
+        if has_reasoning && !tool_block_open {
             if self.thinking_block_index.is_none() {
                 self.close_open_blocks(&mut events);
                 let idx = self.next_block_index;
@@ -2720,15 +2796,7 @@ impl AnthropicSseEncoder {
                         name: String::new(),
                         content_block_index: 0,
                         started: false,
-                        closed: false,
                     });
-                if state.closed {
-                    tracing::debug!(
-                        tool_call_index = oai_index,
-                        "dropping tool-call fragment for a tool_use block a thinking block closed",
-                    );
-                    continue;
-                }
 
                 if !id.is_empty() {
                     state.id = id.to_string();
@@ -2910,12 +2978,12 @@ impl AnthropicSseEncoder {
         let mut open: Vec<usize> = Vec::new();
         open.extend(self.thinking_block_index.take());
         open.extend(self.text_block_index.take());
-        for state in self.tool_calls.values_mut() {
-            if state.started && !state.closed {
-                open.push(state.content_block_index);
-                state.closed = true;
-            }
-        }
+        open.extend(
+            self.tool_calls
+                .values()
+                .filter(|t| t.started)
+                .map(|t| t.content_block_index),
+        );
         open.sort_unstable();
         events.extend(open.into_iter().map(content_block_stop_event));
     }
@@ -6333,6 +6401,34 @@ mod tests {
         );
     }
 
+    /// Reasoning inside an open tool_use block is dropped so the call's
+    /// arguments arrive whole in one block.
+    #[test]
+    fn sse_encoder_reasoning_inside_open_tool_use_keeps_arguments_whole() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "m", 0);
+        let mut events = enc.next_events(&tool_call_chunk(0, "c1", "f", "{\"tz\":"));
+        events.extend(enc.next_events(&reasoning_chunk("hmm")));
+        events.extend(enc.next_events(&tool_call_chunk(0, "", "", "\"UTC\"}")));
+        events.extend(enc.next_events(&tool_finish_chunk()));
+        assert_eq!(
+            event_summary(&events),
+            [
+                "message_start",
+                "start 0 \"tool_use\"",
+                "delta 0 \"input_json_delta\"",
+                "delta 0 \"input_json_delta\"",
+                "stop 0",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        let args: String = events
+            .iter()
+            .filter_map(|e| e.data["delta"]["partial_json"].as_str())
+            .collect();
+        assert_eq!(args, "{\"tz\":\"UTC\"}");
+    }
+
     /// A tool call whose name has not arrived yet has no block to close: a
     /// thinking block opening in between must not cost it its block, and its
     /// index follows the thinking block's.
@@ -6390,6 +6486,73 @@ mod tests {
         let body = r#"{"id": "m", "model": "c", "content": [{"type": "text", "text": "x"}]}"#;
         let out = response_into_chat_response(serde_json::from_str(body).unwrap());
         assert!(!out.message.extra.contains_key("reasoning_content"));
+    }
+
+    #[test]
+    fn strip_unsigned_thinking_drops_only_empty_signature_blocks() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "unsigned", "signature": ""},
+                    {"type": "thinking", "thinking": "signed", "signature": "sig"},
+                    {"type": "redacted_thinking", "data": "opaque"},
+                    {"type": "text", "text": "a1"},
+                ]},
+                {"role": "user", "content": "q2"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "only", "signature": ""},
+                ]},
+                {"role": "user", "content": "q3"},
+            ],
+        });
+        let out = strip_unsigned_thinking_blocks(&body);
+        assert_eq!(
+            out["messages"],
+            serde_json::json!([
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "signed", "signature": "sig"},
+                    {"type": "redacted_thinking", "data": "opaque"},
+                    {"type": "text", "text": "a1"},
+                ]},
+                {"role": "user", "content": "q2"},
+                {"role": "user", "content": "q3"},
+            ])
+        );
+        let signed_only = serde_json::json!({"messages": [{"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "t", "signature": "sig"},
+        ]}]});
+        assert!(matches!(
+            strip_unsigned_thinking_blocks(&signed_only),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    /// Streamed thinking blocks join exactly as the non-streaming path joins
+    /// them: one newline between blocks, none inside one.
+    #[test]
+    fn stream_thinking_blocks_are_separated_by_a_newline() {
+        let mut state = StreamState::default();
+        let mut reasoning = String::new();
+        for (index, text) in [(0, "one"), (0, " more"), (2, "two")] {
+            let ev: AnthropicStreamEvent = serde_json::from_value(serde_json::json!({
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "thinking_delta", "thinking": text},
+            }))
+            .unwrap();
+            state.update(&ev);
+            reasoning.push_str(
+                &state
+                    .to_chunk(&ev)
+                    .unwrap()
+                    .delta
+                    .reasoning_content
+                    .unwrap(),
+            );
+        }
+        assert_eq!(reasoning, "one more\ntwo");
     }
 
     #[test]
