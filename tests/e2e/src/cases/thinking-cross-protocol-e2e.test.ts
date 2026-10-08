@@ -506,6 +506,7 @@ describe("unsigned thinking blocks and Anthropic's own API (AISIX-Cloud#1784)", 
   let etcdReachable = false;
   const M = {
     anthropic: "unsigned-anthropic",
+    anthropicCount: "unsigned-anthropic-count",
     thirdParty: "unsigned-third-party",
     thirdPartyDown: "unsigned-third-party-down",
     group: "unsigned-failover-group",
@@ -517,6 +518,7 @@ describe("unsigned thinking blocks and Anthropic's own API (AISIX-Cloud#1784)", 
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     ups.anthropic = await startOpenAiUpstream({ nonStreamBody: ANTHROPIC_NON_STREAM });
+    ups.anthropicCount = await startOpenAiUpstream({ nonStreamBody: { input_tokens: 42 } });
     ups.thirdParty = await startOpenAiUpstream({ nonStreamBody: ANTHROPIC_NON_STREAM });
     ups.thirdPartyDown = await startOpenAiUpstream({
       status: 500,
@@ -524,19 +526,21 @@ describe("unsigned thinking blocks and Anthropic's own API (AISIX-Cloud#1784)", 
     });
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
-    const anthPk = await seed.createProviderKey({
-      display_name: `${M.anthropic}-pk`,
-      provider: "anthropic",
-      adapter: "anthropic",
-      secret: "sk-anth-mock",
-      api_base: ups.anthropic.baseUrl,
-    });
-    await seed.createModel({
-      display_name: M.anthropic,
-      provider: "anthropic",
-      model_name: "claude-sonnet-4-5",
-      provider_key_id: anthPk.id,
-    });
+    for (const key of ["anthropic", "anthropicCount"] as const) {
+      const anthPk = await seed.createProviderKey({
+        display_name: `${M[key]}-pk`,
+        provider: "anthropic",
+        adapter: "anthropic",
+        secret: "sk-anth-mock",
+        api_base: ups[key]!.baseUrl,
+      });
+      await seed.createModel({
+        display_name: M[key],
+        provider: "anthropic",
+        model_name: "claude-sonnet-4-5",
+        provider_key_id: anthPk.id,
+      });
+    }
     // Another vendor's Anthropic-compatible endpoint, declared on an
     // OpenAI-adapter key — the way a DeepSeek / Moonshot key reaches it.
     for (const key of ["thirdParty", "thirdPartyDown"] as const) {
@@ -584,8 +588,8 @@ describe("unsigned thinking blocks and Anthropic's own API (AISIX-Cloud#1784)", 
     });
   }
 
-  function send(model: string): Promise<Response> {
-    return fetch(`${app!.proxyUrl}/v1/messages`, {
+  function send(model: string, path = "/v1/messages"): Promise<Response> {
+    return fetch(`${app!.proxyUrl}${path}`, {
       method: "POST",
       headers: { "x-api-key": KEY, "content-type": "application/json" },
       body: JSON.stringify({
@@ -619,6 +623,16 @@ describe("unsigned thinking blocks and Anthropic's own API (AISIX-Cloud#1784)", 
     const res = await send(M.anthropic);
     expect(res.status).toBe(200);
     expectStripped(sentMessages(ups.anthropic!, baseline));
+  });
+
+  test("count_tokens counts the body Anthropic's own API would receive", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    await ready();
+    const baseline = ups.anthropicCount!.receivedRequests.length;
+    const res = await send(M.anthropicCount, "/v1/messages/count_tokens");
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { input_tokens: number }).input_tokens).toBe(42);
+    expectStripped(sentMessages(ups.anthropicCount!, baseline));
   });
 
   test("another vendor's Anthropic-compatible endpoint receives the unsigned blocks", async (ctx) => {
