@@ -739,9 +739,10 @@ async fn count_tokens_to_target(
         // `messages::dispatch_to_target`). This route only ever dispatches to
         // an Anthropic-protocol upstream, but that includes third-party ones,
         // and the count it returns must be the count for the body the sibling
-        // route would actually send.
+        // route would actually send — which, for Anthropic's own API, is also
+        // without unsigned thinking blocks.
         let body = if crate::dispatch::is_first_party_anthropic(snapshot, model) {
-            std::borrow::Cow::Borrowed(body)
+            aisix_provider_anthropic::strip_unsigned_thinking_blocks(body)
         } else {
             aisix_provider_anthropic::strip_billing_header_attribution(body)
         };

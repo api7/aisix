@@ -1126,9 +1126,13 @@ async fn dispatch_to_target(
     // provider's prompt cache on every turn. Dropped here, once, so both
     // the passthrough and the cross-provider branch below are covered —
     // and after the handler's guardrail scan, which reads the caller's
-    // body as it was sent.
+    // body as it was sent. Anthropic's own API instead gets the history
+    // without the unsigned thinking blocks this gateway rendered from
+    // another upstream's reasoning: it rejects any signature that does not
+    // verify. Per target, so a fail-over between the two kinds of upstream
+    // sends each the history it accepts.
     let body = if crate::dispatch::is_first_party_anthropic(snapshot, model) {
-        std::borrow::Cow::Borrowed(body)
+        aisix_provider_anthropic::strip_unsigned_thinking_blocks(body)
     } else {
         aisix_provider_anthropic::strip_billing_header_attribution(body)
     };
