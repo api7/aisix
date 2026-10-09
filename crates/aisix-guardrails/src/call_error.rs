@@ -38,8 +38,9 @@ pub(crate) struct CallFailure<F> {
     pub(crate) failure: F,
     /// The response status, when a response arrived before the failure.
     pub(crate) http_status: Option<u16>,
-    /// The underlying error with its whole `source()` chain; `None` when the
-    /// failure is a bucketed status or a timer, which carry no error value.
+    /// The underlying error with its whole `source()` chain, or only where it
+    /// failed for a response that did not decode; `None` when the failure is
+    /// a bucketed status or a timer, which carry no error value.
     pub(crate) error: Option<String>,
     /// For a reqwest error, which phase it failed in (see [`error_kind`]).
     pub(crate) error_kind: Option<&'static str>,
@@ -120,7 +121,7 @@ impl CallClock {
         CallFailure {
             failure,
             http_status: self.http_status,
-            error: Some(error_chain(err)),
+            error: Some(decode_failure(err).unwrap_or_else(|| error_chain(err))),
             error_kind: Some(error_kind(err)),
             elapsed_ms: self.elapsed_ms(),
         }
@@ -150,6 +151,35 @@ pub fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
         source = s.source();
     }
     out
+}
+
+/// A response that did not decode, described by serde's category and
+/// position alone; `None` when `err` has no serde error beneath it.
+///
+/// serde's message quotes the offending value, and a moderation response
+/// can carry the screened text (Presidio's anonymized output, a provider
+/// echoing its input), which a guardrail log must never hold (#153).
+/// Reading a body the peer cut short is also reported as `decode` but has
+/// no serde source, so it keeps its full chain like any transport error.
+fn decode_failure(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut source = Some(err);
+    while let Some(e) = source {
+        if let Some(serde) = e.downcast_ref::<serde_json::Error>() {
+            let category = match serde.classify() {
+                serde_json::error::Category::Io => "io",
+                serde_json::error::Category::Syntax => "syntax",
+                serde_json::error::Category::Data => "data",
+                serde_json::error::Category::Eof => "eof",
+            };
+            return Some(format!(
+                "response could not be decoded ({category}, line {} column {})",
+                serde.line(),
+                serde.column()
+            ));
+        }
+        source = e.source();
+    }
+    None
 }
 
 /// The phase a reqwest error failed in. Checked in this order because the
@@ -259,14 +289,16 @@ pub(crate) mod testing {
         }
     }
 
-    /// A provider that answers every call with `200` and a body that is not
-    /// JSON, tagged with `request_id` in the `x-acs-request-id` header.
-    pub(crate) async fn not_json_server(request_id: &str) -> wiremock::MockServer {
+    /// A provider that answers every call with `200` and a body no kind
+    /// can decode: a bare JSON string holding [`PROMPT_MARKER`], the way a
+    /// provider that echoes its input would. Tagged with `request_id` in
+    /// the `x-acs-request-id` header.
+    pub(crate) async fn undecodable_server(request_id: &str) -> wiremock::MockServer {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::any())
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
-                    .set_body_string("<html>not json</html>")
+                    .set_body_string(format!("\"{PROMPT_MARKER}\""))
                     .insert_header("x-acs-request-id", request_id),
             )
             .mount(&server)
@@ -274,8 +306,9 @@ pub(crate) mod testing {
         server
     }
 
-    /// The warn for a response that could not be decoded carries the decode
-    /// error next to the failure bucket.
+    /// The warn for a response that could not be decoded says where it
+    /// failed to decode, next to the failure bucket — and nothing of what
+    /// the response said, which quoted the moderated text.
     pub(crate) fn assert_decode_logged(logged: &str, message: &str, failure: &str) {
         let line = failure_line(logged, message);
         assert!(
@@ -284,10 +317,14 @@ pub(crate) mod testing {
         );
         assert!(line.contains("error_kind=decode"), "phase logged: {line}");
         assert!(
-            line.contains("error decoding response body"),
-            "underlying cause logged: {line}"
+            line.contains("response could not be decoded (data, line 1 column"),
+            "decode failure and its position logged: {line}"
         );
         assert!(line.contains("elapsed_ms="), "duration logged: {line}");
+        assert!(
+            !logged.contains(PROMPT_MARKER),
+            "the response's echo of the moderated text leaked: {logged}"
+        );
     }
 
     /// A provider that answers every call with `status` and an empty JSON

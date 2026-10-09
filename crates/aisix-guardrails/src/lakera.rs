@@ -916,11 +916,12 @@ mod tests {
         assert_refusal_logged(&logged, "lakera guard call failed", &["lk-test-key"]);
     }
 
-    /// A response that is not JSON is logged with the decode error.
+    /// A response that does not decode is logged with where it failed, and
+    /// none of the text it quoted.
     #[tokio::test]
     async fn undecodable_response_logs_the_underlying_error() {
         use crate::call_error::testing::*;
-        let server = not_json_server("DECODE-REQ-1").await;
+        let server = undecodable_server("DECODE-REQ-1").await;
         let uri = server.uri();
         let logged = capture_logs(|| async {
             let g = build(&uri, true);

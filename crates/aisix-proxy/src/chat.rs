@@ -974,7 +974,7 @@ async fn cache_semantic_embed(
             tracing::warn!(
                 target: "aisix::cache",
                 policy_name = %sem.policy_name,
-                error = %err,
+                error = %crate::semantic::embed_failure_text(&err),
                 "cache semantic embedding call failed; request proceeds uncached",
             );
             state

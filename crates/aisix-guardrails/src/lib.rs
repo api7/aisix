@@ -311,9 +311,12 @@ pub enum EmbedFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbedError {
     pub failure: EmbedFailure,
-    /// The dispatch error's Display with its `source()` chain
-    /// ([`error_chain`]); `None` when the failure is ours, not the
-    /// provider's (an unresolved alias, a vector count that does not match).
+    /// What went wrong, for the log line. It must never carry text derived
+    /// from an upstream response, which can quote the screened input: an
+    /// embedder keeps only a status or a decode position for those, and
+    /// the [`error_chain`] for everything else. `None`
+    /// when the failure is ours, not the provider's (an unresolved alias,
+    /// a vector count that does not match).
     pub error: Option<String>,
 }
 
