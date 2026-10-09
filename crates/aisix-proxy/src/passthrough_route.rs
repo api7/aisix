@@ -324,6 +324,7 @@ pub async fn entry(
             let status = error.status().as_u16();
             let elapsed = started.elapsed();
             let api_key_id = auth.as_deref().unwrap_or("");
+            let (error_kind, error_message) = crate::attempt::access_log_error(&error);
             emit_access_log(
                 &method,
                 &path,
@@ -334,7 +335,7 @@ pub async fn entry(
                 elapsed,
                 &request_id,
                 None,
-                Some(&error),
+                Some((error_kind, error_message.as_str())),
             );
             crate::request_metrics::record(
                 &state,
@@ -354,7 +355,7 @@ pub async fn entry(
                 "",
                 api_key_id,
                 status,
-                error.kind(),
+                crate::attempt::error_class(&error),
                 error.is_guardrail_block(),
                 &client,
                 crate::usage_attr::applied_guardrails(&audit),
@@ -6621,6 +6622,13 @@ impl RouteTelemetry {
                 None => {}
             }
         }
+        // Named before the line is written, so the line and the event carry
+        // the same class for a stream the caller abandoned.
+        crate::usage_attr::stamp_client_disconnect(
+            self.status,
+            &mut self.error_class,
+            &mut self.error_message,
+        );
         let elapsed = self.started.elapsed();
         let snapshot = self.state.snapshot.load();
         let usage = self.usage.unwrap_or_default();
@@ -6649,7 +6657,8 @@ impl RouteTelemetry {
                 prompt: usage.prompt_tokens,
                 completion: usage.completion_tokens,
             }),
-            None,
+            (!self.error_class.is_empty())
+                .then_some((self.error_class.as_str(), self.error_message.as_str())),
         );
 
         let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &self.pk_id);
@@ -6817,15 +6826,12 @@ fn emit_access_log(
     duration: Duration,
     request_id: &str,
     tokens: Option<AccessLogTokens>,
-    error: Option<&ProxyError>,
+    // `(error_kind, error)`: [`crate::attempt::error_class`] for a failure
+    // the pipeline raised, the usage event's own class for one that ended a
+    // relay — the two records of one request carry one class.
+    error: Option<(&str, &str)>,
 ) {
-    let (error_kind, error) = match error {
-        Some(e) => {
-            let (kind, msg) = crate::attempt::access_log_error(e);
-            (Some(kind), Some(msg))
-        }
-        None => (None, None),
-    };
+    let (error_kind, error) = error.unzip();
     let target = crate::attribution::AccessLogTarget::current();
     crate::attribution::emit_access_log(AccessLog {
         method: method.as_str(),
@@ -6849,7 +6855,7 @@ fn emit_access_log(
         routing_attempt_count: None,
         routing_fallback_count: None,
         error_kind,
-        error: error.as_deref(),
+        error: error.filter(|e| !e.is_empty()),
         mcp: None,
         cache: None,
         request_body_bytes: None,

@@ -299,6 +299,12 @@ pub(crate) struct PkLabels<'a> {
 }
 
 impl<'a> PkLabels<'a> {
+    /// Rebuild the labels from their parts, for a sample recorded after the
+    /// `ResolvedPk` that produced them is gone (a parked stream sample).
+    pub(crate) fn from_parts(id: &'a str, name: &'a str, protocol: &'static str) -> Self {
+        Self { id, name, protocol }
+    }
+
     pub(crate) fn id(self) -> &'a str {
         self.id
     }
@@ -930,10 +936,11 @@ pub(crate) fn emit_usage(
     // filter on. Filling it only when the class is still empty keeps this
     // from overwriting a more specific one, and leaves the head-phase
     // event's own message alone.
-    if event.status_code == crate::CLIENT_CLOSED_REQUEST && event.error_class.is_empty() {
-        event.error_class = crate::CLIENT_DISCONNECTED_KIND.to_string();
-        event.error_message = crate::cancel::CANCELLED_MID_STREAM.to_string();
-    }
+    stamp_client_disconnect(
+        event.status_code,
+        &mut event.error_class,
+        &mut event.error_message,
+    );
     // The request's access-log line, for the families that deferred it to
     // their stream (AISIX-Cloud#1571). Here, and after the stamping above,
     // so the line and the event cannot disagree about the outcome: one
@@ -993,6 +1000,17 @@ pub(crate) fn emit_usage(
         emission.as_ref(),
         exporters.iter().map(|e| &e.value),
     );
+}
+
+/// Name a `499` that nothing else named: a stream the caller abandoned.
+/// [`emit_usage`] applies it to every event; a surface that writes its
+/// access-log line before handing the event over applies it first, so the
+/// line carries the same class.
+pub(crate) fn stamp_client_disconnect(status: u16, class: &mut String, message: &mut String) {
+    if status == crate::CLIENT_CLOSED_REQUEST && class.is_empty() {
+        *class = crate::CLIENT_DISCONNECTED_KIND.to_string();
+        *message = crate::cancel::CANCELLED_MID_STREAM.to_string();
+    }
 }
 
 /// Move the bounded gateway-embedding child audit to the terminal parent

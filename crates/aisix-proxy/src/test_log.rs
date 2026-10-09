@@ -314,3 +314,71 @@ pub(crate) async fn spawn_sse_upstream(frames: Vec<String>) -> String {
     });
     format!("http://{addr}")
 }
+
+/// `metric`'s samples for `endpoint`, summed per `status` label.
+pub(crate) fn samples_by_status(
+    rendered: &str,
+    metric: &str,
+    endpoint: &str,
+) -> std::collections::BTreeMap<u16, f64> {
+    let mut out = std::collections::BTreeMap::new();
+    let prefix = format!("{metric}{{");
+    let endpoint = format!("endpoint=\"{endpoint}\"");
+    for line in rendered.lines().filter(|l| l.starts_with(&prefix)) {
+        let Some((labels, value)) = line.rsplit_once(' ') else {
+            continue;
+        };
+        if !labels.contains(&endpoint) {
+            continue;
+        }
+        let status = labels
+            .split("status=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .and_then(|s| s.parse::<u16>().ok())
+            .expect("every request-family sample carries a status");
+        *out.entry(status).or_insert(0.0) += value.parse::<f64>().unwrap();
+    }
+    out
+}
+
+/// What [`three_stream_endings`] must leave in the request families: ONE
+/// sample per ending, under that ending's own status — `200` for the
+/// delivered stream, `499` for the two the caller abandoned — and a
+/// duration that spans the whole delivered stream, not its head.
+///
+/// A family that records at its handler's return reports three `200`s
+/// here; one that records at both ends reports five samples.
+pub(crate) fn assert_request_families_follow_the_endings(
+    metrics: &aisix_obs::Metrics,
+    endpoint: &str,
+    llm: bool,
+) {
+    let rendered = metrics.render();
+    let expected = std::collections::BTreeMap::from([(200u16, 1.0), (499u16, 2.0)]);
+    let mut families = vec!["aisix_proxy_requests_total"];
+    if llm {
+        families.push("aisix_llm_requests_total");
+    }
+    for family in families {
+        assert_eq!(
+            samples_by_status(&rendered, family, endpoint),
+            expected,
+            "{family}: one sample per ending, at its terminal status\n{rendered}",
+        );
+    }
+    assert_eq!(
+        samples_by_status(&rendered, "aisix_proxy_failed_requests_total", endpoint),
+        std::collections::BTreeMap::from([(499u16, 2.0)]),
+        "the two abandoned streams are failures\n{rendered}",
+    );
+    let delivered = samples_by_status(
+        &rendered,
+        "aisix_proxy_request_duration_seconds_sum",
+        endpoint,
+    );
+    assert!(
+        delivered.get(&200).copied().unwrap_or_default() >= SLOW_DRAIN.as_secs_f64(),
+        "the delivered stream's duration must span its body, not its head: {delivered:?}",
+    );
+}

@@ -212,15 +212,18 @@ counts at its outermost layer and only knows once the response body is done
 with, so the cell holds the line and the middleware's guard writes it then. A
 line emitted directly is written without either size, and nothing errors.
 
-One exception, and it is the whole of it: **a STREAMED response's line is not
-the handler's to write.** Its tail runs when the head goes out, which is not
-when the request ends — so it parks the line on the attribution cell
-(`attribution::PendingAccessLog`) and the line is completed in
+One exception, and it is the whole of it: **a STREAMED response's line — and
+its request metrics — are not the handler's to write.** Its tail runs when the
+head goes out, which is not when the request ends — so it parks the line on the
+attribution cell (`attribution::PendingAccessLog`), together with its
+`request_metrics::PendingRequestMetrics` instead of calling
+`request_metrics::record` (`defer_access_log` takes both), and both are
+completed in
 `usage_attr::emit_usage` with the request's TERMINAL usage event, whichever of
 the stream's endings produced it. That is what makes the line and the row agree
-on `status`, `error_class` and `error_message` by construction; writing the line
-at the tail instead would report every abandoned stream as a `200` beside its
-own `499` row. Two consequences for a new streaming family: park
+on `status`, `error_class` and `error_message` by construction, and puts the
+request families on the same status; writing either at the tail instead would
+report every abandoned stream as a `200` beside its own `499` row. Two consequences for a new streaming family: park
 the line whenever the response IS a stream (a "telemetry already emitted" flag
 is NOT the same predicate — chat's buffered ensemble sets one), and make sure
 the stream really does emit a terminal usage event, because that emit is now
@@ -254,7 +257,8 @@ A handler that instead wraps its whole dispatch and logs the wrapper's status
 (`/mcp`, `/a2a`, `/passthrough`, `/v1/videos`, `/v1/files`) is already covered —
 don't add a second emit to those, or the request logs twice.
 
-Emit the request metrics through `request_metrics::record` and nothing else. It
+Emit the request metrics through `request_metrics::record` (or, for a stream,
+the parked `PendingRequestMetrics`) and nothing else. It
 writes the legacy `aisix_requests_total` **and** the detailed `aisix_proxy_*` /
 `aisix_llm_*` families from one call, so calling `Metrics::record_request`
 directly silently produces a request that exists in one family and not the

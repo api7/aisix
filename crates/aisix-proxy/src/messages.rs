@@ -180,6 +180,17 @@ pub async fn messages(
             monitor_hits.extend(output_monitor_hits);
             let elapsed = started.elapsed();
             let status = response.status().as_u16();
+            // ONE ProviderKey lookup for both the metric emit and the
+            // winner's usage event below (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &provider_key_id);
+            let request_upstream = crate::request_metrics::Upstream {
+                provider: &provider_label,
+                model: &model_name,
+                upstream_model: &upstream_model,
+                pk: pk.labels(),
+                stream: stream_requested,
+                is_fallback: routing.fallback_count() > 0,
+            };
             // Conjoined with the request's own streaming flag rather than
             // resting on `usage_handled_by_stream` alone: a family that ever
             // reuses that flag to mean "already emitted" on a BUFFERED path,
@@ -201,6 +212,13 @@ pub async fn messages(
                     )
                     .with_model(&provider_label, &model_name)
                     .with_routing(&routing),
+                    crate::request_metrics::PendingRequestMetrics::at_stream_end(
+                        &state,
+                        "/v1/messages",
+                        crate::request_metrics::Caller::new(&auth),
+                        request_upstream,
+                        started,
+                    ),
                 );
             } else {
                 emit_access_log(
@@ -214,25 +232,15 @@ pub async fn messages(
                     &routing,
                     None,
                 );
+                crate::request_metrics::record(
+                    &state,
+                    "/v1/messages",
+                    crate::request_metrics::Caller::new(&auth),
+                    request_upstream,
+                    status,
+                    elapsed,
+                );
             }
-            // ONE ProviderKey lookup for both the metric emit and the
-            // winner's usage event below (#941).
-            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &provider_key_id);
-            crate::request_metrics::record(
-                &state,
-                "/v1/messages",
-                crate::request_metrics::Caller::new(&auth),
-                crate::request_metrics::Upstream {
-                    provider: &provider_label,
-                    model: &model_name,
-                    upstream_model: &upstream_model,
-                    pk: pk.labels(),
-                    stream: stream_requested,
-                    is_fallback: routing.fallback_count() > 0,
-                },
-                status,
-                elapsed,
-            );
             // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only —
             // a stream records its full duration at completion instead.
             if !stream_requested {
@@ -465,7 +473,7 @@ pub async fn messages(
                     &client,
                     AttemptInfo {
                         kind: "initial".to_string(),
-                        error_class: err.kind().to_string(),
+                        error_class: crate::attempt::error_class(&err).to_string(),
                         ..Default::default()
                     },
                     guardrail_blocked,
@@ -1602,6 +1610,11 @@ async fn anthropic_passthrough_dispatch(
                 };
                 let (elapsed, attempt_elapsed) =
                     crate::request_metrics::stream_end_elapsed(started, attempt_started);
+                let terminal_status = anthropic_stream_status(
+                    usage.reached_end,
+                    usage.guardrail_blocked,
+                    usage.failure.as_ref(),
+                );
                 let snap_c = state_c.snapshot.load();
                 let pk_c = crate::usage_attr::ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 crate::request_metrics::record_e2e_latency(
@@ -1616,7 +1629,7 @@ async fn anthropic_passthrough_dispatch(
                         stream: true,
                         ..Default::default()
                     },
-                    200,
+                    terminal_status,
                     elapsed,
                 );
                 // A stream can outlive several config generations, so the
@@ -1652,11 +1665,7 @@ async fn anthropic_passthrough_dispatch(
                     // An upstream failure after the headers — a transport
                     // error, a read timeout, an in-band `error` event — is
                     // recorded as that failure's status and error.
-                    anthropic_stream_status(
-                        usage.reached_end,
-                        usage.guardrail_blocked,
-                        usage.failure.as_ref(),
-                    ),
+                    terminal_status,
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
                     attempt_elapsed,
@@ -2362,6 +2371,11 @@ async fn cross_provider_dispatch(
                     started_for_telem,
                     attempt_started_for_telem,
                 );
+                let terminal_status = anthropic_stream_status(
+                    comp.reached_end,
+                    comp.guardrail_blocked,
+                    comp.failure.as_ref(),
+                );
                 let snap_telem = state_for_telem.snapshot.load();
                 let pk_telem =
                     crate::usage_attr::ResolvedPk::resolve(&snap_telem, &provider_key_id_for_telem);
@@ -2377,7 +2391,7 @@ async fn cross_provider_dispatch(
                         stream: true,
                         ..Default::default()
                     },
-                    200,
+                    terminal_status,
                     elapsed,
                 );
                 // Fresh snapshot at stream end — see the passthrough path.
@@ -2396,11 +2410,7 @@ async fn cross_provider_dispatch(
                     &metric_upstream_model,
                     metric_caller.as_caller(),
                     // See the sibling passthrough path.
-                    anthropic_stream_status(
-                        comp.reached_end,
-                        comp.guardrail_blocked,
-                        comp.failure.as_ref(),
-                    ),
+                    terminal_status,
                     // Attempt-scoped — see the sibling passthrough path.
                     attempt_elapsed,
                     metrics,
@@ -7398,7 +7408,9 @@ data: [DONE]\n\n";
         hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
         hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let handle = SnapshotHandle::new(snap);
-        let app = crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache());
+        let state = crate::ProxyState::new(handle, hub, &cfg()).without_cache();
+        let metrics = state.metrics.clone();
+        let app = crate::build_router(state);
 
         let endings = crate::test_log::three_stream_endings(app, || {
             make_req(serde_json::json!({
@@ -7411,6 +7423,7 @@ data: [DONE]\n\n";
         .await;
         crate::test_log::assert_one_line_per_ending(&endings, "/v1/messages", "k-1");
         crate::test_log::assert_latency_is_time_to_first_token(&endings);
+        crate::test_log::assert_request_families_follow_the_endings(&metrics, "/v1/messages", true);
         assert_eq!(
             endings.delivered.field("model").as_deref(),
             Some("my-claude-alias"),

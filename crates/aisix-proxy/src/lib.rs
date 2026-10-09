@@ -9324,6 +9324,7 @@ data: [DONE]\n\n",
         let snap = seed_routing_group("smart", &[("m-primary", "primary", &upstream.uri())]);
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let metrics = state.metrics.clone();
         let app = build_router(state);
 
         let streaming_request = || {
@@ -9342,6 +9343,11 @@ data: [DONE]\n\n",
         let endings = crate::test_log::three_stream_endings(app.clone(), streaming_request).await;
         crate::test_log::assert_one_line_per_ending(&endings, "/v1/chat/completions", "key-id-1");
         crate::test_log::assert_latency_is_time_to_first_token(&endings);
+        crate::test_log::assert_request_families_follow_the_endings(
+            &metrics,
+            "/v1/chat/completions",
+            true,
+        );
 
         // The line and the row are ONE record of ONE request, so they agree
         // on the outcome down to the sentence. They can only disagree if the
@@ -9437,6 +9443,7 @@ data: [DONE]\n\n",
         let snap = seed_snapshot("my-tts", &["my-tts"], &upstream.uri());
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let metrics = state.metrics.clone();
         let app = build_router(state);
 
         let req = Request::builder()
@@ -9461,6 +9468,16 @@ data: [DONE]\n\n",
         assert_body_phase_cancel(&event);
         assert_eq!(event.operation, "speech");
         assert!(rx.try_recv().is_err(), "one request, one row");
+        // The request families count it once, under the same 499: it had a
+        // response head, so it is a request — one the caller never read.
+        let rendered = metrics.render();
+        for family in ["aisix_proxy_requests_total", "aisix_llm_requests_total"] {
+            assert_eq!(
+                crate::test_log::samples_by_status(&rendered, family, "/v1/audio/speech"),
+                std::collections::BTreeMap::from([(CLIENT_CLOSED_REQUEST, 1.0)]),
+                "{family}\n{rendered}",
+            );
+        }
     }
 
     /// A COMPLETED response whose buffered body the caller never read is
@@ -9761,9 +9778,12 @@ data: [DONE]\n\n",
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let state = build_state(snap, Arc::new(Hub::new())).with_usage_sink(UsageSink::new(tx));
         let cell = std::sync::Arc::new(attribution::RequestAttribution::default());
+        // Tracked, as the telemetry middleware tracks every request: only a
+        // tracked cell knows whether its response head went out.
+        cell.track(tracing::Span::none());
 
         // What a streaming handler leaves behind on its way out: the caller
-        // it authenticated, and its line.
+        // it authenticated, its line, and its request-metric samples.
         attribution::sync_scope(&cell, || {
             attribution::note_client(&crate::client_ip::ClientContext::default(), "key-id-1");
             attribution::defer_access_log(
@@ -9775,6 +9795,13 @@ data: [DONE]\n\n",
                     std::time::Instant::now(),
                 )
                 .with_model("openai", "my-gpt4"),
+                crate::request_metrics::PendingRequestMetrics::at_stream_end(
+                    &state,
+                    "/v1/chat/completions",
+                    crate::request_metrics::Caller::unattributed(Some("key-id-1")),
+                    crate::request_metrics::Upstream::default(),
+                    std::time::Instant::now(),
+                ),
             );
         });
 
@@ -9810,6 +9837,17 @@ data: [DONE]\n\n",
             u64::from(event.status_code),
             line.status(),
             "one record, one outcome",
+        );
+        // No response head went out, so this is a head-phase cancel: the
+        // cancel counter speaks for it, the request families do not.
+        let rendered = state.metrics.render();
+        assert!(
+            rendered.contains(CANCEL_METRIC),
+            "the cancel counter must count it: {rendered}"
+        );
+        assert!(
+            !rendered.contains("aisix_proxy_requests_total{"),
+            "a head-phase cancel reached the request families: {rendered}"
         );
     }
 

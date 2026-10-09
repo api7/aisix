@@ -267,7 +267,7 @@ pub async fn count_tokens(
                     &model_name,
                     &api_key_id,
                     status,
-                    err.kind(),
+                    crate::attempt::error_class(&err),
                     err.is_guardrail_block(),
                     &client,
                     crate::usage_attr::applied_guardrails(&screening.audit),

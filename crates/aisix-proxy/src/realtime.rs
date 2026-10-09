@@ -323,7 +323,7 @@ pub(crate) async fn realtime(
                 params.get("model").map(String::as_str).unwrap_or(""),
                 api_key_id.unwrap_or(""),
                 status,
-                err.kind(),
+                crate::attempt::error_class(&err),
                 err.is_guardrail_block(),
                 &client,
                 // Refused before the handshake, so no chain was ever

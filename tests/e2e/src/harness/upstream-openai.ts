@@ -116,6 +116,13 @@ export interface OpenAiUpstreamStep {
 export interface OpenAiUpstream {
   baseUrl: string;
   receivedRequests: ReceivedRequest[];
+  /**
+   * Indexes into `receivedRequests` whose connection the GATEWAY closed
+   * before this mock had finished its response — what an upstream observes
+   * when the gateway abandons a call (a client that hung up, a timeout).
+   * A mock-initiated drop (`disconnectAfterEvents`) is not listed.
+   */
+  closedByPeer: number[];
   close(): Promise<void>;
 }
 
@@ -144,6 +151,7 @@ export async function startOpenAiUpstream(
   opts: OpenAiUpstreamOptions = {},
 ): Promise<OpenAiUpstream> {
   const received: ReceivedRequest[] = [];
+  const closedByPeer: number[] = [];
   let requestIndex = 0;
 
   const handler = (
@@ -156,6 +164,15 @@ export async function startOpenAiUpstream(
     // Swallow it so a deliberately-slow mock can't surface as an unhandled
     // exception that fails the run.
     res.on("error", () => {});
+    // Indexed once the request body has been read, below; a connection that
+    // closes before that never reached `receivedRequests` at all.
+    let index: number | undefined;
+    let selfClosed = false;
+    res.on("close", () => {
+      if (index !== undefined && !selfClosed && !res.writableFinished) {
+        closedByPeer.push(index);
+      }
+    });
     let raw = "";
     req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
     req.on("end", async () => {
@@ -174,6 +191,7 @@ export async function startOpenAiUpstream(
           .map((n) => n.toLowerCase()),
         body: raw,
       });
+      index = received.length - 1;
 
       if (step.responseDelayMs) await sleep(step.responseDelayMs);
 
@@ -271,6 +289,7 @@ export async function startOpenAiUpstream(
             step.disconnectAfterEvents !== undefined &&
             i >= step.disconnectAfterEvents
           ) {
+            selfClosed = true;
             res.destroy();
             return;
           }
@@ -317,6 +336,7 @@ export async function startOpenAiUpstream(
   return {
     baseUrl,
     receivedRequests: received,
+    closedByPeer,
     async close() {
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));

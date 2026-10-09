@@ -169,7 +169,13 @@ pub async fn chat_completions(
             // One ProviderKey lookup for both terminal metric emits and the
             // winner's usage event below (#941).
             let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
-            record_success(
+            // `telemetry_handled_by_stream` alone is NOT "the response is a
+            // stream": the BUFFERED ensemble path sets it too, to mean "the
+            // sub-call emits already covered this request". That one has no
+            // later emitter to write a parked line, so the conjunction is
+            // what keeps its line from disappearing.
+            let streamed = req.is_streaming() && success.telemetry_handled_by_stream;
+            let deferred_metrics = record_success(
                 &state,
                 &pk,
                 &auth,
@@ -181,13 +187,9 @@ pub async fn chat_completions(
                 status,
                 &success,
                 elapsed,
+                streamed.then_some(started),
             );
-            // `telemetry_handled_by_stream` alone is NOT "the response is a
-            // stream": the BUFFERED ensemble path sets it too, to mean "the
-            // sub-call emits already covered this request". That one has no
-            // later emitter to write a parked line, so the conjunction is
-            // what keeps its line from disappearing.
-            if req.is_streaming() && success.telemetry_handled_by_stream {
+            if let Some(deferred_metrics) = deferred_metrics {
                 // A streamed response has no outcome yet: the head exists, nothing
                 // has been delivered, and whether the caller reads it to the end
                 // or walks away is minutes from being known. Park the line and
@@ -203,6 +205,7 @@ pub async fn chat_completions(
                     )
                     .with_model(&success.provider, &model_name)
                     .with_routing(&success.routing),
+                    deferred_metrics,
                 );
             } else {
                 emit_access_log(
@@ -665,7 +668,7 @@ pub async fn chat_completions(
                             attempt_kind: "initial".to_string(),
                             // Bounded ProxyError class so the dashboard can
                             // show why the request never reached an upstream.
-                            error_class: err.kind().to_string(),
+                            error_class: crate::attempt::error_class(&err).to_string(),
                             // Input-blocked / pre-upstream errors still record
                             // the resolved guardrail chain (empty if it failed
                             // before resolution).
@@ -2299,6 +2302,10 @@ async fn dispatch(
                 // own.
                 let snap = state_for_telem.snapshot.load();
                 let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &provider_key_id_for_telem);
+                // A stream the consumer abandoned mid-flight is reported as
+                // 499, one an upstream error ended as that error's status —
+                // on the usage event and on every latency histogram below.
+                let terminal_status = stream_terminal_status(&comp);
                 // Telemetry: emit with the actual upstream-reported counts.
                 // cost_usd stays 0.0; cp-api recomputes server-side from
                 // its model_pricing catalog (same pattern as the non-
@@ -2311,11 +2318,10 @@ async fn dispatch(
                     &model_id_for_telem,
                     &model_for_metrics,
                     &api_key_id_for_telem,
-                    // A stream the consumer abandoned mid-flight is reported
-                    // as 499, one an upstream error ended as that error's
-                    // status. The upstream work still happened, so the event
-                    // is emitted either way — only its outcome differs.
-                    stream_terminal_status(&comp),
+                    // The upstream work still happened, so the event is
+                    // emitted however the stream ended — only its outcome
+                    // differs.
+                    terminal_status,
                     // Scoped to the winning attempt, not the request: the
                     // failed attempts before it emit their own events and
                     // `started` would double-count them (plus the pre-dispatch
@@ -2449,7 +2455,7 @@ async fn dispatch(
                         endpoint: "/v1/chat/completions",
                         model: &bounded_model_for_metrics,
                         provider: &provider_for_metrics,
-                        status: 200,
+                        status: terminal_status,
                         streaming: true,
                         details: UsageLabels {
                             endpoint: "/v1/chat/completions",
@@ -2475,7 +2481,7 @@ async fn dispatch(
                         endpoint: "/v1/chat/completions",
                         model: &bounded_model_for_metrics,
                         provider: &provider_for_metrics,
-                        status: 200,
+                        status: terminal_status,
                         streaming: true,
                         details: UsageLabels {
                             endpoint: "/v1/chat/completions",
@@ -4175,6 +4181,7 @@ async fn dispatch_ensemble(
                 // Fresh snapshot at stream end, shared by every emit in this
                 // closure (#941) — see the single-model streaming path.
                 let snap = state_for_telem.snapshot.load();
+                let terminal_status = stream_terminal_status(&comp);
                 let aggregate_input = panel_usage_for_metrics
                     .prompt_tokens
                     .saturating_add(comp.prompt_tokens);
@@ -4260,7 +4267,7 @@ async fn dispatch_ensemble(
                     &api_key_id_for_telem,
                     // The judge's stream is the one the caller reads: its
                     // abandonment or upstream failure is the request's.
-                    stream_terminal_status(&comp),
+                    terminal_status,
                     started.elapsed(),
                     comp.prompt_tokens,
                     comp.completion_tokens,
@@ -4370,7 +4377,7 @@ async fn dispatch_ensemble(
                         // Matches the legacy series: no single provider
                         // governs an ensemble response.
                         provider: "ensemble",
-                        status: 200,
+                        status: terminal_status,
                         streaming: true,
                         details: UsageLabels {
                             endpoint: "/v1/chat/completions",
@@ -4397,7 +4404,7 @@ async fn dispatch_ensemble(
                         endpoint: "/v1/chat/completions",
                         model: &bounded_model_for_telem,
                         provider: "ensemble",
-                        status: 200,
+                        status: terminal_status,
                         streaming: true,
                         details: UsageLabels {
                             endpoint: "/v1/chat/completions",
@@ -4797,23 +4804,42 @@ fn record_success(
     status: u16,
     s: &Success,
     elapsed: Duration,
-) {
+    // `Some(request start)` when the response is a stream whose terminal
+    // emitter owns the request's end: its request samples are returned to be
+    // parked beside the access-log line instead of recorded at the head.
+    stream_started: Option<std::time::Instant>,
+) -> Option<crate::request_metrics::PendingRequestMetrics> {
     let caller = crate::request_metrics::Caller::new(auth);
-    crate::request_metrics::record(
-        state,
-        "/v1/chat/completions",
-        caller,
-        crate::request_metrics::Upstream {
-            provider,
-            model,
-            upstream_model: &s.upstream_model,
-            pk: pk.labels(),
-            stream,
-            is_fallback,
-        },
-        status,
-        elapsed,
-    );
+    let request_upstream = crate::request_metrics::Upstream {
+        provider,
+        model,
+        upstream_model: &s.upstream_model,
+        pk: pk.labels(),
+        stream,
+        is_fallback,
+    };
+    let deferred = match stream_started {
+        Some(started) => Some(
+            crate::request_metrics::PendingRequestMetrics::at_stream_end(
+                state,
+                "/v1/chat/completions",
+                caller,
+                request_upstream,
+                started,
+            ),
+        ),
+        None => {
+            crate::request_metrics::record(
+                state,
+                "/v1/chat/completions",
+                caller,
+                request_upstream,
+                status,
+                elapsed,
+            );
+            None
+        }
+    };
     // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only here —
     // `elapsed` for a stream is time-to-response-start; the stream's
     // on_complete records the full duration instead.
@@ -4861,6 +4887,7 @@ fn record_success(
             client_type,
         },
     );
+    deferred
 }
 
 fn record_budget_gauges(
