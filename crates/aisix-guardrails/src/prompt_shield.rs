@@ -50,6 +50,7 @@ use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::call_error::{CallClock, CallFailure};
 use crate::chunk::chunk_text;
 use crate::{Guardrail, GuardrailVerdict};
 
@@ -141,13 +142,14 @@ impl PromptShieldGuardrail {
     /// POST to the Prompt Shield endpoint. Returns `Ok(true)` if any
     /// attack was detected, `Ok(false)` if the request is clean, `Err`
     /// if the call failed.
-    async fn call_api(&self, user_prompt: &str) -> Result<bool, AcsFailure> {
+    async fn call_api(&self, user_prompt: &str) -> Result<bool, CallFailure<AcsFailure>> {
         let url = format!("{}{}", self.endpoint, SHIELD_PATH);
         let body = ShieldRequest {
             user_prompt,
             documents: &[],
         };
 
+        let clock = CallClock::start();
         let future = self
             .client
             .post(&url)
@@ -157,17 +159,17 @@ impl PromptShieldGuardrail {
             .send();
 
         let resp = match tokio::time::timeout(self.timeout, future).await {
-            Err(_elapsed) => return Err(AcsFailure::Timeout),
-            Ok(Err(_e)) => return Err(AcsFailure::IoError),
+            Err(_elapsed) => return Err(clock.fail(AcsFailure::Timeout)),
+            Ok(Err(e)) => return Err(clock.fail_with(AcsFailure::IoError, &e)),
             Ok(Ok(r)) => r,
         };
 
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(AcsFailure::Throttled);
+            return Err(clock.fail(AcsFailure::Throttled));
         }
         if status.is_server_error() {
-            return Err(AcsFailure::ServerError);
+            return Err(clock.fail(AcsFailure::ServerError));
         }
         if !status.is_success() {
             // 4xx other than 429 — almost always a misconfiguration.
@@ -175,32 +177,42 @@ impl PromptShieldGuardrail {
             // silently bypasses the guardrail on every request until
             // the operator notices. A persistent error-level log is
             // the only signal they get.
-            let response_body = crate::read_error_body_capped(resp).await;
+            let response_body = crate::read_error_body_capped(resp, &self.row_name).await;
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
                 response_body = %response_body,
                 "azure content safety returned 4xx — check endpoint and api_key configuration",
             );
-            return Err(AcsFailure::ConfigError);
+            return Err(clock.fail(AcsFailure::ConfigError));
         }
 
-        let parsed: ShieldResponse = resp.json().await.map_err(|_| AcsFailure::ServerError)?;
+        let parsed: ShieldResponse = resp
+            .json()
+            .await
+            .map_err(|e| clock.fail_with(AcsFailure::ServerError, &e))?;
         let attacked = parsed.user_prompt_analysis.attack_detected
             || parsed.documents_analysis.iter().any(|d| d.attack_detected);
         Ok(attacked)
     }
 
-    fn handle_failure(&self, failure: AcsFailure, fail_open: bool) -> GuardrailVerdict {
-        let tag = failure.bypass_tag();
+    fn handle_failure(
+        &self,
+        failure: CallFailure<AcsFailure>,
+        fail_open: bool,
+    ) -> GuardrailVerdict {
+        let tag = failure.failure.bypass_tag();
         // ConfigError is already logged at error level in call_api(); skip
         // the generic warn here so operators see exactly one log line per
         // event and alert rules don't fire twice for the same failure.
-        if !matches!(failure, AcsFailure::ConfigError) {
+        if !matches!(failure.failure, AcsFailure::ConfigError) {
             tracing::warn!(
                 row = %self.row_name,
-                failure = ?failure,
+                failure = ?failure.failure,
                 fail_open = fail_open,
+                error = failure.error.as_deref(),
+                error_kind = failure.error_kind.map(tracing::field::display),
+                elapsed_ms = failure.elapsed_ms,
                 "azure content safety call failed",
             );
         }
@@ -490,7 +502,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_fail_open_true_returns_bypass() {
         let g = build("http://unused", true);
-        let v = g.handle_failure(AcsFailure::Timeout, g.fail_open);
+        let v = g.handle_failure(CallFailure::bare(AcsFailure::Timeout), g.fail_open);
         match v {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "azure_cs_timeout"),
             other => panic!("expected Bypass, got {other:?}"),
@@ -500,14 +512,14 @@ mod tests {
     #[tokio::test]
     async fn timeout_fail_open_false_returns_block() {
         let g = build("http://unused", false);
-        let v = g.handle_failure(AcsFailure::Timeout, g.fail_open);
+        let v = g.handle_failure(CallFailure::bare(AcsFailure::Timeout), g.fail_open);
         assert!(v.is_block(), "expected Block, got {v:?}");
     }
 
     #[tokio::test]
     async fn throttled_fail_open_true_returns_bypass_throttled() {
         let g = build("http://unused", true);
-        let v = g.handle_failure(AcsFailure::Throttled, g.fail_open);
+        let v = g.handle_failure(CallFailure::bare(AcsFailure::Throttled), g.fail_open);
         match v {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "azure_cs_throttled"),
             other => panic!("expected Bypass, got {other:?}"),
@@ -524,10 +536,10 @@ mod tests {
         assert!(!g.output_fail_open, "output must default fail-closed");
         // Input policy bypasses, output policy blocks.
         assert!(g
-            .handle_failure(AcsFailure::Timeout, g.fail_open)
+            .handle_failure(CallFailure::bare(AcsFailure::Timeout), g.fail_open)
             .is_bypass());
         assert!(g
-            .handle_failure(AcsFailure::Timeout, g.output_fail_open)
+            .handle_failure(CallFailure::bare(AcsFailure::Timeout), g.output_fail_open)
             .is_block());
     }
 
@@ -849,5 +861,37 @@ mod tests {
         let empty_req = ChatFormat::new("m", vec![ChatMessage::user("")]);
         let v = g.check_input(&empty_req).await;
         assert_eq!(v, GuardrailVerdict::Allow, "empty input must not call API");
+    }
+
+    /// A refused connection is logged with its cause, not just `IoError`
+    /// (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn refused_connection_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let endpoint = refused_endpoint();
+        let logged = capture_logs(|| async {
+            let g = build(&endpoint, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_refusal_logged(
+            &logged,
+            "azure content safety call failed",
+            &["test-key-abc"],
+        );
+    }
+
+    /// A response that is not JSON is logged with the decode error.
+    #[tokio::test]
+    async fn undecodable_response_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let server = not_json_server("DECODE-REQ-1").await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_decode_logged(&logged, "azure content safety call failed", "ServerError");
     }
 }

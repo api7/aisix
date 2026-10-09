@@ -1079,7 +1079,7 @@ async fn host_fetch(
                 .map(|v| (k.as_str().to_owned(), v.to_owned()))
         })
         .collect();
-    let body = crate::read_body_capped(&mut response, body_cap).await;
+    let body = crate::read_body_capped(&mut response, body_cap, &row_name).await;
     if body.len() >= body_cap {
         // Reported rather than handed over: a truncated body makes
         // `resp.json()` throw a parse error that reads like a bug in the

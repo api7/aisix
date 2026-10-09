@@ -46,6 +46,7 @@ use aisix_gateway::{ChatFormat, ChatResponse, Role};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::call_error::{CallClock, CallFailure};
 use crate::chunk::chunk_text;
 use crate::{Guardrail, GuardrailVerdict, StreamOutputPolicy};
 
@@ -148,7 +149,7 @@ impl TextModerationGuardrail {
     }
 
     /// POST one chunk to `text:analyze` and return the parsed result.
-    async fn analyze(&self, text: &str) -> Result<AnalyzeResponse, AcsFailure> {
+    async fn analyze(&self, text: &str) -> Result<AnalyzeResponse, CallFailure<AcsFailure>> {
         let url = format!("{}{}", self.endpoint, ANALYZE_PATH);
         let body = AnalyzeRequest {
             text,
@@ -158,6 +159,7 @@ impl TextModerationGuardrail {
             output_type: &self.output_type,
         };
 
+        let clock = CallClock::start();
         let future = self
             .client
             .post(&url)
@@ -166,32 +168,32 @@ impl TextModerationGuardrail {
             .send();
 
         let resp = match tokio::time::timeout(self.timeout, future).await {
-            Err(_elapsed) => return Err(AcsFailure::Timeout),
-            Ok(Err(_e)) => return Err(AcsFailure::IoError),
+            Err(_elapsed) => return Err(clock.fail(AcsFailure::Timeout)),
+            Ok(Err(e)) => return Err(clock.fail_with(AcsFailure::IoError, &e)),
             Ok(Ok(r)) => r,
         };
 
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(AcsFailure::Throttled);
+            return Err(clock.fail(AcsFailure::Throttled));
         }
         if status.is_server_error() {
-            return Err(AcsFailure::ServerError);
+            return Err(clock.fail(AcsFailure::ServerError));
         }
         if !status.is_success() {
-            let response_body = crate::read_error_body_capped(resp).await;
+            let response_body = crate::read_error_body_capped(resp, &self.row_name).await;
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
                 response_body = %response_body,
                 "azure content safety text:analyze returned 4xx — check endpoint and api_key configuration",
             );
-            return Err(AcsFailure::ConfigError);
+            return Err(clock.fail(AcsFailure::ConfigError));
         }
 
         resp.json::<AnalyzeResponse>()
             .await
-            .map_err(|_| AcsFailure::ServerError)
+            .map_err(|e| clock.fail_with(AcsFailure::ServerError, &e))
     }
 
     /// Apply the threshold + blocklist policy to one analyze response.
@@ -219,13 +221,20 @@ impl TextModerationGuardrail {
         None
     }
 
-    fn handle_failure(&self, failure: AcsFailure, fail_open: bool) -> GuardrailVerdict {
-        let tag = failure.bypass_tag();
-        if !matches!(failure, AcsFailure::ConfigError) {
+    fn handle_failure(
+        &self,
+        failure: CallFailure<AcsFailure>,
+        fail_open: bool,
+    ) -> GuardrailVerdict {
+        let tag = failure.failure.bypass_tag();
+        if !matches!(failure.failure, AcsFailure::ConfigError) {
             tracing::warn!(
                 row = %self.row_name,
-                failure = ?failure,
+                failure = ?failure.failure,
                 fail_open,
+                error = failure.error.as_deref(),
+                error_kind = failure.error_kind.map(tracing::field::display),
+                elapsed_ms = failure.elapsed_ms,
                 "azure content safety text moderation call failed",
             );
         }
@@ -613,7 +622,7 @@ mod tests {
     #[test]
     fn timeout_fail_open_true_returns_bypass() {
         let g = build("http://unused", true);
-        match g.handle_failure(AcsFailure::Timeout, true) {
+        match g.handle_failure(CallFailure::bare(AcsFailure::Timeout), true) {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "azure_cs_timeout"),
             other => panic!("expected Bypass, got {other:?}"),
         }
@@ -626,7 +635,7 @@ mod tests {
         assert!(!g.output_fail_open, "output must default to fail-closed");
         // An output-side failure with fail_open=false must Block.
         assert!(g
-            .handle_failure(AcsFailure::Timeout, g.output_fail_open)
+            .handle_failure(CallFailure::bare(AcsFailure::Timeout), g.output_fail_open)
             .is_block());
     }
 
@@ -759,5 +768,41 @@ mod tests {
 
         let g = build(&server.uri(), true);
         assert!(g.check_output(&resp("violent output")).await.is_block());
+    }
+
+    /// A refused connection is logged with its cause, not just `IoError`
+    /// (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn refused_connection_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let endpoint = refused_endpoint();
+        let logged = capture_logs(|| async {
+            let g = build(&endpoint, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_refusal_logged(
+            &logged,
+            "azure content safety text moderation call failed",
+            &["test-key-abc"],
+        );
+    }
+
+    /// A response that is not JSON is logged with the decode error.
+    #[tokio::test]
+    async fn undecodable_response_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let server = not_json_server("DECODE-REQ-1").await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_decode_logged(
+            &logged,
+            "azure content safety text moderation call failed",
+            "ServerError",
+        );
     }
 }

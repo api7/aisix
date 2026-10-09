@@ -53,6 +53,7 @@ use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha1::Sha1;
 
+use crate::call_error::{CallClock, CallFailure};
 use crate::chunk::chunk_text;
 use crate::{Guardrail, GuardrailVerdict, StreamOutputPolicy};
 
@@ -232,7 +233,10 @@ impl AliyunTextModerationGuardrail {
         service: &str,
         content: &str,
         session_id: Option<&str>,
-    ) -> (Result<String, AliyunFailure>, AliyunDiagnostics) {
+    ) -> (
+        Result<String, CallFailure<AliyunFailure>>,
+        AliyunDiagnostics,
+    ) {
         let mut svc_params = serde_json::Map::new();
         svc_params.insert(
             "content".into(),
@@ -284,6 +288,7 @@ impl AliyunTextModerationGuardrail {
         body.push_str("&Signature=");
         body.push_str(&percent_encode(&signature));
 
+        let clock = CallClock::start();
         let future = self
             .client
             .post(format!("{}/", self.endpoint))
@@ -296,8 +301,18 @@ impl AliyunTextModerationGuardrail {
         // sent can't be invented. `request_id` stays empty and the failure
         // bucket carries the whole story.
         let resp = match tokio::time::timeout(self.timeout, future).await {
-            Err(_elapsed) => return (Err(AliyunFailure::Timeout), AliyunDiagnostics::default()),
-            Ok(Err(_e)) => return (Err(AliyunFailure::IoError), AliyunDiagnostics::default()),
+            Err(_elapsed) => {
+                return (
+                    Err(clock.fail(AliyunFailure::Timeout)),
+                    AliyunDiagnostics::default(),
+                )
+            }
+            Ok(Err(e)) => {
+                return (
+                    Err(clock.fail_with(AliyunFailure::IoError, &e)),
+                    AliyunDiagnostics::default(),
+                )
+            }
             Ok(Ok(r)) => r,
         };
 
@@ -307,10 +322,10 @@ impl AliyunTextModerationGuardrail {
 
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return (Err(AliyunFailure::Throttled), diag);
+            return (Err(clock.fail(AliyunFailure::Throttled)), diag);
         }
         if status.is_server_error() {
-            return (Err(AliyunFailure::ServerError), diag);
+            return (Err(clock.fail(AliyunFailure::ServerError)), diag);
         }
         if !status.is_success() {
             // Report the provider's error CODE (e.g. `InvalidAccessKeyId.NotFound`)
@@ -329,7 +344,8 @@ impl AliyunTextModerationGuardrail {
             // lives in it; it is just never logged verbatim.
             let mut resp = resp;
             let response_body =
-                crate::read_body_capped(&mut resp, MAX_ERROR_BODY_PARSE_BYTES).await;
+                crate::read_body_capped(&mut resp, MAX_ERROR_BODY_PARSE_BYTES, &self.row_name)
+                    .await;
             diag.code = extract_error_code(&response_body);
             tracing::error!(
                 row = %self.row_name,
@@ -338,12 +354,17 @@ impl AliyunTextModerationGuardrail {
                 aliyun_code = %diag.code,
                 "aliyun TextModerationPlus returned 4xx — check region/access keys configuration",
             );
-            return (Err(AliyunFailure::ConfigError), diag);
+            return (Err(clock.fail(AliyunFailure::ConfigError)), diag);
         }
 
         let body: AliyunResponse = match resp.json().await {
             Ok(b) => b,
-            Err(_) => return (Err(AliyunFailure::MalformedResponse), diag),
+            Err(e) => {
+                return (
+                    Err(clock.fail_with(AliyunFailure::MalformedResponse, &e)),
+                    diag,
+                )
+            }
         };
         diag.absorb_body(&body);
 
@@ -377,22 +398,25 @@ impl AliyunTextModerationGuardrail {
                 Err(failure)
             }
         };
-        (outcome, diag)
+        (outcome.map_err(|f| clock.fail(f)), diag)
     }
 
     fn handle_failure(
         &self,
-        failure: AliyunFailure,
+        failure: CallFailure<AliyunFailure>,
         diag: &AliyunDiagnostics,
         fail_open: bool,
     ) -> GuardrailVerdict {
-        let tag = failure.bypass_tag();
-        if !matches!(failure, AliyunFailure::ConfigError) {
+        let tag = failure.failure.bypass_tag();
+        if !matches!(failure.failure, AliyunFailure::ConfigError) {
             tracing::warn!(
                 row = %self.row_name,
                 aliyun_request_id = %diag.request_id,
-                failure = ?failure,
+                failure = ?failure.failure,
                 fail_open,
+                error = failure.error.as_deref(),
+                error_kind = failure.error_kind.map(tracing::field::display),
+                elapsed_ms = failure.elapsed_ms,
                 "aliyun text moderation call failed",
             );
         }
@@ -1708,6 +1732,47 @@ mod tests {
         assert!(
             !risky_diag.labels.is_empty(),
             "a risky prompt must report at least one Label, got {risky_diag:?}"
+        );
+    }
+
+    /// A refused connection is logged with its cause, not just `IoError`
+    /// (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn refused_connection_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let endpoint = refused_endpoint();
+        let logged = capture_logs(|| async {
+            let g = build(&endpoint, "high", true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_refusal_logged(
+            &logged,
+            "aliyun text moderation call failed",
+            &["test-secret", "LTAI_TEST"],
+        );
+    }
+
+    /// A response that is not JSON is logged with the decode error.
+    #[tokio::test]
+    async fn undecodable_response_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let server = not_json_server("DECODE-REQ-1").await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, "high", true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_decode_logged(
+            &logged,
+            "aliyun text moderation call failed",
+            "MalformedResponse",
+        );
+        assert!(
+            failure_line(&logged, "aliyun text moderation call failed")
+                .contains("aliyun_request_id=DECODE-REQ-1"),
+            "the id Aliyun sent survives a decode failure; got: {logged}"
         );
     }
 }

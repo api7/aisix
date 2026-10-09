@@ -59,6 +59,7 @@ use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::call_error::{CallClock, CallFailure};
 use crate::{Guardrail, GuardrailVerdict, SegmentsOutcome, StreamOutputPolicy};
 
 /// Default Lakera Guard endpoint (the config's `endpoint` overrides it).
@@ -134,7 +135,7 @@ impl LakeraGuardrail {
     async fn call_api(
         &self,
         messages: &[GuardMessage<'_>],
-    ) -> Result<GuardResponse, LakeraFailure> {
+    ) -> Result<GuardResponse, CallFailure<LakeraFailure>> {
         let url = format!("{}{}", self.endpoint, GUARD_PATH);
         let body = GuardRequest {
             messages,
@@ -146,6 +147,7 @@ impl LakeraGuardrail {
             breakdown: true,
         };
 
+        let clock = CallClock::start();
         let future = self
             .client
             .post(&url)
@@ -154,27 +156,27 @@ impl LakeraGuardrail {
             .send();
 
         let resp = match tokio::time::timeout(self.timeout, future).await {
-            Err(_elapsed) => return Err(LakeraFailure::Timeout),
-            Ok(Err(_e)) => return Err(LakeraFailure::IoError),
+            Err(_elapsed) => return Err(clock.fail(LakeraFailure::Timeout)),
+            Ok(Err(e)) => return Err(clock.fail_with(LakeraFailure::IoError, &e)),
             Ok(Ok(r)) => r,
         };
 
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(LakeraFailure::Throttled);
+            return Err(clock.fail(LakeraFailure::Throttled));
         }
         if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
-            return Err(LakeraFailure::TooLarge);
+            return Err(clock.fail(LakeraFailure::TooLarge));
         }
         if status.is_server_error() {
-            return Err(LakeraFailure::ServerError);
+            return Err(clock.fail(LakeraFailure::ServerError));
         }
         if !status.is_success() {
             // 4xx other than 429 — almost always a misconfiguration
             // (bad api_key / project_id / endpoint). Error level: with
             // fail_open=true this silently bypasses the guardrail on every
             // request until the operator notices.
-            let response_body = crate::read_error_body_capped(resp).await;
+            let response_body = crate::read_error_body_capped(resp, &self.row_name).await;
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
@@ -182,12 +184,14 @@ impl LakeraGuardrail {
                 "lakera guard returned 4xx — check endpoint, api_key, and project_id configuration",
             );
             if crate::too_large::body_says_too_large(&response_body) {
-                return Err(LakeraFailure::TooLarge);
+                return Err(clock.fail(LakeraFailure::TooLarge));
             }
-            return Err(LakeraFailure::ConfigError);
+            return Err(clock.fail(LakeraFailure::ConfigError));
         }
 
-        resp.json().await.map_err(|_| LakeraFailure::ServerError)
+        resp.json()
+            .await
+            .map_err(|e| clock.fail_with(LakeraFailure::ServerError, &e))
     }
 
     /// Blob-mode guard: one message, verdict only. Serves `check_input`/
@@ -282,14 +286,21 @@ impl LakeraGuardrail {
         ))
     }
 
-    fn handle_failure(&self, failure: LakeraFailure, fail_open: bool) -> GuardrailVerdict {
-        let tag = failure.bypass_tag();
+    fn handle_failure(
+        &self,
+        failure: CallFailure<LakeraFailure>,
+        fail_open: bool,
+    ) -> GuardrailVerdict {
+        let tag = failure.failure.bypass_tag();
         // ConfigError is already logged at error level in call_api().
-        if !matches!(failure, LakeraFailure::ConfigError) {
+        if !matches!(failure.failure, LakeraFailure::ConfigError) {
             tracing::warn!(
                 row = %self.row_name,
-                failure = ?failure,
+                failure = ?failure.failure,
                 fail_open = fail_open,
+                error = failure.error.as_deref(),
+                error_kind = failure.error_kind.map(tracing::field::display),
+                elapsed_ms = failure.elapsed_ms,
                 "lakera guard call failed",
             );
         }
@@ -881,5 +892,33 @@ mod tests {
         let (masked, counts) = mask_slots(&texts, &[0], &payload);
         assert_eq!(masked[0], "héllo [MASKED EMAIL]");
         assert_eq!(counts.get("EMAIL"), Some(&1));
+    }
+
+    /// A refused connection is logged with its cause, not just `IoError`
+    /// (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn refused_connection_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let endpoint = refused_endpoint();
+        let logged = capture_logs(|| async {
+            let g = build(&endpoint, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_refusal_logged(&logged, "lakera guard call failed", &["lk-test-key"]);
+    }
+
+    /// A response that is not JSON is logged with the decode error.
+    #[tokio::test]
+    async fn undecodable_response_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let server = not_json_server("DECODE-REQ-1").await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_decode_logged(&logged, "lakera guard call failed", "ServerError");
     }
 }

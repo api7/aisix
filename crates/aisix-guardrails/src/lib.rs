@@ -26,6 +26,7 @@ mod audit;
 #[cfg(feature = "bedrock")]
 mod bedrock;
 mod build;
+mod call_error;
 mod chain;
 #[cfg(any(feature = "azure-content-safety", feature = "aliyun-text-moderation"))]
 mod chunk;
@@ -83,24 +84,40 @@ pub(crate) fn truncate_error_body_for_log(body: &str) -> &str {
     feature = "openai-moderation",
     feature = "presidio",
 ))]
-pub(crate) async fn read_error_body_capped(mut resp: reqwest::Response) -> String {
-    truncate_error_body_for_log(&read_body_capped(&mut resp, MAX_ERROR_BODY_LOG_BYTES).await)
+pub(crate) async fn read_error_body_capped(mut resp: reqwest::Response, row: &str) -> String {
+    truncate_error_body_for_log(&read_body_capped(&mut resp, MAX_ERROR_BODY_LOG_BYTES, row).await)
         .to_owned()
 }
 
 /// Read at most `cap` bytes of a response body, chunk by chunk, giving up on
-/// the first read error.
+/// the first read error. The error is logged rather than returned: callers
+/// carry on with the bytes read so far.
 ///
 /// Split out from [`read_error_body_capped`] because a caller that PARSES the
 /// body needs a different budget from one that logs a snippet of it: a snippet
 /// can stop anywhere, whereas a truncated body may simply not contain the field
 /// being looked for. See `aliyun::MAX_ERROR_BODY_PARSE_BYTES`.
-pub(crate) async fn read_body_capped(resp: &mut reqwest::Response, cap: usize) -> String {
+pub(crate) async fn read_body_capped(
+    resp: &mut reqwest::Response,
+    cap: usize,
+    row: &str,
+) -> String {
     let mut buf: Vec<u8> = Vec::new();
     while buf.len() < cap {
         match resp.chunk().await {
             Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
-            Ok(None) | Err(_) => break,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(
+                    row = %row,
+                    http_status = resp.status().as_u16(),
+                    error = call_error::error_chain(&e).as_str(),
+                    error_kind = %call_error::error_kind(&e),
+                    bytes_read = buf.len(),
+                    "guardrail response body read failed",
+                );
+                break;
+            }
         }
     }
     String::from_utf8_lossy(&buf).into_owned()
@@ -1233,6 +1250,41 @@ pub(crate) fn keep_callsites_enabled() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A body cut short by the peer is logged with its cause, and the bytes
+    /// that did arrive are still handed back.
+    #[tokio::test]
+    async fn body_read_error_is_logged() {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = [0u8; 4096];
+            let _ = std::io::Read::read(&mut sock, &mut req);
+            // Promise 100 bytes, send 7, hang up.
+            sock.write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 100\r\n\r\npartial")
+                .unwrap();
+        });
+        let logged = crate::call_error::testing::capture_logs(|| async {
+            let mut resp = reqwest::get(format!("http://{addr}/")).await.unwrap();
+            assert_eq!(read_body_capped(&mut resp, 1024, "row-x").await, "partial");
+        })
+        .await;
+        server.join().unwrap();
+        let line = crate::call_error::testing::failure_line(
+            &logged,
+            "guardrail response body read failed",
+        );
+        assert!(line.contains("row=row-x"), "{line}");
+        assert!(line.contains("http_status=403"), "{line}");
+        assert!(line.contains("error_kind=decode"), "{line}");
+        assert!(
+            line.contains("end of file before message length reached"),
+            "{line}"
+        );
+        assert!(line.contains("bytes_read=7"), "{line}");
+    }
     use std::collections::BTreeSet;
 
     #[test]
