@@ -147,7 +147,7 @@ impl LakeraGuardrail {
             breakdown: true,
         };
 
-        let clock = CallClock::start();
+        let mut clock = CallClock::start(self.timeout);
         let future = self
             .client
             .post(&url)
@@ -155,11 +155,12 @@ impl LakeraGuardrail {
             .json(&body)
             .send();
 
-        let resp = match tokio::time::timeout(self.timeout, future).await {
+        let resp = match clock.within(future).await {
             Err(_elapsed) => return Err(clock.fail(LakeraFailure::Timeout)),
             Ok(Err(e)) => return Err(clock.fail_with(LakeraFailure::IoError, &e)),
             Ok(Ok(r)) => r,
         };
+        clock.responded(resp.status());
 
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -176,7 +177,12 @@ impl LakeraGuardrail {
             // (bad api_key / project_id / endpoint). Error level: with
             // fail_open=true this silently bypasses the guardrail on every
             // request until the operator notices.
-            let response_body = crate::read_error_body_capped(resp, &self.row_name).await;
+            let Ok(response_body) = clock
+                .within(crate::read_error_body_capped(resp, &self.row_name))
+                .await
+            else {
+                return Err(clock.fail(LakeraFailure::Timeout));
+            };
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
@@ -189,9 +195,10 @@ impl LakeraGuardrail {
             return Err(clock.fail(LakeraFailure::ConfigError));
         }
 
-        resp.json()
-            .await
-            .map_err(|e| clock.fail_with(LakeraFailure::ServerError, &e))
+        match clock.within(resp.json()).await {
+            Ok(r) => r.map_err(|e| clock.fail_with(LakeraFailure::ServerError, &e)),
+            Err(_) => Err(clock.fail(LakeraFailure::Timeout)),
+        }
     }
 
     /// Blob-mode guard: one message, verdict only. Serves `check_input`/
@@ -297,6 +304,7 @@ impl LakeraGuardrail {
             tracing::warn!(
                 row = %self.row_name,
                 failure = ?failure.failure,
+                http_status = failure.http_status,
                 fail_open = fail_open,
                 error = failure.error.as_deref(),
                 error_kind = failure.error_kind.map(tracing::field::display),
@@ -920,5 +928,56 @@ mod tests {
         })
         .await;
         assert_decode_logged(&logged, "lakera guard call failed", "ServerError");
+    }
+
+    /// A 5xx is logged with its status (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn server_error_logs_the_status() {
+        use crate::call_error::testing::*;
+        let server = status_server(503).await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_status_logged(&logged, "lakera guard call failed", 503);
+    }
+
+    /// `timeout_ms` covers the response body, not just its headers: a body
+    /// that stalls ends the call as a timeout instead of hanging it.
+    #[tokio::test]
+    async fn stalled_body_times_out() {
+        use crate::call_error::testing::*;
+        let uri = stalled_body_server(200).await;
+        let logged = capture_logs(|| async {
+            let mut g = build(&uri, true);
+            g.timeout = Duration::from_millis(200);
+            let verdict =
+                tokio::time::timeout(Duration::from_secs(5), g.check_input(&req(PROMPT_MARKER)))
+                    .await
+                    .expect("the guardrail call must end at its own timeout");
+            assert!(verdict.is_bypass());
+        })
+        .await;
+        assert_stall_logged(&logged, "lakera guard call failed", 200);
+    }
+
+    /// An error body that stalls is bounded by `timeout_ms` too.
+    #[tokio::test]
+    async fn stalled_error_body_times_out() {
+        use crate::call_error::testing::*;
+        let uri = stalled_body_server(403).await;
+        let logged = capture_logs(|| async {
+            let mut g = build(&uri, true);
+            g.timeout = Duration::from_millis(200);
+            let verdict =
+                tokio::time::timeout(Duration::from_secs(5), g.check_input(&req(PROMPT_MARKER)))
+                    .await
+                    .expect("the guardrail call must end at its own timeout");
+            assert!(verdict.is_bypass());
+        })
+        .await;
+        assert_stall_logged(&logged, "lakera guard call failed", 403);
     }
 }

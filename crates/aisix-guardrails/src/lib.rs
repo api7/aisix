@@ -304,6 +304,28 @@ pub enum EmbedFailure {
     Upstream,
 }
 
+/// A failed guardrail embedding call: the bounded [`EmbedFailure`] plus,
+/// when the dispatch produced one, the underlying error for the operator
+/// log. `error` goes to the log line only — never to a verdict, a tag or a
+/// metric label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedError {
+    pub failure: EmbedFailure,
+    /// The dispatch error's Display with its `source()` chain
+    /// ([`error_chain`]); `None` when the failure is ours, not the
+    /// provider's (an unresolved alias, a vector count that does not match).
+    pub error: Option<String>,
+}
+
+impl From<EmbedFailure> for EmbedError {
+    fn from(failure: EmbedFailure) -> Self {
+        Self {
+            failure,
+            error: None,
+        }
+    }
+}
+
 impl EmbedFailure {
     /// The bounded tag used in verdict reasons and metric labels.
     pub fn as_str(self) -> &'static str {
@@ -349,7 +371,7 @@ pub trait GuardrailEmbedder: Send + Sync + 'static {
         texts: &[String],
         cacheable: bool,
         timeout: std::time::Duration,
-    ) -> Result<Embedded, EmbedFailure>;
+    ) -> Result<Embedded, EmbedError>;
 }
 
 /// One embedding call's result.
@@ -415,6 +437,7 @@ pub use build::{
     unattached_guardrail_names, unbuildable_guardrail_rows, LiveGuardrailChain, LiveGuardrailIndex,
     UnbuildableGuardrailRow, UNATTACHED_SWEEP_INTERVAL,
 };
+pub use call_error::error_chain;
 pub use chain::GuardrailChain;
 pub use index::{GuardrailIndex, RequestContext};
 pub use keyword::{KeywordBlocklist, KeywordRule};

@@ -159,7 +159,7 @@ impl TextModerationGuardrail {
             output_type: &self.output_type,
         };
 
-        let clock = CallClock::start();
+        let mut clock = CallClock::start(self.timeout);
         let future = self
             .client
             .post(&url)
@@ -167,11 +167,12 @@ impl TextModerationGuardrail {
             .json(&body)
             .send();
 
-        let resp = match tokio::time::timeout(self.timeout, future).await {
+        let resp = match clock.within(future).await {
             Err(_elapsed) => return Err(clock.fail(AcsFailure::Timeout)),
             Ok(Err(e)) => return Err(clock.fail_with(AcsFailure::IoError, &e)),
             Ok(Ok(r)) => r,
         };
+        clock.responded(resp.status());
 
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -181,7 +182,12 @@ impl TextModerationGuardrail {
             return Err(clock.fail(AcsFailure::ServerError));
         }
         if !status.is_success() {
-            let response_body = crate::read_error_body_capped(resp, &self.row_name).await;
+            let Ok(response_body) = clock
+                .within(crate::read_error_body_capped(resp, &self.row_name))
+                .await
+            else {
+                return Err(clock.fail(AcsFailure::Timeout));
+            };
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
@@ -191,9 +197,10 @@ impl TextModerationGuardrail {
             return Err(clock.fail(AcsFailure::ConfigError));
         }
 
-        resp.json::<AnalyzeResponse>()
-            .await
-            .map_err(|e| clock.fail_with(AcsFailure::ServerError, &e))
+        match clock.within(resp.json::<AnalyzeResponse>()).await {
+            Ok(r) => r.map_err(|e| clock.fail_with(AcsFailure::ServerError, &e)),
+            Err(_) => Err(clock.fail(AcsFailure::Timeout)),
+        }
     }
 
     /// Apply the threshold + blocklist policy to one analyze response.
@@ -231,6 +238,7 @@ impl TextModerationGuardrail {
             tracing::warn!(
                 row = %self.row_name,
                 failure = ?failure.failure,
+                http_status = failure.http_status,
                 fail_open,
                 error = failure.error.as_deref(),
                 error_kind = failure.error_kind.map(tracing::field::display),
@@ -803,6 +811,47 @@ mod tests {
             &logged,
             "azure content safety text moderation call failed",
             "ServerError",
+        );
+    }
+
+    /// A 5xx is logged with its status (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn server_error_logs_the_status() {
+        use crate::call_error::testing::*;
+        let server = status_server(503).await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_status_logged(
+            &logged,
+            "azure content safety text moderation call failed",
+            503,
+        );
+    }
+
+    /// `timeout_ms` covers the response body, not just its headers: a body
+    /// that stalls ends the call as a timeout instead of hanging it.
+    #[tokio::test]
+    async fn stalled_body_times_out() {
+        use crate::call_error::testing::*;
+        let uri = stalled_body_server(200).await;
+        let logged = capture_logs(|| async {
+            let mut g = build(&uri, true);
+            g.timeout = Duration::from_millis(200);
+            let verdict =
+                tokio::time::timeout(Duration::from_secs(5), g.check_input(&req(PROMPT_MARKER)))
+                    .await
+                    .expect("the guardrail call must end at its own timeout");
+            assert!(verdict.is_bypass());
+        })
+        .await;
+        assert_stall_logged(
+            &logged,
+            "azure content safety text moderation call failed",
+            200,
         );
     }
 }

@@ -144,7 +144,7 @@ impl OpenaiModerationGuardrail {
             input,
         };
 
-        let clock = CallClock::start();
+        let mut clock = CallClock::start(self.timeout);
         let future = self
             .client
             .post(&url)
@@ -152,11 +152,12 @@ impl OpenaiModerationGuardrail {
             .json(&body)
             .send();
 
-        let resp = match tokio::time::timeout(self.timeout, future).await {
+        let resp = match clock.within(future).await {
             Err(_elapsed) => return Err(clock.fail(ModerationFailure::Timeout)),
             Ok(Err(e)) => return Err(clock.fail_with(ModerationFailure::IoError, &e)),
             Ok(Ok(r)) => r,
         };
+        clock.responded(resp.status());
 
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -171,7 +172,12 @@ impl OpenaiModerationGuardrail {
             // unhandled error here — read the body before deciding which
             // it was, so the operator is not sent after an outage that
             // is really a payload the deployment cannot take.
-            let response_body = crate::read_error_body_capped(resp, &self.row_name).await;
+            let Ok(response_body) = clock
+                .within(crate::read_error_body_capped(resp, &self.row_name))
+                .await
+            else {
+                return Err(clock.fail(ModerationFailure::Timeout));
+            };
             if crate::too_large::body_says_too_large(&response_body) {
                 tracing::error!(
                     row = %self.row_name,
@@ -188,7 +194,12 @@ impl OpenaiModerationGuardrail {
             // (bad api_key / endpoint / model). Error level: with
             // fail_open=true this silently bypasses the guardrail on every
             // request until the operator notices.
-            let response_body = crate::read_error_body_capped(resp, &self.row_name).await;
+            let Ok(response_body) = clock
+                .within(crate::read_error_body_capped(resp, &self.row_name))
+                .await
+            else {
+                return Err(clock.fail(ModerationFailure::Timeout));
+            };
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
@@ -201,9 +212,10 @@ impl OpenaiModerationGuardrail {
             return Err(clock.fail(ModerationFailure::ConfigError));
         }
 
-        resp.json()
-            .await
-            .map_err(|e| clock.fail_with(ModerationFailure::ServerError, &e))
+        match clock.within(resp.json()).await {
+            Ok(r) => r.map_err(|e| clock.fail_with(ModerationFailure::ServerError, &e)),
+            Err(_) => Err(clock.fail(ModerationFailure::Timeout)),
+        }
     }
 
     fn evaluate(&self, resp: &ModerationResponse) -> GuardrailVerdict {
@@ -260,6 +272,7 @@ impl OpenaiModerationGuardrail {
             tracing::warn!(
                 row = %self.row_name,
                 failure = ?failure.failure,
+                http_status = failure.http_status,
                 fail_open = fail_open,
                 error = failure.error.as_deref(),
                 error_kind = failure.error_kind.map(tracing::field::display),
@@ -644,5 +657,38 @@ mod tests {
         })
         .await;
         assert_decode_logged(&logged, "openai moderation call failed", "ServerError");
+    }
+
+    /// A 5xx is logged with its status (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn server_error_logs_the_status() {
+        use crate::call_error::testing::*;
+        let server = status_server(503).await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_status_logged(&logged, "openai moderation call failed", 503);
+    }
+
+    /// `timeout_ms` covers the response body, not just its headers: a body
+    /// that stalls ends the call as a timeout instead of hanging it.
+    #[tokio::test]
+    async fn stalled_body_times_out() {
+        use crate::call_error::testing::*;
+        let uri = stalled_body_server(200).await;
+        let logged = capture_logs(|| async {
+            let mut g = build(&uri, true);
+            g.timeout = Duration::from_millis(200);
+            let verdict =
+                tokio::time::timeout(Duration::from_secs(5), g.check_input(&req(PROMPT_MARKER)))
+                    .await
+                    .expect("the guardrail call must end at its own timeout");
+            assert!(verdict.is_bypass());
+        })
+        .await;
+        assert_stall_logged(&logged, "openai moderation call failed", 200);
     }
 }

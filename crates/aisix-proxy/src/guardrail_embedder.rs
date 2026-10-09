@@ -27,7 +27,7 @@ use std::time::Duration;
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, Model};
 use aisix_gateway::{BridgeError, Hub};
-use aisix_guardrails::{EmbedFailure, Embedded, GuardrailEmbedder};
+use aisix_guardrails::{EmbedError, EmbedFailure, Embedded, GuardrailEmbedder};
 use async_trait::async_trait;
 
 use crate::error::ProxyError;
@@ -68,7 +68,7 @@ impl GuardrailEmbedder for ProxyGuardrailEmbedder {
         texts: &[String],
         cacheable: bool,
         timeout: Duration,
-    ) -> Result<Embedded, EmbedFailure> {
+    ) -> Result<Embedded, EmbedError> {
         if texts.is_empty() {
             // No call, so nothing resolved and nothing to name. Safe
             // because a caller with no texts also produces no score: the
@@ -87,14 +87,14 @@ impl GuardrailEmbedder for ProxyGuardrailEmbedder {
         // without the guardrail row being rewritten or its chain rebuilt.
         let alias = aisix_core::models::resolve_model_ref(&snapshot, model_alias, model_id);
         let Some(entry) = snapshot.models.get_by_name(&alias) else {
-            return Err(EmbedFailure::Unresolved);
+            return Err(EmbedFailure::Unresolved.into());
         };
         // The alias must name an EMBEDDING model. A chat model would
         // answer the dispatch with a completion, not a vector, and the
         // resulting error would read as a provider outage rather than
         // the configuration mistake it is.
         let Some(dimensions) = embedding_dimensions(&entry.value) else {
-            return Err(EmbedFailure::Unresolved);
+            return Err(EmbedFailure::Unresolved.into());
         };
 
         // Cache lookup first, so a fully warm example set costs no call.
@@ -132,7 +132,7 @@ impl GuardrailEmbedder for ProxyGuardrailEmbedder {
         .await
         .map_err(classify)?;
         if fetched.len() != misses.len() {
-            return Err(EmbedFailure::Upstream);
+            return Err(EmbedFailure::Upstream.into());
         }
 
         if cacheable {
@@ -172,12 +172,19 @@ fn embedding_dimensions(model: &Model) -> Option<u32> {
 /// closer, while the rest say the model or its credential is wrong.
 /// Both land on the same fail-open/fail-closed decision, so mis-binning
 /// one can only mislabel a log line, never change a verdict.
-fn classify(err: ProxyError) -> EmbedFailure {
-    match err {
+///
+/// The error itself rides along for the guardrail's failure log, which is
+/// the only place it is reported: nothing on the dispatch path logs it.
+fn classify(err: ProxyError) -> EmbedError {
+    let failure = match &err {
         ProxyError::Bridge(BridgeError::Timeout { .. }) => EmbedFailure::Timeout,
         // No bridge for the provider key, or the model has no provider /
         // upstream model name — configuration, not an outage.
         ProxyError::ProviderUnavailable | ProxyError::InvalidRequest(_) => EmbedFailure::Unresolved,
         _ => EmbedFailure::Upstream,
+    };
+    EmbedError {
+        failure,
+        error: Some(aisix_guardrails::error_chain(&err)),
     }
 }

@@ -6,10 +6,14 @@
 //! an operator *why*: `IoError` is a DNS failure, a refused connection, a TLS
 //! error and a connection the peer reset, all at once. [`CallFailure`] carries
 //! the rest, and each kind's "<provider> call failed" warn logs it as the same
-//! three fields — `error`, `error_kind`, `elapsed_ms` — so the family cannot
-//! drift.
+//! fields — `http_status`, `error`, `error_kind`, `elapsed_ms` — so the family
+//! cannot drift.
+//!
+//! [`CallClock`] also owns the call's deadline: `timeout_ms` bounds the whole
+//! call, so every await on the response — the send, an error body, the JSON
+//! decode — goes through [`CallClock::within`].
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A failure bucket plus the cause the warn logs next to it.
 #[cfg_attr(
@@ -25,6 +29,8 @@ use std::time::Instant;
 #[derive(Debug)]
 pub(crate) struct CallFailure<F> {
     pub(crate) failure: F,
+    /// The response status, when a response arrived before the failure.
+    pub(crate) http_status: Option<u16>,
     /// The underlying error with its whole `source()` chain; `None` when the
     /// failure is a bucketed status or a timer, which carry no error value.
     pub(crate) error: Option<String>,
@@ -41,6 +47,7 @@ impl<F> CallFailure<F> {
     pub(crate) fn bare(failure: F) -> Self {
         Self {
             failure,
+            http_status: None,
             error: None,
             error_kind: None,
             elapsed_ms: 0,
@@ -49,7 +56,8 @@ impl<F> CallFailure<F> {
 }
 
 /// Started right before a guardrail call is sent; every failure of that call
-/// is built from it so the elapsed time is measured the same way everywhere.
+/// is built from it so the elapsed time is measured the same way everywhere,
+/// and every await of that call is bounded by its one deadline.
 #[cfg_attr(
     not(any(
         feature = "azure-content-safety",
@@ -60,7 +68,11 @@ impl<F> CallFailure<F> {
     )),
     allow(dead_code)
 )]
-pub(crate) struct CallClock(Instant);
+pub(crate) struct CallClock {
+    started: Instant,
+    deadline: tokio::time::Instant,
+    http_status: Option<u16>,
+}
 
 #[cfg_attr(
     not(any(
@@ -73,12 +85,33 @@ pub(crate) struct CallClock(Instant);
     allow(dead_code)
 )]
 impl CallClock {
-    pub(crate) fn start() -> Self {
-        Self(Instant::now())
+    /// Start the clock for a call bounded by `timeout` end to end.
+    pub(crate) fn start(timeout: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            deadline: tokio::time::Instant::now() + timeout,
+            http_status: None,
+        }
+    }
+
+    /// Run `fut` against the call's deadline. `Err` means the deadline
+    /// passed, which every kind reports as its `Timeout` failure — whether
+    /// the provider never answered or answered and then stalled the body.
+    pub(crate) async fn within<T>(
+        &self,
+        fut: impl std::future::Future<Output = T>,
+    ) -> Result<T, tokio::time::error::Elapsed> {
+        tokio::time::timeout_at(self.deadline, fut).await
+    }
+
+    /// Record the status of the response that arrived, so every later
+    /// failure of this call logs it.
+    pub(crate) fn responded(&mut self, status: reqwest::StatusCode) {
+        self.http_status = Some(status.as_u16());
     }
 
     fn elapsed_ms(&self) -> u64 {
-        u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// A failure decided from what the provider answered (a status, a code)
@@ -86,6 +119,7 @@ impl CallClock {
     pub(crate) fn fail<F>(&self, failure: F) -> CallFailure<F> {
         CallFailure {
             failure,
+            http_status: self.http_status,
             error: None,
             error_kind: None,
             elapsed_ms: self.elapsed_ms(),
@@ -97,6 +131,7 @@ impl CallClock {
     pub(crate) fn fail_with<F>(&self, failure: F, err: &reqwest::Error) -> CallFailure<F> {
         CallFailure {
             failure,
+            http_status: self.http_status,
             error: Some(error_chain(err)),
             error_kind: Some(error_kind(err)),
             elapsed_ms: self.elapsed_ms(),
@@ -115,7 +150,7 @@ impl CallClock {
 /// The request URL is part of reqwest's text. No guardrail kind puts a
 /// credential in it: every kind sends its key in a header or a signed form
 /// body, so the URL is the configured endpoint plus a fixed path.
-pub(crate) fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+pub fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     let mut out = err.to_string();
     let mut source = err.source();
     while let Some(s) = source {
@@ -227,6 +262,10 @@ pub(crate) mod testing {
             "underlying cause logged: {line}"
         );
         assert!(line.contains("elapsed_ms="), "duration logged: {line}");
+        assert!(
+            !line.contains("http_status="),
+            "no response, no status: {line}"
+        );
         for secret in secrets.iter().chain(&[PROMPT_MARKER]) {
             assert!(!logged.contains(secret), "`{secret}` leaked: {logged}");
         }
@@ -261,5 +300,59 @@ pub(crate) mod testing {
             "underlying cause logged: {line}"
         );
         assert!(line.contains("elapsed_ms="), "duration logged: {line}");
+    }
+
+    /// A provider that answers every call with `status` and an empty JSON
+    /// object.
+    pub(crate) async fn status_server(status: u16) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(status).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The warn for a call that got a response carries its status.
+    pub(crate) fn assert_status_logged(logged: &str, message: &str, status: u16) {
+        let line = failure_line(logged, message);
+        assert!(
+            line.contains(&format!("http_status={status}")),
+            "status logged: {line}"
+        );
+        assert!(line.contains("elapsed_ms="), "duration logged: {line}");
+    }
+
+    /// A provider that sends `status` and its headers, promises a body,
+    /// sends one byte of it and then never another.
+    pub(crate) async fn stalled_body_server(status: u16) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 16 * 1024];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
+                     content-length: 1000\r\n\r\n{{"
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                held.push(sock);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A body that stalls past `timeout_ms` ends the call as the kind's
+    /// `Timeout`, with the status of the response that did arrive.
+    pub(crate) fn assert_stall_logged(logged: &str, message: &str, status: u16) {
+        let line = failure_line(logged, message);
+        assert!(line.contains("failure=Timeout"), "bucket: {line}");
+        assert!(
+            line.contains(&format!("http_status={status}")),
+            "status logged: {line}"
+        );
     }
 }

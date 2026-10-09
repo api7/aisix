@@ -288,7 +288,7 @@ impl AliyunTextModerationGuardrail {
         body.push_str("&Signature=");
         body.push_str(&percent_encode(&signature));
 
-        let clock = CallClock::start();
+        let mut clock = CallClock::start(self.timeout);
         let future = self
             .client
             .post(format!("{}/", self.endpoint))
@@ -300,7 +300,7 @@ impl AliyunTextModerationGuardrail {
         // No response means no diagnostics to report: an id Aliyun never
         // sent can't be invented. `request_id` stays empty and the failure
         // bucket carries the whole story.
-        let resp = match tokio::time::timeout(self.timeout, future).await {
+        let resp = match clock.within(future).await {
             Err(_elapsed) => {
                 return (
                     Err(clock.fail(AliyunFailure::Timeout)),
@@ -315,6 +315,7 @@ impl AliyunTextModerationGuardrail {
             }
             Ok(Ok(r)) => r,
         };
+        clock.responded(resp.status());
 
         // Read the id off the headers up front: it survives every path
         // below, including the ones where the body is unusable.
@@ -343,9 +344,16 @@ impl AliyunTextModerationGuardrail {
             // The body is still read (capped) rather than skipped, since the code
             // lives in it; it is just never logged verbatim.
             let mut resp = resp;
-            let response_body =
-                crate::read_body_capped(&mut resp, MAX_ERROR_BODY_PARSE_BYTES, &self.row_name)
-                    .await;
+            let Ok(response_body) = clock
+                .within(crate::read_body_capped(
+                    &mut resp,
+                    MAX_ERROR_BODY_PARSE_BYTES,
+                    &self.row_name,
+                ))
+                .await
+            else {
+                return (Err(clock.fail(AliyunFailure::Timeout)), diag);
+            };
             diag.code = extract_error_code(&response_body);
             tracing::error!(
                 row = %self.row_name,
@@ -357,9 +365,10 @@ impl AliyunTextModerationGuardrail {
             return (Err(clock.fail(AliyunFailure::ConfigError)), diag);
         }
 
-        let body: AliyunResponse = match resp.json().await {
-            Ok(b) => b,
-            Err(e) => {
+        let body: AliyunResponse = match clock.within(resp.json()).await {
+            Ok(Ok(b)) => b,
+            Err(_) => return (Err(clock.fail(AliyunFailure::Timeout)), diag),
+            Ok(Err(e)) => {
                 return (
                     Err(clock.fail_with(AliyunFailure::MalformedResponse, &e)),
                     diag,
@@ -413,6 +422,7 @@ impl AliyunTextModerationGuardrail {
                 row = %self.row_name,
                 aliyun_request_id = %diag.request_id,
                 failure = ?failure.failure,
+                http_status = failure.http_status,
                 fail_open,
                 error = failure.error.as_deref(),
                 error_kind = failure.error_kind.map(tracing::field::display),
@@ -1774,5 +1784,38 @@ mod tests {
                 .contains("aliyun_request_id=DECODE-REQ-1"),
             "the id Aliyun sent survives a decode failure; got: {logged}"
         );
+    }
+
+    /// A 5xx is logged with its status (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn server_error_logs_the_status() {
+        use crate::call_error::testing::*;
+        let server = status_server(503).await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, "high", true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_status_logged(&logged, "aliyun text moderation call failed", 503);
+    }
+
+    /// `timeout_ms` covers the response body, not just its headers: a body
+    /// that stalls ends the call as a timeout instead of hanging it.
+    #[tokio::test]
+    async fn stalled_body_times_out() {
+        use crate::call_error::testing::*;
+        let uri = stalled_body_server(200).await;
+        let logged = capture_logs(|| async {
+            let mut g = build(&uri, "high", true);
+            g.timeout = Duration::from_millis(200);
+            let verdict =
+                tokio::time::timeout(Duration::from_secs(5), g.check_input(&req(PROMPT_MARKER)))
+                    .await
+                    .expect("the guardrail call must end at its own timeout");
+            assert!(verdict.is_bypass());
+        })
+        .await;
+        assert_stall_logged(&logged, "aliyun text moderation call failed", 200);
     }
 }

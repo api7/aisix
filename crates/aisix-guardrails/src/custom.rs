@@ -997,6 +997,7 @@ async fn host_embed(
         })
         .unwrap_or_else(|e| embed_error(e.to_string())),
         Err(failure) => {
+            let failure = failure.failure;
             tracing::warn!(row = %row_name, model = %model, failure = ?failure, "custom guardrail embed failed");
             embed_error(format!("{failure:?}"))
         }
@@ -1854,7 +1855,7 @@ mod tests {
                 texts: &[String],
                 _cacheable: bool,
                 _timeout: Duration,
-            ) -> Result<crate::Embedded, crate::EmbedFailure> {
+            ) -> Result<crate::Embedded, crate::EmbedError> {
                 // "jailbreak" points one way, everything else the other.
                 let vectors = texts
                     .iter()
