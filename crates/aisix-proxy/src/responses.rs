@@ -254,6 +254,17 @@ pub async fn responses(
             monitor_hits.extend(success.output_monitor_hits.clone());
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
+            // ONE ProviderKey lookup for both the metric emit and the
+            // winner's usage event below (#941).
+            let pk = ResolvedPk::resolve(&snapshot, &success.provider_key_id);
+            let request_upstream = crate::request_metrics::Upstream {
+                provider: &success.provider,
+                model: &model_name,
+                upstream_model: &success.upstream_model,
+                pk: pk.labels(),
+                stream: stream_requested,
+                is_fallback: success.routing.fallback_count() > 0,
+            };
             // See the note in `messages.rs`: the flag alone is not "the
             // response is a stream".
             if stream_requested && success.usage_handled_by_stream {
@@ -272,6 +283,13 @@ pub async fn responses(
                     )
                     .with_model(&success.provider, &model_name)
                     .with_routing(&success.routing),
+                    crate::request_metrics::PendingRequestMetrics::at_stream_end(
+                        &state,
+                        "/v1/responses",
+                        crate::request_metrics::Caller::new(&auth),
+                        request_upstream,
+                        started,
+                    ),
                 );
             } else {
                 emit_access_log(
@@ -288,25 +306,15 @@ pub async fn responses(
                     &success.routing,
                     None,
                 );
+                crate::request_metrics::record(
+                    &state,
+                    "/v1/responses",
+                    crate::request_metrics::Caller::new(&auth),
+                    request_upstream,
+                    status,
+                    elapsed,
+                );
             }
-            // ONE ProviderKey lookup for both the metric emit and the
-            // winner's usage event below (#941).
-            let pk = ResolvedPk::resolve(&snapshot, &success.provider_key_id);
-            crate::request_metrics::record(
-                &state,
-                "/v1/responses",
-                crate::request_metrics::Caller::new(&auth),
-                crate::request_metrics::Upstream {
-                    provider: &success.provider,
-                    model: &model_name,
-                    upstream_model: &success.upstream_model,
-                    pk: pk.labels(),
-                    stream: stream_requested,
-                    is_fallback: success.routing.fallback_count() > 0,
-                },
-                status,
-                elapsed,
-            );
             // Per #655: one zero-token UsageEvent per failed attempt that
             // preceded the winner (non-streaming failover).
             emit_failed_attempts(
@@ -542,7 +550,7 @@ pub async fn responses(
                     &client,
                     AttemptInfo {
                         kind: "initial".to_string(),
-                        error_class: err.kind().to_string(),
+                        error_class: crate::attempt::error_class(&err).to_string(),
                         ..Default::default()
                     },
                     guardrail_blocked,
@@ -2007,6 +2015,13 @@ async fn responses_to_target(
                 };
                 let (elapsed, attempt_elapsed) =
                     crate::request_metrics::stream_end_elapsed(started, attempt_started);
+                // A stream the consumer abandoned mid-flight is reported as
+                // 499. An upstream failure after the headers — a transport
+                // error, a read timeout, an in-band `error` or
+                // `response.failed` event — is recorded as that failure's
+                // status and error.
+                let terminal_status =
+                    crate::attempt::stream_status(usage.reached_end, usage.failure.as_ref());
                 // SLO e2e histogram: full stream duration (verbatim path).
                 let snap_c = state_c.snapshot.load();
                 let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
@@ -2022,7 +2037,7 @@ async fn responses_to_target(
                         stream: true,
                         ..Default::default()
                     },
-                    200,
+                    terminal_status,
                     elapsed,
                 );
                 // Live-forward path: no output masking possible (a masking
@@ -2046,16 +2061,10 @@ async fn responses_to_target(
                     metric_caller.as_caller(),
                     &provider_c,
                     &metric_upstream_model,
-                    // A stream the consumer abandoned mid-flight is reported
-                    // as 499, matching LiteLLM. The upstream work still
-                    // happened, so the event is emitted either way — only
-                    // its outcome differs.
-                    //
-                    // An upstream failure after the headers — a transport
-                    // error, a read timeout, an in-band `error` or
-                    // `response.failed` event — is recorded as that failure's
-                    // status and error.
-                    crate::attempt::stream_status(usage.reached_end, usage.failure.as_ref()),
+                    // The upstream work still happened, so the event is
+                    // emitted however the stream ended — only its outcome
+                    // differs.
+                    terminal_status,
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
                     attempt_elapsed,
@@ -7501,7 +7510,11 @@ data: [DONE]\n\n";
         let snap = new_snap_openai(&upstream);
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        let app = build_app(snap);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+        let metrics = state.metrics.clone();
+        let app = crate::build_router(state);
 
         let endings = crate::test_log::three_stream_endings(app, || {
             make_req(serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}))
@@ -7509,6 +7522,11 @@ data: [DONE]\n\n";
         .await;
         crate::test_log::assert_one_line_per_ending(&endings, "/v1/responses", "k-1");
         crate::test_log::assert_latency_is_time_to_first_token(&endings);
+        crate::test_log::assert_request_families_follow_the_endings(
+            &metrics,
+            "/v1/responses",
+            true,
+        );
         assert_eq!(
             endings.delivered.field("provider_request_id").as_deref(),
             Some("resp_stream"),

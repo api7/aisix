@@ -166,6 +166,11 @@ pub async fn a2a_endpoint(
 
     let elapsed = started.elapsed();
     let status = response.status().as_u16();
+    let a2a_upstream = crate::request_metrics::Upstream {
+        provider: "a2a",
+        model: A2A_MODEL_LABEL,
+        ..Default::default()
+    };
     if crate::attribution::stream_owns_access_log() {
         // A streamed call ends when the agent's last event is relayed or
         // the caller walks away, both of which are below this frame and
@@ -181,6 +186,13 @@ pub async fn a2a_endpoint(
                 started,
             )
             .with_model("a2a", ""),
+            crate::request_metrics::PendingRequestMetrics::at_stream_end(
+                &state,
+                "/a2a",
+                crate::request_metrics::Caller::new(&caller_auth),
+                a2a_upstream,
+                started,
+            ),
         );
     } else {
         let target = crate::attribution::AccessLogTarget::current();
@@ -214,19 +226,15 @@ pub async fn a2a_endpoint(
             request_body_bytes: None,
             response_body_bytes: None,
         });
+        crate::request_metrics::record(
+            &state,
+            "/a2a",
+            crate::request_metrics::Caller::new(&caller_auth),
+            a2a_upstream,
+            status,
+            elapsed,
+        );
     }
-    crate::request_metrics::record(
-        &state,
-        "/a2a",
-        crate::request_metrics::Caller::new(&caller_auth),
-        crate::request_metrics::Upstream {
-            provider: "a2a",
-            model: A2A_MODEL_LABEL,
-            ..Default::default()
-        },
-        status,
-        elapsed,
-    );
     response
 }
 
@@ -998,13 +1006,10 @@ fn emit_a2a_usage(
         auth.key().user_id.as_deref(),
         auth.user_name(),
     );
-    // The client-perceived duration of the call. Nothing else records it for
-    // `/a2a`: the handler returns the moment a stream's response head is out,
-    // so `aisix_proxy_request_duration_seconds` times only how long a stream
-    // took to OPEN. Recorded here rather than at the stream's drop guard so
-    // the unary, quota-rejected and failed-to-open paths are in the sample
-    // too — a streaming-only series would report `/a2a` as having no failures
-    // at all.
+    // The client-perceived duration of the call. Recorded here rather than at
+    // the stream's drop guard so the unary, quota-rejected and failed-to-open
+    // paths are in the sample too — a streaming-only series would report
+    // `/a2a` as having no failures at all.
     crate::request_metrics::record_e2e_latency_downstream_only(
         state,
         "/a2a",
@@ -2221,7 +2226,9 @@ mod tests {
         let agent_url = spawn_progressing_stream_agent().await;
         let handle = SnapshotHandle::new(snapshot_with(&agent_url, true, serde_json::json!(["*"])));
         let hub = Arc::new(aisix_gateway::Hub::new());
-        let router = build_router(ProxyState::new(handle, hub, &proxy_cfg()).without_cache());
+        let state = ProxyState::new(handle, hub, &proxy_cfg()).without_cache();
+        let metrics = state.metrics.clone();
+        let router = build_router(state);
 
         let endings = crate::test_log::three_stream_endings(router, || {
             HttpRequest::post("/a2a/invoice")
@@ -2235,6 +2242,7 @@ mod tests {
         })
         .await;
         crate::test_log::assert_one_line_per_ending(&endings, "/a2a", "ak-1");
+        crate::test_log::assert_request_families_follow_the_endings(&metrics, "/a2a", false);
         assert_eq!(
             endings.delivered.field("provider").as_deref(),
             Some("a2a"),

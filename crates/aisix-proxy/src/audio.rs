@@ -153,6 +153,19 @@ pub async fn transcriptions(
             // Actual status, not a hardcoded 200 — the #696 billed-then-
             // output-blocked path returns Ok(success) carrying a 422.
             let status = success.response.status().as_u16();
+            // ONE ProviderKey lookup for both terminal emits (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
+            let deferred_metrics = record_audio_metrics(
+                &state,
+                &pk,
+                "/v1/audio/transcriptions",
+                &auth,
+                &success,
+                status,
+                elapsed,
+                routing.fallback_count() > 0,
+                success.usage_handled_by_stream.then_some(started),
+            );
             // On this family the flag IS "the response is a live relay" — it
             // is set only inside the `is_event_stream` branch and is what
             // labels the metric as streaming — so there is no second
@@ -160,7 +173,7 @@ pub async fn transcriptions(
             // `/v1/responses`. If it ever comes to mean "already emitted"
             // too, park on the relay itself instead: a parked line with no
             // later emitter is a line silently lost.
-            if success.usage_handled_by_stream {
+            if let Some(deferred_metrics) = deferred_metrics {
                 // A relayed transcription stream has no outcome yet — the caller may
                 // read it to the terminal event or walk away. Park the line and
                 // let the relay's own Drop emitter write it beside the usage
@@ -175,6 +188,7 @@ pub async fn transcriptions(
                     )
                     .with_model(&success.provider, &success.model_name)
                     .with_routing(&routing),
+                    deferred_metrics,
                 );
             } else {
                 emit_access_log(
@@ -190,18 +204,6 @@ pub async fn transcriptions(
                     None,
                 );
             }
-            // ONE ProviderKey lookup for both terminal emits (#941).
-            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
-            record_audio_metrics(
-                &state,
-                &pk,
-                "/v1/audio/transcriptions",
-                &auth,
-                &success,
-                status,
-                elapsed,
-                routing.fallback_count() > 0,
-            );
             // One zero-token event per attempt that failed before the
             // winner (#655); a live relay's own event is the winner's.
             crate::usage_attr::emit_failed_attempts(
@@ -313,7 +315,7 @@ pub async fn transcriptions(
                     "",
                     &api_key_id,
                     status,
-                    err.kind(),
+                    crate::attempt::error_class(&err),
                     err.is_guardrail_block(),
                     &client,
                     crate::usage_attr::applied_guardrails(&audit),
@@ -391,7 +393,20 @@ pub async fn translations(
             // Actual status, not a hardcoded 200 — the #696 billed-then-
             // output-blocked path returns Ok(success) carrying a 422.
             let status = success.response.status().as_u16();
-            if success.usage_handled_by_stream {
+            // ONE ProviderKey lookup for both terminal emits (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
+            let deferred_metrics = record_audio_metrics(
+                &state,
+                &pk,
+                "/v1/audio/translations",
+                &auth,
+                &success,
+                status,
+                elapsed,
+                routing.fallback_count() > 0,
+                success.usage_handled_by_stream.then_some(started),
+            );
+            if let Some(deferred_metrics) = deferred_metrics {
                 // A relayed transcription stream has no outcome yet — the caller may
                 // read it to the terminal event or walk away. Park the line and
                 // let the relay's own Drop emitter write it beside the usage
@@ -406,6 +421,7 @@ pub async fn translations(
                     )
                     .with_model(&success.provider, &success.model_name)
                     .with_routing(&routing),
+                    deferred_metrics,
                 );
             } else {
                 emit_access_log(
@@ -421,18 +437,6 @@ pub async fn translations(
                     None,
                 );
             }
-            // ONE ProviderKey lookup for both terminal emits (#941).
-            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
-            record_audio_metrics(
-                &state,
-                &pk,
-                "/v1/audio/translations",
-                &auth,
-                &success,
-                status,
-                elapsed,
-                routing.fallback_count() > 0,
-            );
             // One zero-token event per attempt that failed before the
             // winner (#655); a live relay's own event is the winner's.
             crate::usage_attr::emit_failed_attempts(
@@ -543,7 +547,7 @@ pub async fn translations(
                     "",
                     &api_key_id,
                     status,
-                    err.kind(),
+                    crate::attempt::error_class(&err),
                     err.is_guardrail_block(),
                     &client,
                     crate::usage_attr::applied_guardrails(&audit),
@@ -616,8 +620,9 @@ pub async fn speech(
     .await
     {
         Ok(success) => {
-            let elapsed = started.elapsed();
-            let status = success.response.status().as_u16();
+            // One ProviderKey lookup for the metric emit + the usage event
+            // below (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
             // The audio has not streamed yet — the caller may read it to the
             // end or walk away, and the upstream may fail part-way. Park the
             // line for the relay's own emitter to write beside the usage
@@ -632,24 +637,20 @@ pub async fn speech(
                 )
                 .with_model(&success.provider, &model_name)
                 .with_routing(&routing),
-            );
-            // One ProviderKey lookup for the metric emit + the usage event
-            // below (#941).
-            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
-            crate::request_metrics::record(
-                &state,
-                "/v1/audio/speech",
-                crate::request_metrics::Caller::new(&auth),
-                crate::request_metrics::Upstream {
-                    provider: &success.provider,
-                    model: &model_name,
-                    upstream_model: &success.upstream_model,
-                    pk: pk.labels(),
-                    is_fallback: routing.fallback_count() > 0,
-                    ..Default::default()
-                },
-                status,
-                elapsed,
+                crate::request_metrics::PendingRequestMetrics::at_stream_end(
+                    &state,
+                    "/v1/audio/speech",
+                    crate::request_metrics::Caller::new(&auth),
+                    crate::request_metrics::Upstream {
+                        provider: &success.provider,
+                        model: &model_name,
+                        upstream_model: &success.upstream_model,
+                        pk: pk.labels(),
+                        is_fallback: routing.fallback_count() > 0,
+                        ..Default::default()
+                    },
+                    started,
+                ),
             );
             // One zero-token event per attempt that failed before the
             // winner (#655); the relay's own event is the winner's.
@@ -808,7 +809,7 @@ pub async fn speech(
                     &model_name,
                     &api_key_id,
                     status,
-                    err.kind(),
+                    crate::attempt::error_class(&err),
                     err.is_guardrail_block(),
                     &client,
                     crate::usage_attr::applied_guardrails(&audit),
@@ -2497,25 +2498,33 @@ fn record_audio_metrics(
     status: u16,
     elapsed: Duration,
     is_fallback: bool,
-) {
-    crate::request_metrics::record(
-        state,
-        endpoint,
-        crate::request_metrics::Caller::new(auth),
-        crate::request_metrics::Upstream {
-            provider: &success.provider,
-            model: &success.model_name,
-            upstream_model: &success.upstream_model,
-            pk: pk.labels(),
-            // True exactly on the live SSE relay (#998) — the flag that
-            // moves the usage emit into the stream is the same condition
-            // that makes this a streamed response.
-            stream: success.usage_handled_by_stream,
-            is_fallback,
-        },
-        status,
-        elapsed,
-    );
+    // `Some(request start)` on the live relay, whose samples are returned
+    // to be parked beside its access-log line rather than recorded now.
+    stream_started: Option<std::time::Instant>,
+) -> Option<crate::request_metrics::PendingRequestMetrics> {
+    let caller = crate::request_metrics::Caller::new(auth);
+    let upstream = crate::request_metrics::Upstream {
+        provider: &success.provider,
+        model: &success.model_name,
+        upstream_model: &success.upstream_model,
+        pk: pk.labels(),
+        // True exactly on the live SSE relay (#998) — the flag that
+        // moves the usage emit into the stream is the same condition
+        // that makes this a streamed response.
+        stream: success.usage_handled_by_stream,
+        is_fallback,
+    };
+    match stream_started {
+        Some(started) => Some(
+            crate::request_metrics::PendingRequestMetrics::at_stream_end(
+                state, endpoint, caller, upstream, started,
+            ),
+        ),
+        None => {
+            crate::request_metrics::record(state, endpoint, caller, upstream, status, elapsed);
+            None
+        }
+    }
 }
 
 /// Emit a UsageEvent for a successful transcription/translation. Tokens
@@ -4757,7 +4766,11 @@ data: [DONE]\n\n";
         let snap = new_snap(&upstream);
         snap.models.insert(whisper_model("my-transcribe"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        let app = build_app(snap);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+        let metrics = state.metrics.clone();
+        let app = crate::build_router(state);
 
         let endings = crate::test_log::three_stream_endings(app, || {
             let (ct, body) = streaming_transcription_multipart("my-transcribe");
@@ -4771,6 +4784,11 @@ data: [DONE]\n\n";
         })
         .await;
         crate::test_log::assert_one_line_per_ending(&endings, "/v1/audio/transcriptions", "k-1");
+        crate::test_log::assert_request_families_follow_the_endings(
+            &metrics,
+            "/v1/audio/transcriptions",
+            true,
+        );
         assert_eq!(
             endings.delivered.num("total_tokens"),
             Some(38),

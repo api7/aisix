@@ -854,7 +854,7 @@ fn finish(
                 "",
                 &auth.entry.id,
                 status,
-                err.kind(),
+                crate::attempt::error_class(&err),
                 err.is_guardrail_block(),
                 client,
                 applied,

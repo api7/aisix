@@ -278,8 +278,26 @@ impl AttemptInfo {
     }
 }
 
-/// Bounded, low-sensitivity error class for the per-attempt `error_class`
-/// telemetry field (#655).
+/// The failure class a request's records carry: the access log's
+/// `error_kind` and the usage event's `error_class`, on every path —
+/// non-streamed, streamed, per attempt, and terminal.
+///
+/// Both read it from here so the two cannot drift into two vocabularies
+/// again. An upstream failure reports its [`routing_error_class`]; every
+/// other failure its [`ProxyError::kind`].
+///
+/// NOT the client-facing envelope's `error.type`, which stays
+/// [`ProxyError::kind`]: that one is public API, and for a bridge error it
+/// keeps its own spelling (`upstream_error`, `transport_error`, …).
+pub(crate) fn error_class(err: &ProxyError) -> &'static str {
+    match err {
+        ProxyError::Bridge(be) => routing_error_class(be),
+        other => other.kind(),
+    }
+}
+
+/// Bounded, low-sensitivity error class of an upstream failure — see
+/// [`error_class`], which every record of a failed request goes through.
 pub(crate) fn routing_error_class(err: &BridgeError) -> &'static str {
     match err {
         BridgeError::Timeout { .. } => "timeout",
@@ -391,21 +409,19 @@ pub(crate) fn stream_status(reached_end: bool, failure: Option<&StreamFailure>) 
 /// close. Here every variant contributes its `Display`, because the access
 /// log is the one line an operator gets per request.
 pub(crate) fn access_log_error(err: &ProxyError) -> (&'static str, String) {
-    (err.kind(), sanitize_error_message(&err.to_string()))
+    (error_class(err), sanitize_error_message(&err.to_string()))
 }
 
 /// Bounded error class + short message for a per-attempt record, derived
-/// from a `ProxyError`. Bridge errors carry the upstream-mapped class +
-/// message; everything else uses the DP-stable `ProxyError::kind`. Shared
-/// by the `/v1/messages` and `/v1/responses` dispatch loops.
+/// from a `ProxyError`. The class is [`error_class`]; only a bridge error
+/// carries a message. Shared by the `/v1/messages` and `/v1/responses`
+/// dispatch loops.
 pub(crate) fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
-    match err {
-        ProxyError::Bridge(be) => (
-            routing_error_class(be).to_string(),
-            attempt_error_message(be),
-        ),
-        other => (other.kind().to_string(), String::new()),
-    }
+    let message = match err {
+        ProxyError::Bridge(be) => attempt_error_message(be),
+        _ => String::new(),
+    };
+    (error_class(err).to_string(), message)
 }
 
 /// Whether a failed attempt actually reached its upstream — the
@@ -495,6 +511,47 @@ mod tests {
             BridgeError::InvalidUpstreamConfig("model.model_name missing".into()),
             BridgeError::InvalidUpstreamCredentials("provider_key.api_key is empty".into()),
         ]
+    }
+
+    /// One vocabulary for a failure's records: the access log's `error_kind`
+    /// and the usage event's `error_class` both name an upstream failure by
+    /// its routing class, while the client's envelope keeps its own public
+    /// `error.type`. The two used to differ for the same failure — the
+    /// non-streamed line said `upstream_error` where the row said
+    /// `upstream_status`.
+    #[test]
+    fn every_record_of_a_failure_names_it_with_one_class() {
+        let expected = [
+            ("timeout", "timeout"),
+            ("upstream_status", "upstream_error"),
+            ("upstream_decode", "upstream_decode_error"),
+            ("upstream_in_band", "upstream_in_band_error"),
+            ("transport", "transport_error"),
+            ("stream_aborted", "stream_aborted"),
+            ("config", "config_error"),
+            ("config", "config_error"),
+            ("invalid_config", "invalid_request_error"),
+            ("invalid_credentials", "authentication_error"),
+        ];
+        let samples = bridge_error_samples();
+        assert_eq!(samples.len(), expected.len());
+        for (be, (class, envelope)) in samples.into_iter().zip(expected) {
+            let routing = routing_error_class(&be);
+            let err = ProxyError::Bridge(be);
+            assert_eq!(error_class(&err), class, "{err:?}");
+            assert_eq!(routing, class, "the attempt record: {err:?}");
+            assert_eq!(access_log_error(&err).0, class, "the access log: {err:?}");
+            assert_eq!(attempt_error_from_proxy(&err).0, class, "{err:?}");
+            assert_eq!(
+                err.kind(),
+                envelope,
+                "the client envelope is public API: {err:?}"
+            );
+        }
+        // A failure only one vocabulary ever named keeps its name.
+        let not_found = ProxyError::ModelNotFound("m".into());
+        assert_eq!(error_class(&not_found), "model_not_found");
+        assert_eq!(access_log_error(&not_found).0, "model_not_found");
     }
 
     /// The `aisix_deployment_*` families read as upstream health, so an

@@ -405,6 +405,9 @@ struct Cell {
     /// See [`PendingAccessLog`]. `Some` only between a streaming handler
     /// returning and the request's terminal usage event going out.
     pending_log: Option<PendingAccessLog>,
+    /// Parked and completed with `pending_log`; see
+    /// [`crate::request_metrics::PendingRequestMetrics`].
+    pending_metrics: Option<crate::request_metrics::PendingRequestMetrics>,
     /// See [`note_stream_owns_access_log`].
     stream_owns_log: bool,
     /// See [`RequestAttribution::track`]. `None` on a cell no telemetry
@@ -748,13 +751,26 @@ impl RequestAttribution {
     /// Read through the cell handle rather than the task-local because the
     /// cancel guard holds the handle and runs from `Drop`, outside every
     /// scope.
+    ///
+    /// The stream's request-metric samples go out here too, under the same
+    /// status — unless the response head was never written: a cancel that
+    /// lands between the handler parking them and returning is a head-phase
+    /// cancel, which the request families do not count.
     pub(crate) fn emit_deferred_access_log(&self, event: &aisix_obs::UsageEvent) -> bool {
         let mut cell = self.lock();
-        let Some(pending) = cell.pending_log.take() else {
-            return false;
-        };
+        let metrics = cell.pending_metrics.take();
+        // A cell no telemetry middleware tracks never learns about its head;
+        // its line is written at once too (`park_access_log`).
+        let had_head = cell.head_written || cell.request_span.is_none();
+        let pending = cell.pending_log.take();
         let target = cell.resolved.clone();
         drop(cell);
+        if let Some(metrics) = metrics.filter(|_| had_head) {
+            metrics.record_terminal(event.status_code);
+        }
+        let Some(pending) = pending else {
+            return false;
+        };
         pending.emit(self, &target, event);
         true
     }
@@ -1101,11 +1117,20 @@ pub(crate) fn note_attempt_settled(rec: &AttemptRecord) {
     });
 }
 
-/// Park this request's access-log line until its outcome is known. Called
-/// by a streaming handler in place of writing the line itself — see
-/// [`PendingAccessLog`].
-pub(crate) fn defer_access_log(pending: PendingAccessLog) {
-    let _ = CURRENT.try_with(|a| a.lock().pending_log = Some(pending));
+/// Park this request's access-log line and its request-metric samples until
+/// its outcome is known. Called by a streaming handler in place of writing
+/// either itself — see [`PendingAccessLog`] and
+/// [`crate::request_metrics::PendingRequestMetrics`]. Taken together so a
+/// streaming family cannot defer one and record the other at its head.
+pub(crate) fn defer_access_log(
+    pending: PendingAccessLog,
+    metrics: crate::request_metrics::PendingRequestMetrics,
+) {
+    let _ = CURRENT.try_with(|a| {
+        let mut cell = a.lock();
+        cell.pending_log = Some(pending);
+        cell.pending_metrics = Some(metrics);
+    });
 }
 
 /// Note that this request answered with a stream whose own terminal

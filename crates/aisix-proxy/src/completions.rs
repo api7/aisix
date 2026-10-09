@@ -326,7 +326,7 @@ pub async fn completions(
                     &model_name,
                     &api_key_id,
                     status,
-                    err.kind(),
+                    crate::attempt::error_class(&err),
                     err.is_guardrail_block(),
                     &client,
                     crate::usage_attr::applied_guardrails(&audit),
