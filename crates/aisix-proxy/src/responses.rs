@@ -254,6 +254,16 @@ pub async fn responses(
             monitor_hits.extend(success.output_monitor_hits.clone());
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
+            // A held-back stream the upstream failed in-band goes out as a
+            // 200 carrying the failure, and its usage event records the
+            // failure's status (below). The request metrics record the same
+            // outcome; a guardrail refusal keeps its own status.
+            let terminal_status = success
+                .usage
+                .as_ref()
+                .and_then(|u| u.failure.as_ref())
+                .filter(|_| !success.guardrail_blocked)
+                .map_or(status, |f| f.status);
             // ONE ProviderKey lookup for both the metric emit and the
             // winner's usage event below (#941).
             let pk = ResolvedPk::resolve(&snapshot, &success.provider_key_id);
@@ -311,7 +321,7 @@ pub async fn responses(
                     "/v1/responses",
                     crate::request_metrics::Caller::new(&auth),
                     request_upstream,
-                    status,
+                    terminal_status,
                     elapsed,
                 );
             }
@@ -366,7 +376,7 @@ pub async fn responses(
                         stream: stream_requested,
                         ..Default::default()
                     },
-                    status,
+                    terminal_status,
                     elapsed,
                 );
                 if let Some(mut usage) = success.usage {

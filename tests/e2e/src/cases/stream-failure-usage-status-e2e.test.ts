@@ -4,8 +4,10 @@ import {
   EtcdClient,
   ProxyClient,
   SeedClient,
+  scrapeMetrics,
   spawnApp,
   startMockSls,
+  sumMetric,
   startOpenAiUpstream,
   waitConfigPropagation,
   waitForSlsLog,
@@ -409,18 +411,33 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     expect(row.get("error_message") ?? "").not.toBe("");
   }
 
+  // The request families record the same terminal status as the row, once —
+  // not the `200` the head went out with. Each model here serves one test.
+  async function expectRequestFamily(path: string, model: string, status: string): Promise<void> {
+    const want = (st: string) => (l: Record<string, string>) =>
+      l.endpoint === path && l.model === model && l.status === st;
+    await expect
+      .poll(async () => sumMetric(await scrapeMetrics(app!.metricsUrl), "aisix_proxy_requests_total", want(status)))
+      .toBe(1);
+    const samples = await scrapeMetrics(app!.metricsUrl);
+    expect(sumMetric(samples, "aisix_proxy_requests_total", want("200")), "recorded as a success").toBe(0);
+    expect(sumMetric(samples, "aisix_proxy_failed_requests_total", want(status))).toBe(1);
+  }
+
   // ── A mid-stream upstream failure, per family ──────────────────────
 
   test("chat/completions: a connection lost mid-stream is a 502 with its error", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
     const requestId = await streamToEnd("/v1/chat/completions", "sf-chat-cut");
     expectUpstreamFailure(await usageRow(requestId), "502");
+    await expectRequestFamily("/v1/chat/completions", "sf-chat-cut", "502");
   });
 
   test("messages (translated): a connection lost mid-stream is a 502, not the caller leaving", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
     const requestId = await streamToEnd("/v1/messages", "sf-messages-bridge-cut");
     expectUpstreamFailure(await usageRow(requestId), "502");
+    await expectRequestFamily("/v1/messages", "sf-messages-bridge-cut", "502");
   });
 
   test("messages (native): an in-band rate-limit error records the 429 it would have been", async (ctx) => {
@@ -429,12 +446,14 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     const row = await usageRow(requestId);
     expectUpstreamFailure(row, "429");
     expect(row.get("error_message")).toContain("exceeded your rate limit");
+    await expectRequestFamily("/v1/messages", "sf-messages-native-error", "429");
   });
 
   test("responses (translated): a connection lost mid-stream is a 502 with its error", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
     const requestId = await streamToEnd("/v1/responses", "sf-responses-bridge-cut");
     expectUpstreamFailure(await usageRow(requestId), "502");
+    await expectRequestFamily("/v1/responses", "sf-responses-bridge-cut", "502");
   });
 
   test("responses (native): an upstream response.failed is a 502 carrying its message", async (ctx) => {
@@ -443,6 +462,7 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     const row = await usageRow(requestId);
     expectUpstreamFailure(row, "502");
     expect(row.get("error_message")).toContain("failed partway through the response");
+    await expectRequestFamily("/v1/responses", "sf-responses-native-failed", "502");
   });
 
   test("responses (native, held back by an output guardrail): an upstream response.failed is still a 502", async (ctx) => {
@@ -452,6 +472,7 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     expectUpstreamFailure(row, "502");
     expect(row.get("error_message")).toContain("failed partway through the response");
     expect(row.get("guardrail_blocked") ?? "false").toBe("false");
+    await expectRequestFamily("/v1/responses", "sf-responses-native-failed-held", "502");
   });
 
   test("responses (translated): an upstream stream that carried nothing is a 502", async (ctx) => {
@@ -460,6 +481,7 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     const row = await usageRow(requestId);
     expectUpstreamFailure(row, "502");
     expect(row.get("error_message")).toContain("empty stream");
+    await expectRequestFamily("/v1/responses", "sf-responses-bridge-empty", "502");
   });
 
   test("audio transcriptions: a stream that loses its upstream is a 502, not the caller leaving", async (ctx) => {
