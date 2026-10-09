@@ -9,14 +9,15 @@
 //! fields — `http_status`, `error`, `error_kind`, `elapsed_ms` — so the family
 //! cannot drift.
 //!
-//! [`CallClock`] also owns the call's deadline: `timeout_ms` bounds the whole
-//! call, so every await on the response — the send, an error body, the JSON
-//! decode — goes through [`CallClock::within`].
+//! [`CallClock`] also owns the call's deadline: `timeout_ms` bounds each HTTP
+//! call end to end, so every await on its response — the send, an error
+//! body, the JSON decode — goes through [`CallClock::within`]. A check that
+//! makes several calls (chunks, Presidio's analyze then anonymize) gives each
+//! its own `timeout_ms`, as before.
 
-use std::time::{Duration, Instant};
-
-/// A failure bucket plus the cause the warn logs next to it.
-#[cfg_attr(
+// Only the feature-gated HTTP kinds use the clock; `error_chain` and
+// `error_kind` are used unconditionally.
+#![cfg_attr(
     not(any(
         feature = "azure-content-safety",
         feature = "aliyun-text-moderation",
@@ -26,6 +27,12 @@ use std::time::{Duration, Instant};
     )),
     allow(dead_code)
 )]
+
+use std::time::Duration;
+
+use tokio::time::Instant;
+
+/// A failure bucket plus the cause the warn logs next to it.
 #[derive(Debug)]
 pub(crate) struct CallFailure<F> {
     pub(crate) failure: F,
@@ -58,38 +65,19 @@ impl<F> CallFailure<F> {
 /// Started right before a guardrail call is sent; every failure of that call
 /// is built from it so the elapsed time is measured the same way everywhere,
 /// and every await of that call is bounded by its one deadline.
-#[cfg_attr(
-    not(any(
-        feature = "azure-content-safety",
-        feature = "aliyun-text-moderation",
-        feature = "lakera",
-        feature = "openai-moderation",
-        feature = "presidio",
-    )),
-    allow(dead_code)
-)]
 pub(crate) struct CallClock {
     started: Instant,
-    deadline: tokio::time::Instant,
+    deadline: Instant,
     http_status: Option<u16>,
 }
 
-#[cfg_attr(
-    not(any(
-        feature = "azure-content-safety",
-        feature = "aliyun-text-moderation",
-        feature = "lakera",
-        feature = "openai-moderation",
-        feature = "presidio",
-    )),
-    allow(dead_code)
-)]
 impl CallClock {
     /// Start the clock for a call bounded by `timeout` end to end.
     pub(crate) fn start(timeout: Duration) -> Self {
+        let started = Instant::now();
         Self {
-            started: Instant::now(),
-            deadline: tokio::time::Instant::now() + timeout,
+            started,
+            deadline: started + timeout,
             http_status: None,
         }
     }

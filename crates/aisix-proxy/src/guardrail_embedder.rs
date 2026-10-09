@@ -174,7 +174,10 @@ fn embedding_dimensions(model: &Model) -> Option<u32> {
 /// one can only mislabel a log line, never change a verdict.
 ///
 /// The error itself rides along for the guardrail's failure log, which is
-/// the only place it is reported: nothing on the dispatch path logs it.
+/// the only place it is reported: nothing on the dispatch path logs it. An
+/// upstream's own error message is left out and only its status kept: it
+/// is provider free text that can quote the screened input back, which a
+/// guardrail log must never carry (#153).
 fn classify(err: ProxyError) -> EmbedError {
     let failure = match &err {
         ProxyError::Bridge(BridgeError::Timeout { .. }) => EmbedFailure::Timeout,
@@ -183,8 +186,18 @@ fn classify(err: ProxyError) -> EmbedError {
         ProxyError::ProviderUnavailable | ProxyError::InvalidRequest(_) => EmbedFailure::Unresolved,
         _ => EmbedFailure::Upstream,
     };
+    let error = match &err {
+        ProxyError::Bridge(BridgeError::UpstreamStatus { status, .. }) => {
+            format!("upstream returned HTTP {status}")
+        }
+        ProxyError::Bridge(BridgeError::UpstreamInBand { status, .. }) => match status {
+            Some(status) => format!("upstream reported an in-band error (status {status})"),
+            None => "upstream reported an in-band error".to_owned(),
+        },
+        _ => aisix_guardrails::error_chain(&err),
+    };
     EmbedError {
         failure,
-        error: Some(aisix_guardrails::error_chain(&err)),
+        error: Some(error),
     }
 }
