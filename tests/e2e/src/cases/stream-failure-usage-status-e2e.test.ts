@@ -4,10 +4,11 @@ import {
   EtcdClient,
   ProxyClient,
   SeedClient,
+  metricDelta,
   scrapeMetrics,
   spawnApp,
   startMockSls,
-  sumMetric,
+  type MetricSample,
   startOpenAiUpstream,
   waitConfigPropagation,
   waitForSlsLog,
@@ -412,80 +413,93 @@ describe("usage status of a stream that fails after its 200 headers", () => {
   }
 
   // The request families record the same terminal status as the row, once —
-  // not the `200` the head went out with. Each model here serves one test.
-  async function expectRequestFamily(path: string, model: string, status: string): Promise<void> {
+  // not the `200` the head went out with. Deltas from a scrape taken before
+  // the request, so only this request's samples count.
+  async function expectRequestFamily(
+    before: MetricSample[],
+    path: string,
+    model: string,
+    status: string,
+  ): Promise<void> {
     const want = (st: string) => (l: Record<string, string>) =>
       l.endpoint === path && l.model === model && l.status === st;
-    await expect
-      .poll(async () => sumMetric(await scrapeMetrics(app!.metricsUrl), "aisix_proxy_requests_total", want(status)))
-      .toBe(1);
-    const samples = await scrapeMetrics(app!.metricsUrl);
-    expect(sumMetric(samples, "aisix_proxy_requests_total", want("200")), "recorded as a success").toBe(0);
-    expect(sumMetric(samples, "aisix_proxy_failed_requests_total", want(status))).toBe(1);
+    const delta = async (name: string, st: string) =>
+      metricDelta(before, await scrapeMetrics(app!.metricsUrl), name, want(st));
+    await expect.poll(() => delta("aisix_proxy_requests_total", status)).toBe(1);
+    expect(await delta("aisix_proxy_requests_total", "200"), "recorded as a success").toBe(0);
+    expect(await delta("aisix_proxy_failed_requests_total", status)).toBe(1);
   }
 
   // ── A mid-stream upstream failure, per family ──────────────────────
 
   test("chat/completions: a connection lost mid-stream is a 502 with its error", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
+    const before = await scrapeMetrics(app.metricsUrl);
     const requestId = await streamToEnd("/v1/chat/completions", "sf-chat-cut");
     expectUpstreamFailure(await usageRow(requestId), "502");
-    await expectRequestFamily("/v1/chat/completions", "sf-chat-cut", "502");
+    await expectRequestFamily(before, "/v1/chat/completions", "sf-chat-cut", "502");
   });
 
   test("messages (translated): a connection lost mid-stream is a 502, not the caller leaving", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
+    const before = await scrapeMetrics(app.metricsUrl);
     const requestId = await streamToEnd("/v1/messages", "sf-messages-bridge-cut");
     expectUpstreamFailure(await usageRow(requestId), "502");
-    await expectRequestFamily("/v1/messages", "sf-messages-bridge-cut", "502");
+    await expectRequestFamily(before, "/v1/messages", "sf-messages-bridge-cut", "502");
   });
 
   test("messages (native): an in-band rate-limit error records the 429 it would have been", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
+    const before = await scrapeMetrics(app.metricsUrl);
     const requestId = await streamToEnd("/v1/messages", "sf-messages-native-error");
     const row = await usageRow(requestId);
     expectUpstreamFailure(row, "429");
     expect(row.get("error_message")).toContain("exceeded your rate limit");
-    await expectRequestFamily("/v1/messages", "sf-messages-native-error", "429");
+    await expectRequestFamily(before, "/v1/messages", "sf-messages-native-error", "429");
   });
 
   test("responses (translated): a connection lost mid-stream is a 502 with its error", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
+    const before = await scrapeMetrics(app.metricsUrl);
     const requestId = await streamToEnd("/v1/responses", "sf-responses-bridge-cut");
     expectUpstreamFailure(await usageRow(requestId), "502");
-    await expectRequestFamily("/v1/responses", "sf-responses-bridge-cut", "502");
+    await expectRequestFamily(before, "/v1/responses", "sf-responses-bridge-cut", "502");
   });
 
   test("responses (native): an upstream response.failed is a 502 carrying its message", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
+    const before = await scrapeMetrics(app.metricsUrl);
     const requestId = await streamToEnd("/v1/responses", "sf-responses-native-failed");
     const row = await usageRow(requestId);
     expectUpstreamFailure(row, "502");
     expect(row.get("error_message")).toContain("failed partway through the response");
-    await expectRequestFamily("/v1/responses", "sf-responses-native-failed", "502");
+    await expectRequestFamily(before, "/v1/responses", "sf-responses-native-failed", "502");
   });
 
   test("responses (native, held back by an output guardrail): an upstream response.failed is still a 502", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
+    const before = await scrapeMetrics(app.metricsUrl);
     const requestId = await streamToEnd("/v1/responses", "sf-responses-native-failed-held");
     const row = await usageRow(requestId);
     expectUpstreamFailure(row, "502");
     expect(row.get("error_message")).toContain("failed partway through the response");
     expect(row.get("guardrail_blocked") ?? "false").toBe("false");
-    await expectRequestFamily("/v1/responses", "sf-responses-native-failed-held", "502");
+    await expectRequestFamily(before, "/v1/responses", "sf-responses-native-failed-held", "502");
   });
 
   test("responses (translated): an upstream stream that carried nothing is a 502", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
+    const before = await scrapeMetrics(app.metricsUrl);
     const requestId = await streamToEnd("/v1/responses", "sf-responses-bridge-empty");
     const row = await usageRow(requestId);
     expectUpstreamFailure(row, "502");
     expect(row.get("error_message")).toContain("empty stream");
-    await expectRequestFamily("/v1/responses", "sf-responses-bridge-empty", "502");
+    await expectRequestFamily(before, "/v1/responses", "sf-responses-bridge-empty", "502");
   });
 
   test("audio transcriptions: a stream that loses its upstream is a 502, not the caller leaving", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
+    const before = await scrapeMetrics(app.metricsUrl);
     const form = new FormData();
     form.set("model", "sf-transcribe-cut");
     form.set("stream", "true");
@@ -500,6 +514,7 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     expect(requestId).not.toBe("");
     await res.text().catch(() => undefined);
     expectUpstreamFailure(await usageRow(requestId), "502");
+    await expectRequestFamily(before, "/v1/audio/transcriptions", "sf-transcribe-cut", "502");
   });
 
   async function speech(model: string, signal?: AbortSignal): Promise<Response> {
@@ -513,12 +528,14 @@ describe("usage status of a stream that fails after its 200 headers", () => {
 
   test("audio speech: audio that loses its upstream part-way is a 502 with its error", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
+    const before = await scrapeMetrics(app.metricsUrl);
     const res = await speech("sf-speech-cut");
     expect(res.status).toBe(200);
     const requestId = res.headers.get("x-aisix-request-id") ?? "";
     expect(requestId).not.toBe("");
     await res.arrayBuffer().catch(() => undefined);
     expectUpstreamFailure(await usageRow(requestId), "502");
+    await expectRequestFamily(before, "/v1/audio/speech", "sf-speech-cut", "502");
   });
 
   test("audio speech: a caller that leaves part-way is a 499", async (ctx) => {
