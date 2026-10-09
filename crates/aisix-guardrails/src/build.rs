@@ -3732,7 +3732,7 @@ mod tests {
             texts: &[String],
             _cacheable: bool,
             _timeout: std::time::Duration,
-        ) -> Result<crate::Embedded, crate::EmbedFailure> {
+        ) -> Result<crate::Embedded, crate::EmbedError> {
             Ok(crate::Embedded {
                 model: "stub-embedder".to_owned(),
                 vectors: texts.iter().map(|_| vec![1.0, 0.0]).collect(),

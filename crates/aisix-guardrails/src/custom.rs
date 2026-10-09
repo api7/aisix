@@ -997,6 +997,7 @@ async fn host_embed(
         })
         .unwrap_or_else(|e| embed_error(e.to_string())),
         Err(failure) => {
+            let failure = failure.failure;
             tracing::warn!(row = %row_name, model = %model, failure = ?failure, "custom guardrail embed failed");
             embed_error(format!("{failure:?}"))
         }
@@ -1079,7 +1080,7 @@ async fn host_fetch(
                 .map(|v| (k.as_str().to_owned(), v.to_owned()))
         })
         .collect();
-    let body = crate::read_body_capped(&mut response, body_cap).await;
+    let body = crate::read_body_capped(&mut response, body_cap, &row_name).await;
     if body.len() >= body_cap {
         // Reported rather than handed over: a truncated body makes
         // `resp.json()` throw a parse error that reads like a bug in the
@@ -1854,7 +1855,7 @@ mod tests {
                 texts: &[String],
                 _cacheable: bool,
                 _timeout: Duration,
-            ) -> Result<crate::Embedded, crate::EmbedFailure> {
+            ) -> Result<crate::Embedded, crate::EmbedError> {
                 // "jailbreak" points one way, everything else the other.
                 let vectors = texts
                     .iter()

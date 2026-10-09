@@ -67,6 +67,7 @@ use crate::aliyun::{
     classify_body_error_code, extract_error_code, percent_encode, sign, AliyunFailure,
     ACS_REQUEST_ID_HEADER, MAX_ERROR_BODY_PARSE_BYTES,
 };
+use crate::call_error::{CallClock, CallFailure};
 use crate::chunk::chunk_text;
 use crate::{Guardrail, GuardrailVerdict, SegmentsOutcome, StreamOutputPolicy};
 
@@ -469,7 +470,10 @@ impl AliyunAiGuardrail {
         service: &str,
         content: &str,
         session_id: Option<&str>,
-    ) -> (Result<CallReply, AliyunFailure>, AigDiagnostics) {
+    ) -> (
+        Result<CallReply, CallFailure<AliyunFailure>>,
+        AigDiagnostics,
+    ) {
         let mut svc_params = serde_json::Map::new();
         svc_params.insert(
             "content".into(),
@@ -525,6 +529,7 @@ impl AliyunAiGuardrail {
         body.push_str("&Signature=");
         body.push_str(&percent_encode(&signature));
 
+        let mut clock = CallClock::start(self.timeout);
         let future = self
             .client
             .post(format!("{}/", self.endpoint))
@@ -535,11 +540,22 @@ impl AliyunAiGuardrail {
 
         // No response means no diagnostics to report: an id Aliyun never
         // sent can't be invented.
-        let resp = match tokio::time::timeout(self.timeout, future).await {
-            Err(_elapsed) => return (Err(AliyunFailure::Timeout), AigDiagnostics::default()),
-            Ok(Err(_e)) => return (Err(AliyunFailure::IoError), AigDiagnostics::default()),
+        let resp = match clock.within(future).await {
+            Err(_elapsed) => {
+                return (
+                    Err(clock.fail(AliyunFailure::Timeout)),
+                    AigDiagnostics::default(),
+                )
+            }
+            Ok(Err(e)) => {
+                return (
+                    Err(clock.fail_with(AliyunFailure::IoError, &e)),
+                    AigDiagnostics::default(),
+                )
+            }
             Ok(Ok(r)) => r,
         };
+        clock.responded(resp.status());
 
         // Read the id off the headers up front: it survives every path
         // below, including the ones where the body is unusable.
@@ -547,10 +563,10 @@ impl AliyunAiGuardrail {
 
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return (Err(AliyunFailure::Throttled), diag);
+            return (Err(clock.fail(AliyunFailure::Throttled)), diag);
         }
         if status.is_server_error() {
-            return (Err(AliyunFailure::ServerError), diag);
+            return (Err(clock.fail(AliyunFailure::ServerError)), diag);
         }
         if !status.is_success() {
             // Report the provider's error CODE only — an RPC-layer error
@@ -560,8 +576,16 @@ impl AliyunAiGuardrail {
             // is a symbolic error class from a closed vocabulary and
             // structurally cannot carry request content (#153).
             let mut resp = resp;
-            let response_body =
-                crate::read_body_capped(&mut resp, MAX_ERROR_BODY_PARSE_BYTES).await;
+            let Ok(response_body) = clock
+                .within(crate::read_body_capped(
+                    &mut resp,
+                    MAX_ERROR_BODY_PARSE_BYTES,
+                    &self.row_name,
+                ))
+                .await
+            else {
+                return (Err(clock.fail(AliyunFailure::Timeout)), diag);
+            };
             diag.code = extract_error_code(&response_body);
             tracing::error!(
                 row = %self.row_name,
@@ -570,12 +594,18 @@ impl AliyunAiGuardrail {
                 aliyun_code = %diag.code,
                 "aliyun MultiModalGuard returned 4xx — check region/access keys configuration",
             );
-            return (Err(AliyunFailure::ConfigError), diag);
+            return (Err(clock.fail(AliyunFailure::ConfigError)), diag);
         }
 
-        let body: AigResponse = match resp.json().await {
-            Ok(b) => b,
-            Err(_) => return (Err(AliyunFailure::MalformedResponse), diag),
+        let body: AigResponse = match clock.within(resp.json()).await {
+            Ok(Ok(b)) => b,
+            Err(_) => return (Err(clock.fail(AliyunFailure::Timeout)), diag),
+            Ok(Err(e)) => {
+                return (
+                    Err(clock.fail_with(AliyunFailure::MalformedResponse, &e)),
+                    diag,
+                )
+            }
         };
         diag.absorb_body(&body);
 
@@ -633,22 +663,26 @@ impl AliyunAiGuardrail {
                 Err(failure)
             }
         };
-        (outcome, diag)
+        (outcome.map_err(|f| clock.fail(f)), diag)
     }
 
     fn handle_failure(
         &self,
-        failure: AliyunFailure,
+        failure: CallFailure<AliyunFailure>,
         diag: &AigDiagnostics,
         fail_open: bool,
     ) -> GuardrailVerdict {
-        let tag = failure.bypass_tag();
-        if !matches!(failure, AliyunFailure::ConfigError) {
+        let tag = failure.failure.bypass_tag();
+        if !matches!(failure.failure, AliyunFailure::ConfigError) {
             tracing::warn!(
                 row = %self.row_name,
                 aliyun_request_id = %diag.request_id,
-                failure = ?failure,
+                failure = ?failure.failure,
+                http_status = failure.http_status,
                 fail_open,
+                error = failure.error.as_deref(),
+                error_kind = failure.error_kind.map(tracing::field::display),
+                elapsed_ms = failure.elapsed_ms,
                 "aliyun AI guardrail call failed",
             );
         }
@@ -2077,5 +2111,119 @@ mod tests {
                 masked.suggestion
             );
         }
+    }
+
+    /// A refused connection is logged with its cause, not just `IoError`
+    /// (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn refused_connection_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let endpoint = refused_endpoint();
+        let logged = capture_logs(|| async {
+            let g = build(&endpoint, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_refusal_logged(
+            &logged,
+            "aliyun AI guardrail call failed",
+            &["test-secret", "LTAI_TEST"],
+        );
+    }
+
+    /// A response that is not JSON is logged with the decode error.
+    #[tokio::test]
+    async fn undecodable_response_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let server = not_json_server("DECODE-REQ-1").await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_decode_logged(
+            &logged,
+            "aliyun AI guardrail call failed",
+            "MalformedResponse",
+        );
+        assert!(
+            failure_line(&logged, "aliyun AI guardrail call failed")
+                .contains("aliyun_request_id=DECODE-REQ-1"),
+            "the id Aliyun sent survives a decode failure; got: {logged}"
+        );
+    }
+
+    /// A name that does not resolve is logged as a DNS failure — the cause
+    /// reqwest's own message hides behind "error sending request".
+    #[tokio::test]
+    async fn unresolvable_host_logs_the_dns_error() {
+        use crate::call_error::testing::*;
+        let logged = capture_logs(|| async {
+            let g = build("http://aisix-guardrail-test.invalid", true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        let line = failure_line(&logged, "aliyun AI guardrail call failed");
+        assert!(line.contains("failure=IoError"), "bucket kept: {line}");
+        assert!(line.contains("error_kind=connect"), "phase logged: {line}");
+        assert!(
+            line.contains("dns error"),
+            "underlying cause logged: {line}"
+        );
+        for secret in ["test-secret", "LTAI_TEST", PROMPT_MARKER] {
+            assert!(!logged.contains(secret), "`{secret}` leaked: {logged}");
+        }
+    }
+
+    /// A 5xx is logged with its status (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn server_error_logs_the_status() {
+        use crate::call_error::testing::*;
+        let server = status_server(503).await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_status_logged(&logged, "aliyun AI guardrail call failed", 503);
+    }
+
+    /// `timeout_ms` covers the response body, not just its headers: a body
+    /// that stalls ends the call as a timeout instead of hanging it.
+    #[tokio::test]
+    async fn stalled_body_times_out() {
+        use crate::call_error::testing::*;
+        let uri = stalled_body_server(200).await;
+        let logged = capture_logs(|| async {
+            let mut g = build(&uri, true);
+            g.timeout = Duration::from_millis(200);
+            let verdict =
+                tokio::time::timeout(Duration::from_secs(5), g.check_input(&req(PROMPT_MARKER)))
+                    .await
+                    .expect("the guardrail call must end at its own timeout");
+            assert!(verdict.is_bypass());
+        })
+        .await;
+        assert_stall_logged(&logged, "aliyun AI guardrail call failed", 200);
+    }
+
+    /// An error body that stalls is bounded by `timeout_ms` too.
+    #[tokio::test]
+    async fn stalled_error_body_times_out() {
+        use crate::call_error::testing::*;
+        let uri = stalled_body_server(403).await;
+        let logged = capture_logs(|| async {
+            let mut g = build(&uri, true);
+            g.timeout = Duration::from_millis(200);
+            let verdict =
+                tokio::time::timeout(Duration::from_secs(5), g.check_input(&req(PROMPT_MARKER)))
+                    .await
+                    .expect("the guardrail call must end at its own timeout");
+            assert!(verdict.is_bypass());
+        })
+        .await;
+        assert_stall_logged(&logged, "aliyun AI guardrail call failed", 403);
     }
 }

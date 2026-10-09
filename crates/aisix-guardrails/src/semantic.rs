@@ -87,7 +87,7 @@ use aisix_gateway::{ChatFormat, ChatResponse, Role};
 use async_trait::async_trait;
 
 use crate::{
-    EmbedFailure, Guardrail, GuardrailAuditLog, GuardrailEmbedder, GuardrailVerdict,
+    EmbedError, EmbedFailure, Guardrail, GuardrailAuditLog, GuardrailEmbedder, GuardrailVerdict,
     StreamOutputPolicy,
 };
 
@@ -206,6 +206,7 @@ impl SemanticGuardrail {
         // so the split below needs no second lookup.
         let mut prototypes = self.cfg.deny_examples.clone();
         prototypes.extend(self.cfg.allow_examples.iter().cloned());
+        let started = std::time::Instant::now();
         let prototype_vecs = match self
             .cfg
             .embedder
@@ -219,10 +220,11 @@ impl SemanticGuardrail {
             .await
         {
             Ok(v) if v.vectors.len() == prototypes.len() => v.vectors,
-            Ok(_) => return self.on_failure(EmbedFailure::Upstream, fail_open),
-            Err(failure) => return self.on_failure(failure, fail_open),
+            Ok(_) => return self.on_failure(EmbedFailure::Upstream.into(), started, fail_open),
+            Err(failure) => return self.on_failure(failure, started, fail_open),
         };
 
+        let started = std::time::Instant::now();
         let candidate_vecs = match self
             .cfg
             .embedder
@@ -236,8 +238,8 @@ impl SemanticGuardrail {
             .await
         {
             Ok(v) if v.vectors.len() == texts.len() => v,
-            Ok(_) => return self.on_failure(EmbedFailure::Upstream, fail_open),
-            Err(failure) => return self.on_failure(failure, fail_open),
+            Ok(_) => return self.on_failure(EmbedFailure::Upstream.into(), started, fail_open),
+            Err(failure) => return self.on_failure(failure, started, fail_open),
         };
         // The model that actually produced these numbers, by its current
         // display name — what a score has to carry, and what neither
@@ -352,13 +354,21 @@ impl SemanticGuardrail {
         judged
     }
 
-    fn on_failure(&self, failure: EmbedFailure, fail_open: bool) -> GuardrailVerdict {
-        let tag = failure.as_str();
+    /// `started` is when the failed embedding call was made.
+    fn on_failure(
+        &self,
+        failure: EmbedError,
+        started: std::time::Instant,
+        fail_open: bool,
+    ) -> GuardrailVerdict {
+        let tag = failure.failure.as_str();
         tracing::warn!(
             guardrail = "semantic",
             embedding_model = %self.cfg.embedding_model_identity,
             failure = tag,
             fail_open,
+            error = failure.error.as_deref(),
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "semantic guardrail could not embed"
         );
         if fail_open {
@@ -565,11 +575,11 @@ mod tests {
             texts: &[String],
             _cacheable: bool,
             _timeout: Duration,
-        ) -> Result<crate::Embedded, EmbedFailure> {
+        ) -> Result<crate::Embedded, EmbedError> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             self.calls.lock().unwrap().push(texts.to_vec());
             if let Some(failure) = self.fail {
-                return Err(failure);
+                return Err(failure.into());
             }
             let mut out: Vec<Vec<f32>> = texts.iter().map(|t| vector_for(t)).collect();
             if self.wrong_length {
