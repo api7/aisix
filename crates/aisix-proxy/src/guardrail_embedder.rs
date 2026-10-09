@@ -232,13 +232,12 @@ mod tests {
 
     #[test]
     fn a_decode_failure_keeps_only_its_position() {
-        let quoted =
-            "invalid type: string \"screened text\", expected a sequence at line 1 column 42";
+        let serde = serde_json::from_str::<Vec<f32>>(r#""screened text""#).unwrap_err();
+        let message = format!("upstream body: {serde}");
+        assert!(message.contains("screened text"), "{message}");
         assert_eq!(
-            logged(BridgeError::UpstreamDecode(format!(
-                "upstream body: {quoted}"
-            ))),
-            "upstream response could not be decoded (line 1 column 42)"
+            logged(BridgeError::UpstreamDecode(message)),
+            "upstream response could not be decoded (line 1 column 15)"
         );
         assert_eq!(
             logged(BridgeError::UpstreamDecode(
