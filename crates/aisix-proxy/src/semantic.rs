@@ -354,7 +354,7 @@ async fn decide_by_embedding(
         Err(e) => {
             tracing::warn!(
                 router = %router_entry.value.display_name,
-                error = embed_failure_text(&e).as_str(),
+                error = %embed_failure_text(&e),
                 "semantic embedding call failed; applying on_embedding_failure",
             );
             return None;
@@ -566,8 +566,16 @@ async fn classify_inner(
         .bytes()
         .await
         .map_err(|e| aisix_gateway::transport_error_message(&e))?;
-    let mut parsed: ClassifierResponse = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("classifier response is not the expected shape: {e}"))?;
+    // Neither error below repeats what the classifier answered: its
+    // response can quote the prompt it was sent (`state`), and these
+    // errors end up on the router's warn line.
+    let mut parsed: ClassifierResponse = serde_json::from_slice(&bytes).map_err(|e| {
+        format!(
+            "classifier response is not the expected shape (line {} column {})",
+            e.line(),
+            e.column()
+        )
+    })?;
     let answer = parsed
         .answers
         .remove(CLASSIFIER_QUESTION)
@@ -575,12 +583,7 @@ async fn classify_inner(
     let picked = routes
         .iter()
         .position(|r| r.name == answer.choice)
-        .ok_or_else(|| {
-            format!(
-                "classifier picked {:?}, which is not one of the offered routes",
-                answer.choice
-            )
-        })?;
+        .ok_or("classifier picked a choice that is not one of the offered routes")?;
     Ok((picked, answer.confidence))
 }
 

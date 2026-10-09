@@ -28,6 +28,8 @@ import { pickFreePort } from "../harness/ports.js";
 //   "boom"     -> HTTP 500
 //   "slow"     -> answers after 2s        (timeout_ms is 500)
 //   "garbage"  -> picks "poetry", which was never offered
+//   "echoshape" -> 200 whose confidence is the prompt itself (wrong type)
+//   "echopick"  -> picks the prompt itself, which was never offered
 
 const CALLER_PLAINTEXT = "sk-semantic-classifier-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -90,6 +92,16 @@ async function startDecisionMock(): Promise<DecisionMock> {
         res.end(JSON.stringify({ error: "internal" }));
       } else if (state.includes("slow")) {
         setTimeout(() => answer("code", 0.99), 2_000);
+      } else if (state.includes("echoshape")) {
+        res.statusCode = 200;
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            answers: { route: { type: "choice", choice: "code", confidence: body.state } },
+          }),
+        );
+      } else if (state.includes("echopick")) {
+        answer(body.state ?? "", 0.99);
       } else if (state.includes("garbage")) {
         answer("poetry", 0.99);
       } else if (state.includes("python")) {
@@ -541,6 +553,30 @@ describe("semantic classifier e2e", () => {
       await expectDecision(toTarget, { fallback: "decision_failed" });
     });
   }
+
+  test("a classifier failure's warning does not repeat what the classifier answered", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    // Both answers quote the prompt back; the warning must say what was
+    // wrong with the answer without carrying it.
+    for (const [prompt, cause] of [
+      ["echoshape classifierpromptmarkera", "classifier response is not the expected shape"],
+      ["echopick classifierpromptmarkerb", "classifier picked a choice that is not one of the offered routes"],
+    ]) {
+      const r = await chat("jev-router", prompt);
+      expect(r.status).toBe(200);
+      expect(r.content).toBe("served-by-default-model");
+      await expectDecision(r, { fallback: "decision_failed" });
+      const line = await waitForLogLine(
+        app!,
+        (l) =>
+          l.includes("semantic classifier call failed") &&
+          l.includes("router=jev-router") &&
+          l.includes(cause),
+        `the classifier failure line for ${prompt}`,
+      );
+      expect(line).not.toContain("classifierpromptmarker");
+    }
+  });
 
   test("a provider key that is missing or not typesafe is a decision failure", async (ctx) => {
     if (!etcdReachable || !app || !decisions) return ctx.skip();
