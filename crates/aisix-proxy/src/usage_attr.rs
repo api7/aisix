@@ -1337,48 +1337,16 @@ mod tests {
         /// at all, followed by why.
         const EXEMPT: &str = "NO-GUARDRAIL-CHAIN:";
 
-        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut blocks = 0usize;
+        let literals = usage_event_literals();
+        let blocks = literals.len();
         let mut missing = Vec::new();
-
-        for path in crate_rs_files(&src_dir) {
-            let src = std::fs::read_to_string(&path).expect("source must read");
-            let name = path
-                .strip_prefix(&src_dir)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-            let code = code_mask(&src);
-            for (idx, _) in src.match_indices("UsageEvent {") {
-                // Skip anything that is not Rust code: this file writes the
-                // token it searches for in a string literal and in a
-                // comment, and both would otherwise be counted as emitters
-                // — a check inflating its own coverage.
-                if !code[idx] {
-                    continue;
-                }
-                // `-> UsageEvent {` (optionally path-qualified) is a
-                // return type followed by a function body, not a literal.
-                let before = src[..idx]
-                    .trim_end()
-                    .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
-                    .trim_end();
-                if before.ends_with("->") {
-                    continue;
-                }
-                let open = idx + "UsageEvent ".len();
-                let Some(block) = braced_block(&src, &code, open) else {
-                    panic!("{name}: unbalanced UsageEvent literal at byte {idx}");
-                };
-                blocks += 1;
-                if block.contains(EXEMPT) {
-                    continue;
-                }
-                for field in ["guardrail_bypassed_reason", "applied_guardrails"] {
-                    if !sets_field(block, field) {
-                        let line = src[..idx].lines().count();
-                        missing.push(format!("{name}:{line} ({field})"));
-                    }
+        for (site, block) in &literals {
+            if block.contains(EXEMPT) {
+                continue;
+            }
+            for field in ["guardrail_bypassed_reason", "applied_guardrails"] {
+                if !sets_field(block, field) {
+                    missing.push(format!("{site} ({field})"));
                 }
             }
         }
@@ -1411,16 +1379,50 @@ mod tests {
     /// another family can see.
     #[test]
     fn every_usage_event_this_crate_builds_carries_the_request_headers() {
+        let literals = usage_event_literals();
+        assert!(
+            literals.len() >= 18,
+            "the UsageEvent literal scan found only {}",
+            literals.len()
+        );
+        // The cancel emitter's literals spread a base event that sets it.
+        let missing: Vec<&str> = literals
+            .iter()
+            .filter(|(_, block)| {
+                !sets_field(block, "request_headers") && !block.contains("..base_event(")
+            })
+            .map(|(site, _)| site.as_str())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these UsageEvent literals do not set request_headers: {missing:?}"
+        );
+    }
+
+    /// Every `UsageEvent { .. }` literal in this crate's source, as
+    /// `("<file>:<line>", block)`. A parse of the source rather than a list
+    /// of emitters — see the guardrail census above for why.
+    fn usage_event_literals() -> Vec<(String, String)> {
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut blocks = 0usize;
-        let mut missing = Vec::new();
+        let mut out = Vec::new();
         for path in crate_rs_files(&src_dir) {
             let src = std::fs::read_to_string(&path).expect("source must read");
+            let name = path
+                .strip_prefix(&src_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
             let code = code_mask(&src);
             for (idx, _) in src.match_indices("UsageEvent {") {
+                // Skip anything that is not Rust code: this file writes the
+                // token it searches for in a string literal and in a
+                // comment, and both would otherwise be counted as emitters
+                // — a check inflating its own coverage.
                 if !code[idx] {
                     continue;
                 }
+                // `-> UsageEvent {` (optionally path-qualified) is a
+                // return type followed by a function body, not a literal.
                 let before = src[..idx]
                     .trim_end()
                     .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
@@ -1429,25 +1431,14 @@ mod tests {
                     continue;
                 }
                 let open = idx + "UsageEvent ".len();
-                let block = braced_block(&src, &code, open).expect("balanced literal");
-                blocks += 1;
-                // The cancel emitter's literals spread a base event that
-                // sets it.
-                if sets_field(block, "request_headers") || block.contains("..base_event(") {
-                    continue;
-                }
+                let Some(block) = braced_block(&src, &code, open) else {
+                    panic!("{name}: unbalanced UsageEvent literal at byte {idx}");
+                };
                 let line = src[..idx].lines().count();
-                missing.push(format!("{}:{line}", path.display()));
+                out.push((format!("{name}:{line}"), block.to_string()));
             }
         }
-        assert!(
-            blocks >= 18,
-            "the UsageEvent literal scan found only {blocks}"
-        );
-        assert!(
-            missing.is_empty(),
-            "these UsageEvent literals do not set request_headers: {missing:?}"
-        );
+        out
     }
 
     /// Every `.rs` file under `dir`, sorted. Recursive: `src/` is flat

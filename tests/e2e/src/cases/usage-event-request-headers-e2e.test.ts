@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { request as httpRequest } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
@@ -6,10 +6,12 @@ import {
   ProxyClient,
   SeedClient,
   spawnApp,
+  startMcpUpstream,
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
   waitForSlsLog,
+  type McpUpstream,
   type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -39,6 +41,7 @@ type Headers = Record<string, string | string[]>;
 describe("usage events record operator-selected request headers (AISIX-Cloud#1719)", () => {
   let upstream: OpenAiUpstream | undefined;
   let broken: OpenAiUpstream | undefined;
+  let mcp: McpUpstream | undefined;
   let sls: MockSls | undefined;
   let app: SpawnedApp | undefined;
   let etcdReachable = false;
@@ -100,6 +103,7 @@ describe("usage events record operator-selected request headers (AISIX-Cloud#171
     sls = await startMockSls();
     upstream = await startOpenAiUpstream();
     broken = await startOpenAiUpstream({ status: 500 });
+    mcp = await startMcpUpstream("urh");
 
     app = await spawnApp({
       usageEventRequestHeaders: ["x-sub-user", "x-department"],
@@ -147,11 +151,17 @@ describe("usage events record operator-selected request headers (AISIX-Cloud#171
       target_url: `${upstream.baseUrl}/v1`,
       provider_key_id: pk.id,
     });
+    await seed.update("mcp_servers", randomUUID(), {
+      display_name: "urh",
+      url: mcp.url,
+      enabled: true,
+    });
     // Seeded last: it authenticating implies everything above is live.
     await seed.createApiKey({
       key_hash: hash(PLAINTEXT),
       allowed_models: ["*"],
       allowed_routes: ["*"],
+      mcp_access: { allow: ["*"] },
     });
     const proxy = new ProxyClient(app.proxyUrl, PLAINTEXT);
     await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
@@ -161,6 +171,7 @@ describe("usage events record operator-selected request headers (AISIX-Cloud#171
     await app?.exit();
     await upstream?.close();
     await broken?.close();
+    await mcp?.close();
     await sls?.close();
   });
 
@@ -255,6 +266,35 @@ describe("usage events record operator-selected request headers (AISIX-Cloud#171
     expect(res.status).toBeGreaterThanOrEqual(500);
     const row = await rowFor(res.requestId, "failure row");
     expect(recorded(row)).toEqual({ "x-sub-user": "frank" });
+  });
+
+  // `/mcp` resolves its caller without the extractor the other families
+  // share, so it captures the headers on its own path.
+  test("an MCP tool call records the map", async (ctx) => {
+    if (!etcdReachable || !app || !sls) {
+      ctx.skip();
+      return;
+    }
+    const rpc = (id: number, method: string, params: Record<string, unknown>) =>
+      send(
+        "/mcp",
+        { jsonrpc: "2.0", id, method, params },
+        { accept: "application/json, text/event-stream", "x-sub-user": "grace" },
+      );
+    await rpc(1, "initialize", {
+      protocolVersion: "2025-11-25",
+      capabilities: {},
+      clientInfo: { name: "usage-event-request-headers", version: "0.1" },
+    });
+    const res = await rpc(2, "tools/call", { name: "urh__echo", arguments: { text: "hi" } });
+    expect(res.status).toBe(200);
+    const row = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (l) => l.get("operation") === "mcp" && l.get("mcp_tool_name") === "echo",
+      "mcp row",
+    );
+    expect(recorded(row)).toEqual({ "x-sub-user": "grace" });
   });
 });
 
