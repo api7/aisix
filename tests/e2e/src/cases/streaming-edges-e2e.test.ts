@@ -29,13 +29,9 @@ import {
 //     iterator-time error + no synthetic `finish_reason:"stop"`.
 //
 // Note on scope (client-abort case): verifies gateway LIVENESS
-// post-abort, not upstream-side disconnect propagation. The
-// harness has no signal for "upstream observed the client
-// disconnect", so a regression where the gateway holds the
-// upstream connection open (silently consuming chunks after the
-// client aborted) would pass this test. Filing that as a separate
-// harness-extension task; today's coverage is "gateway stays
-// alive", which is the load-bearing user-visible contract.
+// post-abort. That the gateway also closes the upstream connection
+// when the caller leaves is pinned by `stream-terminal-status-e2e`,
+// through the mock upstream's `closedByPeer`.
 //
 // References:
 // - Gateway's own streaming contract: `docs/api-proxy.md` §5
