@@ -15,6 +15,10 @@
 //! stream, not time to response start, and a stream that fails after its
 //! head counts as a failure.
 //!
+//! One open-ended body is still recorded at its head: the
+//! `/v1/videos/:id/content` relay files no usage event (the submission
+//! was metered), so there is no terminal emit to park on.
+//!
 //! A caller that leaves before the response head is written is NOT
 //! recorded here — it never had a response. It is counted by
 //! `aisix_proxy_client_cancelled_requests_total` alone.
@@ -144,7 +148,10 @@ pub(crate) struct Owned {
 impl Owned {
     /// The owning form of [`Caller::new`].
     pub(crate) fn from_auth(auth: &AuthenticatedKey) -> Self {
-        let c = Caller::new(auth);
+        Self::from_caller(Caller::new(auth))
+    }
+
+    pub(crate) fn from_caller(c: Caller<'_>) -> Self {
         let known = |v: &str| (v != UNKNOWN).then(|| v.to_owned());
         Self {
             api_key_id: c.api_key_id.to_owned(),
@@ -392,7 +399,63 @@ pub(crate) fn record(
     status: u16,
     elapsed: Duration,
 ) {
-    PendingRequestMetrics::new(state, endpoint, caller, upstream).emit(status, elapsed);
+    // Emit-chokepoint label bounding (#451 class): success paths hand in
+    // the caller's requested string, which for a wildcard-served alias
+    // is caller-minted — collapse it to the configured row's name here
+    // so no handler-family member can mint unbounded series.
+    let snap = state.snapshot.load();
+    let (model, upstream_model) =
+        crate::usage_attr::metric_model_label_pair(&snap, upstream.model, upstream.upstream_model);
+    let upstream = Upstream {
+        model: model.as_ref(),
+        upstream_model: upstream_model.as_ref(),
+        ..upstream
+    };
+    emit(&state.metrics, endpoint, caller, upstream, status, elapsed);
+}
+
+/// Write one request's samples. `upstream` must already be bounded.
+fn emit(
+    metrics: &aisix_obs::Metrics,
+    endpoint: &'static str,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    elapsed: Duration,
+) {
+    let outcome = RequestOutcome::from_status(status);
+    metrics.record_request(upstream.provider, upstream.model, status, outcome, elapsed);
+    let labels = RequestLabels {
+        endpoint,
+        // Derived from the endpoint rather than passed in, so the detailed
+        // families can't disagree with `aisix_proxy_in_flight_requests`
+        // about which protocol a route speaks.
+        inbound_protocol: crate::inbound_protocol_for_endpoint(endpoint),
+        // Read off the SAME ProviderKey row that produced the id and name
+        // beside it (`usage_attr::ResolvedPk`), so a request can never be
+        // labelled with one key's identity and another's protocol.
+        upstream_protocol: upstream.pk.protocol(),
+        provider: upstream.provider,
+        model: upstream.model,
+        upstream_model: upstream.upstream_model,
+        provider_key_id: upstream.pk.id(),
+        provider_key_name: upstream.pk.name(),
+        api_key_id: caller.api_key_id,
+        api_key_name: caller.api_key_name,
+        team_id: caller.team_id,
+        team_name: caller.team_name,
+        user_id: caller.user_id,
+        user_name: caller.user_name,
+        stream: upstream.stream,
+        is_fallback: upstream.is_fallback,
+        status,
+        outcome,
+    };
+    if is_llm_endpoint(endpoint) {
+        metrics.record_proxy_and_llm_request(labels, elapsed);
+    } else {
+        metrics.record_proxy_request(labels, elapsed);
+    }
 }
 
 /// The request families of a STREAMED response, held until the stream ends.
@@ -422,59 +485,14 @@ pub(crate) struct PendingRequestMetrics {
     upstream_model: String,
     provider_key_id: String,
     provider_key_name: String,
-    api_key_id: String,
-    api_key_name: String,
-    team_id: String,
-    team_name: String,
-    user_id: String,
-    user_name: String,
+    caller: Owned,
     stream: bool,
     is_fallback: bool,
     /// The request clock: a stream's duration is the whole stream.
-    started: Option<std::time::Instant>,
+    started: std::time::Instant,
 }
 
 impl PendingRequestMetrics {
-    fn new(
-        state: &ProxyState,
-        endpoint: &'static str,
-        caller: Caller<'_>,
-        upstream: Upstream<'_>,
-    ) -> Self {
-        // Emit-chokepoint label bounding (#451 class): success paths hand in
-        // the caller's requested string, which for a wildcard-served alias
-        // is caller-minted — collapse it to the configured row's name here
-        // so no handler-family member can mint unbounded series.
-        let snap = state.snapshot.load();
-        let (model, upstream_model) = crate::usage_attr::metric_model_label_pair(
-            &snap,
-            upstream.model,
-            upstream.upstream_model,
-        );
-        Self {
-            metrics: state.metrics.clone(),
-            endpoint,
-            // Read off the SAME ProviderKey row that produced the id and name
-            // beside it (`usage_attr::ResolvedPk`), so a request can never be
-            // labelled with one key's identity and another's protocol.
-            upstream_protocol: upstream.pk.protocol(),
-            provider: upstream.provider.to_owned(),
-            model: model.into_owned(),
-            upstream_model: upstream_model.into_owned(),
-            provider_key_id: upstream.pk.id().to_owned(),
-            provider_key_name: upstream.pk.name().to_owned(),
-            api_key_id: caller.api_key_id.to_owned(),
-            api_key_name: caller.api_key_name.to_owned(),
-            team_id: caller.team_id.to_owned(),
-            team_name: caller.team_name.to_owned(),
-            user_id: caller.user_id.to_owned(),
-            user_name: caller.user_name.to_owned(),
-            stream: upstream.stream,
-            is_fallback: upstream.is_fallback,
-            started: None,
-        }
-    }
-
     /// A streamed request's samples, to be recorded when its terminal usage
     /// event goes out. `started` is the REQUEST clock.
     pub(crate) fn at_stream_end(
@@ -484,50 +502,50 @@ impl PendingRequestMetrics {
         upstream: Upstream<'_>,
         started: std::time::Instant,
     ) -> Self {
+        let snap = state.snapshot.load();
+        let (model, upstream_model) = crate::usage_attr::metric_model_label_pair(
+            &snap,
+            upstream.model,
+            upstream.upstream_model,
+        );
         Self {
-            started: Some(started),
-            ..Self::new(state, endpoint, caller, upstream)
+            metrics: state.metrics.clone(),
+            endpoint,
+            upstream_protocol: upstream.pk.protocol(),
+            provider: upstream.provider.to_owned(),
+            model: model.into_owned(),
+            upstream_model: upstream_model.into_owned(),
+            provider_key_id: upstream.pk.id().to_owned(),
+            provider_key_name: upstream.pk.name().to_owned(),
+            caller: Owned::from_caller(caller),
+            stream: upstream.stream,
+            is_fallback: upstream.is_fallback,
+            started,
         }
     }
 
     /// Record the parked samples under the request's terminal status.
     pub(crate) fn record_terminal(self, status: u16) {
-        let elapsed = self.started.map(|s| s.elapsed()).unwrap_or_default();
-        self.emit(status, elapsed);
-    }
-
-    fn emit(&self, status: u16, elapsed: Duration) {
-        let outcome = RequestOutcome::from_status(status);
-        self.metrics
-            .record_request(&self.provider, &self.model, status, outcome, elapsed);
-        let labels = RequestLabels {
-            endpoint: self.endpoint,
-            // Derived from the endpoint rather than passed in, so the detailed
-            // families can't disagree with `aisix_proxy_in_flight_requests`
-            // about which protocol a route speaks.
-            inbound_protocol: crate::inbound_protocol_for_endpoint(self.endpoint),
-            upstream_protocol: self.upstream_protocol,
+        let upstream = Upstream {
             provider: &self.provider,
             model: &self.model,
             upstream_model: &self.upstream_model,
-            provider_key_id: &self.provider_key_id,
-            provider_key_name: &self.provider_key_name,
-            api_key_id: &self.api_key_id,
-            api_key_name: &self.api_key_name,
-            team_id: &self.team_id,
-            team_name: &self.team_name,
-            user_id: &self.user_id,
-            user_name: &self.user_name,
+            pk: PkLabels::from_parts(
+                &self.provider_key_id,
+                &self.provider_key_name,
+                self.upstream_protocol,
+            ),
             stream: self.stream,
             is_fallback: self.is_fallback,
-            status,
-            outcome,
         };
-        if is_llm_endpoint(self.endpoint) {
-            self.metrics.record_proxy_and_llm_request(labels, elapsed);
-        } else {
-            self.metrics.record_proxy_request(labels, elapsed);
-        }
+        emit(
+            &self.metrics,
+            self.endpoint,
+            self.caller.as_caller(),
+            upstream,
+            status,
+            self.started.elapsed(),
+        );
     }
 }
 

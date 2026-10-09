@@ -299,6 +299,12 @@ pub(crate) struct PkLabels<'a> {
 }
 
 impl<'a> PkLabels<'a> {
+    /// Rebuild the labels from their parts, for a sample recorded after the
+    /// `ResolvedPk` that produced them is gone (a parked stream sample).
+    pub(crate) fn from_parts(id: &'a str, name: &'a str, protocol: &'static str) -> Self {
+        Self { id, name, protocol }
+    }
+
     pub(crate) fn id(self) -> &'a str {
         self.id
     }
