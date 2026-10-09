@@ -31,12 +31,14 @@ const CALLER_KEY_HASH = createHash("sha256")
 const ACCESS_KEY_ID = "LTAI_CAUSE_E2E";
 const ACCESS_KEY_SECRET = "cause-e2e-secret-value";
 const PROMPT_MARKER = "causepromptmarker";
+const DECODE_EXAMPLE = "decodeexamplemarker";
 
 describe("guardrail call failure logs its underlying cause", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let proxy: ProxyClient | undefined;
   let echoServer: Server | undefined;
+  let decodeServer: Server | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -212,6 +214,86 @@ describe("guardrail call failure logs its underlying cause", () => {
     );
     await seed.attachGuardrailToModel(customGuard.id, customModel.id);
 
+    // A Bedrock Titan embedding upstream that answers 200 with a
+    // wrong-typed vector: `embedding` is a string holding the submitted
+    // request, so the decode error can quote the very text that was being
+    // screened.
+    decodeServer = createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
+      req.on("end", () => {
+        res.statusCode = 200;
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ embedding: raw, inputTextTokenCount: 1 }));
+      });
+    });
+    const decodePort = await pickFreePort();
+    await new Promise<void>((resolve) =>
+      decodeServer!.listen(decodePort, "127.0.0.1", resolve),
+    );
+    const decodePk = await seed.createProviderKey({
+      display_name: "cause-decode-pk",
+      provider: "bedrock",
+      adapter: "bedrock",
+      secret: JSON.stringify({
+        access_key_id: "AKIA-cause-e2e",
+        secret_access_key: "sk-cause-e2e",
+        region: "us-west-2",
+      }),
+      api_base: `http://127.0.0.1:${decodePort}`,
+    });
+    await seed.createModel({
+      display_name: "cause-decode-embed",
+      provider: "bedrock",
+      model_name: "amazon.titan-embed-text-v1",
+      provider_key_id: decodePk.id,
+      embedding: { dimensions: 4, normalize: true },
+    });
+    const decodeSemanticModel = await seed.createModel({
+      display_name: "cause-decode-semantic",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+    });
+    const decodeSemanticGuard = await seed.createGuardrail(
+      {
+        name: "cause-decode-semantic-guard",
+        enabled: true,
+        hook_point: "input",
+        fail_open: true,
+        kind: "semantic",
+        embedding_model: "cause-decode-embed",
+        deny_examples: [DECODE_EXAMPLE],
+        deny_threshold: 0.9,
+      },
+      { attach: false },
+    );
+    await seed.attachGuardrailToModel(decodeSemanticGuard.id, decodeSemanticModel.id);
+    const decodeCustomModel = await seed.createModel({
+      display_name: "cause-decode-custom",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+    });
+    const decodeCustomGuard = await seed.createGuardrail(
+      {
+        name: "cause-decode-custom-guard",
+        enabled: true,
+        hook_point: "input",
+        fail_open: true,
+        kind: "custom",
+        script: `export async function checkInput(ctx) {
+  try {
+    await aisix.embed("cause-decode-embed", [ctx.text]);
+  } catch (e) {}
+  return { action: "none" };
+}`,
+        timeout_ms: 5000,
+      },
+      { attach: false },
+    );
+    await seed.attachGuardrailToModel(decodeCustomGuard.id, decodeCustomModel.id);
+
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [
@@ -219,6 +301,8 @@ describe("guardrail call failure logs its underlying cause", () => {
         "cause-semantic",
         "cause-echo",
         "cause-custom",
+        "cause-decode-semantic",
+        "cause-decode-custom",
       ],
     });
     proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
@@ -232,6 +316,9 @@ describe("guardrail call failure logs its underlying cause", () => {
     await upstream?.close();
     await new Promise<void>((resolve) =>
       echoServer ? echoServer.close(() => resolve()) : resolve(),
+    );
+    await new Promise<void>((resolve) =>
+      decodeServer ? decodeServer.close(() => resolve()) : resolve(),
     );
   });
 
@@ -328,6 +415,37 @@ describe("guardrail call failure logs its underlying cause", () => {
     expect(line).toMatch(/elapsed_ms=\d+/);
     // The echo upstream quoted the caller's text (PROMPT_MARKER) back.
     expect(line).not.toContain("invalid input");
+    expect(line).not.toContain(PROMPT_MARKER);
+    expectNoSecrets();
+  });
+
+  test("semantic: an undecodable 200 response logs the decode failure, not the body", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const line = await failureLine("cause-decode-semantic", (l) =>
+      l.includes("semantic guardrail could not embed") &&
+      l.includes("embedding_model=cause-decode-embed"),
+    );
+    expect(line).toContain("could not be decoded");
+    // The response's string vector was the request that carried the
+    // row's own example.
+    expect(line).not.toContain(DECODE_EXAMPLE);
+    expect(app!.output()).not.toContain(DECODE_EXAMPLE);
+    expectNoSecrets();
+  });
+
+  test("custom: an undecodable 200 response to aisix.embed logs the decode failure, not the body", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const line = await failureLine("cause-decode-custom", (l) =>
+      l.includes("custom guardrail embed failed") &&
+      l.includes("row=cause-decode-custom-guard"),
+    );
+    expect(line).toContain("could not be decoded");
     expect(line).not.toContain(PROMPT_MARKER);
     expectNoSecrets();
   });

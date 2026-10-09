@@ -174,10 +174,13 @@ fn embedding_dimensions(model: &Model) -> Option<u32> {
 /// one can only mislabel a log line, never change a verdict.
 ///
 /// The error itself rides along for the guardrail's failure log, which is
-/// the only place it is reported: nothing on the dispatch path logs it. An
-/// upstream's own error message is left out and only its status kept: it
-/// is provider free text that can quote the screened input back, which a
-/// guardrail log must never carry (#153).
+/// the only place it is reported: nothing on the dispatch path logs it.
+/// Any text derived from an upstream response is left out, because a
+/// guardrail log must never carry the screened input (#153) and a
+/// response can quote it back: an error envelope keeps only its status, a
+/// decode failure only its position (serde's message quotes the offending
+/// value), and a misconfiguration only its variant (it can embed a
+/// token endpoint's response body). Transport errors keep their full chain.
 fn classify(err: ProxyError) -> EmbedError {
     let failure = match &err {
         ProxyError::Bridge(BridgeError::Timeout { .. }) => EmbedFailure::Timeout,
@@ -194,10 +197,67 @@ fn classify(err: ProxyError) -> EmbedError {
             Some(status) => format!("upstream reported an in-band error (status {status})"),
             None => "upstream reported an in-band error".to_owned(),
         },
+        ProxyError::Bridge(BridgeError::UpstreamDecode(message)) => {
+            match decode_position(message) {
+                Some((line, column)) => {
+                    format!("upstream response could not be decoded (line {line} column {column})")
+                }
+                None => "upstream response could not be decoded".to_owned(),
+            }
+        }
+        ProxyError::Bridge(BridgeError::Config(_)) => "bridge is misconfigured".to_owned(),
         _ => aisix_guardrails::error_chain(&err),
     };
     EmbedError {
         failure,
         error: Some(error),
+    }
+}
+
+/// The `line N column M` suffix serde_json appends to its messages. Only
+/// the two numbers are taken, so nothing of the message itself survives.
+fn decode_position(message: &str) -> Option<(u64, u64)> {
+    let (_, position) = message.rsplit_once(" at line ")?;
+    let (line, column) = position.split_once(" column ")?;
+    Some((line.parse().ok()?, column.parse().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn logged(err: BridgeError) -> String {
+        classify(ProxyError::Bridge(err)).error.expect("error text")
+    }
+
+    #[test]
+    fn a_decode_failure_keeps_only_its_position() {
+        let quoted =
+            "invalid type: string \"screened text\", expected a sequence at line 1 column 42";
+        assert_eq!(
+            logged(BridgeError::UpstreamDecode(format!(
+                "upstream body: {quoted}"
+            ))),
+            "upstream response could not be decoded (line 1 column 42)"
+        );
+        assert_eq!(
+            logged(BridgeError::UpstreamDecode(
+                "error decoding response body".into()
+            )),
+            "upstream response could not be decoded"
+        );
+    }
+
+    #[test]
+    fn a_misconfiguration_drops_its_text() {
+        let err =
+            BridgeError::Config("token mint upstream returned HTTP 400: screened text".into());
+        assert_eq!(logged(err), "bridge is misconfigured");
+    }
+
+    #[test]
+    fn a_transport_error_keeps_its_cause() {
+        let err = BridgeError::Transport("connection refused".into());
+        assert!(logged(err).contains("connection refused"));
     }
 }
