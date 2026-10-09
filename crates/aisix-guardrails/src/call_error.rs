@@ -12,6 +12,16 @@
 use std::time::Instant;
 
 /// A failure bucket plus the cause the warn logs next to it.
+#[cfg_attr(
+    not(any(
+        feature = "azure-content-safety",
+        feature = "aliyun-text-moderation",
+        feature = "lakera",
+        feature = "openai-moderation",
+        feature = "presidio",
+    )),
+    allow(dead_code)
+)]
 #[derive(Debug)]
 pub(crate) struct CallFailure<F> {
     pub(crate) failure: F,
@@ -40,8 +50,28 @@ impl<F> CallFailure<F> {
 
 /// Started right before a guardrail call is sent; every failure of that call
 /// is built from it so the elapsed time is measured the same way everywhere.
+#[cfg_attr(
+    not(any(
+        feature = "azure-content-safety",
+        feature = "aliyun-text-moderation",
+        feature = "lakera",
+        feature = "openai-moderation",
+        feature = "presidio",
+    )),
+    allow(dead_code)
+)]
 pub(crate) struct CallClock(Instant);
 
+#[cfg_attr(
+    not(any(
+        feature = "azure-content-safety",
+        feature = "aliyun-text-moderation",
+        feature = "lakera",
+        feature = "openai-moderation",
+        feature = "presidio",
+    )),
+    allow(dead_code)
+)]
 impl CallClock {
     pub(crate) fn start() -> Self {
         Self(Instant::now())
