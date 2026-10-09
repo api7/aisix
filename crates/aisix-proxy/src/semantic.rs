@@ -354,7 +354,7 @@ async fn decide_by_embedding(
         Err(e) => {
             tracing::warn!(
                 router = %router_entry.value.display_name,
-                error = %e,
+                error = embed_failure_text(&e).as_str(),
                 "semantic embedding call failed; applying on_embedding_failure",
             );
             return None;
@@ -827,6 +827,86 @@ async fn embed_texts_inner(
         )));
     }
     Ok(out)
+}
+
+/// What a failed [`embed_texts`] call may say on a log line.
+///
+/// The text embedded is a caller's prompt or a guardrail's screened input,
+/// and an upstream response can quote it back, so nothing a response said
+/// is kept: an error envelope keeps only its status, and a decode failure
+/// only the position serde reported (its message quotes the offending
+/// value). Everything else — transport, timeout, configuration — keeps
+/// its full error chain.
+pub(crate) fn embed_failure_text(err: &ProxyError) -> String {
+    use aisix_gateway::BridgeError;
+    match err {
+        ProxyError::Bridge(BridgeError::UpstreamStatus { status, .. }) => {
+            format!("upstream returned HTTP {status}")
+        }
+        ProxyError::Bridge(BridgeError::UpstreamInBand { status, .. }) => match status {
+            Some(status) => format!("upstream reported an in-band error (status {status})"),
+            None => "upstream reported an in-band error".to_owned(),
+        },
+        ProxyError::Bridge(BridgeError::UpstreamDecode(message)) => {
+            match decode_position(message) {
+                Some((line, column)) => {
+                    format!("upstream response could not be decoded (line {line} column {column})")
+                }
+                None => "upstream response could not be decoded".to_owned(),
+            }
+        }
+        _ => aisix_guardrails::error_chain(err),
+    }
+}
+
+/// The `line N column M` suffix serde_json appends to its messages. Only
+/// the two numbers are taken, so nothing of the message itself survives.
+fn decode_position(message: &str) -> Option<(u64, u64)> {
+    let (_, position) = message.rsplit_once(" at line ")?;
+    let (line, column) = position.split_once(" column ")?;
+    Some((line.parse().ok()?, column.parse().ok()?))
+}
+
+#[cfg(test)]
+mod embed_failure_text_tests {
+    use super::*;
+    use aisix_gateway::BridgeError;
+
+    fn logged(err: BridgeError) -> String {
+        embed_failure_text(&ProxyError::Bridge(err))
+    }
+
+    #[test]
+    fn an_error_envelope_keeps_only_its_status() {
+        let err = BridgeError::upstream_status(400, "invalid input: screened text");
+        assert_eq!(logged(err), "upstream returned HTTP 400");
+    }
+
+    #[test]
+    fn a_decode_failure_keeps_only_its_position() {
+        let serde = serde_json::from_str::<Vec<f32>>(r#""screened text""#).unwrap_err();
+        let message = format!("upstream body: {serde}");
+        assert!(message.contains("screened text"), "{message}");
+        assert_eq!(
+            logged(BridgeError::UpstreamDecode(message)),
+            "upstream response could not be decoded (line 1 column 15)"
+        );
+        assert_eq!(
+            logged(BridgeError::UpstreamDecode(
+                "error decoding response body".into()
+            )),
+            "upstream response could not be decoded"
+        );
+    }
+
+    #[test]
+    fn transport_and_configuration_errors_keep_their_text() {
+        assert!(logged(BridgeError::Transport("connection refused".into()))
+            .contains("connection refused"));
+        let config =
+            BridgeError::Config("token mint upstream returned HTTP 400: invalid_grant".into());
+        assert!(logged(config).contains("invalid_grant"));
+    }
 }
 
 #[cfg(test)]

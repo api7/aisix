@@ -174,13 +174,9 @@ fn embedding_dimensions(model: &Model) -> Option<u32> {
 /// one can only mislabel a log line, never change a verdict.
 ///
 /// The error itself rides along for the guardrail's failure log, which is
-/// the only place it is reported: nothing on the dispatch path logs it.
-/// Any text derived from an upstream response is left out, because a
-/// guardrail log must never carry the screened input (#153) and a
-/// response can quote it back: an error envelope keeps only its status, a
-/// decode failure only its position (serde's message quotes the offending
-/// value), and a misconfiguration only its variant (it can embed a
-/// token endpoint's response body). Transport errors keep their full chain.
+/// the only place it is reported: nothing on the dispatch path logs it. Its
+/// text is [`crate::semantic::embed_failure_text`], which keeps anything an
+/// upstream response said out of it (#153).
 fn classify(err: ProxyError) -> EmbedError {
     let failure = match &err {
         ProxyError::Bridge(BridgeError::Timeout { .. }) => EmbedFailure::Timeout,
@@ -189,74 +185,8 @@ fn classify(err: ProxyError) -> EmbedError {
         ProxyError::ProviderUnavailable | ProxyError::InvalidRequest(_) => EmbedFailure::Unresolved,
         _ => EmbedFailure::Upstream,
     };
-    let error = match &err {
-        ProxyError::Bridge(BridgeError::UpstreamStatus { status, .. }) => {
-            format!("upstream returned HTTP {status}")
-        }
-        ProxyError::Bridge(BridgeError::UpstreamInBand { status, .. }) => match status {
-            Some(status) => format!("upstream reported an in-band error (status {status})"),
-            None => "upstream reported an in-band error".to_owned(),
-        },
-        ProxyError::Bridge(BridgeError::UpstreamDecode(message)) => {
-            match decode_position(message) {
-                Some((line, column)) => {
-                    format!("upstream response could not be decoded (line {line} column {column})")
-                }
-                None => "upstream response could not be decoded".to_owned(),
-            }
-        }
-        ProxyError::Bridge(BridgeError::Config(_)) => "bridge is misconfigured".to_owned(),
-        _ => aisix_guardrails::error_chain(&err),
-    };
     EmbedError {
         failure,
-        error: Some(error),
-    }
-}
-
-/// The `line N column M` suffix serde_json appends to its messages. Only
-/// the two numbers are taken, so nothing of the message itself survives.
-fn decode_position(message: &str) -> Option<(u64, u64)> {
-    let (_, position) = message.rsplit_once(" at line ")?;
-    let (line, column) = position.split_once(" column ")?;
-    Some((line.parse().ok()?, column.parse().ok()?))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn logged(err: BridgeError) -> String {
-        classify(ProxyError::Bridge(err)).error.expect("error text")
-    }
-
-    #[test]
-    fn a_decode_failure_keeps_only_its_position() {
-        let serde = serde_json::from_str::<Vec<f32>>(r#""screened text""#).unwrap_err();
-        let message = format!("upstream body: {serde}");
-        assert!(message.contains("screened text"), "{message}");
-        assert_eq!(
-            logged(BridgeError::UpstreamDecode(message)),
-            "upstream response could not be decoded (line 1 column 15)"
-        );
-        assert_eq!(
-            logged(BridgeError::UpstreamDecode(
-                "error decoding response body".into()
-            )),
-            "upstream response could not be decoded"
-        );
-    }
-
-    #[test]
-    fn a_misconfiguration_drops_its_text() {
-        let err =
-            BridgeError::Config("token mint upstream returned HTTP 400: screened text".into());
-        assert_eq!(logged(err), "bridge is misconfigured");
-    }
-
-    #[test]
-    fn a_transport_error_keeps_its_cause() {
-        let err = BridgeError::Transport("connection refused".into());
-        assert!(logged(err).contains("connection refused"));
+        error: Some(crate::semantic::embed_failure_text(&err)),
     }
 }

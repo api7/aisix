@@ -313,8 +313,8 @@ pub struct EmbedError {
     pub failure: EmbedFailure,
     /// What went wrong, for the log line. It must never carry text derived
     /// from an upstream response, which can quote the screened input: an
-    /// embedder keeps a status, a decode position or a variant name for
-    /// those, and the [`error_chain`] only for transport errors. `None`
+    /// embedder keeps only a status or a decode position for those, and
+    /// the [`error_chain`] for everything else. `None`
     /// when the failure is ours, not the provider's (an unresolved alias,
     /// a vector count that does not match).
     pub error: Option<String>,
