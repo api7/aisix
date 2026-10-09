@@ -328,6 +328,7 @@ describe("guardrail call failure logs its underlying cause", () => {
     expect(line).toMatch(/elapsed_ms=\d+/);
     // The echo upstream quoted the caller's text (PROMPT_MARKER) back.
     expect(line).not.toContain("invalid input");
+    expect(line).not.toContain(PROMPT_MARKER);
     expectNoSecrets();
   });
 });
