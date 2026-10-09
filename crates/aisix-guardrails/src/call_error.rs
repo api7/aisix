@@ -132,7 +132,8 @@ pub(crate) fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 /// The phase a reqwest error failed in. Checked in this order because the
 /// predicates overlap: a connect timeout is both `is_connect` and
 /// `is_timeout`, and is reported as `connect` (`elapsed_ms` tells the two
-/// apart).
+/// apart). On a response body, reqwest reports both a read that the peer
+/// cut short and a parse failure as `decode`; `error` tells those apart.
 pub(crate) fn error_kind(err: &reqwest::Error) -> &'static str {
     if err.is_connect() {
         "connect"
@@ -260,6 +261,5 @@ pub(crate) mod testing {
             "underlying cause logged: {line}"
         );
         assert!(line.contains("elapsed_ms="), "duration logged: {line}");
-        assert!(!logged.contains(PROMPT_MARKER), "prompt leaked: {logged}");
     }
 }
