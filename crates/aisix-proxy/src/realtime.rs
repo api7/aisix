@@ -1079,6 +1079,7 @@ async fn run_session(
         inbound_protocol: "realtime".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        request_headers: client.request_headers.clone(),
         // A frame the chain refused ends the session, so the session's one
         // terminal event is where the refusal has to be recorded — this is
         // the only realtime row the "Guardrail blocks" view can ever see

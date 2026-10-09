@@ -231,6 +231,12 @@ observability:
       thresholds: [0.8, 0.9]
       dir: "/var/lib/aisix/heap"
       keep: 5
+  # Request headers recorded on every usage event (a `request_headers` map
+  # keyed by these lowercase names). See config.example.yaml for the full
+  # annotation. Override with a comma-separated list, e.g.
+  # AISIX_OBSERVABILITY__USAGE_EVENT__REQUEST_HEADERS=x-sub-user,x-department
+  usage_event:
+    request_headers: []
 
 managed:
   enabled: true

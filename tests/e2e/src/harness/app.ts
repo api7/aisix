@@ -142,6 +142,11 @@ export interface AppOverrides {
    */
   heapProfiling?: Record<string, unknown>;
   /**
+   * `observability.usage_event.request_headers`: the request headers every
+   * usage event records. Omitted, the binary's default (none) applies.
+   */
+  usageEventRequestHeaders?: string[];
+  /**
    * FILE MODE: contents of a standalone `resources.yaml`. When set, the
    * generated config carries `resources_file` (pointing at this content
    * written into the tmp dir) and NO `etcd` section — the gateway loads
@@ -459,6 +464,9 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
             },
           }),
       ...(overrides.heapProfiling ? { heap_profiling: overrides.heapProfiling } : {}),
+      ...(overrides.usageEventRequestHeaders
+        ? { usage_event: { request_headers: overrides.usageEventRequestHeaders } }
+        : {}),
     },
     cache: { backend: "memory" },
     // The gateway ships a 30s drain window so a load balancer can

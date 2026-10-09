@@ -759,6 +759,16 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_user_agent: String,
 
+    /// Values of the request headers the operator listed in
+    /// `observability.usage_event.request_headers`, keyed by that
+    /// (lowercase) name. A header the request did not carry has no key;
+    /// repeated occurrences are joined with `", "` in arrival order; each
+    /// value is control-character-stripped and capped like
+    /// `client_user_agent`. Every event of a request carries the same map.
+    /// Empty — and off the wire — when nothing is configured or matched.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub request_headers: std::collections::BTreeMap<String, String>,
+
     // ─── MCP gateway attribution ───
     /// Registered name of the upstream MCP server a `tools/call` was routed
     /// to (the namespace prefix of the requested tool). Empty for non-MCP
@@ -1783,6 +1793,7 @@ mod tests {
         // resolve a peer / the client sent no User-Agent.
         assert!(!json.contains("client_source_ip"));
         assert!(!json.contains("client_user_agent"));
+        assert!(!json.contains("request_headers"));
         // Requested alias (AISIX-Cloud#790): absent when the request
         // never carried a resolvable model name.
         assert!(!json.contains("requested_model"));
@@ -1971,6 +1982,24 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains(r#""client_source_ip":"203.0.113.7""#));
         assert!(json.contains(r#""client_user_agent":"codex-cli/1.2""#));
+    }
+
+    #[test]
+    fn request_headers_serialise_as_one_object() {
+        let ev = UsageEvent {
+            request_id: "req-headers".into(),
+            request_headers: [
+                ("x-sub-user".to_string(), "alice".to_string()),
+                ("x-department".to_string(), "eng, ops".to_string()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let json: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            json["request_headers"],
+            serde_json::json!({"x-sub-user": "alice", "x-department": "eng, ops"})
+        );
     }
 
     #[test]

@@ -681,6 +681,7 @@ pub(crate) fn emit_failed_attempts_as(
             applied_guardrails: applied_guardrails.to_vec(),
             client_source_ip: client.source_ip.clone(),
             client_user_agent: client.user_agent.clone(),
+            request_headers: client.request_headers.clone(),
             guardrail_blocked: terminal && guardrail_blocked,
             guardrail_monitor_hits: if terminal {
                 std::mem::take(&mut monitor_hits)
@@ -798,6 +799,7 @@ pub(crate) fn build_error_usage_event(
         error_class: error_class.to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        request_headers: client.request_headers.clone(),
         guardrail_blocked,
         applied_guardrails: applied,
         guardrail_enforced_hits: enforced,
@@ -1335,10 +1337,74 @@ mod tests {
         /// at all, followed by why.
         const EXEMPT: &str = "NO-GUARDRAIL-CHAIN:";
 
-        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut blocks = 0usize;
+        let literals = usage_event_literals();
+        let blocks = literals.len();
         let mut missing = Vec::new();
+        for (site, block) in &literals {
+            if block.contains(EXEMPT) {
+                continue;
+            }
+            for field in ["guardrail_bypassed_reason", "applied_guardrails"] {
+                if !sets_field(block, field) {
+                    missing.push(format!("{site} ({field})"));
+                }
+            }
+        }
 
+        // The parse must actually find the emitters, not silently yield an
+        // empty set that makes the assertion below vacuous.
+        // The crate's real count. A floor rather than an equality so
+        // adding an emitter does not fail here (the `missing` check
+        // already governs a new one) — but losing four to a parse that
+        // quietly stopped matching is the drift this exists to catch.
+        assert!(
+            blocks >= 18,
+            "the UsageEvent literal scan found only {blocks} — it has stopped tracking the \
+             emitter family",
+        );
+        assert!(
+            missing.is_empty(),
+            "these UsageEvent emitters neither set the named field nor carry a \
+             `{EXEMPT} <why>` comment saying they have no guardrail chain: {missing:?}\n\
+             An unset field reads as an unguarded request, so an emitter that skips it makes \
+             the field unusable as a negative answer.",
+        );
+    }
+
+    /// Every `UsageEvent` this crate builds carries the request's
+    /// `request_headers`, so the operator-selected headers reach every
+    /// event of every family — success, failure, per-attempt, cancel, and
+    /// the after-the-fact batch rows alike. An emitter that forgot it would
+    /// export rows silently missing the attribution, which no test of
+    /// another family can see.
+    #[test]
+    fn every_usage_event_this_crate_builds_carries_the_request_headers() {
+        let literals = usage_event_literals();
+        assert!(
+            literals.len() >= 18,
+            "the UsageEvent literal scan found only {}",
+            literals.len()
+        );
+        // The cancel emitter's literals spread a base event that sets it.
+        let missing: Vec<&str> = literals
+            .iter()
+            .filter(|(_, block)| {
+                !sets_field(block, "request_headers") && !block.contains("..base_event(")
+            })
+            .map(|(site, _)| site.as_str())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these UsageEvent literals do not set request_headers: {missing:?}"
+        );
+    }
+
+    /// Every `UsageEvent { .. }` literal in this crate's source, as
+    /// `("<file>:<line>", block)`. A parse of the source rather than a list
+    /// of emitters — see the guardrail census above for why.
+    fn usage_event_literals() -> Vec<(String, String)> {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
         for path in crate_rs_files(&src_dir) {
             let src = std::fs::read_to_string(&path).expect("source must read");
             let name = path
@@ -1368,37 +1434,11 @@ mod tests {
                 let Some(block) = braced_block(&src, &code, open) else {
                     panic!("{name}: unbalanced UsageEvent literal at byte {idx}");
                 };
-                blocks += 1;
-                if block.contains(EXEMPT) {
-                    continue;
-                }
-                for field in ["guardrail_bypassed_reason", "applied_guardrails"] {
-                    if !sets_field(block, field) {
-                        let line = src[..idx].lines().count();
-                        missing.push(format!("{name}:{line} ({field})"));
-                    }
-                }
+                let line = src[..idx].lines().count();
+                out.push((format!("{name}:{line}"), block.to_string()));
             }
         }
-
-        // The parse must actually find the emitters, not silently yield an
-        // empty set that makes the assertion below vacuous.
-        // The crate's real count. A floor rather than an equality so
-        // adding an emitter does not fail here (the `missing` check
-        // already governs a new one) — but losing four to a parse that
-        // quietly stopped matching is the drift this exists to catch.
-        assert!(
-            blocks >= 18,
-            "the UsageEvent literal scan found only {blocks} — it has stopped tracking the \
-             emitter family",
-        );
-        assert!(
-            missing.is_empty(),
-            "these UsageEvent emitters neither set the named field nor carry a \
-             `{EXEMPT} <why>` comment saying they have no guardrail chain: {missing:?}\n\
-             An unset field reads as an unguarded request, so an emitter that skips it makes \
-             the field unusable as a negative answer.",
-        );
+        out
     }
 
     /// Every `.rs` file under `dir`, sorted. Recursive: `src/` is flat

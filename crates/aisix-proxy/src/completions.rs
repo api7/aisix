@@ -929,6 +929,7 @@ fn emit_usage_event(
         applied_guardrails: applied_guardrails.to_vec(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        request_headers: client.request_headers.clone(),
         // #911 [23]: a billed-then-output-blocked completion surfaces on the
         // dashboard's Blocked tab while still carrying its billed token counts.
         guardrail_blocked,

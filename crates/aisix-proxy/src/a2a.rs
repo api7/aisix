@@ -84,6 +84,8 @@ struct A2aCall {
     applied_guardrails: Vec<aisix_core::AppliedGuardrail>,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     guardrail_audit: crate::usage_attr::GuardrailAudit,
+    /// `UsageEvent::request_headers`, captured off the inbound request.
+    request_headers: std::collections::BTreeMap<String, String>,
 }
 
 /// The words exchanged on one A2A call.
@@ -257,6 +259,11 @@ async fn dispatch(
     let upstream = upstream_from_a2a_agent(&entry.value);
 
     let (parts, body) = request.into_parts();
+    let request_headers = crate::client_ip::capture_request_headers(
+        &parts.headers,
+        &state.usage_event_request_headers,
+    );
+    crate::attribution::note_request_headers(&request_headers);
     // Resolved here rather than inside the bridge: the inbound headers exist
     // only on this side, and the same resolved set serves the buffered and the
     // streaming dispatch below.
@@ -317,6 +324,7 @@ async fn dispatch(
         applied_guardrails: Vec::new(),
         guardrail_monitor_hits: Vec::new(),
         guardrail_audit: None,
+        request_headers,
     };
     // Read before the upstream is contacted, so a call that never lands still
     // records which task the caller was asking about.
@@ -959,6 +967,7 @@ fn emit_a2a_usage(
         a2a_context_id: call.facts.context_id.clone(),
         a2a_task_state: call.facts.task_state.to_string(),
         a2a_stream_event_count: call.stream.event_count,
+        request_headers: call.request_headers.clone(),
         // An A2A agent reports no usage of its own, so these are the
         // gateway's own count of the words that passed through — flagged as
         // estimated, which is exactly what `usage_estimated` is for. Cost

@@ -269,6 +269,21 @@ observability:
       thresholds: [0.8, 0.9]
       dir: "/var/lib/aisix/heap"
       keep: 5
+  # Request headers recorded on every usage event, so events exported to
+  # Aliyun SLS, Datadog, object storage or OTLP can be attributed by values
+  # your callers send (a sub-user id, a department). Each event carries a
+  # `request_headers` map keyed by the names listed here; OTLP exports each
+  # one as the span attribute `http.request.header.<name>`. A header the
+  # request did not send is left out; a header sent more than once is joined
+  # with ", ". Values are stripped of control characters and capped at 256
+  # characters. Recording never changes what is forwarded upstream.
+  # Names must be lowercase; credential headers (authorization, x-api-key,
+  # cookie, ...) and duplicates are refused at startup. Changes require a
+  # restart.
+  # Env-only deployments set the list comma-separated:
+  # AISIX_OBSERVABILITY__USAGE_EVENT__REQUEST_HEADERS=x-sub-user,x-department
+  usage_event:
+    request_headers: []
 
 # Managed-mode switch. Uncomment when connecting the gateway to
 # AISIX Cloud: the admin API and Playground will NOT be bound — all

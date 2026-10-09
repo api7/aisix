@@ -1202,6 +1202,51 @@ pub struct ObservabilityConfig {
     pub debug: DebugListenerConfig,
     /// Heap-profile dumps written without anyone asking for them.
     pub heap_profiling: HeapProfilingConfig,
+    /// What every usage event records beyond the gateway's own fields.
+    pub usage_event: UsageEventConfig,
+}
+
+/// `observability.usage_event`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields, default)]
+pub struct UsageEventConfig {
+    /// Request headers whose values every usage event records under
+    /// `request_headers`, keyed by the name listed here. Lowercase names
+    /// only; credential headers and duplicates are refused at startup.
+    /// Recording a header never changes what is forwarded upstream.
+    /// Empty (the default) records none; changing the list requires a
+    /// restart.
+    pub request_headers: Vec<String>,
+}
+
+impl UsageEventConfig {
+    /// Why `request_headers` cannot be used, or `None` when it can.
+    fn validate(&self) -> Option<String> {
+        let mut seen = std::collections::HashSet::new();
+        for name in &self.request_headers {
+            let token = !name.is_empty()
+                && name.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || b"!#$%&'*+.^_`|~-".contains(&b)
+                });
+            if !token {
+                return Some(format!(
+                    "{name:?} is not a lowercase HTTP header name \
+                     (allowed: a-z 0-9 ! # $ % & ' * + . ^ _ ` | ~ -)"
+                ));
+            }
+            if crate::forwarded_headers::CREDENTIAL_SLOT_HEADERS.contains(&name.as_str()) {
+                return Some(format!(
+                    "{name:?} carries a credential and is never recorded ({})",
+                    crate::forwarded_headers::CREDENTIAL_SLOT_HEADERS.join(", ")
+                ));
+            }
+            if !seen.insert(name.as_str()) {
+                return Some(format!("{name:?} is listed more than once"));
+            }
+        }
+        None
+    }
 }
 
 /// `observability.debug` — a listener for diagnostics that must never be
@@ -1284,6 +1329,7 @@ impl Default for ObservabilityConfig {
             tracing: None,
             debug: DebugListenerConfig::default(),
             heap_profiling: HeapProfilingConfig::default(),
+            usage_event: UsageEventConfig::default(),
         }
     }
 }
@@ -2135,6 +2181,7 @@ const ENV_LIST_PARSE_KEYS: &[&str] = &[
     "observability.metrics.buckets.guardrail_latency",
     "observability.metrics.buckets.a2a_ttfb",
     "observability.heap_profiling.auto_dump.thresholds",
+    "observability.usage_event.request_headers",
     "cache.redis.nodes",
     "cache.redis.sentinels",
     "ratelimit.redis.nodes",
@@ -2399,6 +2446,11 @@ impl Config {
                  header name, or a reserved header a request id must never be read \
                  from ({})",
                 CREDENTIAL_HEADERS.join(", ")
+            )));
+        }
+        if let Some(why) = self.observability.usage_event.validate() {
+            return Err(BootstrapError::Config(format!(
+                "observability.usage_event.request_headers rejects {why}"
             )));
         }
         // Zero workers would bind no listener at all: the proxy would
@@ -3103,6 +3155,64 @@ admin:
                     "expected the offending key in the error for {spelling}, got: {err}"
                 );
             }
+        }
+    }
+
+    fn load_with_usage_event_headers(list: &str) -> Result<Config, BootstrapError> {
+        let f = write_yaml(&format!(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+observability:
+  usage_event:
+    request_headers: {list}
+"#
+        ));
+        Config::load_from_path(Some(f.path()))
+    }
+
+    #[test]
+    fn usage_event_request_headers_default_to_none_and_load_as_listed() {
+        assert!(ObservabilityConfig::default()
+            .usage_event
+            .request_headers
+            .is_empty());
+        let cfg = load_with_usage_event_headers(r#"["x-sub-user", "x-department"]"#).unwrap();
+        assert_eq!(
+            cfg.observability.usage_event.request_headers,
+            vec!["x-sub-user".to_string(), "x-department".to_string()],
+        );
+    }
+
+    /// A name that can never match, a credential, and a duplicate each fail
+    /// the boot naming the key — the credential one because recording it
+    /// would copy a caller's secret into every exported usage event.
+    #[test]
+    fn usage_event_request_headers_are_validated_at_startup() {
+        let mut bad: Vec<String> = ["X-Sub-User", "x sub", "", "x-dept:1", "x-é"]
+            .iter()
+            .map(|n| format!("[{n:?}]"))
+            .collect();
+        bad.extend(
+            crate::forwarded_headers::CREDENTIAL_SLOT_HEADERS
+                .iter()
+                .map(|n| format!("[{n:?}]")),
+        );
+        bad.push(r#"["x-sub-user", "x-sub-user"]"#.to_string());
+        for list in bad {
+            let err = load_with_usage_event_headers(&list)
+                .expect_err(&format!("{list} must be refused"))
+                .to_string();
+            assert!(
+                err.contains("observability.usage_event.request_headers"),
+                "{list}: error must name the key, got: {err}"
+            );
         }
     }
 
@@ -3863,7 +3973,7 @@ admin:
         // values for the struct-typed sequences, read back through the
         // typed accessors.
         const CHILD_MARKER: &str = "TEST_ENV_SEQUENCE_FIELDS_CHILD";
-        const ENV: [(&str, &str); 10] = [
+        const ENV: [(&str, &str); 11] = [
             ("AISIX_ETCD__ENDPOINTS", "http://127.0.0.1:2379"),
             ("AISIX_ADMIN__ADMIN_KEYS", "k1,k2"),
             ("AISIX_PROXY__ADDR", "0.0.0.0:3000"),
@@ -3891,6 +4001,10 @@ admin:
             (
                 "AISIX_OBSERVABILITY__METRICS__BUCKETS__REQUEST_TTFT",
                 "0.1,0.5,1",
+            ),
+            (
+                "AISIX_OBSERVABILITY__USAGE_EVENT__REQUEST_HEADERS",
+                "x-sub-user,x-department",
             ),
         ];
 
@@ -3932,6 +4046,10 @@ admin:
         assert_eq!(
             cfg.proxy.request_id.accept_headers,
             vec!["x-aisix-request-id".to_string(), "x-request-id".to_string()],
+        );
+        assert_eq!(
+            cfg.observability.usage_event.request_headers,
+            vec!["x-sub-user".to_string(), "x-department".to_string()],
         );
         assert_eq!(cfg.proxy.url_rewrites.len(), 1);
         assert_eq!(cfg.proxy.listeners.len(), 2);

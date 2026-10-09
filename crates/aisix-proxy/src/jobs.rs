@@ -671,6 +671,7 @@ fn emit_job_usage_event(
         inbound_protocol: "openai".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        request_headers: client.request_headers.clone(),
         guardrail_monitor_hits,
         applied_guardrails,
         guardrail_enforced_hits,
@@ -1398,7 +1399,7 @@ pub(crate) async fn get_batch(
         // batch downloads the output JSONL and emits real token usage.
         if status == StatusCode::OK {
             if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                maybe_attribute_batch(&state, &auth, &target, &raw, &v);
+                maybe_attribute_batch(&state, &auth, &client, &target, &raw, &v);
             }
         }
 
@@ -1893,6 +1894,9 @@ fn batch_attribution_request_id(raw_batch_id: &str, idx: usize, multi: bool) -> 
 fn maybe_attribute_batch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
+    // The request that observed completion — the same one the caller
+    // identity below is taken from.
+    client: &ClientContext,
     target: &JobTarget,
     raw_batch_id: &str,
     batch: &Value,
@@ -1921,6 +1925,7 @@ fn maybe_attribute_batch(
     let user_id = auth.entry.value.user_id.clone();
     let user_name = auth.user_name().map(str::to_owned);
     let jwt = auth.jwt.clone();
+    let request_headers = client.request_headers.clone();
     let model_id = target.model_entry.id.clone();
     let display_name = target.display_name().to_string();
     // Resolved before the spawn, off the live snapshot, through the same
@@ -1948,6 +1953,7 @@ fn maybe_attribute_batch(
             jwt.as_ref(),
             user_id.as_deref(),
             user_name.as_deref(),
+            &request_headers,
             &model_id,
             &display_name,
             cost.as_ref(),
@@ -1982,6 +1988,7 @@ async fn attribute_batch_usage(
     jwt: Option<&std::sync::Arc<crate::auth::JwtIdentity>>,
     user_id: Option<&str>,
     user_name: Option<&str>,
+    request_headers: &std::collections::BTreeMap<String, String>,
     model_id: &str,
     display_name: &str,
     cost: Option<&aisix_core::models::model::ModelCost>,
@@ -2096,6 +2103,7 @@ async fn attribute_batch_usage(
             // deliberately bypasses it (no live request, so no trace
             // bundle), and both labels still come from one constant.
             operation: crate::operation::BATCH_COMPLETION.operation.to_string(),
+            request_headers: request_headers.clone(),
             ..Default::default()
         };
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);

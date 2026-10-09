@@ -321,6 +321,7 @@ fn base_event(
         byo_label: crate::chat::sanitize_tag(tags.byo_label.unwrap_or_default()),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        request_headers: ctx.request_headers.clone(),
         // What a model-less family is attributed by instead of a model.
         // Empty everywhere else, exactly as those families' own events
         // leave the fields they do not fill.

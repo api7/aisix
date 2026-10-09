@@ -15,6 +15,7 @@
 //! limit to the shared layers), guardrails on both the tool arguments (input)
 //! and the tool result (output), and a usage event into the shared sink.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use aisix_core::models::McpServerAllowlist;
@@ -198,6 +199,11 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
         auth,
         anonymous_allowlist,
     } = caller;
+    let request_headers = crate::client_ip::capture_request_headers(
+        &parts.headers,
+        &state.usage_event_request_headers,
+    );
+    crate::attribution::note_request_headers(&request_headers);
     let request = Request::from_parts(parts, body);
     // #698: /mcp emits the same access log + request metrics as every other
     // handler — pre-fix the endpoint was invisible in both. One wrapper
@@ -234,6 +240,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
         &state,
         request,
         &request_id,
+        &request_headers,
         trace.as_ref(),
         &mut mcp_log,
     )
@@ -304,6 +311,7 @@ async fn dispatch(
     state: &ProxyState,
     request: Request,
     request_id: &str,
+    request_headers: &BTreeMap<String, String>,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     log: &mut McpRequestLog,
 ) -> Response {
@@ -463,6 +471,7 @@ async fn dispatch(
                     &snapshot,
                     &auth,
                     request_id,
+                    request_headers,
                     &mcp_server,
                     &mcp_tool,
                     response.status().as_u16(),
@@ -573,6 +582,7 @@ async fn dispatch(
                 &snapshot,
                 &auth,
                 request_id,
+                request_headers,
                 &mcp_server,
                 &mcp_tool,
                 StatusCode::OK.as_u16(),
@@ -644,6 +654,7 @@ async fn dispatch(
                         &snapshot,
                         &auth,
                         request_id,
+                        request_headers,
                         &mcp_server,
                         &mcp_tool,
                         StatusCode::OK.as_u16(),
@@ -695,6 +706,7 @@ async fn dispatch(
                         &snapshot,
                         &auth,
                         request_id,
+                        request_headers,
                         &mcp_server,
                         &mcp_tool,
                         StatusCode::OK.as_u16(),
@@ -834,6 +846,7 @@ async fn dispatch(
                         &snapshot,
                         &auth,
                         request_id,
+                        request_headers,
                         &mcp_server,
                         &mcp_tool,
                         StatusCode::BAD_GATEWAY.as_u16(),
@@ -861,6 +874,7 @@ async fn dispatch(
                         &snapshot,
                         &auth,
                         request_id,
+                        request_headers,
                         &mcp_server,
                         &mcp_tool,
                         StatusCode::OK.as_u16(),
@@ -907,6 +921,7 @@ async fn dispatch(
             &snapshot,
             &auth,
             request_id,
+            request_headers,
             &mcp_server,
             &mcp_tool,
             response.status().as_u16(),
@@ -1446,6 +1461,7 @@ fn emit_tool_call_usage(
     snap: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     request_id: &str,
+    request_headers: &BTreeMap<String, String>,
     mcp_server: &str,
     mcp_tool: &str,
     status_code: u16,
@@ -1484,6 +1500,7 @@ fn emit_tool_call_usage(
         inbound_protocol: "mcp".to_string(),
         mcp_server_name: mcp_server.to_string(),
         mcp_tool_name: mcp_tool.to_string(),
+        request_headers: request_headers.clone(),
         guardrail_blocked,
         guardrail_monitor_hits,
         applied_guardrails: guardrail_chain

@@ -338,6 +338,10 @@ pub struct ProxyStateInner {
     /// the built-in allowlist (AISIX-Cloud#1045). Default = built-ins
     /// only; the server bootstrap swaps in the compiled config rules.
     pub client_classifier: Arc<ClientTypeClassifier>,
+    /// `observability.usage_event.request_headers`: the request headers
+    /// every usage event records (see `client_ip::capture_request_headers`).
+    /// Default = none.
+    pub usage_event_request_headers: Arc<[String]>,
     /// Deployment-wide retry budget (`upstream.retries`) — the floor every
     /// dispatch falls back to when neither the target Model nor its model
     /// group sets one. See `routing::effective_retries`.
@@ -449,6 +453,7 @@ impl ProxyState {
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
+            usage_event_request_headers: Arc::from([]),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
         })
@@ -501,6 +506,7 @@ impl ProxyState {
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
+            usage_event_request_headers: Arc::from([]),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
         })
@@ -567,6 +573,7 @@ impl ProxyState {
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
+            usage_event_request_headers: Arc::from([]),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
         })
@@ -598,6 +605,13 @@ impl ProxyState {
     /// Default is built-ins only.
     pub fn with_client_classifier(mut self, classifier: Arc<ClientTypeClassifier>) -> Self {
         Arc::make_mut(&mut self.inner).client_classifier = classifier;
+        self
+    }
+
+    /// Record `observability.usage_event.request_headers` on every usage
+    /// event. Default is none.
+    pub fn with_usage_event_request_headers(mut self, names: &[String]) -> Self {
+        Arc::make_mut(&mut self.inner).usage_event_request_headers = names.into();
         self
     }
 

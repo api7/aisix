@@ -3876,6 +3876,7 @@ fn emit_usage_event(
         byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        request_headers: client.request_headers.clone(),
         guardrail_blocked,
         redacted_entity_counts,
         guardrail_monitor_hits,
@@ -4042,6 +4043,7 @@ fn emit_zero_token_event(
         byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        request_headers: client.request_headers.clone(),
         // Guardrails run once per REQUEST, not once per attempt, so a
         // superseded attempt's event would repeat the same hit per retry.
         // Only the terminal event carries them.

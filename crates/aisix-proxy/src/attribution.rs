@@ -173,6 +173,9 @@ pub(crate) struct CancelContext {
     pub auth: Option<crate::auth::AuthenticatedKey>,
     /// See [`RouteIdentity`].
     pub route: RouteIdentity,
+    /// `UsageEvent::request_headers`, from [`note_client`] or, on `/mcp`
+    /// and `/a2a`, from [`note_request_headers`].
+    pub request_headers: std::collections::BTreeMap<String, String>,
     /// The surface the request RESOLVED, when the path cannot say.
     ///
     /// The cancel guard otherwise reads the surface off the normalized
@@ -975,8 +978,15 @@ pub(crate) fn note_client(client: &ClientContext, api_key_id: &str) {
         if !api_key_id.is_empty() {
             c.api_key_id = api_key_id.to_string();
         }
+        c.request_headers = client.request_headers.clone();
         c.client = Some(client.clone());
     });
+}
+
+/// Note the request headers a usage event records, for the routes that
+/// build no [`ClientContext`] (`/mcp`, `/a2a`).
+pub(crate) fn note_request_headers(headers: &std::collections::BTreeMap<String, String>) {
+    with_cancel(|c| c.request_headers = headers.clone());
 }
 
 /// Note the authenticated principal. Called from the `AuthenticatedKey`
