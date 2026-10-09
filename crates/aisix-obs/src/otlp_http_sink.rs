@@ -1032,6 +1032,16 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
             &event.client_user_agent,
         ));
     }
+    // Operator-selected request headers, under the OpenTelemetry HTTP
+    // semantic-convention name `http.request.header.<lowercase name>`,
+    // which that convention types as a string array — one element here,
+    // because repeated occurrences were already joined into one value.
+    for (name, value) in &event.request_headers {
+        attributes.push(attr_string_array(
+            &format!("http.request.header.{name}"),
+            std::slice::from_ref(value),
+        ));
+    }
     // End-user identity a passthrough route's `identity_header` extracted —
     // the per-employee attribution of the forward-proxy scenario. Not gated
     // on the protocol so a future handler that learns to populate it exports
@@ -2485,6 +2495,35 @@ mod tests {
             ua.expect("client_user_agent attr")["value"]["stringValue"],
             "codex-cli/1.2"
         );
+    }
+
+    #[test]
+    fn payload_carries_request_headers_as_semconv_string_arrays() {
+        let mut ev = sample_event();
+        ev.request_headers = [
+            ("x-sub-user".to_string(), "alice".to_string()),
+            ("x-department".to_string(), "eng, ops".to_string()),
+        ]
+        .into();
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap();
+        for (key, value) in [
+            ("http.request.header.x-sub-user", "alice"),
+            ("http.request.header.x-department", "eng, ops"),
+        ] {
+            let attr = attrs
+                .iter()
+                .find(|a| a["key"] == key)
+                .unwrap_or_else(|| panic!("{key} attr missing"));
+            assert_eq!(
+                attr["value"],
+                json!({"arrayValue": {"values": [{"stringValue": value}]}}),
+            );
+        }
+        let none = build_otlp_traces_payload(&sample_event(), "x");
+        assert!(!none.to_string().contains("http.request.header."));
     }
 
     #[test]

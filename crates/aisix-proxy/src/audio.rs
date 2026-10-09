@@ -2641,6 +2641,7 @@ fn emit_usage_event(
         applied_guardrails: applied_guardrails.to_vec(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        request_headers: client.request_headers.clone(),
         redacted_entity_counts,
         guardrail_monitor_hits,
         guardrail_blocked,

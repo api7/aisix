@@ -681,6 +681,7 @@ pub(crate) fn emit_failed_attempts_as(
             applied_guardrails: applied_guardrails.to_vec(),
             client_source_ip: client.source_ip.clone(),
             client_user_agent: client.user_agent.clone(),
+            request_headers: client.request_headers.clone(),
             guardrail_blocked: terminal && guardrail_blocked,
             guardrail_monitor_hits: if terminal {
                 std::mem::take(&mut monitor_hits)
@@ -798,6 +799,7 @@ pub(crate) fn build_error_usage_event(
         error_class: error_class.to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        request_headers: client.request_headers.clone(),
         guardrail_blocked,
         applied_guardrails: applied,
         guardrail_enforced_hits: enforced,
@@ -1398,6 +1400,53 @@ mod tests {
              `{EXEMPT} <why>` comment saying they have no guardrail chain: {missing:?}\n\
              An unset field reads as an unguarded request, so an emitter that skips it makes \
              the field unusable as a negative answer.",
+        );
+    }
+
+    /// Every `UsageEvent` this crate builds carries the request's
+    /// `request_headers`, so the operator-selected headers reach every
+    /// event of every family — success, failure, per-attempt, cancel, and
+    /// the after-the-fact batch rows alike. An emitter that forgot it would
+    /// export rows silently missing the attribution, which no test of
+    /// another family can see.
+    #[test]
+    fn every_usage_event_this_crate_builds_carries_the_request_headers() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut blocks = 0usize;
+        let mut missing = Vec::new();
+        for path in crate_rs_files(&src_dir) {
+            let src = std::fs::read_to_string(&path).expect("source must read");
+            let code = code_mask(&src);
+            for (idx, _) in src.match_indices("UsageEvent {") {
+                if !code[idx] {
+                    continue;
+                }
+                let before = src[..idx]
+                    .trim_end()
+                    .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
+                    .trim_end();
+                if before.ends_with("->") {
+                    continue;
+                }
+                let open = idx + "UsageEvent ".len();
+                let block = braced_block(&src, &code, open).expect("balanced literal");
+                blocks += 1;
+                // The cancel emitter's literals spread a base event that
+                // sets it.
+                if sets_field(block, "request_headers") || block.contains("..base_event(") {
+                    continue;
+                }
+                let line = src[..idx].lines().count();
+                missing.push(format!("{}:{line}", path.display()));
+            }
+        }
+        assert!(
+            blocks >= 18,
+            "the UsageEvent literal scan found only {blocks}"
+        );
+        assert!(
+            missing.is_empty(),
+            "these UsageEvent literals do not set request_headers: {missing:?}"
         );
     }
 

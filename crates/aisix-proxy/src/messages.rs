@@ -3396,6 +3396,7 @@ fn emit_anthropic_usage_event(
         byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        request_headers: client.request_headers.clone(),
         applied_guardrails,
         redacted_entity_counts,
         guardrail_monitor_hits,

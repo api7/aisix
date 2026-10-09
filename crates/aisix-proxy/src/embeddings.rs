@@ -852,6 +852,7 @@ fn emit_usage_event(
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        request_headers: client.request_headers.clone(),
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);

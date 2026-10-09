@@ -995,6 +995,7 @@ async fn dispatch(
         client_identity,
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        request_headers: client.request_headers.clone(),
         started,
         attempt_started,
         status: status.as_u16(),
@@ -6501,6 +6502,7 @@ struct RouteTelemetry {
     client_identity: String,
     client_source_ip: String,
     client_user_agent: String,
+    request_headers: std::collections::BTreeMap<String, String>,
     started: Instant,
     /// When the upstream call itself began — the scope the two `upstream_*`
     /// figures are measured in, distinct from `started` (request receipt).
@@ -6704,6 +6706,7 @@ impl RouteTelemetry {
             client_identity: self.client_identity.clone(),
             client_source_ip: self.client_source_ip.clone(),
             client_user_agent: self.client_user_agent.clone(),
+            request_headers: self.request_headers.clone(),
             guardrail_blocked: self.guardrail_blocked,
             guardrail_monitor_hits: std::mem::take(&mut self.monitor_hits),
             applied_guardrails: crate::usage_attr::applied_guardrails(&self.audit),

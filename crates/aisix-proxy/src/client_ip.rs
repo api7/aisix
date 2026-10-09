@@ -10,6 +10,7 @@
 //! `x-forwarded-for`) is walked to find the originating address. With no
 //! trusted proxies configured (the default) the peer is always logged.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -161,6 +162,40 @@ pub struct ClientContext {
     /// the middleware isn't in the chain (a handler unit test with a
     /// bare router) — emission then falls back to the legacy flat span.
     pub trace: Option<Arc<aisix_obs::RequestTraceBundle>>,
+    /// The operator-selected request headers every usage event of this
+    /// request records ([`capture_request_headers`]).
+    pub request_headers: BTreeMap<String, String>,
+}
+
+/// The values of `names` (`observability.usage_event.request_headers`,
+/// validated lowercase at boot) on this request, for
+/// `UsageEvent::request_headers`.
+///
+/// Every emitter takes the map from here — through [`ClientContext`], or
+/// directly on `/mcp` and `/a2a`, which build none — so all events of one
+/// request carry the same values. An absent header has no key; repeated
+/// occurrences are joined with `", "` in arrival order; bytes are decoded
+/// lossily as UTF-8 and then [`crate::chat::sanitize_tag`]ged, and a value
+/// that sanitises to nothing has no key either. Reading a header here never
+/// changes what is forwarded upstream.
+pub(crate) fn capture_request_headers(
+    headers: &HeaderMap,
+    names: &[String],
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for name in names {
+        let joined = headers
+            .get_all(name.as_str())
+            .iter()
+            .map(|v| String::from_utf8_lossy(v.as_bytes()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let value = crate::chat::sanitize_tag(joined);
+        if !value.is_empty() {
+            out.insert(name.clone(), value);
+        }
+    }
+    out
 }
 
 /// Resolve the caller's address from the peer plus the trusted-proxy
@@ -243,6 +278,10 @@ where
                 .extensions
                 .get::<Arc<aisix_obs::RequestTraceBundle>>()
                 .cloned(),
+            request_headers: capture_request_headers(
+                &parts.headers,
+                &proxy_state.usage_event_request_headers,
+            ),
         };
         // Hand the caller to the request's attribution cell as well
         // (AISIX-Cloud#1571). This extractor is the one place every
@@ -416,5 +455,36 @@ mod tests {
             parsed,
             vec![ip("203.0.113.7"), ip("10.0.0.1"), ip("10.0.0.2")]
         );
+    }
+
+    /// The value rules the e2e cannot drive through a real HTTP client:
+    /// non-UTF-8 bytes, a value that sanitises to nothing, and the cap.
+    #[test]
+    fn captured_header_values_follow_the_value_rules() {
+        let names: Vec<String> = ["x-a", "x-b", "x-c", "x-d", "x-absent"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut h = axum::http::HeaderMap::new();
+        h.append("x-a", "one".parse().unwrap());
+        h.append("x-a", "two".parse().unwrap());
+        h.append(
+            "x-b",
+            axum::http::HeaderValue::from_bytes(b"caf\xe9\tbar").unwrap(),
+        );
+        h.append("x-c", axum::http::HeaderValue::from_bytes(b"\t").unwrap());
+        h.append("x-d", "y".repeat(300).parse().unwrap());
+        h.append("x-other", "not listed".parse().unwrap());
+        let got = capture_request_headers(&h, &names);
+        assert_eq!(got.get("x-a").map(String::as_str), Some("one, two"));
+        assert_eq!(got.get("x-b").map(String::as_str), Some("caf\u{fffd}bar"));
+        assert!(
+            !got.contains_key("x-c"),
+            "a value sanitised to nothing has no key"
+        );
+        assert_eq!(got["x-d"].chars().count(), 256);
+        assert!(!got.contains_key("x-absent"));
+        assert!(!got.contains_key("x-other"));
+        assert_eq!(got.len(), 3);
     }
 }
