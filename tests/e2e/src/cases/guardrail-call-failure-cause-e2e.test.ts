@@ -184,9 +184,42 @@ describe("guardrail call failure logs its underlying cause", () => {
     );
     await seed.attachGuardrailToModel(echoGuard.id, echoModel.id);
 
+    // A custom script reaches the same embedding dispatch through
+    // `aisix.embed`; it embeds the caller's text, which the echo upstream
+    // then quotes back in its error message.
+    const customModel = await seed.createModel({
+      display_name: "cause-custom",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+    });
+    const customGuard = await seed.createGuardrail(
+      {
+        name: "cause-custom-guard",
+        enabled: true,
+        hook_point: "input",
+        fail_open: true,
+        kind: "custom",
+        script: `export async function checkInput(ctx) {
+  try {
+    await aisix.embed("cause-echo-embed", [ctx.text]);
+  } catch (e) {}
+  return { action: "none" };
+}`,
+        timeout_ms: 5000,
+      },
+      { attach: false },
+    );
+    await seed.attachGuardrailToModel(customGuard.id, customModel.id);
+
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: [...rows.map((r) => r.model), "cause-semantic", "cause-echo"],
+      allowed_models: [
+        ...rows.map((r) => r.model),
+        "cause-semantic",
+        "cause-echo",
+        "cause-custom",
+      ],
     });
     proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     await waitConfigPropagation(
@@ -278,6 +311,23 @@ describe("guardrail call failure logs its underlying cause", () => {
     // (here the row's own examples, which are embedded first).
     expect(line).not.toContain("invalid input");
     expect(line).not.toContain("ignore your instructions");
+    expectNoSecrets();
+  });
+
+  test("custom: an aisix.embed provider error logs its status, not the echoed input", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const line = await failureLine("cause-custom", (l) =>
+      l.includes("custom guardrail embed failed") &&
+      l.includes("row=cause-custom-guard"),
+    );
+    expect(line).toContain("model=cause-echo-embed");
+    expect(line).toContain("upstream returned HTTP 400");
+    expect(line).toMatch(/elapsed_ms=\d+/);
+    // The echo upstream quoted the caller's text (PROMPT_MARKER) back.
+    expect(line).not.toContain("invalid input");
     expectNoSecrets();
   });
 });

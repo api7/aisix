@@ -104,7 +104,7 @@ use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 use rquickjs::{CatchResultExt, Module};
 
-use crate::{Guardrail, GuardrailVerdict, SegmentsOutcome, StreamOutputPolicy};
+use crate::{EmbedError, Guardrail, GuardrailVerdict, SegmentsOutcome, StreamOutputPolicy};
 
 /// Module name the script is compiled under. Shows up in the JS stack trace
 /// a thrown error carries, so keep it recognisable to the operator.
@@ -990,15 +990,22 @@ async fn host_embed(
     };
     // The script names the model by alias — `aisix.embed(name, texts)` is
     // the whole surface — so there is no id spelling to pass here.
+    let started = Instant::now();
     match embedder.embed(&model, None, &texts, false, budget).await {
         Ok(embedded) => serde_json::to_string(&EmbedResult {
             error: None,
             vectors: embedded.vectors,
         })
         .unwrap_or_else(|e| embed_error(e.to_string())),
-        Err(failure) => {
-            let failure = failure.failure;
-            tracing::warn!(row = %row_name, model = %model, failure = ?failure, "custom guardrail embed failed");
+        Err(EmbedError { failure, error }) => {
+            tracing::warn!(
+                row = %row_name,
+                model = %model,
+                failure = ?failure,
+                error = error.as_deref(),
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "custom guardrail embed failed"
+            );
             embed_error(format!("{failure:?}"))
         }
     }
