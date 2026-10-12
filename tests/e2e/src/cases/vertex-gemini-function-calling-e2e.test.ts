@@ -981,8 +981,9 @@ describe("a Gemini tool call id continuing on another provider", () => {
     expect(res.status).toBe(200);
     await res.text();
     const ids: string[] = messages[1].tool_calls.map((c: any) => c.id);
-    const signed = ids.find((id) => id.length > 64);
+    const signed = ids.find((id) => id.includes("__thought__"));
     expect(signed, "Gemini's first call carries its signature in the id").toBeDefined();
+    const [signedBase, signature] = signed!.split("__thought__");
     const withCalls = moderated.filter((text) => text.includes("get_weather"));
     // The calls were scanned on the way out and on the way back in, ids
     // included — but not the signature riding in the first one.
@@ -990,8 +991,8 @@ describe("a Gemini tool call id continuing on another provider", () => {
     const unsigned = ids.filter((id) => id !== signed);
     for (const text of withCalls) {
       for (const id of unsigned) expect(text).toContain(id);
-      expect(text).toContain(signed!.slice(0, 20));
-      expect(text).not.toContain(signed!.slice(-100));
+      expect(text).toContain(`"${signedBase}"`);
+      expect(text).not.toContain(signature);
     }
   });
 });

@@ -116,7 +116,8 @@ pub fn reject_legacy_function_calling(req: &ChatFormat) -> Result<(), BridgeErro
 
 /// The text a guardrail scans for a `tool_calls` array: every call as it
 /// is, but with any thought signature cut off its `id`. The base id is
-/// caller-controlled text an upstream receives, so it is scanned; the
+/// part of what the call carries — on the input side it is caller text an
+/// upstream receives — so it is scanned like the rest of the call; the
 /// signature is hundreds of bytes of opaque base64 a keyword rule could
 /// match by chance, and no upstream but Gemini ever sees it.
 pub fn tool_calls_scan_text(tool_calls: &Value) -> String {
