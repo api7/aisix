@@ -114,9 +114,11 @@ pub fn reject_legacy_function_calling(req: &ChatFormat) -> Result<(), BridgeErro
     }
 }
 
-/// The text a guardrail scans for a `tool_calls` array: every call with its
-/// `id` removed. An id is an opaque handle, and a thought signature inside
-/// one is kilobytes of base64 that a keyword rule could match by chance.
+/// The text a guardrail scans for a `tool_calls` array: every call as it
+/// is, but with any thought signature cut off its `id`. The base id is
+/// caller-controlled text an upstream receives, so it is scanned; the
+/// signature is hundreds of bytes of opaque base64 a keyword rule could
+/// match by chance, and no upstream but Gemini ever sees it.
 pub fn tool_calls_scan_text(tool_calls: &Value) -> String {
     match tool_calls {
         Value::Array(calls) => blocks_scan_text(calls),
@@ -125,18 +127,23 @@ pub fn tool_calls_scan_text(tool_calls: &Value) -> String {
 }
 
 /// [`tool_calls_scan_text`] over any list of tool-call-bearing objects
-/// (an Anthropic `content` array included): each one serialized without
-/// its `id`, as a JSON array.
+/// (an Anthropic `content` array included): each one serialized with its
+/// `id` reduced to the base id, as a JSON array.
 pub fn blocks_scan_text<'a>(blocks: impl IntoIterator<Item = &'a Value>) -> String {
-    struct WithoutId<'a>(&'a Value);
-    impl serde::Serialize for WithoutId<'_> {
+    struct BaseId<'a>(&'a Value);
+    impl serde::Serialize for BaseId<'_> {
         fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             use serde::ser::SerializeMap;
             match self.0 {
                 Value::Object(obj) => {
                     let mut map = serializer.serialize_map(None)?;
-                    for (k, v) in obj.iter().filter(|(k, _)| k.as_str() != "id") {
-                        map.serialize_entry(k, v)?;
+                    for (k, v) in obj {
+                        match (k.as_str(), v) {
+                            ("id", Value::String(id)) => {
+                                map.serialize_entry(k, strip_thought_signature(id))?
+                            }
+                            _ => map.serialize_entry(k, v)?,
+                        }
                     }
                     map.end()
                 }
@@ -144,7 +151,7 @@ pub fn blocks_scan_text<'a>(blocks: impl IntoIterator<Item = &'a Value>) -> Stri
             }
         }
     }
-    let blocks: Vec<WithoutId<'_>> = blocks.into_iter().map(WithoutId).collect();
+    let blocks: Vec<BaseId<'_>> = blocks.into_iter().map(BaseId).collect();
     serde_json::to_string(&blocks).unwrap_or_default()
 }
 
@@ -211,12 +218,16 @@ mod tests {
     }
 
     #[test]
-    fn scan_text_carries_no_tool_call_id() {
+    fn scan_text_carries_the_base_id_without_its_signature() {
         let text = tool_calls_scan_text(&json!([
             {"id": "call_a__thought__c2ln", "type": "function",
              "function": {"name": "lookup", "arguments": "{\"q\":1}"}}
         ]));
-        assert!(!text.contains("call_a"));
+        assert!(text.contains("\"call_a\""), "{text}");
+        assert!(
+            !text.contains("__thought__") && !text.contains("c2ln"),
+            "{text}"
+        );
         assert!(text.contains("lookup") && text.contains("{\\\"q\\\":1}"));
     }
 }

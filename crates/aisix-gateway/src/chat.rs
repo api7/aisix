@@ -779,7 +779,7 @@ impl ChatResponse {
                 }
                 // Serialize the whole tool-call payload so no function
                 // name or argument can escape inspection regardless of the
-                // provider-specific shape — all but the ids.
+                // provider-specific shape (ids without a thought signature).
                 out.push_str(&crate::tool_calls::tool_calls_scan_text(tool_calls));
             }
         }

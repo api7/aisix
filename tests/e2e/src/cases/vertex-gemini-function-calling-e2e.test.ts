@@ -967,7 +967,7 @@ describe("a Gemini tool call id continuing on another provider", () => {
     expectPortable(lastAt("/responses").input.filter((i: any) => i.call_id).map((i: any) => i.call_id));
   });
 
-  test("guardrails scan tool calls without their ids", async (ctx) => {
+  test("guardrails scan tool call ids without their signature", async (ctx) => {
     if (!etcdReachable || !app || !vertex) return ctx.skip();
     // Turn 1 runs the output scan over the signed calls, turn 2 the input
     // scan over the history carrying them.
@@ -980,11 +980,18 @@ describe("a Gemini tool call id continuing on another provider", () => {
     });
     expect(res.status).toBe(200);
     await res.text();
-    const ids = messages[1].tool_calls.map((c: any) => c.id);
-    const withCalls = moderated.filter((text) => text.includes("Rome"));
-    // The calls were scanned on the way out and on the way back in ...
+    const ids: string[] = messages[1].tool_calls.map((c: any) => c.id);
+    const signed = ids.find((id) => id.length > 64);
+    expect(signed, "Gemini's first call carries its signature in the id").toBeDefined();
+    const withCalls = moderated.filter((text) => text.includes("get_weather"));
+    // The calls were scanned on the way out and on the way back in, ids
+    // included — but not the signature riding in the first one.
     expect(withCalls.length).toBeGreaterThanOrEqual(2);
-    // ... without their ids.
-    for (const text of withCalls) for (const id of ids) expect(text).not.toContain(id);
+    const unsigned = ids.filter((id) => id !== signed);
+    for (const text of withCalls) {
+      for (const id of unsigned) expect(text).toContain(id);
+      expect(text).toContain(signed!.slice(0, 20));
+      expect(text).not.toContain(signed!.slice(-100));
+    }
   });
 });
