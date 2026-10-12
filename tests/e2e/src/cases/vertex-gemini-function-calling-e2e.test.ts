@@ -1020,9 +1020,9 @@ describe("a Gemini tool call id continuing on another provider", () => {
     });
     expect(res.status).toBe(200);
     await res.text();
-    const input = moderated.find((text) => text.includes("get_weather"));
-    expect(input, "the replayed calls were scanned").toBeDefined();
-    expect(input).toContain(signedBase);
-    expect(input).not.toContain(signature);
+    const scanned = moderated.filter((text) => text.includes("get_weather"));
+    expect(scanned.length, "the replayed calls were scanned").toBeGreaterThan(0);
+    expect(scanned.some((text) => text.includes(signedBase))).toBe(true);
+    for (const text of moderated) expect(text).not.toContain(signature);
   });
 });
