@@ -393,6 +393,15 @@ pub enum BridgeError {
     /// (serialization, our generated request_id) which stays 500.
     #[error("invalid upstream configuration: {0}")]
     InvalidUpstreamConfig(String),
+    /// The caller's request asks for something this provider's bridge
+    /// cannot translate (a request field, tool type, or history shape).
+    /// Same 400 `invalid_request_error`, non-retryable handling and
+    /// `invalid_config` telemetry class as [`InvalidUpstreamConfig`]; the
+    /// only difference is the message, which is the sentence itself
+    /// rather than one prefixed as an upstream misconfiguration, so the
+    /// caller is pointed at the request instead of the ProviderKey/Model.
+    #[error("{0}")]
+    InvalidRequest(String),
     /// Customer-fixable upstream *credential* problem — the admin's
     /// ProviderKey secret/credential is missing, empty, or malformed
     /// (empty secret, api key with invalid HTTP-header bytes, unparseable
@@ -707,7 +716,7 @@ impl BridgeError {
             // embedder — surface it through this table. Mapping it to 501
             // here would change what those two return.
             BridgeError::Config(_) | BridgeError::UnsupportedCapability(_) => 500,
-            BridgeError::InvalidUpstreamConfig(_) => 400,
+            BridgeError::InvalidUpstreamConfig(_) | BridgeError::InvalidRequest(_) => 400,
             BridgeError::InvalidUpstreamCredentials(_) => 401,
             BridgeError::Transport(_) => 502,
             BridgeError::StreamAborted => 502,
@@ -743,6 +752,7 @@ impl BridgeError {
             BridgeError::Config(_)
             | BridgeError::UnsupportedCapability(_)
             | BridgeError::InvalidUpstreamConfig(_)
+            | BridgeError::InvalidRequest(_)
             | BridgeError::InvalidUpstreamCredentials(_) => false,
         }
     }
@@ -755,7 +765,9 @@ impl BridgeError {
             BridgeError::UpstreamDecode(_) => "upstream_decode_error",
             BridgeError::UpstreamInBand { .. } => "upstream_in_band_error",
             BridgeError::Config(_) | BridgeError::UnsupportedCapability(_) => "config_error",
-            BridgeError::InvalidUpstreamConfig(_) => "invalid_request_error",
+            BridgeError::InvalidUpstreamConfig(_) | BridgeError::InvalidRequest(_) => {
+                "invalid_request_error"
+            }
             BridgeError::InvalidUpstreamCredentials(_) => "authentication_error",
             BridgeError::Transport(_) => "transport_error",
             BridgeError::StreamAborted => "stream_aborted",

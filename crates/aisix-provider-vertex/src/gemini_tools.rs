@@ -168,14 +168,14 @@ pub(crate) fn gemini_tools(tools: &Value) -> Result<Option<Vec<Value>>, BridgeEr
             (None | Some("function"), Some(f)) => f,
             (None, None) if entry.get("name").is_some() => entry,
             _ => {
-                return Err(BridgeError::InvalidUpstreamConfig(format!(
+                return Err(BridgeError::InvalidRequest(format!(
                     "tool type {:?} is not supported for this model; only function tools are",
                     kind.unwrap_or("<missing>")
                 )))
             }
         };
         let Some(name) = function.get("name").and_then(Value::as_str) else {
-            return Err(BridgeError::InvalidUpstreamConfig(
+            return Err(BridgeError::InvalidRequest(
                 "function tool has no name".into(),
             ));
         };
@@ -217,7 +217,7 @@ pub(crate) fn gemini_tool_config(choice: &Value) -> Result<Option<Value>, Bridge
                 "auto" => "AUTO",
                 "required" => "ANY",
                 other => {
-                    return Err(BridgeError::InvalidUpstreamConfig(format!(
+                    return Err(BridgeError::InvalidRequest(format!(
                         "tool_choice {other:?} is not supported for this model; \
                          use \"auto\", \"none\", \"required\" or a named function"
                     )))
@@ -231,7 +231,7 @@ pub(crate) fn gemini_tool_config(choice: &Value) -> Result<Option<Value>, Bridge
                 .and_then(Value::as_str)
                 .filter(|n| !n.is_empty())
             else {
-                return Err(BridgeError::InvalidUpstreamConfig(
+                return Err(BridgeError::InvalidRequest(
                     "tool_choice object must name a function: \
                      {\"type\":\"function\",\"function\":{\"name\":...}}"
                         .into(),
@@ -305,7 +305,7 @@ pub(crate) fn function_call_parts(
     let mut parts = Vec::with_capacity(tool_calls.len());
     for call in tool_calls {
         let Some(function) = call.get("function") else {
-            return Err(BridgeError::InvalidUpstreamConfig(
+            return Err(BridgeError::InvalidRequest(
                 "assistant tool call is not a function call; only function tool calls \
                  can be replayed to this model"
                     .into(),
@@ -319,7 +319,7 @@ pub(crate) fn function_call_parts(
             None | Some(Value::Null) => json!({}),
             Some(Value::String(s)) if s.is_empty() => json!({}),
             Some(Value::String(s)) => serde_json::from_str(s).map_err(|e| {
-                BridgeError::InvalidUpstreamConfig(format!(
+                BridgeError::InvalidRequest(format!(
                     "assistant tool call {name:?} has arguments that are not valid JSON: {e}"
                 ))
             })?,
@@ -380,7 +380,7 @@ pub(crate) fn function_response_part(
         .or(message.name.as_deref())
         .filter(|name| !name.is_empty())
         .ok_or_else(|| {
-            BridgeError::InvalidUpstreamConfig(
+            BridgeError::InvalidRequest(
                 "tool message has no corresponding tool call in an earlier assistant turn".into(),
             )
         })?;
@@ -766,7 +766,7 @@ mod tests {
             assert!(
                 matches!(
                     gemini_tool_config(&refused),
-                    Err(BridgeError::InvalidUpstreamConfig(_))
+                    Err(BridgeError::InvalidRequest(_))
                 ),
                 "{refused}"
             );
@@ -809,7 +809,7 @@ mod tests {
             assert!(
                 matches!(
                     gemini_tools(&json!([tool])),
-                    Err(BridgeError::InvalidUpstreamConfig(_))
+                    Err(BridgeError::InvalidRequest(_))
                 ),
                 "{tool}"
             );
@@ -933,7 +933,7 @@ mod tests {
     fn unparseable_history_arguments_are_refused() {
         assert!(matches!(
             function_call_parts(&[call("c", "f", "{not json")], "gemini-2.5-flash"),
-            Err(BridgeError::InvalidUpstreamConfig(_))
+            Err(BridgeError::InvalidRequest(_))
         ));
     }
 
@@ -961,7 +961,7 @@ mod tests {
         .unwrap();
         assert_eq!(part["functionResponse"]["response"], json!({"temp": 21}));
         let part = function_response_part(&tool_message("x", "[1,2]"), &[]);
-        assert!(matches!(part, Err(BridgeError::InvalidUpstreamConfig(_))));
+        assert!(matches!(part, Err(BridgeError::InvalidRequest(_))));
     }
 
     #[test]
@@ -1012,7 +1012,7 @@ mod tests {
             json!({"id": "c", "type": "custom", "custom": {"name": "apply_patch", "input": "x"}});
         assert!(matches!(
             function_call_parts(&[custom], "gemini-2.5-flash"),
-            Err(BridgeError::InvalidUpstreamConfig(_))
+            Err(BridgeError::InvalidRequest(_))
         ));
     }
 }

@@ -1,0 +1,198 @@
+import { createHash } from "node:crypto";
+import { createServer, type Server } from "node:http";
+import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import {
+  EtcdClient,
+  SeedClient,
+  spawnApp,
+  waitConfigPropagation,
+  type SpawnedApp,
+} from "../harness/index.js";
+
+// A request whose shape a provider's bridge cannot translate — the legacy
+// `functions` fields, a non-function tool, a tool result with no call
+// before it — is refused with 400 `invalid_request_error` before anything
+// is sent upstream. The message has to point at the request: one prefixed
+// "invalid upstream configuration" sends the caller to the ProviderKey and
+// Model, where there is nothing to fix.
+//
+// The refusals are raised while the upstream body is being built, so the
+// upstream here only counts requests; every case asserts it saw none.
+
+const CALLER_PLAINTEXT = "sk-caller-shape-refusal";
+const CALLER_KEY_HASH = createHash("sha256")
+  .update(CALLER_PLAINTEXT)
+  .digest("hex");
+
+const WEATHER_FUNCTION = {
+  name: "get_weather",
+  parameters: { type: "object", properties: { city: { type: "string" } } },
+};
+
+function post(app: SpawnedApp, path: string, body: unknown): Promise<Response> {
+  return fetch(`${app.proxyUrl}${path}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${CALLER_PLAINTEXT}`,
+      "x-api-key": CALLER_PLAINTEXT,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+describe("a refused request shape is described as a request error", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: Server | undefined;
+  let upstreamHits = 0;
+  let etcdReachable = false;
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    upstream = createServer((req, res) => {
+      upstreamHits += 1;
+      req.resume();
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "upstream must not be reached" } }));
+    });
+    await new Promise<void>((resolve) => upstream!.listen(0, "127.0.0.1", resolve));
+    const addr = upstream.address();
+    if (addr === null || typeof addr === "string") throw new Error("no port");
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    app = await spawnApp();
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    const vertexPk = await seed.createProviderKey({
+      display_name: "refusal-vertex-pk",
+      provider: "google",
+      adapter: "vertex",
+      secret: JSON.stringify({
+        access_token: "ya29.caller-shape-refusal",
+        project: "proj-e2e",
+        region: "us-central1",
+      }),
+      api_base: baseUrl,
+    });
+    await seed.createModel({
+      display_name: "refusal-gemini",
+      provider: "google",
+      model_name: "gemini-2.5-flash",
+      provider_key_id: vertexPk.id,
+    });
+    const bedrockPk = await seed.createProviderKey({
+      display_name: "refusal-bedrock-pk",
+      provider: "bedrock",
+      adapter: "bedrock",
+      secret: JSON.stringify({
+        access_key_id: "AKIA-refusal",
+        secret_access_key: "sk-refusal",
+        region: "us-east-1",
+      }),
+      api_base: baseUrl,
+    });
+    await seed.createModel({
+      display_name: "refusal-nova",
+      provider: "bedrock",
+      model_name: "us.amazon.nova-lite-v1:0",
+      provider_key_id: bedrockPk.id,
+    });
+    // Seeded last, so this key authenticating implies the whole seed set
+    // has reached the gateway's snapshot.
+    await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      await res.text();
+      return res.status === 200;
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await new Promise<void>((resolve) => (upstream ? upstream.close(() => resolve()) : resolve()));
+  });
+
+  async function expectRequestRefusal(res: Response, mentions: RegExp) {
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as any;
+    expect(body.error.type).toBe("invalid_request_error");
+    expect(body.error.message).not.toMatch(/invalid upstream configuration/i);
+    expect(body.error.message).toMatch(mentions);
+  }
+
+  const USER = { role: "user", content: "Weather in Paris?" };
+  const ORPHAN_TOOL_RESULT = { role: "tool", tool_call_id: "call_unknown", content: "sunny" };
+
+  test.for<[string, string, Record<string, unknown>, RegExp]>([
+    ["gemini: legacy functions", "refusal-gemini", { functions: [WEATHER_FUNCTION] }, /^`functions` is not supported/],
+    [
+      "gemini: legacy function_call",
+      "refusal-gemini",
+      { tools: [{ type: "function", function: WEATHER_FUNCTION }], function_call: "auto" },
+      /^`function_call` is not supported/,
+    ],
+    ["gemini: a non-function tool", "refusal-gemini", { tools: [{ type: "web_search" }] }, /^tool type "web_search" is not supported/],
+    [
+      "gemini: an orphan tool result",
+      "refusal-gemini",
+      { messages: [USER, ORPHAN_TOOL_RESULT] },
+      /^tool message has no corresponding tool call/,
+    ],
+    ["bedrock: legacy functions", "refusal-nova", { functions: [WEATHER_FUNCTION] }, /^`functions` is not supported/],
+  ])("chat: %s", async ([, model, extra, mentions], ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    for (const stream of [false, true]) {
+      const before = upstreamHits;
+      const res = await post(app, "/v1/chat/completions", {
+        model,
+        messages: [USER],
+        stream,
+        ...extra,
+      });
+      await expectRequestRefusal(res, mentions);
+      expect(upstreamHits, `stream=${stream}`).toBe(before);
+    }
+  });
+
+  test("messages: a tool_result with no tool_use before it", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    for (const stream of [false, true]) {
+      const before = upstreamHits;
+      const res = await post(app, "/v1/messages", {
+        model: "refusal-gemini",
+        max_tokens: 64,
+        stream,
+        messages: [
+          { role: "user", content: "Weather in Paris?" },
+          {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "toolu_unknown", content: "sunny" }],
+          },
+        ],
+      });
+      await expectRequestRefusal(res, /^tool message has no corresponding tool call/);
+      expect(upstreamHits, `stream=${stream}`).toBe(before);
+    }
+  });
+
+  test("responses: a function_call_output with no function_call before it", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    for (const stream of [false, true]) {
+      const before = upstreamHits;
+      const res = await post(app, "/v1/responses", {
+        model: "refusal-gemini",
+        stream,
+        input: [
+          { role: "user", content: "Weather in Paris?" },
+          { type: "function_call_output", call_id: "call_unknown", output: "sunny" },
+        ],
+      });
+      await expectRequestRefusal(res, /^tool message has no corresponding tool call/);
+      expect(upstreamHits, `stream=${stream}`).toBe(before);
+    }
+  });
+});
