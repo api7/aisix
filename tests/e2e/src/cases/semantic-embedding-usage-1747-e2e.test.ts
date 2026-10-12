@@ -167,9 +167,15 @@ async function startEmbeddingMock(): Promise<EmbeddingMock> {
       const upstreamModel = body.model ?? "embedding-usage-mock";
       callsByModel.set(upstreamModel, (callsByModel.get(upstreamModel) ?? 0) + 1);
       if (body.model === FAILED_USAGE_UPSTREAM_MODEL) {
-        res.statusCode = 502;
-        res.setHeader("content-type", "application/json");
-        res.end(JSON.stringify({ error: { message: "embedding upstream unavailable" } }));
+        // Answered after the same delay as a success, so the failed call's
+        // `latency_ms` cannot round down to 0 on a fast runner.
+        const failTimer = setTimeout(() => {
+          if (res.destroyed || res.writableEnded) return;
+          res.statusCode = 502;
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify({ error: { message: "embedding upstream unavailable" } }));
+        }, EMBEDDING_DELAY_MS);
+        res.once("close", () => clearTimeout(failTimer));
         return;
       }
       const inputs = Array.isArray(body.input) ? body.input : [body.input ?? ""];

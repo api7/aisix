@@ -321,7 +321,7 @@ pub async fn embeddings(
                     &model_name,
                     &api_key_id,
                     status,
-                    crate::attempt::error_class(&err),
+                    crate::usage_attr::EventError::of(&err),
                     err.is_guardrail_block(),
                     &client,
                     crate::usage_attr::applied_guardrails(&audit),

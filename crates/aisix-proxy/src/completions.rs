@@ -79,6 +79,10 @@ struct CompletionDispatchSuccess {
     /// ledger + /logs from under-reporting spend the provider charged for
     /// — the output analog of chat.rs's UpstreamCharge / responses.rs #543.
     guardrail_blocked: bool,
+    /// The refusal's own text, from [`crate::attempt::gateway_error_message`],
+    /// so the usage event names the block the way an input refusal does.
+    /// Empty when nothing was blocked.
+    guardrail_block_message: String,
     /// Captured request/response content for content-capturing exporters
     /// (AISIX-Cloud#947). `Some` only when an enabled exporter opted into
     /// `content_mode = full`; threaded to `fan_out` via the handler's emit,
@@ -256,6 +260,7 @@ pub async fn completions(
                     &success.provider_request_id,
                     &client,
                     success.guardrail_blocked,
+                    &success.guardrail_block_message,
                     success.redactions.clone(),
                     success.monitor_hits.clone(),
                     success.captured_content.as_ref(),
@@ -326,7 +331,7 @@ pub async fn completions(
                     &model_name,
                     &api_key_id,
                     status,
-                    crate::attempt::error_class(&err),
+                    crate::usage_attr::EventError::of(&err),
                     err.is_guardrail_block(),
                     &client,
                     crate::usage_attr::applied_guardrails(&audit),
@@ -681,13 +686,14 @@ async fn dispatch(
                     // recording zero tokens here would let cp-api's ledger
                     // under-report spend the customer was charged for. Same
                     // output analog as responses.rs #543 / chat.rs UpstreamCharge.
+                    let block = crate::error::guardrail_block_error(
+                        "response",
+                        guardrail_name.as_deref(),
+                        unavailable.as_deref(),
+                    );
+                    let guardrail_block_message = crate::attempt::gateway_error_message(&block);
                     return Ok(CompletionDispatchSuccess {
-                        response: crate::error::guardrail_block_error(
-                            "response",
-                            guardrail_name.as_deref(),
-                            unavailable.as_deref(),
-                        )
-                        .into_response(),
+                        response: block.into_response(),
                         provider: provider_label,
                         model_id: target.id.clone(),
                         provider_key_id: pk_id.clone(),
@@ -699,6 +705,7 @@ async fn dispatch(
                         redactions,
                         monitor_hits,
                         guardrail_blocked: true,
+                        guardrail_block_message,
                         // Blocked responses never reached the client — no
                         // content capture, matching the chat surface.
                         captured_content: None,
@@ -744,6 +751,7 @@ async fn dispatch(
                 redactions,
                 monitor_hits,
                 guardrail_blocked: false,
+                guardrail_block_message: String::new(),
                 captured_content,
             })
         }
@@ -767,6 +775,7 @@ async fn dispatch(
                 redactions,
                 monitor_hits,
                 guardrail_blocked: false,
+                guardrail_block_message: String::new(),
                 captured_content: None,
             })
         }
@@ -892,6 +901,8 @@ fn emit_usage_event(
     provider_request_id: &str,
     client: &ClientContext,
     guardrail_blocked: bool,
+    // The output refusal's text; see `CompletionDispatchSuccess`.
+    guardrail_block_message: &str,
     // Per-detector PII mask counts (#932). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
     // Monitor-mode guardrail observations (AISIX-Cloud#562).
@@ -942,6 +953,11 @@ fn emit_usage_event(
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
     crate::usage_attr::apply_winning_attempt(&mut event, winner);
+    // An output guardrail's refusal names itself like an input refusal does.
+    if guardrail_blocked {
+        event.error_class = crate::attempt::GUARDRAIL_BLOCK_CLASS.to_string();
+        event.error_message = guardrail_block_message.to_string();
+    }
     crate::usage_attr::apply_caller_identity(
         &mut event,
         client.jwt.as_ref(),

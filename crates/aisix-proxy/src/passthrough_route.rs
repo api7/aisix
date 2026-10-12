@@ -355,7 +355,7 @@ pub async fn entry(
                 "",
                 api_key_id,
                 status,
-                crate::attempt::error_class(&error),
+                crate::usage_attr::EventError::of(&error),
                 error.is_guardrail_block(),
                 &client,
                 crate::usage_attr::applied_guardrails(&audit),
@@ -5755,6 +5755,7 @@ fn stream_response(
                                 "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
                             );
                             blocked = true;
+                            telemetry.record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
                             chain.record_output_buffer_exceeded();
                             pending.clear();
                             pending_held.clear();
@@ -5818,6 +5819,7 @@ fn stream_response(
                                 "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
                             );
                             blocked = true;
+                            telemetry.record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
                             chain.record_output_buffer_exceeded();
                             pending.clear();
                             pending_held.clear();
@@ -5862,6 +5864,7 @@ fn stream_response(
                         pending.clear();
                         pending_held.clear();
                         blocked = true;
+                        telemetry.record_refusal(None, Some(crate::error::TAG_UNSCANNABLE_BODY));
                         yield Ok(guardrail_error_frame(
                             anthropic.unwrap_or(false),
                             None,
@@ -5934,6 +5937,7 @@ fn stream_response(
                                     "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
                                 );
                                 blocked = true;
+                                telemetry.record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
                                 chain.record_output_buffer_exceeded();
                                 pending.clear();
                                 pending_held.clear();
@@ -5974,6 +5978,7 @@ fn stream_response(
                                         "guardrail blocked passthrough-route stream (window)",
                                     );
                                     blocked = true;
+                                    telemetry.record_refusal(guardrail_name.as_deref(), unavailable.as_deref());
                                     yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), guardrail_name.as_deref(), unavailable.as_deref()));
                                     break 'outer;
                                 }
@@ -6048,6 +6053,7 @@ fn stream_response(
                                     "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
                                 );
                                 blocked = true;
+                                telemetry.record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
                                 chain.record_output_buffer_exceeded();
                                 yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
                                 break 'outer;
@@ -6099,8 +6105,8 @@ fn stream_response(
                         chain.record_output_buffer_exceeded();
                         pending.clear();
                         pending_held.clear();
+                        telemetry.record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
                         yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
-                        telemetry.guardrail_blocked = true;
                         telemetry.stream_reached_end = true;
                         telemetry.emit();
                         return;
@@ -6169,8 +6175,8 @@ fn stream_response(
                         chain.record_output_buffer_exceeded();
                         pending.clear();
                         pending_held.clear();
+                        telemetry.record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
                         yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
-                        telemetry.guardrail_blocked = true;
                         telemetry.stream_reached_end = true;
                         telemetry.emit();
                         return;
@@ -6222,12 +6228,12 @@ fn stream_response(
                         );
                         pending.clear();
                         pending_held.clear();
+                        telemetry.record_refusal(None, Some(crate::error::TAG_UNSCANNABLE_BODY));
                         yield Ok(guardrail_error_frame(
                             anthropic.unwrap_or(false),
                             None,
                             Some(crate::error::TAG_UNSCANNABLE_BODY),
                         ));
-                        telemetry.guardrail_blocked = true;
                         telemetry.stream_reached_end = true;
                         telemetry.emit();
                         return;
@@ -6281,8 +6287,8 @@ fn stream_response(
                         chain.record_output_buffer_exceeded();
                         pending.clear();
                         pending_held.clear();
+                        telemetry.record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
                         yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
-                        telemetry.guardrail_blocked = true;
                         telemetry.stream_reached_end = true;
                         telemetry.emit();
                         return;
@@ -6348,8 +6354,8 @@ fn stream_response(
                             // the error frame is the caller-visible signal either way.
                             pending.clear();
                             pending_held.clear();
+                            telemetry.record_refusal(guardrail_name.as_deref(), unavailable.as_deref());
                             yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), guardrail_name.as_deref(), unavailable.as_deref()));
-                            telemetry.guardrail_blocked = true;
                             telemetry.stream_reached_end = true;
                             telemetry.emit();
                             return;
@@ -6565,9 +6571,26 @@ impl RouteTelemetry {
             return;
         }
         let failure = crate::attempt::StreamFailure::from_bridge(err);
-        self.error_class = failure.error_class.to_string();
-        self.error_message = failure.error_message;
+        // A guardrail refusal already recorded names the event.
+        if !self.guardrail_blocked {
+            self.error_class = failure.error_class.to_string();
+            self.error_message = failure.error_message;
+        }
         self.failure_status = Some(failure.status);
+    }
+
+    /// Record the guardrail refusal that ended a streamed relay after its
+    /// head went out, with the text of the error frame it ends on. The
+    /// stream keeps its status; the refusal names the event over any
+    /// upstream failure recorded before it.
+    fn record_refusal(&mut self, guardrail_name: Option<&str>, unavailable: Option<&str>) {
+        if self.guardrail_blocked {
+            return;
+        }
+        self.guardrail_blocked = true;
+        self.error_class = crate::attempt::GUARDRAIL_BLOCK_CLASS.to_string();
+        self.error_message =
+            crate::attempt::StreamRefusal::new(guardrail_name, unavailable).error_message;
     }
 
     /// A successful renewal can prove a stream still owns its shared
@@ -6579,8 +6602,11 @@ impl RouteTelemetry {
         if self.failure_status.is_some() {
             return;
         }
-        self.error_class = "rate_limit_lease_lost".to_string();
-        self.error_message = "distributed concurrency lease was lost".to_string();
+        // A guardrail refusal already recorded names the event.
+        if !self.guardrail_blocked {
+            self.error_class = "rate_limit_lease_lost".to_string();
+            self.error_message = "distributed concurrency lease was lost".to_string();
+        }
         self.failure_status = Some(429);
     }
 
