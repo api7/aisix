@@ -79,17 +79,18 @@ pub fn chat_without_thought_signatures(req: Cow<'_, ChatFormat>) -> Cow<'_, Chat
 /// Reduce every tool-call id in a raw request body (Anthropic Messages
 /// `tool_use.id` / `tool_result.tool_use_id`, Responses `call_id`, chat
 /// `tool_calls[].id` / `tool_call_id`) to its base id, wherever it sits.
+/// A call's own arguments (`tool_use.input`, `arguments`) are the caller's
+/// data and are left alone, whatever keys they hold.
 pub fn strip_thought_signatures_in_body(body: &mut Value) {
     match body {
         Value::Object(obj) => {
             for (key, value) in obj.iter_mut() {
-                if matches!(
-                    key.as_str(),
-                    "id" | "call_id" | "tool_call_id" | "tool_use_id"
-                ) {
-                    strip_in_place(Some(value));
-                } else {
-                    strip_thought_signatures_in_body(value);
+                match (key.as_str(), &*value) {
+                    ("id" | "call_id" | "tool_call_id" | "tool_use_id", _) => {
+                        strip_in_place(Some(value))
+                    }
+                    ("arguments", _) | ("input", Value::Object(_)) => {}
+                    _ => strip_thought_signatures_in_body(value),
                 }
             }
         }
@@ -190,7 +191,8 @@ mod tests {
     fn raw_bodies_lose_the_suffix_on_every_id_field() {
         let mut body = json!({
             "messages": [{"role": "assistant", "content": [
-                {"type": "tool_use", "id": "call_a__thought__c2ln", "name": "f", "input": {}},
+                {"type": "tool_use", "id": "call_a__thought__c2ln", "name": "f",
+                 "input": {"id": "kept__thought__as-is"}},
                 {"type": "text", "text": "an id__thought__ in prose stays"}
             ]}, {"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "call_a__thought__c2ln", "content": "ok"}
@@ -199,6 +201,10 @@ mod tests {
         });
         strip_thought_signatures_in_body(&mut body);
         assert_eq!(body["messages"][0]["content"][0]["id"], "call_a");
+        assert_eq!(
+            body["messages"][0]["content"][0]["input"]["id"],
+            "kept__thought__as-is"
+        );
         assert_eq!(
             body["messages"][0]["content"][1]["text"],
             "an id__thought__ in prose stays"

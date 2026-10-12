@@ -995,4 +995,34 @@ describe("a Gemini tool call id continuing on another provider", () => {
       expect(text).not.toContain(signature);
     }
   });
+
+  test("the /v1/responses input scan reads a replayed call_id without its signature", async (ctx) => {
+    if (!etcdReachable || !app || !vertex) return ctx.skip();
+    const first = await post(app, "/v1/responses", {
+      model: "portable-gemini",
+      input: "Weather in Paris and Rome?",
+      tools: [RESPONSES_WEATHER_TOOL],
+    });
+    expect(first.status).toBe(200);
+    const calls = ((await first.json()) as any).output.filter((o: any) => o.type === "function_call");
+    const signed = calls.map((c: any) => c.call_id).find((id: string) => id.includes("__thought__"));
+    expect(signed).toBeDefined();
+    const [signedBase, signature] = signed.split("__thought__");
+    moderated.length = 0;
+    const res = await post(app, "/v1/responses", {
+      model: "portable-gemini-guarded",
+      input: [
+        { role: "user", content: "Weather in Paris and Rome?" },
+        ...calls.map((c: any) => ({ type: "function_call", call_id: c.call_id, name: c.name, arguments: c.arguments })),
+        ...calls.map((c: any) => ({ type: "function_call_output", call_id: c.call_id, output: "sunny" })),
+      ],
+      tools: [RESPONSES_WEATHER_TOOL],
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+    const input = moderated.find((text) => text.includes("get_weather"));
+    expect(input, "the replayed calls were scanned").toBeDefined();
+    expect(input).toContain(signedBase);
+    expect(input).not.toContain(signature);
+  });
 });
