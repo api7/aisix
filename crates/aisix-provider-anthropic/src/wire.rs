@@ -504,7 +504,8 @@ pub fn build_request<'a>(
             }
         }
     }
-    translate_reasoning_effort_to_anthropic(&mut extras);
+    let thinking_max_tokens =
+        translate_reasoning_effort_to_anthropic(&mut extras, upstream_model, req.max_tokens);
     // `response_format` is the OpenAI spelling of structured outputs. It
     // has no top-level Anthropic counterpart, so it is always consumed
     // here — riding `extra` onto the body would be rejected as an unknown
@@ -561,7 +562,10 @@ pub fn build_request<'a>(
     AnthropicRequest {
         model: upstream_model,
         messages,
-        max_tokens: req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        max_tokens: req
+            .max_tokens
+            .or(thinking_max_tokens)
+            .unwrap_or(DEFAULT_MAX_TOKENS),
         system,
         temperature: req.temperature,
         top_p: req.top_p,
@@ -703,35 +707,38 @@ fn claude_family_version(model: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-/// Rewrite an OpenAI-shape `reasoning_effort` into Anthropic's effort
-/// control, the mirror of [`reasoning_effort_for`]. The field is always
+/// Rewrite an OpenAI-shape `reasoning_effort` into Anthropic's thinking
+/// controls, the mirror of [`reasoning_effort_for`]. The field is always
 /// consumed: forwarding it verbatim reaches `/v1/messages` as an unknown
 /// top-level parameter (AISIX-Cloud#1474).
 ///
-/// `output_config.effort` is the target rather than a
-/// `thinking.budget_tokens` block, because a budget is rejected outright
-/// from Opus 4.7 onwards while effort is accepted across the whole
-/// current family. LiteLLM picks between the two using its model
-/// capability map; the gateway has no equivalent — it holds only the
-/// operator-supplied upstream model name — so it emits the shape current
-/// models take. `thinking` is left alone: a caller asking for a depth
-/// tier has said nothing about which thinking mode it wants, and on
-/// Opus 4.6 and later the model applies its own.
+/// The target is `output_config.effort`, except on the Claude families
+/// that reject it with a 400 — Haiku 4.5, Sonnet 4.5 and every family
+/// before 4.5 (see [`rejects_effort_parameter`]). Those take a
+/// `thinking.budget_tokens` block instead, sized per tier. Anthropic
+/// requires `max_tokens` above the budget, so the return value is the
+/// `max_tokens` such a request must carry when the caller sent none: the
+/// budget plus [`DEFAULT_MAX_TOKENS`]. A caller's own `max_tokens` is
+/// never changed; the budget is capped below it instead, and a
+/// `max_tokens` too small for Anthropic's minimum budget leaves thinking
+/// off.
+///
+/// On the effort path `thinking` is left alone: a caller asking for a
+/// depth tier has said nothing about which thinking mode it wants.
 ///
 /// An effort the caller expressed natively always wins, being the more
 /// specific statement of the same setting. That means `output_config.effort`
 /// specifically, not the presence of an `output_config`: the object also
 /// carries `format` and `task_budget`, and treating it as an effort
 /// declaration would drop the tier of any request that sent one of those.
+/// On the budget path a native `thinking` block wins the same way.
 pub fn translate_reasoning_effort_to_anthropic(
     extras: &mut serde_json::Map<String, serde_json::Value>,
-) {
-    let Some(effort) = extras.remove("reasoning_effort") else {
-        return;
-    };
-    let Some(effort) = effort.as_str() else {
-        return;
-    };
+    model: &str,
+    max_tokens: Option<u32>,
+) -> Option<u32> {
+    let effort = extras.remove("reasoning_effort")?;
+    let effort = effort.as_str()?;
     // A caller who natively turned thinking off has already stated the
     // depth, so the alias adds nothing — and pairing a tier with it
     // would build a request Anthropic rejects above `high`, naming an
@@ -743,7 +750,7 @@ pub fn translate_reasoning_effort_to_anthropic(
         .and_then(|t| t.as_str())
         == Some("disabled")
     {
-        return;
+        return None;
     }
     let has_native_effort = extras
         .get("output_config")
@@ -761,7 +768,13 @@ pub fn translate_reasoning_effort_to_anthropic(
                 serde_json::json!({"type": "disabled"}),
             );
         }
-        return;
+        return None;
+    }
+    if rejects_effort_parameter(model) {
+        if has_native_effort || extras.contains_key("thinking") {
+            return None;
+        }
+        return insert_thinking_budget(extras, effort, max_tokens);
     }
     // Anthropic's vocabulary has no `minimal`; `low` is its floor.
     let tier = match effort {
@@ -775,7 +788,7 @@ pub fn translate_reasoning_effort_to_anthropic(
                 reasoning_effort = %other,
                 "dropping unrecognised reasoning_effort on Anthropic dispatch"
             );
-            return;
+            return None;
         }
     };
     match extras.get_mut("output_config") {
@@ -796,7 +809,83 @@ pub fn translate_reasoning_effort_to_anthropic(
             );
         }
     }
+    None
 }
+
+/// Whether `model` names a Claude family that rejects
+/// `output_config.effort`: Anthropic documents effort support from
+/// Opus 4.5 and Sonnet 4.6 on, so Haiku 4.5, Sonnet 4.5 and every
+/// earlier family answer it with a 400. A name with no readable Claude
+/// version is not one of them.
+pub fn rejects_effort_parameter(model: &str) -> bool {
+    match claude_family_version(model) {
+        Some(version) if version < (4, 5) => true,
+        Some((4, 5)) => !model.to_ascii_lowercase().contains("opus"),
+        _ => false,
+    }
+}
+
+/// Add the `thinking.budget_tokens` block for an effort tier, returning
+/// the `max_tokens` the request needs when the caller sent none.
+fn insert_thinking_budget(
+    extras: &mut serde_json::Map<String, serde_json::Value>,
+    effort: &str,
+    max_tokens: Option<u32>,
+) -> Option<u32> {
+    let Some(budget) = thinking_budget_for(effort, max_tokens) else {
+        tracing::debug!(
+            reasoning_effort = %effort,
+            "dropping reasoning_effort on Anthropic dispatch: no thinking budget for it"
+        );
+        return None;
+    };
+    extras.insert(
+        "thinking".to_string(),
+        serde_json::json!({"type": "enabled", "budget_tokens": budget.budget_tokens}),
+    );
+    budget.required_max_tokens
+}
+
+/// The thinking budget an effort tier asks for on a Claude family that
+/// rejects `output_config.effort` (see [`rejects_effort_parameter`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThinkingBudget {
+    pub budget_tokens: u32,
+    /// The `max_tokens` the request must carry: `Some` only when the
+    /// caller sent none, since Anthropic requires it above the budget.
+    pub required_max_tokens: Option<u32>,
+}
+
+/// Size the thinking budget for an effort tier: minimal/low 1024,
+/// medium 2048, high 4096, xhigh 8192, max 16384. Without a caller
+/// `max_tokens` the request needs the budget plus [`DEFAULT_MAX_TOKENS`];
+/// a caller's own `max_tokens` is kept and the budget capped below it.
+/// `None` for an unrecognised tier, or when `max_tokens` is too small for
+/// Anthropic's minimum budget, in which case thinking stays off.
+pub fn thinking_budget_for(effort: &str, max_tokens: Option<u32>) -> Option<ThinkingBudget> {
+    let budget = match effort {
+        "minimal" | "low" => 1024,
+        "medium" => 2048,
+        "high" => 4096,
+        "xhigh" => 8192,
+        "max" => 16384,
+        _ => return None,
+    };
+    Some(match max_tokens {
+        None => ThinkingBudget {
+            budget_tokens: budget,
+            required_max_tokens: Some(budget + DEFAULT_MAX_TOKENS),
+        },
+        Some(max) if max <= MIN_THINKING_BUDGET_TOKENS => return None,
+        Some(max) => ThinkingBudget {
+            budget_tokens: budget.min(max - 1),
+            required_max_tokens: None,
+        },
+    })
+}
+
+/// The smallest `thinking.budget_tokens` Anthropic accepts.
+const MIN_THINKING_BUDGET_TOKENS: u32 = 1024;
 
 /// Inject a pair of prompt-cache breakpoints into a request that carries
 /// none of its own — one on the last system block, one on the last
@@ -5388,6 +5477,32 @@ mod tests {
     }
 
     // ─── reasoning_effort → Anthropic (AISIX-Cloud#1474) ──────────
+
+    #[test]
+    fn effort_support_split_by_claude_family() {
+        for model in [
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-5@20250929",
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-1",
+            "claude-3-7-sonnet-20250219",
+            "claude-3-5-haiku-latest",
+        ] {
+            assert!(rejects_effort_parameter(model), "{model}");
+        }
+        for model in [
+            "claude-opus-4-5",
+            "claude-opus-4-5-20251101",
+            "claude-sonnet-4-6",
+            "claude-opus-4-7",
+            "claude-haiku-5",
+            "glm-4.6",
+            "kimi-k2",
+        ] {
+            assert!(!rejects_effort_parameter(model), "{model}");
+        }
+    }
 
     #[test]
     fn build_request_maps_reasoning_effort_to_output_config() {

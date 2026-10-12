@@ -273,6 +273,15 @@ pub enum ProxyError {
     WebSocketUpgradeRequired { status: StatusCode, detail: String },
     #[error("no bridge registered for provider")]
     ProviderUnavailable,
+    /// A semantic router could not make its routing decision — the
+    /// classifier or embedding call failed — and its failure policy is
+    /// `fail`. `reason` is a closed vocabulary; the underlying error,
+    /// which can quote the prompt, stays on the router's warn line.
+    #[error("semantic router '{router}' could not pick a route ({reason})")]
+    SemanticDecisionFailed {
+        router: String,
+        reason: crate::semantic::DecisionFailure,
+    },
     /// Every routing candidate was excluded by the runtime status layer
     /// (all in cooldown or background-unhealthy) and the routing model
     /// is configured with `when_all_unavailable: fail`. Caller-visible as
@@ -460,6 +469,7 @@ impl ProxyError {
             ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             ProxyError::WebSocketUpgradeRequired { status, .. } => *status,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ProxyError::SemanticDecisionFailed { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::AllCandidatesUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::ContentFiltered { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
@@ -498,6 +508,9 @@ impl ProxyError {
             ProxyError::WebSocketUpgradeRequired { .. } => "websocket_upgrade_required",
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
+            // A gateway-side dependency failed, like `JwksUnavailable`;
+            // `error.code` carries the distinction.
+            ProxyError::SemanticDecisionFailed { .. } => "api_error",
             ProxyError::AllCandidatesUnavailable { .. } => "all_candidates_unavailable",
             ProxyError::ContentFiltered { .. } => "content_filter",
             ProxyError::BudgetExceeded(_) => "billing_error",
@@ -643,6 +656,7 @@ impl ProxyError {
             }
             ProxyError::JwtIdentityUnmapped => env.with_code("jwt_identity_unmapped"),
             ProxyError::JwksUnavailable => env.with_code("jwks_unavailable"),
+            ProxyError::SemanticDecisionFailed { .. } => env.with_code("semantic_routing_failed"),
             // Same stable-code convention, for the one distinction a
             // caller cannot make from `error.type`: `content_filter`
             // covers both a policy refusal and a fail-closed row that

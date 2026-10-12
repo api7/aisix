@@ -68,7 +68,9 @@ pub(crate) fn chat_request<'a>(request: &'a ChatFormat, model: &Model) -> Cow<'a
 /// a removal.
 ///
 /// `output_config.effort` is the only effort this mapping reads or
-/// rewrites. A `thinking` block is not an effort setting here — clients
+/// rewrites; a target that receives the Anthropic body itself goes
+/// through [`anthropic_native_request`], which writes a thinking budget
+/// instead on the Claude families that reject the effort. A `thinking` block is not an effort setting here — clients
 /// send one on every request and state an effort only when their user
 /// picked one — so a request carrying `thinking` and no
 /// `output_config.effort` sets no effort and takes the `""` entry.
@@ -99,6 +101,66 @@ pub(crate) fn anthropic_request<'a>(
         return (Cow::Borrowed(body), MappedEffort::AsWritten);
     }
     json_request(body, model, "output_config", "effort", carrier)
+}
+
+/// [`anthropic_request`] for a target that receives the Anthropic body
+/// itself (`/v1/messages` passthrough and `/v1/messages/count_tokens`).
+///
+/// On a Claude family that rejects `output_config.effort` (Haiku 4.5,
+/// Sonnet 4.5 and earlier — see
+/// [`aisix_provider_anthropic::wire::rejects_effort_parameter`]), an
+/// effort this mapping would inject into a request that set none becomes
+/// the same thinking budget the chat bridge sends there instead, or is
+/// dropped when no budget fits. A `thinking` block the caller sent wins
+/// and the request goes upstream as written. An effort the caller set
+/// natively and every other model take [`anthropic_request`] unchanged.
+///
+/// `sends_max_tokens` is false for the token-counting route, whose body
+/// carries no `max_tokens`; elsewhere a request without one gets the
+/// budget plus the default answer allowance, as on the chat bridge.
+pub(crate) fn anthropic_native_request<'a>(
+    body: &'a Value,
+    model: &Model,
+    sends_max_tokens: bool,
+) -> (Cow<'a, Value>, MappedEffort) {
+    use aisix_provider_anthropic::wire::{rejects_effort_parameter, thinking_budget_for};
+
+    let carrier = json_carrier(body, "output_config", "effort");
+    if carrier != Carrier::NotSet
+        || !model
+            .model_name
+            .as_deref()
+            .is_some_and(rejects_effort_parameter)
+    {
+        return anthropic_request(body, model);
+    }
+    let EffortAction::Set(mapped) = resolve(carrier, model) else {
+        return anthropic_request(body, model);
+    };
+    if body.get("thinking").is_some() {
+        return (Cow::Borrowed(body), MappedEffort::AsWritten);
+    }
+    let max_tokens = body
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .map(|m| u32::try_from(m).unwrap_or(u32::MAX));
+    // An unrecognised tier has no budget, and this family rejects the
+    // effort, so nothing is sent — as on the chat bridge.
+    let Some(budget) = thinking_budget_for(mapped, max_tokens) else {
+        return (Cow::Borrowed(body), MappedEffort::AsWritten);
+    };
+    let mut outbound = body.clone();
+    let root = outbound
+        .as_object_mut()
+        .expect("a NotSet carrier is read off an object body");
+    root.insert(
+        "thinking".to_string(),
+        json!({"type": "enabled", "budget_tokens": budget.budget_tokens}),
+    );
+    if let (true, Some(required)) = (sends_max_tokens, budget.required_max_tokens) {
+        root.insert("max_tokens".to_string(), required.into());
+    }
+    (Cow::Owned(outbound), MappedEffort::AsWritten)
 }
 
 /// Whether the request turned reasoning off outright.
