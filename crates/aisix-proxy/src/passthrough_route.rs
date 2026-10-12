@@ -1316,17 +1316,11 @@ fn content_text(v: &serde_json::Value) -> String {
     }
 }
 
-/// The text a guardrail scans from ONE chat-envelope message: its content
-/// plus the whole serialized `tool_calls` payload, and — on the request
-/// side only — an assistant turn's replayed `reasoning_content`.
-///
-/// The tool-call half is what the typed endpoints scan (`message_scan_text`
-/// in the guardrails crate), and it is not optional: a request whose only
-/// sensitive text sits in a tool call's `arguments` would otherwise pass a
-/// deny-list that the same body sent to `/v1/chat/completions` trips.
-/// Serialising the whole payload means no function name or argument can
-/// escape inspection regardless of the provider-specific shape. The same
-/// argument carries `reasoning_content`, which relays upstream verbatim.
+/// The captured text of ONE chat-envelope message: its content plus the
+/// whole serialized `tool_calls` payload, and — when `reasoning` is set —
+/// an assistant turn's replayed `reasoning_content`. Telemetry capture
+/// only: guardrails read the source-preserving selectors below, which
+/// leave tool-call ids out.
 ///
 /// `reasoning` splits the two callers because this helper reads BOTH the
 /// request's `messages[]` and the buffered response's `choices[].message`:
@@ -8233,16 +8227,24 @@ mod tests {
                 {"type": "function_call", "id": "fc_ITEMID", "call_id": "call_RESPID",
                  "name": "lookup", "arguments": "{\"q\":\"RESPARGS\"}"},
                 {"type": "function_call_output", "id": "fco_OUTID", "call_id": "call_RESPID",
-                 "output": "RESPRESULT"}
+                 "output": "RESPRESULT"},
+                {"type": "custom_tool_call", "id": "ctc_CUSTOMID", "call_id": "call_CUSTOMCALLID",
+                 "name": "apply_patch", "input": "CUSTOMINPUT"}
             ]
         })
         .to_string();
         let scanned =
             request_guardrail_text(PassthroughProtocol::OpenaiResponses, responses.as_bytes());
-        for id in ["ITEMID", "RESPID", "OUTID"] {
+        for id in ["ITEMID", "RESPID", "OUTID", "CUSTOMID", "CUSTOMCALLID"] {
             assert!(!scanned.contains(id), "{id} leaked into {scanned:?}");
         }
-        for text in ["lookup", "RESPARGS", "RESPRESULT"] {
+        for text in [
+            "lookup",
+            "RESPARGS",
+            "RESPRESULT",
+            "apply_patch",
+            "CUSTOMINPUT",
+        ] {
             assert!(scanned.contains(text), "{text} missing from {scanned:?}");
         }
     }
