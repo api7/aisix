@@ -432,8 +432,9 @@ struct Cell {
     terminal_upstream: Option<Duration>,
     /// See [`note_semantic_decision`].
     semantic: Option<aisix_obs::SemanticAccessLog>,
-    /// See [`note_terminal_error`]: `(error_class, error_message)`.
-    terminal_error: Option<(String, String)>,
+    /// See [`note_terminal_error`]: `(status, error_class, error_message)`
+    /// of the terminal event, `None` when it named no failure.
+    terminal_error: Option<(u16, String, String)>,
     /// The `upstream` end-to-end observation has been recorded.
     e2e_upstream_recorded: bool,
 }
@@ -447,8 +448,8 @@ impl Cell {
     /// the terminal event, so the event is known by then even where the
     /// line was built first.
     fn name_failure(&self, record: &mut aisix_obs::AccessLogRecord) {
-        if let Some((class, message)) = &self.terminal_error {
-            record.fill_error_if_absent(class, message);
+        if let Some((status, class, message)) = &self.terminal_error {
+            record.fill_error_if_absent(*status, class, message);
         }
     }
 
@@ -1230,13 +1231,10 @@ pub(crate) fn note_e2e_downstream(
 /// Note the failure the request's terminal usage event names, so the
 /// access-log line carries it too ([`Cell::name_failure`]). Called from the
 /// emission chokepoint, so every family records it the same way.
-pub(crate) fn note_terminal_error(error_class: &str, error_message: &str) {
-    if error_class.is_empty() {
-        return;
-    }
-    let _ = CURRENT.try_with(|a| {
-        a.lock().terminal_error = Some((error_class.to_string(), error_message.to_string()));
-    });
+pub(crate) fn note_terminal_error(status: u16, error_class: &str, error_message: &str) {
+    let failure = (!error_class.is_empty())
+        .then(|| (status, error_class.to_string(), error_message.to_string()));
+    let _ = CURRENT.try_with(|a| a.lock().terminal_error = failure);
 }
 
 /// Note the upstream duration of the attempt behind the request's terminal

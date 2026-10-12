@@ -37,7 +37,7 @@ const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 
 /** One field of an access-log line, as the text formatter writes it. */
 function field(line: string, name: string): string | undefined {
-  const m = new RegExp(`\\b${name}=("(?:[^"\\\\]|\\\\.)*"|\\S+)`).exec(line);
+  const m = new RegExp(`(?:^|\\s)${name}=("(?:[^"\\\\]|\\\\.)*"|\\S+)`).exec(line);
   if (!m) return undefined;
   return m[1].startsWith('"') ? (JSON.parse(m[1]) as string) : m[1];
 }
