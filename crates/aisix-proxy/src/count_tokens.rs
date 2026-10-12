@@ -763,6 +763,10 @@ async fn count_tokens_to_target(
         if let Some(m) = body.get_mut("model") {
             *m = Value::String(upstream_model.clone());
         }
+        // A Gemini thought signature riding in a tool id is for Gemini only.
+        if let Some(messages) = body.get_mut("messages") {
+            aisix_gateway::tool_calls::strip_thought_signatures_in_body(messages);
+        }
 
         // Apply the PK's `request.*` override block to the outbound body,
         // identically to the /v1/messages passthrough — count_tokens shares

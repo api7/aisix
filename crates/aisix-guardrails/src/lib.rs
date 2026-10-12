@@ -172,7 +172,7 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
     }
     if let Some(tool_calls) = m.extra.get("tool_calls") {
         if !tool_calls.is_null() {
-            parts.push(tool_calls.to_string());
+            parts.push(aisix_gateway::tool_calls::tool_calls_scan_text(tool_calls));
         }
     }
     if let Some(reasoning) = m.extra.get("reasoning_content").and_then(|v| v.as_str()) {

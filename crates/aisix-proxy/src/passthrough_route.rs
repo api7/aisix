@@ -1327,6 +1327,8 @@ fn content_text(v: &serde_json::Value) -> String {
 /// Serialising the whole payload means no function name or argument can
 /// escape inspection regardless of the provider-specific shape. The same
 /// argument carries `reasoning_content`, which relays upstream verbatim.
+/// Unlike the typed endpoints it keeps a Gemini thought signature in a
+/// tool id: a passthrough route forwards the id upstream verbatim.
 ///
 /// `reasoning` splits the two callers because this helper reads BOTH the
 /// request's `messages[]` and the buffered response's `choices[].message`:

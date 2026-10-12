@@ -708,6 +708,9 @@ impl Bridge for BedrockBridge {
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
+        // Converse has no slot for the legacy fields and would drop them.
+        aisix_gateway::tool_calls::reject_legacy_function_calling(&req)?;
+        let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
         let publisher = BedrockPublisher::from_model_id(upstream_id).ok_or_else(|| {
@@ -756,6 +759,9 @@ impl Bridge for BedrockBridge {
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
+        // Converse has no slot for the legacy fields and would drop them.
+        aisix_gateway::tool_calls::reject_legacy_function_calling(&req)?;
+        let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
         let publisher = BedrockPublisher::from_model_id(upstream_id).ok_or_else(|| {
