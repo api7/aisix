@@ -406,6 +406,12 @@ describe("reasoning effort → Claude families without effort support: thinking 
     expect(capped.thinking).toEqual({ type: "enabled", budget_tokens: 2999 });
     expect(capped.max_tokens).toBe(3000);
 
+    // Anthropic requires max_tokens; a body without one gets the room the
+    // budget needs, as on the chat bridge.
+    const bare = await anthropicUpstreamBody("/v1/messages", { model: "mapped-sonnet-45" });
+    expect(bare.thinking).toEqual({ type: "enabled", budget_tokens: 4096 });
+    expect(bare.max_tokens).toBe(4096 + 4096);
+
     const tiny = await anthropicUpstreamBody("/v1/messages", {
       model: "mapped-sonnet-45",
       max_tokens: 1024,

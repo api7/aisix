@@ -68,7 +68,9 @@ pub(crate) fn chat_request<'a>(request: &'a ChatFormat, model: &Model) -> Cow<'a
 /// a removal.
 ///
 /// `output_config.effort` is the only effort this mapping reads or
-/// rewrites. A `thinking` block is not an effort setting here — clients
+/// rewrites; a target that receives the Anthropic body itself goes
+/// through [`anthropic_native_request`], which writes a thinking budget
+/// instead on the Claude families that reject the effort. A `thinking` block is not an effort setting here — clients
 /// send one on every request and state an effort only when their user
 /// picked one — so a request carrying `thinking` and no
 /// `output_config.effort` sets no effort and takes the `""` entry.
@@ -108,10 +110,10 @@ pub(crate) fn anthropic_request<'a>(
 /// Sonnet 4.5 and earlier — see
 /// [`aisix_provider_anthropic::wire::rejects_effort_parameter`]), an
 /// effort this mapping would inject into a request that set none becomes
-/// the same thinking budget the chat bridge sends there instead. A
-/// `thinking` block the caller sent wins and the request goes upstream
-/// as written. An effort the caller set natively, every other model, and
-/// a tier with no budget take [`anthropic_request`] unchanged.
+/// the same thinking budget the chat bridge sends there instead, or is
+/// dropped when no budget fits. A `thinking` block the caller sent wins
+/// and the request goes upstream as written. An effort the caller set
+/// natively and every other model take [`anthropic_request`] unchanged.
 ///
 /// `sends_max_tokens` is false for the token-counting route, whose body
 /// carries no `max_tokens`; elsewhere a request without one gets the
@@ -142,13 +144,10 @@ pub(crate) fn anthropic_native_request<'a>(
         .get("max_tokens")
         .and_then(Value::as_u64)
         .map(|m| u32::try_from(m).unwrap_or(u32::MAX));
-    if max_tokens.is_some_and(|m| m <= 1024) {
-        // Too small for Anthropic's minimum budget: no thinking, and no
-        // effort either, which this family would reject.
-        return (Cow::Borrowed(body), MappedEffort::AsWritten);
-    }
+    // An unrecognised tier has no budget, and this family rejects the
+    // effort, so nothing is sent — as on the chat bridge.
     let Some(budget) = thinking_budget_for(mapped, max_tokens) else {
-        return anthropic_request(body, model);
+        return (Cow::Borrowed(body), MappedEffort::AsWritten);
     };
     let mut outbound = body.clone();
     let root = outbound

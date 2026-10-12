@@ -747,7 +747,8 @@ async fn count_tokens_to_target(
             aisix_provider_anthropic::strip_billing_header_attribution(body)
         };
         // This route dispatches only to Anthropic-protocol upstreams, which
-        // read `output_config.effort` themselves, so the mapping outcome the
+        // read the mapped effort (or, on a family that rejects it, the
+        // thinking budget) themselves, so the mapping outcome the
         // cross-provider bridge needs has no consumer here.
         let (mapped, _) =
             crate::effort_mapping::anthropic_native_request(body.as_ref(), model, false);
