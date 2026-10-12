@@ -2600,8 +2600,8 @@ fn append_chat_request_message_strings(
     Some(())
 }
 
-/// Every string of a replayed `tool_calls` carrier except each call's `id`:
-/// a tool-call id is an opaque handle, never scan text.
+/// Every string of a replayed `tool_calls` carrier except each call's id
+/// keys: a tool-call id is an opaque handle, never scan text.
 fn append_chat_request_tool_call_strings(
     out: &mut String,
     tool_calls: &RawJson<'_>,
@@ -2619,7 +2619,11 @@ fn append_chat_request_tool_call_strings(
     };
     for call in calls {
         let text = if raw_is_object(&call) {
-            decoded_json_string_values_except_root_keys(call.get().as_bytes(), &["id"], scan_error)?
+            decoded_json_string_values_except_root_keys(
+                call.get().as_bytes(),
+                &aisix_gateway::tool_calls::TOOL_CALL_ID_KEYS,
+                scan_error,
+            )?
         } else {
             decoded_json_string_values_including_empty(call.get().as_bytes(), scan_error)?
         };
@@ -2682,17 +2686,25 @@ fn append_responses_item_strings(
         "arguments",
         "input",
     ];
-    // Tool-call ids are opaque handles, never scan text: `call_id` on every
-    // tool call and tool result, and the item `id` of a `*_call` /
-    // `*_call_output` item.
-    let is_tool_call_item = raw_top_level_unique_type(item_body)
-        .ok()
-        .flatten()
-        .is_some_and(|kind| kind.ends_with("_call") || kind.ends_with("_call_output"));
+    // Opaque handles and ciphertext are never scan text, matching the typed
+    // `/v1/responses` scan: `call_id` / `approval_request_id` on every item,
+    // the `id` of a tool call, tool result, item reference, MCP approval
+    // request or reasoning item, and a reasoning item's `encrypted_content`.
+    let kind = raw_top_level_unique_type(item_body).ok().flatten();
+    let kind = kind.as_deref().unwrap_or_default();
     let mut excluded = text_keys.to_vec();
-    excluded.push("call_id");
-    if is_tool_call_item {
+    excluded.extend(["call_id", "approval_request_id"]);
+    if kind.ends_with("_call")
+        || kind.ends_with("_call_output")
+        || matches!(
+            kind,
+            "item_reference" | "mcp_approval_request" | "reasoning"
+        )
+    {
         excluded.push("id");
+    }
+    if kind == "reasoning" {
+        excluded.push("encrypted_content");
     }
     append_scan_text(
         out,
@@ -8206,7 +8218,7 @@ mod tests {
         let chat = serde_json::json!({
             "messages": [
                 {"role": "assistant", "content": null, "tool_calls": [{
-                    "id": "call_CHATID__thought__SIG", "type": "function",
+                    "id": "call_CHATID__thought__SIG", "call_id": "call_CHATID", "type": "function",
                     "function": {"name": "lookup", "arguments": "{\"q\":\"CHATARGS\"}"}
                 }]},
                 {"role": "tool", "tool_call_id": "call_CHATID__thought__SIG", "content": "CHATRESULT"}
@@ -8229,13 +8241,30 @@ mod tests {
                 {"type": "function_call_output", "id": "fco_OUTID", "call_id": "call_RESPID",
                  "output": "RESPRESULT"},
                 {"type": "custom_tool_call", "id": "ctc_CUSTOMID", "call_id": "call_CUSTOMCALLID",
-                 "name": "apply_patch", "input": "CUSTOMINPUT"}
+                 "name": "apply_patch", "input": "CUSTOMINPUT"},
+                {"type": "item_reference", "id": "fc_REFID"},
+                {"type": "mcp_approval_request", "id": "mcpr_APPROVALID", "server_label": "srv",
+                 "name": "mcp_tool", "arguments": "{}"},
+                {"type": "mcp_approval_response", "approval_request_id": "mcpr_APPROVALID",
+                 "approve": true, "reason": "APPROVEREASON"},
+                {"type": "reasoning", "id": "rs_REASONID", "encrypted_content": "CIPHERTEXT",
+                 "summary": [{"type": "summary_text", "text": "REASONSUMMARY"}]}
             ]
         })
         .to_string();
         let scanned =
             request_guardrail_text(PassthroughProtocol::OpenaiResponses, responses.as_bytes());
-        for id in ["ITEMID", "RESPID", "OUTID", "CUSTOMID", "CUSTOMCALLID"] {
+        for id in [
+            "ITEMID",
+            "RESPID",
+            "OUTID",
+            "CUSTOMID",
+            "CUSTOMCALLID",
+            "REFID",
+            "APPROVALID",
+            "REASONID",
+            "CIPHERTEXT",
+        ] {
             assert!(!scanned.contains(id), "{id} leaked into {scanned:?}");
         }
         for text in [

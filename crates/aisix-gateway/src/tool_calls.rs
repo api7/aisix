@@ -131,7 +131,7 @@ pub fn tool_calls_scan_text(tool_calls: &Value) -> String {
 /// The top-level keys that hold a tool-call id on any wire this gateway
 /// speaks: a chat call's and an Anthropic block's `id`, a Responses
 /// `call_id`, and the result-side back-references.
-const TOOL_CALL_ID_KEYS: [&str; 4] = ["id", "call_id", "tool_use_id", "tool_call_id"];
+pub const TOOL_CALL_ID_KEYS: [&str; 4] = ["id", "call_id", "tool_use_id", "tool_call_id"];
 
 /// [`tool_calls_scan_text`] over any list of tool-call-bearing objects
 /// (an Anthropic `content` array included): each one serialized without its

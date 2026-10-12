@@ -359,6 +359,33 @@ describe("guardrails never scan a tool-call id", () => {
     }
   }
 
+  // The Responses input carries other opaque handles beside call ids: an item
+  // reference, MCP approval ids, and a replayed reasoning item's id and
+  // ciphertext. Neither the typed route nor a passthrough route scans them.
+  const handleHistory = [
+    ...responsesHistory,
+    { type: "item_reference", id: "fc_OUTIDREF" },
+    { type: "mcp_approval_request", id: "mcpr_OUTIDAPPROVAL", server_label: "srv", name: "mcp_lookup", arguments: "{}" },
+    { type: "mcp_approval_response", approval_request_id: "mcpr_OUTIDAPPROVAL", approve: true, reason: "APPROVEREASON" },
+    {
+      type: "reasoning",
+      id: "rs_OUTIDREASONING",
+      encrypted_content: "OUTIDCIPHERTEXT",
+      summary: [{ type: "summary_text", text: "REASONSUMMARY" }],
+    },
+  ];
+  for (const path of ["/v1/responses", "/ids-pt/v1/responses"]) {
+    test(`${path} input leaves out item references, approval ids and reasoning ciphertext`, async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const model = path.startsWith("/ids-pt") ? "gpt-4o" : "ids-gpt";
+      const texts = await scanned(path, { model, input: handleHistory, tools: [RESPONSES_TOOL] });
+      expectNoIds(texts);
+      for (const text of ["INARGMARK", "APPROVEREASON", "REASONSUMMARY"]) {
+        expect(texts.some((t) => t.includes(text)), `${text} scanned`).toBe(true);
+      }
+    });
+  }
+
   test("/v1/messages/count_tokens", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const texts = await scanned("/v1/messages/count_tokens", { model: "ids-claude", messages: messagesHistory, tools: [ANTHROPIC_TOOL] });
