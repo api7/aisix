@@ -429,6 +429,23 @@ pub struct AccessLogRecord {
 }
 
 impl AccessLogRecord {
+    /// Name the failure on a line whose writer had no typed error in hand,
+    /// from the request's terminal usage event with status `status`. A line
+    /// that already names an error keeps it, and a line reporting a
+    /// different status than the event describes another outcome — a
+    /// caller that left after the line was written — so it is left alone.
+    pub fn fill_error_if_absent(&mut self, status: u16, error_kind: &str, error: &str) {
+        if self.error_kind.is_some()
+            || self.error.is_some()
+            || error_kind.is_empty()
+            || self.status != status
+        {
+            return;
+        }
+        self.error_kind = Some(error_kind.to_string());
+        self.error = (!error.is_empty()).then(|| error.to_string());
+    }
+
     pub fn emit(&self) {
         fn borrowed(v: &Option<String>) -> Option<&str> {
             v.as_deref()
