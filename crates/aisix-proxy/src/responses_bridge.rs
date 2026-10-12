@@ -30,6 +30,8 @@ use aisix_gateway::{
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
+use crate::attempt::RecordsStreamRefusal;
+
 /// Translate a `/v1/responses` request body into the gateway's canonical
 /// [`ChatFormat`]. Unlike `responses::responses_input_to_chat` (which is a
 /// lossy, text-only projection used solely for input-guardrail scanning),
@@ -2283,6 +2285,9 @@ pub struct ResponsesStreamCompletion {
     /// the non-streaming path so the dashboard's Blocked tab + budget ledger
     /// see it.
     pub guardrail_blocked: bool,
+    /// The refusal that `guardrail_blocked` records; see
+    /// [`crate::attempt::RecordsStreamRefusal`].
+    pub(crate) refusal: Option<crate::attempt::StreamRefusal>,
     /// The upstream failure that ended the stream — a mid-stream error, or
     /// a stream that carried no response. The usage event reports it
     /// instead of a `200`.
@@ -2307,6 +2312,12 @@ pub struct ResponsesStreamCompletion {
     /// bounded to `token_estimate::OUTPUT_ACCUMULATION_CAP`; never leaves
     /// the process.
     est_output_text: String,
+}
+
+impl crate::attempt::RecordsStreamRefusal for ResponsesStreamCompletion {
+    fn refusal_slots(&mut self) -> (&mut bool, &mut Option<crate::attempt::StreamRefusal>) {
+        (&mut self.guardrail_blocked, &mut self.refusal)
+    }
 }
 
 struct CompleteOnDrop<F: FnOnce(ResponsesStreamCompletion)> {
@@ -2680,7 +2691,7 @@ pub fn build_responses_bridge_stream(
                 max_buffer_bytes,
                 "streaming /v1/responses (cross-provider) output exceeded buffer cap; failing closed",
             );
-            guard.comp().guardrail_blocked = true;
+            guard.comp().record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
             aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
             yield Ok(guardrail_failure_frames(
                 &mut encoder,
@@ -2803,7 +2814,7 @@ pub fn build_responses_bridge_stream(
                     reason = %reason,
                     "guardrail blocked streaming /v1/responses (cross-provider) response",
                 );
-                guard.comp().guardrail_blocked = true;
+                guard.comp().record_refusal(guardrail_name.as_deref(), unavailable.as_deref());
                 // On the live-forward path the terminal event is already on
                 // the wire; the error frame is all that can follow it.
                 let terminal_sent = !buffering && encoder.is_finished();

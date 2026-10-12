@@ -382,7 +382,6 @@ async fn dispatch(
     let reservation = match crate::quota::enforce(state, &snapshot, &auth, None).await {
         Ok(reservation) => reservation,
         Err(err) => {
-            let response = err.into_response();
             emit_a2a_usage(
                 state,
                 &snapshot,
@@ -390,14 +389,13 @@ async fn dispatch(
                 request_id,
                 agent,
                 &call,
-                response.status().as_u16(),
+                err.status().as_u16(),
                 Duration::ZERO,
                 trace.as_ref(),
                 /* dispatched */ false,
-                // A quota refusal is not a guardrail decision.
-                /* guardrail_blocked */
-                false,
+                Some(&err),
             );
+            let response = err.into_response();
             return response;
         }
     };
@@ -445,7 +443,7 @@ async fn dispatch(
                 latency,
                 trace.as_ref(),
                 /* dispatched */ true,
-                /* guardrail_blocked */ false,
+                /* refusal */ None,
             );
             axum::Json(response_value).into_response()
         }
@@ -463,7 +461,7 @@ async fn dispatch(
                 latency,
                 trace.as_ref(),
                 /* dispatched */ true,
-                /* guardrail_blocked */ false,
+                /* refusal */ None,
             );
             a2a_error_response(rpc_id, status, &err.to_string())
         }
@@ -534,7 +532,7 @@ impl Drop for StreamUsageOnDrop {
             self.started.elapsed(),
             self.trace.as_ref(),
             /* dispatched */ true,
-            /* guardrail_blocked */ false,
+            /* refusal */ None,
         );
     }
 }
@@ -580,7 +578,7 @@ async fn dispatch_stream(
                 started.elapsed(),
                 trace.as_ref(),
                 /* dispatched */ true,
-                /* guardrail_blocked */ false,
+                /* refusal */ None,
             );
             return a2a_error_response(rpc_id, status, &err.to_string());
         }
@@ -876,12 +874,16 @@ async fn guardrail_block_response(
         reason = %reason,
         "guardrail blocked A2A request",
     );
-    let message = crate::error::guardrail_block_message(
+    let refusal = crate::error::guardrail_block_error(
         "request",
         guardrail_name.as_deref(),
         unavailable.as_deref(),
     );
-    let response = a2a_error_response(rpc_id, StatusCode::UNPROCESSABLE_ENTITY, &message);
+    let response = a2a_error_response(
+        rpc_id,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        &refusal.to_string(),
+    );
     emit_a2a_usage(
         state,
         snapshot,
@@ -894,7 +896,7 @@ async fn guardrail_block_response(
         trace,
         /* dispatched */ false,
         // This IS the guardrail refusal.
-        /* guardrail_blocked */ true,
+        Some(&refusal),
     );
     Some(response)
 }
@@ -947,11 +949,14 @@ fn emit_a2a_usage(
     // Whether the call reached the upstream agent — false for a quota
     // rejection, which refuses before any upstream contact.
     dispatched: bool,
-    // Whether a guardrail refused the call. `/a2a` emits exactly one event
-    // per call, so this row is the only place a refusal can appear to the
-    // dashboard's "Guardrail blocks" view (AISIX-Cloud#1428).
-    guardrail_blocked: bool,
+    // The gateway's own refusal of the call — a guardrail block or a quota
+    // rejection — named on the event like every other surface names it.
+    // `/a2a` emits exactly one event per call, so this row is the only
+    // place a refusal can appear to the dashboard's "Guardrail blocks"
+    // view (AISIX-Cloud#1428).
+    refusal: Option<&crate::error::ProxyError>,
 ) {
+    let guardrail_blocked = refusal.is_some_and(crate::error::ProxyError::is_guardrail_block);
     // No model resolves on this endpoint, so the estimator falls back to its
     // default encoding — the same thing it does for any non-OpenAI model.
     let response_text = call.text.response.joined();
@@ -993,6 +998,12 @@ fn emit_a2a_usage(
             .map(|d| d.as_millis().min(u32::MAX as u128) as u32)
             .unwrap_or_default(),
         guardrail_blocked,
+        error_class: refusal
+            .map(|e| crate::attempt::error_class(e).to_string())
+            .unwrap_or_default(),
+        error_message: refusal
+            .map(crate::attempt::gateway_error_message)
+            .unwrap_or_default(),
         applied_guardrails: call.applied_guardrails.clone(),
         guardrail_monitor_hits: call.guardrail_monitor_hits.clone(),
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(&call.guardrail_audit),

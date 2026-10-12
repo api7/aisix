@@ -390,6 +390,56 @@ impl StreamFailure {
     }
 }
 
+/// A guardrail refusal that ended a stream after its `200` head. The
+/// stream keeps that status; its terminal usage event names the refusal
+/// with the class and text a buffered refusal carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamRefusal {
+    pub error_message: String,
+}
+
+impl StreamRefusal {
+    /// The refusal whose error frame carries `guardrail_name` / `unavailable`.
+    pub fn new(guardrail_name: Option<&str>, unavailable: Option<&str>) -> Self {
+        let err = crate::error::guardrail_block_error("response", guardrail_name, unavailable);
+        Self {
+            error_message: gateway_error_message(&err),
+        }
+    }
+
+    /// Stamp this refusal onto an attempt record bound for a usage event.
+    pub fn apply_to(&self, attempt: &mut AttemptInfo) {
+        attempt.error_class = GUARDRAIL_BLOCK_CLASS.to_string();
+        attempt.error_message = self.error_message.clone();
+    }
+}
+
+/// A stream's completion record, which a guardrail refusal can end.
+pub(crate) trait RecordsStreamRefusal {
+    fn refusal_slots(&mut self) -> (&mut bool, &mut Option<StreamRefusal>);
+
+    /// Mark the stream refused, with the text of the error frame it ends
+    /// on. The first refusal is the one recorded.
+    fn record_refusal(&mut self, guardrail_name: Option<&str>, unavailable: Option<&str>) {
+        let (blocked, refusal) = self.refusal_slots();
+        *blocked = true;
+        refusal.get_or_insert_with(|| StreamRefusal::new(guardrail_name, unavailable));
+    }
+}
+
+/// The class and message a stream's terminal event carries: its refusal's
+/// if a guardrail ended it, otherwise its upstream failure's.
+pub(crate) fn stream_error_fields(
+    refusal: Option<&StreamRefusal>,
+    failure: Option<&StreamFailure>,
+) -> (String, String) {
+    match (refusal, failure) {
+        (Some(r), _) => (GUARDRAIL_BLOCK_CLASS.to_string(), r.error_message.clone()),
+        (None, Some(f)) => (f.error_class.to_string(), f.error_message.clone()),
+        (None, None) => (String::new(), String::new()),
+    }
+}
+
 /// The usage-event status of a stream no guardrail refused: its upstream
 /// failure's status if it had one, `499` if the caller went away first,
 /// otherwise `200`. A failure outranks the disconnect: a relay that passes

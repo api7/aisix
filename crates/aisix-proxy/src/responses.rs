@@ -2605,7 +2605,9 @@ async fn responses_cross_provider_to_target(
                     crate::attempt::stream_status(comp.reached_end, comp.failure.as_ref())
                 };
                 let mut attempt_c = attempt_c;
-                if let Some(f) = comp.failure.as_ref().filter(|_| !comp.guardrail_blocked) {
+                if let Some(r) = comp.refusal.as_ref() {
+                    r.apply_to(&mut attempt_c);
+                } else if let Some(f) = comp.failure.as_ref().filter(|_| !comp.guardrail_blocked) {
                     f.apply_to(&mut attempt_c);
                 }
                 // Content capture (AISIX-Cloud#947): prompt captured up front,
