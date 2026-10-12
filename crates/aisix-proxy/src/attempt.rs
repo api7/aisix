@@ -283,7 +283,8 @@ impl AttemptInfo {
 /// non-streamed, streamed, per attempt, and terminal.
 ///
 /// Both read it from here so the two cannot drift into two vocabularies
-/// again. An upstream failure reports its [`routing_error_class`]; every
+/// again. An upstream failure reports its [`routing_error_class`], a
+/// semantic router's failed decision `semantic_decision_failed`, and every
 /// other failure its [`ProxyError::kind`].
 ///
 /// NOT the client-facing envelope's `error.type`, which stays
