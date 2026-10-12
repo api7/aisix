@@ -497,28 +497,25 @@ impl ToolCallIndexer {
             let id = call
                 .get("id")
                 .and_then(serde_json::Value::as_str)
-                .filter(|id| !id.is_empty())
-                .map(str::to_owned);
-            let index = match call.get("index").and_then(serde_json::Value::as_u64) {
-                Some(index) => index,
-                None => {
-                    let index = match (&self.current, &id) {
-                        (Some((current, _)), None) => *current,
-                        (Some((current, Some(current_id))), Some(id)) if current_id == id => {
-                            *current
-                        }
-                        _ => self.next,
-                    };
-                    call.insert("index".into(), index.into());
-                    index
-                }
-            };
-            self.next = self.next.max(index + 1);
-            let id = id.or_else(|| match &self.current {
-                Some((current, current_id)) if *current == index => current_id.clone(),
-                _ => None,
+                .filter(|id| !id.is_empty());
+            let explicit = call.get("index").and_then(serde_json::Value::as_u64);
+            let index = explicit.unwrap_or(match (&self.current, id) {
+                (Some((current, _)), None) => *current,
+                (Some((current, Some(current_id))), Some(id)) if current_id == id => *current,
+                _ => self.next,
             });
-            self.current = Some((index, id));
+            match &mut self.current {
+                Some((current, current_id)) if *current == index => {
+                    if let Some(id) = id.filter(|id| current_id.as_deref() != Some(*id)) {
+                        *current_id = Some(id.to_owned());
+                    }
+                }
+                _ => self.current = Some((index, id.map(str::to_owned))),
+            }
+            self.next = self.next.max(index + 1);
+            if explicit.is_none() {
+                call.insert("index".into(), index.into());
+            }
         }
     }
 }
@@ -1618,6 +1615,49 @@ mod tests {
     /// request set `encoding_format: "base64"`, which is the OpenAI
     /// SDK default). Pre-fix the deserializer rejected the string
     /// shape with `error decoding response body` → 502.
+    #[test]
+    fn tool_call_indexer_separates_calls_by_id_and_keeps_fragments_together() {
+        let mut indexer = ToolCallIndexer::default();
+        let mut indices = |calls: serde_json::Value| {
+            let mut calls = calls.as_array().unwrap().clone();
+            indexer.fill(&mut calls);
+            calls
+                .iter()
+                .map(|c| c["index"].as_u64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        // Gemini: each call whole, its own id, no index.
+        assert_eq!(
+            indices(serde_json::json!([{"id": "a", "function": {"arguments": "{}"}}])),
+            [0]
+        );
+        assert_eq!(
+            indices(serde_json::json!([{"id": "b", "function": {"arguments": "{}"}}])),
+            [1]
+        );
+        // A fragment without an id, or repeating the current id, continues the call.
+        assert_eq!(
+            indices(serde_json::json!([{"function": {"arguments": "x"}}])),
+            [1]
+        );
+        assert_eq!(
+            indices(serde_json::json!([{"id": "b", "function": {"arguments": "y"}}])),
+            [1]
+        );
+        // Two new calls in one chunk.
+        assert_eq!(
+            indices(serde_json::json!([{"id": "c"}, {"id": "d"}])),
+            [2, 3]
+        );
+        // An explicit index is kept and moves the next free slot past it.
+        assert_eq!(indices(serde_json::json!([{"index": 7, "id": "e"}])), [7]);
+        assert_eq!(
+            indices(serde_json::json!([{"function": {"arguments": "z"}}])),
+            [7]
+        );
+        assert_eq!(indices(serde_json::json!([{"id": "f"}])), [8]);
+    }
+
     #[test]
     fn embeddings_response_accepts_float_array() {
         let body = r#"{
