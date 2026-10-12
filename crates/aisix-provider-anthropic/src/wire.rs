@@ -1558,6 +1558,22 @@ pub enum AnthropicStreamEvent {
     MessageStart {
         message: AnthropicStreamStartMessage,
     },
+    /// Opens a content block. Read for `tool_use` blocks, the only frame
+    /// that carries a tool call's `id` and `name`.
+    #[serde(rename = "content_block_start")]
+    ContentBlockStart {
+        #[serde(default)]
+        index: Option<u64>,
+        #[serde(default)]
+        content_block: AnthropicStreamContentBlock,
+    },
+    /// Closes a content block. Read to give an argument-less tool call
+    /// the `"{}"` arguments the non-streaming path reports for it.
+    #[serde(rename = "content_block_stop")]
+    ContentBlockStop {
+        #[serde(default)]
+        index: Option<u64>,
+    },
     #[serde(rename = "content_block_delta")]
     ContentBlockDelta {
         /// The content block the delta belongs to. Read only to tell one
@@ -1582,8 +1598,20 @@ pub enum AnthropicStreamEvent {
     /// stream looked like a clean completion (AISIX-Cloud#1222).
     #[serde(rename = "error")]
     Error { error: AnthropicStreamErrorBody },
-    /// Catch-all for content_block_start / content_block_stop / ping /
-    /// unknown event types — we don't need their state for chunk emission.
+    /// Catch-all for ping / unknown event types.
+    #[serde(other)]
+    Other,
+}
+
+/// The `content_block` of a `content_block_start` frame.
+#[derive(Debug, Default, Deserialize)]
+#[serde(tag = "type")]
+pub enum AnthropicStreamContentBlock {
+    #[serde(rename = "tool_use")]
+    ToolUse { id: String, name: String },
+    /// Text, thinking and every other block type: their content arrives
+    /// in the deltas that follow.
+    #[default]
     #[serde(other)]
     Other,
 }
@@ -1684,6 +1712,12 @@ pub enum AnthropicStreamDelta {
     /// slot for it.
     #[serde(rename = "thinking_delta")]
     ThinkingDelta { thinking: String },
+    /// A fragment of a `tool_use` block's JSON input.
+    #[serde(rename = "input_json_delta")]
+    InputJsonDelta {
+        #[serde(default)]
+        partial_json: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -1731,6 +1765,11 @@ pub struct StreamState {
     /// line, as the non-streaming path joins blocks with `"\n"`.
     last_thinking_block: Option<u64>,
     thinking_block_changed: bool,
+    /// One entry per `tool_use` block in arrival order: its content-block
+    /// index and whether any argument text arrived for it. A block's
+    /// position here is its OpenAI `tool_calls[].index`, so text or
+    /// thinking blocks ahead of it don't shift the numbering.
+    tool_blocks: Vec<(Option<u64>, bool)>,
 }
 
 impl StreamState {
@@ -1765,6 +1804,18 @@ impl StreamState {
                     self.last_thinking_block.is_some() && self.last_thinking_block != *index;
                 self.last_thinking_block = *index;
             }
+            AnthropicStreamEvent::ContentBlockStart {
+                index,
+                content_block: AnthropicStreamContentBlock::ToolUse { .. },
+            } => self.tool_blocks.push((*index, false)),
+            AnthropicStreamEvent::ContentBlockDelta {
+                index,
+                delta: AnthropicStreamDelta::InputJsonDelta { partial_json },
+            } if !partial_json.is_empty() => {
+                if let Some(pos) = self.tool_position(*index) {
+                    self.tool_blocks[pos].1 = true;
+                }
+            }
             // AISIX-Cloud#952: harvest cumulative input/cache counts from
             // the terminal message_delta too (max-wins) — some backends
             // report them only there. Runs before to_chunk() for the same
@@ -1786,9 +1837,52 @@ impl StreamState {
         }
     }
 
+    fn tool_position(&self, index: Option<u64>) -> Option<usize> {
+        self.tool_blocks.iter().rposition(|(i, _)| *i == index)
+    }
+
+    fn tool_call_chunk(&self, call: serde_json::Value) -> ChatChunk {
+        ChatChunk {
+            id: self.id.clone(),
+            model: self.model.clone(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![call]),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        }
+    }
+
     /// Translate one event into an optional chunk to yield upstream.
+    /// [`Self::update`] must have seen the event first.
     pub fn to_chunk(&self, event: &AnthropicStreamEvent) -> Option<ChatChunk> {
         match event {
+            AnthropicStreamEvent::ContentBlockStart {
+                index,
+                content_block: AnthropicStreamContentBlock::ToolUse { id, name },
+            } => Some(self.tool_call_chunk(serde_json::json!({
+                "index": self.tool_position(*index)?,
+                "id": id,
+                "type": "function",
+                "function": {"name": name, "arguments": ""},
+            }))),
+            AnthropicStreamEvent::ContentBlockDelta {
+                index,
+                delta: AnthropicStreamDelta::InputJsonDelta { partial_json },
+            } if !partial_json.is_empty() => Some(self.tool_call_chunk(serde_json::json!({
+                "index": self.tool_position(*index)?,
+                "function": {"arguments": partial_json},
+            }))),
+            AnthropicStreamEvent::ContentBlockStop { index } => {
+                let pos = self.tool_position(*index)?;
+                (!self.tool_blocks[pos].1).then(|| {
+                    self.tool_call_chunk(serde_json::json!({
+                        "index": pos,
+                        "function": {"arguments": "{}"},
+                    }))
+                })
+            }
             AnthropicStreamEvent::ContentBlockDelta {
                 delta: AnthropicStreamDelta::TextDelta { text },
                 ..
@@ -6668,6 +6762,54 @@ mod tests {
             );
         }
         assert_eq!(reasoning, "one more\ntwo");
+    }
+
+    /// Streamed `tool_use` blocks become OpenAI `tool_calls` deltas numbered
+    /// densely in arrival order, whatever content blocks precede them; a
+    /// call whose input never streamed gets `"{}"` arguments.
+    #[test]
+    fn stream_tool_use_blocks_become_tool_call_deltas() {
+        let frames = serde_json::json!([
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "plan"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "ok"}},
+            {"type": "content_block_stop", "index": 1},
+            {"type": "content_block_start", "index": 2, "content_block": {"type": "tool_use", "id": "toolu_a", "name": "get_weather", "input": {}}},
+            {"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": ""}},
+            {"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "{\"city\":"}},
+            {"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "\"Paris\"}"}},
+            {"type": "content_block_stop", "index": 2},
+            {"type": "content_block_start", "index": 3, "content_block": {"type": "tool_use", "id": "toolu_b", "name": "get_time", "input": {}}},
+            {"type": "content_block_delta", "index": 3, "delta": {"type": "input_json_delta", "partial_json": ""}},
+            {"type": "content_block_stop", "index": 3},
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 9}},
+        ]);
+        let mut state = StreamState::default();
+        let mut calls = Vec::new();
+        let mut finish = None;
+        for frame in frames.as_array().unwrap() {
+            let ev: AnthropicStreamEvent = serde_json::from_value(frame.clone()).unwrap();
+            state.update(&ev);
+            if let Some(chunk) = state.to_chunk(&ev) {
+                calls.extend(chunk.delta.tool_calls.unwrap_or_default());
+                finish = finish.or(chunk.finish_reason);
+            }
+        }
+        assert_eq!(
+            calls,
+            vec![
+                serde_json::json!({"index": 0, "id": "toolu_a", "type": "function",
+                    "function": {"name": "get_weather", "arguments": ""}}),
+                serde_json::json!({"index": 0, "function": {"arguments": "{\"city\":"}}),
+                serde_json::json!({"index": 0, "function": {"arguments": "\"Paris\"}"}}),
+                serde_json::json!({"index": 1, "id": "toolu_b", "type": "function",
+                    "function": {"name": "get_time", "arguments": ""}}),
+                serde_json::json!({"index": 1, "function": {"arguments": "{}"}}),
+            ]
+        );
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
     }
 
     #[test]
