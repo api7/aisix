@@ -196,6 +196,8 @@ interface ChatResult {
   content: string | undefined;
   route: string | null;
   requestId: string;
+  /** The error envelope of a non-200 answer. */
+  error?: { message?: string; type?: string; code?: string };
 }
 
 /** The fields of one access-log line, as the text formatter writes them. */
@@ -348,13 +350,19 @@ describe("semantic classifier e2e", () => {
       },
     });
     await jevRouter("jev-fail", { on_failure: "fail" });
+    await jevRouter("jev-fail-missing-key", {
+      provider_key_id: "no-such-provider-key",
+      on_failure: "fail",
+    });
     await jevRouter("jev-target", { on_failure: { target: "safe-model" } });
     await jevRouter("jev-wrong-key", { provider_key_id: wrongProvider.id });
     await jevRouter("jev-missing-key", { provider_key_id: "no-such-provider-key" });
 
-    for (const [name, embeddingModel] of [
-      ["emb-router", "embed-mock"],
-      ["emb-broken", "embed-broken"],
+    for (const [name, embeddingModel, onFailure] of [
+      ["emb-router", "embed-mock", undefined],
+      ["emb-broken", "embed-broken", undefined],
+      ["emb-broken-fail", "embed-broken", "fail"],
+      ["emb-not-embedding-fail", "code-model", "fail"],
     ]) {
       await seed.createModel({
         display_name: name,
@@ -366,6 +374,7 @@ describe("semantic classifier e2e", () => {
           ],
           default: "default-model",
           match: { threshold: 0.5 },
+          ...(onFailure ? { on_embedding_failure: onFailure } : {}),
         },
       });
     }
@@ -418,15 +427,22 @@ describe("semantic classifier e2e", () => {
       body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }] }),
     });
     let content: string | undefined;
+    let error: ChatResult["error"];
     if (res.status === 200) {
       const json = (await res.json()) as { choices?: { message?: { content?: string } }[] };
       content = json.choices?.[0]?.message?.content;
     } else {
-      await res.text();
+      const text = await res.text();
+      try {
+        error = (JSON.parse(text) as { error?: ChatResult["error"] }).error;
+      } catch {
+        // Not an envelope; `error` stays unset.
+      }
     }
     return {
       status: res.status,
       content,
+      error,
       route: res.headers.get("x-aisix-route"),
       requestId: res.headers.get("x-aisix-request-id") ?? "",
     };
@@ -449,6 +465,20 @@ describe("semantic classifier e2e", () => {
     expect(field(line, "semantic_route"), line).toBe(want.route);
     expect(field(line, "semantic_score"), line).toBe(want.score);
     expect(field(line, "semantic_fallback"), line).toBe(want.fallback);
+  }
+
+  /**
+   * A router whose policy is `fail` names the decision failure, never a
+   * provider-bridge fault, to the caller and in the access log.
+   */
+  async function expectDecisionFailed(r: ChatResult, router: string, reason: string) {
+    const message = `semantic router '${router}' could not pick a route (${reason})`;
+    expect(r.status).toBe(503);
+    expect(r.error).toEqual({ message, type: "api_error", code: "semantic_routing_failed" });
+    const line = await accessLine(r.requestId);
+    expect(field(line, "error_kind"), line).toBe("semantic_decision_failed");
+    expect(field(line, "error"), line).toBe(message);
+    expect(field(line, "semantic_fallback"), line).toBe("decision_failed");
   }
 
   test("routes to the classifier's pick and asks the question the contract names", async (ctx) => {
@@ -529,10 +559,10 @@ describe("semantic classifier e2e", () => {
     expect(decisions.calls.length).toBe(before);
   });
 
-  for (const [what, prompt] of [
-    ["an upstream error", "boom goes the classifier"],
-    ["a timeout", "slow classifier please"],
-    ["an option it never offered", "garbage answer"],
+  for (const [what, prompt, reason] of [
+    ["an upstream error", "boom goes the classifier", "classifier_upstream"],
+    ["a timeout", "slow classifier please", "classifier_timeout"],
+    ["an option it never offered", "garbage answer", "classifier_invalid_response"],
   ]) {
     test(`on_failure applies to ${what}`, async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
@@ -543,8 +573,7 @@ describe("semantic classifier e2e", () => {
       await expectDecision(byDefault, { fallback: "decision_failed" });
 
       const failed = await chat("jev-fail", prompt);
-      expect(failed.status).toBe(503);
-      await expectDecision(failed, { fallback: "decision_failed" });
+      await expectDecisionFailed(failed, "jev-fail", reason);
 
       const toTarget = await chat("jev-target", prompt);
       expect(toTarget.status).toBe(200);
@@ -589,6 +618,18 @@ describe("semantic classifier e2e", () => {
     }
     // The wrong-provider key's credential never reached the endpoint.
     expect(decisions.calls.length).toBe(before);
+
+    const failed = await chat("jev-fail-missing-key", "fix my python script");
+    await expectDecisionFailed(failed, "jev-fail-missing-key", "classifier_unavailable");
+  });
+
+  test("an embedding router whose policy is fail names the decision failure", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const upstreamError = await chat("emb-broken-fail", "python please");
+    await expectDecisionFailed(upstreamError, "emb-broken-fail", "embedding_upstream");
+
+    const notEmbedding = await chat("emb-not-embedding-fail", "python please");
+    await expectDecisionFailed(notEmbedding, "emb-not-embedding-fail", "embedding_unavailable");
   });
 
   test("classifier rows carrying an embedding-mode field, or missing a description, are rejected", async (ctx) => {

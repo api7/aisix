@@ -1130,7 +1130,12 @@ async fn dispatch_to_target(
     } else {
         aisix_provider_anthropic::strip_billing_header_attribution(body)
     };
-    let (mapped, mapped_effort) = crate::effort_mapping::anthropic_request(body.as_ref(), model);
+    let speaks_anthropic = crate::dispatch::speaks_anthropic(snapshot, model);
+    let (mapped, mapped_effort) = if speaks_anthropic {
+        crate::effort_mapping::anthropic_native_request(body.as_ref(), model, true)
+    } else {
+        crate::effort_mapping::anthropic_request(body.as_ref(), model)
+    };
     // One owned-or-borrowed body for this target: a rewrite either step
     // made is the copy the passthrough edits in place, rather than a copy
     // of a copy held across the upstream wait.
@@ -1140,7 +1145,7 @@ async fn dispatch_to_target(
     };
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
 
-    if !crate::dispatch::speaks_anthropic(snapshot, model) {
+    if !speaks_anthropic {
         return cross_provider_dispatch(
             state,
             snapshot,

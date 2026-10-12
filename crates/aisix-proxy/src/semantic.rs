@@ -84,6 +84,72 @@ pub(crate) fn decide(
     RouteDecision { winner, scores }
 }
 
+/// Why a semantic router could not make its decision: the closed vocabulary
+/// [`ProxyError::SemanticDecisionFailed`] carries to the caller and the
+/// access log. Free text about the failure goes only to the warn line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionFailure {
+    ClassifierTimeout,
+    /// The classifier answered a non-2xx status, or the call failed in
+    /// transport.
+    ClassifierUpstream,
+    /// The classifier answered 2xx with no usable choice.
+    ClassifierInvalidResponse,
+    /// The classifier's provider key is missing or not a `typesafe` one.
+    ClassifierUnavailable,
+    EmbeddingTimeout,
+    /// The embedding upstream answered an error, or the call failed in
+    /// transport or decoding.
+    EmbeddingUpstream,
+    /// The embedding model is missing, misconfigured, or returned vectors
+    /// that do not fit it.
+    EmbeddingUnavailable,
+}
+
+impl DecisionFailure {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ClassifierTimeout => "classifier_timeout",
+            Self::ClassifierUpstream => "classifier_upstream",
+            Self::ClassifierInvalidResponse => "classifier_invalid_response",
+            Self::ClassifierUnavailable => "classifier_unavailable",
+            Self::EmbeddingTimeout => "embedding_timeout",
+            Self::EmbeddingUpstream => "embedding_upstream",
+            Self::EmbeddingUnavailable => "embedding_unavailable",
+        }
+    }
+
+    fn of_classifier_transport(err: &reqwest::Error) -> (Self, String) {
+        let failure = if err.is_timeout() {
+            Self::ClassifierTimeout
+        } else {
+            Self::ClassifierUpstream
+        };
+        (failure, aisix_gateway::transport_error_message(err))
+    }
+
+    fn of_embedding_error(err: &ProxyError) -> Self {
+        use aisix_gateway::BridgeError;
+        match err {
+            ProxyError::Bridge(BridgeError::Timeout { .. }) => Self::EmbeddingTimeout,
+            ProxyError::Bridge(
+                BridgeError::UpstreamStatus { .. }
+                | BridgeError::UpstreamInBand { .. }
+                | BridgeError::UpstreamDecode(_)
+                | BridgeError::Transport(_)
+                | BridgeError::StreamAborted,
+            ) => Self::EmbeddingUpstream,
+            _ => Self::EmbeddingUnavailable,
+        }
+    }
+}
+
+impl std::fmt::Display for DecisionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Direct-model alias to dispatch to when the router cannot decide — the
 /// embedding call failed (`on_embedding_failure`), or the classifier call
 /// did (`classifier.on_failure`). `None` means the policy is `fail` — the
@@ -208,28 +274,32 @@ pub(crate) async fn resolve(
         Some(classifier) => match classify(snapshot, &semantic.routes, classifier, prompt).await {
             Ok((picked, confidence)) => {
                 let confident = confidence >= classifier.min_confidence;
-                Some(Pick {
+                Ok(Pick {
                     winner: confident.then_some(picked),
                     score: Some(confidence),
                     miss: (!confident).then_some(SemanticFallback::LowConfidence),
                 })
             }
-            Err(error) => {
+            Err((failure, error)) => {
                 tracing::warn!(
                     router = %router.display_name,
+                    reason = %failure,
                     error = %error,
                     "semantic classifier call failed; applying classifier.on_failure",
                 );
-                None
+                Err(failure)
             }
         },
         None => {
             decide_by_embedding(state, snapshot, router_entry, semantic, prompt, request_id).await
         }
     };
-    let Some(pick) = pick else {
-        note_decision(None, None, Some(SemanticFallback::DecisionFailed));
-        return fallback(state, snapshot, router, source_ip, semantic);
+    let pick = match pick {
+        Ok(pick) => pick,
+        Err(failure) => {
+            note_decision(None, None, Some(SemanticFallback::DecisionFailed));
+            return fallback(state, snapshot, router, source_ip, semantic, failure);
+        }
     };
 
     let (attempt, route_name): (AttemptModel, Option<String>) = match pick.winner {
@@ -278,7 +348,7 @@ fn note_decision(route: Option<String>, score: Option<f64>, fallback: Option<Sem
 }
 
 /// The embedding decision: embed the prompt, score it against every
-/// route's examples. `None` when the embedding could not be computed, which
+/// route's examples. `Err` when the embedding could not be computed, which
 /// the caller answers with `on_embedding_failure`.
 async fn decide_by_embedding(
     state: &ProxyState,
@@ -287,7 +357,7 @@ async fn decide_by_embedding(
     semantic: &Semantic,
     prompt: &str,
     request_id: &str,
-) -> Option<Pick> {
+) -> Result<Pick, DecisionFailure> {
     // Resolve the embedding model + its modality metadata. A dangling or
     // wrong-kind reference is a config error; degrade via the failure
     // policy rather than 500.
@@ -302,7 +372,7 @@ async fn decide_by_embedding(
                 "semantic router references a missing or non-embedding embedding_model; \
                  applying on_embedding_failure",
             );
-            return None;
+            return Err(DecisionFailure::EmbeddingUnavailable);
         }
     };
     let dims = embed_entry
@@ -352,12 +422,14 @@ async fn decide_by_embedding(
     {
         Ok(v) => v,
         Err(e) => {
+            let failure = DecisionFailure::of_embedding_error(&e);
             tracing::warn!(
                 router = %router_entry.value.display_name,
+                reason = %failure,
                 error = %embed_failure_text(&e),
                 "semantic embedding call failed; applying on_embedding_failure",
             );
-            return None;
+            return Err(failure);
         }
     };
 
@@ -392,7 +464,7 @@ async fn decide_by_embedding(
         Some(i) => decision.scores.get(i).copied(),
         None => decision.scores.iter().copied().reduce(f32::max),
     };
-    Some(Pick {
+    Ok(Pick {
         winner: decision.winner,
         score: score.map(log_score),
         miss: decision
@@ -417,13 +489,17 @@ fn fallback(
     router: &Model,
     source_ip: &str,
     semantic: &Semantic,
+    failure: DecisionFailure,
 ) -> Result<(Vec<AttemptModel>, Option<String>), ProxyError> {
     match failure_target(snapshot, semantic) {
         Some(alias) => {
             let (attempt, _) = select_eligible(state, snapshot, router, source_ip, &alias, None)?;
             Ok((vec![attempt], None))
         }
-        None => Err(ProxyError::ProviderUnavailable),
+        None => Err(ProxyError::SemanticDecisionFailed {
+            router: router.display_name.clone(),
+            reason: failure,
+        }),
     }
 }
 
@@ -511,7 +587,7 @@ async fn classify(
     routes: &[SemanticRoute],
     classifier: &SemanticClassifier,
     prompt: &str,
-) -> Result<(usize, f64), String> {
+) -> Result<(usize, f64), (DecisionFailure, String)> {
     crate::attribution::detached(classify_inner(snapshot, routes, classifier, prompt)).await
 }
 
@@ -520,20 +596,27 @@ async fn classify_inner(
     routes: &[SemanticRoute],
     classifier: &SemanticClassifier,
     prompt: &str,
-) -> Result<(usize, f64), String> {
+) -> Result<(usize, f64), (DecisionFailure, String)> {
+    use DecisionFailure::{ClassifierInvalidResponse, ClassifierUnavailable, ClassifierUpstream};
     let pk = snapshot
         .provider_keys
         .get_by_id(&classifier.provider_key_id)
         .ok_or_else(|| {
-            format!(
-                "classifier provider_key_id {:?} matches no provider key",
-                classifier.provider_key_id
+            (
+                ClassifierUnavailable,
+                format!(
+                    "classifier provider_key_id {:?} matches no provider key",
+                    classifier.provider_key_id
+                ),
             )
         })?;
     if pk.value.provider != TYPESAFE_PROVIDER {
-        return Err(format!(
-            "classifier provider key {:?} has provider {:?}, not {TYPESAFE_PROVIDER:?}",
-            pk.value.display_name, pk.value.provider
+        return Err((
+            ClassifierUnavailable,
+            format!(
+                "classifier provider key {:?} has provider {:?}, not {TYPESAFE_PROVIDER:?}",
+                pk.value.display_name, pk.value.provider
+            ),
         ));
     }
     let base = pk
@@ -548,7 +631,12 @@ async fn classify_inner(
         model: &classifier.model,
         questions: ClassifierQuestions(routes),
     })
-    .map_err(|e| format!("encoding the classifier request: {e}"))?;
+    .map_err(|e| {
+        (
+            ClassifierUnavailable,
+            format!("encoding the classifier request: {e}"),
+        )
+    })?;
     let resp = crate::http_client::client_for(pk.value.upstream_connection().as_ref())
         .post(format!("{base}/v1/systemone"))
         .bearer_auth(&pk.value.api_key)
@@ -557,33 +645,39 @@ async fn classify_inner(
         .body(body)
         .send()
         .await
-        .map_err(|e| aisix_gateway::transport_error_message(&e))?;
+        .map_err(|e| DecisionFailure::of_classifier_transport(&e))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(format!("classifier returned HTTP {}", status.as_u16()));
+        return Err((
+            ClassifierUpstream,
+            format!("classifier returned HTTP {}", status.as_u16()),
+        ));
     }
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| aisix_gateway::transport_error_message(&e))?;
+        .map_err(|e| DecisionFailure::of_classifier_transport(&e))?;
     // Neither error below repeats what the classifier answered: its
     // response can quote the prompt it was sent (`state`), and these
     // errors end up on the router's warn line.
     let mut parsed: ClassifierResponse = serde_json::from_slice(&bytes).map_err(|e| {
-        format!(
-            "classifier response is not the expected shape (line {} column {})",
-            e.line(),
-            e.column()
+        (
+            ClassifierInvalidResponse,
+            format!(
+                "classifier response is not the expected shape (line {} column {})",
+                e.line(),
+                e.column()
+            ),
         )
     })?;
-    let answer = parsed
-        .answers
-        .remove(CLASSIFIER_QUESTION)
-        .ok_or("classifier response carries no answer to the routing question")?;
-    let picked = routes
-        .iter()
-        .position(|r| r.name == answer.choice)
-        .ok_or("classifier picked a choice that is not one of the offered routes")?;
+    let answer = parsed.answers.remove(CLASSIFIER_QUESTION).ok_or((
+        ClassifierInvalidResponse,
+        "classifier response carries no answer to the routing question".to_owned(),
+    ))?;
+    let picked = routes.iter().position(|r| r.name == answer.choice).ok_or((
+        ClassifierInvalidResponse,
+        "classifier picked a choice that is not one of the offered routes".to_owned(),
+    ))?;
     Ok((picked, answer.confidence))
 }
 
