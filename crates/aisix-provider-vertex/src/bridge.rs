@@ -44,6 +44,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aisix_gateway::tool_calls::reject_legacy_function_calling;
+
 use crate::gemini_tools::{
     function_call_parts, function_response_part, gemini_tool_config, gemini_tools,
     tool_call_from_function_call, GeminiFunctionCall,
@@ -1853,11 +1855,10 @@ fn gemini_chunk_into_chat_chunks(
     // chunk than the calls; a stream that called tools finishes as
     // `tool_calls`, like the non-stream response.
     let finish_reason = finish_reason_raw.as_deref().map(|s| {
-        let mapped = map_gemini_finish_reason(Some(s));
-        if !tool_calls.is_empty() || (state.tool_calls > 0 && mapped == FinishReason::Stop) {
-            FinishReason::ToolCalls
+        if !tool_calls.is_empty() || state.tool_calls > 0 {
+            finish_with_tool_calls(Some(s))
         } else {
-            mapped
+            map_gemini_finish_reason(Some(s))
         }
     });
 
@@ -2233,12 +2234,15 @@ fn rewrite_gemini_openapi_schema(schema: &mut serde_json::Value) {
 ///   body carries only the fields named on the struct, so an OpenAI-only
 ///   knob can never ride onto the wire and 400.
 ///
-/// Fails (400) on a history this translation cannot express: a tool
-/// result with no call to answer, or call arguments that are not JSON.
+/// Fails (400) on what this translation cannot express rather than
+/// dropping it: the legacy `functions` / `function_call` fields, a
+/// non-function tool, an unsupported `tool_choice`, a tool result with no
+/// call to answer, or call arguments that are not JSON.
 fn build_gemini_request(
     req: &ChatFormat,
     upstream_model: &str,
 ) -> Result<GeminiGenerateContentRequest, BridgeError> {
+    reject_legacy_function_calling(req)?;
     let mut system_parts: Vec<String> = Vec::new();
     let mut contents: Vec<GeminiContent> = Vec::new();
     let mut tool_responses: Vec<GeminiPart> = Vec::new();
@@ -2261,11 +2265,9 @@ fn build_gemini_request(
                 role: "user",
                 parts: vec![GeminiPart::text(m.content_str())],
             }),
-            Role::Tool => tool_responses.push(GeminiPart::Raw(function_response_part(
-                m,
-                last_tool_calls,
-                upstream_model,
-            )?)),
+            Role::Tool => {
+                tool_responses.push(GeminiPart::Raw(function_response_part(m, last_tool_calls)?))
+            }
             Role::Assistant => {
                 let tool_calls = m
                     .extra
@@ -2314,9 +2316,11 @@ fn build_gemini_request(
         Some(tools) => gemini_tools(tools)?,
         None => None,
     };
-    let tool_config = match req.extra.get("tool_choice") {
-        Some(choice) => gemini_tool_config(choice)?,
-        None => None,
+    // A calling mode with nothing to call is meaningless; the choice is
+    // dropped with the (absent) tools.
+    let tool_config = match (&tools, req.extra.get("tool_choice")) {
+        (Some(_), Some(choice)) => gemini_tool_config(choice)?,
+        _ => None,
     };
     let json_output = gemini_json_output(req, upstream_model);
     let generation_config = if req.temperature.is_some()
@@ -2524,8 +2528,6 @@ fn gemini_response_into_chat_response(
                     map_gemini_finish_reason(c.finish_reason.as_deref()),
                 )
             } else {
-                // Gemini reports `STOP` on a tool-calling turn; the
-                // OpenAI shape says why the turn ended.
                 let mut message = ChatMessage::assistant(text);
                 if message.content.as_deref() == Some("") {
                     message.content = None;
@@ -2533,7 +2535,7 @@ fn gemini_response_into_chat_response(
                 message
                     .extra
                     .insert("tool_calls".into(), serde_json::Value::Array(tool_calls));
-                (message, FinishReason::ToolCalls)
+                (message, finish_with_tool_calls(c.finish_reason.as_deref()))
             }
         }
         None => (ChatMessage::assistant(""), FinishReason::Stop),
@@ -2548,6 +2550,16 @@ fn gemini_response_into_chat_response(
         message,
         finish_reason: finish,
         usage,
+    }
+}
+
+/// The finish reason of a turn that called tools. Gemini reports `STOP`
+/// for one, which the OpenAI shape spells `tool_calls`; a turn cut short
+/// by the token limit or a block keeps saying so.
+fn finish_with_tool_calls(reason: Option<&str>) -> FinishReason {
+    match reason {
+        None | Some("STOP") => FinishReason::ToolCalls,
+        other => map_gemini_finish_reason(other),
     }
 }
 
@@ -6517,13 +6529,13 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             serde_json::json!([
                 {"role": "user", "parts": [{"text": "weather in Paris and Rome?"}]},
                 {"role": "model", "parts": [
-                    {"functionCall": {"name": "get_weather", "args": {"city": "Paris"}},
+                    {"functionCall": {"id": "call_a", "name": "get_weather", "args": {"city": "Paris"}},
                      "thoughtSignature": "SIGA"},
-                    {"functionCall": {"name": "get_weather", "args": {"city": "Rome"}}}
+                    {"functionCall": {"id": "call_b", "name": "get_weather", "args": {"city": "Rome"}}}
                 ]},
                 {"role": "user", "parts": [
-                    {"functionResponse": {"name": "get_weather", "response": {"content": "sunny"}}},
-                    {"functionResponse": {"name": "get_weather", "response": {"temp": 21}}}
+                    {"functionResponse": {"id": "call_a", "name": "get_weather", "response": {"content": "sunny"}}},
+                    {"functionResponse": {"id": "call_b", "name": "get_weather", "response": {"temp": 21}}}
                 ]},
                 {"role": "user", "parts": [{"text": "thanks"}]}
             ])
@@ -6596,5 +6608,47 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             chunks.last().unwrap().finish_reason,
             Some(FinishReason::ToolCalls)
         );
+    }
+
+    #[test]
+    fn legacy_function_fields_are_refused_not_dropped() {
+        for field in ["functions", "function_call"] {
+            let mut req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+            req.extra.insert(field.into(), serde_json::json!([]));
+            assert!(
+                matches!(
+                    build_gemini_request(&req, "gemini-2.5-flash"),
+                    Err(BridgeError::InvalidUpstreamConfig(_))
+                ),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_choice_without_tools_sends_no_tool_config() {
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        req.extra
+            .insert("tool_choice".into(), serde_json::json!("required"));
+        let body = build_gemini_request(&req, "gemini-2.5-flash").unwrap();
+        assert!(body.tool_config.is_none() && body.tools.is_none());
+    }
+
+    #[test]
+    fn a_tool_calling_turn_cut_short_keeps_its_reason() {
+        let finish = |reason: &str| {
+            gemini_response_into_chat_response(
+                function_call_response(serde_json::json!({
+                    "candidates": [{"content": {"parts": [
+                        {"functionCall": {"name": "f", "args": {}}}]}, "finishReason": reason}]
+                })),
+                "gemini-2.5-flash",
+            )
+            .finish_reason
+        };
+        assert_eq!(finish("STOP"), FinishReason::ToolCalls);
+        assert_eq!(finish("MAX_TOKENS"), FinishReason::Length);
+        assert_eq!(finish("SAFETY"), FinishReason::ContentFilter);
+        assert_eq!(finish("MALFORMED_FUNCTION_CALL"), FinishReason::Stop);
     }
 }

@@ -6,42 +6,47 @@
 //! `role: "tool"` results. This module translates each of those to the
 //! Gemini shape and back:
 //!
-//! - `tools[].function` → one `{"functionDeclarations": [...]}` tool, the
-//!   parameters narrowed to the OpenAPI `Schema` subset Gemini accepts
+//! - `tools[].function` → one `{"functionDeclarations": [...]}` tool
+//!   ([`gemini_tools`]); the parameters go as the typed `parameters`
+//!   schema when they fit it, else verbatim as `parametersJsonSchema`
 //!   ([`gemini_function_parameters`]);
 //! - `tool_choice` → `toolConfig.functionCallingConfig`
 //!   ([`gemini_tool_config`]);
 //! - assistant `tool_calls` → `functionCall` parts, tool results →
-//!   `functionResponse` parts;
+//!   `functionResponse` parts, both carrying the call id;
 //! - response `functionCall` parts → OpenAI `tool_calls`
 //!   ([`tool_call_from_function_call`]).
 //!
 //! Thought signatures. Gemini 3 rejects history whose function calls lack
 //! the `thoughtSignature` it returned with them, and an OpenAI-shaped
 //! client has no field to carry one back in. The signature therefore
-//! rides in the tool call id the client is handed (`<id>__thought__<sig>`)
-//! and is split back out when the history returns. A Gemini 3 history
-//! with no signature on a turn's first call (one written by another
-//! model) gets Google's documented placeholder instead.
-//! <https://ai.google.dev/gemini-api/docs/thought-signatures>
+//! rides in the tool call id the client is handed
+//! (`<id>__thought__<signature>`, URL-safe base64 without padding so the
+//! id stays `[A-Za-z0-9_-]`), and is split back out here when the history
+//! returns. Every other bridge strips it
+//! ([`aisix_gateway::tool_calls`]). A Gemini 3 history with no signature
+//! on a turn's first call (one written by another model) gets Google's
+//! documented placeholder instead.
+//! <https://cloud.google.com/vertex-ai/generative-ai/docs/thought-signatures>
 
 use aisix_gateway::{
     structured_output::{apply_schema_limits, SchemaLimits},
+    tool_calls::THOUGHT_SIGNATURE_SEPARATOR,
     BridgeError, ChatMessage,
 };
 use serde_json::{json, Map, Value};
-
-/// Separator between a tool call id and the thought signature embedded
-/// in it.
-const THOUGHT_SIGNATURE_SEPARATOR: &str = "__thought__";
 
 /// Base64 of `skip_thought_signature_validator`: the value Google
 /// documents for function calls replayed into Gemini 3 without a
 /// signature of their own (history from another model).
 const PLACEHOLDER_THOUGHT_SIGNATURE: &str = "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I=";
 
-/// Inline internal `$ref`s and nothing else. The rest of the narrowing
-/// is the dedicated walk in [`gemini_function_parameters`].
+/// Longest tool call id this gateway hands out, and the character set it
+/// keeps to: what OpenAI and Bedrock accept, so the base id survives a
+/// conversation moving to another provider.
+const MAX_TOOL_CALL_ID_LEN: usize = 64;
+
+/// Inline internal `$ref`s and nothing else.
 const INLINE_REFS_ONLY: SchemaLimits = SchemaLimits {
     noted_constraints: &[],
     dropped_keywords: &[],
@@ -50,7 +55,7 @@ const INLINE_REFS_ONLY: SchemaLimits = SchemaLimits {
     inline_internal_refs: true,
 };
 
-/// The members of Gemini's `Schema` type a function's parameters may
+/// The members of Gemini's `Schema` type a function's `parameters` may
 /// carry. Anything else is rejected by name upstream.
 const SCHEMA_FIELDS: &[&str] = &[
     "type",
@@ -77,10 +82,32 @@ const SCHEMA_FIELDS: &[&str] = &[
     "anyOf",
 ];
 
-/// Whether `model` is Gemini 3 or newer — the generations that accept
-/// (and return) `id` on `functionCall` / `functionResponse` and that
-/// require thought signatures on replayed function calls. Older
-/// generations reject the `id` field with a 400.
+/// JSON Schema keywords the typed `Schema` has no equivalent for. A schema
+/// using any of them goes as `parametersJsonSchema` rather than losing
+/// the constraint.
+const UNTYPED_KEYWORDS: &[&str] = &[
+    "oneOf",
+    "allOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "const",
+    "contains",
+    "patternProperties",
+    "prefixItems",
+    "propertyNames",
+    "dependentSchemas",
+    "dependentRequired",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "$ref",
+    "$dynamicRef",
+];
+
+/// Whether `model` is Gemini 3 or newer — the generations that require a
+/// thought signature on every replayed function call, and so get the
+/// placeholder when the history has none.
 ///
 /// Only names recognisably older are excluded, so an alias such as
 /// `gemini-flash-latest` that tracks the newest generation counts as
@@ -125,24 +152,32 @@ pub(crate) fn gemini_3_or_newer(model: &str) -> bool {
 }
 
 /// `tools` → Gemini's `tools` array: every function tool becomes a
-/// declaration in ONE `functionDeclarations` tool. Entries that are not
-/// function tools (hosted tools of other providers) have no declaration
-/// to become and are left out.
+/// declaration in ONE `functionDeclarations` tool. A tool of any other
+/// type (another provider's hosted tool) has no Gemini equivalent here
+/// and is refused rather than dropped.
 pub(crate) fn gemini_tools(tools: &Value) -> Result<Option<Vec<Value>>, BridgeError> {
     let Some(entries) = tools.as_array() else {
         return Ok(None);
     };
     let mut declarations = Vec::new();
     for entry in entries {
+        let kind = entry.get("type").and_then(Value::as_str);
         // `{"type":"function","function":{...}}`, or the bare function
         // object some clients send.
-        let function = match entry.get("function") {
-            Some(f) => f,
-            None if entry.get("name").is_some() => entry,
-            None => continue,
+        let function = match (kind, entry.get("function")) {
+            (None | Some("function"), Some(f)) => f,
+            (None, None) if entry.get("name").is_some() => entry,
+            _ => {
+                return Err(BridgeError::InvalidUpstreamConfig(format!(
+                    "tool type {:?} is not supported for this model; only function tools are",
+                    kind.unwrap_or("<missing>")
+                )))
+            }
         };
         let Some(name) = function.get("name").and_then(Value::as_str) else {
-            continue;
+            return Err(BridgeError::InvalidUpstreamConfig(
+                "function tool has no name".into(),
+            ));
         };
         let mut declaration = Map::new();
         declaration.insert("name".into(), name.into());
@@ -154,12 +189,14 @@ pub(crate) fn gemini_tools(tools: &Value) -> Result<Option<Vec<Value>>, BridgeEr
             Some(Value::String(s)) if s.is_empty() => {
                 declaration.insert("parameters".into(), json!({"type": "object"}));
             }
-            Some(schema @ Value::Object(_)) => {
-                declaration.insert("parameters".into(), gemini_function_parameters(schema)?);
-            }
-            Some(other) => {
-                declaration.insert("parameters".into(), other.clone());
-            }
+            Some(schema) => match gemini_function_parameters(schema) {
+                GeminiParameters::Typed(typed) => {
+                    declaration.insert("parameters".into(), typed);
+                }
+                GeminiParameters::JsonSchema(raw) => {
+                    declaration.insert("parametersJsonSchema".into(), raw);
+                }
+            },
         }
         declarations.push(Value::Object(declaration));
     }
@@ -171,7 +208,7 @@ pub(crate) fn gemini_tools(tools: &Value) -> Result<Option<Vec<Value>>, BridgeEr
 
 /// `tool_choice` → `toolConfig`. `none` / `auto` / `required` become the
 /// `NONE` / `AUTO` / `ANY` calling modes; a named function becomes `ANY`
-/// restricted to that one name.
+/// restricted to that one name. Anything else is refused.
 pub(crate) fn gemini_tool_config(choice: &Value) -> Result<Option<Value>, BridgeError> {
     let config = match choice {
         Value::String(mode) => {
@@ -181,18 +218,25 @@ pub(crate) fn gemini_tool_config(choice: &Value) -> Result<Option<Value>, Bridge
                 "required" => "ANY",
                 other => {
                     return Err(BridgeError::InvalidUpstreamConfig(format!(
-                        "Gemini does not support tool_choice={other:?}; \
-                         supported values are \"auto\", \"none\", \"required\" or a named function"
+                        "tool_choice {other:?} is not supported for this model; \
+                         use \"auto\", \"none\", \"required\" or a named function"
                     )))
                 }
             };
             json!({ "mode": mode })
         }
         Value::Object(_) => {
-            let name = choice
+            let Some(name) = choice
                 .pointer("/function/name")
                 .and_then(Value::as_str)
-                .unwrap_or_default();
+                .filter(|n| !n.is_empty())
+            else {
+                return Err(BridgeError::InvalidUpstreamConfig(
+                    "tool_choice object must name a function: \
+                     {\"type\":\"function\",\"function\":{\"name\":...}}"
+                        .into(),
+                ));
+            };
             json!({ "mode": "ANY", "allowedFunctionNames": [name] })
         }
         _ => return Ok(None),
@@ -208,10 +252,40 @@ fn split_tool_call_id(id: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Gemini's signature (standard base64) → the URL-safe, unpadded form
+/// carried in an id.
+fn encode_signature(signature: &str) -> String {
+    signature
+        .trim_end_matches('=')
+        .chars()
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            c => c,
+        })
+        .collect()
+}
+
+/// The inverse of [`encode_signature`].
+fn decode_signature(encoded: &str) -> String {
+    let mut signature: String = encoded
+        .chars()
+        .map(|c| match c {
+            '-' => '+',
+            '_' => '/',
+            c => c,
+        })
+        .collect();
+    while signature.len() % 4 != 0 {
+        signature.push('=');
+    }
+    signature
+}
+
 /// The thought signature a replayed tool call carries: a
 /// `provider_specific_fields.thought_signature` on the call or on its
 /// function, else the one embedded in its id.
-fn tool_call_thought_signature(call: &Value) -> Option<&str> {
+fn tool_call_thought_signature(call: &Value) -> Option<String> {
     fn explicit(v: Option<&Value>) -> Option<&str> {
         v.and_then(|v| v.pointer("/provider_specific_fields/thought_signature"))
             .and_then(Value::as_str)
@@ -219,20 +293,23 @@ fn tool_call_thought_signature(call: &Value) -> Option<&str> {
     }
     explicit(Some(call))
         .or_else(|| explicit(call.get("function")))
+        .map(str::to_string)
         .or_else(|| {
             call.get("id")
                 .and_then(Value::as_str)
                 .and_then(|id| split_tool_call_id(id).1)
+                .filter(|s| !s.is_empty())
+                .map(decode_signature)
         })
 }
 
-/// An assistant turn's `tool_calls` → `functionCall` parts, each with
-/// the thought signature it was returned with.
+/// An assistant turn's `tool_calls` → `functionCall` parts, each with its
+/// call id and the thought signature it was returned with.
 pub(crate) fn function_call_parts(
     tool_calls: &[Value],
     upstream_model: &str,
 ) -> Result<Vec<Value>, BridgeError> {
-    let newer = gemini_3_or_newer(upstream_model);
+    let needs_signature = gemini_3_or_newer(upstream_model);
     let mut parts = Vec::with_capacity(tool_calls.len());
     for call in tool_calls {
         let Some(function) = call.get("function") else {
@@ -243,8 +320,8 @@ pub(crate) fn function_call_parts(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let args = match function.get("arguments") {
-            None | Some(Value::Null) => json!({"type": "object"}),
-            Some(Value::String(s)) if s.is_empty() => json!({"type": "object"}),
+            None | Some(Value::Null) => json!({}),
+            Some(Value::String(s)) if s.is_empty() => json!({}),
             Some(Value::String(s)) => serde_json::from_str(s).map_err(|e| {
                 BridgeError::InvalidUpstreamConfig(format!(
                     "assistant tool call {name:?} has arguments that are not valid JSON: {e}"
@@ -253,13 +330,13 @@ pub(crate) fn function_call_parts(
             Some(other) => other.clone(),
         };
         let mut function_call = Map::new();
-        if newer {
-            if let Some(id) = call.get("id").and_then(Value::as_str) {
-                let (id, _) = split_tool_call_id(id);
-                if !id.is_empty() {
-                    function_call.insert("id".into(), id.into());
-                }
-            }
+        if let Some(id) = call
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|id| split_tool_call_id(id).0)
+            .filter(|id| !id.is_empty())
+        {
+            function_call.insert("id".into(), id.into());
         }
         function_call.insert("name".into(), name.into());
         function_call.insert("args".into(), args);
@@ -267,8 +344,9 @@ pub(crate) fn function_call_parts(
         part.insert("functionCall".into(), Value::Object(function_call));
         // Gemini signs only the first call of a parallel batch, so only
         // that one gets the placeholder when the history has none.
-        let signature = tool_call_thought_signature(call)
-            .or_else(|| (newer && parts.is_empty()).then_some(PLACEHOLDER_THOUGHT_SIGNATURE));
+        let signature = tool_call_thought_signature(call).or_else(|| {
+            (needs_signature && parts.is_empty()).then(|| PLACEHOLDER_THOUGHT_SIGNATURE.to_string())
+        });
         if let Some(signature) = signature {
             part.insert("thoughtSignature".into(), signature.into());
         }
@@ -287,7 +365,6 @@ pub(crate) fn function_call_parts(
 pub(crate) fn function_response_part(
     message: &ChatMessage,
     last_tool_calls: Option<&[Value]>,
-    upstream_model: &str,
 ) -> Result<Value, BridgeError> {
     let call_id = message.tool_call_id.as_deref();
     let name = last_tool_calls
@@ -315,22 +392,33 @@ pub(crate) fn function_response_part(
         json!({ "content": content })
     };
     let mut function_response = Map::new();
-    if gemini_3_or_newer(upstream_model) {
-        if let Some(id) = call_id.map(|id| split_tool_call_id(id).0) {
-            if !id.is_empty() {
-                function_response.insert("id".into(), id.into());
-            }
-        }
+    if let Some(id) = call_id
+        .map(|id| split_tool_call_id(id).0)
+        .filter(|id| !id.is_empty())
+    {
+        function_response.insert("id".into(), id.into());
     }
     function_response.insert("name".into(), name.into());
     function_response.insert("response".into(), response);
     Ok(json!({ "functionResponse": function_response }))
 }
 
+/// Whether an id Gemini minted can be handed out as it is: short enough
+/// and in the character set every upstream accepts.
+fn portable_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_TOOL_CALL_ID_LEN
+        && !id.contains(THOUGHT_SIGNATURE_SEPARATOR)
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// A response `functionCall` part → an OpenAI `tool_calls[]` entry
 /// (without `index`; the streaming path adds it). The id is Gemini's own
-/// when it sent one, else a minted `call_…`; a thought signature on the
-/// part is appended to it so the client hands it back with the history.
+/// when it sent a portable one, else a minted `call_…`; a thought
+/// signature on the part is appended to it so the client hands it back
+/// with the history.
 pub(crate) fn tool_call_from_function_call(
     function_call: &GeminiFunctionCall,
     thought_signature: Option<&str>,
@@ -338,11 +426,11 @@ pub(crate) fn tool_call_from_function_call(
     let mut id = function_call
         .id
         .clone()
-        .filter(|id| !id.is_empty())
+        .filter(|id| portable_id(id))
         .unwrap_or_else(|| format!("call_{}", &uuid::Uuid::new_v4().simple().to_string()[..28]));
     if let Some(signature) = thought_signature.filter(|s| !s.is_empty()) {
         id.push_str(THOUGHT_SIGNATURE_SEPARATOR);
-        id.push_str(signature);
+        id.push_str(&encode_signature(signature));
     }
     let arguments = function_call
         .args
@@ -366,164 +454,150 @@ pub(crate) struct GeminiFunctionCall {
     pub(crate) args: Option<Value>,
 }
 
-/// Narrow a JSON Schema to the OpenAPI `Schema` subset Gemini accepts in
-/// a function declaration's `parameters`:
+/// Which declaration field a function's parameters go in.
+#[derive(Debug, PartialEq)]
+pub(crate) enum GeminiParameters {
+    /// `parameters`: Gemini's typed OpenAPI `Schema`.
+    Typed(Value),
+    /// `parametersJsonSchema`: the caller's JSON Schema as written.
+    JsonSchema(Value),
+}
+
+/// A function's JSON Schema → the declaration field it goes in.
+///
+/// A schema the typed `Schema` can express is converted to it:
 ///
 /// - internal `$ref`s are inlined (the dialect has no references);
-/// - a `null` branch of an `anyOf` becomes `nullable: true` on the rest;
-/// - a type list (`["string","integer"]`) becomes an `anyOf`;
-/// - `enum` survives only on string-typed nodes, and an empty-string
-///   member becomes `null`;
+/// - `type: [X, "null"]` becomes `type: X` with `nullable: true`, and a
+///   `null` branch of an `anyOf` becomes `nullable: true` on the rest;
 /// - an array without `items` gets `{"type":"object"}` items, a node
 ///   with no type gets `type: object`, and empty `properties` are
 ///   removed;
-/// - every member outside the `Schema` type is dropped, and an `anyOf`
-///   node keeps nothing but the branches (its `title` / `description`
-///   are copied into each).
-pub(crate) fn gemini_function_parameters(schema: &Value) -> Result<Value, BridgeError> {
-    let mut schema = schema.clone();
-    apply_schema_limits(&mut schema, &INLINE_REFS_ONLY);
-    anyof_null_to_nullable(&mut schema)?;
-    type_lists_to_anyof(&mut schema);
-    empty_enum_strings_to_null(&mut schema);
-    enum_on_strings_only(&mut schema);
-    default_array_items(&mut schema);
-    default_object_type(&mut schema);
-    Ok(keep_schema_fields(schema))
+/// - every member outside the `Schema` type is dropped
+///   (`additionalProperties`, `$schema`, unsupported `format`s …), and an
+///   `anyOf` node keeps nothing but the branches (its `title` /
+///   `description` are copied into each).
+///
+/// One the typed form cannot express — `oneOf` / `allOf` and the other
+/// [`UNTYPED_KEYWORDS`], a type list other than `[X]` / `[X, "null"]`, an
+/// `enum` on anything but a string, a tuple `items`, a recursive `$ref` —
+/// goes verbatim as `parametersJsonSchema` instead, so no constraint is
+/// silently lost.
+pub(crate) fn gemini_function_parameters(schema: &Value) -> GeminiParameters {
+    let mut typed = schema.clone();
+    apply_schema_limits(&mut typed, &INLINE_REFS_ONLY);
+    if !fits_typed_schema(&typed) {
+        return GeminiParameters::JsonSchema(schema.clone());
+    }
+    nullable_type_lists(&mut typed);
+    anyof_null_to_nullable(&mut typed);
+    default_array_items(&mut typed);
+    default_object_type(&mut typed);
+    GeminiParameters::Typed(keep_schema_fields(typed))
 }
 
-fn for_properties_and_items(obj: &mut Map<String, Value>, f: &mut dyn FnMut(&mut Value)) {
+/// The non-null member of a `[X]` or `[X, "null"]` type list.
+fn single_type(types: &[Value]) -> Option<&str> {
+    let mut named = types
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|t| *t != "null");
+    let first = named.next()?;
+    let all_strings = types.iter().all(Value::is_string);
+    let fits = all_strings
+        && named.next().is_none()
+        && (types.len() == 1 || (types.len() == 2 && types.iter().any(|t| t == "null")));
+    fits.then_some(first)
+}
+
+fn fits_typed_schema(schema: &Value) -> bool {
+    let Some(obj) = schema.as_object() else {
+        // `true` / `false` schemas have no typed spelling.
+        return false;
+    };
+    if UNTYPED_KEYWORDS.iter().any(|k| obj.contains_key(*k)) {
+        return false;
+    }
+    let ty = match obj.get("type") {
+        None => None,
+        Some(Value::String(t)) => Some(t.as_str()),
+        Some(Value::Array(types)) => match single_type(types) {
+            Some(t) => Some(t),
+            None => return false,
+        },
+        Some(_) => return false,
+    };
+    if obj.contains_key("enum") && ty != Some("string") {
+        return false;
+    }
+    if let Some(properties) = obj.get("properties") {
+        match properties.as_object() {
+            Some(properties) if properties.values().all(fits_typed_schema) => {}
+            _ => return false,
+        }
+    }
+    match obj.get("items") {
+        None => {}
+        Some(items @ Value::Object(_)) if fits_typed_schema(items) => {}
+        Some(_) => return false,
+    }
+    if let Some(branches) = obj.get("anyOf") {
+        let Some(branches) = branches.as_array() else {
+            return false;
+        };
+        let non_null = branches
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) != Some("null"))
+            .count();
+        if non_null == 0 || !branches.iter().all(fits_typed_schema) {
+            return false;
+        }
+    }
+    true
+}
+
+fn for_each_typed_subschema(obj: &mut Map<String, Value>, f: &mut dyn FnMut(&mut Value)) {
     if let Some(properties) = obj.get_mut("properties").and_then(Value::as_object_mut) {
         properties.values_mut().for_each(&mut *f);
     }
     if let Some(items) = obj.get_mut("items") {
         f(items);
     }
+    if let Some(branches) = obj.get_mut("anyOf").and_then(Value::as_array_mut) {
+        branches.iter_mut().for_each(&mut *f);
+    }
 }
 
-fn anyof_null_to_nullable(schema: &mut Value) -> Result<(), BridgeError> {
+fn nullable_type_lists(schema: &mut Value) {
     let Some(obj) = schema.as_object_mut() else {
-        return Ok(());
+        return;
+    };
+    if let Some(Value::Array(types)) = obj.get("type") {
+        let nullable = types.iter().any(|t| t == "null");
+        if let Some(ty) = single_type(types).map(str::to_string) {
+            obj.insert("type".into(), ty.into());
+            if nullable {
+                obj.insert("nullable".into(), true.into());
+            }
+        }
+    }
+    for_each_typed_subschema(obj, &mut nullable_type_lists);
+}
+
+fn anyof_null_to_nullable(schema: &mut Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
     };
     if let Some(branches) = obj.get_mut("anyOf").and_then(Value::as_array_mut) {
         let before = branches.len();
         branches.retain(|b| b.get("type").and_then(Value::as_str) != Some("null"));
-        let had_null = branches.len() != before;
-        for branch in branches.iter_mut() {
-            if let Some(b) = branch.as_object_mut() {
-                if b.is_empty() {
-                    b.insert("type".into(), "object".into());
-                }
-            }
-        }
-        if branches.is_empty() {
-            return Err(BridgeError::InvalidUpstreamConfig(
-                "tool parameters: an anyOf with only a null type is not supported by Gemini".into(),
-            ));
-        }
-        if had_null {
-            for branch in branches.iter_mut() {
-                if let Some(b) = branch.as_object_mut() {
-                    b.insert("nullable".into(), true.into());
-                }
+        if branches.len() != before {
+            for branch in branches.iter_mut().filter_map(Value::as_object_mut) {
+                branch.insert("nullable".into(), true.into());
             }
         }
     }
-    let mut result = Ok(());
-    for_properties_and_items(obj, &mut |sub| {
-        if result.is_ok() {
-            result = anyof_null_to_nullable(sub);
-        }
-    });
-    result
-}
-
-fn type_lists_to_anyof(schema: &mut Value) {
-    const TYPE_SPECIFIC: &[&str] = &[
-        "properties",
-        "required",
-        "additionalProperties",
-        "items",
-        "minItems",
-        "maxItems",
-        "minProperties",
-        "maxProperties",
-    ];
-    let Some(obj) = schema.as_object_mut() else {
-        return;
-    };
-    if let Some(Value::Array(types)) = obj.get("type").cloned() {
-        if types.len() == 1 {
-            obj.insert("type".into(), types[0].clone());
-        } else if types.len() > 1 {
-            let structured = types
-                .iter()
-                .any(|t| matches!(t.as_str(), Some("object" | "array")));
-            let mut branches = Vec::new();
-            for t in types.iter().filter_map(Value::as_str) {
-                let mut branch = Map::new();
-                branch.insert("type".into(), t.into());
-                if t == "object" || t == "array" {
-                    for field in TYPE_SPECIFIC {
-                        if let Some(v) = obj.get(*field) {
-                            branch.insert((*field).into(), v.clone());
-                        }
-                    }
-                }
-                branches.push(Value::Object(branch));
-            }
-            if structured {
-                for field in TYPE_SPECIFIC {
-                    obj.remove(*field);
-                }
-            }
-            obj.remove("type");
-            obj.insert("anyOf".into(), Value::Array(branches));
-        }
-    }
-    for_properties_and_items(obj, &mut type_lists_to_anyof);
-    if let Some(branches) = obj.get_mut("anyOf").and_then(Value::as_array_mut) {
-        branches.iter_mut().for_each(type_lists_to_anyof);
-    }
-}
-
-fn empty_enum_strings_to_null(schema: &mut Value) {
-    let Some(obj) = schema.as_object_mut() else {
-        return;
-    };
-    if let Some(members) = obj.get_mut("enum").and_then(Value::as_array_mut) {
-        for member in members.iter_mut() {
-            if member.as_str() == Some("") {
-                *member = Value::Null;
-            }
-        }
-    }
-    for_properties_and_items(obj, &mut empty_enum_strings_to_null);
-}
-
-fn is_string_type(v: Option<&Value>) -> bool {
-    v.and_then(Value::as_str)
-        .is_some_and(|t| t.eq_ignore_ascii_case("string"))
-}
-
-fn enum_on_strings_only(schema: &mut Value) {
-    let Some(obj) = schema.as_object_mut() else {
-        return;
-    };
-    if obj.get("enum").is_some_and(Value::is_array) {
-        let keep = is_string_type(obj.get("type"))
-            || obj
-                .get("anyOf")
-                .and_then(Value::as_array)
-                .is_some_and(|bs| bs.iter().any(|b| is_string_type(b.get("type"))));
-        if !keep {
-            obj.remove("enum");
-        }
-    }
-    for_properties_and_items(obj, &mut enum_on_strings_only);
-    if let Some(branches) = obj.get_mut("anyOf").and_then(Value::as_array_mut) {
-        branches.iter_mut().for_each(enum_on_strings_only);
-    }
+    for_each_typed_subschema(obj, &mut anyof_null_to_nullable);
 }
 
 fn default_array_items(schema: &mut Value) {
@@ -681,10 +755,19 @@ mod tests {
             mode(json!({"type": "function", "function": {"name": "get_weather"}})),
             json!({"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["get_weather"]}})
         );
-        assert!(matches!(
-            gemini_tool_config(&json!("any")),
-            Err(BridgeError::InvalidUpstreamConfig(_))
-        ));
+        for refused in [
+            json!("any"),
+            json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto", "tools": []}}),
+            json!({"type": "function", "function": {}}),
+        ] {
+            assert!(
+                matches!(
+                    gemini_tool_config(&refused),
+                    Err(BridgeError::InvalidUpstreamConfig(_))
+                ),
+                "{refused}"
+            );
+        }
     }
 
     #[test]
@@ -695,7 +778,8 @@ mod tests {
                 "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
                                "required": ["city"], "additionalProperties": false}}},
             {"type": "function", "function": {"name": "now"}},
-            {"type": "web_search_preview"},
+            {"type": "function", "function": {"name": "pick", "parameters":
+                {"type": "object", "properties": {"x": {"oneOf": [{"type": "string"}, {"type": "integer"}]}}}}},
         ]))
         .unwrap()
         .unwrap();
@@ -706,23 +790,40 @@ mod tests {
                  "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
                                 "required": ["city"]}},
                 {"name": "now"},
+                {"name": "pick", "parametersJsonSchema":
+                    {"type": "object", "properties": {"x": {"oneOf": [{"type": "string"}, {"type": "integer"}]}}}},
             ]})]
         );
         assert_eq!(gemini_tools(&json!([])).unwrap(), None);
     }
 
     #[test]
-    fn parameters_narrow_to_the_gemini_schema_subset() {
-        let narrowed = gemini_function_parameters(&json!({
+    fn a_tool_type_without_a_gemini_equivalent_is_refused() {
+        for tool in [
+            json!({"type": "web_search_preview"}),
+            json!({"type": "custom", "custom": {"name": "x"}}),
+        ] {
+            assert!(
+                matches!(
+                    gemini_tools(&json!([tool])),
+                    Err(BridgeError::InvalidUpstreamConfig(_))
+                ),
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_schema_the_typed_form_can_express_is_converted() {
+        let typed = gemini_function_parameters(&json!({
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "properties": {
                 "unit": {"anyOf": [{"type": "string", "enum": ["c", "f", ""]}, {"type": "null"}],
                           "description": "Unit"},
-                "days": {"type": ["integer", "null"], "minimum": 1, "exclusiveMinimum": 0},
+                "days": {"type": ["integer", "null"], "minimum": 1},
+                "mode": {"type": ["string", "null"], "enum": ["fast", ""]},
                 "tags": {"type": "array"},
-                "level": {"type": "integer", "enum": [1, 2]},
-                "mode": {"type": "string", "enum": ["fast", ""]},
                 "when": {"type": "string", "format": "date-time"},
                 "email": {"type": "string", "format": "email"},
                 "place": {"$ref": "#/$defs/Place"},
@@ -731,36 +832,47 @@ mod tests {
             "required": ["unit"],
             "additionalProperties": false,
             "$defs": {"Place": {"type": "object", "properties": {"name": {"type": "string"}}}},
-        }))
-        .unwrap();
+        }));
         assert_eq!(
-            narrowed,
-            json!({
+            typed,
+            GeminiParameters::Typed(json!({
                 "type": "object",
                 "properties": {
                     "unit": {"anyOf": [{"type": "string", "enum": ["c", "f", ""],
                                         "nullable": true, "description": "Unit"}]},
-                    "days": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                    "days": {"type": "integer", "nullable": true, "minimum": 1},
+                    "mode": {"type": "string", "nullable": true, "enum": ["fast", ""]},
                     "tags": {"type": "array", "items": {"type": "object"}},
-                    "level": {"type": "integer"},
-                    "mode": {"type": "string", "enum": ["fast", null]},
                     "when": {"type": "string", "format": "date-time"},
                     "email": {"type": "string"},
                     "place": {"type": "object", "properties": {"name": {"type": "string"}}},
                     "meta": {"type": "object"},
                 },
                 "required": ["unit"],
-            })
+            }))
         );
     }
 
     #[test]
-    fn an_anyof_of_only_null_is_refused() {
-        assert!(matches!(
-            gemini_function_parameters(&json!({"type": "object", "properties": {
-                "x": {"anyOf": [{"type": "null"}]}}})),
-            Err(BridgeError::InvalidUpstreamConfig(_))
-        ));
+    fn a_schema_the_typed_form_cannot_express_goes_as_json_schema() {
+        let object = |prop: Value| json!({"type": "object", "properties": {"x": prop}});
+        for prop in [
+            json!({"oneOf": [{"type": "string"}, {"type": "integer"}]}),
+            json!({"allOf": [{"type": "object"}]}),
+            json!({"type": ["string", "integer"]}),
+            json!({"type": "integer", "enum": [1, 2]}),
+            json!({"type": "array", "items": [{"type": "string"}]}),
+            json!({"anyOf": [{"type": "null"}]}),
+            json!({"const": "a"}),
+            json!({"$ref": "#/$defs/Missing"}),
+        ] {
+            let schema = object(prop.clone());
+            assert_eq!(
+                gemini_function_parameters(&schema),
+                GeminiParameters::JsonSchema(schema),
+                "{prop}"
+            );
+        }
     }
 
     fn call(id: &str, name: &str, arguments: &str) -> Value {
@@ -768,30 +880,28 @@ mod tests {
     }
 
     #[test]
-    fn history_tool_calls_carry_their_signature_and_gemini_3_ids() {
+    fn history_tool_calls_carry_their_id_and_decoded_signature() {
+        // `+/=` in Gemini's signature travel as `-_` and no padding.
         let calls = [
             call(
-                "call_a__thought__SIGA",
+                "call_a__thought__ab-c_d",
                 "get_weather",
                 r#"{"city":"Paris"}"#,
             ),
             call("call_b", "get_weather", r#"{"city":"Rome"}"#),
         ];
+        let expected = vec![
+            json!({"functionCall": {"id": "call_a", "name": "get_weather", "args": {"city": "Paris"}},
+                   "thoughtSignature": "ab+c/d=="}),
+            json!({"functionCall": {"id": "call_b", "name": "get_weather", "args": {"city": "Rome"}}}),
+        ];
         assert_eq!(
             function_call_parts(&calls, "gemini-2.5-flash").unwrap(),
-            vec![
-                json!({"functionCall": {"name": "get_weather", "args": {"city": "Paris"}},
-                       "thoughtSignature": "SIGA"}),
-                json!({"functionCall": {"name": "get_weather", "args": {"city": "Rome"}}}),
-            ]
+            expected
         );
         assert_eq!(
             function_call_parts(&calls, "gemini-3-pro-preview").unwrap(),
-            vec![
-                json!({"functionCall": {"id": "call_a", "name": "get_weather", "args": {"city": "Paris"}},
-                       "thoughtSignature": "SIGA"}),
-                json!({"functionCall": {"id": "call_b", "name": "get_weather", "args": {"city": "Rome"}}}),
-            ]
+            expected
         );
     }
 
@@ -801,9 +911,19 @@ mod tests {
         let parts = function_call_parts(&calls, "gemini-3-pro-preview").unwrap();
         assert_eq!(parts[0]["thoughtSignature"], PLACEHOLDER_THOUGHT_SIGNATURE);
         assert!(parts[1].get("thoughtSignature").is_none());
-        assert_eq!(parts[1]["functionCall"]["args"], json!({"type": "object"}));
         let older = function_call_parts(&calls, "gemini-2.5-flash").unwrap();
         assert!(older[0].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn a_call_without_arguments_replays_empty_args() {
+        let calls = [
+            json!({"id": "a", "type": "function", "function": {"name": "now", "arguments": ""}}),
+            json!({"id": "b", "type": "function", "function": {"name": "now"}}),
+        ];
+        for part in function_call_parts(&calls, "gemini-2.5-flash").unwrap() {
+            assert_eq!(part["functionCall"]["args"], json!({}));
+        }
     }
 
     #[test]
@@ -821,47 +941,55 @@ mod tests {
     }
 
     #[test]
-    fn tool_results_recover_the_function_name_and_wrap_text() {
+    fn tool_results_recover_the_function_name_and_carry_the_id() {
         let calls = [call("call_a__thought__SIG", "get_weather", "{}")];
-        let part = function_response_part(
-            &tool_message("call_a__thought__SIG", "sunny"),
-            Some(&calls),
-            "gemini-2.5-flash",
-        )
-        .unwrap();
+        let part =
+            function_response_part(&tool_message("call_a__thought__SIG", "sunny"), Some(&calls))
+                .unwrap();
         assert_eq!(
             part,
-            json!({"functionResponse": {"name": "get_weather", "response": {"content": "sunny"}}})
+            json!({"functionResponse": {"id": "call_a", "name": "get_weather",
+                                        "response": {"content": "sunny"}}})
         );
         let part = function_response_part(
             &tool_message("call_a__thought__SIG", r#" {"temp": 21}"#),
             Some(&calls),
-            "gemini-3-pro-preview",
         )
         .unwrap();
-        assert_eq!(
-            part,
-            json!({"functionResponse": {"id": "call_a", "name": "get_weather", "response": {"temp": 21}}})
-        );
-        let part = function_response_part(&tool_message("x", "[1,2]"), None, "gemini-2.5-flash");
+        assert_eq!(part["functionResponse"]["response"], json!({"temp": 21}));
+        let part = function_response_part(&tool_message("x", "[1,2]"), None);
         assert!(matches!(part, Err(BridgeError::InvalidUpstreamConfig(_))));
     }
 
     #[test]
-    fn response_calls_mint_ids_and_carry_the_signature() {
+    fn response_calls_get_portable_ids_and_carry_the_signature() {
         let fc: GeminiFunctionCall =
             serde_json::from_value(json!({"name": "get_weather", "args": {"city": "Paris"}}))
                 .unwrap();
-        let tc = tool_call_from_function_call(&fc, Some("SIG"));
+        let tc = tool_call_from_function_call(&fc, Some("ab+c/d=="));
         let id = tc["id"].as_str().unwrap();
         let (bare, sig) = split_tool_call_id(id);
         assert!(bare.starts_with("call_") && bare.len() == 33, "{bare}");
-        assert_eq!(sig, Some("SIG"));
+        assert_eq!(sig, Some("ab-c_d"));
+        assert!(id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'));
         assert_eq!(tc["function"]["arguments"], r#"{"city":"Paris"}"#);
+
         let fc: GeminiFunctionCall =
             serde_json::from_value(json!({"id": "native-1", "name": "now"})).unwrap();
         let tc = tool_call_from_function_call(&fc, None);
         assert_eq!(tc["id"], "native-1");
         assert_eq!(tc["function"]["arguments"], "{}");
+
+        for unportable in ["has space", "a/b", &"x".repeat(65)] {
+            let fc: GeminiFunctionCall =
+                serde_json::from_value(json!({"id": unportable, "name": "now"})).unwrap();
+            let tc = tool_call_from_function_call(&fc, None);
+            assert!(
+                tc["id"].as_str().unwrap().starts_with("call_"),
+                "{unportable}"
+            );
+        }
     }
 }
