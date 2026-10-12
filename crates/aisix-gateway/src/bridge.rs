@@ -385,14 +385,24 @@ pub enum BridgeError {
     #[error("this provider does not support {0}")]
     UnsupportedCapability(BridgeCapability),
     /// Customer-fixable upstream config — the admin's ProviderKey/Model
-    /// is set up wrong (missing api_base, missing model_name) or the
-    /// caller's request is malformed (e.g. split_system shape). Maps to
+    /// is set up wrong (missing api_base, missing model_name). A request
+    /// shape the bridge cannot translate is [`InvalidRequest`] instead,
+    /// whose message does not blame the upstream config. Maps to
     /// 400, not 500: it's the caller's mistake, retrying won't help, and
     /// a 5xx wrongly tells SDKs/monitoring it's a server fault (#367).
     /// Contrast [`Config`], reserved for errors *we* cause
     /// (serialization, our generated request_id) which stays 500.
     #[error("invalid upstream configuration: {0}")]
     InvalidUpstreamConfig(String),
+    /// The caller's request asks for something this provider's bridge
+    /// cannot translate (a request field, tool type, or history shape).
+    /// Same 400 `invalid_request_error`, non-retryable handling and
+    /// `invalid_config` telemetry class as [`InvalidUpstreamConfig`]; the
+    /// only difference is the message, which is the sentence itself
+    /// rather than one prefixed as an upstream misconfiguration, so the
+    /// caller is pointed at the request instead of the ProviderKey/Model.
+    #[error("{0}")]
+    InvalidRequest(String),
     /// Customer-fixable upstream *credential* problem — the admin's
     /// ProviderKey secret/credential is missing, empty, or malformed
     /// (empty secret, api key with invalid HTTP-header bytes, unparseable
@@ -707,7 +717,7 @@ impl BridgeError {
             // embedder — surface it through this table. Mapping it to 501
             // here would change what those two return.
             BridgeError::Config(_) | BridgeError::UnsupportedCapability(_) => 500,
-            BridgeError::InvalidUpstreamConfig(_) => 400,
+            BridgeError::InvalidUpstreamConfig(_) | BridgeError::InvalidRequest(_) => 400,
             BridgeError::InvalidUpstreamCredentials(_) => 401,
             BridgeError::Transport(_) => 502,
             BridgeError::StreamAborted => 502,
@@ -718,7 +728,7 @@ impl BridgeError {
     /// error was raised.
     ///
     /// Gates the `aisix_deployment_*` families, which read as **upstream
-    /// health** for one deployment target. The three config/credential
+    /// health** for one deployment target. The config/credential/request
     /// variants are raised while the request is still being assembled — an
     /// empty or unusable `api_key`, a missing `model_name`/`api_base`, a
     /// body that would not serialize, a `split_system` shape the provider
@@ -743,6 +753,7 @@ impl BridgeError {
             BridgeError::Config(_)
             | BridgeError::UnsupportedCapability(_)
             | BridgeError::InvalidUpstreamConfig(_)
+            | BridgeError::InvalidRequest(_)
             | BridgeError::InvalidUpstreamCredentials(_) => false,
         }
     }
@@ -755,7 +766,9 @@ impl BridgeError {
             BridgeError::UpstreamDecode(_) => "upstream_decode_error",
             BridgeError::UpstreamInBand { .. } => "upstream_in_band_error",
             BridgeError::Config(_) | BridgeError::UnsupportedCapability(_) => "config_error",
-            BridgeError::InvalidUpstreamConfig(_) => "invalid_request_error",
+            BridgeError::InvalidUpstreamConfig(_) | BridgeError::InvalidRequest(_) => {
+                "invalid_request_error"
+            }
             BridgeError::InvalidUpstreamCredentials(_) => "authentication_error",
             BridgeError::Transport(_) => "transport_error",
             BridgeError::StreamAborted => "stream_aborted",

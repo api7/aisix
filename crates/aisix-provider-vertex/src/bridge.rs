@@ -6629,7 +6629,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             assert!(
                 matches!(
                     build_gemini_request(&req, "gemini-2.5-flash"),
-                    Err(BridgeError::InvalidUpstreamConfig(_))
+                    Err(BridgeError::InvalidRequest(_))
                 ),
                 "{field}"
             );
