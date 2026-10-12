@@ -295,9 +295,6 @@ describe("guardrails never scan a tool-call id", () => {
     },
     {
       name: "/v1/chat/completions bridged to Anthropic",
-      // A streamed Anthropic reply reaches a chat client without its tool
-      // calls today, so there is no streamed tool-call output to scan here.
-      bufferedOutputOnly: true,
       path: "/v1/chat/completions",
       body: (history: boolean) => ({
         model: "ids-claude",
@@ -341,7 +338,7 @@ describe("guardrails never scan a tool-call id", () => {
     const mode = stream ? "streamed" : "buffered";
     for (const surface of surfaces) {
       // A fresh question: the only ids in play are the ones the upstream mints.
-      test.skipIf(stream && "bufferedOutputOnly" in surface)(`${surface.name} output (${mode})`, async (ctx) => {
+      test(`${surface.name} output (${mode})`, async (ctx) => {
         if (!etcdReachable || !app) return ctx.skip();
         const texts = await scanned(surface.path, { ...surface.body(false), stream });
         expectNoIds(texts);
