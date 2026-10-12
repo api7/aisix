@@ -1327,8 +1327,6 @@ fn content_text(v: &serde_json::Value) -> String {
 /// Serialising the whole payload means no function name or argument can
 /// escape inspection regardless of the provider-specific shape. The same
 /// argument carries `reasoning_content`, which relays upstream verbatim.
-/// Unlike the typed endpoints it keeps a Gemini thought signature in a
-/// tool id: a passthrough route forwards the id upstream verbatim.
 ///
 /// `reasoning` splits the two callers because this helper reads BOTH the
 /// request's `messages[]` and the buffered response's `choices[].message`:
@@ -2580,7 +2578,13 @@ fn append_chat_request_message_strings(
         out,
         &decoded_json_string_values_except_root_keys(
             message_body,
-            &["content", "tool_calls", "reasoning_content", "reasoning"],
+            &[
+                "content",
+                "tool_calls",
+                "reasoning_content",
+                "reasoning",
+                "tool_call_id",
+            ],
             scan_error,
         )?,
     )?;
@@ -2596,12 +2600,37 @@ fn append_chat_request_message_strings(
         return None;
     };
     for tool_calls in tool_calls {
-        append_scan_text(
-            out,
-            &decoded_json_string_values_including_empty(tool_calls.get().as_bytes(), scan_error)?,
-        )?;
+        append_chat_request_tool_call_strings(out, &tool_calls, scan_error)?;
     }
     append_raw_top_level_strings(out, message_body, "reasoning_content")?;
+    Some(())
+}
+
+/// Every string of a replayed `tool_calls` carrier except each call's `id`:
+/// a tool-call id is an opaque handle, never scan text.
+fn append_chat_request_tool_call_strings(
+    out: &mut String,
+    tool_calls: &RawJson<'_>,
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> Option<()> {
+    if !tool_calls.get().trim_start().starts_with('[') {
+        return append_scan_text(
+            out,
+            &decoded_json_string_values_including_empty(tool_calls.get().as_bytes(), scan_error)?,
+        );
+    }
+    let Some(calls) = raw_array_items(tool_calls) else {
+        mark_unevaluable(scan_error);
+        return None;
+    };
+    for call in calls {
+        let text = if raw_is_object(&call) {
+            decoded_json_string_values_except_root_keys(call.get().as_bytes(), &["id"], scan_error)?
+        } else {
+            decoded_json_string_values_including_empty(call.get().as_bytes(), scan_error)?
+        };
+        append_scan_text(out, &text)?;
+    }
     Some(())
 }
 
@@ -2659,9 +2688,21 @@ fn append_responses_item_strings(
         "arguments",
         "input",
     ];
+    // Tool-call ids are opaque handles, never scan text: `call_id` on every
+    // tool call and tool result, and the item `id` of a `*_call` /
+    // `*_call_output` item.
+    let is_tool_call_item = raw_top_level_unique_type(item_body)
+        .ok()
+        .flatten()
+        .is_some_and(|kind| kind.ends_with("_call") || kind.ends_with("_call_output"));
+    let mut excluded = text_keys.to_vec();
+    excluded.push("call_id");
+    if is_tool_call_item {
+        excluded.push("id");
+    }
     append_scan_text(
         out,
-        &decoded_json_string_values_except_root_keys(item_body, &text_keys, scan_error)?,
+        &decoded_json_string_values_except_root_keys(item_body, &excluded, scan_error)?,
     )?;
     for key in text_keys {
         for value in raw_top_level_values(item_body, key)? {
@@ -8162,6 +8203,48 @@ mod tests {
         // green above means the reasoning item was skipped rather than the
         // whole walk having come back empty.
         assert!(!scanned.contains("\"output\""), "got {scanned:?}");
+    }
+
+    /// Tool-call ids are opaque handles and never scan text, on either
+    /// envelope; the call's name and arguments, and a result's output, are.
+    #[test]
+    fn request_scan_leaves_out_tool_call_ids() {
+        let chat = serde_json::json!({
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_CHATID__thought__SIG", "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"CHATARGS\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_CHATID__thought__SIG", "content": "CHATRESULT"}
+            ]
+        })
+        .to_string();
+        let scanned = request_guardrail_text(PassthroughProtocol::OpenaiChat, chat.as_bytes());
+        assert!(
+            !scanned.contains("CHATID") && !scanned.contains("SIG"),
+            "got {scanned:?}"
+        );
+        for text in ["lookup", "CHATARGS", "CHATRESULT"] {
+            assert!(scanned.contains(text), "{text} missing from {scanned:?}");
+        }
+
+        let responses = serde_json::json!({
+            "input": [
+                {"type": "function_call", "id": "fc_ITEMID", "call_id": "call_RESPID",
+                 "name": "lookup", "arguments": "{\"q\":\"RESPARGS\"}"},
+                {"type": "function_call_output", "id": "fco_OUTID", "call_id": "call_RESPID",
+                 "output": "RESPRESULT"}
+            ]
+        })
+        .to_string();
+        let scanned =
+            request_guardrail_text(PassthroughProtocol::OpenaiResponses, responses.as_bytes());
+        for id in ["ITEMID", "RESPID", "OUTID"] {
+            assert!(!scanned.contains(id), "{id} leaked into {scanned:?}");
+        }
+        for text in ["lookup", "RESPARGS", "RESPRESULT"] {
+            assert!(scanned.contains(text), "{text} missing from {scanned:?}");
+        }
     }
 
     #[test]
