@@ -19,7 +19,8 @@ import {
 // `type: "function"` and the name on a call's first fragment, the argument
 // text after it, and `finish_reason: "tool_calls"`. Covered for the Anthropic
 // Messages upstream, Claude on Vertex (`:streamRawPredict`, same event
-// stream), and `/v1/responses`, which streams Claude through the same chunks.
+// stream), and `/v1/responses` and `/v1/messages` to Vertex Claude, which
+// reach the client through the same chunks.
 
 const CALLER = "sk-anthropic-stream-tool-calls";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
@@ -306,6 +307,42 @@ describe("Claude streaming tool calls reach OpenAI-protocol clients", () => {
     expect(JSON.parse(out.calls[0]!.arguments)).toEqual({ city: "Paris", unit: "celsius" });
     expect(JSON.parse(out.calls[1]!.arguments)).toEqual({});
     expect(out.finish).toBe("tool_calls");
+  });
+
+  test("/v1/messages streaming to Claude on Vertex: the tool calls come back as tool_use blocks", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    await ready();
+    const res = await fetch(`${app!.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "x-api-key": CALLER, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: MODELS.vertex,
+        max_tokens: 256,
+        stream: true,
+        tools: TOOLS.map((t) => ({ name: t.function.name, input_schema: t.function.parameters })),
+        messages: [{ role: "user", content: "What's the weather in Paris, and what time is it?" }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const events = parseChatSse(await res.text());
+    const blocks = new Map<number, { id: string; name: string; json: string }>();
+    for (const e of events) {
+      if (e.type === "content_block_start" && e.content_block?.type === "tool_use") {
+        blocks.set(e.index, { id: e.content_block.id, name: e.content_block.name, json: "" });
+      }
+      if (e.type === "content_block_delta" && e.delta?.type === "input_json_delta") {
+        blocks.get(e.index)!.json += e.delta.partial_json;
+      }
+    }
+    const calls = [...blocks.values()];
+    expect(calls.map((c) => [c.id, c.name])).toEqual([
+      ["toolu_weather", "get_weather"],
+      ["toolu_time", "get_time"],
+    ]);
+    expect(JSON.parse(calls[0]!.json)).toEqual({ city: "Paris", unit: "celsius" });
+    expect(JSON.parse(calls[1]!.json)).toEqual({});
+    const stop = events.find((e) => e.type === "message_delta");
+    expect(stop?.delta?.stop_reason).toBe("tool_use");
   });
 
   test("/v1/responses streaming: Claude's parallel tool calls become function_call items", async (ctx) => {

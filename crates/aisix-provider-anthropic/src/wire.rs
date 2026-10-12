@@ -1559,13 +1559,15 @@ pub enum AnthropicStreamEvent {
         message: AnthropicStreamStartMessage,
     },
     /// Opens a content block. Read for `tool_use` blocks, the only frame
-    /// that carries a tool call's `id` and `name`.
+    /// that carries a tool call's `id` and `name`. The block stays an
+    /// untyped value so a block this decoder doesn't understand can never
+    /// fail the stream.
     #[serde(rename = "content_block_start")]
     ContentBlockStart {
         #[serde(default)]
         index: Option<u64>,
         #[serde(default)]
-        content_block: AnthropicStreamContentBlock,
+        content_block: serde_json::Value,
     },
     /// Closes a content block. Read to give an argument-less tool call
     /// the `"{}"` arguments the non-streaming path reports for it.
@@ -1603,17 +1605,25 @@ pub enum AnthropicStreamEvent {
     Other,
 }
 
-/// The `content_block` of a `content_block_start` frame.
-#[derive(Debug, Default, Deserialize)]
-#[serde(tag = "type")]
-pub enum AnthropicStreamContentBlock {
-    #[serde(rename = "tool_use")]
-    ToolUse { id: String, name: String },
-    /// Text, thinking and every other block type: their content arrives
-    /// in the deltas that follow.
-    #[default]
-    #[serde(other)]
-    Other,
+/// A `tool_use` block opened by `content_block_start`: its id, its name,
+/// and its `input` when the frame already carries a non-empty one (Claude
+/// sends `{}` and streams the input as `input_json_delta` instead).
+fn stream_tool_use(block: &serde_json::Value) -> Option<(&str, &str, Option<String>)> {
+    if block.get("type")?.as_str()? != "tool_use" {
+        return None;
+    }
+    let field = |k| {
+        block
+            .get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let input = block
+        .get("input")
+        .and_then(serde_json::Value::as_object)
+        .filter(|o| !o.is_empty())
+        .map(|o| serde_json::Value::Object(o.clone()).to_string());
+    Some((field("id"), field("name"), input))
 }
 
 /// Body of an in-band `event: error` frame:
@@ -1770,12 +1780,19 @@ pub struct StreamState {
     /// position here is its OpenAI `tool_calls[].index`, so text or
     /// thinking blocks ahead of it don't shift the numbering.
     tool_blocks: Vec<(Option<u64>, bool)>,
+    /// The tool block currently open, for frames that carry no `index`.
+    open_tool: Option<usize>,
+    /// The tool call the event last passed to [`Self::update`] emits for.
+    event_tool: Option<usize>,
 }
 
 impl StreamState {
     pub fn update(&mut self, event: &AnthropicStreamEvent) {
+        self.event_tool = None;
         match event {
             AnthropicStreamEvent::MessageStart { message } => {
+                self.tool_blocks.clear();
+                self.open_tool = None;
                 self.id = message.id.clone();
                 self.model = message.model.clone();
                 // Reset on every message_start so a later message_start without
@@ -1806,15 +1823,32 @@ impl StreamState {
             }
             AnthropicStreamEvent::ContentBlockStart {
                 index,
-                content_block: AnthropicStreamContentBlock::ToolUse { .. },
-            } => self.tool_blocks.push((*index, false)),
+                content_block,
+            } => {
+                self.open_tool = stream_tool_use(content_block).map(|(_, _, input)| {
+                    self.tool_blocks.push((*index, input.is_some()));
+                    self.tool_blocks.len() - 1
+                });
+                self.event_tool = self.open_tool;
+            }
             AnthropicStreamEvent::ContentBlockDelta {
                 index,
                 delta: AnthropicStreamDelta::InputJsonDelta { partial_json },
             } if !partial_json.is_empty() => {
-                if let Some(pos) = self.tool_position(*index) {
+                self.event_tool = self.tool_position(*index);
+                if let Some(pos) = self.event_tool {
                     self.tool_blocks[pos].1 = true;
                 }
+            }
+            // A tool call no argument text arrived for is closed with "{}".
+            AnthropicStreamEvent::ContentBlockStop { index } => {
+                if let Some(pos) = self.tool_position(*index) {
+                    if !self.tool_blocks[pos].1 {
+                        self.tool_blocks[pos].1 = true;
+                        self.event_tool = Some(pos);
+                    }
+                }
+                self.open_tool = None;
             }
             // AISIX-Cloud#952: harvest cumulative input/cache counts from
             // the terminal message_delta too (max-wins) — some backends
@@ -1838,7 +1872,10 @@ impl StreamState {
     }
 
     fn tool_position(&self, index: Option<u64>) -> Option<usize> {
-        self.tool_blocks.iter().rposition(|(i, _)| *i == index)
+        match index {
+            Some(_) => self.tool_blocks.iter().rposition(|(i, _)| *i == index),
+            None => self.open_tool,
+        }
     }
 
     fn tool_call_chunk(&self, call: serde_json::Value) -> ChatChunk {
@@ -1858,30 +1895,27 @@ impl StreamState {
     /// [`Self::update`] must have seen the event first.
     pub fn to_chunk(&self, event: &AnthropicStreamEvent) -> Option<ChatChunk> {
         match event {
-            AnthropicStreamEvent::ContentBlockStart {
-                index,
-                content_block: AnthropicStreamContentBlock::ToolUse { id, name },
-            } => Some(self.tool_call_chunk(serde_json::json!({
-                "index": self.tool_position(*index)?,
-                "id": id,
-                "type": "function",
-                "function": {"name": name, "arguments": ""},
-            }))),
+            AnthropicStreamEvent::ContentBlockStart { content_block, .. } => {
+                let (id, name, input) = stream_tool_use(content_block)?;
+                Some(self.tool_call_chunk(serde_json::json!({
+                    "index": self.event_tool?,
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": input.unwrap_or_default()},
+                })))
+            }
             AnthropicStreamEvent::ContentBlockDelta {
-                index,
                 delta: AnthropicStreamDelta::InputJsonDelta { partial_json },
-            } if !partial_json.is_empty() => Some(self.tool_call_chunk(serde_json::json!({
-                "index": self.tool_position(*index)?,
+                ..
+            } => Some(self.tool_call_chunk(serde_json::json!({
+                "index": self.event_tool?,
                 "function": {"arguments": partial_json},
             }))),
-            AnthropicStreamEvent::ContentBlockStop { index } => {
-                let pos = self.tool_position(*index)?;
-                (!self.tool_blocks[pos].1).then(|| {
-                    self.tool_call_chunk(serde_json::json!({
-                        "index": pos,
-                        "function": {"arguments": "{}"},
-                    }))
-                })
+            AnthropicStreamEvent::ContentBlockStop { .. } => {
+                Some(self.tool_call_chunk(serde_json::json!({
+                    "index": self.event_tool?,
+                    "function": {"arguments": "{}"},
+                })))
             }
             AnthropicStreamEvent::ContentBlockDelta {
                 delta: AnthropicStreamDelta::TextDelta { text },
@@ -6810,6 +6844,45 @@ mod tests {
             ]
         );
         assert_eq!(finish, Some(FinishReason::ToolCalls));
+    }
+
+    /// Frames from Anthropic-compatible backends that deviate from Claude's
+    /// own: a block that cannot be read is ignored rather than failing the
+    /// stream, an input already present on the opening frame is kept, and
+    /// frames without `index` belong to the block that is open.
+    #[test]
+    fn stream_tool_use_tolerates_compatible_backend_variants() {
+        let frames = serde_json::json!([
+            {"type": "message_start", "message": {"id": "m", "model": "x"}},
+            {"type": "content_block_start", "index": 0, "content_block": null},
+            {"type": "content_block_start", "index": 0, "content_block": {"text": ""}},
+            {"type": "content_block_start", "content_block": {"type": "tool_use", "id": "t1", "name": "a", "input": {"k": 1}}},
+            {"type": "content_block_stop"},
+            {"type": "content_block_start", "content_block": {"type": "tool_use", "id": "t2", "name": "b", "input": {}}},
+            {"type": "content_block_delta", "delta": {"type": "input_json_delta", "partial_json": "{}"}},
+            {"type": "content_block_stop"},
+            {"type": "content_block_start", "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_stop"},
+        ]);
+        let mut state = StreamState::default();
+        let mut calls = Vec::new();
+        for frame in frames.as_array().unwrap() {
+            let ev: AnthropicStreamEvent = serde_json::from_value(frame.clone()).unwrap();
+            state.update(&ev);
+            if let Some(chunk) = state.to_chunk(&ev) {
+                calls.extend(chunk.delta.tool_calls.unwrap_or_default());
+            }
+        }
+        assert_eq!(
+            calls,
+            vec![
+                serde_json::json!({"index": 0, "id": "t1", "type": "function",
+                    "function": {"name": "a", "arguments": "{\"k\":1}"}}),
+                serde_json::json!({"index": 1, "id": "t2", "type": "function",
+                    "function": {"name": "b", "arguments": ""}}),
+                serde_json::json!({"index": 1, "function": {"arguments": "{}"}}),
+            ]
+        );
     }
 
     #[test]
