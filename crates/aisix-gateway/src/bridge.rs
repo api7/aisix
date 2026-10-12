@@ -385,8 +385,9 @@ pub enum BridgeError {
     #[error("this provider does not support {0}")]
     UnsupportedCapability(BridgeCapability),
     /// Customer-fixable upstream config — the admin's ProviderKey/Model
-    /// is set up wrong (missing api_base, missing model_name) or the
-    /// caller's request is malformed (e.g. split_system shape). Maps to
+    /// is set up wrong (missing api_base, missing model_name). A request
+    /// shape the bridge cannot translate is [`InvalidRequest`] instead,
+    /// whose message does not blame the upstream config. Maps to
     /// 400, not 500: it's the caller's mistake, retrying won't help, and
     /// a 5xx wrongly tells SDKs/monitoring it's a server fault (#367).
     /// Contrast [`Config`], reserved for errors *we* cause
@@ -727,7 +728,7 @@ impl BridgeError {
     /// error was raised.
     ///
     /// Gates the `aisix_deployment_*` families, which read as **upstream
-    /// health** for one deployment target. The three config/credential
+    /// health** for one deployment target. The config/credential/request
     /// variants are raised while the request is still being assembled — an
     /// empty or unusable `api_key`, a missing `model_name`/`api_base`, a
     /// body that would not serialize, a `split_system` shape the provider
