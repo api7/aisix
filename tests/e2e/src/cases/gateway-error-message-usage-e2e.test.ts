@@ -248,6 +248,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
     const event = await eventFor(r.requestId, what);
     expect(event.get("error_class"), what).toBe(want.errorClass);
     expect(event.get("error_message"), what).toBe(want.message);
+    return event;
   }
 
   const notFound = (model: string) => ({
@@ -345,17 +346,25 @@ describe("gateway-side failures name themselves on the usage event", () => {
     const audio = new FormData();
     audio.set("model", "gem-ghost-transcriptions");
     audio.set("file", new Blob([new Uint8Array([1, 2, 3])], { type: "audio/wav" }), "a.wav");
-    await expectNamed(
+    // Read only inside dispatch, so the event records the model the
+    // message names.
+    const transcription = await expectNamed(
       await send("/v1/audio/transcriptions", { form: audio }),
       "transcriptions",
       notFound("gem-ghost-transcriptions"),
     );
+    expect(transcription.get("requested_model")).toBe("gem-ghost-transcriptions");
 
     const file = new FormData();
     file.set("model", "gem-ghost-files");
     file.set("purpose", "batch");
     file.set("file", new Blob(["{}\n"], { type: "application/jsonl" }), "b.jsonl");
-    await expectNamed(await send("/v1/files", { form: file }), "files", notFound("gem-ghost-files"));
+    const files = await expectNamed(
+      await send("/v1/files", { form: file }),
+      "files",
+      notFound("gem-ghost-files"),
+    );
+    expect(files.get("requested_model")).toBe("gem-ghost-files");
 
     // The caller's key grants no passthrough route.
     await expectNamed(await send("/gem-route/chat/completions", { body: {} }), "passthrough", {

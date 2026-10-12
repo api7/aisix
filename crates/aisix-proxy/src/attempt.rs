@@ -728,7 +728,7 @@ mod tests {
 
         // A non-bridge variant: `attempt_error_from_proxy` yields "" here,
         // which would put the access log right back to naming no cause.
-        let not_found = ProxyError::ModelNotFound("model \"ghost\" not found".into());
+        let not_found = ProxyError::ModelNotFound("ghost".into());
         let (kind, msg) = access_log_error(&not_found);
         assert_eq!(kind, "model_not_found");
         assert!(msg.contains("ghost"), "{msg}");

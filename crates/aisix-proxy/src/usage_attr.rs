@@ -609,13 +609,25 @@ pub(crate) fn emit_error_usage_event(
 pub(crate) struct EventError {
     class: &'static str,
     message: String,
+    /// The model an unknown- or forbidden-model refusal names. Some
+    /// surfaces read the caller's `model` only inside dispatch and emit
+    /// with an empty `requested_model`; the event records it there, so
+    /// the message never carries a name the event does not.
+    model: Option<String>,
 }
 
 impl EventError {
     pub(crate) fn of(err: &ProxyError) -> Self {
+        let model = match err {
+            ProxyError::ModelNotFound(model) | ProxyError::ModelForbidden(model) => {
+                Some(model.clone())
+            }
+            _ => None,
+        };
         Self {
             class: crate::attempt::error_class(err),
             message: crate::attempt::gateway_error_message(err),
+            model,
         }
     }
 
@@ -624,6 +636,7 @@ impl EventError {
         Self {
             class,
             message: String::new(),
+            model: None,
         }
     }
 }
@@ -825,7 +838,10 @@ pub(crate) fn build_error_usage_event(
         request_id: request_id.to_string(),
         occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         api_key_id: api_key_id.to_string(),
-        requested_model: requested_model.to_string(),
+        requested_model: match error.model {
+            Some(model) if requested_model.is_empty() => model,
+            _ => requested_model.to_string(),
+        },
         status_code,
         inbound_protocol: inbound_protocol.to_string(),
         error_class: error.class.to_string(),

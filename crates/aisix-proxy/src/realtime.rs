@@ -1085,6 +1085,18 @@ async fn run_session(
         guardrail_blocked: session_error
             .as_ref()
             .is_some_and(ProxyError::is_guardrail_block),
+        // The refusal names itself, as on every other surface. An upstream
+        // failure that ended the session is not recorded here.
+        error_class: session_error
+            .as_ref()
+            .filter(|e| e.is_guardrail_block())
+            .map(|e| crate::attempt::error_class(e).to_string())
+            .unwrap_or_default(),
+        error_message: session_error
+            .as_ref()
+            .filter(|e| e.is_guardrail_block())
+            .map(crate::attempt::gateway_error_message)
+            .unwrap_or_default(),
         guardrail_monitor_hits: monitor_hits,
         applied_guardrails: crate::usage_attr::applied_guardrails(&audit),
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(&audit),
