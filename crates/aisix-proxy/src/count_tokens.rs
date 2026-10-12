@@ -749,7 +749,8 @@ async fn count_tokens_to_target(
         // This route dispatches only to Anthropic-protocol upstreams, which
         // read `output_config.effort` themselves, so the mapping outcome the
         // cross-provider bridge needs has no consumer here.
-        let (mapped, _) = crate::effort_mapping::anthropic_request(body.as_ref(), model);
+        let (mapped, _) =
+            crate::effort_mapping::anthropic_native_request(body.as_ref(), model, false);
         let mut body = match mapped {
             std::borrow::Cow::Owned(mapped) => mapped,
             std::borrow::Cow::Borrowed(_) => body.into_owned(),

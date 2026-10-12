@@ -817,7 +817,7 @@ pub fn translate_reasoning_effort_to_anthropic(
 /// Opus 4.5 and Sonnet 4.6 on, so Haiku 4.5, Sonnet 4.5 and every
 /// earlier family answer it with a 400. A name with no readable Claude
 /// version is not one of them.
-fn rejects_effort_parameter(model: &str) -> bool {
+pub fn rejects_effort_parameter(model: &str) -> bool {
     match claude_family_version(model) {
         Some(version) if version < (4, 5) => true,
         Some((4, 5)) => !model.to_ascii_lowercase().contains("opus"),
@@ -832,30 +832,56 @@ fn insert_thinking_budget(
     effort: &str,
     max_tokens: Option<u32>,
 ) -> Option<u32> {
+    let Some(budget) = thinking_budget_for(effort, max_tokens) else {
+        tracing::debug!(
+            reasoning_effort = %effort,
+            "dropping reasoning_effort on Anthropic dispatch: no thinking budget for it"
+        );
+        return None;
+    };
+    extras.insert(
+        "thinking".to_string(),
+        serde_json::json!({"type": "enabled", "budget_tokens": budget.budget_tokens}),
+    );
+    budget.required_max_tokens
+}
+
+/// The thinking budget an effort tier asks for on a Claude family that
+/// rejects `output_config.effort` (see [`rejects_effort_parameter`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThinkingBudget {
+    pub budget_tokens: u32,
+    /// The `max_tokens` the request must carry: `Some` only when the
+    /// caller sent none, since Anthropic requires it above the budget.
+    pub required_max_tokens: Option<u32>,
+}
+
+/// Size the thinking budget for an effort tier: minimal/low 1024,
+/// medium 2048, high 4096, xhigh 8192, max 16384. Without a caller
+/// `max_tokens` the request needs the budget plus [`DEFAULT_MAX_TOKENS`];
+/// a caller's own `max_tokens` is kept and the budget capped below it.
+/// `None` for an unrecognised tier, or when `max_tokens` is too small for
+/// Anthropic's minimum budget, in which case thinking stays off.
+pub fn thinking_budget_for(effort: &str, max_tokens: Option<u32>) -> Option<ThinkingBudget> {
     let budget = match effort {
         "minimal" | "low" => 1024,
         "medium" => 2048,
         "high" => 4096,
         "xhigh" => 8192,
         "max" => 16384,
-        other => {
-            tracing::debug!(
-                reasoning_effort = %other,
-                "dropping unrecognised reasoning_effort on Anthropic dispatch"
-            );
-            return None;
-        }
+        _ => return None,
     };
-    let (budget, required_max_tokens) = match max_tokens {
-        None => (budget, Some(budget + DEFAULT_MAX_TOKENS)),
+    Some(match max_tokens {
+        None => ThinkingBudget {
+            budget_tokens: budget,
+            required_max_tokens: Some(budget + DEFAULT_MAX_TOKENS),
+        },
         Some(max) if max <= MIN_THINKING_BUDGET_TOKENS => return None,
-        Some(max) => (budget.min(max - 1), None),
-    };
-    extras.insert(
-        "thinking".to_string(),
-        serde_json::json!({"type": "enabled", "budget_tokens": budget}),
-    );
-    required_max_tokens
+        Some(max) => ThinkingBudget {
+            budget_tokens: budget.min(max - 1),
+            required_max_tokens: None,
+        },
+    })
 }
 
 /// The smallest `thinking.budget_tokens` Anthropic accepts.

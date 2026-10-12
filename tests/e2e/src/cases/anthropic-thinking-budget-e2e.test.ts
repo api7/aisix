@@ -77,6 +77,22 @@ describe("reasoning effort → Claude families without effort support: thinking 
       });
     }
 
+    // `/v1/messages` and `/v1/messages/count_tokens` carry no OpenAI
+    // effort; an operator effort mapping is what injects one there.
+    for (const [alias, name] of [
+      ["mapped-sonnet-45", "claude-sonnet-4-5"],
+      ["mapped-opus-45", "claude-opus-4-5"],
+      ["mapped-sonnet-46", "claude-sonnet-4-6"],
+    ]) {
+      await seed.createModel({
+        display_name: alias,
+        provider: "anthropic",
+        model_name: name,
+        provider_key_id: anthropicPk.id,
+        effort_mapping: { "": "high" },
+      });
+    }
+
     const bedrockPk = await seed.createProviderKey({
       display_name: "budget-bedrock-pk",
       provider: "bedrock",
@@ -156,6 +172,28 @@ describe("reasoning effort → Claude families without effort support: thinking 
       .slice(baseline)
       .find((r) => pathPattern.test(r.path));
     expect(sent, `no upstream request matched ${pathPattern}`).toBeDefined();
+    return JSON.parse(sent!.body) as Record<string, any>;
+  }
+
+  /** POST an Anthropic-shape body and return what the upstream received. */
+  async function anthropicUpstreamBody(
+    endpoint: "/v1/messages" | "/v1/messages/count_tokens",
+    body: Record<string, unknown>,
+  ): Promise<Record<string, any>> {
+    const baseline = upstream!.receivedRequests.length;
+    const res = await fetch(`${app!.proxyUrl}${endpoint}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": CALLER_PLAINTEXT },
+      body: JSON.stringify({ messages: [{ role: "user", content: "probe" }], ...body }),
+    });
+    const text = await res.text();
+    // The mock answers a Messages reply on every path, which the
+    // token-counting route cannot read; only the request is asserted there.
+    if (endpoint === "/v1/messages") expect(res.status, text).toBe(200);
+    const sent = upstream!.receivedRequests
+      .slice(baseline)
+      .find((r) => r.path.endsWith(endpoint));
+    expect(sent, `no upstream request to ${endpoint}`).toBeDefined();
     return JSON.parse(sent!.body) as Record<string, any>;
   }
 
@@ -349,5 +387,66 @@ describe("reasoning effort → Claude families without effort support: thinking 
     expect(body.thinking).toEqual({ type: "enabled", budget_tokens: 4096 });
     expect(body.output_config).toBeUndefined();
     expect(body.max_tokens).toBe(4096 + 4096);
+  });
+
+  test("/v1/messages: a mapped effort on Sonnet 4.5 becomes a budget", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) return ctx.skip();
+    const roomy = await anthropicUpstreamBody("/v1/messages", {
+      model: "mapped-sonnet-45",
+      max_tokens: 8000,
+    });
+    expect(roomy.thinking).toEqual({ type: "enabled", budget_tokens: 4096 });
+    expect(roomy.output_config).toBeUndefined();
+    expect(roomy.max_tokens).toBe(8000);
+
+    const capped = await anthropicUpstreamBody("/v1/messages", {
+      model: "mapped-sonnet-45",
+      max_tokens: 3000,
+    });
+    expect(capped.thinking).toEqual({ type: "enabled", budget_tokens: 2999 });
+    expect(capped.max_tokens).toBe(3000);
+
+    const tiny = await anthropicUpstreamBody("/v1/messages", {
+      model: "mapped-sonnet-45",
+      max_tokens: 1024,
+    });
+    expect(tiny.thinking).toBeUndefined();
+    expect(tiny.output_config).toBeUndefined();
+
+    // What the caller stated natively goes upstream as written.
+    const nativeThinking = { type: "enabled", budget_tokens: 1500 };
+    const withThinking = await anthropicUpstreamBody("/v1/messages", {
+      model: "mapped-sonnet-45",
+      max_tokens: 8000,
+      thinking: nativeThinking,
+    });
+    expect(withThinking.thinking).toEqual(nativeThinking);
+    expect(withThinking.output_config).toBeUndefined();
+  });
+
+  test("/v1/messages: a mapped effort on Opus 4.5 and Sonnet 4.6 stays an effort", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) return ctx.skip();
+    for (const model of ["mapped-opus-45", "mapped-sonnet-46"]) {
+      const body = await anthropicUpstreamBody("/v1/messages", { model, max_tokens: 8000 });
+      expect(body.output_config, model).toEqual({ effort: "high" });
+      expect(body.thinking, model).toBeUndefined();
+      expect(body.max_tokens, model).toBe(8000);
+    }
+  });
+
+  test("/v1/messages/count_tokens: the same rewrite, with no max_tokens added", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) return ctx.skip();
+    const old = await anthropicUpstreamBody("/v1/messages/count_tokens", {
+      model: "mapped-sonnet-45",
+    });
+    expect(old.thinking).toEqual({ type: "enabled", budget_tokens: 4096 });
+    expect(old.output_config).toBeUndefined();
+    expect(old.max_tokens).toBeUndefined();
+
+    const current = await anthropicUpstreamBody("/v1/messages/count_tokens", {
+      model: "mapped-sonnet-46",
+    });
+    expect(current.output_config).toEqual({ effort: "high" });
+    expect(current.thinking).toBeUndefined();
   });
 });
