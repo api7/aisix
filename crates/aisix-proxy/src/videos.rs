@@ -1729,7 +1729,7 @@ pub async fn create_video(
                     &model_name,
                     &auth.entry.id,
                     status,
-                    crate::attempt::error_class(&err),
+                    crate::usage_attr::EventError::of(&err),
                     err.is_guardrail_block(),
                     &client,
                     crate::usage_attr::applied_guardrails(&audit),

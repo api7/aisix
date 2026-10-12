@@ -390,6 +390,56 @@ impl StreamFailure {
     }
 }
 
+/// A guardrail refusal that ended a stream after its `200` head. The
+/// stream keeps that status; its terminal usage event names the refusal
+/// with the class and text a buffered refusal carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamRefusal {
+    pub error_message: String,
+}
+
+impl StreamRefusal {
+    /// The refusal whose error frame carries `guardrail_name` / `unavailable`.
+    pub fn new(guardrail_name: Option<&str>, unavailable: Option<&str>) -> Self {
+        let err = crate::error::guardrail_block_error("response", guardrail_name, unavailable);
+        Self {
+            error_message: gateway_error_message(&err),
+        }
+    }
+
+    /// Stamp this refusal onto an attempt record bound for a usage event.
+    pub fn apply_to(&self, attempt: &mut AttemptInfo) {
+        attempt.error_class = GUARDRAIL_BLOCK_CLASS.to_string();
+        attempt.error_message = self.error_message.clone();
+    }
+}
+
+/// A stream's completion record, which a guardrail refusal can end.
+pub(crate) trait RecordsStreamRefusal {
+    fn refusal_slots(&mut self) -> (&mut bool, &mut Option<StreamRefusal>);
+
+    /// Mark the stream refused, with the text of the error frame it ends
+    /// on. The first refusal is the one recorded.
+    fn record_refusal(&mut self, guardrail_name: Option<&str>, unavailable: Option<&str>) {
+        let (blocked, refusal) = self.refusal_slots();
+        *blocked = true;
+        refusal.get_or_insert_with(|| StreamRefusal::new(guardrail_name, unavailable));
+    }
+}
+
+/// The class and message a stream's terminal event carries: its refusal's
+/// if a guardrail ended it, otherwise its upstream failure's.
+pub(crate) fn stream_error_fields(
+    refusal: Option<&StreamRefusal>,
+    failure: Option<&StreamFailure>,
+) -> (String, String) {
+    match (refusal, failure) {
+        (Some(r), _) => (GUARDRAIL_BLOCK_CLASS.to_string(), r.error_message.clone()),
+        (None, Some(f)) => (f.error_class.to_string(), f.error_message.clone()),
+        (None, None) => (String::new(), String::new()),
+    }
+}
+
 /// The usage-event status of a stream no guardrail refused: its upstream
 /// failure's status if it had one, `499` if the caller went away first,
 /// otherwise `200`. A failure outranks the disconnect: a relay that passes
@@ -417,15 +467,74 @@ pub(crate) fn access_log_error(err: &ProxyError) -> (&'static str, String) {
 }
 
 /// Bounded error class + short message for a per-attempt record, derived
-/// from a `ProxyError`. The class is [`error_class`]; only a bridge error
-/// carries a message. Shared by the `/v1/messages` and `/v1/responses`
-/// dispatch loops.
+/// from a `ProxyError`. The class is [`error_class`]; a bridge error
+/// carries its message, and so does a guardrail refusal of the upstream's
+/// answer, because that attempt is the request's terminal event and the
+/// refusal is the gateway's own (see [`gateway_error_message`]). Shared by
+/// the `/v1/messages` and `/v1/responses` dispatch loops.
 pub(crate) fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
     let message = match err {
         ProxyError::Bridge(be) => attempt_error_message(be),
+        ProxyError::ContentFiltered { .. } => gateway_error_message(err),
         _ => String::new(),
     };
     (error_class(err).to_string(), message)
+}
+
+/// The class of a guardrail refusal ([`ProxyError::ContentFiltered`]), for
+/// the paths that answer an output refusal without carrying the error
+/// itself to the usage event.
+pub(crate) const GUARDRAIL_BLOCK_CLASS: &str = "content_filter";
+
+/// The `error_message` a terminal usage event carries for a failure the
+/// gateway answered itself: the access log's text, for the variants whose
+/// text is entirely the gateway's own — fixed wording, operator-configured
+/// names, bounded vocabularies, and the caller's model name, which the
+/// event already holds as `requested_model`. Empty for the rest, because
+/// the usage event travels further than the access log (the control
+/// plane's store, OTLP, SLS) and must not carry what the caller or an
+/// upstream wrote.
+pub(crate) fn gateway_error_message(err: &ProxyError) -> String {
+    let gateway_text = match err {
+        ProxyError::MissingAuth
+        | ProxyError::MissingRouteAuthHeader(_)
+        | ProxyError::InvalidApiKey
+        | ProxyError::ApiKeyExpired
+        | ProxyError::ApiKeyDisabled
+        | ProxyError::JwtInvalid
+        | ProxyError::JwtExpired
+        | ProxyError::JwtClaimsRejected
+        | ProxyError::JwtInsufficientScope { .. }
+        | ProxyError::JwtIdentityUnmapped
+        | ProxyError::JwksUnavailable
+        | ProxyError::ModelNotFound(_)
+        | ProxyError::ModelForbidden(_)
+        | ProxyError::ModelIpRestricted(_)
+        | ProxyError::RouteIpRestricted(_)
+        | ProxyError::RouteForbidden(_)
+        | ProxyError::WebSocketUpgradeRequired { .. }
+        | ProxyError::ProviderUnavailable
+        | ProxyError::SemanticDecisionFailed { .. }
+        | ProxyError::AllCandidatesUnavailable { .. }
+        // Built by `guardrail_block_message`: policy wording and the
+        // guardrail's name, never the matched content.
+        | ProxyError::ContentFiltered { .. }
+        | ProxyError::BudgetExceeded(_)
+        | ProxyError::RequestTooLarge { .. }
+        | ProxyError::RateLimit(_)
+        | ProxyError::PolicyRateLimit { .. } => true,
+        // `InvalidRequest` can quote the request body (a serde message
+        // names the offending value), a video id is whatever the caller
+        // sent, and a bridge error carries upstream response text.
+        ProxyError::InvalidRequest(_) | ProxyError::VideoNotFound(_) | ProxyError::Bridge(_) => {
+            false
+        }
+    };
+    if gateway_text {
+        access_log_error(err).1
+    } else {
+        String::new()
+    }
 }
 
 /// Whether a failed attempt actually reached its upstream — the
@@ -613,6 +722,40 @@ mod tests {
         )));
     }
 
+    /// A usage event travels further than the access log, so only a
+    /// failure whose text is entirely the gateway's own carries it there.
+    #[test]
+    fn gateway_error_message_carries_only_gateway_text() {
+        let semantic = ProxyError::SemanticDecisionFailed {
+            router: "router-a".into(),
+            reason: crate::semantic::DecisionFailure::ClassifierTimeout,
+        };
+        assert_eq!(
+            gateway_error_message(&semantic),
+            "semantic router 'router-a' could not pick a route (classifier_timeout)"
+        );
+        assert_eq!(
+            gateway_error_message(&ProxyError::ModelNotFound("ghost".into())),
+            "model \"ghost\" not found"
+        );
+        for quoting in [
+            ProxyError::InvalidRequest("invalid type: string \"my prompt\"".into()),
+            ProxyError::VideoNotFound("caller-id".into()),
+            ProxyError::Bridge(BridgeError::Config("upstream said x".into())),
+        ] {
+            assert_eq!(gateway_error_message(&quoting), "", "{quoting:?}");
+        }
+        let refusal = ProxyError::ContentFiltered {
+            message: "request rejected by guardrail 'g'".into(),
+            unavailable: None,
+        };
+        assert_eq!(error_class(&refusal), GUARDRAIL_BLOCK_CLASS);
+        assert_eq!(
+            attempt_error_from_proxy(&refusal).1,
+            "request rejected by guardrail 'g'"
+        );
+    }
+
     /// AISIX-Cloud#1093: the access log is the one line an operator gets
     /// per request, so EVERY failure has to name itself there — including
     /// the variants `attempt_error_from_proxy` deliberately leaves
@@ -635,7 +778,7 @@ mod tests {
 
         // A non-bridge variant: `attempt_error_from_proxy` yields "" here,
         // which would put the access log right back to naming no cause.
-        let not_found = ProxyError::ModelNotFound("model \"ghost\" not found".into());
+        let not_found = ProxyError::ModelNotFound("ghost".into());
         let (kind, msg) = access_log_error(&not_found);
         assert_eq!(kind, "model_not_found");
         assert!(msg.contains("ghost"), "{msg}");
