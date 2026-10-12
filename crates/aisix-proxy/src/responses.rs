@@ -1141,10 +1141,9 @@ pub(crate) fn responses_item_role(item: &Value) -> Role {
 ///   the payload into a tool call on this surface. The same pair the
 ///   output scanner reads for a generated call.
 ///
-/// A replayed call's `call_id` is scanned too, without any Gemini thought
-/// signature riding in it — the same base id a chat `tool_calls[].id`
-/// contributes to its scan, and the same caller text an upstream
-/// receives (`aisix_gateway::tool_calls::tool_calls_scan_text`).
+/// A call's `call_id` is not scanned: tool-call ids are opaque handles,
+/// left out of scan text on every surface
+/// (`aisix_gateway::tool_calls::tool_calls_scan_text`).
 ///
 /// `arguments` / `input` are rewritten by the mask walker
 /// (`redact::redact_responses_item`); `name` is NOT, exactly as a
@@ -1171,11 +1170,6 @@ pub(crate) fn responses_item_role(item: &Value) -> Role {
 /// kind). Reading a key absent on other item types is a harmless no-op.
 /// <https://platform.openai.com/docs/api-reference/responses/create>
 pub(crate) fn responses_item_text(item: &Value) -> String {
-    let call_id = item
-        .get("name")
-        .and(item.get("call_id"))
-        .and_then(Value::as_str)
-        .map(|id| aisix_gateway::tool_calls::strip_thought_signature(id).to_string());
     [
         item.get("content"),
         item.get("output"),
@@ -1188,7 +1182,6 @@ pub(crate) fn responses_item_text(item: &Value) -> String {
     .into_iter()
     .flatten()
     .map(responses_value_text)
-    .chain(call_id)
     .filter(|s| !s.is_empty())
     .collect::<Vec<_>>()
     .join("\n")
@@ -7520,19 +7513,26 @@ data: [DONE]\n\n";
         assert!(scanned.contains("lookup") && scanned.contains("argtext"));
     }
 
-    /// A replayed call's `call_id` is caller text the upstream receives, so
-    /// its base id is scanned like a chat `tool_calls[].id`; the Gemini
-    /// thought signature riding in it is not.
+    /// Tool-call ids are opaque handles: neither a replayed call's
+    /// `call_id` nor a result's reaches the scan, while the call's name and
+    /// arguments do.
     #[test]
-    fn responses_input_scan_covers_a_replayed_call_id_without_its_signature() {
+    fn responses_input_scan_leaves_out_call_ids() {
         let item = serde_json::json!({
-            "type": "function_call", "call_id": "call_BASEID__thought__SIGNATURE",
-            "name": "lookup", "arguments": "{}"
+            "type": "function_call", "id": "fc_ITEMID", "call_id": "call_BASEID__thought__SIGNATURE",
+            "name": "lookup", "arguments": "{\"q\":\"argtext\"}"
         });
         let scanned = super::responses_item_text(&item);
-        assert!(scanned.contains("call_BASEID"), "got {scanned:?}");
-        assert!(!scanned.contains("SIGNATURE"), "got {scanned:?}");
-        // A result's `call_id` stays out, as a chat `tool_call_id` does.
+        assert!(
+            !scanned.contains("BASEID")
+                && !scanned.contains("SIGNATURE")
+                && !scanned.contains("ITEMID"),
+            "got {scanned:?}"
+        );
+        assert!(
+            scanned.contains("lookup") && scanned.contains("argtext"),
+            "got {scanned:?}"
+        );
         let output = serde_json::json!({
             "type": "function_call_output", "call_id": "call_BASEID", "output": "ok"
         });

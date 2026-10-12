@@ -432,11 +432,27 @@ struct Cell {
     terminal_upstream: Option<Duration>,
     /// See [`note_semantic_decision`].
     semantic: Option<aisix_obs::SemanticAccessLog>,
+    /// See [`note_terminal_error`]: `(status, error_class, error_message)`
+    /// of the terminal event, `None` when it named no failure.
+    terminal_error: Option<(u16, String, String)>,
     /// The `upstream` end-to-end observation has been recorded.
     e2e_upstream_recorded: bool,
 }
 
 impl Cell {
+    /// Name the request's failure on its line from the terminal usage event,
+    /// when the line's writer had no typed error to name it with — the
+    /// families that hand back an already-rendered response (`/a2a`,
+    /// `/mcp`) or report a refusal as a success (a buffered output
+    /// guardrail block). The line is completed when the request ends, after
+    /// the terminal event, so the event is known by then even where the
+    /// line was built first.
+    fn name_failure(&self, record: &mut aisix_obs::AccessLogRecord) {
+        if let Some((status, class, message)) = &self.terminal_error {
+            record.fill_error_if_absent(*status, class, message);
+        }
+    }
+
     /// The `upstream` end-to-end observation, once both of its halves are
     /// known and it has not been recorded yet.
     fn take_e2e_upstream(
@@ -685,6 +701,7 @@ impl RequestAttribution {
         let mut cell = self.lock();
         let mut record = line.to_record();
         record.semantic = cell.semantic.clone();
+        cell.name_failure(&mut record);
         let ready = ReadyLine {
             record,
             duration_from,
@@ -718,7 +735,10 @@ impl RequestAttribution {
     pub(crate) fn finish(&self) {
         let mut cell = self.lock();
         cell.finished = true;
-        let line = cell.ready_line.take();
+        let mut line = cell.ready_line.take();
+        if let Some(line) = line.as_mut() {
+            cell.name_failure(&mut line.record);
+        }
         let sizes = self.body_sizes(cell.head_written);
         let span = cell.request_span.clone();
         drop(cell);
@@ -1206,6 +1226,15 @@ pub(crate) fn note_e2e_downstream(
     downstream: Duration,
 ) {
     record_e2e_upstream(|cell| cell.e2e_labels = Some((metrics, labels, downstream)));
+}
+
+/// Note the failure the request's terminal usage event names, so the
+/// access-log line carries it too ([`Cell::name_failure`]). Called from the
+/// emission chokepoint, so every family records it the same way.
+pub(crate) fn note_terminal_error(status: u16, error_class: &str, error_message: &str) {
+    let failure = (!error_class.is_empty())
+        .then(|| (status, error_class.to_string(), error_message.to_string()));
+    let _ = CURRENT.try_with(|a| a.lock().terminal_error = failure);
 }
 
 /// Note the upstream duration of the attempt behind the request's terminal

@@ -116,11 +116,11 @@ pub fn reject_legacy_function_calling(req: &ChatFormat) -> Result<(), BridgeErro
 }
 
 /// The text a guardrail scans for a `tool_calls` array: every call as it
-/// is, but with any thought signature cut off its `id`. The base id is
-/// part of what the call carries — on the input side it is caller text an
-/// upstream receives — so it is scanned like the rest of the call; the
-/// signature is hundreds of bytes of opaque base64 a keyword rule could
-/// match by chance, and no upstream but Gemini ever sees it.
+/// is, minus its id. An id is an opaque handle that links a call to its
+/// result; it carries no content, and scanning it only produces false
+/// positives — Gemini ids carry hundreds of bytes of thought signature, and
+/// upstream-generated ids are random strings a keyword rule can match by
+/// chance.
 pub fn tool_calls_scan_text(tool_calls: &Value) -> String {
     match tool_calls {
         Value::Array(calls) => blocks_scan_text(calls),
@@ -128,23 +128,25 @@ pub fn tool_calls_scan_text(tool_calls: &Value) -> String {
     }
 }
 
+/// The top-level keys that hold a tool-call id on any wire this gateway
+/// speaks: a chat call's and an Anthropic block's `id`, a Responses
+/// `call_id`, and the result-side back-references.
+pub const TOOL_CALL_ID_KEYS: [&str; 4] = ["id", "call_id", "tool_use_id", "tool_call_id"];
+
 /// [`tool_calls_scan_text`] over any list of tool-call-bearing objects
-/// (an Anthropic `content` array included): each one serialized with its
-/// `id` reduced to the base id, as a JSON array.
+/// (an Anthropic `content` array included): each one serialized without its
+/// id keys, as a JSON array.
 pub fn blocks_scan_text<'a>(blocks: impl IntoIterator<Item = &'a Value>) -> String {
-    struct BaseId<'a>(&'a Value);
-    impl serde::Serialize for BaseId<'_> {
+    struct WithoutIds<'a>(&'a Value);
+    impl serde::Serialize for WithoutIds<'_> {
         fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             use serde::ser::SerializeMap;
             match self.0 {
                 Value::Object(obj) => {
                     let mut map = serializer.serialize_map(None)?;
                     for (k, v) in obj {
-                        match (k.as_str(), v) {
-                            ("id", Value::String(id)) => {
-                                map.serialize_entry(k, strip_thought_signature(id))?
-                            }
-                            _ => map.serialize_entry(k, v)?,
+                        if !TOOL_CALL_ID_KEYS.contains(&k.as_str()) {
+                            map.serialize_entry(k, v)?;
                         }
                     }
                     map.end()
@@ -153,7 +155,7 @@ pub fn blocks_scan_text<'a>(blocks: impl IntoIterator<Item = &'a Value>) -> Stri
             }
         }
     }
-    let blocks: Vec<BaseId<'_>> = blocks.into_iter().map(BaseId).collect();
+    let blocks: Vec<WithoutIds<'_>> = blocks.into_iter().map(WithoutIds).collect();
     serde_json::to_string(&blocks).unwrap_or_default()
 }
 
@@ -225,16 +227,21 @@ mod tests {
     }
 
     #[test]
-    fn scan_text_carries_the_base_id_without_its_signature() {
+    fn scan_text_carries_no_tool_call_id() {
         let text = tool_calls_scan_text(&json!([
             {"id": "call_a__thought__c2ln", "type": "function",
-             "function": {"name": "lookup", "arguments": "{\"q\":1}"}}
+             "function": {"name": "lookup", "arguments": "{\"id\":\"arg_id\"}"}}
         ]));
-        assert!(text.contains("\"call_a\""), "{text}");
+        assert!(!text.contains("call_a") && !text.contains("c2ln"), "{text}");
+        assert!(text.contains("lookup") && text.contains("arg_id"), "{text}");
+        let blocks = blocks_scan_text(&[
+            json!({"type": "tool_use", "id": "toolu_x", "name": "f", "input": {"id": "in_id"}}),
+            json!({"type": "web_search_tool_result", "tool_use_id": "srvtoolu_y", "content": []}),
+        ]);
         assert!(
-            !text.contains("__thought__") && !text.contains("c2ln"),
-            "{text}"
+            !blocks.contains("toolu_x") && !blocks.contains("srvtoolu_y"),
+            "{blocks}"
         );
-        assert!(text.contains("lookup") && text.contains("{\\\"q\\\":1}"));
+        assert!(blocks.contains("in_id"), "{blocks}");
     }
 }

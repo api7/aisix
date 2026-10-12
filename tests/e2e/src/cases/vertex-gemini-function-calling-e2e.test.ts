@@ -723,8 +723,8 @@ describe("a Gemini tool call id continuing on another provider", () => {
       model_name: "gemini-2.5-flash",
       provider_key_id: vertexPk.id,
     });
-    // A moderation guardrail scans the whole tool-call payload; what it is
-    // sent is recorded.
+    // A moderation guardrail scans the tool calls; what it is sent is
+    // recorded.
     const guarded = await seed.createModel({
       display_name: "portable-gemini-guarded",
       provider: "google",
@@ -967,7 +967,7 @@ describe("a Gemini tool call id continuing on another provider", () => {
     expectPortable(lastAt("/responses").input.filter((i: any) => i.call_id).map((i: any) => i.call_id));
   });
 
-  test("guardrails scan tool call ids without their signature", async (ctx) => {
+  test("guardrails scan tool calls without their ids", async (ctx) => {
     if (!etcdReachable || !app || !vertex) return ctx.skip();
     // Turn 1 runs the output scan over the signed calls, turn 2 the input
     // scan over the history carrying them.
@@ -985,18 +985,17 @@ describe("a Gemini tool call id continuing on another provider", () => {
     expect(signed, "Gemini's first call carries its signature in the id").toBeDefined();
     const [signedBase, signature] = signed!.split("__thought__");
     const withCalls = moderated.filter((text) => text.includes("get_weather"));
-    // The calls were scanned on the way out and on the way back in, ids
-    // included — but not the signature riding in the first one.
+    // The calls were scanned on the way out and on the way back in, but an
+    // id — base or signature — is an opaque handle and never scan text.
     expect(withCalls.length).toBeGreaterThanOrEqual(2);
-    const unsigned = ids.filter((id) => id !== signed);
-    for (const text of withCalls) {
-      for (const id of unsigned) expect(text).toContain(id);
-      expect(text).toContain(`"${signedBase}"`);
+    for (const text of moderated) {
+      for (const id of ids) expect(text).not.toContain(id);
+      expect(text).not.toContain(signedBase);
       expect(text).not.toContain(signature);
     }
   });
 
-  test("the /v1/responses input scan reads a replayed call_id without its signature", async (ctx) => {
+  test("the /v1/responses input scan leaves a replayed call_id out", async (ctx) => {
     if (!etcdReachable || !app || !vertex) return ctx.skip();
     const first = await post(app, "/v1/responses", {
       model: "portable-gemini",
@@ -1022,7 +1021,9 @@ describe("a Gemini tool call id continuing on another provider", () => {
     await res.text();
     const scanned = moderated.filter((text) => text.includes("get_weather"));
     expect(scanned.length, "the replayed calls were scanned").toBeGreaterThan(0);
-    expect(scanned.some((text) => text.includes(signedBase))).toBe(true);
-    for (const text of moderated) expect(text).not.toContain(signature);
+    for (const text of moderated) {
+      expect(text).not.toContain(signedBase);
+      expect(text).not.toContain(signature);
+    }
   });
 });
