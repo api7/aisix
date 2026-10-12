@@ -726,6 +726,7 @@ impl Bridge for AzureOpenAiBridge {
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
+        let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let deployment = upstream_model(ctx)?;
         let upstream = AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
         // Keep reserved-config helpers reachable from the public surface
@@ -802,6 +803,7 @@ impl Bridge for AzureOpenAiBridge {
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
+        let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let deployment = upstream_model(ctx)?;
         let upstream = AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
         let _ = wire::reserved_query_params();

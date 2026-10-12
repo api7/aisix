@@ -5,7 +5,9 @@ import {
   EtcdClient,
   SeedClient,
   spawnApp,
+  startOpenAiUpstream,
   waitConfigPropagation,
+  type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
 
@@ -23,7 +25,10 @@ const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
 
-const SIGNATURE = "c2lnbmF0dXJlLWZvci1wYXJpcw==";
+// Gemini signatures are standard base64 and hundreds of bytes long; their
+// length, `+`, `/` and padding are what an id must not carry to other
+// providers.
+const SIGNATURE = "c2ln+bmF0/dXJl".repeat(20) + "c2lnbg==";
 const FINAL_ANSWER = "Sunny in Paris, 21 degrees in Rome.";
 
 const WEATHER_TOOL = {
@@ -446,30 +451,34 @@ describe("function calling on Vertex's native Gemini wire", () => {
     const sent = lastUpstreamBody();
     expect(sent.contents.map((c: any) => c.role)).toEqual(["user", "model", "user"]);
     const model = sent.contents[1].parts;
-    expect(model.map((p: any) => p.functionCall)).toEqual([
-      { name: "get_weather", args: { city: "Paris" } },
-      { name: "get_weather", args: { city: "Rome" } },
+    expect(model.map((p: any) => [p.functionCall.name, p.functionCall.args])).toEqual([
+      ["get_weather", { city: "Paris" }],
+      ["get_weather", { city: "Rome" }],
     ]);
     // Gemini rejects a replayed call without the signature it was sent with.
     expect(model[0].thoughtSignature).toBe(SIGNATURE);
-    expect(sent.contents[2].parts.map((p: any) => p.functionResponse)).toEqual([
-      { name: "get_weather", response: { content: "sunny" } },
-      { name: "get_weather", response: { temp: 21 } },
+    expect(
+      sent.contents[2].parts.map((p: any) => [p.functionResponse.name, p.functionResponse.response]),
+    ).toEqual([
+      ["get_weather", { content: "sunny" }],
+      ["get_weather", { temp: 21 }],
     ]);
   });
 
-  test("Gemini 3: replayed calls and responses carry the call id", async (ctx) => {
+  test.each(["vertex-fc-gemini", "vertex-fc-gemini-3"])(
+    "%s: replayed calls and responses carry the call id",
+    async (modelName, ctx) => {
     if (!etcdReachable || !app || !upstream) return ctx.skip();
     const question = { role: "user", content: "Weather in Paris and Rome?" };
     const first = await post(app, "/v1/chat/completions", {
-      model: "vertex-fc-gemini-3",
+      model: modelName,
       messages: [question],
       tools: [WEATHER_TOOL],
     });
     expect(first.status).toBe(200);
     const assistant = ((await first.json()) as any).choices[0].message;
     const second = await post(app, "/v1/chat/completions", {
-      model: "vertex-fc-gemini-3",
+      model: modelName,
       messages: [
         question,
         assistant,
@@ -486,7 +495,8 @@ describe("function calling on Vertex's native Gemini wire", () => {
     expect(callIds.every((id: unknown) => typeof id === "string" && id.length > 0)).toBe(true);
     expect(responseIds).toEqual(callIds);
     expect(sent.contents[1].parts[0].thoughtSignature).toBe(SIGNATURE);
-  });
+  },
+  );
 
   test("messages: a tool_result history goes back as functionResponse parts", async (ctx) => {
     if (!etcdReachable || !app || !upstream) return ctx.skip();
@@ -530,9 +540,240 @@ describe("function calling on Vertex's native Gemini wire", () => {
     const responses = sent.contents.flatMap((c: any) =>
       (c.parts ?? []).filter((p: any) => p.functionResponse),
     );
-    expect(responses.map((p: any) => p.functionResponse)).toEqual([
-      { name: "get_weather", response: { content: "sunny" } },
-      { name: "get_weather", response: { content: "windy" } },
+    expect(
+      responses.map((p: any) => [p.functionResponse.name, p.functionResponse.response]),
+    ).toEqual([
+      ["get_weather", { content: "sunny" }],
+      ["get_weather", { content: "windy" }],
+    ]);
+  });
+
+  test("chat: ids handed to the client are portable", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) return ctx.skip();
+    const res = await post(app, "/v1/chat/completions", {
+      model: "vertex-fc-gemini",
+      messages: [{ role: "user", content: "Weather in Paris and Rome?" }],
+      tools: [WEATHER_TOOL],
+    });
+    expect(res.status).toBe(200);
+    const calls = ((await res.json()) as any).choices[0].message.tool_calls;
+    for (const call of calls) expect(call.id).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+
+  test("chat: a schema the typed form cannot express goes as parametersJsonSchema", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) return ctx.skip();
+    const parameters = {
+      type: "object",
+      properties: {
+        place: { oneOf: [{ type: "string" }, { type: "integer" }] },
+      },
+      required: ["place"],
+    };
+    const res = await post(app, "/v1/chat/completions", {
+      model: "vertex-fc-gemini",
+      messages: [{ role: "user", content: "Weather in Paris?" }],
+      tools: [{ type: "function", function: { name: "get_weather", parameters } }],
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+    const declaration = lastUpstreamBody().tools[0].functionDeclarations[0];
+    expect(declaration.parametersJsonSchema).toEqual(parameters);
+    expect(declaration.parameters).toBeUndefined();
+  });
+
+  test.each([
+    ["legacy functions", { functions: [WEATHER_TOOL.function] }],
+    ["legacy function_call", { tools: [WEATHER_TOOL], function_call: "auto" }],
+    ["a hosted tool", { tools: [{ type: "web_search_preview" }] }],
+    [
+      "an unnamed tool_choice object",
+      { tools: [WEATHER_TOOL], tool_choice: { type: "allowed_tools", allowed_tools: {} } },
+    ],
+  ])("chat: %s is refused, not dropped", async (_what, extra, ctx) => {
+    if (!etcdReachable || !app || !upstream) return ctx.skip();
+    const before = upstream.received.length;
+    const res = await post(app, "/v1/chat/completions", {
+      model: "vertex-fc-gemini",
+      messages: [{ role: "user", content: "Weather in Paris?" }],
+      ...extra,
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as any;
+    expect(body.error.type).toBe("invalid_request_error");
+    expect(upstream.received.length).toBe(before);
+  });
+});
+
+// A tool call id minted for a Gemini answer carries that answer's thought
+// signature. When the conversation continues on another provider the id
+// has to be one that provider accepts: OpenAI caps ids at 64 characters,
+// Bedrock also restricts them to [A-Za-z0-9_-].
+describe("a Gemini tool call id continuing on another provider", () => {
+  let app: SpawnedApp | undefined;
+  let vertex: VertexUpstream | undefined;
+  let openai: OpenAiUpstream | undefined;
+  let bedrock: { baseUrl: string; bodies: any[]; close(): Promise<void> } | undefined;
+  let etcdReachable = false;
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+    vertex = await startVertexUpstream();
+    openai = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "chatcmpl-1",
+        object: "chat.completion",
+        created: 1,
+        model: "gpt-4o",
+        choices: [{ index: 0, message: { role: "assistant", content: FINAL_ANSWER }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+    });
+    const bodies: any[] = [];
+    const server: Server = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            output: { message: { role: "assistant", content: [{ text: FINAL_ANSWER }] } },
+            stopReason: "end_turn",
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            metrics: { latencyMs: 1 },
+          }),
+        );
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const addr = server.address() as { port: number };
+    bedrock = {
+      baseUrl: `http://127.0.0.1:${addr.port}`,
+      bodies,
+      close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    };
+
+    app = await spawnApp();
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    const vertexPk = await seed.createProviderKey({
+      display_name: "vertex-portable-pk",
+      provider: "google",
+      adapter: "vertex",
+      secret: JSON.stringify({ access_token: "ya29.portable", project: "p", region: "us-central1" }),
+      api_base: vertex.baseUrl,
+    });
+    await seed.createModel({
+      display_name: "portable-gemini",
+      provider: "google",
+      model_name: "gemini-2.5-flash",
+      provider_key_id: vertexPk.id,
+    });
+    const openaiPk = await seed.createProviderKey({
+      display_name: "portable-openai-pk",
+      secret: "sk-openai-mock",
+      api_base: `${openai.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "portable-gpt",
+      provider: "openai",
+      model_name: "gpt-4o",
+      provider_key_id: openaiPk.id,
+    });
+    const bedrockPk = await seed.createProviderKey({
+      display_name: "portable-bedrock-pk",
+      provider: "bedrock",
+      adapter: "bedrock",
+      secret: JSON.stringify({
+        access_key_id: "AKIA-portable",
+        secret_access_key: "sk-portable",
+        region: "us-west-2",
+      }),
+      api_base: bedrock.baseUrl,
+    });
+    await seed.createModel({
+      display_name: "portable-nova",
+      provider: "bedrock",
+      model_name: "amazon.nova-pro-v1:0",
+      provider_key_id: bedrockPk.id,
+    });
+    await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      await res.text();
+      return res.status === 200;
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await vertex?.close();
+    await openai?.close();
+    await bedrock?.close();
+  });
+
+  async function geminiHistory(): Promise<any[]> {
+    const question = { role: "user", content: "Weather in Paris and Rome?" };
+    const first = await post(app!, "/v1/chat/completions", {
+      model: "portable-gemini",
+      messages: [question],
+      tools: [WEATHER_TOOL],
+    });
+    expect(first.status).toBe(200);
+    const assistant = ((await first.json()) as any).choices[0].message;
+    expect(assistant.tool_calls).toHaveLength(2);
+    return [
+      question,
+      assistant,
+      ...assistant.tool_calls.map((c: any) => ({ role: "tool", tool_call_id: c.id, content: "sunny" })),
+    ];
+  }
+
+  function expectPortable(ids: string[]) {
+    expect(ids).toHaveLength(4);
+    for (const id of ids) {
+      expect(id.length).toBeLessThanOrEqual(64);
+      expect(id).toMatch(/^[A-Za-z0-9_-]+$/);
+    }
+    // Each call and the result answering it still agree.
+    expect(ids.slice(0, 2)).toEqual(ids.slice(2));
+  }
+
+  test("an OpenAI upstream receives ids it accepts", async (ctx) => {
+    if (!etcdReachable || !app || !openai) return ctx.skip();
+    const messages = await geminiHistory();
+    const res = await post(app, "/v1/chat/completions", {
+      model: "portable-gpt",
+      messages,
+      tools: [WEATHER_TOOL],
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+    const sent = JSON.parse(openai.receivedRequests.at(-1)!.body);
+    expectPortable([
+      ...sent.messages[1].tool_calls.map((c: any) => c.id),
+      ...sent.messages.slice(2).map((m: any) => m.tool_call_id),
+    ]);
+  });
+
+  test("a Bedrock upstream receives ids it accepts", async (ctx) => {
+    if (!etcdReachable || !app || !bedrock) return ctx.skip();
+    const messages = await geminiHistory();
+    const res = await post(app, "/v1/chat/completions", {
+      model: "portable-nova",
+      messages,
+      tools: [WEATHER_TOOL],
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+    const sent = bedrock.bodies.at(-1);
+    const blocks = sent.messages.flatMap((m: any) => m.content);
+    expectPortable([
+      ...blocks.filter((b: any) => b.toolUse).map((b: any) => b.toolUse.toolUseId),
+      ...blocks.filter((b: any) => b.toolResult).map((b: any) => b.toolResult.toolUseId),
     ]);
   });
 });

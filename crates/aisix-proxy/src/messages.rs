@@ -1252,6 +1252,10 @@ async fn anthropic_passthrough_dispatch(
         if let Some(m) = body.get_mut("model") {
             *m = Value::String(upstream_model.clone());
         }
+        // A Gemini thought signature riding in a tool id is for Gemini only.
+        if let Some(messages) = body.get_mut("messages") {
+            aisix_gateway::tool_calls::strip_thought_signatures_in_body(messages);
+        }
 
         // Apply the PK's `request.*` override block to the outbound
         // body. Mirrors the OpenAI dispatch path's `prepare_outbound_body`
@@ -1830,7 +1834,10 @@ async fn anthropic_passthrough_dispatch(
                 if !out_text.is_empty() {
                     out_text.push('\n');
                 }
-                out_text.push_str(&serde_json::to_string(&scannable).unwrap_or_default());
+                // Every block but its `id`: a tool id is an opaque handle.
+                out_text.push_str(&aisix_gateway::tool_calls::tool_calls_scan_text(
+                    &Value::Array(scannable.into_iter().cloned().collect()),
+                ));
 
                 let synth = aisix_gateway::ChatResponse {
                     id: String::new(),

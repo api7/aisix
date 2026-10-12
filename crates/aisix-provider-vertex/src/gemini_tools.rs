@@ -276,7 +276,7 @@ fn decode_signature(encoded: &str) -> String {
             c => c,
         })
         .collect();
-    while signature.len() % 4 != 0 {
+    while !signature.len().is_multiple_of(4) {
         signature.push('=');
     }
     signature

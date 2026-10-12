@@ -1274,6 +1274,10 @@ async fn responses_to_target(
         if let Some(m) = body.get_mut("model") {
             *m = Value::String(upstream_model.clone());
         }
+        // A Gemini thought signature riding in a call id is for Gemini only.
+        if let Some(input) = body.get_mut("input") {
+            aisix_gateway::tool_calls::strip_thought_signatures_in_body(input);
+        }
 
         // Apply the PK's `request.*` overrides to the outbound body, matching the
         // OpenAI bridge's chat() path and the /v1/messages passthrough. The

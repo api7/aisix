@@ -654,6 +654,11 @@ impl Bridge for VertexBridge {
             ))
         })?;
         let _ = wire::reserved_query_params();
+        // The thought signature in a tool call id is for Gemini alone.
+        let req = match publisher {
+            VertexPublisher::Google => req,
+            _ => aisix_gateway::tool_calls::chat_without_thought_signatures(req),
+        };
 
         match publisher {
             VertexPublisher::Google => self.chat_gemini(req, ctx, upstream_id).await,
@@ -688,13 +693,18 @@ impl Bridge for VertexBridge {
                  mistral-* / jamba-*"
             ))
         })?;
+        // The thought signature in a tool call id is for Gemini alone.
+        let req = match publisher {
+            VertexPublisher::Google => req,
+            _ => aisix_gateway::tool_calls::chat_without_thought_signatures(req),
+        };
         // The Claude tool route's JSON only exists once the synthetic
         // tool call has been assembled, so it cannot be streamed as it
         // arrives. Run the request non-streaming and fake-stream the
         // translated result: the client sees an ordinary chunk sequence,
         // and usage rides its own terminal chunk exactly as on a real
-        // stream. Gemini never takes that route — this bridge sends it
-        // no tools — and the OpenAI-shim publishers speak
+        // stream. Gemini never takes that route — its structured output
+        // is native — and the OpenAI-shim publishers speak
         // `response_format` natively.
         if publisher == VertexPublisher::Anthropic
             && matches!(
