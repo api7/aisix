@@ -474,6 +474,7 @@ pub async fn messages(
                     AttemptInfo {
                         kind: "initial".to_string(),
                         error_class: crate::attempt::error_class(&err).to_string(),
+                        error_message: crate::attempt::gateway_error_message(&err),
                         ..Default::default()
                     },
                     guardrail_blocked,

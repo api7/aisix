@@ -79,6 +79,10 @@ struct AudioDispatchSuccess {
     /// `guardrail_blocked`) doesn't under-report spend — same convention as
     /// completions #911 [23] / responses #543.
     guardrail_blocked: bool,
+    /// The refusal's own text, from [`crate::attempt::gateway_error_message`],
+    /// so the usage event names the block the way an input refusal does.
+    /// Empty when nothing was blocked.
+    guardrail_block_message: String,
     /// Captured request/response content for content-capturing exporters
     /// (#700, LiteLLM parity: the audio bytes are represented by their
     /// sha256, text form fields verbatim; the response is the post-redaction
@@ -315,7 +319,7 @@ pub async fn transcriptions(
                     "",
                     &api_key_id,
                     status,
-                    crate::attempt::error_class(&err),
+                    crate::usage_attr::EventError::of(&err),
                     err.is_guardrail_block(),
                     &client,
                     crate::usage_attr::applied_guardrails(&audit),
@@ -547,7 +551,7 @@ pub async fn translations(
                     "",
                     &api_key_id,
                     status,
-                    crate::attempt::error_class(&err),
+                    crate::usage_attr::EventError::of(&err),
                     err.is_guardrail_block(),
                     &client,
                     crate::usage_attr::applied_guardrails(&audit),
@@ -809,7 +813,7 @@ pub async fn speech(
                     &model_name,
                     &api_key_id,
                     status,
-                    crate::attempt::error_class(&err),
+                    crate::usage_attr::EventError::of(&err),
                     err.is_guardrail_block(),
                     &client,
                     crate::usage_attr::applied_guardrails(&audit),
@@ -1775,6 +1779,7 @@ async fn multipart_dispatch(
                 redactions,
                 monitor_hits,
                 guardrail_blocked: false,
+                guardrail_block_message: String::new(),
                 // The guard's emit carries the captured content too.
                 captured_content: None,
             });
@@ -1878,14 +1883,15 @@ async fn multipart_dispatch(
             }
         }
         if let Some((guardrail_name, unavailable)) = refusal {
+            let block = crate::error::guardrail_block_error(
+                "response",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            );
+            let guardrail_block_message = crate::attempt::gateway_error_message(&block);
             return Ok(AudioDispatchSuccess {
                 usage_handled_by_stream: false,
-                response: crate::error::guardrail_block_error(
-                    "response",
-                    guardrail_name.as_deref(),
-                    unavailable.as_deref(),
-                )
-                .into_response(),
+                response: block.into_response(),
                 model_name,
                 provider: provider_label,
                 model_id: target.id.clone(),
@@ -1897,6 +1903,7 @@ async fn multipart_dispatch(
                 redactions,
                 monitor_hits: monitor_hits.clone(),
                 guardrail_blocked: true,
+                guardrail_block_message,
                 // The blocked transcript never reached the client — no
                 // content capture, matching the chat surface.
                 captured_content: None,
@@ -1943,6 +1950,7 @@ async fn multipart_dispatch(
         redactions,
         monitor_hits,
         guardrail_blocked: false,
+        guardrail_block_message: String::new(),
         captured_content,
     })
 }
@@ -2571,7 +2579,16 @@ fn emit_audio_usage(
         success.guardrail_blocked,
         success.captured_content.as_ref(),
         audit,
-        /* failure */ None,
+        // An output guardrail's refusal names itself like an input refusal
+        // does, through the same two fields a stream failure fills.
+        success
+            .guardrail_blocked
+            .then(|| crate::attempt::StreamFailure {
+                status,
+                error_class: crate::attempt::GUARDRAIL_BLOCK_CLASS,
+                error_message: success.guardrail_block_message.clone(),
+            })
+            .as_ref(),
         winner,
     );
 }

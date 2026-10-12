@@ -77,6 +77,10 @@ struct ResponseDispatchSuccess {
     /// it (silently zeroing the tokens would underreport spend the operator
     /// paid the provider for).
     guardrail_blocked: bool,
+    /// The refusal's own text, from [`crate::attempt::gateway_error_message`],
+    /// so the usage event names the block the way an input refusal does.
+    /// Empty when nothing was blocked.
+    guardrail_block_message: String,
     /// `true` on the verbatim streaming path: the response stream's Drop
     /// guard owns the UsageEvent emit (parsed from the terminal SSE event),
     /// so the top-level handler must NOT emit the winner event again (#808).
@@ -404,6 +408,12 @@ pub async fn responses(
                         }
                         None => status,
                     };
+                    // An output guardrail's refusal names itself like an
+                    // input refusal does.
+                    if success.guardrail_blocked {
+                        attempt.error_class = crate::attempt::GUARDRAIL_BLOCK_CLASS.to_string();
+                        attempt.error_message = success.guardrail_block_message.clone();
+                    }
                     // `latency_ms` is scoped to the winning attempt — the
                     // failed ones before it emitted their own events, so
                     // `elapsed` would double-count them. Access log keeps the
@@ -561,6 +571,7 @@ pub async fn responses(
                     AttemptInfo {
                         kind: "initial".to_string(),
                         error_class: crate::attempt::error_class(&err).to_string(),
+                        error_message: crate::attempt::gateway_error_message(&err),
                         ..Default::default()
                     },
                     guardrail_blocked,
@@ -1580,13 +1591,14 @@ async fn responses_to_target(
                 // Return the refusal as a terminal dispatch envelope so
                 // that measured TTFT is emitted exactly once even though
                 // the terminal usage frame was never reached.
+                let block = crate::error::guardrail_block_error(
+                    "response",
+                    None,
+                    Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+                );
+                let guardrail_block_message = crate::attempt::gateway_error_message(&block);
                 return Ok(ResponseDispatchSuccess {
-                    response: crate::error::guardrail_block_error(
-                        "response",
-                        None,
-                        Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
-                    )
-                    .into_response(),
+                    response: block.into_response(),
                     provider: provider_label,
                     usage: Some(ResponseUsage {
                         upstream_ttft_ms,
@@ -1597,6 +1609,7 @@ async fn responses_to_target(
                     upstream_model: upstream_model.clone(),
                     routing: RoutingTelemetry::default(),
                     guardrail_blocked: true,
+                    guardrail_block_message,
                     usage_handled_by_stream: false,
                     captured_content: match (&captured_prompt, content_cap) {
                         (Some(prompt), Some(cap)) => {
@@ -1649,13 +1662,14 @@ async fn responses_to_target(
             // was empty to begin with is an empty upstream response and
             // is left alone.
             if buf.is_empty() && seal.cut_anything() {
+                let block = crate::error::guardrail_block_error(
+                    "response",
+                    None,
+                    Some(crate::error::TAG_UNSCANNABLE_BODY),
+                );
+                let guardrail_block_message = crate::attempt::gateway_error_message(&block);
                 return Ok(ResponseDispatchSuccess {
-                    response: crate::error::guardrail_block_error(
-                        "response",
-                        None,
-                        Some(crate::error::TAG_UNSCANNABLE_BODY),
-                    )
-                    .into_response(),
+                    response: block.into_response(),
                     provider: provider_label,
                     usage: Some(ResponseUsage {
                         upstream_ttft_ms,
@@ -1666,6 +1680,7 @@ async fn responses_to_target(
                     upstream_model: upstream_model.clone(),
                     routing: RoutingTelemetry::default(),
                     guardrail_blocked: true,
+                    guardrail_block_message,
                     usage_handled_by_stream: false,
                     captured_content: match (&captured_prompt, content_cap) {
                         (Some(prompt), Some(cap)) => {
@@ -1775,13 +1790,14 @@ async fn responses_to_target(
                 // refusal as a successful dispatch envelope so the handler
                 // emits the terminal usage + TTFT observation with status
                 // 422, matching the cross-provider and non-streaming paths.
+                let block = crate::error::guardrail_block_error(
+                    "response",
+                    guardrail_name.as_deref(),
+                    unavailable.as_deref(),
+                );
+                let guardrail_block_message = crate::attempt::gateway_error_message(&block);
                 return Ok(ResponseDispatchSuccess {
-                    response: crate::error::guardrail_block_error(
-                        "response",
-                        guardrail_name.as_deref(),
-                        unavailable.as_deref(),
-                    )
-                    .into_response(),
+                    response: block.into_response(),
                     provider: provider_label,
                     usage: Some(usage),
                     model_id: model_id.to_string(),
@@ -1789,6 +1805,7 @@ async fn responses_to_target(
                     upstream_model: upstream_model.clone(),
                     routing: RoutingTelemetry::default(),
                     guardrail_blocked: true,
+                    guardrail_block_message,
                     usage_handled_by_stream: false,
                     output_redactions: crate::redact::RedactionCounts::new(),
                     output_monitor_hits,
@@ -1842,6 +1859,7 @@ async fn responses_to_target(
                 upstream_model: upstream_model.clone(),
                 routing: RoutingTelemetry::default(),
                 guardrail_blocked: false,
+                guardrail_block_message: String::new(),
                 usage_handled_by_stream: false,
                 output_redactions,
                 output_monitor_hits,
@@ -2115,6 +2133,7 @@ async fn responses_to_target(
             upstream_model: upstream_model.clone(),
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
+            guardrail_block_message: String::new(),
             usage_handled_by_stream: true,
             // The Drop guard's emit carries the counts.
             output_redactions: crate::redact::RedactionCounts::new(),
@@ -2215,13 +2234,14 @@ async fn responses_to_target(
                 // guardrail_blocked) — recording zero tokens would let the
                 // customer's ledger underreport spend they were charged for.
                 // This is the output analog of chat.rs's UpstreamCharge.
+                let block = crate::error::guardrail_block_error(
+                    "response",
+                    guardrail_name.as_deref(),
+                    unavailable.as_deref(),
+                );
+                let guardrail_block_message = crate::attempt::gateway_error_message(&block);
                 return Ok(ResponseDispatchSuccess {
-                    response: crate::error::guardrail_block_error(
-                        "response",
-                        guardrail_name.as_deref(),
-                        unavailable.as_deref(),
-                    )
-                    .into_response(),
+                    response: block.into_response(),
                     provider: provider_label,
                     usage,
                     model_id: model_id.to_string(),
@@ -2229,6 +2249,7 @@ async fn responses_to_target(
                     upstream_model: upstream_model.clone(),
                     routing: RoutingTelemetry::default(),
                     guardrail_blocked: true,
+                    guardrail_block_message,
                     usage_handled_by_stream: false,
                     output_redactions: crate::redact::RedactionCounts::new(),
                     // Hits observed by the blocking check still count.
@@ -2277,6 +2298,7 @@ async fn responses_to_target(
             upstream_model,
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
+            guardrail_block_message: String::new(),
             usage_handled_by_stream: false,
             output_redactions,
             output_monitor_hits,
@@ -2680,6 +2702,7 @@ async fn responses_cross_provider_to_target(
             upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
+            guardrail_block_message: String::new(),
             usage_handled_by_stream: true,
             // The stream's end-of-stream emit carries the counts.
             output_redactions: crate::redact::RedactionCounts::new(),
@@ -2800,13 +2823,14 @@ async fn responses_cross_provider_to_target(
             // #543: the upstream already billed — return the 422 body but
             // carry the billed usage (marked guardrail_blocked) so the
             // ledger doesn't underreport spend.
+            let block = crate::error::guardrail_block_error(
+                "response",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            );
+            let guardrail_block_message = crate::attempt::gateway_error_message(&block);
             return Ok(ResponseDispatchSuccess {
-                response: crate::error::guardrail_block_error(
-                    "response",
-                    guardrail_name.as_deref(),
-                    unavailable.as_deref(),
-                )
-                .into_response(),
+                response: block.into_response(),
                 provider: provider_label,
                 usage: Some(usage),
                 model_id: model_id.to_string(),
@@ -2814,6 +2838,7 @@ async fn responses_cross_provider_to_target(
                 upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 routing: RoutingTelemetry::default(),
                 guardrail_blocked: true,
+                guardrail_block_message,
                 usage_handled_by_stream: false,
                 output_redactions: crate::redact::RedactionCounts::new(),
                 // Hits observed by the blocking check still count.
@@ -2868,6 +2893,7 @@ async fn responses_cross_provider_to_target(
         upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
         routing: RoutingTelemetry::default(),
         guardrail_blocked: false,
+        guardrail_block_message: String::new(),
         usage_handled_by_stream: false,
         output_redactions,
         output_monitor_hits,

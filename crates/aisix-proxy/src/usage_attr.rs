@@ -23,6 +23,7 @@ use aisix_obs::{UsageEvent, UsageEventLabels};
 
 use crate::chat::sanitize_tag;
 use crate::client_ip::ClientContext;
+use crate::error::ProxyError;
 use crate::operation::Surface;
 use crate::state::ProxyState;
 
@@ -542,7 +543,7 @@ pub(crate) fn emit_error_usage_event(
     requested_model: &str,
     api_key_id: &str,
     status_code: u16,
-    error_class: &str,
+    error: EventError,
     // Whether this failure IS a guardrail refusal, from
     // [`ProxyError::is_guardrail_block`]. Every caller but the realtime
     // connect failure — which synthesizes its class without a `ProxyError`
@@ -577,7 +578,7 @@ pub(crate) fn emit_error_usage_event(
         requested_model,
         api_key_id,
         status_code,
-        error_class,
+        error,
         guardrail_blocked,
         client,
         applied,
@@ -600,6 +601,31 @@ pub(crate) fn emit_error_usage_event(
         usage_event_labels(&model, &pk),
         client.trace.as_ref(),
     );
+}
+
+/// The failure a request's terminal error event names: its
+/// [`crate::attempt::error_class`] and, for a failure whose text is the
+/// gateway's own, the [`crate::attempt::gateway_error_message`].
+pub(crate) struct EventError {
+    class: &'static str,
+    message: String,
+}
+
+impl EventError {
+    pub(crate) fn of(err: &ProxyError) -> Self {
+        Self {
+            class: crate::attempt::error_class(err),
+            message: crate::attempt::gateway_error_message(err),
+        }
+    }
+
+    /// A class the caller synthesizes without a `ProxyError`.
+    pub(crate) fn class_only(class: &'static str) -> Self {
+        Self {
+            class,
+            message: String::new(),
+        }
+    }
 }
 
 /// Emit one zero-token `UsageEvent` per FAILED attempt a single-shot
@@ -785,7 +811,7 @@ pub(crate) fn build_error_usage_event(
     requested_model: &str,
     api_key_id: &str,
     status_code: u16,
-    error_class: &str,
+    error: EventError,
     // See [`emit_error_usage_event`].
     guardrail_blocked: bool,
     client: &ClientContext,
@@ -802,7 +828,8 @@ pub(crate) fn build_error_usage_event(
         requested_model: requested_model.to_string(),
         status_code,
         inbound_protocol: inbound_protocol.to_string(),
-        error_class: error_class.to_string(),
+        error_class: error.class.to_string(),
+        error_message: error.message,
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         request_headers: client.request_headers.clone(),

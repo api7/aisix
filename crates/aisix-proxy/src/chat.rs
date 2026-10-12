@@ -630,8 +630,11 @@ pub async fn chat_completions(
                             attempt_model: winner
                                 .map(|w| w.target_model.clone())
                                 .unwrap_or_default(),
-                            error_class: String::new(),
-                            error_message: String::new(),
+                            // The output guardrail's refusal is what ended
+                            // the request, so it names itself like an input
+                            // refusal does.
+                            error_class: crate::attempt::error_class(&err).to_string(),
+                            error_message: crate::attempt::gateway_error_message(&err),
                             // The chain governed the request even though it
                             // ultimately blocked on the output filter.
                             applied_guardrails: applied_guardrails.clone(),
@@ -669,6 +672,7 @@ pub async fn chat_completions(
                             // Bounded ProxyError class so the dashboard can
                             // show why the request never reached an upstream.
                             error_class: crate::attempt::error_class(&err).to_string(),
+                            error_message: crate::attempt::gateway_error_message(&err),
                             // Input-blocked / pre-upstream errors still record
                             // the resolved guardrail chain (empty if it failed
                             // before resolution).

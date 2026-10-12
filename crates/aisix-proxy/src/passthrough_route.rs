@@ -355,7 +355,7 @@ pub async fn entry(
                 "",
                 api_key_id,
                 status,
-                crate::attempt::error_class(&error),
+                crate::usage_attr::EventError::of(&error),
                 error.is_guardrail_block(),
                 &client,
                 crate::usage_attr::applied_guardrails(&audit),

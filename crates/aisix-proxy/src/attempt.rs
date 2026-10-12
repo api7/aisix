@@ -417,15 +417,74 @@ pub(crate) fn access_log_error(err: &ProxyError) -> (&'static str, String) {
 }
 
 /// Bounded error class + short message for a per-attempt record, derived
-/// from a `ProxyError`. The class is [`error_class`]; only a bridge error
-/// carries a message. Shared by the `/v1/messages` and `/v1/responses`
-/// dispatch loops.
+/// from a `ProxyError`. The class is [`error_class`]; a bridge error
+/// carries its message, and so does a guardrail refusal of the upstream's
+/// answer, because that attempt is the request's terminal event and the
+/// refusal is the gateway's own (see [`gateway_error_message`]). Shared by
+/// the `/v1/messages` and `/v1/responses` dispatch loops.
 pub(crate) fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
     let message = match err {
         ProxyError::Bridge(be) => attempt_error_message(be),
+        ProxyError::ContentFiltered { .. } => gateway_error_message(err),
         _ => String::new(),
     };
     (error_class(err).to_string(), message)
+}
+
+/// The class of a guardrail refusal ([`ProxyError::ContentFiltered`]), for
+/// the paths that answer an output refusal without carrying the error
+/// itself to the usage event.
+pub(crate) const GUARDRAIL_BLOCK_CLASS: &str = "content_filter";
+
+/// The `error_message` a terminal usage event carries for a failure the
+/// gateway answered itself: the access log's text, for the variants whose
+/// text is entirely the gateway's own — fixed wording, operator-configured
+/// names, bounded vocabularies, and the caller's model name, which the
+/// event already holds as `requested_model`. Empty for the rest, because
+/// the usage event travels further than the access log (the control
+/// plane's store, OTLP, SLS) and must not carry what the caller or an
+/// upstream wrote.
+pub(crate) fn gateway_error_message(err: &ProxyError) -> String {
+    let gateway_text = match err {
+        ProxyError::MissingAuth
+        | ProxyError::MissingRouteAuthHeader(_)
+        | ProxyError::InvalidApiKey
+        | ProxyError::ApiKeyExpired
+        | ProxyError::ApiKeyDisabled
+        | ProxyError::JwtInvalid
+        | ProxyError::JwtExpired
+        | ProxyError::JwtClaimsRejected
+        | ProxyError::JwtInsufficientScope { .. }
+        | ProxyError::JwtIdentityUnmapped
+        | ProxyError::JwksUnavailable
+        | ProxyError::ModelNotFound(_)
+        | ProxyError::ModelForbidden(_)
+        | ProxyError::ModelIpRestricted(_)
+        | ProxyError::RouteIpRestricted(_)
+        | ProxyError::RouteForbidden(_)
+        | ProxyError::WebSocketUpgradeRequired { .. }
+        | ProxyError::ProviderUnavailable
+        | ProxyError::SemanticDecisionFailed { .. }
+        | ProxyError::AllCandidatesUnavailable { .. }
+        // Built by `guardrail_block_message`: policy wording and the
+        // guardrail's name, never the matched content.
+        | ProxyError::ContentFiltered { .. }
+        | ProxyError::BudgetExceeded(_)
+        | ProxyError::RequestTooLarge { .. }
+        | ProxyError::RateLimit(_)
+        | ProxyError::PolicyRateLimit { .. } => true,
+        // `InvalidRequest` can quote the request body (a serde message
+        // names the offending value), a video id is whatever the caller
+        // sent, and a bridge error carries upstream response text.
+        ProxyError::InvalidRequest(_) | ProxyError::VideoNotFound(_) | ProxyError::Bridge(_) => {
+            false
+        }
+    };
+    if gateway_text {
+        access_log_error(err).1
+    } else {
+        String::new()
+    }
 }
 
 /// Whether a failed attempt actually reached its upstream — the
@@ -611,6 +670,40 @@ mod tests {
         assert!(!attempt_reached_upstream(&ProxyError::ModelNotFound(
             "nope".into()
         )));
+    }
+
+    /// A usage event travels further than the access log, so only a
+    /// failure whose text is entirely the gateway's own carries it there.
+    #[test]
+    fn gateway_error_message_carries_only_gateway_text() {
+        let semantic = ProxyError::SemanticDecisionFailed {
+            router: "router-a".into(),
+            reason: crate::semantic::DecisionFailure::ClassifierTimeout,
+        };
+        assert_eq!(
+            gateway_error_message(&semantic),
+            "semantic router 'router-a' could not pick a route (classifier_timeout)"
+        );
+        assert_eq!(
+            gateway_error_message(&ProxyError::ModelNotFound("ghost".into())),
+            "model \"ghost\" not found"
+        );
+        for quoting in [
+            ProxyError::InvalidRequest("invalid type: string \"my prompt\"".into()),
+            ProxyError::VideoNotFound("caller-id".into()),
+            ProxyError::Bridge(BridgeError::Config("upstream said x".into())),
+        ] {
+            assert_eq!(gateway_error_message(&quoting), "", "{quoting:?}");
+        }
+        let refusal = ProxyError::ContentFiltered {
+            message: "request rejected by guardrail 'g'".into(),
+            unavailable: None,
+        };
+        assert_eq!(error_class(&refusal), GUARDRAIL_BLOCK_CLASS);
+        assert_eq!(
+            attempt_error_from_proxy(&refusal).1,
+            "request rejected by guardrail 'g'"
+        );
     }
 
     /// AISIX-Cloud#1093: the access log is the one line an operator gets

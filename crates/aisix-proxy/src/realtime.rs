@@ -323,7 +323,7 @@ pub(crate) async fn realtime(
                 params.get("model").map(String::as_str).unwrap_or(""),
                 api_key_id.unwrap_or(""),
                 status,
-                crate::attempt::error_class(&err),
+                crate::usage_attr::EventError::of(&err),
                 err.is_guardrail_block(),
                 &client,
                 // Refused before the handshake, so no chain was ever
@@ -375,11 +375,9 @@ async fn prepare(
     }
 
     let model_entry = crate::model_resolve::resolve_model(snapshot, &requested_model)
-        .ok_or_else(|| ProxyError::ModelNotFound(format!("model {requested_model:?} not found")))?;
+        .ok_or_else(|| ProxyError::ModelNotFound(requested_model.to_string()))?;
     if !auth.key().can_access(snapshot, &requested_model) {
-        return Err(ProxyError::ModelForbidden(format!(
-            "api key is not authorized for model {requested_model:?}"
-        )));
+        return Err(ProxyError::ModelForbidden(requested_model.to_string()));
     }
     let model = &model_entry.value;
     if model.is_routing() || model.is_ensemble() || model.is_semantic() {
@@ -831,7 +829,7 @@ async fn run_session(
                 &requested_model,
                 &auth.entry.id,
                 502,
-                "transport",
+                crate::usage_attr::EventError::class_only("transport"),
                 // Failing to open the upstream socket is not a guardrail
                 // decision, whatever the chain went on to allow.
                 /* guardrail_blocked */
