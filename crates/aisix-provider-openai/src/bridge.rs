@@ -497,6 +497,7 @@ impl Bridge for OpenAiBridge {
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
+        let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -737,6 +738,7 @@ impl Bridge for OpenAiBridge {
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
+        let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 

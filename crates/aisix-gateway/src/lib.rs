@@ -34,6 +34,7 @@ pub mod dns_cache;
 pub mod hub;
 pub mod sse;
 pub mod structured_output;
+pub mod tool_calls;
 pub mod upstream_headers;
 pub mod upstream_http;
 pub mod upstream_tls;
