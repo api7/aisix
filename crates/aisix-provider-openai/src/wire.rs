@@ -1609,12 +1609,6 @@ mod tests {
         assert_eq!(tool_msg["role"], "tool");
     }
 
-    /// Issue #393: OpenAI's embeddings response carries `embedding` as
-    /// either a JSON array (when the request set
-    /// `encoding_format: "float"`) OR a base64 string (when the
-    /// request set `encoding_format: "base64"`, which is the OpenAI
-    /// SDK default). Pre-fix the deserializer rejected the string
-    /// shape with `error decoding response body` → 502.
     #[test]
     fn tool_call_indexer_separates_calls_by_id_and_keeps_fragments_together() {
         let mut indexer = ToolCallIndexer::default();
@@ -1658,6 +1652,12 @@ mod tests {
         assert_eq!(indices(serde_json::json!([{"id": "f"}])), [8]);
     }
 
+    /// Issue #393: OpenAI's embeddings response carries `embedding` as
+    /// either a JSON array (when the request set
+    /// `encoding_format: "float"`) OR a base64 string (when the
+    /// request set `encoding_format: "base64"`, which is the OpenAI
+    /// SDK default). Pre-fix the deserializer rejected the string
+    /// shape with `error decoding response body` → 502.
     #[test]
     fn embeddings_response_accepts_float_array() {
         let body = r#"{
