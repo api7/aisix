@@ -53,6 +53,7 @@
 #![deny(rust_2018_idioms)]
 
 mod bridge;
+mod gemini_tools;
 mod token_mint;
 mod wire;
 
