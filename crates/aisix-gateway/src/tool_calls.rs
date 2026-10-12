@@ -108,7 +108,7 @@ pub fn reject_legacy_function_calling(req: &ChatFormat) -> Result<(), BridgeErro
         .into_iter()
         .find(|k| req.extra.contains_key(*k))
     {
-        Some(field) => Err(BridgeError::InvalidUpstreamConfig(format!(
+        Some(field) => Err(BridgeError::InvalidRequest(format!(
             "`{field}` is not supported for this model; use `tools` and `tool_choice` instead"
         ))),
         None => Ok(()),
@@ -222,7 +222,7 @@ mod tests {
         req.extra.insert("functions".into(), json!([]));
         assert!(matches!(
             reject_legacy_function_calling(&req),
-            Err(BridgeError::InvalidUpstreamConfig(m)) if m.contains("tools")
+            Err(BridgeError::InvalidRequest(m)) if m.contains("tools")
         ));
     }
 

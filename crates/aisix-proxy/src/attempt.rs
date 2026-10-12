@@ -313,7 +313,9 @@ pub(crate) fn routing_error_class(err: &BridgeError) -> &'static str {
         // own would retire one series and create another for a failure that
         // did not change.
         BridgeError::Config(_) | BridgeError::UnsupportedCapability(_) => "config",
-        BridgeError::InvalidUpstreamConfig(_) => "invalid_config",
+        // Same class as `InvalidUpstreamConfig`, which these caller-shape
+        // refusals were raised as before the variant existed.
+        BridgeError::InvalidUpstreamConfig(_) | BridgeError::InvalidRequest(_) => "invalid_config",
         BridgeError::InvalidUpstreamCredentials(_) => "invalid_credentials",
         BridgeError::Transport(_) => "transport",
         BridgeError::StreamAborted => "stream_aborted",
@@ -623,6 +625,7 @@ mod tests {
             BridgeError::Config("serialize request body: eof".into()),
             BridgeError::UnsupportedCapability(BridgeCapability::Embeddings),
             BridgeError::InvalidUpstreamConfig("model.model_name missing".into()),
+            BridgeError::InvalidRequest("`functions` is not supported for this model".into()),
             BridgeError::InvalidUpstreamCredentials("provider_key.api_key is empty".into()),
         ]
     }
@@ -644,6 +647,7 @@ mod tests {
             ("stream_aborted", "stream_aborted"),
             ("config", "config_error"),
             ("config", "config_error"),
+            ("invalid_config", "invalid_request_error"),
             ("invalid_config", "invalid_request_error"),
             ("invalid_credentials", "authentication_error"),
         ];
@@ -692,6 +696,7 @@ mod tests {
                 // its own would retire a series nothing else feeds.
                 BridgeError::UnsupportedCapability(_) => (false, "config"),
                 BridgeError::InvalidUpstreamConfig(_) => (false, "invalid_config"),
+                BridgeError::InvalidRequest(_) => (false, "invalid_config"),
                 BridgeError::InvalidUpstreamCredentials(_) => (false, "invalid_credentials"),
             };
             assert_eq!(
