@@ -549,8 +549,13 @@ pub(crate) struct OpenAiEmbedRequest<'a> {
 /// `embeddings.create({model, input})` call failed with
 /// `502 upstream_decode_error` because the deserializer rejected
 /// the string shape.
+///
+/// `index` defaults to 0: Google AI Studio's OpenAI-compatible endpoint
+/// serialises from proto3 and omits a zero `index`, so a single-input
+/// response carries no `index` at all.
 #[derive(Debug, Deserialize)]
 pub(crate) struct OpenAiEmbeddingObject {
+    #[serde(default)]
     pub index: u32,
     pub object: String,
     pub embedding: EmbeddingVector,
