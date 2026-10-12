@@ -55,6 +55,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+use crate::attempt::RecordsStreamRefusal;
 use crate::attempt::{
     attempt_error_from_proxy, attempt_reached_upstream, ms_since, AttemptInfo, AttemptRecord,
     RoutingTelemetry,
@@ -474,6 +475,7 @@ pub async fn messages(
                     AttemptInfo {
                         kind: "initial".to_string(),
                         error_class: crate::attempt::error_class(&err).to_string(),
+                        error_message: crate::attempt::gateway_error_message(&err),
                         ..Default::default()
                     },
                     guardrail_blocked,
@@ -1679,6 +1681,7 @@ async fn anthropic_passthrough_dispatch(
                     anthropic_stream_attempt(
                         &attempt_c,
                         usage.guardrail_blocked,
+                        usage.refusal.as_ref(),
                         usage.failure.as_ref(),
                     ),
                     usage.guardrail_blocked,
@@ -2423,6 +2426,7 @@ async fn cross_provider_dispatch(
                     anthropic_stream_attempt(
                         &attempt_for_telem,
                         comp.guardrail_blocked,
+                        comp.refusal.as_ref(),
                         comp.failure.as_ref(),
                     ),
                     comp.guardrail_blocked,
@@ -2843,7 +2847,7 @@ fn build_anthropic_sse_stream(
                 max_buffer_bytes = max_hold,
                 "streaming /v1/messages response exceeded hold-back cap; failing closed",
             );
-            guard.comp().guardrail_blocked = true;
+            guard.comp().record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
             if let Some(chain) = output_guardrail.as_ref() {
                 aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
             }
@@ -2943,7 +2947,7 @@ fn build_anthropic_sse_stream(
                     );
                     // Hold-back: the held chunks are dropped — the matched
                     // content never reached the wire.
-                    guard.comp().guardrail_blocked = true;
+                    guard.comp().record_refusal(guardrail_name.as_deref(), unavailable.as_deref());
                     let frame = guardrail_block_frame(guardrail_name.as_deref(), unavailable.as_deref());
                     yield Ok(bytes::Bytes::from(frame));
                     return;
@@ -3081,10 +3085,13 @@ fn anthropic_stream_status(
 fn anthropic_stream_attempt(
     attempt: &AttemptInfo,
     guardrail_blocked: bool,
+    refusal: Option<&crate::attempt::StreamRefusal>,
     failure: Option<&crate::attempt::StreamFailure>,
 ) -> AttemptInfo {
     let mut attempt = attempt.clone();
-    if let Some(f) = failure.filter(|_| !guardrail_blocked) {
+    if let Some(r) = refusal {
+        r.apply_to(&mut attempt);
+    } else if let Some(f) = failure.filter(|_| !guardrail_blocked) {
         f.apply_to(&mut attempt);
     }
     attempt
@@ -3145,9 +3152,18 @@ struct AnthropicStreamCompletion {
     /// but it must not read as a clean delivery (AISIX-Cloud#1428). Mirrors
     /// `chat::StreamCompletion::guardrail_blocked`.
     guardrail_blocked: bool,
+    /// The refusal that `guardrail_blocked` records; see
+    /// [`crate::attempt::RecordsStreamRefusal`].
+    refusal: Option<crate::attempt::StreamRefusal>,
     /// The upstream error that ended the stream after its `200` went out.
     /// The usage event reports it instead of a `200` or a `499`.
     failure: Option<crate::attempt::StreamFailure>,
+}
+
+impl crate::attempt::RecordsStreamRefusal for AnthropicStreamCompletion {
+    fn refusal_slots(&mut self) -> (&mut bool, &mut Option<crate::attempt::StreamRefusal>) {
+        (&mut self.guardrail_blocked, &mut self.refusal)
+    }
 }
 
 struct CompleteAnthropicStreamOnDrop<F: FnOnce(AnthropicStreamCompletion)> {
@@ -3610,6 +3626,15 @@ struct AnthropicStreamUsage {
     /// but it must not read as a clean delivery (AISIX-Cloud#1428). Mirrors
     /// `chat::StreamCompletion::guardrail_blocked`.
     guardrail_blocked: bool,
+    /// The refusal that `guardrail_blocked` records; see
+    /// [`crate::attempt::RecordsStreamRefusal`].
+    refusal: Option<crate::attempt::StreamRefusal>,
+}
+
+impl crate::attempt::RecordsStreamRefusal for AnthropicStreamUsage {
+    fn refusal_slots(&mut self) -> (&mut bool, &mut Option<crate::attempt::StreamRefusal>) {
+        (&mut self.guardrail_blocked, &mut self.refusal)
+    }
 }
 
 /// Update the accumulator from one parsed SSE `data:` JSON object.
@@ -4032,7 +4057,7 @@ where
                              SSE frame past the cap; failing closed rather than releasing \
                              it unscanned",
                         );
-                        guard.usage().guardrail_blocked = true;
+                        guard.usage().record_refusal(None, Some(crate::error::TAG_UNSCANNABLE_BODY));
                         // `unscannable_body`, not `output_buffer_exceeded`:
                         // the frame is refused because it never reached the
                         // scan, not because of its size. The hold-back cap
@@ -4218,7 +4243,7 @@ where
                 max_buffer_bytes = max_hold,
                 "streaming /v1/messages passthrough exceeded hold-back cap; failing closed",
             );
-            guard.usage().guardrail_blocked = true;
+            guard.usage().record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
             if let Some(chain) = output_guardrail.as_ref() {
                 aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
             }
@@ -4257,7 +4282,7 @@ where
             // frame-cap arm above uses. A `held` that was empty to begin
             // with is an empty upstream response and is left alone.
             if held.is_empty() && seal.cut_anything() {
-                guard.usage().guardrail_blocked = true;
+                guard.usage().record_refusal(None, Some(crate::error::TAG_UNSCANNABLE_BODY));
                 yield Ok(Bytes::from(guardrail_block_frame(
                     None,
                     Some(crate::error::TAG_UNSCANNABLE_BODY),
@@ -4395,7 +4420,7 @@ where
                         "guardrail blocked streaming /v1/messages passthrough response",
                     );
                     blocked = true;
-                    guard.usage().guardrail_blocked = true;
+                    guard.usage().record_refusal(guardrail_name.as_deref(), unavailable.as_deref());
                     let frame = guardrail_block_frame(guardrail_name.as_deref(), unavailable.as_deref());
                     yield Ok(Bytes::from(frame));
                 }

@@ -202,11 +202,9 @@ pub(crate) fn resolve_target(
     let model_entry = match wanted {
         Some(name) => {
             let entry = crate::model_resolve::resolve_model(snapshot, name)
-                .ok_or_else(|| ProxyError::ModelNotFound(format!("model {name:?} not found")))?;
+                .ok_or_else(|| ProxyError::ModelNotFound(name.to_string()))?;
             if !auth.key().can_access(snapshot, name) {
-                return Err(ProxyError::ModelForbidden(format!(
-                    "api key is not authorized for model {name:?}"
-                )));
+                return Err(ProxyError::ModelForbidden(name.to_string()));
             }
             let m = &entry.value;
             if m.is_routing() || m.is_ensemble() || m.is_semantic() {
@@ -854,7 +852,7 @@ fn finish(
                 "",
                 &auth.entry.id,
                 status,
-                crate::attempt::error_class(&err),
+                crate::usage_attr::EventError::of(&err),
                 err.is_guardrail_block(),
                 client,
                 applied,

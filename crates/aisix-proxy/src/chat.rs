@@ -37,6 +37,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::attempt::RecordsStreamRefusal;
 use crate::attempt::{attempt_error_message, routing_error_class, AttemptRecord, RoutingTelemetry};
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
@@ -630,8 +631,11 @@ pub async fn chat_completions(
                             attempt_model: winner
                                 .map(|w| w.target_model.clone())
                                 .unwrap_or_default(),
-                            error_class: String::new(),
-                            error_message: String::new(),
+                            // The output guardrail's refusal is what ended
+                            // the request, so it names itself like an input
+                            // refusal does.
+                            error_class: crate::attempt::error_class(&err).to_string(),
+                            error_message: crate::attempt::gateway_error_message(&err),
                             // The chain governed the request even though it
                             // ultimately blocked on the output filter.
                             applied_guardrails: applied_guardrails.clone(),
@@ -669,6 +673,7 @@ pub async fn chat_completions(
                             // Bounded ProxyError class so the dashboard can
                             // show why the request never reached an upstream.
                             error_class: crate::attempt::error_class(&err).to_string(),
+                            error_message: crate::attempt::gateway_error_message(&err),
                             // Input-blocked / pre-upstream errors still record
                             // the resolved guardrail chain (empty if it failed
                             // before resolution).
@@ -2306,6 +2311,10 @@ async fn dispatch(
                 // 499, one an upstream error ended as that error's status —
                 // on the usage event and on every latency histogram below.
                 let terminal_status = stream_terminal_status(&comp);
+                let stream_error = crate::attempt::stream_error_fields(
+                    comp.refusal.as_ref(),
+                    comp.failure.as_ref(),
+                );
                 // Telemetry: emit with the actual upstream-reported counts.
                 // cost_usd stays 0.0; cp-api recomputes server-side from
                 // its model_pricing catalog (same pattern as the non-
@@ -2371,16 +2380,8 @@ async fn dispatch(
                         attempt_index: winner_idx,
                         attempt_kind: winner_kind.to_string(),
                         attempt_model: attempt_model_for_telem.clone(),
-                        error_class: comp
-                            .failure
-                            .as_ref()
-                            .map(|f| f.error_class.to_string())
-                            .unwrap_or_default(),
-                        error_message: comp
-                            .failure
-                            .as_ref()
-                            .map(|f| f.error_message.clone())
-                            .unwrap_or_default(),
+                        error_class: stream_error.0.clone(),
+                        error_message: stream_error.1.clone(),
                         applied_guardrails: applied_guardrails_for_telem.clone(),
                         redacted_entity_counts: {
                             let mut merged = input_redactions_for_telem.clone();
@@ -4257,6 +4258,10 @@ async fn dispatch_ensemble(
                 }
                 let judge_pk =
                     crate::usage_attr::ResolvedPk::resolve(&snap, &judge_provider_key_id);
+                let stream_error = crate::attempt::stream_error_fields(
+                    comp.refusal.as_ref(),
+                    comp.failure.as_ref(),
+                );
                 emit_usage_event(
                     &state_for_telem,
                     &snap,
@@ -4297,16 +4302,8 @@ async fn dispatch_ensemble(
                         attempt_index: judge_attempt_index,
                         attempt_kind: "judge".to_string(),
                         attempt_model: judge_attempt_model.clone(),
-                        error_class: comp
-                            .failure
-                            .as_ref()
-                            .map(|f| f.error_class.to_string())
-                            .unwrap_or_default(),
-                        error_message: comp
-                            .failure
-                            .as_ref()
-                            .map(|f| f.error_message.clone())
-                            .unwrap_or_default(),
+                        error_class: stream_error.0.clone(),
+                        error_message: stream_error.1.clone(),
                         applied_guardrails: applied_guardrails_for_telem.clone(),
                         redacted_entity_counts: {
                             let mut merged = input_redactions_for_telem.clone();
@@ -5393,6 +5390,9 @@ struct StreamCompletion {
     /// streaming-blocked path the same way the non-streaming path
     /// already does.
     guardrail_blocked: bool,
+    /// The refusal that `guardrail_blocked` records; see
+    /// [`crate::attempt::RecordsStreamRefusal`].
+    refusal: Option<crate::attempt::StreamRefusal>,
     /// First Bypass reason observed at end-of-stream (per #204
     /// audit H1). The non-streaming path captures Bypass into the
     /// telemetry envelope so operators can audit which policy
@@ -5461,6 +5461,12 @@ struct StreamCompletion {
     /// The upstream error that ended the stream after its `200` went out,
     /// if one did. The terminal usage event reports it instead of a `200`.
     failure: Option<crate::attempt::StreamFailure>,
+}
+
+impl crate::attempt::RecordsStreamRefusal for StreamCompletion {
+    fn refusal_slots(&mut self) -> (&mut bool, &mut Option<crate::attempt::StreamRefusal>) {
+        (&mut self.guardrail_blocked, &mut self.refusal)
+    }
 }
 
 /// The terminal usage-event status of a chat stream. A guardrail block keeps
@@ -5987,7 +5993,7 @@ where
                         "streamed tool-call arguments exceeded max_buffer_bytes; failing closed",
                     );
                     errored = true;
-                    guard.comp().guardrail_blocked = true;
+                    guard.comp().record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
                     ctx.chain.record_output_buffer_exceeded();
                     yield Ok::<_, Infallible>(
                         Event::default().event("error").data(
@@ -6069,7 +6075,7 @@ where
                                             "guardrail blocked streaming response (window)",
                                         );
                                         errored = true;
-                                        guard.comp().guardrail_blocked = true;
+                                        guard.comp().record_refusal(guardrail_name.as_deref(), unavailable.as_deref());
                                         yield Ok::<_, Infallible>(
                                             Event::default().event("error").data(
                                                 crate::error::guardrail_block_frame_payload(
@@ -6151,7 +6157,7 @@ where
                                     "streaming response exceeded max_buffer_bytes; failing closed",
                                 );
                                 errored = true;
-                                guard.comp().guardrail_blocked = true;
+                                guard.comp().record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
                                 if let Some(ctx) = output_guardrail.as_ref() {
                                     ctx.chain.record_output_buffer_exceeded();
                                 }
@@ -6315,7 +6321,7 @@ where
                                     "guardrail blocked streaming response",
                                 );
                                 errored = true;
-                                guard.comp().guardrail_blocked = true;
+                                guard.comp().record_refusal(guardrail_name.as_deref(), unavailable.as_deref());
                                 yield Ok::<_, Infallible>(
                                     Event::default().event("error").data(crate::error::guardrail_block_frame_payload(
                                         guardrail_name.as_deref(),
@@ -6443,7 +6449,7 @@ where
                             "guardrail blocked streaming response",
                         );
                         errored = true;
-                        guard.comp().guardrail_blocked = true;
+                        guard.comp().record_refusal(guardrail_name.as_deref(), unavailable.as_deref());
                         yield Ok::<_, Infallible>(
                             Event::default()
                                 .event("error")

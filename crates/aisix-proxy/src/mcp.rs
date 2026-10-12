@@ -465,7 +465,6 @@ async fn dispatch(
         match crate::quota::enforce_mcp(state, &snapshot, &auth, &mcp_server).await {
             Ok(reservation) => Some(reservation),
             Err(err) => {
-                let response = err.into_response();
                 emit_tool_call_usage(
                     state,
                     &snapshot,
@@ -474,9 +473,9 @@ async fn dispatch(
                     request_headers,
                     &mcp_server,
                     &mcp_tool,
-                    response.status().as_u16(),
+                    err.status().as_u16(),
                     Duration::ZERO,
-                    false,
+                    Some(&err),
                     Vec::new(),
                     crate::redact::RedactionCounts::new(),
                     /* guardrail_chain */ None,
@@ -484,7 +483,7 @@ async fn dispatch(
                     trace,
                     /* dispatched */ false,
                 );
-                return response;
+                return err.into_response();
             }
         }
     } else {
@@ -577,6 +576,11 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked MCP tool call"
             );
+            let refusal = crate::error::guardrail_block_error(
+                "tool call",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            );
             emit_tool_call_usage(
                 state,
                 &snapshot,
@@ -587,7 +591,7 @@ async fn dispatch(
                 &mcp_tool,
                 StatusCode::OK.as_u16(),
                 Duration::ZERO,
-                true,
+                Some(&refusal),
                 monitor_hits,
                 crate::redact::RedactionCounts::new(),
                 guardrail_chain.as_ref(),
@@ -649,6 +653,11 @@ async fn dispatch(
                         error = %err,
                         "mcp input mask splice failed; blocking tool call",
                     );
+                    let refusal = crate::error::guardrail_block_error(
+                        "tool call",
+                        None,
+                        Some(crate::error::TAG_MASK_WRITEBACK_FAILED),
+                    );
                     emit_tool_call_usage(
                         state,
                         &snapshot,
@@ -659,7 +668,7 @@ async fn dispatch(
                         &mcp_tool,
                         StatusCode::OK.as_u16(),
                         Duration::ZERO,
-                        true,
+                        Some(&refusal),
                         monitor_hits,
                         crate::redact::RedactionCounts::new(),
                         guardrail_chain.as_ref(),
@@ -701,6 +710,11 @@ async fn dispatch(
                     guardrail_name,
                     unavailable,
                 } => {
+                    let refusal = crate::error::guardrail_block_error(
+                        "tool call",
+                        guardrail_name.as_deref(),
+                        unavailable.as_deref(),
+                    );
                     emit_tool_call_usage(
                         state,
                         &snapshot,
@@ -711,7 +725,7 @@ async fn dispatch(
                         &mcp_tool,
                         StatusCode::OK.as_u16(),
                         Duration::ZERO,
-                        true,
+                        Some(&refusal),
                         monitor_hits,
                         redaction_counts,
                         guardrail_chain.as_ref(),
@@ -851,7 +865,7 @@ async fn dispatch(
                         &mcp_tool,
                         StatusCode::BAD_GATEWAY.as_u16(),
                         latency,
-                        false,
+                        None,
                         monitor_hits,
                         redaction_counts,
                         guardrail_chain.as_ref(),
@@ -869,6 +883,11 @@ async fn dispatch(
                     guardrail_name,
                     unavailable,
                 } => {
+                    let refusal = crate::error::guardrail_block_error(
+                        "tool result",
+                        guardrail_name.as_deref(),
+                        unavailable.as_deref(),
+                    );
                     emit_tool_call_usage(
                         state,
                         &snapshot,
@@ -879,7 +898,7 @@ async fn dispatch(
                         &mcp_tool,
                         StatusCode::OK.as_u16(),
                         latency,
-                        true,
+                        Some(&refusal),
                         monitor_hits,
                         redaction_counts,
                         guardrail_chain.as_ref(),
@@ -926,7 +945,7 @@ async fn dispatch(
             &mcp_tool,
             response.status().as_u16(),
             latency,
-            false,
+            None,
             monitor_hits,
             redaction_counts,
             guardrail_chain.as_ref(),
@@ -1466,7 +1485,9 @@ fn emit_tool_call_usage(
     mcp_tool: &str,
     status_code: u16,
     latency: Duration,
-    guardrail_blocked: bool,
+    // The gateway's own refusal of the call — a guardrail block or a quota
+    // rejection — named on the event like every other surface names it.
+    refusal: Option<&crate::error::ProxyError>,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     // Per-detector mask counts from the write-back passes (names only,
     // never values — #932 no-leak).
@@ -1501,7 +1522,13 @@ fn emit_tool_call_usage(
         mcp_server_name: mcp_server.to_string(),
         mcp_tool_name: mcp_tool.to_string(),
         request_headers: request_headers.clone(),
-        guardrail_blocked,
+        guardrail_blocked: refusal.is_some_and(crate::error::ProxyError::is_guardrail_block),
+        error_class: refusal
+            .map(|e| crate::attempt::error_class(e).to_string())
+            .unwrap_or_default(),
+        error_message: refusal
+            .map(crate::attempt::gateway_error_message)
+            .unwrap_or_default(),
         guardrail_monitor_hits,
         applied_guardrails: guardrail_chain
             .map(|c| c.applied().to_vec())

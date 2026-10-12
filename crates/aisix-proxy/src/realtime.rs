@@ -323,7 +323,7 @@ pub(crate) async fn realtime(
                 params.get("model").map(String::as_str).unwrap_or(""),
                 api_key_id.unwrap_or(""),
                 status,
-                crate::attempt::error_class(&err),
+                crate::usage_attr::EventError::of(&err),
                 err.is_guardrail_block(),
                 &client,
                 // Refused before the handshake, so no chain was ever
@@ -375,11 +375,9 @@ async fn prepare(
     }
 
     let model_entry = crate::model_resolve::resolve_model(snapshot, &requested_model)
-        .ok_or_else(|| ProxyError::ModelNotFound(format!("model {requested_model:?} not found")))?;
+        .ok_or_else(|| ProxyError::ModelNotFound(requested_model.to_string()))?;
     if !auth.key().can_access(snapshot, &requested_model) {
-        return Err(ProxyError::ModelForbidden(format!(
-            "api key is not authorized for model {requested_model:?}"
-        )));
+        return Err(ProxyError::ModelForbidden(requested_model.to_string()));
     }
     let model = &model_entry.value;
     if model.is_routing() || model.is_ensemble() || model.is_semantic() {
@@ -831,7 +829,7 @@ async fn run_session(
                 &requested_model,
                 &auth.entry.id,
                 502,
-                "transport",
+                crate::usage_attr::EventError::class_only("transport"),
                 // Failing to open the upstream socket is not a guardrail
                 // decision, whatever the chain went on to allow.
                 /* guardrail_blocked */
@@ -911,6 +909,7 @@ async fn run_session(
                         )
                         .await
                         {
+                            let (resp, refusal) = resp;
                             let _ = client_tx.send(AxMessage::Text(resp)).await;
                             let _ = client_tx
                                 .send(AxMessage::Close(Some(CloseFrame {
@@ -919,10 +918,7 @@ async fn run_session(
                                 })))
                                 .await;
                             close_status = 400;
-                            session_error = Some(ProxyError::ContentFiltered {
-                                message: "realtime frame blocked by a guardrail".into(),
-                                unavailable: None,
-                            });
+                            session_error = Some(refusal);
                             break;
                         }
                     }
@@ -959,6 +955,7 @@ async fn run_session(
                         )
                         .await
                         {
+                            let (resp, refusal) = resp;
                             let _ = client_tx.send(AxMessage::Text(resp)).await;
                             let _ = client_tx
                                 .send(AxMessage::Close(Some(CloseFrame {
@@ -967,10 +964,7 @@ async fn run_session(
                                 })))
                                 .await;
                             close_status = 400;
-                            session_error = Some(ProxyError::ContentFiltered {
-                                message: "realtime frame blocked by a guardrail".into(),
-                                unavailable: None,
-                            });
+                            session_error = Some(refusal);
                             break;
                         }
                     }
@@ -1087,6 +1081,18 @@ async fn run_session(
         guardrail_blocked: session_error
             .as_ref()
             .is_some_and(ProxyError::is_guardrail_block),
+        // The refusal names itself, as on every other surface. An upstream
+        // failure that ended the session is not recorded here.
+        error_class: session_error
+            .as_ref()
+            .filter(|e| e.is_guardrail_block())
+            .map(|e| crate::attempt::error_class(e).to_string())
+            .unwrap_or_default(),
+        error_message: session_error
+            .as_ref()
+            .filter(|e| e.is_guardrail_block())
+            .map(crate::attempt::gateway_error_message)
+            .unwrap_or_default(),
         guardrail_monitor_hits: monitor_hits,
         applied_guardrails: crate::usage_attr::applied_guardrails(&audit),
         guardrail_enforced_hits: crate::usage_attr::enforced_hits(&audit),
@@ -1153,14 +1159,15 @@ enum Dir {
 }
 
 /// Whole-frame guardrail scan (the `/passthrough` blob precedent applied
-/// per WS text frame). Returns the client-facing error event on Block.
+/// per WS text frame). Returns the client-facing error event on Block,
+/// with the refusal it reports.
 async fn guardrail_block_event(
     chain: &aisix_guardrails::GuardrailChain,
     model_name: &str,
     text: &str,
     input_side: bool,
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
-) -> Option<String> {
+) -> Option<(String, ProxyError)> {
     let (verdict, hits) = if input_side {
         let chat = aisix_gateway::ChatFormat::new(
             model_name,
@@ -1190,18 +1197,21 @@ async fn guardrail_block_event(
             reason = %reason,
             "guardrail blocked realtime frame",
         );
-        let msg = crate::error::guardrail_block_message(
+        let refusal = crate::error::guardrail_block_error(
             if input_side { "request" } else { "response" },
             guardrail_name.as_deref(),
             unavailable.as_deref(),
         );
-        return Some(
-            serde_json::json!({
-                "type": "error",
-                "error": {"type": "invalid_request_error", "code": "content_filtered", "message": msg}
-            })
-            .to_string(),
-        );
+        let event = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "content_filtered",
+                "message": refusal.to_string(),
+            }
+        })
+        .to_string();
+        return Some((event, refusal));
     }
     None
 }
