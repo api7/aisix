@@ -10,6 +10,7 @@ import {
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   waitForSlsLog,
   type A2aUpstream,
   type McpUpstream,
@@ -33,6 +34,13 @@ const LIMITED = "sk-gateway-error-message-limited";
 const LIMITED_A2A = "sk-gateway-error-message-limited-a2a";
 const LIMITED_MCP = "sk-gateway-error-message-limited-mcp";
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
+
+/** One field of an access-log line, as the text formatter writes it. */
+function field(line: string, name: string): string | undefined {
+  const m = new RegExp(`\\b${name}=("(?:[^"\\\\]|\\\\.)*"|\\S+)`).exec(line);
+  if (!m) return undefined;
+  return m[1].startsWith('"') ? (JSON.parse(m[1]) as string) : m[1];
+}
 
 const SLS_PROJECT = "gem-project";
 const LOGSTORE = "gem-logstore";
@@ -103,6 +111,8 @@ describe("gateway-side failures name themselves on the usage event", () => {
   let leaky: OpenAiUpstream | undefined;
   let leakyResponses: OpenAiUpstream | undefined;
   let leakyStream: OpenAiUpstream | undefined;
+  let leakyCompletions: OpenAiUpstream | undefined;
+  let leakyTranscript: OpenAiUpstream | undefined;
   let leakyAnthropic: OpenAiUpstream | undefined;
   let agent: A2aUpstream | undefined;
   let mcp: McpUpstream | undefined;
@@ -152,12 +162,26 @@ describe("gateway-side failures name themselves on the usage event", () => {
     });
 
     leakyStream = await startOpenAiUpstream({ streamEvents: LEAKY_STREAM });
+    leakyCompletions = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "cmpl-leaky",
+        object: "text_completion",
+        created: 1,
+        model: "gpt-3.5-turbo-instruct",
+        choices: [{ index: 0, text: `here is ${FORBIDDEN}`, finish_reason: "stop" }],
+        usage: { prompt_tokens: 3, completion_tokens: 3, total_tokens: 6 },
+      },
+    });
+    leakyTranscript = await startOpenAiUpstream({
+      nonStreamBody: { text: `here is ${FORBIDDEN}` },
+    });
     leakyAnthropic = await startOpenAiUpstream({ rawStreamFrames: LEAKY_ANTHROPIC_STREAM });
     agent = await startA2aUpstream({ cardMount: "origin" });
     mcp = await startMcpUpstream("gemmcp");
     realtime = await startRealtimeUpstream();
 
     app = await spawnApp({
+      logLevel: "info",
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "LTAI_mock_ak",
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock_ak_secret",
@@ -267,6 +291,25 @@ describe("gateway-side failures name themselves on the usage event", () => {
       provider_key_id: leakyStreamPk.id,
     });
     await seed.attachGuardrailToModel(outputGuard.id, leakyStreamModel.id);
+    // Buffered output refusals the gateway answers as a 422 "success".
+    for (const [name, upstreamUrl, upstreamModel] of [
+      ["gem-leaky-completions", leakyCompletions.baseUrl, "gpt-3.5-turbo-instruct"],
+      ["gem-leaky-transcript", leakyTranscript.baseUrl, "whisper-1"],
+    ] as const) {
+      const leakyPk = await seed.createProviderKey({
+        display_name: `${name}-pk`,
+        secret: "sk-mock",
+        api_base: `${upstreamUrl}/v1`,
+      });
+      const m = await seed.createModel({
+        display_name: name,
+        provider: "openai",
+        model_name: upstreamModel,
+        provider_key_id: leakyPk.id,
+      });
+      await seed.attachGuardrailToModel(outputGuard.id, m.id);
+    }
+
     // The Anthropic-native /v1/messages passthrough stream.
     const anthropicPk = await seed.createProviderKey({
       display_name: "gem-leaky-anthropic-pk",
@@ -378,6 +421,8 @@ describe("gateway-side failures name themselves on the usage event", () => {
     await leaky?.close();
     await leakyResponses?.close();
     await leakyStream?.close();
+    await leakyCompletions?.close();
+    await leakyTranscript?.close();
     await leakyAnthropic?.close();
     await agent?.close();
     await mcp?.close();
@@ -411,10 +456,31 @@ describe("gateway-side failures name themselves on the usage event", () => {
     return { status: res.status, requestId: res.headers.get("x-aisix-request-id") ?? "" };
   }
 
-  /** The terminal usage event the request filed. */
+  /**
+   * The terminal usage event the request filed — checked against the
+   * request's access-log line, which must name the same failure: the class
+   * as `error_kind`, and the event's message, where it carries one, as
+   * `error`.
+   */
   async function eventFor(requestId: string, what: string): Promise<Map<string, string>> {
     expect(requestId, `${what}: no x-aisix-request-id`).not.toBe("");
-    return waitForSlsLog(sls!, LOGSTORE, (l) => l.get("request_id") === requestId, what);
+    const event = await waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (l) => l.get("request_id") === requestId,
+      what,
+    );
+    const line = await waitForLogLine(
+      app!,
+      (l) => l.includes("proxy request completed") && l.includes(`"${requestId}"`),
+      `${what}: access-log line`,
+    );
+    expect(field(line, "error_kind"), `${what}: ${line}`).toBe(event.get("error_class"));
+    const message = event.get("error_message");
+    if (message !== undefined) {
+      expect(field(line, "error"), `${what}: ${line}`).toBe(message);
+    }
+    return event;
   }
 
   async function expectNamed(
@@ -695,5 +761,24 @@ describe("gateway-side failures name themselves on the usage event", () => {
     expect(event.get("error_message")).toBe(
       "request blocked by content policy (guardrail 'gem-input-block')",
     );
+  });
+  test("completions and transcriptions name a buffered output refusal", async (ctx) => {
+    if (!ready()) return ctx.skip();
+    const completion = await send("/v1/completions", {
+      body: { model: "gem-leaky-completions", prompt: "hi" },
+    });
+    expect(completion.status).toBe(422);
+    const completionEvent = await eventFor(completion.requestId, "completions output block");
+    expect(completionEvent.get("error_class")).toBe("content_filter");
+    expect(completionEvent.get("error_message")).toContain("gem-output-block");
+
+    const audio = new FormData();
+    audio.set("model", "gem-leaky-transcript");
+    audio.set("file", new Blob([new Uint8Array([1, 2, 3])], { type: "audio/wav" }), "a.wav");
+    const transcript = await send("/v1/audio/transcriptions", { form: audio });
+    expect(transcript.status).toBe(422);
+    const transcriptEvent = await eventFor(transcript.requestId, "transcription output block");
+    expect(transcriptEvent.get("error_class")).toBe("content_filter");
+    expect(transcriptEvent.get("error_message")).toContain("gem-output-block");
   });
 });

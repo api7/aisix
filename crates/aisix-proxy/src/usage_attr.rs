@@ -991,6 +991,7 @@ pub(crate) fn emit_usage(
     // endings this is. A request that wrote its line inline — everything
     // non-streamed — parked nothing, and this is a no-op for it.
     if terminal {
+        crate::attribution::note_terminal_error(&event.error_class, &event.error_message);
         crate::attribution::emit_deferred_access_log(&event);
     }
     // The `upstream` side of the request's end-to-end latency is the

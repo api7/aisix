@@ -214,7 +214,9 @@ pub async fn a2a_endpoint(
             total_tokens: None,
             request_id: &request_id,
             // Same as `/mcp`: `dispatch` returns an already-rendered
-            // `Response`, so no typed error reaches this point.
+            // `Response`, so no typed error reaches this point; the
+            // request's terminal usage event names the failure on this line
+            // when it is completed (`attribution::note_terminal_error`).
             error_kind: None,
             error: None,
             provider_request_id: None,
