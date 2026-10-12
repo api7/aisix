@@ -1834,7 +1834,7 @@ async fn anthropic_passthrough_dispatch(
                 if !out_text.is_empty() {
                     out_text.push('\n');
                 }
-                // Tool ids without a thought signature.
+                // Tool-call ids left out.
                 out_text.push_str(&aisix_gateway::tool_calls::blocks_scan_text(scannable));
 
                 let synth = aisix_gateway::ChatResponse {
