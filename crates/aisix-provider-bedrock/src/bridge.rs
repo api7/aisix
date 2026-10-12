@@ -1086,10 +1086,14 @@ impl BedrockBridge {
         // only the /invoke body path runs apply_param_constraints otherwise,
         // so without this a Bedrock-wide temperature ceiling silently no-ops
         // for every Converse (non-Anthropic) publisher.
-        if let Some(cfg) = build_inference_config(&req, pk_param_constraints(ctx)) {
+        let (reasoning_fields, thinking_max_tokens) =
+            build_converse_additional_model_request_fields(&req, upstream_id);
+        if let Some(cfg) =
+            build_inference_config(&req, thinking_max_tokens, pk_param_constraints(ctx))
+        {
             call = call.inference_config(cfg);
         }
-        if let Some(fields) = build_converse_additional_model_request_fields(&req, upstream_id) {
+        if let Some(fields) = reasoning_fields {
             call = call.additional_model_request_fields(fields);
         }
         // A caller's `response_format` becomes one of two request shapes
@@ -1182,10 +1186,14 @@ impl BedrockBridge {
         }
         // Mirror chat_converse on the stream path — same audit fix +
         // the #463 param_constraints temperature clamp.
-        if let Some(cfg) = build_inference_config(&req, pk_param_constraints(ctx)) {
+        let (reasoning_fields, thinking_max_tokens) =
+            build_converse_additional_model_request_fields(&req, upstream_id);
+        if let Some(cfg) =
+            build_inference_config(&req, thinking_max_tokens, pk_param_constraints(ctx))
+        {
             call = call.inference_config(cfg);
         }
-        if let Some(fields) = build_converse_additional_model_request_fields(&req, upstream_id) {
+        if let Some(fields) = reasoning_fields {
             call = call.additional_model_request_fields(fields);
         }
         // Only the native structured-output shape reaches this path —
@@ -1885,11 +1893,16 @@ fn pk_param_constraints(ctx: &BridgeContext) -> Option<&ParamConstraints> {
 /// misconfigured `min > max`. `ParamConstraints` is temperature-only
 /// today, so `max_tokens` / `top_p` are forwarded unclamped (no
 /// constraint field exists for them).
+/// `thinking_max_tokens` is the `max_tokens` a translated thinking budget
+/// needs when the caller sent none; see
+/// [`translate_reasoning_effort_to_anthropic`].
 fn build_inference_config(
     req: &ChatFormat,
+    thinking_max_tokens: Option<u32>,
     constraints: Option<&ParamConstraints>,
 ) -> Option<InferenceConfiguration> {
-    if req.temperature.is_none() && req.max_tokens.is_none() && req.top_p.is_none() {
+    let max_tokens = req.max_tokens.or(thinking_max_tokens);
+    if req.temperature.is_none() && max_tokens.is_none() && req.top_p.is_none() {
         return None;
     }
     let mut b = InferenceConfiguration::builder();
@@ -1912,7 +1925,7 @@ fn build_inference_config(
         }
         b = b.temperature(next);
     }
-    if let Some(m) = req.max_tokens {
+    if let Some(m) = max_tokens {
         // Bedrock's API uses i32; ChatFormat's u32 is always non-negative.
         let clamped = i32::try_from(m).unwrap_or(i32::MAX);
         b = b.max_tokens(clamped);
@@ -1929,27 +1942,31 @@ fn build_inference_config(
 /// Converse and therefore places the same provider fields under
 /// `additionalModelRequestFields`. Other Bedrock publishers must not receive
 /// Anthropic parameters they may reject.
+///
+/// The second value is the `max_tokens` a translated thinking budget needs
+/// when the caller sent none.
 fn build_converse_additional_model_request_fields(
     req: &ChatFormat,
     upstream_id: &str,
-) -> Option<aws_smithy_types::Document> {
+) -> (Option<aws_smithy_types::Document>, Option<u32>) {
     if BedrockPublisher::from_model_id(upstream_id) != Some(BedrockPublisher::Anthropic) {
-        return None;
+        return (None, None);
     }
 
     let mut extras = req.extra.clone();
-    translate_reasoning_effort_to_anthropic(&mut extras);
+    let thinking_max_tokens = translate_reasoning_effort_to_anthropic(
+        &mut extras,
+        bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id),
+        req.max_tokens,
+    );
     let mut fields = serde_json::Map::new();
     for name in ["thinking", "output_config", "anthropic_beta"] {
         if let Some(value) = extras.remove(name) {
             fields.insert(name.to_string(), value);
         }
     }
-    if fields.is_empty() {
-        None
-    } else {
-        Some(json_to_document(&serde_json::Value::Object(fields)))
-    }
+    let fields = (!fields.is_empty()).then(|| json_to_document(&serde_json::Value::Object(fields)));
+    (fields, thinking_max_tokens)
 }
 
 /// Decide what a request's OpenAI `response_format` becomes on Bedrock.
