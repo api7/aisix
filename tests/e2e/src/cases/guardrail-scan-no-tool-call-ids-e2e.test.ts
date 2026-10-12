@@ -246,14 +246,9 @@ describe("guardrails never scan a tool-call id", () => {
     return [...moderated];
   }
 
-  /** The request carried a tool call; the response may carry one. */
-  function expectNoIds(texts: string[], { output }: { output: boolean }) {
+  function expectNoIds(texts: string[]) {
     for (const text of texts) {
       for (const mark of ID_MARKS) expect(text, `id ${mark} reached the guardrail`).not.toContain(mark);
-    }
-    expect(texts.some((t) => t.includes(TOOL) && t.includes("INARGMARK")), "input name and arguments scanned").toBe(true);
-    if (output) {
-      expect(texts.some((t) => t.includes("OUTARGMARK")), "output arguments scanned").toBe(true);
     }
   }
 
@@ -277,58 +272,104 @@ describe("guardrails never scan a tool-call id", () => {
     { type: "function_call_output", call_id: IN_ID, output: "sunny" },
   ];
 
-  for (const stream of [false, true]) {
-    const mode = stream ? "streamed" : "buffered";
-
-    test(`/v1/chat/completions (${mode})`, async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const texts = await scanned("/v1/chat/completions", { model: "ids-gpt", messages: chatHistory, tools: [CHAT_TOOL], stream });
-      expectNoIds(texts, { output: true });
-    });
-
-    test(`/v1/messages (${mode})`, async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const texts = await scanned("/v1/messages", {
+  const question = "Weather in Paris?";
+  const surfaces = [
+    {
+      name: "/v1/chat/completions",
+      path: "/v1/chat/completions",
+      body: (history: boolean) => ({
+        model: "ids-gpt",
+        messages: history ? chatHistory : [{ role: "user", content: question }],
+        tools: [CHAT_TOOL],
+      }),
+    },
+    {
+      name: "/v1/messages",
+      path: "/v1/messages",
+      body: (history: boolean) => ({
         model: "ids-claude",
         max_tokens: 64,
-        messages: messagesHistory,
+        messages: history ? messagesHistory : [{ role: "user", content: question }],
         tools: [ANTHROPIC_TOOL],
-        stream,
+      }),
+    },
+    {
+      name: "/v1/chat/completions bridged to Anthropic",
+      // A streamed Anthropic reply reaches a chat client without its tool
+      // calls today, so there is no streamed tool-call output to scan here.
+      bufferedOutputOnly: true,
+      path: "/v1/chat/completions",
+      body: (history: boolean) => ({
+        model: "ids-claude",
+        max_tokens: 64,
+        messages: history ? chatHistory : [{ role: "user", content: question }],
+        tools: [CHAT_TOOL],
+      }),
+    },
+    {
+      name: "/v1/messages bridged to OpenAI Chat",
+      path: "/v1/messages",
+      body: (history: boolean) => ({
+        model: "ids-gpt",
+        max_tokens: 64,
+        messages: history ? messagesHistory : [{ role: "user", content: question }],
+        tools: [ANTHROPIC_TOOL],
+      }),
+    },
+    {
+      name: "/v1/responses",
+      path: "/v1/responses",
+      body: (history: boolean) => ({ model: "ids-gpt", input: history ? responsesHistory : question, tools: [RESPONSES_TOOL] }),
+    },
+    {
+      name: "passthrough chat envelope",
+      path: "/ids-pt/v1/chat/completions",
+      body: (history: boolean) => ({
+        model: "gpt-4o",
+        messages: history ? chatHistory : [{ role: "user", content: question }],
+        tools: [CHAT_TOOL],
+      }),
+    },
+    {
+      name: "passthrough Responses envelope",
+      path: "/ids-pt/v1/responses",
+      body: (history: boolean) => ({ model: "gpt-4o", input: history ? responsesHistory : question, tools: [RESPONSES_TOOL] }),
+    },
+  ];
+
+  for (const stream of [false, true]) {
+    const mode = stream ? "streamed" : "buffered";
+    for (const surface of surfaces) {
+      // A fresh question: the only ids in play are the ones the upstream mints.
+      test.skipIf(stream && "bufferedOutputOnly" in surface)(`${surface.name} output (${mode})`, async (ctx) => {
+        if (!etcdReachable || !app) return ctx.skip();
+        const texts = await scanned(surface.path, { ...surface.body(false), stream });
+        expectNoIds(texts);
+        expect(texts.some((t) => t.includes("OUTARGMARK")), "output arguments scanned").toBe(true);
       });
-      expectNoIds(texts, { output: true });
-    });
 
-    test(`/v1/responses (${mode})`, async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const texts = await scanned("/v1/responses", { model: "ids-gpt", input: responsesHistory, tools: [RESPONSES_TOOL], stream });
-      expectNoIds(texts, { output: true });
-    });
-
-    test(`passthrough chat envelope (${mode})`, async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const texts = await scanned("/ids-pt/v1/chat/completions", { model: "gpt-4o", messages: chatHistory, tools: [CHAT_TOOL], stream });
-      expectNoIds(texts, { output: true });
-    });
-
-    test(`passthrough Responses envelope (${mode})`, async (ctx) => {
-      if (!etcdReachable || !app) return ctx.skip();
-      const texts = await scanned("/ids-pt/v1/responses", { model: "gpt-4o", input: responsesHistory, tools: [RESPONSES_TOOL], stream });
-      expectNoIds(texts, { output: true });
-    });
+      test(`${surface.name} input (${mode})`, async (ctx) => {
+        if (!etcdReachable || !app) return ctx.skip();
+        const texts = await scanned(surface.path, { ...surface.body(true), stream });
+        expectNoIds(texts);
+        expect(texts.some((t) => t.includes(TOOL) && t.includes("INARGMARK")), "input name and arguments scanned").toBe(
+          true,
+        );
+      });
+    }
   }
 
   test("/v1/messages/count_tokens", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const texts = await scanned("/v1/messages/count_tokens", { model: "ids-claude", messages: messagesHistory, tools: [ANTHROPIC_TOOL] });
-    expectNoIds(texts, { output: false });
+    expectNoIds(texts);
+    expect(texts.some((t) => t.includes(TOOL) && t.includes("INARGMARK")), "input name and arguments scanned").toBe(true);
   });
 
   test("passthrough Anthropic body on the chat envelope", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const texts = await scanned("/ids-pt/v1/messages", { model: "claude-sonnet-4-5", max_tokens: 64, messages: messagesHistory });
-    for (const text of texts) {
-      for (const mark of ID_MARKS) expect(text, `id ${mark} reached the guardrail`).not.toContain(mark);
-    }
+    expectNoIds(texts);
     expect(texts.some((t) => t.includes("INARGMARK")), "tool_use input scanned").toBe(true);
     expect(texts.some((t) => t.includes("OUTARGMARK")), "output tool_use input scanned").toBe(true);
   });
