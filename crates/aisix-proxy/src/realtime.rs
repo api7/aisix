@@ -909,6 +909,7 @@ async fn run_session(
                         )
                         .await
                         {
+                            let (resp, refusal) = resp;
                             let _ = client_tx.send(AxMessage::Text(resp)).await;
                             let _ = client_tx
                                 .send(AxMessage::Close(Some(CloseFrame {
@@ -917,10 +918,7 @@ async fn run_session(
                                 })))
                                 .await;
                             close_status = 400;
-                            session_error = Some(ProxyError::ContentFiltered {
-                                message: "realtime frame blocked by a guardrail".into(),
-                                unavailable: None,
-                            });
+                            session_error = Some(refusal);
                             break;
                         }
                     }
@@ -957,6 +955,7 @@ async fn run_session(
                         )
                         .await
                         {
+                            let (resp, refusal) = resp;
                             let _ = client_tx.send(AxMessage::Text(resp)).await;
                             let _ = client_tx
                                 .send(AxMessage::Close(Some(CloseFrame {
@@ -965,10 +964,7 @@ async fn run_session(
                                 })))
                                 .await;
                             close_status = 400;
-                            session_error = Some(ProxyError::ContentFiltered {
-                                message: "realtime frame blocked by a guardrail".into(),
-                                unavailable: None,
-                            });
+                            session_error = Some(refusal);
                             break;
                         }
                     }
@@ -1163,14 +1159,15 @@ enum Dir {
 }
 
 /// Whole-frame guardrail scan (the `/passthrough` blob precedent applied
-/// per WS text frame). Returns the client-facing error event on Block.
+/// per WS text frame). Returns the client-facing error event on Block,
+/// with the refusal it reports.
 async fn guardrail_block_event(
     chain: &aisix_guardrails::GuardrailChain,
     model_name: &str,
     text: &str,
     input_side: bool,
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
-) -> Option<String> {
+) -> Option<(String, ProxyError)> {
     let (verdict, hits) = if input_side {
         let chat = aisix_gateway::ChatFormat::new(
             model_name,
@@ -1200,18 +1197,21 @@ async fn guardrail_block_event(
             reason = %reason,
             "guardrail blocked realtime frame",
         );
-        let msg = crate::error::guardrail_block_message(
+        let refusal = crate::error::guardrail_block_error(
             if input_side { "request" } else { "response" },
             guardrail_name.as_deref(),
             unavailable.as_deref(),
         );
-        return Some(
-            serde_json::json!({
-                "type": "error",
-                "error": {"type": "invalid_request_error", "code": "content_filtered", "message": msg}
-            })
-            .to_string(),
-        );
+        let event = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "content_filtered",
+                "message": refusal.to_string(),
+            }
+        })
+        .to_string();
+        return Some((event, refusal));
     }
     None
 }

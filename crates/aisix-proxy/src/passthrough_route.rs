@@ -6105,8 +6105,8 @@ fn stream_response(
                         chain.record_output_buffer_exceeded();
                         pending.clear();
                         pending_held.clear();
-                        yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
                         telemetry.record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
+                        yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
                         telemetry.stream_reached_end = true;
                         telemetry.emit();
                         return;
@@ -6175,8 +6175,8 @@ fn stream_response(
                         chain.record_output_buffer_exceeded();
                         pending.clear();
                         pending_held.clear();
-                        yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
                         telemetry.record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
+                        yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
                         telemetry.stream_reached_end = true;
                         telemetry.emit();
                         return;
@@ -6228,12 +6228,12 @@ fn stream_response(
                         );
                         pending.clear();
                         pending_held.clear();
+                        telemetry.record_refusal(None, Some(crate::error::TAG_UNSCANNABLE_BODY));
                         yield Ok(guardrail_error_frame(
                             anthropic.unwrap_or(false),
                             None,
                             Some(crate::error::TAG_UNSCANNABLE_BODY),
                         ));
-                        telemetry.record_refusal(None, Some(crate::error::TAG_UNSCANNABLE_BODY));
                         telemetry.stream_reached_end = true;
                         telemetry.emit();
                         return;
@@ -6287,8 +6287,8 @@ fn stream_response(
                         chain.record_output_buffer_exceeded();
                         pending.clear();
                         pending_held.clear();
-                        yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
                         telemetry.record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
+                        yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED)));
                         telemetry.stream_reached_end = true;
                         telemetry.emit();
                         return;
@@ -6354,8 +6354,8 @@ fn stream_response(
                             // the error frame is the caller-visible signal either way.
                             pending.clear();
                             pending_held.clear();
-                            yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), guardrail_name.as_deref(), unavailable.as_deref()));
                             telemetry.record_refusal(guardrail_name.as_deref(), unavailable.as_deref());
+                            yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), guardrail_name.as_deref(), unavailable.as_deref()));
                             telemetry.stream_reached_end = true;
                             telemetry.emit();
                             return;
@@ -6579,11 +6579,6 @@ impl RouteTelemetry {
         self.failure_status = Some(failure.status);
     }
 
-    /// A successful renewal can prove a stream still owns its shared
-    /// concurrency member; a missing member proves the opposite. The HTTP
-    /// response head has already been sent, so terminate at EOF and record a
-    /// distinct rate-limit outcome instead of misclassifying it as client
-    /// cancellation or an upstream transport failure.
     /// Record the guardrail refusal that ended a streamed relay after its
     /// head went out, with the text of the error frame it ends on. The
     /// stream keeps its status; the refusal names the event over any
@@ -6598,12 +6593,20 @@ impl RouteTelemetry {
             crate::attempt::StreamRefusal::new(guardrail_name, unavailable).error_message;
     }
 
+    /// A successful renewal can prove a stream still owns its shared
+    /// concurrency member; a missing member proves the opposite. The HTTP
+    /// response head has already been sent, so terminate at EOF and record a
+    /// distinct rate-limit outcome instead of misclassifying it as client
+    /// cancellation or an upstream transport failure.
     fn record_rate_limit_lease_lost(&mut self) {
         if self.failure_status.is_some() {
             return;
         }
-        self.error_class = "rate_limit_lease_lost".to_string();
-        self.error_message = "distributed concurrency lease was lost".to_string();
+        // A guardrail refusal already recorded names the event.
+        if !self.guardrail_blocked {
+            self.error_class = "rate_limit_lease_lost".to_string();
+            self.error_message = "distributed concurrency lease was lost".to_string();
+        }
         self.failure_status = Some(429);
     }
 

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { WebSocket as WsClient, WebSocketServer, type WebSocket as WsSocket } from "ws";
 import {
   EtcdClient,
   SeedClient,
@@ -54,6 +55,45 @@ const LEAKY_STREAM = [
   chatChunk({}, "stop"),
   "[DONE]",
 ];
+const sse = (event: string, data: Record<string, unknown>) =>
+  `event: ${event}\ndata: ${JSON.stringify({ type: event, ...data })}\n\n`;
+// The same answer on Anthropic's own stream wire.
+const LEAKY_ANTHROPIC_STREAM = [
+  sse("message_start", {
+    message: {
+      id: "msg_gem",
+      type: "message",
+      role: "assistant",
+      model: "claude-sonnet-4-5",
+      content: [],
+      stop_reason: null,
+      usage: { input_tokens: 3, output_tokens: 1 },
+    },
+  }),
+  sse("content_block_start", { index: 0, content_block: { type: "text", text: "" } }),
+  sse("content_block_delta", { index: 0, delta: { type: "text_delta", text: `here is ${FORBIDDEN}` } }),
+  sse("content_block_stop", { index: 0 }),
+  sse("message_delta", { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } }),
+  sse("message_stop", {}),
+];
+/** A realtime upstream that answers every client frame with `response.done`. */
+async function startRealtimeUpstream(): Promise<{ port: number; close(): Promise<void> }> {
+  const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  wss.on("connection", (socket: WsSocket) => {
+    socket.on("message", () => {
+      socket.send(JSON.stringify({ type: "response.done", response: { usage: {} } }));
+    });
+  });
+  await new Promise<void>((resolve) => wss.on("listening", resolve));
+  const addr = wss.address();
+  if (addr === null || typeof addr === "string") throw new Error("no port");
+  return {
+    port: addr.port,
+    close: () =>
+      new Promise<void>((resolve, reject) => wss.close((e) => (e ? reject(e) : resolve()))),
+  };
+}
+
 const STREAM_REFUSAL = "response blocked by content policy (guardrail 'gem-output-block')";
 
 describe("gateway-side failures name themselves on the usage event", () => {
@@ -63,8 +103,10 @@ describe("gateway-side failures name themselves on the usage event", () => {
   let leaky: OpenAiUpstream | undefined;
   let leakyResponses: OpenAiUpstream | undefined;
   let leakyStream: OpenAiUpstream | undefined;
+  let leakyAnthropic: OpenAiUpstream | undefined;
   let agent: A2aUpstream | undefined;
   let mcp: McpUpstream | undefined;
+  let realtime: { port: number; close(): Promise<void> } | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -110,8 +152,10 @@ describe("gateway-side failures name themselves on the usage event", () => {
     });
 
     leakyStream = await startOpenAiUpstream({ streamEvents: LEAKY_STREAM });
+    leakyAnthropic = await startOpenAiUpstream({ rawStreamFrames: LEAKY_ANTHROPIC_STREAM });
     agent = await startA2aUpstream({ cardMount: "origin" });
     mcp = await startMcpUpstream("gemmcp");
+    realtime = await startRealtimeUpstream();
 
     app = await spawnApp({
       extraEnv: {
@@ -223,6 +267,21 @@ describe("gateway-side failures name themselves on the usage event", () => {
       provider_key_id: leakyStreamPk.id,
     });
     await seed.attachGuardrailToModel(outputGuard.id, leakyStreamModel.id);
+    // The Anthropic-native /v1/messages passthrough stream.
+    const anthropicPk = await seed.createProviderKey({
+      display_name: "gem-leaky-anthropic-pk",
+      secret: "sk-ant-mock",
+      provider: "anthropic",
+      adapter: "anthropic",
+      api_base: leakyAnthropic.baseUrl,
+    });
+    const anthropicModel = await seed.createModel({
+      display_name: "gem-leaky-anthropic",
+      provider: "anthropic",
+      model_name: "claude-sonnet-4-5",
+      provider_key_id: anthropicPk.id,
+    });
+    await seed.attachGuardrailToModel(outputGuard.id, anthropicModel.id);
     const bridgedPk = await seed.createProviderKey({
       display_name: "gem-leaky-bridged-pk",
       secret: "sk-mock",
@@ -248,6 +307,18 @@ describe("gateway-side failures name themselves on the usage event", () => {
       scope_type: "passthrough_route",
       scope_id: streamRoute.id,
       priority: 100,
+    });
+
+    const realtimePk = await seed.createProviderKey({
+      display_name: "gem-realtime-pk",
+      secret: "sk-mock",
+      api_base: `http://127.0.0.1:${realtime.port}/v1`,
+    });
+    await seed.createModel({
+      display_name: "gem-realtime",
+      provider: "openai",
+      model_name: "gpt-realtime-mock",
+      provider_key_id: realtimePk.id,
     });
 
     await seed.update("a2a_agents", randomUUID(), {
@@ -307,8 +378,10 @@ describe("gateway-side failures name themselves on the usage event", () => {
     await leaky?.close();
     await leakyResponses?.close();
     await leakyStream?.close();
+    await leakyAnthropic?.close();
     await agent?.close();
     await mcp?.close();
+    await realtime?.close();
     await sls?.close();
   });
 
@@ -514,6 +587,16 @@ describe("gateway-side failures name themselves on the usage event", () => {
       },
     ],
     [
+      "/v1/messages",
+      "anthropic-native messages stream",
+      {
+        model: "gem-leaky-anthropic",
+        stream: true,
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hi" }],
+      },
+    ],
+    [
       "/v1/responses",
       "bridged responses stream",
       { model: "gem-leaky-bridged", stream: true, input: "hi" },
@@ -588,5 +671,29 @@ describe("gateway-side failures name themselves on the usage event", () => {
     const mcpLimitedEvent = await eventFor(mcpLimited.requestId, "mcp rate limit");
     expect(mcpLimitedEvent.get("error_class")).toBe("rate_limit_exceeded");
     expect(mcpLimitedEvent.get("error_message")).toMatch(/limit exceeded/);
+  });
+  test("a guardrail refusal that ends a /v1/realtime session names itself", async (ctx) => {
+    if (!ready()) return ctx.skip();
+    const ws = new WsClient(
+      `${app!.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=gem-realtime`,
+      { headers: { authorization: `Bearer ${CALLER}` } },
+    );
+    await new Promise<void>((resolve, reject) => {
+      ws.once("open", () => resolve());
+      ws.once("error", reject);
+    });
+    const closed = new Promise<void>((resolve) => ws.once("close", () => resolve()));
+    ws.send(JSON.stringify({ type: "session.update", session: { instructions: `say ${FORBIDDEN}` } }));
+    await closed;
+    const event = await waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (l) => l.get("requested_model") === "gem-realtime" && l.get("guardrail_blocked") === "true",
+      "realtime refusal",
+    );
+    expect(event.get("error_class")).toBe("content_filter");
+    expect(event.get("error_message")).toBe(
+      "request blocked by content policy (guardrail 'gem-input-block')",
+    );
   });
 });
