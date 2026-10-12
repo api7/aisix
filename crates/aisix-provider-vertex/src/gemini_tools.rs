@@ -31,7 +31,7 @@
 
 use aisix_gateway::{
     structured_output::{apply_schema_limits, SchemaLimits},
-    tool_calls::THOUGHT_SIGNATURE_SEPARATOR,
+    tool_calls::{split_thought_signature, strip_thought_signature, THOUGHT_SIGNATURE_SEPARATOR},
     BridgeError, ChatMessage,
 };
 use serde_json::{json, Map, Value};
@@ -244,14 +244,6 @@ pub(crate) fn gemini_tool_config(choice: &Value) -> Result<Option<Value>, Bridge
     Ok(Some(json!({ "functionCallingConfig": config })))
 }
 
-/// Split the thought signature out of a tool call id this gateway minted.
-fn split_tool_call_id(id: &str) -> (&str, Option<&str>) {
-    match id.split_once(THOUGHT_SIGNATURE_SEPARATOR) {
-        Some((id, signature)) => (id, Some(signature)),
-        None => (id, None),
-    }
-}
-
 /// Gemini's signature (standard base64) → the URL-safe, unpadded form
 /// carried in an id.
 fn encode_signature(signature: &str) -> String {
@@ -297,7 +289,7 @@ fn tool_call_thought_signature(call: &Value) -> Option<String> {
         .or_else(|| {
             call.get("id")
                 .and_then(Value::as_str)
-                .and_then(|id| split_tool_call_id(id).1)
+                .and_then(|id| split_thought_signature(id).1)
                 .filter(|s| !s.is_empty())
                 .map(decode_signature)
         })
@@ -313,7 +305,11 @@ pub(crate) fn function_call_parts(
     let mut parts = Vec::with_capacity(tool_calls.len());
     for call in tool_calls {
         let Some(function) = call.get("function") else {
-            continue;
+            return Err(BridgeError::InvalidUpstreamConfig(
+                "assistant tool call is not a function call; only function tool calls \
+                 can be replayed to this model"
+                    .into(),
+            ));
         };
         let name = function
             .get("name")
@@ -333,7 +329,7 @@ pub(crate) fn function_call_parts(
         if let Some(id) = call
             .get("id")
             .and_then(Value::as_str)
-            .map(|id| split_tool_call_id(id).0)
+            .map(|id| split_thought_signature(id).0)
             .filter(|id| !id.is_empty())
         {
             function_call.insert("id".into(), id.into());
@@ -358,27 +354,34 @@ pub(crate) fn function_call_parts(
 /// A `role: "tool"` result → a `functionResponse` part.
 ///
 /// Gemini keys the response by function name, which an OpenAI tool
-/// message does not carry: it is recovered from the most recent
-/// assistant turn's call with the same id, else from the message's own
+/// message does not carry: it is recovered from the latest earlier
+/// assistant call with the same base id, else from the message's own
 /// `name`. A JSON-object result is passed as the response itself;
 /// anything else is wrapped as `{"content": <text>}`.
 pub(crate) fn function_response_part(
     message: &ChatMessage,
-    last_tool_calls: Option<&[Value]>,
+    prior_tool_calls: &[&Value],
 ) -> Result<Value, BridgeError> {
     let call_id = message.tool_call_id.as_deref();
-    let name = last_tool_calls
-        .into_iter()
-        .flatten()
-        .find(|call| call_id.is_some() && call.get("id").and_then(Value::as_str) == call_id)
+    let base_id = call_id.map(strip_thought_signature);
+    let name = prior_tool_calls
+        .iter()
+        .rev()
+        .find(|call| {
+            base_id.is_some()
+                && call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(strip_thought_signature)
+                    == base_id
+        })
         .and_then(|call| call.pointer("/function/name"))
         .and_then(Value::as_str)
         .or(message.name.as_deref())
         .filter(|name| !name.is_empty())
         .ok_or_else(|| {
             BridgeError::InvalidUpstreamConfig(
-                "tool message has no corresponding tool call in the preceding assistant turn"
-                    .into(),
+                "tool message has no corresponding tool call in an earlier assistant turn".into(),
             )
         })?;
     let content = message.content_str();
@@ -393,7 +396,7 @@ pub(crate) fn function_response_part(
     };
     let mut function_response = Map::new();
     if let Some(id) = call_id
-        .map(|id| split_tool_call_id(id).0)
+        .map(|id| split_thought_signature(id).0)
         .filter(|id| !id.is_empty())
     {
         function_response.insert("id".into(), id.into());
@@ -943,9 +946,9 @@ mod tests {
     #[test]
     fn tool_results_recover_the_function_name_and_carry_the_id() {
         let calls = [call("call_a__thought__SIG", "get_weather", "{}")];
+        let prior: Vec<&Value> = calls.iter().collect();
         let part =
-            function_response_part(&tool_message("call_a__thought__SIG", "sunny"), Some(&calls))
-                .unwrap();
+            function_response_part(&tool_message("call_a__thought__SIG", "sunny"), &prior).unwrap();
         assert_eq!(
             part,
             json!({"functionResponse": {"id": "call_a", "name": "get_weather",
@@ -953,11 +956,11 @@ mod tests {
         );
         let part = function_response_part(
             &tool_message("call_a__thought__SIG", r#" {"temp": 21}"#),
-            Some(&calls),
+            &prior,
         )
         .unwrap();
         assert_eq!(part["functionResponse"]["response"], json!({"temp": 21}));
-        let part = function_response_part(&tool_message("x", "[1,2]"), None);
+        let part = function_response_part(&tool_message("x", "[1,2]"), &[]);
         assert!(matches!(part, Err(BridgeError::InvalidUpstreamConfig(_))));
     }
 
@@ -968,7 +971,7 @@ mod tests {
                 .unwrap();
         let tc = tool_call_from_function_call(&fc, Some("ab+c/d=="));
         let id = tc["id"].as_str().unwrap();
-        let (bare, sig) = split_tool_call_id(id);
+        let (bare, sig) = split_thought_signature(id);
         assert!(bare.starts_with("call_") && bare.len() == 33, "{bare}");
         assert_eq!(sig, Some("ab-c_d"));
         assert!(id
@@ -991,5 +994,25 @@ mod tests {
                 "{unportable}"
             );
         }
+    }
+
+    #[test]
+    fn a_result_finds_its_call_by_base_id_in_any_earlier_turn() {
+        let first = call("call_a__thought__SIG", "get_weather", "{}");
+        let second = call("call_b", "get_time", "{}");
+        let prior = [&first, &second];
+        // The suffix was stripped on the way through another hop.
+        let part = function_response_part(&tool_message("call_a", "sunny"), &prior).unwrap();
+        assert_eq!(part["functionResponse"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn a_non_function_tool_call_in_history_is_refused() {
+        let custom =
+            json!({"id": "c", "type": "custom", "custom": {"name": "apply_patch", "input": "x"}});
+        assert!(matches!(
+            function_call_parts(&[custom], "gemini-2.5-flash"),
+            Err(BridgeError::InvalidUpstreamConfig(_))
+        ));
     }
 }

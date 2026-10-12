@@ -18,10 +18,17 @@ use crate::{BridgeError, ChatFormat};
 /// Separates a tool-call id from the thought signature appended to it.
 pub const THOUGHT_SIGNATURE_SEPARATOR: &str = "__thought__";
 
+/// `id` split into its base id and the thought signature appended to it.
+pub fn split_thought_signature(id: &str) -> (&str, Option<&str>) {
+    match id.split_once(THOUGHT_SIGNATURE_SEPARATOR) {
+        Some((base, signature)) => (base, Some(signature)),
+        None => (id, None),
+    }
+}
+
 /// `id` without a thought-signature suffix.
 pub fn strip_thought_signature(id: &str) -> &str {
-    id.split_once(THOUGHT_SIGNATURE_SEPARATOR)
-        .map_or(id, |(base, _)| base)
+    split_thought_signature(id).0
 }
 
 fn has_signature(v: Option<&Value>) -> bool {
@@ -112,23 +119,33 @@ pub fn reject_legacy_function_calling(req: &ChatFormat) -> Result<(), BridgeErro
 /// one is kilobytes of base64 that a keyword rule could match by chance.
 pub fn tool_calls_scan_text(tool_calls: &Value) -> String {
     match tool_calls {
-        Value::Array(calls) => {
-            let without_ids: Vec<Value> = calls
-                .iter()
-                .map(|call| match call {
-                    Value::Object(obj) => Value::Object(
-                        obj.iter()
-                            .filter(|(k, _)| k.as_str() != "id")
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                    ),
-                    other => other.clone(),
-                })
-                .collect();
-            Value::Array(without_ids).to_string()
-        }
+        Value::Array(calls) => blocks_scan_text(calls),
         other => other.to_string(),
     }
+}
+
+/// [`tool_calls_scan_text`] over any list of tool-call-bearing objects
+/// (an Anthropic `content` array included): each one serialized without
+/// its `id`, as a JSON array.
+pub fn blocks_scan_text<'a>(blocks: impl IntoIterator<Item = &'a Value>) -> String {
+    struct WithoutId<'a>(&'a Value);
+    impl serde::Serialize for WithoutId<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeMap;
+            match self.0 {
+                Value::Object(obj) => {
+                    let mut map = serializer.serialize_map(None)?;
+                    for (k, v) in obj.iter().filter(|(k, _)| k.as_str() != "id") {
+                        map.serialize_entry(k, v)?;
+                    }
+                    map.end()
+                }
+                other => other.serialize(serializer),
+            }
+        }
+    }
+    let blocks: Vec<WithoutId<'_>> = blocks.into_iter().map(WithoutId).collect();
+    serde_json::to_string(&blocks).unwrap_or_default()
 }
 
 #[cfg(test)]

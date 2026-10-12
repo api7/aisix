@@ -465,7 +465,7 @@ describe("function calling on Vertex's native Gemini wire", () => {
     ]);
   });
 
-  test.each(["vertex-fc-gemini", "vertex-fc-gemini-3"])(
+  test.for(["vertex-fc-gemini", "vertex-fc-gemini-3"])(
     "%s: replayed calls and responses carry the call id",
     async (modelName, ctx) => {
     if (!etcdReachable || !app || !upstream) return ctx.skip();
@@ -581,7 +581,7 @@ describe("function calling on Vertex's native Gemini wire", () => {
     expect(declaration.parameters).toBeUndefined();
   });
 
-  test.each([
+  test.for<[string, Record<string, unknown>]>([
     ["legacy functions", { functions: [WEATHER_TOOL.function] }],
     ["legacy function_call", { tools: [WEATHER_TOOL], function_call: "auto" }],
     ["a hosted tool", { tools: [{ type: "web_search_preview" }] }],
@@ -589,7 +589,7 @@ describe("function calling on Vertex's native Gemini wire", () => {
       "an unnamed tool_choice object",
       { tools: [WEATHER_TOOL], tool_choice: { type: "allowed_tools", allowed_tools: {} } },
     ],
-  ])("chat: %s is refused, not dropped", async (_what, extra, ctx) => {
+  ])("chat: %s is refused, not dropped", async ([, extra], ctx) => {
     if (!etcdReachable || !app || !upstream) return ctx.skip();
     const before = upstream.received.length;
     const res = await post(app, "/v1/chat/completions", {

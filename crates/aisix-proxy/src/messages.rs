@@ -1835,9 +1835,7 @@ async fn anthropic_passthrough_dispatch(
                     out_text.push('\n');
                 }
                 // Every block but its `id`: a tool id is an opaque handle.
-                out_text.push_str(&aisix_gateway::tool_calls::tool_calls_scan_text(
-                    &Value::Array(scannable.into_iter().cloned().collect()),
-                ));
+                out_text.push_str(&aisix_gateway::tool_calls::blocks_scan_text(scannable));
 
                 let synth = aisix_gateway::ChatResponse {
                     id: String::new(),

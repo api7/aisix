@@ -2256,7 +2256,7 @@ fn build_gemini_request(
     let mut system_parts: Vec<String> = Vec::new();
     let mut contents: Vec<GeminiContent> = Vec::new();
     let mut tool_responses: Vec<GeminiPart> = Vec::new();
-    let mut last_tool_calls: Option<&[serde_json::Value]> = None;
+    let mut prior_tool_calls: Vec<&serde_json::Value> = Vec::new();
     for m in &req.messages {
         // `generateContent` has no slot for replayed reasoning; a turn that
         // holds only that would become an empty `model` turn.
@@ -2275,9 +2275,10 @@ fn build_gemini_request(
                 role: "user",
                 parts: vec![GeminiPart::text(m.content_str())],
             }),
-            Role::Tool => {
-                tool_responses.push(GeminiPart::Raw(function_response_part(m, last_tool_calls)?))
-            }
+            Role::Tool => tool_responses.push(GeminiPart::Raw(function_response_part(
+                m,
+                &prior_tool_calls,
+            )?)),
             Role::Assistant => {
                 let tool_calls = m
                     .extra
@@ -2287,7 +2288,7 @@ fn build_gemini_request(
                 let parts = match tool_calls {
                     None => vec![GeminiPart::text(m.content_str())],
                     Some(calls) => {
-                        last_tool_calls = Some(calls);
+                        prior_tool_calls.extend(calls);
                         // A pure tool-call turn has `content: null` and
                         // no text part.
                         m.text()
