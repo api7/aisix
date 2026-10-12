@@ -38,7 +38,7 @@ use aisix_provider_openai::overrides::{
 use aisix_provider_openai::reasoning::{is_reasoning_model, ReasoningFamily};
 use aisix_provider_openai::wire::{
     build_request, messages_from, response_into_chat_response, stream_chunk_into_chat_chunk,
-    DeveloperRoleMode, OpenAiResponse, OpenAiStreamChunk,
+    DeveloperRoleMode, OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
 };
 
 use crate::aad_token_mint::TokenMinter;
@@ -891,6 +891,7 @@ where
 {
     async_stream::try_stream! {
         let mut decoder = SseDecoder::new();
+        let mut tool_call_indexer = ToolCallIndexer::default();
         let mut stream = Box::pin(byte_stream);
         let mut done_marker_seen = false;
         'outer: loop {
@@ -921,7 +922,7 @@ where
                     }
                     SseEvent::Data(payload) => {
                         let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                        yield stream_chunk_into_chat_chunk(parsed);
+                        yield stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer);
                     }
                 }
             }
@@ -932,7 +933,7 @@ where
             }
             Some(SseEvent::Data(payload)) => {
                 let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                yield stream_chunk_into_chat_chunk(parsed);
+                yield stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer);
             }
             None => {}
         }

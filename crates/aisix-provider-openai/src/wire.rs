@@ -473,14 +473,70 @@ pub struct OpenAiStreamDelta {
     pub reasoning: Option<String>,
 }
 
-pub fn stream_chunk_into_chat_chunk(mut raw: OpenAiStreamChunk) -> ChatChunk {
+/// Supplies the `index` a streamed tool-call delta omits.
+///
+/// Every consumer groups streamed tool-call fragments by `index`, but
+/// Gemini's OpenAI-compatible endpoints (AI Studio and Vertex) send each
+/// call whole in its own chunk with no `index` at all, so two parallel calls
+/// would land on the same slot and have their arguments concatenated. A
+/// delta without `index` that names a new call `id` opens the next slot; one
+/// without an `id`, or repeating the current one, continues the current slot.
+/// One indexer lives for exactly one upstream stream.
+#[derive(Debug, Default)]
+pub struct ToolCallIndexer {
+    next: u64,
+    current: Option<(u64, Option<String>)>,
+}
+
+impl ToolCallIndexer {
+    fn fill(&mut self, tool_calls: &mut [serde_json::Value]) {
+        for call in tool_calls {
+            let Some(call) = call.as_object_mut() else {
+                continue;
+            };
+            let id = call
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned);
+            let index = match call.get("index").and_then(serde_json::Value::as_u64) {
+                Some(index) => index,
+                None => {
+                    let index = match (&self.current, &id) {
+                        (Some((current, _)), None) => *current,
+                        (Some((current, Some(current_id))), Some(id)) if current_id == id => {
+                            *current
+                        }
+                        _ => self.next,
+                    };
+                    call.insert("index".into(), index.into());
+                    index
+                }
+            };
+            self.next = self.next.max(index + 1);
+            let id = id.or_else(|| match &self.current {
+                Some((current, current_id)) if *current == index => current_id.clone(),
+                _ => None,
+            });
+            self.current = Some((index, id));
+        }
+    }
+}
+
+pub fn stream_chunk_into_chat_chunk(
+    mut raw: OpenAiStreamChunk,
+    tool_call_indexer: &mut ToolCallIndexer,
+) -> ChatChunk {
     let first = raw.choices.drain(..).next();
     let (delta, finish) = match first {
         Some(c) => (
             ChatDelta {
                 role: c.delta.role.as_deref().map(role_from_str),
                 content: c.delta.content,
-                tool_calls: c.delta.tool_calls,
+                tool_calls: c.delta.tool_calls.map(|mut calls| {
+                    tool_call_indexer.fill(&mut calls);
+                    calls
+                }),
                 // #648 canonical precedence, mirrored on the streaming path
                 // (#502): DeepSeek-canonical `reasoning_content` wins; fall
                 // back to OpenRouter's `reasoning`. Skip empties so a model
@@ -1260,7 +1316,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw);
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
         assert_eq!(chunk.delta.content.as_deref(), Some("hel"));
         assert!(chunk.finish_reason.is_none());
     }
@@ -1277,7 +1333,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw);
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
         assert_eq!(chunk.finish_reason, Some(FinishReason::Stop));
     }
 
@@ -1300,7 +1356,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw);
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
         let tc = chunk.delta.tool_calls.expect("tool_calls in delta");
         assert_eq!(tc.len(), 1);
         assert_eq!(tc[0]["id"], "call_abc");
@@ -1319,7 +1375,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw);
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
         assert_eq!(
             chunk.delta.reasoning_content.as_deref(),
             Some("thinking...")
@@ -1341,7 +1397,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw);
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
         assert_eq!(
             chunk.delta.reasoning_content.as_deref(),
             Some("let me reason about this")
@@ -1360,7 +1416,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw);
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
         assert_eq!(chunk.delta.reasoning_content.as_deref(), Some("canonical"));
     }
 
@@ -1376,7 +1432,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw);
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
         assert_eq!(chunk.delta.reasoning_content.as_deref(), Some("fallback"));
     }
 
@@ -1392,7 +1448,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw);
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
         assert!(chunk.delta.reasoning_content.is_none());
     }
 

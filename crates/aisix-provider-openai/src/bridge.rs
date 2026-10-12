@@ -47,7 +47,7 @@ use crate::reasoning::{is_reasoning_model, ReasoningFamily};
 use crate::wire::{
     build_request, embed_request_body, embed_response_into, messages_from,
     response_into_chat_response, stream_chunk_into_chat_chunk, DeveloperRoleMode,
-    OpenAiEmbedResponse, OpenAiResponse, OpenAiStreamChunk,
+    OpenAiEmbedResponse, OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
 };
 
 fn developer_role_mode(ctx: &BridgeContext) -> DeveloperRoleMode {
@@ -820,6 +820,7 @@ where
 {
     async_stream::try_stream! {
         let mut decoder = SseDecoder::new();
+        let mut tool_call_indexer = ToolCallIndexer::default();
         let mut stream = Box::pin(byte_stream);
         let mut done_marker_seen = false;
         'outer: while let Some(next) = stream.next().await {
@@ -832,7 +833,7 @@ where
                     }
                     SseEvent::Data(payload) => {
                         let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                        yield stream_chunk_into_chat_chunk(parsed);
+                        yield stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer);
                     }
                 }
             }
@@ -850,7 +851,7 @@ where
             }
             Some(SseEvent::Data(payload)) => {
                 let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                yield stream_chunk_into_chat_chunk(parsed);
+                yield stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer);
             }
             None => {}
         }
