@@ -473,14 +473,67 @@ pub struct OpenAiStreamDelta {
     pub reasoning: Option<String>,
 }
 
-pub fn stream_chunk_into_chat_chunk(mut raw: OpenAiStreamChunk) -> ChatChunk {
+/// Supplies the `index` a streamed tool-call delta omits.
+///
+/// Every consumer groups streamed tool-call fragments by `index`, but
+/// Gemini's OpenAI-compatible endpoints (AI Studio and Vertex) send each
+/// call whole in its own chunk with no `index` at all, so two parallel calls
+/// would land on the same slot and have their arguments concatenated. A
+/// delta without `index` that names a new call `id` opens the next slot; one
+/// without an `id`, or repeating the current one, continues the current slot.
+/// One indexer lives for exactly one upstream stream.
+#[derive(Debug, Default)]
+pub struct ToolCallIndexer {
+    next: u64,
+    current: Option<(u64, Option<String>)>,
+}
+
+impl ToolCallIndexer {
+    fn fill(&mut self, tool_calls: &mut [serde_json::Value]) {
+        for call in tool_calls {
+            let Some(call) = call.as_object_mut() else {
+                continue;
+            };
+            let id = call
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty());
+            let explicit = call.get("index").and_then(serde_json::Value::as_u64);
+            let index = explicit.unwrap_or(match (&self.current, id) {
+                (Some((current, _)), None) => *current,
+                (Some((current, Some(current_id))), Some(id)) if current_id == id => *current,
+                _ => self.next,
+            });
+            match &mut self.current {
+                Some((current, current_id)) if *current == index => {
+                    if let Some(id) = id.filter(|id| current_id.as_deref() != Some(*id)) {
+                        *current_id = Some(id.to_owned());
+                    }
+                }
+                _ => self.current = Some((index, id.map(str::to_owned))),
+            }
+            self.next = self.next.max(index + 1);
+            if explicit.is_none() {
+                call.insert("index".into(), index.into());
+            }
+        }
+    }
+}
+
+pub fn stream_chunk_into_chat_chunk(
+    mut raw: OpenAiStreamChunk,
+    tool_call_indexer: &mut ToolCallIndexer,
+) -> ChatChunk {
     let first = raw.choices.drain(..).next();
     let (delta, finish) = match first {
         Some(c) => (
             ChatDelta {
                 role: c.delta.role.as_deref().map(role_from_str),
                 content: c.delta.content,
-                tool_calls: c.delta.tool_calls,
+                tool_calls: c.delta.tool_calls.map(|mut calls| {
+                    tool_call_indexer.fill(&mut calls);
+                    calls
+                }),
                 // #648 canonical precedence, mirrored on the streaming path
                 // (#502): DeepSeek-canonical `reasoning_content` wins; fall
                 // back to OpenRouter's `reasoning`. Skip empties so a model
@@ -549,9 +602,14 @@ pub(crate) struct OpenAiEmbedRequest<'a> {
 /// `embeddings.create({model, input})` call failed with
 /// `502 upstream_decode_error` because the deserializer rejected
 /// the string shape.
+///
+/// `index` is optional: Google AI Studio's OpenAI-compatible endpoint
+/// serialises from proto3 and omits a zero `index`, so a single-input
+/// response carries none. A missing one is filled from the item's position.
 #[derive(Debug, Deserialize)]
 pub(crate) struct OpenAiEmbeddingObject {
-    pub index: u32,
+    #[serde(default)]
+    pub index: Option<u32>,
     pub object: String,
     pub embedding: EmbeddingVector,
 }
@@ -636,8 +694,9 @@ pub(crate) fn embed_response_into(raw: OpenAiEmbedResponse) -> EmbeddingResponse
         model,
         data: data
             .into_iter()
-            .map(|e| EmbeddingObject {
-                index: e.index,
+            .zip(0u32..)
+            .map(|(e, position)| EmbeddingObject {
+                index: e.index.unwrap_or(position),
                 object: e.object,
                 embedding: e.embedding,
             })
@@ -1254,7 +1313,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw);
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
         assert_eq!(chunk.delta.content.as_deref(), Some("hel"));
         assert!(chunk.finish_reason.is_none());
     }
@@ -1271,7 +1330,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw);
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
         assert_eq!(chunk.finish_reason, Some(FinishReason::Stop));
     }
 
@@ -1294,7 +1353,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw);
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
         let tc = chunk.delta.tool_calls.expect("tool_calls in delta");
         assert_eq!(tc.len(), 1);
         assert_eq!(tc[0]["id"], "call_abc");
@@ -1313,7 +1372,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw);
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
         assert_eq!(
             chunk.delta.reasoning_content.as_deref(),
             Some("thinking...")
@@ -1335,7 +1394,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw);
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
         assert_eq!(
             chunk.delta.reasoning_content.as_deref(),
             Some("let me reason about this")
@@ -1354,7 +1413,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw);
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
         assert_eq!(chunk.delta.reasoning_content.as_deref(), Some("canonical"));
     }
 
@@ -1370,7 +1429,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw);
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
         assert_eq!(chunk.delta.reasoning_content.as_deref(), Some("fallback"));
     }
 
@@ -1386,7 +1445,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw);
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
         assert!(chunk.delta.reasoning_content.is_none());
     }
 
@@ -1548,6 +1607,49 @@ mod tests {
         let tool_msg = &json["messages"][2];
         assert_eq!(tool_msg["tool_call_id"], "c1");
         assert_eq!(tool_msg["role"], "tool");
+    }
+
+    #[test]
+    fn tool_call_indexer_separates_calls_by_id_and_keeps_fragments_together() {
+        let mut indexer = ToolCallIndexer::default();
+        let mut indices = |calls: serde_json::Value| {
+            let mut calls = calls.as_array().unwrap().clone();
+            indexer.fill(&mut calls);
+            calls
+                .iter()
+                .map(|c| c["index"].as_u64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        // Gemini: each call whole, its own id, no index.
+        assert_eq!(
+            indices(serde_json::json!([{"id": "a", "function": {"arguments": "{}"}}])),
+            [0]
+        );
+        assert_eq!(
+            indices(serde_json::json!([{"id": "b", "function": {"arguments": "{}"}}])),
+            [1]
+        );
+        // A fragment without an id, or repeating the current id, continues the call.
+        assert_eq!(
+            indices(serde_json::json!([{"function": {"arguments": "x"}}])),
+            [1]
+        );
+        assert_eq!(
+            indices(serde_json::json!([{"id": "b", "function": {"arguments": "y"}}])),
+            [1]
+        );
+        // Two new calls in one chunk.
+        assert_eq!(
+            indices(serde_json::json!([{"id": "c"}, {"id": "d"}])),
+            [2, 3]
+        );
+        // An explicit index is kept and moves the next free slot past it.
+        assert_eq!(indices(serde_json::json!([{"index": 7, "id": "e"}])), [7]);
+        assert_eq!(
+            indices(serde_json::json!([{"function": {"arguments": "z"}}])),
+            [7]
+        );
+        assert_eq!(indices(serde_json::json!([{"id": "f"}])), [8]);
     }
 
     /// Issue #393: OpenAI's embeddings response carries `embedding` as

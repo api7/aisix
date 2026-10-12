@@ -70,7 +70,7 @@ use aisix_provider_openai::wire::{
     build_request as build_openai_request, messages_from as openai_messages_from,
     response_into_chat_response as openai_response_into_chat_response,
     stream_chunk_into_chat_chunk as openai_stream_chunk_into_chat_chunk, DeveloperRoleMode,
-    OpenAiResponse, OpenAiStreamChunk,
+    OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
 };
 
 // Per-`ProviderKey` request/response override pipeline (#302 §5 / #339).
@@ -1385,6 +1385,7 @@ impl VertexBridge {
         let byte_stream = resp.bytes_stream();
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
+            let mut tool_call_indexer = ToolCallIndexer::default();
             let mut byte_stream = Box::pin(byte_stream);
 
             while let Some(item) = byte_stream.next().await {
@@ -1396,7 +1397,7 @@ impl VertexBridge {
                                 &data,
                                 "vertex openai-shim stream chunk parse",
                             )?;
-                            yield openai_stream_chunk_into_chat_chunk(parsed);
+                            yield openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer);
                         }
                         // OpenAI shim terminates with `data: [DONE]`;
                         // stop emitting on the sentinel.
@@ -1414,7 +1415,7 @@ impl VertexBridge {
                     &data,
                     "vertex openai-shim stream tail parse",
                 )?;
-                yield openai_stream_chunk_into_chat_chunk(parsed);
+                yield openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer);
             }
         };
 
@@ -1619,6 +1620,7 @@ impl VertexBridge {
         let byte_stream = resp.bytes_stream();
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
+            let mut tool_call_indexer = ToolCallIndexer::default();
             let mut byte_stream = Box::pin(byte_stream);
 
             while let Some(item) = byte_stream.next().await {
@@ -1630,7 +1632,7 @@ impl VertexBridge {
                                 &data,
                                 "vertex partner :streamRawPredict chunk parse",
                             )?;
-                            yield openai_stream_chunk_into_chat_chunk(parsed);
+                            yield openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer);
                         }
                         // OpenAI-compatible upstreams (Mistral / AI21)
                         // terminate with `data: [DONE]`; stop on the sentinel.
@@ -1646,7 +1648,7 @@ impl VertexBridge {
                     &data,
                     "vertex partner :streamRawPredict tail parse",
                 )?;
-                yield openai_stream_chunk_into_chat_chunk(parsed);
+                yield openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer);
             }
         };
 
