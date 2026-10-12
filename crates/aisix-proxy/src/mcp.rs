@@ -272,8 +272,9 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
         total_tokens: None,
         request_id: &request_id,
         // `dispatch` renders its own `Response` rather than surfacing a
-        // `ProxyError`, so there is no typed error to name here. The status
-        // code is all this endpoint can attribute a failure to.
+        // `ProxyError`, so there is no typed error to name here; the
+        // request's terminal usage event names the failure on this line
+        // when it is completed (`attribution::note_terminal_error`).
         error_kind: None,
         error: None,
         provider_request_id: None,
