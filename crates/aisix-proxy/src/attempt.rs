@@ -292,6 +292,9 @@ impl AttemptInfo {
 pub(crate) fn error_class(err: &ProxyError) -> &'static str {
     match err {
         ProxyError::Bridge(be) => routing_error_class(be),
+        // Its `error.type` is the generic `api_error`, which would hide
+        // the failure among every other gateway-side fault.
+        ProxyError::SemanticDecisionFailed { .. } => "semantic_decision_failed",
         other => other.kind(),
     }
 }
@@ -463,6 +466,7 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         | ProxyError::InvalidRequest(_)
         | ProxyError::WebSocketUpgradeRequired { .. }
         | ProxyError::ProviderUnavailable
+        | ProxyError::SemanticDecisionFailed { .. }
         | ProxyError::AllCandidatesUnavailable { .. }
         | ProxyError::BudgetExceeded(_)
         | ProxyError::RequestTooLarge { .. }
