@@ -286,6 +286,7 @@ pub fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
     let (message, finish) = match first {
         Some(c) => {
             let mut extra = serde_json::Map::new();
+            let has_tool_calls = c.message.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
             if let Some(tool_calls) = c.message.tool_calls {
                 if !tool_calls.is_empty() {
                     extra.insert(
@@ -345,7 +346,7 @@ pub fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
                     tool_call_id: None,
                     extra,
                 },
-                finish_reason(c.finish_reason.as_deref()),
+                turn_finish_reason(c.finish_reason.as_deref(), has_tool_calls),
             )
         }
         None => (ChatMessage::assistant(""), FinishReason::Stop),
@@ -411,6 +412,18 @@ fn into_usage(u: OpenAiUsage) -> UsageStats {
         // exactly "not reported".
         upstream_total_tokens: u.total_tokens,
         reasoning_folded_into_completion: 0,
+    }
+}
+
+/// The finish reason of a turn that may have called tools. Some
+/// OpenAI-compatible upstreams (Gemini's) end a tool-calling turn with the
+/// generic `stop`; a client that runs tools on `tool_calls` (or on the
+/// `tool_use` it maps to) would stop there instead. Any other terminal
+/// reason is kept, since it says something `tool_calls` would hide.
+fn turn_finish_reason(raw: Option<&str>, called_tools: bool) -> FinishReason {
+    match finish_reason(raw) {
+        FinishReason::Stop if called_tools => FinishReason::ToolCalls,
+        other => other,
     }
 }
 
@@ -489,6 +502,10 @@ pub struct ToolCallIndexer {
 }
 
 impl ToolCallIndexer {
+    fn saw_tool_call(&self) -> bool {
+        self.current.is_some()
+    }
+
     fn fill(&mut self, tool_calls: &mut [serde_json::Value]) {
         for call in tool_calls {
             let Some(call) = call.as_object_mut() else {
@@ -546,8 +563,7 @@ pub fn stream_chunk_into_chat_chunk(
             },
             c.finish_reason
                 .as_deref()
-                .map(|r| finish_reason(Some(r)))
-                .filter(|_| c.finish_reason.is_some()),
+                .map(|r| turn_finish_reason(Some(r), tool_call_indexer.saw_tool_call())),
         ),
         None => (ChatDelta::default(), None),
     };
@@ -1607,6 +1623,58 @@ mod tests {
         let tool_msg = &json["messages"][2];
         assert_eq!(tool_msg["tool_call_id"], "c1");
         assert_eq!(tool_msg["role"], "tool");
+    }
+
+    fn stream_chunk(json: serde_json::Value) -> OpenAiStreamChunk {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn a_streamed_turn_that_called_tools_finishes_as_tool_calls() {
+        let mut indexer = ToolCallIndexer::default();
+        let call = stream_chunk(serde_json::json!({"id": "x", "choices": [{"delta": {
+            "tool_calls": [{"id": "a", "function": {"name": "f", "arguments": "{}"}}]
+        }}]}));
+        assert_eq!(
+            stream_chunk_into_chat_chunk(call, &mut indexer).finish_reason,
+            None
+        );
+        let end = |reason: &str| {
+            stream_chunk(serde_json::json!({"id": "x", "choices": [
+                {"delta": {}, "finish_reason": reason}
+            ]}))
+        };
+        assert_eq!(
+            stream_chunk_into_chat_chunk(end("stop"), &mut indexer).finish_reason,
+            Some(FinishReason::ToolCalls)
+        );
+        assert_eq!(
+            stream_chunk_into_chat_chunk(end("length"), &mut indexer).finish_reason,
+            Some(FinishReason::Length)
+        );
+        assert_eq!(
+            stream_chunk_into_chat_chunk(end("stop"), &mut ToolCallIndexer::default())
+                .finish_reason,
+            Some(FinishReason::Stop)
+        );
+    }
+
+    #[test]
+    fn a_response_that_called_tools_finishes_as_tool_calls() {
+        let response = |finish: &str, tool_calls: serde_json::Value| {
+            let raw: OpenAiResponse = serde_json::from_value(serde_json::json!({
+                "id": "x", "model": "m",
+                "choices": [{"message": {"role": "assistant", "content": null,
+                    "tool_calls": tool_calls}, "finish_reason": finish}]
+            }))
+            .unwrap();
+            response_into_chat_response(raw).finish_reason
+        };
+        let calls = serde_json::json!([{"id": "a", "type": "function",
+            "function": {"name": "f", "arguments": "{}"}}]);
+        assert_eq!(response("stop", calls.clone()), FinishReason::ToolCalls);
+        assert_eq!(response("length", calls), FinishReason::Length);
+        assert_eq!(response("stop", serde_json::json!([])), FinishReason::Stop);
     }
 
     #[test]

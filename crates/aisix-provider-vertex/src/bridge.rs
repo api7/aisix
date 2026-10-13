@@ -1034,7 +1034,7 @@ impl VertexBridge {
         );
         let body_value = {
             let (system, messages) = split_system(&req)
-                .map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
+                .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
             let anthropic_req = build_anthropic_request(&req, upstream_id, system, messages, false);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -1142,7 +1142,7 @@ impl VertexBridge {
         // Vertex `anthropic_version`.
         let body_value = {
             let (system, messages) = split_system(&req)
-                .map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
+                .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
             let anthropic_req = build_anthropic_request(&req, upstream_id, system, messages, true);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))

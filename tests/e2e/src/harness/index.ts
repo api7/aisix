@@ -49,3 +49,4 @@ export {
   type MockIdp,
   type SignOpts,
 } from "./jwks-mock.js";
+export { eventStream, eventStreamFrame } from "./aws-eventstream.js";

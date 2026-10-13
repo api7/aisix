@@ -386,7 +386,7 @@ impl Bridge for AnthropicBridge {
 
         let body = {
             let (system, messages) = split_system(&req)
-                .map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
+                .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
             let mut body = build_request(&req, upstream, system, messages, false);
             maybe_inject_cache_breakpoints(&mut body, ctx);
             outbound_bytes(&body)?
@@ -479,7 +479,7 @@ impl Bridge for AnthropicBridge {
 
         let body = {
             let (system, messages) = split_system(&req)
-                .map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
+                .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
             let mut body = build_request(&req, upstream, system, messages, true);
             maybe_inject_cache_breakpoints(&mut body, ctx);
             outbound_bytes(&body)?
@@ -1048,12 +1048,12 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn tool_role_without_tool_call_id_is_rejected_as_config_error() {
+    async fn tool_role_without_tool_call_id_is_rejected_as_a_request_error() {
         // Tool role IS supported (translates to Anthropic
         // `{role:"user", content:[{type:"tool_result", ...}]}`)
         // when paired with a tool_call_id. Without one, there's no
         // way to pair the result with its originating tool_use, so
-        // the gateway rejects with Config.
+        // the request is refused.
         let server = MockServer::start().await;
         let bridge = AnthropicBridge::new();
         let ctx = sample_ctx(&server.uri());
@@ -1069,7 +1069,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             }],
         );
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
-        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
+        assert!(matches!(err, BridgeError::InvalidRequest(_)));
     }
 
     #[tokio::test]
