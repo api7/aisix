@@ -71,9 +71,28 @@ const INVOKE_REPLY = {
   usage: { input_tokens: 46, output_tokens: 119 },
 };
 
-const PROMPT = "What is 17 * 23?";
+// The same reply as non-streaming Converse returns it, which is how every
+// non-Anthropic publisher answers when not streamed.
+const CONVERSE_REPLY = {
+  output: {
+    message: {
+      role: "assistant",
+      content: [
+        { reasoningContent: { reasoningText: { text: REASONING, signature: SIGNATURE } } },
+        { reasoningContent: { redactedContent: REDACTED } },
+        { text: ANSWER },
+      ],
+    },
+  },
+  stopReason: "end_turn",
+  usage: { inputTokens: 46, outputTokens: 119, totalTokens: 165 },
+  metrics: { latencyMs: 1045 },
+};
 
-describe("Bedrock Claude: streamed reasoning matches the non-streamed reply", () => {
+const PROMPT = "What is 17 * 23?";
+const CONVERSE_MODEL = "bedrock-deepseek-reasoning";
+
+describe("Bedrock: streamed reasoning matches the non-streamed reply", () => {
   let app: SpawnedApp | undefined;
   let upstream: Server | undefined;
   let etcdReachable = false;
@@ -89,6 +108,9 @@ describe("Bedrock Claude: streamed reasoning matches the non-streamed reply", ()
         if (req.url?.endsWith("/converse-stream")) {
           res.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" });
           res.end(CONVERSE_STREAM);
+        } else if (req.url?.endsWith("/converse")) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(CONVERSE_REPLY));
         } else if (req.url?.endsWith("/invoke")) {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify(INVOKE_REPLY));
@@ -119,6 +141,12 @@ describe("Bedrock Claude: streamed reasoning matches the non-streamed reply", ()
       display_name: MODEL,
       provider: "bedrock",
       model_name: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      provider_key_id: pk.id,
+    });
+    await seed.createModel({
+      display_name: CONVERSE_MODEL,
+      provider: "bedrock",
+      model_name: "us.deepseek.r1-v1:0",
       provider_key_id: pk.id,
     });
     // Seeded last, so this key authenticating implies the whole seed set
@@ -237,5 +265,34 @@ describe("Bedrock Claude: streamed reasoning matches the non-streamed reply", ()
     expect(completed, raw).toBeDefined();
     expect(reasoningIn(completed.response.output)).toContain(encoded);
     expectNoOpaqueReasoning(raw);
+  });
+
+  // A non-Anthropic publisher answers through Converse both ways, so its
+  // non-streamed reply has to carry the reasoning as well.
+  test("a Converse publisher returns reasoning streamed and not streamed", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const request = { model: CONVERSE_MODEL, messages: [{ role: "user", content: PROMPT }] };
+
+    const plainRaw = await post("/v1/chat/completions", request);
+    const plain = JSON.parse(plainRaw);
+    expect(plain.choices[0].message.reasoning_content).toBe(REASONING);
+    expect(plain.choices[0].message.content).toBe(ANSWER);
+    expectNoOpaqueReasoning(plainRaw);
+
+    const raw = await post("/v1/chat/completions", { ...request, stream: true });
+    const deltas = sseData(raw).map((c) => c.choices?.[0]?.delta ?? {});
+    expect(deltas.map((d) => d.reasoning_content ?? "").join("")).toBe(REASONING);
+    expect(deltas.map((d) => d.content ?? "").join("")).toBe(ANSWER);
+
+    const messagesRaw = await post("/v1/messages", {
+      model: CONVERSE_MODEL,
+      max_tokens: 2048,
+      messages: [{ role: "user", content: PROMPT }],
+    });
+    const messages = JSON.parse(messagesRaw);
+    expect(
+      messages.content.filter((b: any) => b.type === "thinking").map((b: any) => b.thinking).join(""),
+    ).toBe(REASONING);
+    expectNoOpaqueReasoning(messagesRaw);
   });
 });

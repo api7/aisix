@@ -38,7 +38,7 @@ use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
 use aws_sdk_bedrockruntime::types::{
     AnyToolChoice, ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole,
     ConverseStreamOutput, InferenceConfiguration, JsonSchemaDefinition, Message as BedrockMessage,
-    OutputConfig, OutputFormat, OutputFormatStructure, OutputFormatType,
+    OutputConfig, OutputFormat, OutputFormatStructure, OutputFormatType, ReasoningContentBlock,
     ReasoningContentBlockDelta, SpecificToolChoice, StopReason as SdkStopReason,
     SystemContentBlock, Tool, ToolChoice, ToolConfiguration, ToolInputSchema, ToolResultBlock,
     ToolResultContentBlock, ToolSpecification, ToolUseBlock,
@@ -1421,18 +1421,31 @@ fn converse_output_into_chat_response(
         Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => {
             let mut text = String::new();
             let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+            let mut reasoning: Vec<&str> = Vec::new();
             for block in msg.content() {
                 match block {
                     ContentBlock::Text(t) => text.push_str(t),
                     // #560: translate Converse `toolUse` → OpenAI `tool_calls`.
                     ContentBlock::ToolUse(tu) => tool_calls.push(tool_use_to_openai(tu)),
+                    // Same shape as the Claude `/invoke` path: the text only,
+                    // blocks joined by a newline; the signature and redacted
+                    // ciphertext are dropped.
+                    ContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(r))
+                        if !r.text().is_empty() =>
+                    {
+                        reasoning.push(r.text())
+                    }
                     _ => {}
                 }
             }
-            (
-                build_assistant_message(text, tool_calls),
-                map_stop_reason(resp.stop_reason()),
-            )
+            let mut message = build_assistant_message(text, tool_calls);
+            if !reasoning.is_empty() {
+                message.extra.insert(
+                    "reasoning_content".to_string(),
+                    serde_json::Value::String(reasoning.join("\n")),
+                );
+            }
+            (message, map_stop_reason(resp.stop_reason()))
         }
         _ => (ChatMessage::assistant(String::new()), FinishReason::Stop),
     };
