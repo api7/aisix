@@ -23,9 +23,11 @@
 //! plain text with no overhead.
 //!
 //! Images follow OpenAI's vision token formula at every depth, with
-//! dimensions read from the header of inline data only. Opaque payloads
-//! — inline `data:` URIs, `encrypted_content`, thinking signatures,
-//! generated-image bytes, file and audio data — are never tokenized.
+//! dimensions read from the header of inline data only. Media and opaque
+//! payloads — image, file and audio data, `encrypted_content`, thinking
+//! signatures, generated-image bytes — are never tokenized. A string in a
+//! text slot counts as text whatever it contains, `data:` URI included,
+//! since that is how the upstream bills it.
 //!
 //! Encoding selection mirrors tiktoken's model map (`gpt-4o`/`o1`/... →
 //! `o200k_base`, `gpt-4`/`gpt-3.5` → `cl100k_base`) and falls back to
@@ -266,7 +268,7 @@ fn count_chat_prompt(bpe: &CoreBPE, req: &aisix_gateway::chat::ChatFormat) -> u3
         if let Some(blocks) = m.content_blocks.as_deref() {
             n = n.saturating_add(count_content_blocks(bpe, blocks));
         } else if let Some(text) = m.content.as_deref() {
-            n = n.saturating_add(count_str(bpe, text));
+            n = n.saturating_add(enc(bpe, text));
         }
         if let Some(name) = m.name.as_deref() {
             n = n
@@ -283,7 +285,7 @@ fn count_chat_prompt(bpe: &CoreBPE, req: &aisix_gateway::chat::ChatFormat) -> u3
                 }
                 _ => {
                     if let Some(s) = value.as_str() {
-                        n = n.saturating_add(count_str(bpe, s));
+                        n = n.saturating_add(enc(bpe, s));
                     }
                 }
             }
@@ -377,13 +379,13 @@ fn count_responses_prompt(bpe: &CoreBPE, body: &Value) -> u32 {
         has_system = true;
         n = n.saturating_add(TOKENS_PER_MESSAGE);
         n = n.saturating_add(enc(bpe, "system"));
-        n = n.saturating_add(count_str(bpe, instructions));
+        n = n.saturating_add(enc(bpe, instructions));
     }
     match body.get("input") {
         Some(Value::String(text)) => {
             n = n.saturating_add(TOKENS_PER_MESSAGE);
             n = n.saturating_add(enc(bpe, "user"));
-            n = n.saturating_add(count_str(bpe, text));
+            n = n.saturating_add(enc(bpe, text));
         }
         Some(Value::Array(items)) => {
             for item in items {
@@ -424,7 +426,7 @@ fn count_responses_prompt(bpe: &CoreBPE, body: &Value) -> u32 {
 /// `content` that is either a bare string or an array of typed blocks.
 fn count_content_value(bpe: &CoreBPE, content: &Value) -> u32 {
     match content {
-        Value::String(s) => count_str(bpe, s),
+        Value::String(s) => enc(bpe, s),
         Value::Array(blocks) => count_content_blocks(bpe, blocks),
         _ => 0,
     }
@@ -436,21 +438,11 @@ fn count_content_blocks(bpe: &CoreBPE, blocks: &[Value]) -> u32 {
         .fold(0u32, |n, b| n.saturating_add(count_value(bpe, b)))
 }
 
-/// A plain string counts as text unless it is an inline `data:` URI, whose
-/// base64 payload is not language.
-fn count_str(bpe: &CoreBPE, s: &str) -> u32 {
-    if data_uri_base64(s).is_some() {
-        0
-    } else {
-        enc(bpe, s)
-    }
-}
-
-/// Any JSON value reached by the walk: strings count as text, arrays are
+/// A value inside a content container: strings count as text, arrays are
 /// walked element by element, and objects go through [`count_part`].
 fn count_value(bpe: &CoreBPE, v: &Value) -> u32 {
     match v {
-        Value::String(s) => count_str(bpe, s),
+        Value::String(s) => enc(bpe, s),
         Value::Array(a) => count_content_blocks(bpe, a),
         Value::Object(_) => count_part(bpe, v),
         _ => 0,
@@ -459,16 +451,15 @@ fn count_value(bpe: &CoreBPE, v: &Value) -> u32 {
 
 /// One typed object — a content part at any depth (top-level message
 /// content, a tool output, `tool_result.content`, a screenshot) or a
-/// role-less Responses input item. Known part types take their own rule;
-/// any other object counts its plain-string fields, walking nested values
-/// with the same rules, so an image or opaque payload nested anywhere is
-/// never tokenized as text.
+/// role-less Responses input item. Known part types take their own rule,
+/// so an image or file nested in a tool output is priced as media, never
+/// tokenized as text; any other object goes through [`count_fields`].
 fn count_part(bpe: &CoreBPE, part: &Value) -> u32 {
     let ty = part.get("type").and_then(|t| t.as_str());
     let text_field = |key: &str| {
         part.get(key)
             .and_then(|t| t.as_str())
-            .map_or(0, |s| count_str(bpe, s))
+            .map_or(0, |s| enc(bpe, s))
     };
     match ty {
         Some("text" | "input_text" | "output_text" | "summary_text" | "reasoning_text") => {
@@ -492,9 +483,10 @@ fn count_part(bpe: &CoreBPE, part: &Value) -> u32 {
             };
             image_tokens(detail, source)
         }
-        // Files, documents and audio are not estimated; their payloads
-        // (`file_data`, `data`) are never text.
-        Some("redacted_thinking" | "input_file" | "file" | "document" | "input_audio") => 0,
+        Some("document") => count_document(bpe, part),
+        // Files and audio are not estimated; their payloads (`file_data`,
+        // `data`) are never text.
+        Some("redacted_thinking" | "input_file" | "file" | "input_audio") => 0,
         _ => count_fields(bpe, part, ty),
     }
 }
@@ -513,6 +505,12 @@ const TYPED_OBJECT_METADATA_KEYS: &[&str] = &[
 /// compaction and search-result items, and thinking `signature`s.
 const OPAQUE_KEYS: &[&str] = &["encrypted_content", "signature"];
 
+/// Fields holding content parts (tool outputs, `tool_result.content`,
+/// reasoning summaries), walked part by part. Any other object or array
+/// field is an argument object (`tool_use.input`, `computer_call.action`)
+/// and counts as its compact JSON.
+const CONTENT_CONTAINER_KEYS: &[&str] = &["content", "output", "summary"];
+
 fn count_fields(bpe: &CoreBPE, obj: &Value, ty: Option<&str>) -> u32 {
     let Some(obj) = obj.as_object() else {
         return 0;
@@ -527,47 +525,44 @@ fn count_fields(bpe: &CoreBPE, obj: &Value, ty: Option<&str>) -> u32 {
             continue;
         }
         n = n.saturating_add(match v {
-            // Tool-call arguments (`tool_use.input`) are JSON the model
-            // reads as text.
-            Value::Object(_) if key == "input" => {
-                let mut s = String::new();
-                json_text(v, &mut s);
-                enc(bpe, &s)
+            Value::String(s) => enc(bpe, s),
+            Value::Array(_) | Value::Object(_)
+                if CONTENT_CONTAINER_KEYS.contains(&key.as_str()) =>
+            {
+                count_value(bpe, v)
             }
-            _ => count_value(bpe, v),
+            Value::Array(_) | Value::Object(_) => {
+                serde_json::to_string(v).map_or(0, |s| enc(bpe, &s))
+            }
+            _ => 0,
         });
     }
     n
 }
 
-/// Compact JSON text of `v`, with inline `data:` URIs elided.
-fn json_text(v: &Value, out: &mut String) {
-    match v {
-        Value::String(s) if data_uri_base64(s).is_some() => out.push_str("\"\""),
-        Value::Array(a) => {
-            out.push('[');
-            for (i, e) in a.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                json_text(e, out);
-            }
-            out.push(']');
-        }
-        Value::Object(o) => {
-            out.push('{');
-            for (i, (k, e)) in o.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push_str(&Value::String(k.clone()).to_string());
-                out.push(':');
-                json_text(e, out);
-            }
-            out.push('}');
-        }
-        other => out.push_str(&other.to_string()),
-    }
+/// Anthropic `document`: `title` and `context` are text, and so is a
+/// `text` or `content` source; a base64, URL or file source (a PDF) is not
+/// estimated.
+fn count_document(bpe: &CoreBPE, doc: &Value) -> u32 {
+    let text = |key: &str| {
+        doc.get(key)
+            .and_then(|t| t.as_str())
+            .map_or(0, |s| enc(bpe, s))
+    };
+    let source = doc.get("source");
+    let body = match source.and_then(|s| s.get("type")).and_then(|t| t.as_str()) {
+        Some("text") => source
+            .and_then(|s| s.get("data"))
+            .and_then(|d| d.as_str())
+            .map_or(0, |s| enc(bpe, s)),
+        Some("content") => source
+            .and_then(|s| s.get("content"))
+            .map_or(0, |c| count_content_value(bpe, c)),
+        _ => 0,
+    };
+    text("title")
+        .saturating_add(text("context"))
+        .saturating_add(body)
 }
 
 // ---------------------------------------------------------------------
@@ -1463,16 +1458,10 @@ mod tests {
             json!({"type": "file", "file": {"file_data": uri}}),
             json!({"type": "input_audio", "input_audio": {"data": blob, "format": "wav"}}),
             json!({"type": "document", "source": {"type": "base64", "data": blob}}),
-            json!({"type": "custom_tool_call_output", "output": uri}),
         ];
         for v in zero {
             assert_eq!(count_part(bpe, &v), 0, "{v}");
         }
-        assert_eq!(count_value(bpe, &json!(uri)), 0);
-        assert_eq!(
-            count_value(bpe, &json!(uri.replacen("data:", "Data:", 1))),
-            0
-        );
         // Metadata keys are skipped on typed objects only; nested tool
         // output keeps text stored under the same names.
         let output = json!({"type": "function_call_output", "id": "x",
@@ -1481,10 +1470,6 @@ mod tests {
             count_part(bpe, &output),
             count_text("gpt-4o", "Hello") + count_text("gpt-4o", "world")
         );
-        // A data URI inside JSON-shaped tool arguments is elided too.
-        let with_uri = json!({"type": "tool_use", "name": "f", "input": {"img": uri}});
-        let without = json!({"type": "tool_use", "name": "f", "input": {"img": ""}});
-        assert_eq!(count_part(bpe, &with_uri), count_part(bpe, &without));
         // Text next to the opaque payloads still counts.
         let reasoning = json!({"type": "reasoning", "encrypted_content": blob,
             "summary": [{"type": "summary_text", "text": "Hello"}]});
@@ -1539,5 +1524,95 @@ mod tests {
             est.count_prompt(),
             TOKENS_PER_MESSAGE + m("user") + m("done") + 85 + REPLY_PRIMING
         );
+    }
+
+    /// A `data:` URI outside a media slot is text the upstream bills, so it
+    /// counts as text: wrapping a prompt in one and disconnecting before the
+    /// usage event must not zero the estimate.
+    #[test]
+    fn data_uri_in_text_slots_counts_as_text() {
+        let bpe = bpe_for("gpt-4o");
+        let uri = format!(
+            "data:text/plain;base64,{}",
+            b64(&b"hello world ".repeat(2_000))
+        );
+        let m = count_text("gpt-4o", &uri);
+        assert!(m > 1_000, "{m}");
+        let est = Estimator::new(
+            "gpt-4o",
+            PromptInput::Responses(json!({"model": "gpt-4o", "instructions": uri, "input": uri})),
+        );
+        assert_eq!(
+            est.count_prompt(),
+            (TOKENS_PER_MESSAGE + count_text("gpt-4o", "system") + m)
+                + (TOKENS_PER_MESSAGE + count_text("gpt-4o", "user") + m)
+                + REPLY_PRIMING
+        );
+        for part in [
+            json!({"type": "function_call_output", "output": uri}),
+            json!({"type": "tool_result", "content": uri}),
+            json!({"type": "text", "text": uri}),
+        ] {
+            assert_eq!(count_part(bpe, &part), m, "{part}");
+        }
+        let anthropic = Estimator::new(
+            "gpt-4o",
+            PromptInput::Anthropic(json!({"messages": [{"role": "user", "content": uri}]})),
+        );
+        assert_eq!(
+            anthropic.count_prompt(),
+            TOKENS_PER_MESSAGE + count_text("gpt-4o", "user") + m + REPLY_PRIMING
+        );
+    }
+
+    /// Argument objects count as their compact JSON, keys and numbers
+    /// included; only content containers are walked part by part.
+    #[test]
+    fn argument_objects_count_as_json() {
+        let bpe = bpe_for("gpt-4o");
+        let m = |s: &str| count_text("gpt-4o", s);
+        let tool_use = json!({"type": "tool_use", "id": "tu_1", "name": "f",
+            "input": {"city": "Paris", "days": 3}});
+        assert_eq!(
+            count_part(bpe, &tool_use),
+            m("f") + m(r#"{"city":"Paris","days":3}"#)
+        );
+        let server_tool_use = json!({"type": "server_tool_use", "id": "srv_1", "name": "web_search",
+            "input": {"query": "rust"}});
+        assert_eq!(
+            count_part(bpe, &server_tool_use),
+            m("web_search") + m(r#"{"query":"rust"}"#)
+        );
+        let computer_call = json!({"type": "computer_call", "call_id": "c1",
+            "action": {"type": "click", "x": 512, "y": 384, "button": "left"}});
+        assert_eq!(
+            count_part(bpe, &computer_call),
+            m("c1") + m(r#"{"button":"left","type":"click","x":512,"y":384}"#)
+        );
+    }
+
+    #[test]
+    fn anthropic_document_counts_its_text() {
+        let bpe = bpe_for("gpt-4o");
+        let m = |s: &str| count_text("gpt-4o", s);
+        let pdf = json!({"type": "document", "title": "Report", "context": "Q3 figures",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0x".repeat(10_000)}});
+        assert_eq!(count_part(bpe, &pdf), m("Report") + m("Q3 figures"));
+        let url = json!({"type": "document", "source": {"type": "url", "url": "https://example.com/a.pdf"}});
+        assert_eq!(count_part(bpe, &url), 0);
+        let text = json!({"type": "document", "title": "Notes",
+            "source": {"type": "text", "media_type": "text/plain", "data": "The cat sat."}});
+        assert_eq!(count_part(bpe, &text), m("Notes") + m("The cat sat."));
+        let content_str =
+            json!({"type": "document", "source": {"type": "content", "content": "Hello"}});
+        assert_eq!(count_part(bpe, &content_str), m("Hello"));
+        let content_parts = json!({"type": "document", "source": {"type": "content", "content": [
+            {"type": "text", "text": "Hello"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD".repeat(50_000)}}
+        ]}});
+        assert_eq!(count_part(bpe, &content_parts), m("Hello") + 85);
+        // Nested in a tool_result, the same rule applies.
+        let nested = json!({"type": "tool_result", "tool_use_id": "t", "content": [text]});
+        assert_eq!(count_part(bpe, &nested), m("Notes") + m("The cat sat."));
     }
 }
