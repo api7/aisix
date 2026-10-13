@@ -7670,6 +7670,28 @@ mod tests {
     }
 
     #[test]
+    fn fake_stream_emits_reasoning_ahead_of_the_content() {
+        let mut resp = synthetic_tool_reply(serde_json::json!([
+            {"type": "thinking", "thinking": "the user is Ada", "signature": "sig"},
+        ]));
+        unwrap_json_tool_call(&mut resp);
+        let chunks = response_into_fake_stream_chunks(resp);
+        assert_eq!(chunks.len(), 5);
+        assert_eq!(chunks[0].delta.role, Some(Role::Assistant));
+        assert_eq!(
+            chunks[1].delta.reasoning_content.as_deref(),
+            Some("the user is Ada")
+        );
+        assert!(chunks[1].delta.content.is_none());
+        assert_eq!(
+            chunks[2].delta.content.as_deref(),
+            Some(r#"{"name":"Ada"}"#)
+        );
+        assert_eq!(chunks[3].finish_reason, Some(FinishReason::Stop));
+        assert!(chunks[4].usage.is_some());
+    }
+
+    #[test]
     fn fake_stream_carries_real_tool_calls_through() {
         let mut resp = synthetic_tool_reply(serde_json::json!([
             {"type": "tool_use", "id": "toolu_w", "name": "get_weather", "input": {"city": "SF"}},
