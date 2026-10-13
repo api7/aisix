@@ -28,6 +28,7 @@ async-stream = "0.3"
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 tokio.workspace = true
 http.workspace = true
 # AWS SDK: handles SigV4 + retries + binary event-stream framing.

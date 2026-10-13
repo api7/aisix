@@ -99,6 +99,31 @@ describe("a refused request shape is described as a request error", () => {
       model_name: "us.amazon.nova-lite-v1:0",
       provider_key_id: bedrockPk.id,
     });
+    await seed.createModel({
+      display_name: "refusal-bedrock-claude",
+      provider: "bedrock",
+      model_name: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      provider_key_id: bedrockPk.id,
+    });
+    await seed.createModel({
+      display_name: "refusal-vertex-claude",
+      provider: "google",
+      model_name: "claude-sonnet-4-5@20250929",
+      provider_key_id: vertexPk.id,
+    });
+    const anthropicPk = await seed.createProviderKey({
+      display_name: "refusal-anthropic-pk",
+      provider: "anthropic",
+      adapter: "anthropic",
+      secret: "sk-ant-refusal",
+      api_base: baseUrl,
+    });
+    await seed.createModel({
+      display_name: "refusal-claude",
+      provider: "anthropic",
+      model_name: "claude-sonnet-4-5",
+      provider_key_id: anthropicPk.id,
+    });
     // Seeded last, so this key authenticating implies the whole seed set
     // has reached the gateway's snapshot.
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
@@ -154,6 +179,60 @@ describe("a refused request shape is described as a request error", () => {
         ...extra,
       });
       await expectRequestRefusal(res, mentions);
+      expect(upstreamHits, `stream=${stream}`).toBe(before);
+    }
+  });
+
+  // A tool result has to name the call it answers; the Anthropic-wire
+  // bridges cannot pair one that does not. Bedrock streams Claude through
+  // ConverseStream instead of `/invoke`, so only its non-streaming call is
+  // translated here.
+  const UNNAMED_TOOL_RESULT = [
+    USER,
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        { id: "call_1", type: "function", function: { name: "get_weather", arguments: "{}" } },
+      ],
+    },
+    { role: "tool", content: "sunny" },
+  ];
+  test.for<[string, boolean[]]>([
+    ["refusal-claude", [false, true]],
+    ["refusal-vertex-claude", [false, true]],
+    ["refusal-bedrock-claude", [false]],
+  ])("chat: a tool message without tool_call_id on %s", async ([model, streams], ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    for (const stream of streams) {
+      const before = upstreamHits;
+      const res = await post(app, "/v1/chat/completions", {
+        model,
+        stream,
+        tools: [{ type: "function", function: WEATHER_FUNCTION }],
+        messages: UNNAMED_TOOL_RESULT,
+      });
+      await expectRequestRefusal(res, /^tool message missing tool_call_id/);
+      expect(upstreamHits, `stream=${stream}`).toBe(before);
+    }
+  });
+
+  // A request with nothing but instructions gives the model no turn to
+  // answer. Bedrock Converse cannot carry one, and it is the request that
+  // has to change.
+  test.for<[string, boolean[]]>([
+    ["refusal-nova", [false, true]],
+    ["refusal-bedrock-claude", [true]],
+  ])("chat: a system-only request on %s", async ([model, streams], ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    for (const stream of streams) {
+      const before = upstreamHits;
+      const res = await post(app, "/v1/chat/completions", {
+        model,
+        stream,
+        messages: [{ role: "system", content: "You are terse." }],
+      });
+      await expectRequestRefusal(res, /at least one user or assistant turn/);
       expect(upstreamHits, `stream=${stream}`).toBe(before);
     }
   });

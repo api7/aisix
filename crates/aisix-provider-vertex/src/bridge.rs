@@ -914,18 +914,6 @@ impl VertexBridge {
 
         let body = {
             let typed = build_gemini_request(&req, upstream_id)?;
-            // Audit LOW-4: Gemini requires `contents` to be a non-empty
-            // array. If the caller passed system-only messages (lifted to
-            // `systemInstruction`), `contents` ends up empty and Vertex
-            // returns a generic 400. Fail fast with a clear error so the
-            // operator can fix the request shape before the round trip.
-            if typed.contents.is_empty() {
-                return Err(BridgeError::Config(
-                    "vertex chat: messages must include at least one user / \
-                     assistant turn (system-only requests are not supported by Gemini)"
-                        .into(),
-                ));
-            }
             // Serialize to JSON, then apply the per-ProviderKey override
             // pipeline (#339). The Gemini `contents` shape does not match the
             // OpenAI-style top-level keys the request transforms target, so
@@ -1033,8 +1021,8 @@ impl VertexBridge {
             StructuredOutput::Tool(_)
         );
         let body_value = {
-            let (system, messages) = split_system(&req)
-                .map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
+            let (system, messages) =
+                split_system(&req).map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
             let anthropic_req = build_anthropic_request(&req, upstream_id, system, messages, false);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -1141,8 +1129,8 @@ impl VertexBridge {
         // in the body (only `model` is stripped into the URL). Add the
         // Vertex `anthropic_version`.
         let body_value = {
-            let (system, messages) = split_system(&req)
-                .map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
+            let (system, messages) =
+                split_system(&req).map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
             let anthropic_req = build_anthropic_request(&req, upstream_id, system, messages, true);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -1719,13 +1707,6 @@ impl VertexBridge {
 
         let body = {
             let typed = build_gemini_request(&req, upstream_id)?;
-            if typed.contents.is_empty() {
-                return Err(BridgeError::Config(
-                    "vertex chat: messages must include at least one user / \
-                     assistant turn (system-only requests are not supported by Gemini)"
-                        .into(),
-                ));
-            }
             // Serialize + apply the per-ProviderKey override pipeline (#339)
             // before sending (see the non-stream path for the rail caveat).
             let mut body = serde_json::to_value(&typed)
@@ -2313,6 +2294,16 @@ fn build_gemini_request(
         contents.push(GeminiContent {
             role: "user",
             parts: tool_responses,
+        });
+    }
+    // Gemini rejects an empty `contents`, which is what a request holding
+    // only system / developer turns leaves once they are lifted into
+    // `systemInstruction`. A single blank user turn lets the model answer
+    // the instructions alone.
+    if contents.is_empty() {
+        contents.push(GeminiContent {
+            role: "user",
+            parts: vec![GeminiPart::text(" ")],
         });
     }
     let system_instruction = if system_parts.is_empty() {
@@ -5221,43 +5212,25 @@ mod tests {
         }
     }
 
-    /// Audit LOW-4: system-only messages produce empty `contents[]`
-    /// (system lifted to top-level). Gemini's schema requires
-    /// `contents` to be non-empty; the bridge must fail fast with a
-    /// clear error instead of letting Vertex 400 with a generic
-    /// "upstream returned 400" surface.
-    #[tokio::test]
-    async fn chat_gemini_with_system_only_messages_fails_fast() {
-        let server = MockServer::start().await;
-        // The mock is set up but should NOT be called — the bridge
-        // must reject before dispatch. expect(0) catches a regression
-        // where the request leaks through.
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let bridge = VertexBridge::new().with_api_base_override(server.uri());
-        let ctx = BridgeContext::new(
-            "req-1",
-            sample_model_with("gemini-1.5-pro"),
-            sample_pk_with_secret(valid_secret_json()),
-        );
+    /// A system-only request leaves `contents` empty once the system turn
+    /// moves to `systemInstruction`; Gemini rejects that, so one blank user
+    /// turn is sent in its place.
+    #[test]
+    fn system_only_request_sends_one_blank_user_turn() {
         let req = ChatFormat::new(
             "my-gemini",
             vec![ChatMessage::system("only system, no user")],
         );
-        let err = bridge.chat(&req, &ctx).await.unwrap_err();
-        match err {
-            BridgeError::Config(msg) => {
-                assert!(
-                    msg.contains("at least one user") && msg.contains("system-only"),
-                    "must explain system-only is not supported; got {msg}"
-                );
-            }
-            other => panic!("expected Config error, got {other:?}"),
-        }
+        let body =
+            serde_json::to_value(build_gemini_request(&req, "gemini-2.5-flash").unwrap()).unwrap();
+        assert_eq!(
+            body["contents"],
+            serde_json::json!([{"role": "user", "parts": [{"text": " "}]}])
+        );
+        assert_eq!(
+            body["systemInstruction"]["parts"][0]["text"],
+            "only system, no user"
+        );
     }
 
     #[tokio::test]

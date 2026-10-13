@@ -38,9 +38,10 @@ use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
 use aws_sdk_bedrockruntime::types::{
     AnyToolChoice, ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole,
     ConverseStreamOutput, InferenceConfiguration, JsonSchemaDefinition, Message as BedrockMessage,
-    OutputConfig, OutputFormat, OutputFormatStructure, OutputFormatType, SpecificToolChoice,
-    StopReason as SdkStopReason, SystemContentBlock, Tool, ToolChoice, ToolConfiguration,
-    ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolSpecification, ToolUseBlock,
+    OutputConfig, OutputFormat, OutputFormatStructure, OutputFormatType, ReasoningContentBlock,
+    ReasoningContentBlockDelta, SpecificToolChoice, StopReason as SdkStopReason,
+    SystemContentBlock, Tool, ToolChoice, ToolConfiguration, ToolInputSchema, ToolResultBlock,
+    ToolResultContentBlock, ToolSpecification, ToolUseBlock,
 };
 use aws_sdk_bedrockruntime::Client as BedrockClient;
 use aws_smithy_runtime_api::client::result::ServiceError;
@@ -968,8 +969,8 @@ impl BedrockBridge {
         // Every intermediate stays inside this block, so only the wire
         // bytes are alive while the upstream is awaited.
         let body_bytes = {
-            let (system, messages) = split_system(&req)
-                .map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
+            let (system, messages) =
+                split_system(&req).map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
             let anthropic_req = build_request(&req, anthropic_model, system, messages, false);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -1066,11 +1067,7 @@ impl BedrockBridge {
         let client = self.build_client_from_ctx(ctx)?;
         let (system_blocks, message_blocks) = build_converse_inputs(&req)?;
         if message_blocks.is_empty() {
-            return Err(BridgeError::Config(
-                "bedrock converse: messages must include at least one user / \
-                 assistant turn (system-only requests are not supported by Converse)"
-                    .into(),
-            ));
+            return Err(system_only_request());
         }
 
         let started = Instant::now();
@@ -1174,11 +1171,7 @@ impl BedrockBridge {
         let client = self.build_client_from_ctx(ctx)?;
         let (system_blocks, message_blocks) = build_converse_inputs(&req)?;
         if message_blocks.is_empty() {
-            return Err(BridgeError::Config(
-                "bedrock converse: messages must include at least one user / \
-                 assistant turn (system-only requests are not supported by Converse)"
-                    .into(),
-            ));
+            return Err(system_only_request());
         }
 
         let started = Instant::now();
@@ -1227,20 +1220,11 @@ impl BedrockBridge {
 
         let upstream_id_owned = upstream_id.to_string();
         let stream = async_stream::try_stream! {
-            let mut emitted_role = false;
-            // #560: maps each tool-use block's Converse `contentBlockIndex`
-            // to a dense 0-based OpenAI `tool_calls[].index` (a preceding
-            // text block at index 0 would otherwise shift every tool call).
-            let mut tool_blocks: Vec<i32> = Vec::new();
+            let mut state = ConverseStreamState::default();
             loop {
                 match resp.stream.recv().await {
                     Ok(Some(event)) => {
-                        for chunk in emit_converse_chunk(
-                            event,
-                            &upstream_id_owned,
-                            &mut emitted_role,
-                            &mut tool_blocks,
-                        ) {
+                        for chunk in emit_converse_chunk(event, &upstream_id_owned, &mut state) {
                             yield chunk;
                         }
                     }
@@ -1316,21 +1300,22 @@ fn build_converse_inputs(
             Role::Tool => {
                 // #560: `role:"tool"` → Converse `toolResult` block. The
                 // correlation id rides `tool_call_id`, the result text
-                // rides `content`. Without a `tool_call_id` the result
-                // can't be correlated to a `toolUse`, so skip it.
-                if let Some(id) = msg.tool_call_id.as_deref() {
-                    pending_tool_results.push(ContentBlock::ToolResult(
-                        ToolResultBlock::builder()
-                            .tool_use_id(id)
-                            .content(ToolResultContentBlock::Text(msg.content_str().to_string()))
-                            .build()
-                            .map_err(|e| {
-                                BridgeError::Config(format!(
-                                    "bedrock converse: build tool_result: {e}"
-                                ))
-                            })?,
-                    ));
-                }
+                // rides `content`. A result that names no call still goes
+                // upstream under a generated id, and Bedrock decides what
+                // to make of it rather than the turn vanishing here.
+                let id = msg
+                    .tool_call_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                pending_tool_results.push(ContentBlock::ToolResult(
+                    ToolResultBlock::builder()
+                        .tool_use_id(id)
+                        .content(ToolResultContentBlock::Text(msg.content_str().to_string()))
+                        .build()
+                        .map_err(|e| {
+                            BridgeError::Config(format!("bedrock converse: build tool_result: {e}"))
+                        })?,
+                ));
             }
         }
     }
@@ -1339,6 +1324,17 @@ fn build_converse_inputs(
         messages.push(build_message(ConversationRole::User, pending_tool_results)?);
     }
     Ok((systems, messages))
+}
+
+/// Converse rejects an empty `messages[]`, which is what a request holding
+/// only system / developer turns leaves behind. That is the caller's
+/// request to fix, so it is refused as one rather than as a gateway fault.
+fn system_only_request() -> BridgeError {
+    BridgeError::InvalidRequest(
+        "messages must include at least one user or assistant turn; \
+         a system-only request is not supported for this model"
+            .into(),
+    )
 }
 
 /// Build a Converse [`BedrockMessage`] from a role and its content blocks.
@@ -1426,18 +1422,31 @@ fn converse_output_into_chat_response(
         Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => {
             let mut text = String::new();
             let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+            let mut reasoning: Vec<&str> = Vec::new();
             for block in msg.content() {
                 match block {
                     ContentBlock::Text(t) => text.push_str(t),
                     // #560: translate Converse `toolUse` → OpenAI `tool_calls`.
                     ContentBlock::ToolUse(tu) => tool_calls.push(tool_use_to_openai(tu)),
+                    // Same shape as the Claude `/invoke` path: the text only,
+                    // blocks joined by a newline; the signature and redacted
+                    // ciphertext are dropped.
+                    ContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(r))
+                        if !r.text().is_empty() =>
+                    {
+                        reasoning.push(r.text())
+                    }
                     _ => {}
                 }
             }
-            (
-                build_assistant_message(text, tool_calls),
-                map_stop_reason(resp.stop_reason()),
-            )
+            let mut message = build_assistant_message(text, tool_calls);
+            if !reasoning.is_empty() {
+                message.extra.insert(
+                    "reasoning_content".to_string(),
+                    serde_json::Value::String(reasoning.join("\n")),
+                );
+            }
+            (message, map_stop_reason(resp.stop_reason()))
         }
         _ => (ChatMessage::assistant(String::new()), FinishReason::Stop),
     };
@@ -1520,6 +1529,21 @@ fn map_stop_reason(stop: &SdkStopReason) -> FinishReason {
     }
 }
 
+/// Per-stream state for [`emit_converse_chunk`].
+#[derive(Default)]
+struct ConverseStreamState {
+    emitted_role: bool,
+    /// Each tool-use block's Converse `contentBlockIndex` in arrival order;
+    /// a block's position here is its dense 0-based OpenAI
+    /// `tool_calls[].index`, so a leading text block at index 0 doesn't
+    /// shift the first tool call (#560).
+    tool_blocks: Vec<i32>,
+    /// The `contentBlockIndex` of the last reasoning block that streamed
+    /// text, so a second block starts on a new line — the non-streaming
+    /// Claude path joins thinking blocks with `\n`.
+    reasoning_block: Option<i32>,
+}
+
 /// Translate one Converse stream event into zero, one, or two
 /// [`ChatChunk`]s.
 ///
@@ -1529,25 +1553,22 @@ fn map_stop_reason(stop: &SdkStopReason) -> FinishReason {
 /// - `ContentBlockDelta` (text) → content chunk
 /// - `ContentBlockDelta` (toolUse) → tool_call delta carrying an
 ///   `arguments` fragment (#560)
+/// - `ContentBlockDelta` (reasoningContent text) → `reasoning_content`
+///   chunk, in the shape the non-streaming Claude path (`/invoke`)
+///   returns it: the signature and redacted ciphertext are dropped
 /// - `MessageStop` → finish-reason chunk
 /// - `Metadata` → usage chunk
 /// - Other variants (`ContentBlockStop`, image deltas) → no chunk.
-///
-/// `tool_blocks` records each tool-use block's Converse
-/// `contentBlockIndex` in arrival order; a block's position there is the
-/// dense 0-based OpenAI `tool_calls[].index`, so a leading text block at
-/// index 0 doesn't shift the first tool call.
 fn emit_converse_chunk(
     event: ConverseStreamOutput,
     upstream_id: &str,
-    emitted_role: &mut bool,
-    tool_blocks: &mut Vec<i32>,
+    state: &mut ConverseStreamState,
 ) -> Vec<ChatChunk> {
     let mut out = Vec::new();
     match event {
         ConverseStreamOutput::MessageStart(_m) => {
-            if !*emitted_role {
-                *emitted_role = true;
+            if !state.emitted_role {
+                state.emitted_role = true;
                 out.push(ChatChunk {
                     id: String::new(),
                     model: upstream_id.to_string(),
@@ -1566,8 +1587,8 @@ fn emit_converse_chunk(
         ConverseStreamOutput::ContentBlockStart(s) => {
             let block_index = s.content_block_index;
             if let Some(ContentBlockStart::ToolUse(tu)) = s.start {
-                let oai_index = tool_blocks.len() as i32;
-                tool_blocks.push(block_index);
+                let oai_index = state.tool_blocks.len() as i32;
+                state.tool_blocks.push(block_index);
                 out.push(tool_call_chunk(
                     upstream_id,
                     oai_index,
@@ -1595,7 +1616,7 @@ fn emit_converse_chunk(
                 // #560: a tool-use `arguments` fragment. Correlate to the
                 // call opened by ContentBlockStart via the block index.
                 Some(ContentBlockDelta::ToolUse(tu)) => {
-                    if let Some(pos) = tool_blocks.iter().position(|&i| i == block_index) {
+                    if let Some(pos) = state.tool_blocks.iter().position(|&i| i == block_index) {
                         out.push(tool_call_chunk(
                             upstream_id,
                             pos as i32,
@@ -1604,6 +1625,28 @@ fn emit_converse_chunk(
                             tu.input(),
                         ));
                     }
+                }
+                Some(ContentBlockDelta::ReasoningContent(ReasoningContentBlockDelta::Text(
+                    text,
+                ))) if !text.is_empty() => {
+                    let new_block = state
+                        .reasoning_block
+                        .is_some_and(|last| last != block_index);
+                    state.reasoning_block = Some(block_index);
+                    out.push(ChatChunk {
+                        id: String::new(),
+                        model: upstream_id.to_string(),
+                        delta: ChatDelta {
+                            reasoning_content: Some(if new_block {
+                                format!("\n{text}")
+                            } else {
+                                text
+                            }),
+                            ..Default::default()
+                        },
+                        finish_reason: None,
+                        usage: None,
+                    });
                 }
                 _ => {}
             }
@@ -4974,8 +5017,7 @@ mod tests {
         use aws_sdk_bedrockruntime::types::{
             ContentBlockDeltaEvent, ContentBlockStartEvent, ToolUseBlockDelta, ToolUseBlockStart,
         };
-        let mut emitted_role = false;
-        let mut tool_blocks: Vec<i32> = Vec::new();
+        let mut state = ConverseStreamState::default();
 
         // A tool-use block opens at contentBlockIndex 0.
         let start = ConverseStreamOutput::ContentBlockStart(
@@ -4991,7 +5033,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let chunks = emit_converse_chunk(start, "m", &mut emitted_role, &mut tool_blocks);
+        let chunks = emit_converse_chunk(start, "m", &mut state);
         assert_eq!(chunks.len(), 1);
         let call = &chunks[0].delta.tool_calls.as_ref().unwrap()[0];
         assert_eq!(call.get("index").and_then(|v| v.as_i64()), Some(0));
@@ -5017,7 +5059,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let chunks = emit_converse_chunk(delta, "m", &mut emitted_role, &mut tool_blocks);
+        let chunks = emit_converse_chunk(delta, "m", &mut state);
         assert_eq!(chunks.len(), 1);
         let call = &chunks[0].delta.tool_calls.as_ref().unwrap()[0];
         assert_eq!(call.get("index").and_then(|v| v.as_i64()), Some(0));
@@ -5034,6 +5076,42 @@ mod tests {
     }
 
     #[test]
+    fn emit_converse_chunk_streams_reasoning_text_and_drops_the_opaque_parts() {
+        use aws_sdk_bedrockruntime::types::ContentBlockDeltaEvent;
+        let mut state = ConverseStreamState::default();
+        let mut reasoning = |index: i32, delta: ReasoningContentBlockDelta| {
+            let event = ConverseStreamOutput::ContentBlockDelta(
+                ContentBlockDeltaEvent::builder()
+                    .content_block_index(index)
+                    .delta(ContentBlockDelta::ReasoningContent(delta))
+                    .build()
+                    .unwrap(),
+            );
+            emit_converse_chunk(event, "m", &mut state)
+                .into_iter()
+                .map(|c| c.delta.reasoning_content.unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            reasoning(0, ReasoningContentBlockDelta::Text("17 * 23".into())),
+            ["17 * 23"]
+        );
+        assert!(reasoning(0, ReasoningContentBlockDelta::Text(String::new())).is_empty());
+        assert!(reasoning(0, ReasoningContentBlockDelta::Signature("sig".into())).is_empty());
+        assert!(reasoning(
+            1,
+            ReasoningContentBlockDelta::RedactedContent(Blob::new(b"opaque".to_vec()))
+        )
+        .is_empty());
+        // A second reasoning block starts on its own line, as the blocks
+        // of a non-streamed reply are joined.
+        assert_eq!(
+            reasoning(2, ReasoningContentBlockDelta::Text("again".into())),
+            ["\nagain"]
+        );
+    }
+
+    #[test]
     fn emit_converse_chunk_tool_call_index_is_dense_despite_leading_text() {
         // The headline streaming claim: a leading text block (contentBlockIndex
         // 0) must NOT shift the first tool call's OpenAI index, and parallel
@@ -5042,8 +5120,7 @@ mod tests {
         use aws_sdk_bedrockruntime::types::{
             ContentBlockDeltaEvent, ContentBlockStartEvent, ToolUseBlockDelta, ToolUseBlockStart,
         };
-        let mut emitted_role = false;
-        let mut tool_blocks: Vec<i32> = Vec::new();
+        let mut state = ConverseStreamState::default();
 
         // A text block streams first at contentBlockIndex 0.
         let text = ConverseStreamOutput::ContentBlockDelta(
@@ -5053,7 +5130,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let chunks = emit_converse_chunk(text, "m", &mut emitted_role, &mut tool_blocks);
+        let chunks = emit_converse_chunk(text, "m", &mut state);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].delta.content.as_deref(), Some("Let me check. "));
 
@@ -5073,7 +5150,7 @@ mod tests {
                     .build()
                     .unwrap(),
             );
-            let chunks = emit_converse_chunk(start, "m", &mut emitted_role, &mut tool_blocks);
+            let chunks = emit_converse_chunk(start, "m", &mut state);
             open_indices.push(
                 chunks[0].delta.tool_calls.as_ref().unwrap()[0]["index"]
                     .as_i64()
@@ -5096,7 +5173,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let chunks = emit_converse_chunk(frag, "m", &mut emitted_role, &mut tool_blocks);
+        let chunks = emit_converse_chunk(frag, "m", &mut state);
         assert_eq!(
             chunks[0].delta.tool_calls.as_ref().unwrap()[0]["index"].as_i64(),
             Some(1),
