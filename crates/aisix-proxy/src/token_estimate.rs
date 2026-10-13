@@ -377,13 +377,13 @@ fn count_responses_prompt(bpe: &CoreBPE, body: &Value) -> u32 {
         has_system = true;
         n = n.saturating_add(TOKENS_PER_MESSAGE);
         n = n.saturating_add(enc(bpe, "system"));
-        n = n.saturating_add(enc(bpe, instructions));
+        n = n.saturating_add(count_str(bpe, instructions));
     }
     match body.get("input") {
         Some(Value::String(text)) => {
             n = n.saturating_add(TOKENS_PER_MESSAGE);
             n = n.saturating_add(enc(bpe, "user"));
-            n = n.saturating_add(enc(bpe, text));
+            n = n.saturating_add(count_str(bpe, text));
         }
         Some(Value::Array(items)) => {
             for item in items {
@@ -499,19 +499,19 @@ fn count_part(bpe: &CoreBPE, part: &Value) -> u32 {
     }
 }
 
-/// Keys that never carry prompt text: identifiers, flags, and opaque
-/// payloads (`encrypted_content` on reasoning/compaction items, Anthropic
-/// `signature`).
-const SKIPPED_KEYS: &[&str] = &[
+/// A typed block's or item's own identifiers and flags.
+const TYPED_OBJECT_METADATA_KEYS: &[&str] = &[
     "type",
     "id",
     "status",
     "tool_use_id",
     "cache_control",
     "is_error",
-    "encrypted_content",
-    "signature",
 ];
+
+/// Opaque payloads at any depth: `encrypted_content` on reasoning,
+/// compaction and search-result items, and thinking `signature`s.
+const OPAQUE_KEYS: &[&str] = &["encrypted_content", "signature"];
 
 fn count_fields(bpe: &CoreBPE, obj: &Value, ty: Option<&str>) -> u32 {
     let Some(obj) = obj.as_object() else {
@@ -519,7 +519,8 @@ fn count_fields(bpe: &CoreBPE, obj: &Value, ty: Option<&str>) -> u32 {
     };
     let mut n: u32 = 0;
     for (key, v) in obj {
-        if SKIPPED_KEYS.contains(&key.as_str())
+        if OPAQUE_KEYS.contains(&key.as_str())
+            || (ty.is_some() && TYPED_OBJECT_METADATA_KEYS.contains(&key.as_str()))
             // The generated image's base64 bytes.
             || (ty == Some("image_generation_call") && key == "result")
         {
@@ -594,16 +595,27 @@ fn anthropic_image_source(source: &Value) -> Option<ImageSource<'_>> {
     }
 }
 
-/// The base64 payload of a `data:<mime>;base64,<payload>` URI.
+fn has_prefix_ignore_case(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len())
+        .is_some_and(|h| h.eq_ignore_ascii_case(prefix))
+}
+
+/// The base64 payload of a `data:<mime>;base64,<payload>` URI (scheme and
+/// parameter names are case-insensitive).
 fn data_uri_base64(s: &str) -> Option<&str> {
-    let rest = s.strip_prefix("data:")?;
-    let (header, payload) = rest.split_once(',')?;
-    header.ends_with(";base64").then_some(payload)
+    if !has_prefix_ignore_case(s, "data:") {
+        return None;
+    }
+    let (header, payload) = s[5..].split_once(',')?;
+    let marker = header.len().checked_sub(";base64".len())?;
+    header
+        .get(marker..)?
+        .eq_ignore_ascii_case(";base64")
+        .then_some(payload)
 }
 
 fn is_remote_url(s: &str) -> bool {
-    let lower_prefix = |p: &str| s.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p));
-    lower_prefix("http://") || lower_prefix("https://")
+    has_prefix_ignore_case(s, "http://") || has_prefix_ignore_case(s, "https://")
 }
 
 /// OpenAI's vision token formula. Dimensions are read only from inline
@@ -648,29 +660,39 @@ fn high_detail_tokens(width: u32, height: u32) -> u32 {
     } else {
         (long as f64, short as f64)
     };
-    let tiles = |side: f64| (side / IMAGE_TILE_SIDE as f64).ceil() as u32;
+    // Resized images have whole pixels.
+    let tiles = |side: f64| (side.floor() / IMAGE_TILE_SIDE as f64).ceil() as u32;
     IMAGE_TOKENS_BASE.saturating_add(
         IMAGE_TOKENS_PER_TILE.saturating_mul(tiles(long).saturating_mul(tiles(short))),
     )
 }
 
 /// Width and height from the header of a base64-encoded PNG, GIF, JPEG or
-/// WebP, decoding at most [`IMAGE_HEADER_DECODE_BOUND`] bytes.
+/// WebP. PNG, GIF and WebP are read from the first few bytes; only a JPEG
+/// decodes further, up to [`IMAGE_HEADER_DECODE_BOUND`] bytes.
 fn inline_image_dimensions(base64: &str) -> Option<(u32, u32)> {
+    const SHORT_HEADER_BYTES: usize = 48;
+    let head = decode_base64_prefix(base64, SHORT_HEADER_BYTES)?;
+    let (w, h) = if head.starts_with(&[0xFF, 0xD8]) {
+        jpeg_dimensions(&decode_base64_prefix(base64, IMAGE_HEADER_DECODE_BOUND)?)?
+    } else {
+        png_dimensions(&head)
+            .or_else(|| gif_dimensions(&head))
+            .or_else(|| webp_dimensions(&head))?
+    };
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+/// Decode at most `max_bytes` from the start of a base64 string.
+fn decode_base64_prefix(base64: &str, max_bytes: usize) -> Option<Vec<u8>> {
     use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
     use base64::Engine;
     const ENGINE: GeneralPurpose = GeneralPurpose::new(
         &base64::alphabet::STANDARD,
         GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
     );
-    let max_chars = IMAGE_HEADER_DECODE_BOUND / 3 * 4;
-    let take = base64.len().min(max_chars) / 4 * 4;
-    let bytes = ENGINE.decode(base64.get(..take)?).ok()?;
-    let (w, h) = png_dimensions(&bytes)
-        .or_else(|| gif_dimensions(&bytes))
-        .or_else(|| jpeg_dimensions(&bytes))
-        .or_else(|| webp_dimensions(&bytes))?;
-    (w > 0 && h > 0).then_some((w, h))
+    let take = base64.len().min(max_bytes / 3 * 4) / 4 * 4;
+    ENGINE.decode(base64.get(..take)?).ok()
 }
 
 fn be_u16(b: &[u8], at: usize) -> Option<u32> {
@@ -1301,6 +1323,8 @@ mod tests {
         assert_eq!(high_detail_tokens(5000, 3000), 1105);
         // Long side only: 3000×1000 → 2000×667 → 4×2.
         assert_eq!(high_detail_tokens(3000, 1000), 1445);
+        // 3000×769 → 2000×512.67, which is 512 whole pixels: 4×1.
+        assert_eq!(high_detail_tokens(3000, 769), 765);
     }
 
     #[test]
@@ -1365,6 +1389,8 @@ mod tests {
             image_tokens(Some("high"), url("HTTP://example.com/a.png")),
             250
         );
+        let upper = format!("DATA:image/png;BASE64,{}", b64(&png(1024, 2048)));
+        assert_eq!(image_tokens(Some("high"), url(&upper)), 1105);
         // Unreadable inline data falls back to 300×300.
         let junk = data_uri("image/png", b"definitely not a png header");
         assert_eq!(image_tokens(Some("high"), url(&junk)), 255);
@@ -1443,6 +1469,18 @@ mod tests {
             assert_eq!(count_part(bpe, &v), 0, "{v}");
         }
         assert_eq!(count_value(bpe, &json!(uri)), 0);
+        assert_eq!(
+            count_value(bpe, &json!(uri.replacen("data:", "Data:", 1))),
+            0
+        );
+        // Metadata keys are skipped on typed objects only; nested tool
+        // output keeps text stored under the same names.
+        let output = json!({"type": "function_call_output", "id": "x",
+            "output": {"status": "Hello", "id": "world"}});
+        assert_eq!(
+            count_part(bpe, &output),
+            count_text("gpt-4o", "Hello") + count_text("gpt-4o", "world")
+        );
         // A data URI inside JSON-shaped tool arguments is elided too.
         let with_uri = json!({"type": "tool_use", "name": "f", "input": {"img": uri}});
         let without = json!({"type": "tool_use", "name": "f", "input": {"img": ""}});
