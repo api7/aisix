@@ -385,8 +385,8 @@ impl Bridge for AnthropicBridge {
         let upstream = upstream_model(ctx)?;
 
         let body = {
-            let (system, messages) = split_system(&req)
-                .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
+            let (system, messages) =
+                split_system(&req).map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
             let mut body = build_request(&req, upstream, system, messages, false);
             maybe_inject_cache_breakpoints(&mut body, ctx);
             outbound_bytes(&body)?
@@ -478,8 +478,8 @@ impl Bridge for AnthropicBridge {
         }
 
         let body = {
-            let (system, messages) = split_system(&req)
-                .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
+            let (system, messages) =
+                split_system(&req).map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
             let mut body = build_request(&req, upstream, system, messages, true);
             maybe_inject_cache_breakpoints(&mut body, ctx);
             outbound_bytes(&body)?
