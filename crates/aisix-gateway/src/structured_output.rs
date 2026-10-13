@@ -573,7 +573,8 @@ pub fn unwrap_json_tool_call(resp: &mut ChatResponse) {
 }
 
 /// Render a complete response as the chunk sequence a streaming client
-/// expects: role, content, finish, usage.
+/// expects: role, reasoning (when the response carries any), content,
+/// finish, usage.
 ///
 /// The tool route cannot stream — the JSON only exists once the tool
 /// call is complete — so a bridge runs that request non-streaming and
@@ -617,15 +618,31 @@ pub fn response_into_fake_stream_chunks(resp: ChatResponse) -> Vec<ChatChunk> {
                 })
                 .collect()
         });
-    vec![
-        chunk(
-            ChatDelta {
-                role: Some(Role::Assistant),
-                ..ChatDelta::default()
-            },
-            None,
-            None,
-        ),
+    let reasoning = message
+        .extra
+        .get("reasoning_content")
+        .and_then(|r| r.as_str())
+        .filter(|r| !r.is_empty())
+        .map(|r| {
+            chunk(
+                ChatDelta {
+                    reasoning_content: Some(r.to_string()),
+                    ..ChatDelta::default()
+                },
+                None,
+                None,
+            )
+        });
+    let mut chunks = vec![chunk(
+        ChatDelta {
+            role: Some(Role::Assistant),
+            ..ChatDelta::default()
+        },
+        None,
+        None,
+    )];
+    chunks.extend(reasoning);
+    chunks.extend([
         chunk(
             ChatDelta {
                 content: Some(message.content.unwrap_or_default()),
@@ -637,7 +654,8 @@ pub fn response_into_fake_stream_chunks(resp: ChatResponse) -> Vec<ChatChunk> {
         ),
         chunk(ChatDelta::default(), Some(finish_reason), None),
         chunk(ChatDelta::default(), None, Some(usage)),
-    ]
+    ]);
+    chunks
 }
 
 #[cfg(test)]
