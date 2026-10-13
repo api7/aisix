@@ -22,7 +22,8 @@
 //! present). The completion side counts the accumulated output text as
 //! plain text with no overhead.
 //!
-//! Images follow OpenAI's vision token formula at every depth, with
+//! Images follow OpenAI's vision token formula wherever they appear as a
+//! content part, top-level or nested in a tool output, with
 //! dimensions read from the header of inline data only. Media and opaque
 //! payloads — image, file and audio data, `encrypted_content`, thinking
 //! signatures, generated-image bytes — are never tokenized. A string in a
@@ -439,14 +440,20 @@ fn count_content_blocks(bpe: &CoreBPE, blocks: &[Value]) -> u32 {
 }
 
 /// A value inside a content container: strings count as text, arrays are
-/// walked element by element, and objects go through [`count_part`].
+/// walked element by element, typed objects go through [`count_part`], and
+/// any other object is data counted as its compact JSON.
 fn count_value(bpe: &CoreBPE, v: &Value) -> u32 {
     match v {
         Value::String(s) => enc(bpe, s),
         Value::Array(a) => count_content_blocks(bpe, a),
-        Value::Object(_) => count_part(bpe, v),
+        Value::Object(_) if v.get("type").is_some_and(Value::is_string) => count_part(bpe, v),
+        Value::Object(_) => count_json(bpe, v),
         _ => 0,
     }
+}
+
+fn count_json(bpe: &CoreBPE, v: &Value) -> u32 {
+    serde_json::to_string(v).map_or(0, |s| enc(bpe, &s))
 }
 
 /// One typed object — a content part at any depth (top-level message
@@ -506,10 +513,11 @@ const TYPED_OBJECT_METADATA_KEYS: &[&str] = &[
 const OPAQUE_KEYS: &[&str] = &["encrypted_content", "signature"];
 
 /// Fields holding content parts (tool outputs, `tool_result.content`,
-/// reasoning summaries), walked part by part. Any other object or array
-/// field is an argument object (`tool_use.input`, `computer_call.action`)
-/// and counts as its compact JSON.
-const CONTENT_CONTAINER_KEYS: &[&str] = &["content", "output", "summary"];
+/// reasoning summaries, code interpreter `outputs`), walked part by part.
+/// Any other object or array field is an argument object
+/// (`tool_use.input`, `computer_call.action`) and counts as its compact
+/// JSON.
+const CONTENT_CONTAINER_KEYS: &[&str] = &["content", "output", "outputs", "summary"];
 
 fn count_fields(bpe: &CoreBPE, obj: &Value, ty: Option<&str>) -> u32 {
     let Some(obj) = obj.as_object() else {
@@ -531,9 +539,7 @@ fn count_fields(bpe: &CoreBPE, obj: &Value, ty: Option<&str>) -> u32 {
             {
                 count_value(bpe, v)
             }
-            Value::Array(_) | Value::Object(_) => {
-                serde_json::to_string(v).map_or(0, |s| enc(bpe, &s))
-            }
+            Value::Array(_) | Value::Object(_) => count_json(bpe, v),
             _ => 0,
         });
     }
@@ -1462,13 +1468,13 @@ mod tests {
         for v in zero {
             assert_eq!(count_part(bpe, &v), 0, "{v}");
         }
-        // Metadata keys are skipped on typed objects only; nested tool
-        // output keeps text stored under the same names.
+        // A structured (untyped) tool output is data: its compact JSON
+        // counts, keys and numbers included.
         let output = json!({"type": "function_call_output", "id": "x",
-            "output": {"status": "Hello", "id": "world"}});
+            "output": {"status": "Hello", "temp": 21}});
         assert_eq!(
             count_part(bpe, &output),
-            count_text("gpt-4o", "Hello") + count_text("gpt-4o", "world")
+            count_text("gpt-4o", r#"{"status":"Hello","temp":21}"#)
         );
         // Text next to the opaque payloads still counts.
         let reasoning = json!({"type": "reasoning", "encrypted_content": blob,
@@ -1589,6 +1595,18 @@ mod tests {
             count_part(bpe, &computer_call),
             m("c1") + m(r#"{"button":"left","type":"click","x":512,"y":384}"#)
         );
+        // A data URI inside an argument object is part of that JSON text.
+        let uri = format!("data:image/png;base64,{}", "QUJD".repeat(1_000));
+        let with_uri = json!({"type": "tool_use", "name": "f", "input": {"img": uri}});
+        assert_eq!(
+            count_part(bpe, &with_uri),
+            m("f") + m(&format!(r#"{{"img":"{uri}"}}"#))
+        );
+        // Code interpreter `outputs` is a content container: its image is
+        // priced as media, not tokenized.
+        let code = json!({"type": "code_interpreter_call", "id": "ci_1", "code": "plot()",
+            "outputs": [{"type": "image", "url": uri}]});
+        assert_eq!(count_part(bpe, &code), m("plot()") + 85);
     }
 
     #[test]
