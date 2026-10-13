@@ -7692,6 +7692,24 @@ mod tests {
     }
 
     #[test]
+    fn fake_stream_emits_reasoning_ahead_of_real_tool_calls() {
+        let mut resp = synthetic_tool_reply(serde_json::json!([
+            {"type": "thinking", "thinking": "need the weather", "signature": "sig"},
+            {"type": "tool_use", "id": "toolu_w", "name": "get_weather", "input": {"city": "SF"}},
+        ]));
+        unwrap_json_tool_call(&mut resp);
+        let chunks = response_into_fake_stream_chunks(resp);
+        assert_eq!(
+            chunks[1].delta.reasoning_content.as_deref(),
+            Some("need the weather")
+        );
+        assert!(chunks[1].delta.tool_calls.is_none());
+        let calls = chunks[2].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(chunks[3].finish_reason, Some(FinishReason::ToolCalls));
+    }
+
+    #[test]
     fn fake_stream_carries_real_tool_calls_through() {
         let mut resp = synthetic_tool_reply(serde_json::json!([
             {"type": "tool_use", "id": "toolu_w", "name": "get_weather", "input": {"city": "SF"}},

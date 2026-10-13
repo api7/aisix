@@ -55,6 +55,7 @@ const CLAUDE_REPLY = {
 const MODELS = {
   anthropic: "tool-think-anthropic",
   bedrock: "tool-think-bedrock",
+  vertex: "tool-think-vertex",
 } as const;
 
 interface SseEvent {
@@ -85,6 +86,7 @@ describe("streaming tool-route structured output keeps the reasoning", () => {
   let app: SpawnedApp | undefined;
   let anthropic: OpenAiUpstream | undefined;
   let bedrock: OpenAiUpstream | undefined;
+  let vertex: OpenAiUpstream | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -96,6 +98,8 @@ describe("streaming tool-route structured output keeps the reasoning", () => {
     // Claude on Bedrock answers a non-streaming call on `/invoke` in the
     // Anthropic Messages envelope.
     bedrock = await startOpenAiUpstream({ nonStreamBody: CLAUDE_REPLY });
+    // Claude on Vertex answers `rawPredict` in the same envelope.
+    vertex = await startOpenAiUpstream({ nonStreamBody: CLAUDE_REPLY });
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
@@ -129,6 +133,23 @@ describe("streaming tool-route structured output keeps the reasoning", () => {
       model_name: "anthropic.claude-sonnet-4-20250514-v1:0",
       provider_key_id: bedrockPk.id,
     });
+    const vertexPk = await seed.createProviderKey({
+      display_name: "tool-think-vertex-pk",
+      provider: "google",
+      adapter: "vertex",
+      secret: JSON.stringify({
+        access_token: "ya29.tool-think",
+        project: "proj-e2e",
+        region: "us-east5",
+      }),
+      api_base: vertex.baseUrl,
+    });
+    await seed.createModel({
+      display_name: MODELS.vertex,
+      provider: "google",
+      model_name: "claude-sonnet-4@20250514",
+      provider_key_id: vertexPk.id,
+    });
     // Seeded last, so this key authenticating implies the whole seed set
     // has reached the gateway's snapshot.
     await seed.createApiKey({
@@ -145,6 +166,7 @@ describe("streaming tool-route structured output keeps the reasoning", () => {
     await app?.exit();
     await anthropic?.close();
     await bedrock?.close();
+    await vertex?.close();
   });
 
   function post(path: string, body: unknown): Promise<Response> {
@@ -165,8 +187,8 @@ describe("streaming tool-route structured output keeps the reasoning", () => {
     return JSON.parse(last!.body);
   }
 
-  const chatRequest = (stream: boolean) => ({
-    model: MODELS.anthropic,
+  const chatRequest = (model: string, stream: boolean) => ({
+    model,
     messages: [{ role: "user", content: "who is Ada" }],
     response_format: {
       type: "json_schema",
@@ -176,23 +198,27 @@ describe("streaming tool-route structured output keeps the reasoning", () => {
     stream,
   });
 
-  test("/v1/chat/completions streaming carries the reasoning the non-streaming reply has", async (ctx) => {
-    if (!etcdReachable || !app || !anthropic) return ctx.skip();
+  test.for<[string, string]>([
+    ["anthropic", MODELS.anthropic],
+    ["vertex", MODELS.vertex],
+  ])("/v1/chat/completions streaming on %s Claude carries the reasoning the non-streaming reply has", async ([provider, model], ctx) => {
+    const upstream = provider === "anthropic" ? anthropic : vertex;
+    if (!etcdReachable || !app || !upstream) return ctx.skip();
 
-    const plain = await post("/v1/chat/completions", chatRequest(false));
+    const plain = await post("/v1/chat/completions", chatRequest(model, false));
     expect(plain.status).toBe(200);
     const message = (await plain.json()).choices[0].message;
     expect(message.reasoning_content).toBe(REASONING);
 
-    const res = await post("/v1/chat/completions", chatRequest(true));
+    const res = await post("/v1/chat/completions", chatRequest(model, true));
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/event-stream");
     const frames = parseChatSse(await res.text());
 
     // The streaming request reached the upstream as the tool route with
     // thinking on, run non-streaming.
-    const sent = lastUpstreamBody(anthropic);
-    expect(sent.stream).toBe(false);
+    const sent = lastUpstreamBody(upstream);
+    expect(sent.stream ?? false).toBe(false);
     expect(sent.thinking?.type).toBeDefined();
     expect(sent.tools?.[0]?.name).toBe("json_tool_call");
 
@@ -222,6 +248,21 @@ describe("streaming tool-route structured output keeps the reasoning", () => {
     expect(res.status).toBe(200);
     const events = parseNamedSse(await res.text());
     expect(lastUpstreamBody(anthropic).stream).toBe(false);
+
+    // A client reading events as they arrive sees the reasoning streamed,
+    // ahead of the answer's text.
+    const streamedReasoning = events
+      .filter((e) => e.event === "response.reasoning_summary_text.delta")
+      .map((e) => e.data.delta)
+      .join("");
+    expect(streamedReasoning).toBe(REASONING);
+    const firstReasoning = events.findIndex(
+      (e) => e.event === "response.reasoning_summary_text.delta",
+    );
+    const firstText = events.findIndex(
+      (e) => e.event === "response.output_text.delta",
+    );
+    expect(firstText).toBeGreaterThan(firstReasoning);
 
     const done = events.find((e) => e.event === "response.completed");
     expect(done, "no response.completed event").toBeDefined();
@@ -270,6 +311,9 @@ describe("streaming tool-route structured output keeps the reasoning", () => {
 
     const sent = bedrock.receivedRequests.at(-1);
     expect(sent?.path).toMatch(/\/invoke$/);
+    const sentBody = JSON.parse(sent!.body);
+    expect(sentBody.thinking?.type).toBe("enabled");
+    expect(sentBody.tools?.[0]?.name).toBe("json_tool_call");
 
     const starts = events.filter((e) => e.event === "content_block_start");
     expect(starts.map((e) => e.data.content_block.type)).toEqual([
