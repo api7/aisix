@@ -1300,21 +1300,22 @@ fn build_converse_inputs(
             Role::Tool => {
                 // #560: `role:"tool"` → Converse `toolResult` block. The
                 // correlation id rides `tool_call_id`, the result text
-                // rides `content`. Without a `tool_call_id` the result
-                // can't be correlated to a `toolUse`, so skip it.
-                if let Some(id) = msg.tool_call_id.as_deref() {
-                    pending_tool_results.push(ContentBlock::ToolResult(
-                        ToolResultBlock::builder()
-                            .tool_use_id(id)
-                            .content(ToolResultContentBlock::Text(msg.content_str().to_string()))
-                            .build()
-                            .map_err(|e| {
-                                BridgeError::Config(format!(
-                                    "bedrock converse: build tool_result: {e}"
-                                ))
-                            })?,
-                    ));
-                }
+                // rides `content`. A result that names no call still goes
+                // upstream under a generated id, and Bedrock decides what
+                // to make of it rather than the turn vanishing here.
+                let id = msg
+                    .tool_call_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                pending_tool_results.push(ContentBlock::ToolResult(
+                    ToolResultBlock::builder()
+                        .tool_use_id(id)
+                        .content(ToolResultContentBlock::Text(msg.content_str().to_string()))
+                        .build()
+                        .map_err(|e| {
+                            BridgeError::Config(format!("bedrock converse: build tool_result: {e}"))
+                        })?,
+                ));
             }
         }
     }
