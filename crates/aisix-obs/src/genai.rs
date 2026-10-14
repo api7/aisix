@@ -93,6 +93,10 @@ pub struct UpstreamFacts {
     /// `server.address` / `server.port` of the upstream.
     pub server_address: String,
     pub server_port: Option<u16>,
+    /// `request_model` was filled from the caller's own alias (a wildcard
+    /// row), so it is caller-chosen cardinality: the span name leaves it
+    /// out, the attribute keeps it.
+    pub request_model_caller_named: bool,
 }
 
 impl UpstreamFacts {

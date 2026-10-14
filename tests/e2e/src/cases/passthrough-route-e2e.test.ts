@@ -1135,6 +1135,10 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     const chatSpan = await spanFor("ptr-auto-chat");
     expect(chatSpan.attributes["gen_ai.usage.input_tokens"]).toBe(7);
     expect(chatSpan.attributes["gen_ai.usage.output_tokens"]).toBe(3);
+    // The relay's server is the route's target, not the key's `api_base`,
+    // which only supplies the credential.
+    expect(chatSpan.attributes["server.address"]).toBe(new URL(chatUpstream.baseUrl).hostname);
+    expect(chatSpan.attributes["server.port"]).toBe(Number(new URL(chatUpstream.baseUrl).port));
 
     const respSpan = await spanFor("ptr-auto-resp");
     expect(respSpan.attributes["gen_ai.usage.input_tokens"]).toBe(11);

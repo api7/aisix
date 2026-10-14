@@ -1032,7 +1032,9 @@ fn operation_span_name(record: &SinkRecord) -> String {
         let target = if event.inbound_protocol == "passthrough" {
             event.passthrough_route_name.as_str()
         } else {
-            upstream(record).map_or("", |u| u.request_model.as_str())
+            upstream(record)
+                .filter(|u| !u.request_model_caller_named)
+                .map_or("", |u| u.request_model.as_str())
         };
         (operation, target)
     };
@@ -2925,6 +2927,30 @@ mod tests {
         assert_eq!(
             body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
             "invoke_agent"
+        );
+    }
+
+    /// A wildcard row's upstream model is the caller's own substitution, so
+    /// it stays out of the span name (unbounded cardinality) but is still
+    /// the request-model attribute.
+    #[test]
+    fn a_caller_named_upstream_model_stays_out_of_the_span_name() {
+        let mut ev = sample_event();
+        ev.operation = "chat".into();
+        let record =
+            SinkRecord::metadata_only(ev).with_facts(Some(Arc::new(crate::genai::SpanFacts {
+                upstream: Some(crate::genai::UpstreamFacts {
+                    request_model: "anything-the-caller-sent".into(),
+                    request_model_caller_named: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })));
+        let span = build_otlp_span(&record, "x");
+        assert_eq!(span["name"], "chat");
+        assert_eq!(
+            attr(&span, "gen_ai.request.model").unwrap()["stringValue"],
+            "anything-the-caller-sent"
         );
     }
 

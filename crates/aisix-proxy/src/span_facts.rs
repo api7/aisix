@@ -30,6 +30,7 @@ pub(crate) fn upstream_facts(
             let agent = snap.a2a_agents.get_by_name(&event.a2a_agent_name)?;
             return Some(UpstreamFacts::default().with_base_url(&agent.value.url));
         }
+        "passthrough" => return passthrough_facts(snap, event, provider_key_id),
         _ => {}
     }
     if let Some(row) = snap.models.get_by_id(&event.model_id) {
@@ -50,6 +51,7 @@ pub(crate) fn upstream_facts(
         let facts = UpstreamFacts {
             provider_name: genai_provider_name(vendor, pk.and_then(|p| p.adapter)),
             request_model: request_model(model, event).unwrap_or_default(),
+            request_model_caller_named: model.display_name.contains('*'),
             ..UpstreamFacts::default()
         };
         return Some(
@@ -59,16 +61,33 @@ pub(crate) fn upstream_facts(
             },
         );
     }
-    // A passthrough route names its ProviderKey but no Model.
-    let pk = snap.provider_keys.get_by_id(provider_key_id)?;
-    let pk = &pk.value;
+    None
+}
+
+/// A passthrough route relays to its own `target_url`; the ProviderKey it
+/// may name only supplies the credential, so it says which provider but not
+/// where. A `preserve_host` route relays to whatever host the caller
+/// addressed, which no resource records — no address then.
+fn passthrough_facts(
+    snap: &AisixSnapshot,
+    event: &UsageEvent,
+    provider_key_id: &str,
+) -> Option<UpstreamFacts> {
+    let route = snap
+        .passthrough_routes
+        .get_by_name(&event.passthrough_route_name)?;
+    let route = &route.value;
     let facts = UpstreamFacts {
-        provider_name: genai_provider_name(&pk.provider, pk.adapter),
+        provider_name: snap
+            .provider_keys
+            .get_by_id(provider_key_id)
+            .map(|pk| genai_provider_name(&pk.value.provider, pk.value.adapter))
+            .unwrap_or_default(),
         ..UpstreamFacts::default()
     };
-    Some(match crate::dispatch::configured_base_url(pk, None) {
-        Some(base) => facts.with_base_url(&base),
-        None => facts,
+    Some(match route.target_url.as_deref() {
+        Some(target) if !route.preserve_host => facts.with_base_url(target),
+        _ => facts,
     })
 }
 
