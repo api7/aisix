@@ -40,11 +40,88 @@ pub struct HttpServerFacts {
     pub route: Option<&'static str>,
     /// `url.scheme` of the hop that reached the gateway.
     pub scheme: Option<&'static str>,
+    /// `url.query`, with credential values replaced (see
+    /// [`redact_query`]); `None` when the request carried no query.
+    pub query: Option<String>,
 }
 
 /// Longest `url.path` exported. Paths are caller-chosen; a trace backend
 /// stores the value on every span of the request's root.
 const MAX_URL_PATH_BYTES: usize = 512;
+
+/// Longest `url.query` exported, after redaction.
+const MAX_URL_QUERY_BYTES: usize = 1024;
+
+/// Query keys whose value the HTTP conventions redact by default
+/// (semantic-conventions v1.41.1, `url.query`). Matched case-sensitively, as
+/// the conventions list them.
+const SEMCONV_SENSITIVE_QUERY_KEYS: [&str; 4] =
+    ["AWSAccessKeyId", "Signature", "sig", "X-Goog-Signature"];
+
+/// Query keys the gateway itself treats as credentials: the Vertex / Gemini
+/// API's `key` and `access_token` (reserved in the Vertex bridge), and the
+/// credential parameters the OIDC discovery / JWKS URL screen refuses.
+/// Matched case-insensitively, as those checks match them.
+const GATEWAY_CREDENTIAL_QUERY_KEYS: [&str; 7] = [
+    "key",
+    "access_token",
+    "token",
+    "client_secret",
+    "password",
+    "api_key",
+    "apikey",
+];
+
+/// The query string with every credential value replaced by `REDACTED` and
+/// every other byte kept verbatim.
+pub fn redact_query(query: &str) -> String {
+    query
+        .split('&')
+        .map(|pair| {
+            let Some((raw_key, _)) = pair.split_once('=') else {
+                return pair.to_string();
+            };
+            let key = percent_decode(raw_key);
+            let sensitive = SEMCONV_SENSITIVE_QUERY_KEYS.contains(&key.as_str())
+                || GATEWAY_CREDENTIAL_QUERY_KEYS
+                    .iter()
+                    .any(|k| k.eq_ignore_ascii_case(&key));
+            if sensitive {
+                format!("{raw_key}=REDACTED")
+            } else {
+                pair.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// `application/x-www-form-urlencoded` key decoding, enough to recognise an
+/// encoded key (`%6Bey`, `+`); an invalid escape is kept as written.
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(b) => {
+                        out.push(b);
+                        i += 3;
+                        continue;
+                    }
+                    Err(_) => out.push(b'%'),
+                }
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
 
 impl HttpServerFacts {
     pub fn new(
@@ -63,7 +140,16 @@ impl HttpServerFacts {
             path: capped(path, MAX_URL_PATH_BYTES).to_string(),
             route,
             scheme,
+            query: None,
         }
+    }
+
+    /// Attach the request's query string, redacted.
+    pub fn with_query(mut self, query: Option<&str>) -> Self {
+        self.query = query
+            .filter(|q| !q.is_empty())
+            .map(|q| capped(&redact_query(q), MAX_URL_QUERY_BYTES).to_string());
+        self
     }
 
     /// The SERVER span name: `{method} {route}`, `{method}` without a
@@ -774,6 +860,24 @@ mod tests {
         assert_eq!(
             c.tool_definitions.as_deref(),
             Some(r#"[{"name":"w","type":"function"}]"#)
+        );
+    }
+
+    #[test]
+    fn query_credentials_are_redacted_and_the_rest_kept_verbatim() {
+        assert_eq!(
+            redact_query("key=AIza123&alt=sse&Signature=abc&signature=x&X-Goog-Signature=s&API_KEY=k&%6Bey=z&q=a%20b"),
+            "key=REDACTED&alt=sse&Signature=REDACTED&signature=x&X-Goog-Signature=REDACTED&API_KEY=REDACTED&%6Bey=REDACTED&q=a%20b"
+        );
+        assert_eq!(redact_query("flag&tenant=ops"), "flag&tenant=ops");
+        let facts =
+            HttpServerFacts::new("GET", "/x", None, None).with_query(Some("access_token=t"));
+        assert_eq!(facts.query.as_deref(), Some("access_token=REDACTED"));
+        assert_eq!(
+            HttpServerFacts::new("GET", "/x", None, None)
+                .with_query(Some(""))
+                .query,
+            None
         );
     }
 

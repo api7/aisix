@@ -410,6 +410,8 @@ describe("OTLP spans follow the GenAI semantic conventions", () => {
     expect(server.attributes["user_agent.original"]).toBe("semconv-e2e/1.0");
     expect(server.attributes["client.address"]).toBe("127.0.0.1");
     expect(server.attributes["aisix.client_source_ip"]).toBeUndefined();
+    // No query string, no `url.query`.
+    expect(server.attributes["url.query"]).toBeUndefined();
 
     const attempt = attemptSpan(spans);
     const genai = spans.filter((s) => s.attributes["gen_ai.operation.name"] !== undefined);
@@ -418,6 +420,27 @@ describe("OTLP spans follow the GenAI semantic conventions", () => {
       if (span.spanId === attempt.spanId) continue;
       expect(span.attributes["gen_ai.request.model"], span.name).toBeUndefined();
       expect(span.attributes["gen_ai.usage.input_tokens"], span.name).toBeUndefined();
+    }
+  });
+
+  test("the SERVER span reports the query with credential values redacted", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const query =
+      "key=AIza-live-secret&Signature=sig-live&sig=s2&X-Goog-Signature=gs&access_token=at&tenant=ops&Sig=kept";
+    const { status, requestId, text } = await post(`/v1/chat/completions?${query}`, {
+      model: OPENAI_MODEL,
+      messages: [{ role: "user", content: "query please" }],
+    });
+    expect(status, text).toBe(200);
+    const spans = await requestSpans(otlp!, requestId);
+    const server = spans.find((s) => s.kind === KIND_SERVER)!;
+    expect(server.attributes["url.query"]).toBe(
+      "key=REDACTED&Signature=REDACTED&sig=REDACTED&X-Goog-Signature=REDACTED&access_token=REDACTED&tenant=ops&Sig=kept",
+    );
+    expect(server.attributes["url.path"]).toBe("/v1/chat/completions");
+    for (const span of spans) {
+      expect(JSON.stringify(span.attributes)).not.toContain("live-secret");
+      expect(JSON.stringify(span.attributes)).not.toContain("sig-live");
     }
   });
 

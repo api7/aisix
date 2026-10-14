@@ -171,6 +171,7 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
     expect(span.name).toBe("invoke_agent invoices");
     expect(span.attributes["gen_ai.operation.name"]).toBe("invoke_agent");
     expect(span.attributes["gen_ai.agent.name"]).toBe("invoices");
+    expect(span.attributes["gen_ai.provider.name"]).toBe("a2a");
     // The task the call produced, and the state it ended in.
     expect(span.attributes["aisix.a2a.task_id"]).toBe("task-e2e-1");
     expect(span.attributes["aisix.a2a.task_state"]).toBe("completed");

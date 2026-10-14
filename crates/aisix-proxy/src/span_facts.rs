@@ -27,8 +27,17 @@ pub(crate) fn upstream_facts(
             return Some(UpstreamFacts::default().with_base_url(&server.value.url));
         }
         "a2a" => {
-            let agent = snap.a2a_agents.get_by_name(&event.a2a_agent_name)?;
-            return Some(UpstreamFacts::default().with_base_url(&agent.value.url));
+            // A remote agent has no GenAI provider the gateway can name, but
+            // the attribute is required on an `invoke_agent` span as the
+            // telemetry-flavour discriminator: the protocol is the flavour.
+            let facts = UpstreamFacts {
+                provider_name: "a2a".into(),
+                ..UpstreamFacts::default()
+            };
+            return Some(match snap.a2a_agents.get_by_name(&event.a2a_agent_name) {
+                Some(agent) => facts.with_base_url(&agent.value.url),
+                None => facts,
+            });
         }
         "passthrough" => return passthrough_facts(snap, event, provider_key_id),
         _ => {}

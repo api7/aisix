@@ -1118,6 +1118,9 @@ fn server_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
         if let Some(route) = http.route {
             attributes.push(attr_string("http.route", route));
         }
+        if let Some(query) = &http.query {
+            attributes.push(attr_string("url.query", query));
+        }
     }
     attributes.push(attr_int(
         "http.response.status_code",

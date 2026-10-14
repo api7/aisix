@@ -269,6 +269,7 @@ fn server_span_request(request: &Request) -> aisix_obs::HttpServerFacts {
         (label == path).then_some(label),
         request.extensions().get::<DownstreamScheme>().map(|s| s.0),
     )
+    .with_query(request.uri().query())
 }
 
 /// The caller's W3C trace context, when it arrived intact.
