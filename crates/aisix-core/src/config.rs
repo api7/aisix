@@ -215,7 +215,7 @@ pub struct EtcdTlsConfig {
 
 /// Optional managed-mode configuration (prd-09 §9.2.2).
 ///
-/// When `enabled = true`, AISIX runs as a gateway connected to AISIX Enterprise or AISIX Cloud:
+/// When `enabled = true`, the AISIX gateway connects to AISIX Enterprise or AISIX Cloud:
 ///
 /// - The admin API listener is **not** bound.
 /// - The Playground endpoint is **not** exposed.

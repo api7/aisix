@@ -20,7 +20,7 @@ forever.
 [**Start free**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=ai-gateway) ·
 [**Documentation**](https://docs.api7.ai/ai-gateway/) ·
 [**Quickstart**](https://docs.api7.ai/ai-gateway/getting-started/gateway-quickstart) ·
-[**AISIX Enterprise and Cloud**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) ·
+[**AISIX Enterprise and AISIX Cloud**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) ·
 [**Roadmap**](ROADMAP.md)
 
 <br>
@@ -50,7 +50,7 @@ for centralized management with team governance, budgets, audit, and a dashboard
 > Enterprise**, while API7 hosts it with **AISIX Cloud**. In all three products, the
 > gateway runs in your environment and calls providers directly; live AI traffic does not
 > pass through either control plane. The proxy API is identical throughout.
-> **[Talk to us about AISIX Enterprise or Cloud →](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
+> **[Talk to us about AISIX Enterprise or AISIX Cloud →](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
 
 ## ⚡ Quickstart
 
