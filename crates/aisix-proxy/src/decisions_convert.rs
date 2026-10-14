@@ -25,8 +25,9 @@
 //!   probability reported as 0;
 //! - an answer that is missing, or whose `type` is not its question's, is a
 //!   refusal on the Decisions side and an absent key on the System One side;
-//!   an answer that lacks a field its own type requires fails the whole
-//!   response instead, since the upstream did not answer in its format;
+//!   a response without its `answers` collection, or with an answer that
+//!   lacks a field its own type requires, fails as a whole instead, since the
+//!   upstream did not answer in its format;
 //! - anything one format has no place for is dropped.
 //!
 //! Object member order is load-bearing here (question order IS answer order on
@@ -907,7 +908,9 @@ fn check_decisions_answer(a: &Value, path: &str) -> Result<(), String> {
         Some("score") => {
             need("score", "a number", Value::is_number)?;
             require_list(a, path, "probabilities", |p, path| {
-                require(p, path, "value", "an integer", |v| v.as_i64().is_some())?;
+                require(p, path, "value", "an integer", |v| {
+                    v.as_i64().is_some() || v.as_f64().is_some_and(|f| f.fract() == 0.0)
+                })?;
                 require(p, path, "label", "a string", Value::is_string)?;
                 require(p, path, "probability", "a number", Value::is_number)
             })?;
@@ -927,8 +930,11 @@ fn check_decisions_answer(a: &Value, path: &str) -> Result<(), String> {
 /// requires, or the whole response is an `Err` naming the first one that
 /// does not.
 pub(crate) fn answers_from_systemone(body: &Value, req: &Request) -> Result<Vec<Answer>, String> {
-    let answers = body.get("answers").and_then(Value::as_object);
-    for (key, a) in answers.into_iter().flatten() {
+    let answers = body
+        .get("answers")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{UNEXPECTED}: `answers` is missing or not an object"))?;
+    for (key, a) in answers {
         check_systemone_answer(a, &format!("answers.{key}"))?;
     }
     Ok(systemone_keys(&req.questions)
@@ -936,7 +942,7 @@ pub(crate) fn answers_from_systemone(body: &Value, req: &Request) -> Result<Vec<
         .zip(&req.questions)
         .map(|(key, q)| {
             answers
-                .and_then(|a| a.get(key))
+                .get(key)
                 .and_then(|a| systemone_answer(q, a))
                 .unwrap_or(Answer::Refusal)
         })
@@ -1002,8 +1008,11 @@ fn systemone_answer(q: &Question, a: &Value) -> Option<Answer> {
 /// Read a Decisions response's answers, matched to questions by position,
 /// under the same rule as [`answers_from_systemone`].
 pub(crate) fn answers_from_decisions(body: &Value, req: &Request) -> Result<Vec<Answer>, String> {
-    let answers = body.get("answers").and_then(Value::as_array);
-    for (i, a) in answers.into_iter().flatten().enumerate() {
+    let answers = body
+        .get("answers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{UNEXPECTED}: `answers` is missing or not a list"))?;
+    for (i, a) in answers.iter().enumerate() {
         check_decisions_answer(a, &format!("answers[{i}]"))?;
     }
     Ok(req
@@ -1012,7 +1021,7 @@ pub(crate) fn answers_from_decisions(body: &Value, req: &Request) -> Result<Vec<
         .enumerate()
         .map(|(i, q)| {
             answers
-                .and_then(|a| a.get(i))
+                .get(i)
                 .and_then(|a| decisions_answer(q, a))
                 .unwrap_or(Answer::Refusal)
         })
@@ -1046,7 +1055,9 @@ fn decisions_answer(q: &Question, a: &Value) -> Option<Answer> {
                 .as_array()?
                 .iter()
                 .filter_map(|p| {
-                    let value = p.get("value")?.as_i64()?;
+                    let value = p
+                        .get("value")
+                        .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))?;
                     let label = usize::try_from(value)
                         .ok()
                         .and_then(|i| levels.get(i))
@@ -1586,6 +1597,21 @@ mod tests {
         )
         .unwrap();
         assert!(answers.iter().all(|a| matches!(a, Answer::Refusal)));
+
+        // A whole-number float is an integer level.
+        let mut float_value = dscore.clone();
+        float_value["probabilities"][1]["value"] = json!(1.0);
+        assert!(dwith(&dchoice, &float_value).is_ok());
+
+        // No answers at all is not N refusals.
+        for body in [json!({}), json!({"answers": []})] {
+            let err = answers_from_systemone(&body, &req).err().unwrap();
+            assert!(err.contains("`answers`"), "{err}");
+        }
+        for body in [json!({}), json!({"answers": {}})] {
+            let err = answers_from_decisions(&body, &dreq).err().unwrap();
+            assert!(err.contains("`answers`"), "{err}");
+        }
     }
 
     #[test]
