@@ -226,9 +226,10 @@ notes, and configuration comments:
   product-name uses of **On-Premises** from current public prose.
 - The same gateway binary runs in all three products. A shared binary does not
   imply identical product behavior or configuration surfaces.
-- Use **AISIX OSS gateway** only when a sentence must distinguish a gateway in
-  the direct OSS workflow from a gateway connected to a commercial control
-  plane. Otherwise, use **AISIX gateway** or **gateway**.
+- **Open-source AISIX gateway** is a valid descriptive component phrase, not a
+  product name. Use it when emphasizing the gateway's license or distinguishing
+  direct OSS operation, and do not replace it mechanically with **AISIX OSS
+  gateway**. Otherwise, use **AISIX gateway** or **gateway**.
 - An AISIX gateway is a **data plane** only within AISIX Enterprise or AISIX
   Cloud architecture. Do not call a gateway running as AISIX OSS a data plane.
 - Do not use **standalone gateway** as a product label. `standalone mode` and
