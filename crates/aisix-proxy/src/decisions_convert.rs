@@ -853,14 +853,11 @@ fn integer(v: &Value) -> bool {
 /// A Decisions response carries `model` and a `usage` with its three counts;
 /// the details objects are optional, but typed when present.
 fn check_decisions_envelope(body: &Value) -> Result<(), String> {
-    let top: [(&str, &str, fn(&Value) -> bool); 2] = [
-        ("model", "a string", Value::is_string),
-        ("usage", "an object", Value::is_object),
-    ];
-    for (field, want, ok) in top {
-        if !body.get(field).is_some_and(ok) {
-            return Err(format!("{UNEXPECTED}: `{field}` is missing or not {want}"));
-        }
+    if !body.get("model").is_some_and(Value::is_string) {
+        return Err(format!("{UNEXPECTED}: `model` is missing or not a string"));
+    }
+    if !body.get("usage").is_some_and(Value::is_object) {
+        return Err(format!("{UNEXPECTED}: `usage` is missing or not an object"));
     }
     let usage = &body["usage"];
     for field in ["input_tokens", "output_tokens", "total_tokens"] {
