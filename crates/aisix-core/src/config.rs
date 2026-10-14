@@ -2241,8 +2241,8 @@ impl Config {
         // config-rs default: when `separator` is set, the prefix
         // separator inherits from it — so `separator("__")` alone
         // would demand `AISIX__FOO__BAR` env vars. That's at odds
-        // with every other aisix.cloud service (and the existing
-        // docs / Dockerfile / e2e harness), which all use
+        // with the other AISIX services (and the existing docs,
+        // Dockerfile, and e2e harness), which all use
         // `AISIX_FOO__BAR` (single underscore between prefix and
         // first key segment, double underscore for nested keys).
         // Pin prefix_separator explicitly so the two shapes are
