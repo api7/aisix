@@ -181,7 +181,8 @@ pub struct EtcdConfig {
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
     /// Optional TLS / mTLS bundle used to authenticate to the etcd
-    /// endpoint. Required when talking to an aisix.cloud DP Manager
+    /// endpoint. Required when talking to an AISIX Enterprise or AISIX
+    /// Cloud Data Plane Manager
     /// (see prd-09 §9.3.3 — the CP issues a 10-year client cert via
     /// `IssueAIDataplaneCertificate`). Leave unset for plain-HTTP
     /// etcd (local dev, integration tests).
@@ -368,7 +369,7 @@ impl Default for ManagedConfig {
 }
 
 impl ManagedConfig {
-    /// True if the DP should behave as an aisix.cloud tenant.
+    /// True if the gateway should consume configuration from a control plane.
     pub const fn is_managed(&self) -> bool {
         self.enabled
     }
@@ -5440,7 +5441,7 @@ bogus_field: 1
 
     #[test]
     fn managed_mode_lets_admin_fields_be_omitted() {
-        // A managed-mode config is the minimum aisix.cloud tenant
+        // A managed-mode config is the minimum connected-gateway
         // shape: etcd + tls + proxy + managed.enabled = true. Admin
         // keys / addr are fine to leave out entirely because the
         // admin surface is never bound.
