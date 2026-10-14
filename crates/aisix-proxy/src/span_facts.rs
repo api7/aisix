@@ -66,12 +66,10 @@ pub(crate) fn upstream_facts(
         provider_name: genai_provider_name(&pk.provider, pk.adapter),
         ..UpstreamFacts::default()
     };
-    Some(
-        match pk.api_base.as_deref().filter(|b| !b.trim().is_empty()) {
-            Some(base) => facts.with_base_url(base),
-            None => facts,
-        },
-    )
+    Some(match crate::dispatch::configured_base_url(pk, None) {
+        Some(base) => facts.with_base_url(&base),
+        None => facts,
+    })
 }
 
 /// The model name sent upstream. A wildcard row's own `model_name` is a

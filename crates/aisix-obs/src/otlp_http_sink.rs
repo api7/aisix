@@ -561,6 +561,8 @@ fn content_record(
     let captured = content?;
     let mut sc = SinkContent::capture(&captured.prompt, &captured.response, max_bytes as usize);
     sc.truncated = sc.truncated || captured.truncated;
+    sc.prompt_truncated = sc.prompt_truncated || captured.prompt_truncated;
+    sc.response_truncated = sc.response_truncated || captured.response_truncated;
     Some(Arc::new(
         SinkRecord::metadata_only(event.clone())
             .with_content(sc)
@@ -1463,45 +1465,51 @@ fn push_usage(attributes: &mut Vec<Value>, event: &UsageEvent, operation: Option
 /// `gen_ai.*` content attribute is never malformed or partial.
 fn push_content(attributes: &mut Vec<Value>, event: &UsageEvent, content: &SinkContent) {
     let fits = |value: &str| content.max_bytes.is_none_or(|cap| value.len() <= cap);
+    // Each side is judged on its own: a long answer cut by the cap does not
+    // make a complete prompt any less complete.
+    let prompt_whole = !content.prompt.is_empty() && !content.prompt_truncated;
+    let response_whole = !content.response.is_empty() && !content.response_truncated;
     let mut raw_prompt = !content.prompt.is_empty();
     let mut raw_response = !content.response.is_empty();
-    if !content.truncated {
-        if is_mcp(event) {
-            // Arguments and result are captured as JSON already; the result
-            // is reported only for a call that succeeded.
-            if raw_prompt {
-                attributes.push(attr_string("gen_ai.tool.call.arguments", &content.prompt));
-                raw_prompt = false;
+    if is_mcp(event) {
+        // Arguments and result are captured as JSON already; the result is
+        // reported only for a call that succeeded.
+        if prompt_whole {
+            attributes.push(attr_string("gen_ai.tool.call.arguments", &content.prompt));
+            raw_prompt = false;
+        }
+        if response_whole && (200..300).contains(&event.status_code) {
+            attributes.push(attr_string("gen_ai.tool.call.result", &content.response));
+            raw_response = false;
+        }
+    } else if let Some(wire) = crate::genai::PromptWire::for_operation(&event.operation) {
+        let structured = crate::genai::structured_content(
+            wire,
+            if prompt_whole { &content.prompt } else { "" },
+            if response_whole {
+                &content.response
+            } else {
+                ""
+            },
+            &event.finish_reason,
+        );
+        if let Some(input) = structured.input_messages.as_deref().filter(|v| {
+            fits(v)
+                && structured.system_instructions.as_deref().is_none_or(fits)
+                && structured.tool_definitions.as_deref().is_none_or(fits)
+        }) {
+            attributes.push(attr_string("gen_ai.input.messages", input));
+            if let Some(system) = &structured.system_instructions {
+                attributes.push(attr_string("gen_ai.system_instructions", system));
             }
-            if raw_response && (200..300).contains(&event.status_code) {
-                attributes.push(attr_string("gen_ai.tool.call.result", &content.response));
-                raw_response = false;
+            if let Some(tools) = &structured.tool_definitions {
+                attributes.push(attr_string("gen_ai.tool.definitions", tools));
             }
-        } else if let Some(wire) = crate::genai::PromptWire::for_operation(&event.operation) {
-            let structured = crate::genai::structured_content(
-                wire,
-                &content.prompt,
-                &content.response,
-                &event.finish_reason,
-            );
-            if let Some(input) = structured.input_messages.as_deref().filter(|v| {
-                fits(v)
-                    && structured.system_instructions.as_deref().is_none_or(fits)
-                    && structured.tool_definitions.as_deref().is_none_or(fits)
-            }) {
-                attributes.push(attr_string("gen_ai.input.messages", input));
-                if let Some(system) = &structured.system_instructions {
-                    attributes.push(attr_string("gen_ai.system_instructions", system));
-                }
-                if let Some(tools) = &structured.tool_definitions {
-                    attributes.push(attr_string("gen_ai.tool.definitions", tools));
-                }
-                raw_prompt = false;
-            }
-            if let Some(output) = structured.output_messages.as_deref().filter(|v| fits(v)) {
-                attributes.push(attr_string("gen_ai.output.messages", output));
-                raw_response = false;
-            }
+            raw_prompt = false;
+        }
+        if let Some(output) = structured.output_messages.as_deref().filter(|v| fits(v)) {
+            attributes.push(attr_string("gen_ai.output.messages", output));
+            raw_response = false;
         }
     }
     if raw_prompt {
@@ -2152,6 +2160,8 @@ mod tests {
                     prompt: prompt.clone(),
                     response: "hello there".into(),
                     truncated: false,
+                    prompt_truncated: false,
+                    response_truncated: false,
                 }),
                 None,
                 None,
@@ -2168,6 +2178,25 @@ mod tests {
             r#"[{"finish_reason":"stop","parts":[{"content":"hello there","type":"text"}],"role":"assistant"}]"#
         );
         assert!(attr(&span, "aisix.content.prompt").is_none());
+
+        // Only the answer cut: the prompt is still reported structured.
+        let long_answer = content_record(
+            &otlp_kind(SlsContentMode::Full, 2 * prompt.len() as u32),
+            &event,
+            Some(&CapturedContent::new(
+                &prompt,
+                &"x".repeat(4 * prompt.len()),
+                8192,
+            )),
+            None,
+            None,
+        )
+        .unwrap();
+        let half = build_otlp_span(&long_answer, "x");
+        assert!(attr(&half, "gen_ai.input.messages").is_some());
+        assert!(attr(&half, "gen_ai.output.messages").is_none());
+        assert!(attr(&half, "aisix.content.response").is_some());
+        assert!(attr(&half, "aisix.content.prompt").is_none());
 
         let cut = build_otlp_span(&record(8), "x");
         assert!(attr(&cut, "gen_ai.input.messages").is_none());
@@ -2243,6 +2272,8 @@ mod tests {
             prompt: "the prompt".into(),
             response: "the response".into(),
             truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
         };
 
         // otlp on its default (metadata_only) never carries content, even
@@ -2289,6 +2320,8 @@ mod tests {
             prompt: "a".repeat(500),
             response: "ok".into(),
             truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
         };
         let rec = content_record(
             &sls_kind(SlsContentMode::Full, 16),
@@ -2308,6 +2341,8 @@ mod tests {
             prompt: "short".into(),
             response: "short".into(),
             truncated: true,
+            prompt_truncated: true,
+            response_truncated: false,
         };
         let rec = content_record(&full, &event, Some(&pre), None, None).unwrap();
         assert!(
@@ -2385,6 +2420,8 @@ mod tests {
             prompt: "what is 2+2?".into(),
             response: "4".into(),
             truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
         };
         let rec = content_record(
             &otlp_kind(SlsContentMode::Full, 1024),
@@ -2420,6 +2457,8 @@ mod tests {
             prompt: "a".repeat(500),
             response: "ok".into(),
             truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
         };
         let rec = content_record(
             &otlp_kind(SlsContentMode::Full, 16),

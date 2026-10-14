@@ -646,9 +646,12 @@ fn responses_input(body: &Map<String, Value>) -> Option<Converted> {
                             "parts": openai_content_parts(item.get("content"))?,
                         }));
                     }
+                    // A reference names an earlier item without saying
+                    // whose it was: no role can be claimed for it.
+                    Some("item_reference") => return None,
                     // Reasoning items and server-side tool calls replayed
-                    // from an earlier turn: the item itself, as a generic
-                    // part of the turn that produced it.
+                    // from an earlier turn are the model's own output: the
+                    // item itself, as a generic part of an assistant turn.
                     Some(_) => out.push(json!({"role": "assistant", "parts": [item.clone()]})),
                 }
             }

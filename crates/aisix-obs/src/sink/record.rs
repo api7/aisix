@@ -30,6 +30,12 @@ pub struct SinkContent {
     pub response: String,
     /// True when either field was truncated to a configured size cap.
     pub truncated: bool,
+    /// Which of the two was cut, for an encoder that reports each side on
+    /// its own terms. `truncated` is their OR.
+    #[serde(skip)]
+    pub prompt_truncated: bool,
+    #[serde(skip)]
+    pub response_truncated: bool,
     /// The exporter's per-field cap the content was captured under. An
     /// encoder that re-shapes the content holds the result to the same
     /// bound. `None` when no cap is known.
@@ -50,6 +56,8 @@ impl SinkContent {
             prompt: prompt.into_owned(),
             response: response.into_owned(),
             truncated: p_cut || r_cut,
+            prompt_truncated: p_cut,
+            response_truncated: r_cut,
             max_bytes: Some(max_bytes),
         }
     }
@@ -70,6 +78,9 @@ pub struct CapturedContent {
     pub prompt: String,
     pub response: String,
     pub truncated: bool,
+    /// Which side the capture cap cut; `truncated` is their OR.
+    pub prompt_truncated: bool,
+    pub response_truncated: bool,
 }
 
 impl CapturedContent {
@@ -85,6 +96,8 @@ impl CapturedContent {
             prompt: prompt.into_owned(),
             response: response.into_owned(),
             truncated: p_cut || r_cut,
+            prompt_truncated: p_cut,
+            response_truncated: r_cut,
         }
     }
 }
@@ -335,6 +348,8 @@ mod tests {
             prompt: "hi".into(),
             response: "hello".into(),
             truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
             max_bytes: None,
         });
         let json = serde_json::to_value(&rec).unwrap();
