@@ -6,9 +6,9 @@
 //! becomes a single PUT against the ProviderKey rather than rewriting
 //! every Model that uses it.
 //!
-//! Naming intentionally aligns with the AISIX-Cloud control plane's
-//! `ProviderKey` table — same concept, same name. The self-hosted
-//! Admin API and the SaaS-tier dashboard exposition stay in lockstep.
+//! Naming intentionally aligns with the control plane's `ProviderKey`
+//! table — same concept, same name. AISIX Enterprise and AISIX Cloud
+//! keep the API and dashboard representation in lockstep.
 //!
 //! etcd path: `{prefix}/provider_keys/{uuid}`. Secondary index on
 //! `display_name`.

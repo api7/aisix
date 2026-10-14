@@ -63,7 +63,7 @@ Four top-level resources intentionally **omit**
   tagged union, so the loader takes this resource's unknown-field report
   from the strict schema instead (`unknown_field_paths`).
 
-Two write paths sit outside this enforcement: the AISIX Cloud control
+Two write paths sit outside this enforcement: the AISIX Enterprise or AISIX Cloud control
 plane validates requests against its own API schema before writing
 etcd, and a **raw direct etcd put gets no synchronous validation** —
 the document is only checked on read, by the lenient loader below.
@@ -227,7 +227,7 @@ configured in the repository.
   Refactor target: replace inline schema objects with `$ref` into these
   files. (Follow-up PR.)
 - Documentation sites can consume the hosted Admin API OpenAPI document
-  for the AISIX AI Gateway Admin API reference.
+  for the AISIX Admin API reference.
 - Control-plane services can pin `resources/` for REST input validation
   against the same shape the data plane consumes from etcd, and pin
   `resources-lenient/` to reason about what an already-deployed gateway

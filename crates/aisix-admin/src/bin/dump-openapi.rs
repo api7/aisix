@@ -1,4 +1,4 @@
-//! Emit the canonical AISIX AI Gateway Admin API OpenAPI document.
+//! Emit the canonical AISIX Admin API OpenAPI document.
 //!
 //! Invocation:
 //!

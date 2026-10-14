@@ -321,7 +321,7 @@ async fn authenticate_token_inner(
         // custom-imported key that happens to look like a JWT keeps
         // authenticating on deployments that never enable JWT auth.
     }
-    // Self-hosted CP (prd-09a §9A.7B.4): the snapshot stores
+    // The control plane (prd-09a §9A.7B.4) stores
     // SHA-256 hashes of the plaintext bearer, never the plaintext
     // itself. Hash the incoming token via the canonical helper
     // and look up by the hex digest. cp-api hashes with the same

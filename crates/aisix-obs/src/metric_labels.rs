@@ -32,7 +32,7 @@ macro_rules! variable {
 }
 
 pub static METRIC_VARIABLES: &[MetricVariable] = &[
-    variable!("env_id", "The gateway's AISIX Cloud environment ID; unknown when not connected to AISIX Cloud. Available on every metric."),
+    variable!("env_id", "The gateway's AISIX Enterprise or AISIX Cloud environment ID; unknown when not connected to a control plane. Available on every metric."),
     variable!("trigger", "What caused a configuration apply: watch for a coalesced batch of watch events, full for a (re)load of every prefix. On heap-profile dumps: auto for a memory threshold, manual for a request to the debug listener."),
     variable!("endpoint", "The matched route template, without caller-supplied path parameters."),
     variable!("inbound_protocol", "The protocol used by the caller, derived from the matched endpoint."),

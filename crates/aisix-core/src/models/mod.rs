@@ -13,7 +13,7 @@
 //!
 //! [`Team`] and [`User`] carry only the display names telemetry labels
 //! resolve from an API key's `team_id` / `user_id`; team membership and
-//! limits stay owned by the AISIX Cloud control plane.
+//! limits stay owned by the control plane.
 
 pub mod a2a_agent;
 pub mod apikey;

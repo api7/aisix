@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# Multi-stage build for the aisix AI gateway.
+# Multi-stage build for the AISIX gateway.
 #
 # The workspace pins rustc via rust-toolchain.toml (currently 1.93.1).
 # We use the latest Debian-based official Rust image, then copy the
@@ -18,7 +18,7 @@
 #   docker run --rm -v $(pwd)/config.example.yaml:/etc/aisix/config.yaml \
 #     aisix:dev
 #
-# Run, managed (connected to AISIX Cloud with env-var overrides):
+# Run, managed (connected to AISIX Enterprise or AISIX Cloud with env-var overrides):
 #   docker run --rm \
 #     -e AISIX_CONFIG_PATH=/etc/aisix/config.managed.yaml \
 #     -e AISIX_MANAGED__CP_BASE_URL \
@@ -196,8 +196,8 @@ RUN --mount=type=bind,from=builder,source=/usr/local/bin/aisix,target=/mnt/aisix
     && apt-get purge -y --auto-remove libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
 
-# Bake the managed-mode bootstrap config so AISIX gateways managed by
-# AISIX Cloud can `docker run` without mounting a configuration file.
+# Bake the managed-mode bootstrap config so gateways connected to AISIX
+# Enterprise or AISIX Cloud can `docker run` without mounting a configuration file.
 # Environment variables provide the control-plane endpoints and gateway mTLS
 # certificate bundle.
 COPY config.managed.yaml /etc/aisix/config.managed.yaml

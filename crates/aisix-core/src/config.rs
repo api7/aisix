@@ -80,7 +80,7 @@ pub struct Config {
     pub shutdown: ShutdownConfig,
     /// Optional managed-mode configuration. When `managed.enabled = true`
     /// the admin API and Playground endpoints are **not** bound — the DP
-    /// is a pure etcd reader driven by the aisix.cloud control plane.
+    /// is a pure etcd reader driven by an AISIX Enterprise or AISIX Cloud control plane.
     /// Missing or `enabled = false` runs standalone.
     #[serde(default)]
     pub managed: ManagedConfig,
@@ -181,7 +181,8 @@ pub struct EtcdConfig {
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
     /// Optional TLS / mTLS bundle used to authenticate to the etcd
-    /// endpoint. Required when talking to an aisix.cloud DP Manager
+    /// endpoint. Required when talking to an AISIX Enterprise or AISIX
+    /// Cloud Data Plane Manager
     /// (see prd-09 §9.3.3 — the CP issues a 10-year client cert via
     /// `IssueAIDataplaneCertificate`). Leave unset for plain-HTTP
     /// etcd (local dev, integration tests).
@@ -214,7 +215,7 @@ pub struct EtcdTlsConfig {
 
 /// Optional managed-mode configuration (prd-09 §9.2.2).
 ///
-/// When `enabled = true`, aisix runs as a tenant of aisix.cloud:
+/// When `enabled = true`, the AISIX gateway connects to AISIX Enterprise or AISIX Cloud:
 ///
 /// - The admin API listener is **not** bound.
 /// - The Playground endpoint is **not** exposed.
@@ -227,7 +228,7 @@ pub struct EtcdTlsConfig {
 pub struct ManagedConfig {
     pub enabled: bool,
 
-    /// aisix.cloud CP base URL, e.g. "https://api.us.aisix.cloud".
+    /// Control-plane base URL, for example `https://api.us.aisix.cloud`.
     /// Required for heartbeat when managed mode is enabled.
     ///
     /// Normalised once by [`normalise_cp_base_url`] at load, so every
@@ -238,7 +239,7 @@ pub struct ManagedConfig {
     #[serde(default)]
     pub cp_base_url: Option<String>,
 
-    /// aisix.cloud CP etcd endpoint, e.g. "etcd.us.aisix.cloud:7943".
+    /// Control-plane etcd endpoint, for example `etcd.us.aisix.cloud:7943`.
     /// In v2 the CP returned this in the register response; v3
     /// (prd-09a §9A.7.2) no longer ships it back, so the DP must
     /// know its etcd endpoint at boot. Bare `host:port` without
@@ -368,7 +369,7 @@ impl Default for ManagedConfig {
 }
 
 impl ManagedConfig {
-    /// True if the DP should behave as an aisix.cloud tenant.
+    /// True if the gateway should consume configuration from a control plane.
     pub const fn is_managed(&self) -> bool {
         self.enabled
     }
@@ -1347,7 +1348,7 @@ impl ObservabilityConfig {
                  never had a built-in OTLP tracer, and the block has been removed from \
                  the shipped example configs. Delete it. Traces are exported by an \
                  `observability_exporters` entry with kind = otlp_http, declared in \
-                 your resources file or configured in AISIX Cloud.",
+                 your resources file or configured in AISIX Enterprise or AISIX Cloud.",
             );
         }
         if self.metrics.otlp.is_some() {
@@ -2240,8 +2241,8 @@ impl Config {
         // config-rs default: when `separator` is set, the prefix
         // separator inherits from it — so `separator("__")` alone
         // would demand `AISIX__FOO__BAR` env vars. That's at odds
-        // with every other aisix.cloud service (and the existing
-        // docs / Dockerfile / e2e harness), which all use
+        // with the other AISIX services (and the existing docs,
+        // Dockerfile, and e2e harness), which all use
         // `AISIX_FOO__BAR` (single underscore between prefix and
         // first key segment, double underscore for nested keys).
         // Pin prefix_separator explicitly so the two shapes are
@@ -5440,7 +5441,7 @@ bogus_field: 1
 
     #[test]
     fn managed_mode_lets_admin_fields_be_omitted() {
-        // A managed-mode config is the minimum aisix.cloud tenant
+        // A managed-mode config is the minimum connected-gateway
         // shape: etcd + tls + proxy + managed.enabled = true. Admin
         // keys / addr are fine to leave out entirely because the
         // admin surface is never bound.

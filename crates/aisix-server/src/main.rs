@@ -106,7 +106,7 @@ use tokio::sync::watch;
 #[command(
     name = "aisix",
     version = aisix_core::BUILD_VERSION.as_str(),
-    about = "aisix AI Gateway",
+    about = "AISIX gateway",
     subcommand_negates_reqs = true
 )]
 struct Cli {
@@ -1432,7 +1432,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // Admin router + listener are only built in standalone mode.
     // In managed mode (`cfg.managed.enabled = true`) the DP reads
     // configuration exclusively from etcd; exposing the admin surface
-    // or the Playground would bypass the AISIX Cloud control plane.
+    // or the Playground would bypass the connected control plane.
     //
     // Which store backs the admin surface depends on the resource
     // source: etcd standalone reads the etcd store; file mode reads a

@@ -1,6 +1,6 @@
 # Releasing
 
-How an AISIX AI Gateway release is cut.
+How an AISIX OSS release is cut.
 
 ## 1. Tag
 
