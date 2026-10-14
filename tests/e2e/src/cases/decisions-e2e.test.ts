@@ -196,6 +196,7 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
   let noProbabilities: OpenAiUpstream | undefined;
   let partial: OpenAiUpstream | undefined;
   let openaiNoConfidence: OpenAiUpstream | undefined;
+  let openaiNoUsage: OpenAiUpstream | undefined;
 
   async function post(path: string, body: unknown, caller = CALLER): Promise<Posted> {
     const res = await fetch(`${app!.proxyUrl}${path}`, {
@@ -264,6 +265,8 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
         usage: { input_tokens: 381, output_tokens: 62 },
       },
     });
+    const { usage: _u, ...DECISIONS_WITHOUT_USAGE } = DECISIONS_ANSWER;
+    openaiNoUsage = await startOpenAiUpstream({ nonStreamBody: DECISIONS_WITHOUT_USAGE });
     openaiNoConfidence = await startOpenAiUpstream({
       nonStreamBody: {
         ...DECISIONS_ANSWER,
@@ -361,6 +364,11 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
     await direct("dec-no-confidence-cooled", "jev-latest", typesafeAt(noConfidence), {
       cooldown: { enabled: true, default_seconds: 120 },
     });
+    await direct("dec-openai-no-usage", "gpt-6-luna", {
+      provider: "openai",
+      secret: "sk-openai",
+      api_base: `${openaiNoUsage.baseUrl}/v1`,
+    });
     await direct("dec-openai-no-confidence", "gpt-6-luna", {
       provider: "openai",
       secret: "sk-openai",
@@ -433,6 +441,7 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
       noProbabilities,
       partial,
       openaiNoConfidence,
+      openaiNoUsage,
     ]) {
       await u?.close();
     }
@@ -780,6 +789,12 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
     expect(res.status).toBe(502);
     expect(res.body.error.message).toContain("unexpected decision response");
     expect(res.body.error.message).toContain("answers[2].confidence");
+
+    // An OpenAI-format response must report its usage.
+    const noUsage = await post("/v1/systemone", systemOneBody("dec-openai-no-usage"));
+    expect(noUsage.status).toBe(502);
+    expect(noUsage.body.error.message).toContain("unexpected decision response");
+    expect(noUsage.body.error.message).toContain("`usage`");
   });
 
   test("a model group fails over an incomplete answer and cools its target down", async (ctx) => {

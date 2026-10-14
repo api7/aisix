@@ -846,6 +846,48 @@ fn number_map(v: &Value) -> bool {
         .is_some_and(|m| m.values().all(Value::is_number))
 }
 
+fn integer(v: &Value) -> bool {
+    v.as_i64().is_some() || v.as_f64().is_some_and(|f| f.fract() == 0.0)
+}
+
+/// A Decisions response carries `model` and a `usage` with its three counts;
+/// the details objects are optional, but typed when present.
+fn check_decisions_envelope(body: &Value) -> Result<(), String> {
+    let top: [(&str, &str, fn(&Value) -> bool); 2] = [
+        ("model", "a string", Value::is_string),
+        ("usage", "an object", Value::is_object),
+    ];
+    for (field, want, ok) in top {
+        if !body.get(field).is_some_and(ok) {
+            return Err(format!("{UNEXPECTED}: `{field}` is missing or not {want}"));
+        }
+    }
+    let usage = &body["usage"];
+    for field in ["input_tokens", "output_tokens", "total_tokens"] {
+        require(usage, "usage", field, "an integer", integer)?;
+    }
+    for (details, fields) in [
+        (
+            "input_tokens_details",
+            &["cached_tokens", "cache_write_tokens"][..],
+        ),
+        ("output_tokens_details", &["reasoning_tokens"][..]),
+    ] {
+        let Some(d) = usage.get(details) else {
+            continue;
+        };
+        if !d.is_object() {
+            return Err(format!("{UNEXPECTED}: `usage.{details}` is not an object"));
+        }
+        for field in fields {
+            if d.get(field).is_some() {
+                require(d, &format!("usage.{details}"), field, "an integer", integer)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn string_or_bool(v: &Value) -> bool {
     v.is_string() || v.is_boolean()
 }
@@ -908,9 +950,7 @@ fn check_decisions_answer(a: &Value, path: &str) -> Result<(), String> {
         Some("score") => {
             need("score", "a number", Value::is_number)?;
             require_list(a, path, "probabilities", |p, path| {
-                require(p, path, "value", "an integer", |v| {
-                    v.as_i64().is_some() || v.as_f64().is_some_and(|f| f.fract() == 0.0)
-                })?;
+                require(p, path, "value", "an integer", integer)?;
                 require(p, path, "label", "a string", Value::is_string)?;
                 require(p, path, "probability", "a number", Value::is_number)
             })?;
@@ -1006,8 +1046,10 @@ fn systemone_answer(q: &Question, a: &Value) -> Option<Answer> {
 }
 
 /// Read a Decisions response's answers, matched to questions by position,
-/// under the same rule as [`answers_from_systemone`].
+/// under the same rule as [`answers_from_systemone`]. Unlike System One, the
+/// format also requires `model` and `usage`.
 pub(crate) fn answers_from_decisions(body: &Value, req: &Request) -> Result<Vec<Answer>, String> {
+    check_decisions_envelope(body)?;
     let answers = body
         .get("answers")
         .and_then(Value::as_array)
@@ -1499,6 +1541,7 @@ mod tests {
     /// question type, is a refusal.
     #[test]
     fn an_answer_missing_a_required_field_fails_the_response() {
+        let usage = || json!({"input_tokens":1,"output_tokens":1,"total_tokens":2});
         let req = parse_systemone_request(&parse(
             r#"{"state":"s","questions":{
                 "bug":{"type":"noul","instructions":"Bug?"},
@@ -1562,7 +1605,8 @@ mod tests {
                              {"value":1,"label":"high","probability":0.9}]});
         let dwith = |team: &Value, sev: &Value| {
             answers_from_decisions(
-                &json!({"answers":[{"type":"predicate","name":"bug","probability":0.5},team,sev]}),
+                &json!({"model":"gpt-x","usage":usage(),
+                        "answers":[{"type":"predicate","name":"bug","probability":0.5},team,sev]}),
                 &dreq,
             )
         };
@@ -1591,7 +1635,8 @@ mod tests {
         assert!(err.contains("answers[2].probabilities[1].label"), "{err}");
 
         let answers = answers_from_decisions(
-            &json!({"answers":[{"type":"refusal","name":"bug"},
+            &json!({"model":"gpt-x","usage":usage(),
+                    "answers":[{"type":"refusal","name":"bug"},
                                {"type":"predicate","name":"team","probability":0.5}]}),
             &dreq,
         )
@@ -1608,10 +1653,45 @@ mod tests {
             let err = answers_from_systemone(&body, &req).err().unwrap();
             assert!(err.contains("`answers`"), "{err}");
         }
-        for body in [json!({}), json!({"answers": {}})] {
+        for body in [
+            json!({"model":"gpt-x","usage":usage()}),
+            json!({"model":"gpt-x","usage":usage(),"answers": {}}),
+        ] {
             let err = answers_from_decisions(&body, &dreq).err().unwrap();
             assert!(err.contains("`answers`"), "{err}");
         }
+
+        // A Decisions response also needs `model` and the three usage counts;
+        // the details objects are optional.
+        let ok = json!({"model":"gpt-x","usage":usage(),"answers":[]});
+        assert!(answers_from_decisions(&ok, &dreq).is_ok());
+        for (path, field) in [
+            ("", "model"),
+            ("", "usage"),
+            ("usage", "input_tokens"),
+            ("usage", "output_tokens"),
+            ("usage", "total_tokens"),
+        ] {
+            let mut body = ok.clone();
+            let target = if path.is_empty() {
+                &mut body
+            } else {
+                &mut body[path]
+            };
+            target.as_object_mut().unwrap().remove(field);
+            let err = answers_from_decisions(&body, &dreq).err().unwrap();
+            assert!(
+                err.contains(&format!("`{field}`")) || err.contains(&format!(".{field}`")),
+                "{err}"
+            );
+        }
+        let mut bad_details = ok.clone();
+        bad_details["usage"]["input_tokens_details"] = json!({"cached_tokens":"many"});
+        let err = answers_from_decisions(&bad_details, &dreq).err().unwrap();
+        assert!(
+            err.contains("usage.input_tokens_details.cached_tokens"),
+            "{err}"
+        );
     }
 
     #[test]
