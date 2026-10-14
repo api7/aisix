@@ -295,10 +295,12 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
     const labelled = await logFor("ptr-dims-labelled");
     // Pre-fix this row carried 0/0: `usage_of` read only the canonical
     // pair, and only from a `usage`-wrapped object.
-    // `gen_ai.usage.input_tokens` follows the GenAI conventions: every
-    // cached token is included. The parser records the flat
-    // `cache_*_input_tokens` counters in the additive (Anthropic) family, so
-    // they are added to the prompt count.
+    // `gen_ai.usage.input_tokens` folds the additive cache counters into the
+    // prompt count. This agent's `prompt_tokens` already includes its cache,
+    // but the passthrough usage mapping stores the flat
+    // `cache_*_input_tokens` in the additive fields, so this figure counts
+    // the cache twice. The mapping is corrected in a separate change, which
+    // updates this expectation.
     expect(labelled["gen_ai.usage.input_tokens"]).toBe(
       AGENT_USAGE.prompt_tokens +
         AGENT_USAGE.cache_creation_input_tokens +
