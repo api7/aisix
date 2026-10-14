@@ -24,10 +24,15 @@ aisix-mcp = { path = "../aisix-mcp" }
 # renames, constraints, default body fields, default headers) takes
 # effect on outbound `/v1/messages` requests — without this the
 # override pipeline silently no-ops on the Anthropic path (#335 /
-# #337). These two crates are the only provider crates the proxy
-# depends on directly — others stay behind the Bridge trait.
+# #337). These two crates, plus the Azure one below (used for its
+# credential only), are the only provider crates the proxy depends on
+# directly — others stay behind the Bridge trait.
 aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
 aisix-provider-openai = { path = "../aisix-provider-openai" }
+# `/v1/systemone` and `/v1/decisions` call Microsoft Foundry directly and
+# authenticate with an Azure key exactly as the Azure bridge does
+# (`resolve_credential`), including the Entra ID client-credentials shape.
+aisix-provider-azure-openai = { path = "../aisix-provider-azure-openai" }
 aisix-obs = { path = "../aisix-obs" }
 aisix-ratelimit = { path = "../aisix-ratelimit" }
 aisix-cache = { path = "../aisix-cache" }

@@ -37,6 +37,8 @@ mod client_ip;
 mod completions;
 pub(crate) mod cooldown;
 mod count_tokens;
+mod decisions;
+mod decisions_convert;
 mod dispatch;
 mod ebml;
 mod effort_mapping;
@@ -148,6 +150,8 @@ pub fn build_router(state: ProxyState) -> Router {
             post(count_tokens::count_tokens),
         )
         .route("/v1/rerank", post(rerank::rerank))
+        .route("/v1/systemone", post(decisions::systemone))
+        .route("/v1/decisions", post(decisions::decisions))
         .route("/v1/responses", post(responses::responses))
         .route("/v1/audio/transcriptions", post(audio::transcriptions))
         .route("/v1/audio/translations", post(audio::translations))
@@ -375,6 +379,8 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/v1/messages" => "/v1/messages",
         "/v1/messages/count_tokens" => "/v1/messages/count_tokens",
         "/v1/rerank" => "/v1/rerank",
+        "/v1/systemone" => "/v1/systemone",
+        "/v1/decisions" => "/v1/decisions",
         "/v1/responses" => "/v1/responses",
         "/v1/audio/transcriptions" => "/v1/audio/transcriptions",
         "/v1/audio/translations" => "/v1/audio/translations",
