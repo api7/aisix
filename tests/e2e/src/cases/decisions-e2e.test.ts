@@ -110,6 +110,14 @@ const OPENROUTER_ANSWER = {
   provider: "TypeSafe",
 };
 
+/** {@link SYSTEMONE_ANSWER} with one answer replaced or removed. */
+function systemOneAnswerWith(answers: Record<string, unknown>) {
+  return { ...SYSTEMONE_ANSWER, answers: { ...SYSTEMONE_ANSWER.answers, ...answers } };
+}
+
+const { confidence: _c, ...TEAM_WITHOUT_CONFIDENCE } = SYSTEMONE_ANSWER.answers.team;
+const { probabilities: _p, ...SEVERITY_WITHOUT_PROBABILITIES } = SYSTEMONE_ANSWER.answers.severity;
+
 /** The canonical System One request used across the suite. */
 function systemOneBody(model: string, extra: Record<string, unknown> = {}) {
   return {
@@ -184,6 +192,10 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
   let failing: OpenAiUpstream | undefined;
   let rejecting: OpenAiUpstream | undefined;
   let anthropic: OpenAiUpstream | undefined;
+  let noConfidence: OpenAiUpstream | undefined;
+  let noProbabilities: OpenAiUpstream | undefined;
+  let partial: OpenAiUpstream | undefined;
+  let openaiNoConfidence: OpenAiUpstream | undefined;
 
   async function post(path: string, body: unknown, caller = CALLER): Promise<Posted> {
     const res = await fetch(`${app!.proxyUrl}${path}`, {
@@ -238,6 +250,30 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
       errorBody: { detail: "Noul question must have criteria or instructions: is_bug" },
     });
     anthropic = await startOpenAiUpstream({ nonStreamBody: SYSTEMONE_ANSWER });
+    noConfidence = await startOpenAiUpstream({
+      nonStreamBody: systemOneAnswerWith({ team: TEAM_WITHOUT_CONFIDENCE }),
+    });
+    noProbabilities = await startOpenAiUpstream({
+      nonStreamBody: systemOneAnswerWith({ severity: SEVERITY_WITHOUT_PROBABILITIES }),
+    });
+    // `team` answered as the wrong question type, `severity` not at all.
+    partial = await startOpenAiUpstream({
+      nonStreamBody: {
+        model: "jev-1.13.0",
+        answers: { is_bug: { type: "noul", noul: 0.92 }, team: { type: "noul", noul: 0.3 } },
+        usage: { input_tokens: 381, output_tokens: 62 },
+      },
+    });
+    openaiNoConfidence = await startOpenAiUpstream({
+      nonStreamBody: {
+        ...DECISIONS_ANSWER,
+        answers: DECISIONS_ANSWER.answers.map((a) => {
+          if (a.type !== "score") return a;
+          const { confidence: _, ...rest } = a as Record<string, unknown>;
+          return rest;
+        }),
+      },
+    });
     sls = await startMockSls();
 
     app = await spawnApp({
@@ -313,6 +349,23 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
       secret: "sk-ant",
       api_base: anthropic.baseUrl,
     });
+    const typesafeAt = (upstream: OpenAiUpstream) => ({
+      provider: "typesafe",
+      adapter: undefined,
+      secret: "ts-secret",
+      api_base: upstream.baseUrl,
+    });
+    await direct("dec-no-confidence", "jev-latest", typesafeAt(noConfidence));
+    await direct("dec-no-probabilities", "jev-latest", typesafeAt(noProbabilities));
+    await direct("dec-partial", "jev-latest", typesafeAt(partial));
+    await direct("dec-no-confidence-cooled", "jev-latest", typesafeAt(noConfidence), {
+      cooldown: { enabled: true, default_seconds: 120 },
+    });
+    await direct("dec-openai-no-confidence", "gpt-6-luna", {
+      provider: "openai",
+      secret: "sk-openai",
+      api_base: `${openaiNoConfidence.baseUrl}/v1`,
+    });
     await direct(
       "dec-embedding",
       "text-embedding-3-small",
@@ -324,6 +377,14 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
       routing: {
         strategy: "failover",
         targets: [{ model: "dec-failing" }, { model: "dec-typesafe" }],
+        max_fallbacks: 1,
+      },
+    });
+    await seed.createModel({
+      display_name: "dec-incomplete-group",
+      routing: {
+        strategy: "failover",
+        targets: [{ model: "dec-no-confidence-cooled" }, { model: "dec-typesafe" }],
         max_fallbacks: 1,
       },
     });
@@ -360,7 +421,19 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
 
   afterAll(async () => {
     await app?.exit();
-    for (const u of [typesafe, openai, foundry, openrouter, failing, rejecting, anthropic]) {
+    for (const u of [
+      typesafe,
+      openai,
+      foundry,
+      openrouter,
+      failing,
+      rejecting,
+      anthropic,
+      noConfidence,
+      noProbabilities,
+      partial,
+      openaiNoConfidence,
+    ]) {
       await u?.close();
     }
     await sls?.close();
@@ -688,6 +761,55 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
     expect(failing!.receivedRequests.length).toBeGreaterThan(failFrom);
     expect(typesafe!.receivedRequests.length).toBe(okFrom + 1);
     expect(res.body.model).toBe("dec-group");
+  });
+
+  test("a converted answer missing a field its type requires fails the whole request", async (ctx) => {
+    if (!ready(ctx)) return;
+    for (const [model, field] of [
+      ["dec-no-confidence", "answers.team.confidence"],
+      ["dec-no-probabilities", "answers.severity.probabilities"],
+    ]) {
+      const res = await post("/v1/decisions", decisionsBody(model));
+      expect(res.status, model).toBe(502);
+      expect(res.body.error.message).toContain("unexpected decision response");
+      expect(res.body.error.message).toContain(field);
+    }
+
+    // The other direction: an OpenAI answer read for a System One caller.
+    const res = await post("/v1/systemone", systemOneBody("dec-openai-no-confidence"));
+    expect(res.status).toBe(502);
+    expect(res.body.error.message).toContain("unexpected decision response");
+    expect(res.body.error.message).toContain("answers[2].confidence");
+  });
+
+  test("a model group fails over an incomplete answer and cools its target down", async (ctx) => {
+    if (!ready(ctx)) return;
+    const badFrom = noConfidence!.receivedRequests.length;
+    const okFrom = typesafe!.receivedRequests.length;
+    const res = await post("/v1/decisions", decisionsBody("dec-incomplete-group"));
+
+    expect(res.status).toBe(200);
+    expect(noConfidence!.receivedRequests.length).toBe(badFrom + 1);
+    expect(typesafe!.receivedRequests.length).toBe(okFrom + 1);
+    expect(res.body.model).toBe("dec-incomplete-group");
+    expect(res.body.answers[1]).toMatchObject({ type: "choice", choice: "engineering", confidence: 1 });
+
+    // Cooled down: the next request goes straight to the healthy target.
+    const again = await post("/v1/decisions", decisionsBody("dec-incomplete-group"));
+    expect(again.status).toBe(200);
+    expect(noConfidence!.receivedRequests.length).toBe(badFrom + 1);
+    expect(typesafe!.receivedRequests.length).toBe(okFrom + 2);
+  });
+
+  test("an absent answer and one of another question type are still refusals", async (ctx) => {
+    if (!ready(ctx)) return;
+    const res = await post("/v1/decisions", decisionsBody("dec-partial"));
+    expect(res.status).toBe(200);
+    expect(res.body.answers).toEqual([
+      { type: "predicate", name: "is_bug", probability: 0.92 },
+      { type: "refusal", name: "team" },
+      { type: "refusal", name: "severity" },
+    ]);
   });
 
   test("an upstream 4xx reaches the caller with the upstream's message", async (ctx) => {
