@@ -17,8 +17,11 @@ import {
 //
 //   1. Defaults unchanged — an exporter with neither knob ships spans
 //      for every request and never carries prompt/response content.
-//   2. `content_mode: full` attaches `gen_ai.prompt` / `gen_ai.completion`
-//      truncated to `content_max_bytes` (with `aisix.content_truncated`).
+//   2. `content_mode: full` attaches the captured chat as the GenAI
+//      conventions' structured `gen_ai.input.messages` /
+//      `gen_ai.output.messages`; a capture cut to `content_max_bytes` cannot
+//      be a well-formed message list, so it rides `aisix.content.prompt`
+//      with `aisix.content_truncated` instead.
 //   3. `sample_rate: 0` ships nothing; the same traffic against a
 //      rate-1.0 exporter (positive control) ships spans — proving the
 //      absence was the sampler, not a broken pipeline.
@@ -122,7 +125,7 @@ async function waitForSpan(
   throw new Error(
     `no matching OTLP span recorded within timeout; ${recv.spanAttrs.length} spans seen; ` +
       `sample keys: ${JSON.stringify(recv.spanAttrs.slice(0, 2).map((a) => Object.keys(a)))}; ` +
-      `prompts: ${JSON.stringify(recv.spanAttrs.slice(0, 3).map((a) => a["gen_ai.prompt"]))}`,
+      `prompts: ${JSON.stringify(recv.spanAttrs.slice(0, 3).map((a) => a["gen_ai.input.messages"] ?? a["aisix.content.prompt"]))}`,
   );
 }
 
@@ -173,9 +176,17 @@ describe("otlp exporter knobs e2e (#519 B.2): sample_rate + content capture", ()
         }
       });
 
-      const span = await waitForSpan(otlp, (a) => "aisix.request_id" in a);
-      expect(span["gen_ai.prompt"]).toBeUndefined();
-      expect(span["gen_ai.completion"]).toBeUndefined();
+      const span = await waitForSpan(otlp, (a) => "gen_ai.operation.name" in a);
+      for (const key of [
+        "gen_ai.input.messages",
+        "gen_ai.output.messages",
+        "aisix.content.prompt",
+        "aisix.content.response",
+        "gen_ai.prompt",
+        "gen_ai.completion",
+      ]) {
+        expect(span[key], key).toBeUndefined();
+      }
     },
     60_000,
   );
@@ -214,13 +225,23 @@ describe("otlp exporter knobs e2e (#519 B.2): sample_rate + content capture", ()
         }
       });
 
-      // Short prompt: captured whole, no truncation flag.
+      // Short prompt: captured whole, so it is reported in the conventions'
+      // message schema — never the retired flat `gen_ai.prompt`.
       const shortSpan = await waitForSpan(
         otlp,
-        (a) => (a["gen_ai.prompt"] ?? "").includes("content-probe"),
+        (a) => (a["gen_ai.input.messages"] ?? "").includes("content-probe"),
       );
-      expect(shortSpan["gen_ai.completion"]).toBeTruthy();
+      expect(JSON.parse(shortSpan["gen_ai.input.messages"])).toEqual([
+        { role: "user", parts: [{ type: "text", content: "content-probe" }] },
+      ]);
+      const output = JSON.parse(shortSpan["gen_ai.output.messages"]);
+      expect(output).toHaveLength(1);
+      expect(output[0].role).toBe("assistant");
+      expect(output[0].parts[0].type).toBe("text");
+      expect(typeof output[0].finish_reason).toBe("string");
       expect(shortSpan["aisix.content_truncated"]).toBeUndefined();
+      expect(shortSpan["gen_ai.prompt"]).toBeUndefined();
+      expect(shortSpan["aisix.content.prompt"]).toBeUndefined();
 
       // Oversized prompt: captured but cut at the 200-byte cap.
       const long = "long-content-".repeat(40); // ~520 bytes
@@ -230,10 +251,11 @@ describe("otlp exporter knobs e2e (#519 B.2): sample_rate + content capture", ()
       const longSpan = await waitForSpan(
         otlp,
         (a) =>
-          (a["gen_ai.prompt"] ?? "").includes("long-content-") &&
+          (a["aisix.content.prompt"] ?? "").includes("long-content-") &&
           a["aisix.content_truncated"] === "true",
       );
-      expect(longSpan["gen_ai.prompt"].length).toBeLessThanOrEqual(200);
+      expect(longSpan["aisix.content.prompt"].length).toBeLessThanOrEqual(200);
+      expect(longSpan["gen_ai.input.messages"]).toBeUndefined();
     },
     60_000,
   );

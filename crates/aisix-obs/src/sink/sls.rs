@@ -607,6 +607,7 @@ mod tests {
             prompt: "what is 2+2?".into(),
             response: "4".into(),
             truncated: true,
+            max_bytes: None,
         });
         sink.append_batch(&batch_of(vec![record]), &IdempotencyMarker::None)
             .await

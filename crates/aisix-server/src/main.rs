@@ -1253,6 +1253,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // so a real DP scrape surfaces UsageEvent throughput without
     // needing cp-api or an OTLP receiver in the loop.
     proxy_state = proxy_state.with_usage_sink(usage_sink.with_metrics((*metrics).clone()));
+    // OTLP exports report the configured service name as `service.name`.
+    proxy_state
+        .otlp_fan_out
+        .set_service_name(&cfg.observability.service_name);
     // AISIX-Cloud#1045: operator UA→client_type rules. Compile errors are
     // boot-fatal — a dropped rule would silently misattribute traffic.
     let client_classifier =
@@ -2870,6 +2874,11 @@ async fn accept_loop(
 ) -> anyhow::Result<()> {
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
+
+    // The scheme this listener serves, for the SERVER span's `url.scheme`.
+    let router = router.layer(axum::Extension(aisix_proxy::DownstreamScheme(
+        if tls.is_some() { "https" } else { "http" },
+    )));
 
     // ConnectInfo<SocketAddr> exposes the TCP peer to the proxy's real-ip
     // resolver (#492). Harmless for the admin listener, which ignores it.

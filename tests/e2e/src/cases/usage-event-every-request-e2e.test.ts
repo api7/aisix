@@ -239,6 +239,21 @@ describe("a usage event for every request", () => {
     );
     expect(event.get("status_code")).toBe("502");
     expect(event.get("mcp_server_name")).toBe("big");
+
+    // The exported tool span follows the MCP client span conventions.
+    const deadline = Date.now() + 15_000;
+    const toolSpan = () =>
+      otlp!.spans.find((s) => s.kind === 3 && s.attributes["gen_ai.tool.name"] === "report");
+    while (Date.now() < deadline && !toolSpan()) await new Promise((r) => setTimeout(r, 50));
+    const span = toolSpan();
+    expect(span, "the MCP tool span was exported").toBeTruthy();
+    expect(span!.name).toBe("tools/call report");
+    expect(span!.attributes["mcp.method.name"]).toBe("tools/call");
+    expect(span!.attributes["gen_ai.operation.name"]).toBe("execute_tool");
+    expect(span!.attributes["server.address"]).toBe(new URL(mcp!.url).hostname);
+    expect(span!.attributes["server.port"]).toBe(Number(new URL(mcp!.url).port));
+    expect(span!.statusCode).toBe(2);
+    expect(span!.attributes["error.type"]).toBeTruthy();
   });
 
   test("POST /v1/videos: the gateway's own 501 records an event with no upstream span", async (ctx) => {

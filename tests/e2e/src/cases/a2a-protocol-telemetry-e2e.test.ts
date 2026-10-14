@@ -176,6 +176,10 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
     expect(span.attributes["aisix.a2a.task_state"]).toBe("completed");
     expect(span.attributes["aisix.a2a.operation"]).toBe("message/send");
     expect(span.attributes["aisix.a2a.protocol_version"]).toBe("1.0");
+    // The agent the gateway called, by the address configured for it.
+    const agentUrl = new URL(upstream10.url);
+    expect(span.attributes["server.address"]).toBe(agentUrl.hostname);
+    expect(span.attributes["server.port"]).toBe(Number(agentUrl.port));
   });
 
   test("both wire vocabularies aggregate under one operation", async (ctx) => {
@@ -359,11 +363,13 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
       if (!captured) await new Promise((resolve) => setTimeout(resolve, 250));
     }
     expect(captured, "the full-content exporter received the call").toBeDefined();
-    expect(captured!.attributes["gen_ai.prompt"]).toContain(prompt);
-    expect(captured!.attributes["gen_ai.completion"]).toContain("The invoice is settled.");
+    // Agent text is not a model message list, so it rides the gateway's own
+    // content keys rather than `gen_ai.input.messages` / `output.messages`.
+    expect(captured!.attributes["aisix.content.prompt"]).toContain(prompt);
+    expect(captured!.attributes["aisix.content.response"]).toContain("The invoice is settled.");
     // ...and never the default one, whatever else it carries.
-    expect(metered.attributes["gen_ai.prompt"]).toBeUndefined();
-    expect(metered.attributes["gen_ai.completion"]).toBeUndefined();
+    expect(metered.attributes["aisix.content.prompt"]).toBeUndefined();
+    expect(metered.attributes["aisix.content.response"]).toBeUndefined();
   });
 
   test("a streamed answer survives the progress notes around it", async (ctx) => {
@@ -392,7 +398,7 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
     }
     expect(captured, "the full-content exporter received the stream").toBeDefined();
 
-    const completion = String(captured!.attributes["gen_ai.completion"]);
+    const completion = String(captured!.attributes["aisix.content.response"]);
     expect(completion).toContain(STREAM_ANSWER.join(""));
     expect(completion).toContain("Report generated.");
     expect(completion).not.toContain("halfway");

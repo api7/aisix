@@ -2118,9 +2118,17 @@ async fn attribute_batch_usage(
         // A background poll attributes usage after the fact — there is no
         // live request and therefore no trace bundle; the exporter falls
         // back to the legacy flat span (AISIX-Cloud#1279).
-        state
-            .otlp_fan_out
-            .fan_out(&event, None, None, exporters.iter().map(|e| &e.value));
+        let facts = std::sync::Arc::new(aisix_obs::SpanFacts {
+            upstream: crate::span_facts::upstream_facts(&snap, &event, pk_id),
+            ..Default::default()
+        });
+        state.otlp_fan_out.fan_out(
+            &event,
+            None,
+            None,
+            Some(&facts),
+            exporters.iter().map(|e| &e.value),
+        );
         tracing::info!(
             batch_id = %raw_batch_id,
             provider_model = %provider_model,

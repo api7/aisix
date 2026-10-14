@@ -14,6 +14,7 @@
 #![deny(rust_2018_idioms)]
 
 pub mod access_log;
+pub mod genai;
 pub mod heap_profile;
 mod log_writer;
 pub mod memory;
@@ -35,6 +36,9 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 pub use access_log::{
     AccessLog, AccessLogRecord, CacheAccessLog, McpAccessLog, SemanticAccessLog, SemanticFallback,
+};
+pub use genai::{
+    genai_provider_name, GenAiRequestParams, HttpServerFacts, SpanFacts, UpstreamFacts,
 };
 pub use metrics::{
     client_type_from_user_agent, A2aCallOutcome, A2aLabels, BudgetGauges, BudgetLabels,

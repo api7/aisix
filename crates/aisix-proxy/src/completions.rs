@@ -145,6 +145,11 @@ pub async fn completions(
         }
     };
     let request_id = client.request_id.clone();
+    crate::span_facts::note_request(
+        &client,
+        body.as_object()
+            .map(aisix_obs::GenAiRequestParams::from_openai_completions),
+    );
     let api_key_id = auth.entry.id.clone();
     let model_name = body
         .get("model")

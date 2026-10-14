@@ -201,9 +201,9 @@ impl DatadogSink {
     /// schema and inherits the exact `skip_serializing_if` emptiness rules the
     /// cp-api wire uses (empty strings / zero counters are omitted). Field
     /// names are remapped to the OTel GenAI semconv where one exists
-    /// (`gen_ai.system`, `gen_ai.request.model` / `gen_ai.response.model`,
+    /// (`gen_ai.response.model`, `gen_ai.response.id`,
     /// `gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens`, …) so a
-    /// Datadog log and an OTLP span carry the same keys; the remainder land
+    /// Datadog log and an OTLP span agree on them; the remainder land
     /// under an `aisix.` prefix. The Datadog reserved attributes (`ddsource`,
     /// `ddtags`, `service`, `message`) are set as siblings.
     fn to_log(&self, record: &SinkRecord) -> Value {
@@ -228,8 +228,15 @@ impl DatadogSink {
                 obj.insert(map_field_name(&key), rendered);
             }
         }
-        // The GenAI output count includes reasoning; the record's own
-        // `completion_tokens` may not (see `UsageEvent::genai_output_tokens`).
+        // The GenAI input count includes every cached token, which an
+        // Anthropic-shape record keeps beside `prompt_tokens`; the output
+        // count includes reasoning, which the record's own
+        // `completion_tokens` may not (see `UsageEvent::genai_input_tokens`
+        // / `genai_output_tokens`).
+        obj.insert(
+            "gen_ai.usage.input_tokens".into(),
+            json!(record.usage.genai_input_tokens()),
+        );
         obj.insert(
             "gen_ai.usage.output_tokens".into(),
             json!(record.usage.genai_output_tokens()),
@@ -485,6 +492,32 @@ mod tests {
         assert_eq!(openai["gen_ai.usage.output_tokens"], 25);
     }
 
+    /// The GenAI input count includes cached tokens in either accounting
+    /// shape; the raw cache counters keep their `aisix.` keys.
+    #[tokio::test]
+    async fn input_tokens_include_cache_in_either_accounting_shape() {
+        let server = MockServer::start().await;
+        let sink = sink_for(&server, &[]);
+        let log = |event: UsageEvent| sink.to_log(&SinkRecord::metadata_only(event));
+
+        let anthropic = log(UsageEvent {
+            prompt_tokens: 10,
+            cache_read_tokens: 300,
+            cache_creation_tokens: 40,
+            ..UsageEvent::default()
+        });
+        assert_eq!(anthropic["gen_ai.usage.input_tokens"], 350);
+        assert_eq!(anthropic["aisix.cache_read_tokens"], 300);
+        assert_eq!(anthropic["aisix.cache_creation_tokens"], 40);
+
+        let openai = log(UsageEvent {
+            prompt_tokens: 120,
+            cached_prompt_tokens: 100,
+            ..UsageEvent::default()
+        });
+        assert_eq!(openai["gen_ai.usage.input_tokens"], 120);
+    }
+
     #[tokio::test]
     async fn appends_batch_posts_gzipped_json_with_api_key_header() {
         let server = MockServer::start().await;
@@ -590,6 +623,7 @@ mod tests {
             prompt: "what is 2+2?".into(),
             response: "4".into(),
             truncated: true,
+            max_bytes: None,
         });
         sink.append_batch(&batch_of(vec![record]), &IdempotencyMarker::None)
             .await

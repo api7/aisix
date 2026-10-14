@@ -214,7 +214,17 @@ pub(crate) fn serves_natively(
     surface: ApiSurface,
 ) -> bool {
     let pk = resolve_provider_key(snapshot, model).ok();
-    let pk = pk.as_ref().map(|e| &e.value);
+    serves_natively_with(model, pk.as_ref().map(|e| &e.value), surface)
+}
+
+/// [`serves_natively`] over an already-resolved key, with no attribution
+/// side effect — for readers that run after dispatch, such as the span
+/// encoder's upstream lookup.
+pub(crate) fn serves_natively_with(
+    model: &Model,
+    pk: Option<&ProviderKey>,
+    surface: ApiSurface,
+) -> bool {
     // A platform adapter reaches every surface translated — its own
     // routes are Bedrock's `/model/{id}/converse`, Vertex's
     // `:generateContent` and Azure's deployment-scoped paths, none of
@@ -355,6 +365,32 @@ pub(crate) fn resolve_base_url(provider_key: &ProviderKey) -> Result<String, Pro
                 provider_key.display_name
             )))
         }
+    }
+}
+
+/// The base URL a request on `surface` (or on the key's default route, for
+/// `None`) is sent to, resolved like [`resolve_base_url_for`] /
+/// [`resolve_base_url`] — including the built-in OpenAI and Anthropic
+/// defaults — but without logging: a key that has no base is a
+/// configuration error the dispatch path already reported. `None` there.
+pub(crate) fn configured_base_url(
+    provider_key: &ProviderKey,
+    surface: Option<ApiSurface>,
+) -> Option<String> {
+    if let Some(base) = surface.and_then(|s| surface_base(provider_key, s)) {
+        return Some(strip_endpoint_suffix(base.trim()).to_string());
+    }
+    match provider_key.api_base.as_deref() {
+        Some(b) if !b.trim().is_empty() => Some(strip_endpoint_suffix(b.trim()).to_string()),
+        _ if surface != Some(ApiSurface::Messages)
+            && falls_back_to_openai_default(provider_key) =>
+        {
+            Some(aisix_provider_openai::OPENAI_DEFAULT_BASE.to_string())
+        }
+        _ if falls_back_to_anthropic_default(provider_key) => {
+            Some(aisix_provider_anthropic::ANTHROPIC_DEFAULT_BASE.to_string())
+        }
+        _ => None,
     }
 }
 

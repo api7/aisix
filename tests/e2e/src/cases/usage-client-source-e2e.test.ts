@@ -18,8 +18,8 @@ import {
 // Usage telemetry has no cp-api receiver in DP e2e, so we observe the
 // emitted field VALUES through the per-env OTLP/HTTP fan-out: register a
 // mock OTLP receiver as an `observability_exporter`, drive one chat
-// request, and assert the recorded span carries the two new custom
-// attributes `aisix.client_source_ip` / `aisix.client_user_agent`.
+// request, and assert the request's SERVER span carries them under the
+// OpenTelemetry names `client.address` / `user_agent.original`.
 //
 // IP resolution mirrors nginx set_real_ip_from + real_ip_recursive:
 //   - peer 127.0.0.1 is a trusted proxy (the e2e client is loopback),
@@ -189,12 +189,12 @@ describe("usage client source e2e (#492): source IP + User-Agent on usage events
 
       const span = await waitForSpan(otlp, (a) => {
         return (
-          a["aisix.client_user_agent"] === PROBE_UA &&
-          a["aisix.client_source_ip"] === "203.0.113.7"
+          a["user_agent.original"] === PROBE_UA &&
+          a["client.address"] === "203.0.113.7"
         );
       });
-      expect(span["aisix.client_source_ip"]).toBe("203.0.113.7");
-      expect(span["aisix.client_user_agent"]).toBe(PROBE_UA);
+      expect(span["client.address"]).toBe("203.0.113.7");
+      expect(span["user_agent.original"]).toBe(PROBE_UA);
     },
     60_000,
   );
@@ -237,11 +237,11 @@ describe("usage client source e2e (#492): source IP + User-Agent on usage events
 
       const span = await waitForSpan(
         otlp,
-        (a) => a["aisix.client_user_agent"] === marker,
+        (a) => a["user_agent.original"] === marker,
       );
       // Peer is loopback; XFF must be ignored because 127.0.0.1 is not
       // a configured trusted proxy.
-      expect(span["aisix.client_source_ip"]).toBe("127.0.0.1");
+      expect(span["client.address"]).toBe("127.0.0.1");
     },
     60_000,
   );

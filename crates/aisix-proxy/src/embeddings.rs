@@ -146,6 +146,14 @@ pub async fn embeddings(
         }
     };
     let model_name = body.model.clone();
+    crate::span_facts::note_request(
+        &client,
+        Some(aisix_obs::GenAiRequestParams {
+            encoding_formats: body.encoding_format.iter().cloned().collect(),
+            embedding_dimensions: body.dimensions.map(i64::from),
+            ..Default::default()
+        }),
+    );
     // One snapshot for the whole request (#941): dispatch, the terminal
     // metric emit and the usage event all read this handle instead of
     // loading their own. The request's view of config is therefore frozen

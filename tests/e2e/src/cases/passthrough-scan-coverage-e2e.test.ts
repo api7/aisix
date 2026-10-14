@@ -1268,7 +1268,7 @@ describe("passthrough guardrail scan coverage", () => {
         const span = otlp.spans.find(
           (candidate) =>
             candidate.attributes["aisix.passthrough.route_name"] === `pt-scan-${route}` &&
-            candidate.attributes["gen_ai.completion"] === expectedCompletion,
+            candidate.attributes["aisix.content.response"] === expectedCompletion,
         );
         if (span) return span;
         await new Promise((resolve) => setTimeout(resolve, 50));

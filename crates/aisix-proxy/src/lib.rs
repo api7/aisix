@@ -83,6 +83,7 @@ mod responses_bridge;
 mod rewrite;
 mod routing;
 mod semantic;
+mod span_facts;
 pub mod sse_keepalive;
 mod state;
 mod stream_timeout;
@@ -106,6 +107,7 @@ pub use health::{
 };
 pub use held_content::holdback_bytes;
 pub use request_body_account::in_flight_request_bodies;
+pub use request_id::DownstreamScheme;
 pub use state::{CacheBackends, ProxyState, SemanticRedisCell};
 
 use aisix_obs::{AccessLog, CancelledLabels};

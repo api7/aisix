@@ -16,8 +16,11 @@
 //!    enqueues one OTLP span record into it. The pipeline batches, retries
 //!    transient failures with backoff, and drops-with-metric under
 //!    backpressure — all off the request hot path. Spans are encoded per
-//!    OpenTelemetry's GenAI semantic conventions
-//!    (<https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md>).
+//!    OpenTelemetry's GenAI semantic conventions as released in
+//!    semantic-conventions v1.41.1
+//!    (<https://github.com/open-telemetry/semantic-conventions/blob/v1.41.1/docs/gen-ai/gen-ai-spans.md>),
+//!    the SERVER span per the HTTP server span conventions of the same
+//!    release.
 //!
 //! ## Per-exporter knobs (#519 B.2)
 //!
@@ -28,10 +31,12 @@
 //!   attempt span of one request shares the `request_id`, a trace is
 //!   exported whole or not at all — consistently across retries/fallbacks.
 //! - **`content_mode` / `content_max_bytes`** — same opt-in content capture
-//!   the SLS / Datadog sinks use ([`content_record`]); under `full` the span
-//!   carries `gen_ai.prompt` / `gen_ai.completion` (plus
-//!   `aisix.content_truncated` when cut) — the same keys the Datadog sink
-//!   ships the captured content under. Defaults to `metadata_only`, where
+//!   the SLS / Datadog sinks use ([`content_record`]); under `full` a
+//!   complete message exchange is carried as the conventions' structured
+//!   `gen_ai.input.messages` / `gen_ai.output.messages` /
+//!   `gen_ai.system_instructions` / `gen_ai.tool.definitions`, and anything
+//!   else as `aisix.content.prompt` / `aisix.content.response` (plus
+//!   `aisix.content_truncated` when cut). Defaults to `metadata_only`, where
 //!   the record never carries content fields, so it cannot leak.
 //!
 //! ## What's intentionally NOT here yet
@@ -67,6 +72,14 @@ use crate::usage::{GatewayEmbeddingCall, UsageEvent};
 /// tasks for a wedged user receiver.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `service.name` until the gateway's configured
+/// `observability.service_name` is handed over — the same default that key
+/// has.
+const DEFAULT_SERVICE_NAME: &str = "aisix";
+
+/// The gateway's status for a caller that closed the request (nginx's 499).
+const CLIENT_CLOSED_REQUEST: u16 = 499;
+
 /// Fans usage events out to every configured observability exporter — any
 /// [`ExporterKind`], dispatched per kind to the matching
 /// [`crate::sink::ObservabilitySink`] — each via its own
@@ -96,6 +109,9 @@ struct FanOutInner {
     /// so a request carrying an older snapshot cannot restart one the reaper
     /// has stopped.
     published: std::sync::OnceLock<SnapshotHandle<AisixSnapshot>>,
+    /// The resource `service.name` every OTLP export carries, once
+    /// [`OtlpHttpFanOut::set_service_name`] hands it over.
+    service_name: std::sync::OnceLock<String>,
 }
 
 /// Delivery tuning for otlp exporter pipelines. A short flush keeps a
@@ -140,8 +156,16 @@ impl OtlpHttpFanOut {
                 },
                 client,
                 published: std::sync::OnceLock::new(),
+                service_name: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// Name the service OTLP exports report as `service.name` — the
+    /// gateway's `observability.service_name`. Called once at boot, before
+    /// any exporter pipeline starts; a later call is ignored.
+    pub fn set_service_name(&self, name: &str) {
+        let _ = self.inner.service_name.set(name.to_string());
     }
 
     /// Whether a pipeline may start for exporter `name`: the published
@@ -177,11 +201,16 @@ impl OtlpHttpFanOut {
     /// makes span ids byte-identical across delivery retries and across
     /// exporters. `None` (a caller predating the bundle, or a synthetic
     /// event) falls back to the legacy single-span encoding.
+    ///
+    /// `facts` are the event's export-only span facts — request parameters,
+    /// the dispatched upstream, the inbound HTTP request — which never join
+    /// the usage-event wire.
     pub fn fan_out<'a, I>(
         &self,
         event: &UsageEvent,
         content: Option<&CapturedContent>,
         trace: Option<&crate::trace::TraceEmission>,
+        facts: Option<&Arc<crate::genai::SpanFacts>>,
         exporters: I,
     ) where
         I: IntoIterator<Item = &'a ObservabilityExporter>,
@@ -216,13 +245,21 @@ impl OtlpHttpFanOut {
                     let name = exp.name.clone();
                     let endpoint = cfg.endpoint.clone();
                     let headers = cfg.headers.clone();
+                    let service_name = self
+                        .inner
+                        .service_name
+                        .get()
+                        .cloned()
+                        .unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_string());
                     self.inner.exporters.get_or_create_if(
                         &exp.name,
                         fingerprint,
                         || self.admits(&exp.name),
                         move || {
-                            Arc::new(OtlpSink::new(name, endpoint, headers, client))
-                                as Arc<dyn ObservabilitySink>
+                            Arc::new(
+                                OtlpSink::new(name, endpoint, headers, client)
+                                    .with_service_name(service_name),
+                            ) as Arc<dyn ObservabilitySink>
                         },
                     )
                 }
@@ -308,11 +345,16 @@ impl OtlpHttpFanOut {
             // A content-bearing record for an SLS exporter that opted into
             // full capture (and only when the handler captured content); the
             // shared metadata-only record for everyone else.
-            let record = content_record(&exp.kind, event, content, trace).unwrap_or_else(|| {
-                Arc::clone(metadata_record.get_or_insert_with(|| {
-                    Arc::new(SinkRecord::metadata_only(event.clone()).with_trace(trace.cloned()))
-                }))
-            });
+            let record =
+                content_record(&exp.kind, event, content, trace, facts).unwrap_or_else(|| {
+                    Arc::clone(metadata_record.get_or_insert_with(|| {
+                        Arc::new(
+                            SinkRecord::metadata_only(event.clone())
+                                .with_trace(trace.cloned())
+                                .with_facts(facts.cloned()),
+                        )
+                    }))
+                });
             handle.try_enqueue(record);
         }
     }
@@ -502,6 +544,7 @@ fn content_record(
     event: &UsageEvent,
     content: Option<&CapturedContent>,
     trace: Option<&crate::trace::TraceEmission>,
+    facts: Option<&Arc<crate::genai::SpanFacts>>,
 ) -> Option<Arc<SinkRecord>> {
     // The exporters that opt into full content capture share the
     // `SlsContentMode` model; pull each one's (mode, cap). Any other kind
@@ -521,7 +564,8 @@ fn content_record(
     Some(Arc::new(
         SinkRecord::metadata_only(event.clone())
             .with_content(sc)
-            .with_trace(trace.cloned()),
+            .with_trace(trace.cloned())
+            .with_facts(facts.cloned()),
     ))
 }
 
@@ -600,6 +644,7 @@ pub struct OtlpSink {
     endpoint: String,
     headers: BTreeMap<String, String>,
     client: reqwest::Client,
+    service_name: String,
 }
 
 impl OtlpSink {
@@ -616,7 +661,14 @@ impl OtlpSink {
             endpoint: endpoint.into(),
             headers,
             client,
+            service_name: DEFAULT_SERVICE_NAME.to_string(),
         }
+    }
+
+    /// The resource `service.name` this sink's exports report.
+    pub fn with_service_name(mut self, service_name: String) -> Self {
+        self.service_name = service_name;
+        self
     }
 }
 
@@ -650,7 +702,7 @@ impl ObservabilitySink for OtlpSink {
             .iter()
             .flat_map(|record| build_otlp_spans(record, &self.name))
             .collect();
-        let body = otlp_export_request(spans);
+        let body = otlp_export_request(spans, &self.service_name);
         let bytes = serde_json::to_vec(&body)
             .map_err(|e| SinkError::Permanent(format!("otlp encode: {e}")))?;
 
@@ -719,23 +771,14 @@ impl ObservabilitySink for OtlpSink {
     }
 }
 
-/// Build the single OTLP span object for one sink record. Attribute names
-/// match the OpenTelemetry GenAI semantic conventions:
-/// <https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md>.
+/// Encode a record without a trace snapshot as one CLIENT span: a caller that
+/// predates the request trace bundle, or a usage row with no live request
+/// behind it (the background batch-completion accounting).
 ///
-/// Per-attribute encoding:
-/// - String / int values use the canonical `{"stringValue": ...}` /
-///   `{"intValue": "..."}` (string-encoded int per OTLP/JSON spec).
-/// - Trace ID + span ID are random 16-byte / 8-byte hex values.
-/// - Timestamps are nanos-since-epoch, OTLP's required unit.
-///
-/// When the record carries captured content (this exporter's
-/// `content_mode = full`, see [`content_record`]) the span additionally
-/// carries `gen_ai.prompt` / `gen_ai.completion` — the same prompt /
-/// assembled response the Datadog sink ships under those keys — plus
-/// `aisix.content_truncated` when either field was cut to the exporter's
-/// `content_max_bytes`. Metadata-only records never carry content, so the
-/// default span shape is unchanged.
+/// Attribute names follow the OpenTelemetry GenAI semantic conventions
+/// (semantic-conventions v1.41.1, `docs/gen-ai/gen-ai-spans.md`). Being the
+/// only span, it also carries the inbound-request attributes a SERVER span
+/// would otherwise hold.
 fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
     let event = &record.usage;
     let trace_id = random_trace_id();
@@ -749,34 +792,57 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
     // The span represents this ATTEMPT, so its duration is the
     // attempt-scoped upstream latency (the request-scoped
     // `downstream_latency_ms` rides along as an attribute instead).
-    // Latency landed in milliseconds; widen + multiply.
     let latency_nanos = (event.upstream_latency_ms as u128).saturating_mul(1_000_000);
     let start_unix_nano = end_unix_nano.saturating_sub(latency_nanos);
 
-    json!({
+    let mut attributes = event_attributes(record, exporter_name);
+    merge_attributes(&mut attributes, inbound_request_attributes(event));
+    let error = client_error_type(event);
+    if let Some(error_type) = &error {
+        attributes.push(attr_string("error.type", error_type));
+    }
+    let mut span = json!({
         "traceId": trace_id,
         "spanId":  span_id,
-        "name":    span_name(event),
-        // SPAN_KIND_CLIENT for all three: the gateway is the client of a
-        // remote LLM, agent or MCP server. The conventions name INTERNAL for
-        // a tool executed in-process, which is not what this span describes.
+        "name":    operation_span_name(record),
+        // SPAN_KIND_CLIENT: the gateway is the client of a remote model,
+        // agent or MCP server.
         "kind":    3,
         "startTimeUnixNano": start_unix_nano.to_string(),
         "endTimeUnixNano":   end_unix_nano.to_string(),
-        "attributes": event_attributes(record, exporter_name),
-        "status": { "code": span_status(event.status_code) },
-    })
+        "attributes": attributes,
+    });
+    if error.is_some() {
+        span["status"] = json!({ "code": STATUS_ERROR });
+    }
+    span
 }
+
+/// OTLP `Status.code` for a failed operation. A successful one leaves the
+/// status unset, which the recording-errors convention requires.
+const STATUS_ERROR: i64 = 2;
 
 /// Encode one sink record into its OTLP span set.
 ///
 /// A record carrying a [`crate::trace::TraceEmission`] (AISIX-Cloud#1279)
-/// yields the request's span hierarchy — SERVER → logical GenAI CLIENT →
-/// attempt CLIENT — with ids and nanosecond boundaries frozen at emission
-/// time, so a delivery retry re-encodes byte-identical spans and every
-/// exporter agrees on the trace. A record without one (a caller predating
-/// the bundle, or a synthetic event) falls back to the legacy single-span
-/// shape of [`build_otlp_span`].
+/// yields the request's span hierarchy — SERVER → logical CLIENT → attempt
+/// CLIENT — with ids and nanosecond boundaries frozen at emission time, so
+/// a delivery retry re-encodes byte-identical spans and every exporter
+/// agrees on the trace. A record without one falls back to the single span
+/// of [`build_otlp_span`].
+///
+/// Which span says what:
+///
+/// - The **carrier** (the attempt span when present, else the logical span,
+///   else SERVER) is the GenAI operation span: it alone carries the
+///   `gen_ai.*` attributes, the usage and the captured content, so a backend
+///   that turns GenAI spans into model calls counts each attempt once.
+/// - The **SERVER** span follows the HTTP server conventions: its name is
+///   `{method} {route}`, it carries the inbound request's attributes, and a
+///   4xx leaves its status unset.
+/// - A **logical** span that is not the carrier groups the attempts and
+///   carries only the joining `aisix.*` keys — no `gen_ai.*`, which would
+///   make it read as a second model call.
 fn build_otlp_spans(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
     use crate::trace::SpanRole;
 
@@ -785,39 +851,60 @@ fn build_otlp_spans(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
     };
     let event = &record.usage;
     let trace_id = trace.trace_id.to_hex();
-    let status = span_status(event.status_code);
     let carrier = trace.carrier_role();
+    let operation_name = operation_span_name(record);
     trace
         .spans
         .iter()
         .map(|span| {
-            // The carrier span — the attempt when present, else the
-            // logical CLIENT, else SERVER — gets the event's full
-            // attribute set (and captured content); the structural spans
-            // above it carry only what a consumer needs to join them.
-            let attributes = if Some(span.role) == carrier {
-                event_attributes(record, exporter_name)
-            } else {
-                structural_attributes(event, exporter_name)
+            let is_carrier = Some(span.role) == carrier;
+            let (name, kind, mut attributes, error) = match span.role {
+                SpanRole::Server => {
+                    let mut attributes = server_attributes(record, exporter_name);
+                    if is_carrier {
+                        // A cache hit, a refusal or a pre-dispatch error:
+                        // the request's only span, so it carries the event.
+                        let mut merged = event_attributes(record, exporter_name);
+                        merge_attributes(&mut merged, attributes);
+                        attributes = merged;
+                    }
+                    (
+                        server_span_name(record),
+                        2,
+                        attributes,
+                        server_error_type(event),
+                    )
+                }
+                SpanRole::Logical | SpanRole::Attempt => {
+                    let attributes = if is_carrier {
+                        event_attributes(record, exporter_name)
+                    } else {
+                        joining_attributes(event, exporter_name)
+                    };
+                    (
+                        operation_name.clone(),
+                        3,
+                        attributes,
+                        client_error_type(event),
+                    )
+                }
             };
-            // OTLP SpanKind: SERVER (2) for the inbound request; CLIENT
-            // (3) for the logical GenAI operation and each upstream
-            // attempt.
-            let kind = match span.role {
-                SpanRole::Server => 2,
-                SpanRole::Logical | SpanRole::Attempt => 3,
-            };
+            if let Some(error_type) = &error {
+                attributes.push(attr_string("error.type", error_type));
+            }
             let mut json = json!({
                 "traceId": trace_id,
                 "spanId": span.span_id.to_hex(),
-                "name": span_name(event),
+                "name": name,
                 "kind": kind,
                 "startTimeUnixNano": span.start_unix_nano.to_string(),
                 "endTimeUnixNano": span.end_unix_nano.to_string(),
                 "attributes": attributes,
-                "status": { "code": status },
                 "flags": span_flags(span, trace),
             });
+            if error.is_some() {
+                json["status"] = json!({ "code": STATUS_ERROR });
+            }
             if let Some(parent) = span.parent_span_id {
                 json["parentSpanId"] = Value::String(parent.to_hex());
             }
@@ -857,59 +944,232 @@ fn span_flags(span: &crate::trace::SpanEmit, trace: &crate::trace::TraceEmission
     flags
 }
 
-/// The joining attributes a structural (non-carrier) span carries: enough
-/// to group a trace's spans by request and operation without duplicating
-/// the event's full attribute set onto every level of the hierarchy.
-fn structural_attributes(event: &UsageEvent, exporter_name: &str) -> Vec<Value> {
+/// `error.type` of a CLIENT span, or `None` when the operation did not
+/// fail. Any status outside 1xx–3xx is a failure, except 499: a caller
+/// that hung up cancelled the call on purpose, which the conventions say
+/// not to record as an error.
+fn client_error_type(event: &UsageEvent) -> Option<String> {
+    let status = event.status_code;
+    if status < 400 || status == CLIENT_CLOSED_REQUEST {
+        return None;
+    }
+    Some(error_type_value(event))
+}
+
+/// `error.type` of the SERVER span: only a 5xx is the server's own failure;
+/// a 4xx leaves a SERVER span's status unset (HTTP span status rules).
+fn server_error_type(event: &UsageEvent) -> Option<String> {
+    (event.status_code >= 500).then(|| error_type_value(event))
+}
+
+/// The gateway's own bounded error class when it named one, else the
+/// status code as a string — both values the conventions allow.
+fn error_type_value(event: &UsageEvent) -> String {
+    if event.error_class.is_empty() {
+        event.status_code.to_string()
+    } else {
+        event.error_class.clone()
+    }
+}
+
+/// `gen_ai.operation.name` for this event: the conventions' value where one
+/// applies, else the gateway's own operation, verbatim. `None` only for an
+/// event that carries no operation at all.
+fn genai_operation_name(event: &UsageEvent) -> Option<&str> {
+    if is_a2a(event) {
+        return Some("invoke_agent");
+    }
+    if is_mcp(event) {
+        return Some("execute_tool");
+    }
+    match event.operation.as_str() {
+        "chat" | "messages" | "responses" => Some("chat"),
+        "completions" => Some("text_completion"),
+        "embeddings" => Some("embeddings"),
+        "" => None,
+        other => Some(other),
+    }
+}
+
+fn is_mcp(event: &UsageEvent) -> bool {
+    event.operation == "mcp" || event.inbound_protocol == "mcp"
+}
+
+fn is_a2a(event: &UsageEvent) -> bool {
+    event.operation == "a2a" || event.inbound_protocol == "a2a"
+}
+
+/// The JSON-RPC method of every MCP call the gateway records: usage is
+/// emitted for tool calls only.
+const MCP_TOOL_CALL_METHOD: &str = "tools/call";
+
+/// Longest target this will append to a span name.
+///
+/// An A2A agent name is a registered resource, but an MCP tool name is the
+/// caller's own `tools/call` `params.name` and is recorded before the tool is
+/// known to exist — including on the quota-rejection path, which emits without
+/// ever contacting an upstream. A trace backend indexes span names and most
+/// derive RED metrics from them, so the one field a caller picks freely is
+/// bounded before it gets there.
+const MAX_SPAN_NAME_TARGET: usize = 64;
+
+/// The name of the GenAI operation span (and of a logical span grouping its
+/// attempts): `{operation} {target}`, where the target is the model the
+/// request was made to, the agent invoked, or the passthrough route, and
+/// MCP's own `{mcp.method.name} {gen_ai.tool.name}`. A target that is absent
+/// or outside [`MAX_SPAN_NAME_TARGET`] leaves the bare operation, which the
+/// conventions name as the fallback.
+fn operation_span_name(record: &SinkRecord) -> String {
+    let event = &record.usage;
+    let (operation, target) = if is_mcp(event) {
+        (MCP_TOOL_CALL_METHOD, event.mcp_tool_name.as_str())
+    } else if is_a2a(event) {
+        ("invoke_agent", event.a2a_agent_name.as_str())
+    } else {
+        let operation = genai_operation_name(event).unwrap_or("unknown");
+        let target = if event.inbound_protocol == "passthrough" {
+            event.passthrough_route_name.as_str()
+        } else {
+            upstream(record).map_or("", |u| u.request_model.as_str())
+        };
+        (operation, target)
+    };
+    if target.is_empty() || target.len() > MAX_SPAN_NAME_TARGET {
+        operation.to_string()
+    } else {
+        format!("{operation} {target}")
+    }
+}
+
+fn server_span_name(record: &SinkRecord) -> String {
+    match record.facts.as_ref().and_then(|f| f.http.as_ref()) {
+        Some(http) => http.span_name(),
+        None => "HTTP".to_string(),
+    }
+}
+
+fn upstream(record: &SinkRecord) -> Option<&crate::genai::UpstreamFacts> {
+    record.facts.as_ref().and_then(|f| f.upstream.as_ref())
+}
+
+/// Append `extra`, skipping any key `attributes` already carries.
+fn merge_attributes(attributes: &mut Vec<Value>, extra: Vec<Value>) {
+    for attr in extra {
+        let key = attr["key"].as_str().unwrap_or_default();
+        if !attributes.iter().any(|a| a["key"] == key) {
+            attributes.push(attr);
+        }
+    }
+}
+
+/// The keys every span of a request shares, so a backend can group them.
+fn joining_attributes(event: &UsageEvent, exporter_name: &str) -> Vec<Value> {
     let mut attributes = vec![
-        attr_string("gen_ai.system", "aisix"),
-        attr_string("gen_ai.operation.name", operation_name(event)),
         attr_string("aisix.exporter_name", exporter_name),
         attr_string("aisix.request_id", &event.request_id),
-        attr_int("http.response.status_code", event.status_code as i64),
     ];
     if !event.operation.is_empty() {
         attributes.push(attr_string("aisix.operation", &event.operation));
-    }
-    if !event.requested_model.is_empty() {
-        attributes.push(attr_string("gen_ai.request.model", &event.requested_model));
     }
     attributes
 }
 
-/// Status: OK (1) for 2xx, ERROR (2) otherwise.
-fn span_status(status: u16) -> i64 {
-    if (200..300).contains(&status) {
-        1
-    } else {
-        2
+/// What the caller's HTTP request looked like, under the HTTP and client
+/// conventions' names: the resolved caller address, its `User-Agent`, and
+/// the operator-selected request headers.
+fn inbound_request_attributes(event: &UsageEvent) -> Vec<Value> {
+    let mut attributes = Vec::new();
+    if !event.client_source_ip.is_empty() {
+        attributes.push(attr_string("client.address", &event.client_source_ip));
     }
+    if !event.client_user_agent.is_empty() {
+        attributes.push(attr_string("user_agent.original", &event.client_user_agent));
+    }
+    // `http.request.header.<lowercase name>` is a string array; one element
+    // here, because repeated occurrences were already joined into one value.
+    for (name, value) in &event.request_headers {
+        attributes.push(attr_string_array(
+            &format!("http.request.header.{name}"),
+            std::slice::from_ref(value),
+        ));
+    }
+    attributes
 }
 
-/// The event's full attribute set — every wire field the OTLP allowlist
-/// exports, plus captured content when the record carries it. Attached to
-/// the legacy single span and to the hierarchy's carrier span.
+/// The SERVER span's attributes: the HTTP server convention's request
+/// shape, the response status, the inbound-request attributes, and the
+/// joining keys.
+fn server_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
+    let event = &record.usage;
+    let mut attributes = Vec::new();
+    if let Some(http) = record.facts.as_ref().and_then(|f| f.http.as_ref()) {
+        attributes.push(attr_string("http.request.method", http.method));
+        if let Some(original) = &http.method_original {
+            attributes.push(attr_string("http.request.method_original", original));
+        }
+        attributes.push(attr_string("url.path", &http.path));
+        if let Some(scheme) = http.scheme {
+            attributes.push(attr_string("url.scheme", scheme));
+        }
+        if let Some(route) = http.route {
+            attributes.push(attr_string("http.route", route));
+        }
+    }
+    attributes.push(attr_int(
+        "http.response.status_code",
+        event.status_code as i64,
+    ));
+    attributes.extend(inbound_request_attributes(event));
+    attributes.extend(joining_attributes(event, exporter_name));
+    attributes
+}
+
+/// The GenAI operation span's attributes: the event's full attribute set,
+/// plus captured content when the record carries it.
 fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
     let event = &record.usage;
-    let mut attributes = vec![
-        attr_string("gen_ai.system", "aisix"),
-        attr_string("gen_ai.operation.name", operation_name(event)),
-    ];
-    // The gateway's own, finer reading of the same thing. The semconv value
-    // above is constrained to OpenTelemetry's vocabulary, so every
-    // OpenAI-shaped route lands on `chat` there — which cannot separate a
-    // conversation from an image or a video (AISIX-Cloud#1461). Carried on
-    // the structural spans too, so a trace can be filtered by kind at its
-    // root rather than only on the attempt span. Absent, like every other
-    // optional attribute here, when the event carries no value.
+    let facts = record.facts.as_deref();
+    let upstream = facts.and_then(|f| f.upstream.as_ref());
+    let mcp = is_mcp(event);
+    let a2a = is_a2a(event);
+    let operation = genai_operation_name(event);
+
+    let mut attributes = Vec::new();
+    if let Some(operation) = operation {
+        attributes.push(attr_string("gen_ai.operation.name", operation));
+    }
+    // The gateway's own, finer reading of the same thing. The convention's
+    // value collapses chat, messages and responses onto `chat`, which
+    // cannot separate them (AISIX-Cloud#1461).
     if !event.operation.is_empty() {
         attributes.push(attr_string("aisix.operation", &event.operation));
     }
-    // The model alias the client sent (`model` field) — a Model-Group
-    // name for routed requests (AISIX-Cloud#790). Semconv key for the
-    // requested (vs response) model.
+    if mcp {
+        attributes.push(attr_string("mcp.method.name", MCP_TOOL_CALL_METHOD));
+    }
+    if let Some(upstream) = upstream {
+        if !upstream.provider_name.is_empty() {
+            attributes.push(attr_string("gen_ai.provider.name", &upstream.provider_name));
+        }
+        // The model name sent to the upstream — not the alias the caller
+        // addressed, which is `aisix.requested_model`.
+        if !upstream.request_model.is_empty() {
+            attributes.push(attr_string("gen_ai.request.model", &upstream.request_model));
+        }
+        if !upstream.server_address.is_empty() {
+            attributes.push(attr_string("server.address", &upstream.server_address));
+            if let Some(port) = upstream.server_port {
+                attributes.push(attr_int("server.port", i64::from(port)));
+            }
+        }
+    }
+    // The model alias the client sent (`model` field) — a Model-Group name
+    // for routed requests (AISIX-Cloud#790).
     if !event.requested_model.is_empty() {
-        attributes.push(attr_string("gen_ai.request.model", &event.requested_model));
+        attributes.push(attr_string("aisix.requested_model", &event.requested_model));
+    }
+    if let Some(params) = facts.and_then(|f| f.request.as_deref()) {
+        push_request_params(&mut attributes, params, upstream);
     }
     if !event.provider_model_version.is_empty() {
         attributes.push(attr_string(
@@ -929,14 +1189,17 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
             std::slice::from_ref(&event.finish_reason),
         ));
     }
-    attributes.push(attr_int(
-        "gen_ai.usage.input_tokens",
-        event.prompt_tokens as i64,
-    ));
-    attributes.push(attr_int(
-        "gen_ai.usage.output_tokens",
-        event.genai_output_tokens() as i64,
-    ));
+    // Measured from this attempt's dispatch to the upstream's first
+    // streamed frame — the convention's definition, in seconds.
+    if event.upstream_ttft_ms > 0 {
+        attributes.push(attr_double(
+            "gen_ai.response.time_to_first_chunk",
+            f64::from(event.upstream_ttft_ms) / 1000.0,
+        ));
+    }
+    if !mcp {
+        push_usage(&mut attributes, event, operation);
+    }
     attributes.push(attr_int(
         "http.response.status_code",
         event.status_code as i64,
@@ -1017,31 +1280,6 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
             i64::from(gateway_calls_dropped),
         ));
     }
-    // Downstream client attribution (#492). Custom attrs so exporters
-    // can slice by source IP / client type; the OTLP encoder is an
-    // explicit allowlist, so new UsageEvent fields must be added here.
-    if !event.client_source_ip.is_empty() {
-        attributes.push(attr_string(
-            "aisix.client_source_ip",
-            &event.client_source_ip,
-        ));
-    }
-    if !event.client_user_agent.is_empty() {
-        attributes.push(attr_string(
-            "aisix.client_user_agent",
-            &event.client_user_agent,
-        ));
-    }
-    // Operator-selected request headers, under the OpenTelemetry HTTP
-    // semantic-convention name `http.request.header.<lowercase name>`,
-    // which that convention types as a string array — one element here,
-    // because repeated occurrences were already joined into one value.
-    for (name, value) in &event.request_headers {
-        attributes.push(attr_string_array(
-            &format!("http.request.header.{name}"),
-            std::slice::from_ref(value),
-        ));
-    }
     // End-user identity a passthrough route's `identity_header` extracted —
     // the per-employee attribution of the forward-proxy scenario. Not gated
     // on the protocol so a future handler that learns to populate it exports
@@ -1072,130 +1310,226 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
     // tool call in a trace backend indistinguishable from an LLM request —
     // with the agent, the method and the task it touched recorded nowhere at
     // all (AISIX-Cloud#1215).
-    match event.inbound_protocol.as_str() {
-        "a2a" => {
-            if !event.a2a_agent_name.is_empty() {
-                attributes.push(attr_string("gen_ai.agent.name", &event.a2a_agent_name));
-            }
-            // An A2A context ties a multi-turn exchange's tasks together —
-            // exactly what semconv means by a conversation id.
-            if !event.a2a_context_id.is_empty() {
-                attributes.push(attr_string_capped(
-                    "gen_ai.conversation.id",
-                    &event.a2a_context_id,
-                ));
-            }
-            for (key, value) in [
-                ("aisix.a2a.method", &event.a2a_method),
-                ("aisix.a2a.operation", &event.a2a_operation),
-                ("aisix.a2a.protocol_version", &event.a2a_protocol_version),
-                ("aisix.a2a.task_id", &event.a2a_task_id),
-                ("aisix.a2a.task_state", &event.a2a_task_state),
-            ] {
-                if !value.is_empty() {
-                    attributes.push(attr_string_capped(key, value));
-                }
-            }
-            if event.a2a_stream_event_count > 0 {
-                attributes.push(attr_int(
-                    "aisix.a2a.stream_event_count",
-                    i64::from(event.a2a_stream_event_count),
-                ));
+    if a2a {
+        if !event.a2a_agent_name.is_empty() {
+            attributes.push(attr_string("gen_ai.agent.name", &event.a2a_agent_name));
+        }
+        // An A2A context ties a multi-turn exchange's tasks together —
+        // exactly what semconv means by a conversation id.
+        if !event.a2a_context_id.is_empty() {
+            attributes.push(attr_string_capped(
+                "gen_ai.conversation.id",
+                &event.a2a_context_id,
+            ));
+        }
+        for (key, value) in [
+            ("aisix.a2a.method", &event.a2a_method),
+            ("aisix.a2a.operation", &event.a2a_operation),
+            ("aisix.a2a.protocol_version", &event.a2a_protocol_version),
+            ("aisix.a2a.task_id", &event.a2a_task_id),
+            ("aisix.a2a.task_state", &event.a2a_task_state),
+        ] {
+            if !value.is_empty() {
+                attributes.push(attr_string_capped(key, value));
             }
         }
-        "mcp" => {
-            if !event.mcp_tool_name.is_empty() {
-                attributes.push(attr_string_capped("gen_ai.tool.name", &event.mcp_tool_name));
-            }
-            if !event.mcp_server_name.is_empty() {
-                attributes.push(attr_string("aisix.mcp.server_name", &event.mcp_server_name));
-            }
+        if event.a2a_stream_event_count > 0 {
+            attributes.push(attr_int(
+                "aisix.a2a.stream_event_count",
+                i64::from(event.a2a_stream_event_count),
+            ));
         }
-        "passthrough" => {
-            if !event.passthrough_route_name.is_empty() {
-                attributes.push(attr_string(
-                    "aisix.passthrough.route_name",
-                    &event.passthrough_route_name,
-                ));
-            }
+    } else if mcp {
+        if !event.mcp_tool_name.is_empty() {
+            attributes.push(attr_string_capped("gen_ai.tool.name", &event.mcp_tool_name));
         }
-        _ => {}
+        if !event.mcp_server_name.is_empty() {
+            attributes.push(attr_string("aisix.mcp.server_name", &event.mcp_server_name));
+        }
+    } else if event.inbound_protocol == "passthrough" && !event.passthrough_route_name.is_empty() {
+        attributes.push(attr_string(
+            "aisix.passthrough.route_name",
+            &event.passthrough_route_name,
+        ));
     }
-    // Opt-in captured content (#519 B.2) — present ONLY on a record built by
-    // [`content_record`] for a `content_mode = full` exporter. Keys match the
-    // Datadog sink's flattened content fields, so one query vocabulary works
-    // across both backends.
     if let Some(content) = &record.content {
-        attributes.push(attr_string("gen_ai.prompt", &content.prompt));
-        attributes.push(attr_string("gen_ai.completion", &content.response));
-        if content.truncated {
-            attributes.push(attr_bool("aisix.content_truncated", true));
-        }
+        push_content(&mut attributes, event, content);
     }
-
     attributes
 }
 
-/// The OpenTelemetry GenAI operation this event describes.
-///
-/// The gateway fronts three kinds of upstream, and only one of them is a model
-/// inference. `invoke_agent` and `execute_tool` are the semconv's own
-/// well-known values for the other two, so an A2A or MCP span lands in the
-/// same bucket a trace backend already understands.
-fn operation_name(event: &UsageEvent) -> &'static str {
-    match event.inbound_protocol.as_str() {
-        "a2a" => "invoke_agent",
-        "mcp" => "execute_tool",
-        "passthrough" => "passthrough",
-        _ => "chat",
+/// The request parameters the inference conventions list, as the caller
+/// sent them.
+fn push_request_params(
+    attributes: &mut Vec<Value>,
+    params: &crate::genai::GenAiRequestParams,
+    upstream: Option<&crate::genai::UpstreamFacts>,
+) {
+    if let Some(v) = params.max_tokens {
+        attributes.push(attr_int("gen_ai.request.max_tokens", v));
+    }
+    for (key, value) in [
+        ("gen_ai.request.temperature", params.temperature),
+        ("gen_ai.request.top_p", params.top_p),
+        ("gen_ai.request.top_k", params.top_k),
+        ("gen_ai.request.frequency_penalty", params.frequency_penalty),
+        ("gen_ai.request.presence_penalty", params.presence_penalty),
+    ] {
+        if let Some(v) = value {
+            attributes.push(attr_double(key, v));
+        }
+    }
+    if !params.stop_sequences.is_empty() {
+        attributes.push(attr_string_array(
+            "gen_ai.request.stop_sequences",
+            &params.stop_sequences,
+        ));
+    }
+    if let Some(v) = params.seed {
+        attributes.push(attr_int("gen_ai.request.seed", v));
+    }
+    if let Some(v) = params.choice_count {
+        attributes.push(attr_int("gen_ai.request.choice.count", v));
+    }
+    // Set if and only if the request streamed.
+    if params.stream {
+        attributes.push(attr_bool("gen_ai.request.stream", true));
+    }
+    if let Some(v) = params.output_type {
+        attributes.push(attr_string("gen_ai.output.type", v));
+    }
+    if !params.encoding_formats.is_empty() {
+        attributes.push(attr_string_array(
+            "gen_ai.request.encoding_formats",
+            &params.encoding_formats,
+        ));
+    }
+    if let Some(v) = params.embedding_dimensions {
+        attributes.push(attr_int("gen_ai.embeddings.dimension.count", v));
+    }
+    // Provider-specific attributes belong only on that provider's spans.
+    if let Some(tier) = &params.openai_service_tier {
+        if upstream.is_some_and(|u| u.provider_name == "openai") {
+            attributes.push(attr_string("openai.request.service_tier", tier));
+        }
     }
 }
 
-/// Longest target this will append to a span name.
-///
-/// An A2A agent name is a registered resource, but an MCP tool name is the
-/// caller's own `tools/call` `params.name` and is recorded before the tool is
-/// known to exist — including on the quota-rejection path, which emits without
-/// ever contacting an upstream. A trace backend indexes span names and most
-/// derive RED metrics from them, so the one field a caller picks freely is
-/// bounded before it gets there.
-const MAX_SPAN_NAME_TARGET: usize = 64;
+/// The usage counters, under the conventions' accounting: input includes
+/// every cached token and output includes reasoning, whatever shape the
+/// upstream reported them in. The cache and reasoning breakdowns appear only
+/// when the upstream reported them. An embeddings span has no output.
+fn push_usage(attributes: &mut Vec<Value>, event: &UsageEvent, operation: Option<&str>) {
+    attributes.push(attr_int(
+        "gen_ai.usage.input_tokens",
+        i64::from(event.genai_input_tokens()),
+    ));
+    let cache_read = event.genai_cache_read_input_tokens();
+    if cache_read > 0 {
+        attributes.push(attr_int(
+            "gen_ai.usage.cache_read.input_tokens",
+            i64::from(cache_read),
+        ));
+    }
+    if let Some(creation) = event.genai_cache_creation_input_tokens() {
+        attributes.push(attr_int(
+            "gen_ai.usage.cache_creation.input_tokens",
+            i64::from(creation),
+        ));
+    }
+    if operation == Some("embeddings") {
+        return;
+    }
+    attributes.push(attr_int(
+        "gen_ai.usage.output_tokens",
+        i64::from(event.genai_output_tokens()),
+    ));
+    if event.reasoning_tokens > 0 {
+        attributes.push(attr_int(
+            "gen_ai.usage.reasoning.output_tokens",
+            i64::from(event.reasoning_tokens),
+        ));
+    }
+}
 
-/// The span's name: `{operation} {target}` where the target is low-cardinality
-/// and known, per the semconv's naming rule for agent and tool spans. LLM
-/// traffic keeps the name it has always had.
+/// Captured content (`content_mode = full`).
 ///
-/// A target that is absent or outside [`MAX_SPAN_NAME_TARGET`] leaves the bare
-/// operation, which the conventions name as the fallback for exactly this
-/// case. The raw value is still on the span as an attribute either way.
-fn span_name(event: &UsageEvent) -> String {
-    let operation = operation_name(event);
-    let target = match event.inbound_protocol.as_str() {
-        "a2a" => &event.a2a_agent_name,
-        "mcp" => &event.mcp_tool_name,
-        // A route name is a registered resource like an agent name, so it is
-        // operator-bounded — but it still passes the length cap below.
-        "passthrough" => &event.passthrough_route_name,
-        _ => return "chat.completions".to_string(),
-    };
-    if target.is_empty() || target.len() > MAX_SPAN_NAME_TARGET {
-        operation.to_string()
-    } else {
-        format!("{operation} {target}")
+/// A message-shaped payload whose capture is complete becomes the
+/// conventions' structured attributes, each held to the exporter's
+/// per-field cap. Everything else — a non-message payload (embedding input,
+/// images, audio, jobs, agent text), content the capture cap cut, or content
+/// that does not convert — stays under `aisix.content.prompt` /
+/// `aisix.content.response`, with `aisix.content_truncated` when cut, so a
+/// `gen_ai.*` content attribute is never malformed or partial.
+fn push_content(attributes: &mut Vec<Value>, event: &UsageEvent, content: &SinkContent) {
+    let fits = |value: &str| content.max_bytes.is_none_or(|cap| value.len() <= cap);
+    let mut raw_prompt = !content.prompt.is_empty();
+    let mut raw_response = !content.response.is_empty();
+    if !content.truncated {
+        if is_mcp(event) {
+            // Arguments and result are captured as JSON already; the result
+            // is reported only for a call that succeeded.
+            if raw_prompt {
+                attributes.push(attr_string("gen_ai.tool.call.arguments", &content.prompt));
+                raw_prompt = false;
+            }
+            if raw_response && (200..300).contains(&event.status_code) {
+                attributes.push(attr_string("gen_ai.tool.call.result", &content.response));
+                raw_response = false;
+            }
+        } else if let Some(wire) = crate::genai::PromptWire::for_operation(&event.operation) {
+            let structured = crate::genai::structured_content(
+                wire,
+                &content.prompt,
+                &content.response,
+                &event.finish_reason,
+            );
+            if let Some(input) = structured.input_messages.as_deref().filter(|v| {
+                fits(v)
+                    && structured.system_instructions.as_deref().is_none_or(fits)
+                    && structured.tool_definitions.as_deref().is_none_or(fits)
+            }) {
+                attributes.push(attr_string("gen_ai.input.messages", input));
+                if let Some(system) = &structured.system_instructions {
+                    attributes.push(attr_string("gen_ai.system_instructions", system));
+                }
+                if let Some(tools) = &structured.tool_definitions {
+                    attributes.push(attr_string("gen_ai.tool.definitions", tools));
+                }
+                raw_prompt = false;
+            }
+            if let Some(output) = structured.output_messages.as_deref().filter(|v| fits(v)) {
+                attributes.push(attr_string("gen_ai.output.messages", output));
+                raw_response = false;
+            }
+        }
+    }
+    if raw_prompt {
+        attributes.push(attr_string("aisix.content.prompt", &content.prompt));
+    }
+    if raw_response {
+        attributes.push(attr_string("aisix.content.response", &content.response));
+    }
+    if content.truncated {
+        attributes.push(attr_bool("aisix.content_truncated", true));
     }
 }
 
 /// Wrap one or more spans into an OTLP/HTTP-JSON `ExportTraceServiceRequest`.
-fn otlp_export_request(spans: Vec<Value>) -> Value {
+/// `service.name` is the gateway's configured `observability.service_name`;
+/// the service and instrumentation-scope versions are the build's.
+fn otlp_export_request(spans: Vec<Value>, service_name: &str) -> Value {
+    let version = &*aisix_core::BUILD_VERSION;
     json!({
         "resourceSpans": [{
             "resource": {
                 "attributes": [
-                    attr_string("service.name", "aisix-dp"),
+                    attr_string("service.name", service_name),
+                    attr_string("service.version", version),
                 ],
             },
             "scopeSpans": [{
-                "scope": { "name": "aisix-obs.otlp_http_sink" },
+                "scope": { "name": "aisix-obs.otlp_http_sink", "version": version },
                 "spans": spans,
             }],
         }],
@@ -1209,7 +1543,10 @@ fn otlp_export_request(spans: Vec<Value>) -> Value {
 #[cfg(test)]
 fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
     let record = SinkRecord::metadata_only(event.clone());
-    otlp_export_request(vec![build_otlp_span(&record, exporter_name)])
+    otlp_export_request(
+        vec![build_otlp_span(&record, exporter_name)],
+        DEFAULT_SERVICE_NAME,
+    )
 }
 
 fn attr_string(key: &str, value: &str) -> Value {
@@ -1627,6 +1964,234 @@ mod tests {
         assert!(nanos(attempt, "endTimeUnixNano") <= nanos(logical, "endTimeUnixNano"));
     }
 
+    fn attr<'a>(span: &'a Value, key: &str) -> Option<&'a Value> {
+        span["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["key"] == key)
+            .map(|a| &a["value"])
+    }
+
+    fn hierarchy_with(event: UsageEvent, facts: crate::genai::SpanFacts) -> Vec<Value> {
+        let bundle = crate::trace::RequestTraceBundle::new(None);
+        bundle.start_attempt(0);
+        bundle.end_attempt(0);
+        let record = SinkRecord::metadata_only(event)
+            .with_trace(Some(bundle.emission(true, 0, 10, true)))
+            .with_facts(Some(Arc::new(facts)));
+        build_otlp_spans(&record, "exp-1")
+    }
+
+    fn chat_facts() -> crate::genai::SpanFacts {
+        crate::genai::SpanFacts {
+            http: Some(Arc::new(crate::genai::HttpServerFacts::new(
+                "POST",
+                "/v1/chat/completions",
+                Some("/v1/chat/completions"),
+                Some("https"),
+            ))),
+            request: None,
+            upstream: Some(crate::genai::UpstreamFacts {
+                provider_name: "anthropic".into(),
+                request_model: "claude-sonnet-4-5".into(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// SERVER follows the HTTP server conventions, the GenAI attributes ride
+    /// the attempt alone, and a logical span grouping attempts carries none
+    /// of them — a backend that maps `gen_ai.operation.name` / a model
+    /// attribute to a model call would otherwise count it twice.
+    #[test]
+    fn only_the_carrier_span_reads_as_a_genai_operation() {
+        let mut event = sample_event();
+        event.operation = "chat".into();
+        event.client_source_ip = "203.0.113.7".into();
+        let spans = hierarchy_with(event, chat_facts());
+        let (server, logical, attempt) = (&spans[0], &spans[1], &spans[2]);
+
+        assert_eq!(server["name"], "POST /v1/chat/completions");
+        assert_eq!(
+            attr(server, "http.request.method").unwrap()["stringValue"],
+            "POST"
+        );
+        assert_eq!(
+            attr(server, "url.path").unwrap()["stringValue"],
+            "/v1/chat/completions"
+        );
+        assert_eq!(attr(server, "url.scheme").unwrap()["stringValue"], "https");
+        assert_eq!(
+            attr(server, "http.route").unwrap()["stringValue"],
+            "/v1/chat/completions"
+        );
+        assert_eq!(
+            attr(server, "client.address").unwrap()["stringValue"],
+            "203.0.113.7"
+        );
+        assert!(attr(attempt, "client.address").is_none());
+
+        assert_eq!(attempt["name"], "chat claude-sonnet-4-5");
+        assert_eq!(logical["name"], "chat claude-sonnet-4-5");
+        for key in [
+            "gen_ai.operation.name",
+            "gen_ai.request.model",
+            "gen_ai.provider.name",
+        ] {
+            assert!(attr(attempt, key).is_some(), "{key} on the attempt");
+            assert!(attr(logical, key).is_none(), "{key} on the logical span");
+            assert!(attr(server, key).is_none(), "{key} on the SERVER span");
+        }
+        for span in &spans {
+            assert!(span.get("status").is_none(), "success leaves status unset");
+        }
+    }
+
+    /// A 4xx is the CLIENT spans' error but not the SERVER span's; a 5xx is
+    /// both; a caller's own hang-up (499) is neither.
+    #[test]
+    fn error_status_follows_the_span_kind() {
+        let status_of = |status: u16, class: &str| {
+            let mut event = sample_event();
+            event.operation = "chat".into();
+            event.status_code = status;
+            event.error_class = class.into();
+            hierarchy_with(event, chat_facts())
+        };
+        let spans = status_of(429, "rate_limit_exceeded");
+        assert!(spans[0].get("status").is_none());
+        assert!(attr(&spans[0], "error.type").is_none());
+        for client in &spans[1..] {
+            assert_eq!(client["status"]["code"], STATUS_ERROR);
+            assert_eq!(
+                attr(client, "error.type").unwrap()["stringValue"],
+                "rate_limit_exceeded"
+            );
+        }
+        let spans = status_of(502, "");
+        for span in &spans {
+            assert_eq!(span["status"]["code"], STATUS_ERROR);
+            assert_eq!(attr(span, "error.type").unwrap()["stringValue"], "502");
+        }
+        let spans = status_of(499, "client_disconnected");
+        for span in &spans {
+            assert!(span.get("status").is_none());
+            assert!(attr(span, "error.type").is_none());
+        }
+    }
+
+    /// `gen_ai.usage.input_tokens` includes every cached token whichever
+    /// shape the upstream reported it in, with the cache breakdown beside it.
+    #[test]
+    fn usage_follows_the_conventions_accounting() {
+        let usage = |event: UsageEvent| build_otlp_span(&SinkRecord::metadata_only(event), "x");
+        let anthropic = usage(UsageEvent {
+            prompt_tokens: 10,
+            cache_read_tokens: 300,
+            cache_creation_tokens: 40,
+            completion_tokens: 5,
+            ..sample_event()
+        });
+        assert_eq!(
+            attr(&anthropic, "gen_ai.usage.input_tokens").unwrap()["intValue"],
+            "350"
+        );
+        assert_eq!(
+            attr(&anthropic, "gen_ai.usage.cache_read.input_tokens").unwrap()["intValue"],
+            "300"
+        );
+        assert_eq!(
+            attr(&anthropic, "gen_ai.usage.cache_creation.input_tokens").unwrap()["intValue"],
+            "40"
+        );
+
+        let openai = usage(UsageEvent {
+            prompt_tokens: 120,
+            cached_prompt_tokens: 100,
+            cache_write_tokens: Some(20),
+            completion_tokens: 30,
+            reasoning_tokens: 12,
+            ..sample_event()
+        });
+        assert_eq!(
+            attr(&openai, "gen_ai.usage.input_tokens").unwrap()["intValue"],
+            "120"
+        );
+        assert_eq!(
+            attr(&openai, "gen_ai.usage.cache_read.input_tokens").unwrap()["intValue"],
+            "100"
+        );
+        assert_eq!(
+            attr(&openai, "gen_ai.usage.cache_creation.input_tokens").unwrap()["intValue"],
+            "20"
+        );
+        assert_eq!(
+            attr(&openai, "gen_ai.usage.reasoning.output_tokens").unwrap()["intValue"],
+            "12"
+        );
+
+        let plain = usage(sample_event());
+        assert!(attr(&plain, "gen_ai.usage.cache_read.input_tokens").is_none());
+        assert!(attr(&plain, "gen_ai.usage.cache_creation.input_tokens").is_none());
+    }
+
+    /// A complete chat capture becomes the conventions' structured content;
+    /// a cut one stays raw under `aisix.content.*`.
+    #[test]
+    fn chat_content_is_structured_unless_the_capture_was_cut() {
+        let mut event = sample_event();
+        event.operation = "chat".into();
+        let prompt =
+            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).to_string();
+        let record = |cap: u32| {
+            content_record(
+                &otlp_kind(SlsContentMode::Full, cap),
+                &event,
+                Some(&CapturedContent {
+                    prompt: prompt.clone(),
+                    response: "hello there".into(),
+                    truncated: false,
+                }),
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let span = build_otlp_span(&record(4096), "x");
+        assert_eq!(
+            attr(&span, "gen_ai.input.messages").unwrap()["stringValue"],
+            r#"[{"parts":[{"content":"hi","type":"text"}],"role":"user"}]"#
+        );
+        assert_eq!(
+            attr(&span, "gen_ai.output.messages").unwrap()["stringValue"],
+            r#"[{"finish_reason":"stop","parts":[{"content":"hello there","type":"text"}],"role":"assistant"}]"#
+        );
+        assert!(attr(&span, "aisix.content.prompt").is_none());
+
+        let cut = build_otlp_span(&record(8), "x");
+        assert!(attr(&cut, "gen_ai.input.messages").is_none());
+        assert!(attr(&cut, "gen_ai.output.messages").is_none());
+        assert!(attr(&cut, "aisix.content.prompt").is_some());
+        assert_eq!(
+            attr(&cut, "aisix.content_truncated").unwrap()["boolValue"],
+            true
+        );
+    }
+
+    #[test]
+    fn export_resource_names_the_service_and_build() {
+        let body = otlp_export_request(vec![], "edge-gw");
+        let resource = &body["resourceSpans"][0]["resource"]["attributes"];
+        assert_eq!(resource[0]["key"], "service.name");
+        assert_eq!(resource[0]["value"]["stringValue"], "edge-gw");
+        assert_eq!(resource[1]["key"], "service.version");
+        assert_eq!(
+            body["resourceSpans"][0]["scopeSpans"][0]["scope"]["version"],
+            aisix_core::BUILD_VERSION.as_str()
+        );
+    }
+
     /// The regenerate-per-retry defect this PR removes: encoding the same
     /// record twice — what the delivery retry loop does — must produce
     /// byte-identical ids and timestamps.
@@ -1683,7 +2248,7 @@ mod tests {
         // otlp on its default (metadata_only) never carries content, even
         // when content was captured.
         let otlp = otlp_kind(SlsContentMode::MetadataOnly, 1024);
-        assert!(content_record(&otlp, &event, Some(&captured), None).is_none());
+        assert!(content_record(&otlp, &event, Some(&captured), None, None).is_none());
 
         // object_store never carries content either — content_record gates on
         // the AliyunSls variant, so any other kind gets metadata-only even when
@@ -1699,19 +2264,19 @@ mod tests {
         }))
         .unwrap()
         .kind;
-        assert!(content_record(&objstore, &event, Some(&captured), None).is_none());
+        assert!(content_record(&objstore, &event, Some(&captured), None, None).is_none());
 
         // sls metadata_only → no content.
         let meta = sls_kind(SlsContentMode::MetadataOnly, 1024);
-        assert!(content_record(&meta, &event, Some(&captured), None).is_none());
+        assert!(content_record(&meta, &event, Some(&captured), None, None).is_none());
 
         // sls full but nothing captured → falls back to metadata.
         let full = sls_kind(SlsContentMode::Full, 1024);
-        assert!(content_record(&full, &event, None, None).is_none());
+        assert!(content_record(&full, &event, None, None, None).is_none());
 
         // sls full + captured content → a content-bearing record that still
         // carries the metadata.
-        let rec = content_record(&full, &event, Some(&captured), None)
+        let rec = content_record(&full, &event, Some(&captured), None, None)
             .expect("full-capture sls with content yields a content record");
         let c = rec.content.as_ref().expect("content attached");
         assert_eq!(c.prompt, "the prompt");
@@ -1730,6 +2295,7 @@ mod tests {
             &event,
             Some(&big),
             None,
+            None,
         )
         .unwrap();
         let c = rec.content.as_ref().unwrap();
@@ -1743,7 +2309,7 @@ mod tests {
             response: "short".into(),
             truncated: true,
         };
-        let rec = content_record(&full, &event, Some(&pre), None).unwrap();
+        let rec = content_record(&full, &event, Some(&pre), None, None).unwrap();
         assert!(
             rec.content.as_ref().unwrap().truncated,
             "source truncation must propagate"
@@ -1753,10 +2319,10 @@ mod tests {
         // full + captured content → a content-bearing record (same shared
         // `SlsContentMode` plumbing).
         let dd_meta = datadog_kind(SlsContentMode::MetadataOnly, 1024);
-        assert!(content_record(&dd_meta, &event, Some(&captured), None).is_none());
+        assert!(content_record(&dd_meta, &event, Some(&captured), None, None).is_none());
         let dd_full = datadog_kind(SlsContentMode::Full, 1024);
-        assert!(content_record(&dd_full, &event, None, None).is_none());
-        let rec = content_record(&dd_full, &event, Some(&captured), None)
+        assert!(content_record(&dd_full, &event, None, None, None).is_none());
+        let rec = content_record(&dd_full, &event, Some(&captured), None, None)
             .expect("full-capture datadog with content yields a content record");
         let c = rec.content.as_ref().expect("content attached");
         assert_eq!(c.prompt, "the prompt");
@@ -1767,6 +2333,7 @@ mod tests {
             &event,
             Some(&big),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(rec.content.as_ref().unwrap().prompt.len(), 16);
@@ -1775,8 +2342,8 @@ mod tests {
         // otlp_http behaves identically (#519 B.2): full + captured content →
         // a content-bearing record; full with nothing captured → metadata.
         let otlp_full = otlp_kind(SlsContentMode::Full, 1024);
-        assert!(content_record(&otlp_full, &event, None, None).is_none());
-        let rec = content_record(&otlp_full, &event, Some(&captured), None)
+        assert!(content_record(&otlp_full, &event, None, None, None).is_none());
+        let rec = content_record(&otlp_full, &event, Some(&captured), None, None)
             .expect("full-capture otlp with content yields a content record");
         let c = rec.content.as_ref().expect("content attached");
         assert_eq!(c.prompt, "the prompt");
@@ -1786,6 +2353,7 @@ mod tests {
             &otlp_kind(SlsContentMode::Full, 16),
             &event,
             Some(&big),
+            None,
             None,
         )
         .unwrap();
@@ -1810,8 +2378,9 @@ mod tests {
         assert!(!keys.contains(&"gen_ai.completion"));
         assert!(!keys.contains(&"aisix.content_truncated"));
 
-        // Content-bearing record (content_mode = full): prompt + completion
-        // ride the span under the Datadog sink's key names.
+        // Content-bearing record (content_mode = full) of a payload that is
+        // not a message list (the sample is an image generation): it rides
+        // the bounded `aisix.content.*` keys, never a `gen_ai.*` message.
         let captured = CapturedContent {
             prompt: "what is 2+2?".into(),
             response: "4".into(),
@@ -1822,19 +2391,27 @@ mod tests {
             &event,
             Some(&captured),
             None,
+            None,
         )
         .unwrap();
         let span = build_otlp_span(&rec, "x");
         let attrs = span["attributes"].as_array().unwrap();
         let find = |k: &str| attrs.iter().find(|a| a["key"] == k);
         assert_eq!(
-            find("gen_ai.prompt").expect("prompt attr")["value"]["stringValue"],
+            find("aisix.content.prompt").expect("prompt attr")["value"]["stringValue"],
             "what is 2+2?"
         );
         assert_eq!(
-            find("gen_ai.completion").expect("completion attr")["value"]["stringValue"],
+            find("aisix.content.response").expect("response attr")["value"]["stringValue"],
             "4"
         );
+        for retired in [
+            "gen_ai.prompt",
+            "gen_ai.completion",
+            "gen_ai.input.messages",
+        ] {
+            assert!(find(retired).is_none(), "{retired} must not be emitted");
+        }
         // Nothing was truncated → no flag.
         assert!(find("aisix.content_truncated").is_none());
 
@@ -1848,6 +2425,7 @@ mod tests {
             &otlp_kind(SlsContentMode::Full, 16),
             &event,
             Some(&big),
+            None,
             None,
         )
         .unwrap();
@@ -2071,14 +2649,25 @@ mod tests {
     fn payload_carries_genai_semconv_attributes() {
         let body = build_otlp_traces_payload(&sample_event(), "test-exp");
         let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
-        assert_eq!(span["name"], "chat.completions");
-        assert_eq!(span["status"]["code"], 1);
-        // Attribute set must include the GenAI required + recommended fields
-        // we promised the user.
+        // An operation the conventions have no value for is named by the
+        // gateway's own; no upstream was resolved, so there is no target.
+        assert_eq!(span["name"], "image_generation");
+        // Success leaves the status unset.
+        assert!(span.get("status").is_none());
         let attrs = span["attributes"].as_array().unwrap();
         let keys: Vec<&str> = attrs.iter().map(|a| a["key"].as_str().unwrap()).collect();
-        assert!(keys.contains(&"gen_ai.system"));
-        assert!(keys.contains(&"gen_ai.operation.name"));
+        assert!(
+            !keys.contains(&"gen_ai.system"),
+            "replaced by gen_ai.provider.name"
+        );
+        assert!(!keys.contains(&"error.type"));
+        assert_eq!(
+            attrs
+                .iter()
+                .find(|a| a["key"] == "gen_ai.operation.name")
+                .unwrap()["value"]["stringValue"],
+            "image_generation"
+        );
         // The semconv value collapses every OpenAI-shaped route onto `chat`;
         // this is the one that says which endpoint (AISIX-Cloud#1461), so the
         // VALUE is what has to be checked — the key alone would be satisfied
@@ -2142,6 +2731,7 @@ mod tests {
         // route and the device-injected end-user identity recorded nowhere.
         let mut ev = sample_event();
         ev.inbound_protocol = "passthrough".into();
+        ev.operation = "passthrough".into();
         ev.passthrough_route_name = "copilot-chat".into();
         ev.client_identity = "alice@example.com".into();
 
@@ -2214,7 +2804,8 @@ mod tests {
 
         let body = build_otlp_traces_payload(&ev, "test-exp");
         let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
-        assert_eq!(span["name"], "execute_tool create_issue");
+        // MCP's own naming: `{mcp.method.name} {gen_ai.tool.name}`.
+        assert_eq!(span["name"], "tools/call create_issue");
         let attrs = span["attributes"].as_array().unwrap();
         let find = |k: &str| attrs.iter().find(|a| a["key"] == k);
         assert_eq!(
@@ -2229,6 +2820,12 @@ mod tests {
             find("aisix.mcp.server_name").unwrap()["value"]["stringValue"],
             "github"
         );
+        assert_eq!(
+            find("mcp.method.name").unwrap()["value"]["stringValue"],
+            "tools/call"
+        );
+        // A tool call has no token usage to report.
+        assert!(find("gen_ai.usage.input_tokens").is_none());
     }
 
     #[test]
@@ -2244,7 +2841,7 @@ mod tests {
 
         let body = build_otlp_traces_payload(&ev, "test-exp");
         let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
-        assert_eq!(span["name"], "execute_tool");
+        assert_eq!(span["name"], "tools/call");
         let attrs = span["attributes"].as_array().unwrap();
         let tool = attrs
             .iter()
@@ -2293,23 +2890,41 @@ mod tests {
     }
 
     #[test]
-    fn llm_traffic_keeps_its_chat_span_shape() {
-        // The protocol switch must not move LLM spans: dashboards and saved
-        // trace queries are written against these two values.
-        for protocol in ["", "openai", "anthropic"] {
+    fn inference_spans_are_named_by_operation_and_requested_model() {
+        // Every chat-shaped route maps onto the conventions' `chat`, the
+        // legacy completions route onto `text_completion` and embeddings onto
+        // `embeddings`; the span is named after the model the request was
+        // made to, not the caller's alias.
+        for (operation, genai) in [
+            ("chat", "chat"),
+            ("messages", "chat"),
+            ("responses", "chat"),
+            ("completions", "text_completion"),
+            ("embeddings", "embeddings"),
+            ("rerank", "rerank"),
+        ] {
             let mut ev = sample_event();
-            ev.inbound_protocol = protocol.into();
-            let body = build_otlp_traces_payload(&ev, "test-exp");
-            let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
-            assert_eq!(span["name"], "chat.completions", "protocol={protocol:?}");
+            ev.operation = operation.into();
+            ev.requested_model = "my-alias".into();
+            let record =
+                SinkRecord::metadata_only(ev).with_facts(Some(Arc::new(crate::genai::SpanFacts {
+                    upstream: Some(crate::genai::UpstreamFacts {
+                        provider_name: "openai".into(),
+                        request_model: "gpt-4o".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })));
+            let span = build_otlp_span(&record, "test-exp");
+            assert_eq!(span["name"], format!("{genai} gpt-4o"), "{operation}");
             let attrs = span["attributes"].as_array().unwrap();
-            assert_eq!(
-                attrs
-                    .iter()
-                    .find(|a| a["key"] == "gen_ai.operation.name")
-                    .unwrap()["value"]["stringValue"],
-                "chat"
-            );
+            let string_at = |k: &str| {
+                attrs.iter().find(|a| a["key"] == k).unwrap()["value"]["stringValue"].clone()
+            };
+            assert_eq!(string_at("gen_ai.operation.name"), genai);
+            assert_eq!(string_at("gen_ai.request.model"), "gpt-4o");
+            assert_eq!(string_at("aisix.requested_model"), "my-alias");
+            assert_eq!(string_at("gen_ai.provider.name"), "openai");
         }
     }
 
@@ -2485,16 +3100,20 @@ mod tests {
         let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
             .as_array()
             .unwrap();
-        let ip = attrs.iter().find(|a| a["key"] == "aisix.client_source_ip");
-        let ua = attrs.iter().find(|a| a["key"] == "aisix.client_user_agent");
+        // Under the client / user-agent conventions' names, replacing the
+        // former `aisix.client_*` keys.
+        let ip = attrs.iter().find(|a| a["key"] == "client.address");
+        let ua = attrs.iter().find(|a| a["key"] == "user_agent.original");
         assert_eq!(
-            ip.expect("client_source_ip attr")["value"]["stringValue"],
+            ip.expect("client.address attr")["value"]["stringValue"],
             "203.0.113.7"
         );
         assert_eq!(
-            ua.expect("client_user_agent attr")["value"]["stringValue"],
+            ua.expect("user_agent.original attr")["value"]["stringValue"],
             "codex-cli/1.2"
         );
+        assert!(!body.to_string().contains("aisix.client_source_ip"));
+        assert!(!body.to_string().contains("aisix.client_user_agent"));
     }
 
     #[test]
@@ -2533,8 +3152,8 @@ mod tests {
             .as_array()
             .unwrap();
         let keys: Vec<&str> = attrs.iter().map(|a| a["key"].as_str().unwrap()).collect();
-        assert!(!keys.contains(&"aisix.client_source_ip"));
-        assert!(!keys.contains(&"aisix.client_user_agent"));
+        assert!(!keys.contains(&"client.address"));
+        assert!(!keys.contains(&"user_agent.original"));
     }
 
     #[test]
@@ -2765,7 +3384,7 @@ mod tests {
         // can't easily count spawned tasks, but if the call returned
         // and the test process didn't hang, we're good.
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, None, std::iter::empty());
+        f.fan_out(&sample_event(), None, None, None, std::iter::empty());
     }
 
     #[test]
@@ -2779,7 +3398,7 @@ mod tests {
         let mut exp = sample_exporter();
         exp.enabled = false;
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, None, std::iter::once(&exp));
+        f.fan_out(&sample_event(), None, None, None, std::iter::once(&exp));
     }
 
     #[tokio::test]
@@ -2812,7 +3431,7 @@ mod tests {
         let control = mk("control", &ctrl_srv.uri(), None);
 
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, None, [&zero, &control]);
+        f.fan_out(&sample_event(), None, None, None, [&zero, &control]);
 
         // The control's span lands after the 1s flush…
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2857,7 +3476,7 @@ mod tests {
         .unwrap();
 
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, None, std::iter::once(&exp));
+        f.fan_out(&sample_event(), None, None, None, std::iter::once(&exp));
 
         // Poll for the batched POST (flush_interval is 1s).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2915,7 +3534,13 @@ mod tests {
         ]));
         let f = OtlpHttpFanOut::new();
         let live = handle.load().observability_exporters.entries();
-        f.fan_out(&sample_event(), None, None, live.iter().map(|e| &e.value));
+        f.fan_out(
+            &sample_event(),
+            None,
+            None,
+            None,
+            live.iter().map(|e| &e.value),
+        );
         let mut names: Vec<_> = f.exporter_stats().into_keys().collect();
         names.sort();
         assert_eq!(names, ["gone", "keep", "off"]);
@@ -2937,7 +3562,13 @@ mod tests {
 
         // A request that loaded the snapshot before the publish emits after
         // the reap: the removed exporters' pipelines stay stopped.
-        f.fan_out(&sample_event(), None, None, live.iter().map(|e| &e.value));
+        f.fan_out(
+            &sample_event(),
+            None,
+            None,
+            None,
+            live.iter().map(|e| &e.value),
+        );
         assert_eq!(
             f.exporter_stats().into_keys().collect::<Vec<_>>(),
             ["keep"],

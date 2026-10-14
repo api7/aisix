@@ -167,6 +167,8 @@ admin:
     - "managed-mode-admin-disabled"
 
 observability:
+  # Also the `service.name` resource attribute on every trace an `otlp_http`
+  # observability exporter sends.
   service_name: "aisix"
   log_level: "info"
   # One access-log line ("proxy request completed") per request, written at
