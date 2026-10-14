@@ -129,7 +129,6 @@ registry), edit `.github/release-notes-header.md` — not each release by hand.
 Publish the draft and mark it **Latest**. Give it a descriptive title when the
 release has a headline feature (e.g. `v0.2.0 — Semantic routing`), or just the
 version for patch releases.
-
 ## 4. Downstream
 
 The AISIX Enterprise package (artifact name `aisix-self-hosted`) bundles

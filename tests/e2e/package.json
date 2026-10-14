@@ -12,15 +12,15 @@
   "devDependencies": {
     "@types/node": "20.11.30",
     "@types/ws": "8.5.12",
-    "@vitest/coverage-v8": "2.1.9",
+    "@vitest/coverage-v8": "4.1.11",
     "typescript": "5.5.4",
-    "vitest": "3.2.6",
+    "vitest": "4.1.11",
     "ws": "8.21.0"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.29.0",
+    "@modelcontextprotocol/sdk": "1.32.1",
     "openai": "4.65.0",
-    "undici": "6.28.0",
+    "undici": "6.28.1",
     "yaml": "2.8.3"
   }
 }

@@ -8,9 +8,7 @@ export default defineConfig({
     globalSetup: "./src/harness/global-setup.ts",
     include: ["src/real-provider/**/*.smoke.ts"],
     pool: "forks",
-    poolOptions: {
-      forks: { singleFork: true, minForks: 1, maxForks: 1 },
-    },
+    maxWorkers: 1,
     testTimeout: 90_000,
     hookTimeout: 90_000,
     globals: false,

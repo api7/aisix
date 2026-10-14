@@ -3814,6 +3814,41 @@ fn update_anthropic_usage(
     }
 }
 
+/// This endpoint's reading of a buffered Anthropic Messages body's usage
+/// ([`anthropic_metrics_from_response_json`]), shared with passthrough routes
+/// relaying the same envelope. `None` when the body carries no `usage`.
+pub(crate) fn anthropic_usage_stats(body: &Value) -> Option<aisix_gateway::UsageStats> {
+    body.get("usage")?;
+    let m = anthropic_metrics_from_response_json(body);
+    Some(aisix_gateway::UsageStats::with_cache(
+        m.prompt_tokens,
+        m.completion_tokens,
+        m.cache_creation_tokens,
+        m.cache_read_tokens,
+    ))
+}
+
+/// The usage one streamed Anthropic event reports, read by this endpoint's
+/// own accumulator ([`update_anthropic_usage`]). Only `message_start` and
+/// `message_delta` carry usage; every other event is `None`. A caller that
+/// folds several events takes the field-wise max, as the accumulator does.
+pub(crate) fn anthropic_stream_usage_stats(event: &Value) -> Option<aisix_gateway::UsageStats> {
+    let usage = match event.get("type").and_then(Value::as_str) {
+        Some("message_start") => event.get("message").and_then(|m| m.get("usage")),
+        Some("message_delta") => event.get("usage"),
+        _ => None,
+    };
+    usage.filter(|u| u.is_object())?;
+    let mut acc = AnthropicStreamUsage::default();
+    update_anthropic_usage(&mut acc, event, Instant::now(), &mut true);
+    Some(aisix_gateway::UsageStats::with_cache(
+        acc.prompt_tokens,
+        acc.completion_tokens,
+        acc.cache_creation_tokens,
+        acc.cache_read_tokens,
+    ))
+}
+
 /// Drain every complete SSE frame from `buf`, updating `acc` and
 /// appending the frame to `out` with the client-facing `model` restamped
 /// onto `message_start`. A frame ends at the first blank line;

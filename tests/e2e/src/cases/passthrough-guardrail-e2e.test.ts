@@ -38,6 +38,7 @@ describe("passthrough guardrail (#911 [6])", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let sseUpstream: OpenAiUpstream | undefined;
+  let hybridUpstream: OpenAiUpstream | undefined;
   let seed: SeedClient | undefined;
   let etcdReachable = false;
 
@@ -115,6 +116,31 @@ describe("passthrough guardrail (#911 [6])", () => {
       protocol: "openai_chat",
     });
 
+    // A reply naming two envelopes at once: clean Chat `choices` beside an
+    // Anthropic message body whose `content` carries the forbidden text.
+    hybridUpstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "msg_hybrid",
+        object: "chat.completion",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "all clear" },
+            finish_reason: "stop",
+          },
+        ],
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text: `here it is: ${FORBIDDEN_OUTPUT}` }],
+      },
+    });
+    await seed.createPassthroughRoute({
+      name: "pt-gr-hybrid-tunnel",
+      path_prefix: "/pt-gr-hybrid",
+      target_url: hybridUpstream.baseUrl,
+      provider_key_id: pk.id,
+    });
+
     // Caller key LAST: etcd applies writes in revision order, so a key
     // seeded after every resource it must reach doubles as the
     // propagation barrier for all of them.
@@ -129,6 +155,7 @@ describe("passthrough guardrail (#911 [6])", () => {
     await app?.exit();
     await upstream?.close();
     await sseUpstream?.close();
+    await hybridUpstream?.close();
   });
 
   function passthrough(body: unknown): Promise<Response> {
@@ -248,4 +275,181 @@ describe("passthrough guardrail (#911 [6])", () => {
     expect(text).toContain("event: error");
     expect(text).toContain("content_filter");
   }, 30_000);
+
+  test("the input guardrail reads an Anthropic Messages body wherever it reads the OpenAI one", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const send = (path: string, body: unknown, headers: Record<string, string> = {}) =>
+      fetch(`${app!.proxyUrl}/passthrough/openai/v1/${path}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+          ...headers,
+        },
+        body: JSON.stringify(body),
+      });
+    const anthropic = (body: Record<string, unknown>) =>
+      send(
+        "messages",
+        { model: "claude-sonnet-4-5", max_tokens: 64, ...body },
+        { "anthropic-version": "2023-06-01" },
+      );
+    const openai = (messages: unknown[]) =>
+      send("chat/completions", { model: "gpt-4o-mini", messages });
+
+    // Gate on the input chain being live (a blocked request never reaches
+    // the upstream, so polling here is side-effect free).
+    await waitConfigPropagation(async () => {
+      const probe = await openai([{ role: "user", content: FORBIDDEN_INPUT }]);
+      await probe.text();
+      return probe.status === 422;
+    });
+
+    // The same forbidden text in each slot a caller can put it, on both
+    // envelopes: the system prompt, a tool's result, and a replayed tool
+    // call's arguments.
+    const pairs: [string, () => Promise<Response>, () => Promise<Response>][] = [
+      [
+        "system prompt",
+        () =>
+          anthropic({
+            system: [{ type: "text", text: `be ${FORBIDDEN_INPUT}` }],
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        () =>
+          openai([
+            { role: "system", content: `be ${FORBIDDEN_INPUT}` },
+            { role: "user", content: "hi" },
+          ]),
+      ],
+      [
+        "tool result",
+        () =>
+          anthropic({
+            messages: [
+              {
+                role: "assistant",
+                content: [{ type: "tool_use", id: "toolu_1", name: "read", input: {} }],
+              },
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: "toolu_1",
+                    content: [{ type: "text", text: `file says ${FORBIDDEN_INPUT}` }],
+                  },
+                ],
+              },
+            ],
+          }),
+        () =>
+          openai([
+            {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                { id: "call_1", type: "function", function: { name: "read", arguments: "{}" } },
+              ],
+            },
+            { role: "tool", tool_call_id: "call_1", content: `file says ${FORBIDDEN_INPUT}` },
+          ]),
+      ],
+      [
+        "tool call arguments",
+        () =>
+          anthropic({
+            messages: [
+              {
+                role: "assistant",
+                content: [
+                  {
+                    type: "tool_use",
+                    id: "toolu_2",
+                    name: "write",
+                    input: { text: FORBIDDEN_INPUT },
+                  },
+                ],
+              },
+              {
+                role: "user",
+                content: [{ type: "tool_result", tool_use_id: "toolu_2", content: "ok" }],
+              },
+            ],
+          }),
+        () =>
+          openai([
+            {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: "call_2",
+                  type: "function",
+                  function: {
+                    name: "write",
+                    arguments: JSON.stringify({ text: FORBIDDEN_INPUT }),
+                  },
+                },
+              ],
+            },
+            { role: "tool", tool_call_id: "call_2", content: "ok" },
+          ]),
+      ],
+    ];
+
+    const hitsBefore = upstream.receivedRequests.length;
+    for (const [slot, viaAnthropic, viaOpenai] of pairs) {
+      for (const [envelope, call] of [
+        ["anthropic", viaAnthropic],
+        ["openai", viaOpenai],
+      ] as const) {
+        const res = await call();
+        const body = (await res.json()) as { error?: { message?: unknown } };
+        expect(res.status, `${envelope} ${slot}`).toBe(422);
+        expect(String(body.error?.message), `${envelope} ${slot}`).toContain(
+          `guardrail '${INPUT_GUARDRAIL}'`,
+        );
+      }
+    }
+    expect(upstream.receivedRequests.length - hitsBefore).toBe(0);
+  });
+
+  test("a reply naming both a Chat and an Anthropic envelope is unscannable, so the fail-closed output guardrail refuses it", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    const call = () =>
+      fetch(`${app!.proxyUrl}/pt-gr-hybrid/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [{ role: "user", content: "innocent" }],
+        }),
+      });
+
+    // Gate on the caller key (seeded last): a 401 is the only transient.
+    await waitConfigPropagation(async () => {
+      const r = await call();
+      await r.text();
+      return r.status !== 401;
+    });
+
+    const res = await call();
+    const bodyText = await res.text();
+    // Each selector reads only its own carrier, so scanning the Chat one
+    // alone would let the Anthropic `content` through unscanned.
+    expect(res.status).toBe(422);
+    expect(bodyText).not.toContain(FORBIDDEN_OUTPUT);
+  });
 });
