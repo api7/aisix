@@ -63,6 +63,26 @@ impl Json {
         self.get(key).filter(|v| !matches!(v, Json::Null))
     }
 
+    /// The top-level `model` string of a request.
+    pub(crate) fn model(&self) -> Option<&str> {
+        self.get("model").and_then(Json::as_str)
+    }
+
+    /// This document with its top-level `model` replaced.
+    pub(crate) fn with_model(&self, model: &str) -> Json {
+        match self {
+            Json::Object(members) => Json::Object(
+                members
+                    .iter()
+                    .filter(|(k, _)| k != "model")
+                    .cloned()
+                    .chain([("model".to_owned(), Json::str(model))])
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
     fn as_str(&self) -> Option<&str> {
         match self {
             Json::String(s) => Some(s),
@@ -272,6 +292,14 @@ pub(crate) fn parse_systemone_request(doc: &Json) -> Result<Request, String> {
     if entries.is_empty() {
         return Err("`questions` must not be empty".into());
     }
+    // A repeated name is one question, the last spelling winning, as it is
+    // for every other JSON reader of the same body.
+    let entries: Vec<&(String, Json)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(i, (name, _))| !entries[i + 1..].iter().any(|(k, _)| k == name))
+        .map(|(_, e)| e)
+        .collect();
     let questions = entries
         .iter()
         .map(|(name, q)| systemone_question(name, q))
@@ -1336,6 +1364,30 @@ mod tests {
                        "legend":{"0":{"rank":"low"},"1":"high"},
                        "probabilities":{"0":0.8,"1":0.2}}},
                 "usage":{"input_tokens":10,"output_tokens":2}})
+        );
+    }
+
+    #[test]
+    fn a_repeated_question_name_is_one_question_and_keeps_its_name() {
+        let req = parse_systemone_request(&parse(
+            r#"{"state":"s","questions":{"q":{"type":"noul","instructions":"old"},
+                "r":{"type":"noul","instructions":"R?"},"q":{"type":"noul","instructions":"new"}}}"#,
+        ))
+        .unwrap();
+        let out = to_value(&to_decisions_request("gpt", &req).unwrap());
+        assert_eq!(
+            out["questions"],
+            json!([{"type":"predicate","name":"r","instructions":"R?"},
+                   {"type":"predicate","name":"q","instructions":"new"}])
+        );
+    }
+
+    #[test]
+    fn with_model_replaces_every_model_member() {
+        let doc = parse(r#"{"model":"a","x":1,"model":"b"}"#);
+        assert_eq!(
+            serde_json::to_string(&doc.with_model("up")).unwrap(),
+            r#"{"x":1,"model":"up"}"#
         );
     }
 

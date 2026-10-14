@@ -153,12 +153,9 @@ async fn handle(
             ))
         }
     };
-    let (body, doc) = match (
-        serde_json::from_slice::<Value>(&raw),
-        serde_json::from_slice::<Json>(&raw),
-    ) {
-        (Ok(body), Ok(doc)) => (body, doc),
-        _ => {
+    let doc = match serde_json::from_slice::<Json>(&raw) {
+        Ok(doc) => doc,
+        Err(_) => {
             return reject(ProxyError::InvalidRequest(
                 "invalid JSON request body".into(),
             ))
@@ -166,11 +163,7 @@ async fn handle(
     };
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
-    let model_name = body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let model_name = doc.model().unwrap_or("").to_string();
 
     let snapshot = state.snapshot.load();
     // No guardrail chain is ever resolved on these endpoints, so the audit
@@ -184,7 +177,6 @@ async fn handle(
         &auth,
         &client,
         &raw,
-        &body,
         &doc,
         &mut routing,
     )
@@ -348,18 +340,16 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     client_ctx: &ClientContext,
     raw: &Bytes,
-    body: &Value,
     doc: &Json,
     routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<Success, ProxyError> {
-    if !body.is_object() {
+    if !matches!(doc, Json::Object(_)) {
         return Err(ProxyError::InvalidRequest(
             "request body must be a JSON object".into(),
         ));
     }
-    let model_name = body
-        .get("model")
-        .and_then(Value::as_str)
+    let model_name = doc
+        .model()
         .ok_or_else(|| ProxyError::InvalidRequest("`model` field missing".into()))?
         .to_string();
     let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
@@ -440,8 +430,18 @@ async fn dispatch(
                         &upstream_model,
                         crate::model_echo::top_level_model,
                     )
-                    .map(Bytes::from)
-                    .unwrap_or_else(|| raw.clone())
+                    .map_or_else(
+                        // A `model` key the byte scanner does not match
+                        // (an escaped spelling, a duplicate) still has to
+                        // carry the upstream model.
+                        || serde_json::to_vec(&doc.with_model(&upstream_model)).map(Bytes::from),
+                        |spliced| Ok(Bytes::from(spliced)),
+                    )
+                    .map_err(|e| {
+                        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                            "serialize request body: {e}"
+                        )))
+                    })?
                 } else {
                     let request = converted
                         .as_ref()
@@ -562,6 +562,21 @@ async fn dispatch(
                         aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
                     ))
                 })?;
+                // A converted answer is read here, inside the attempt, so a 200
+                // that is not JSON counts against the target like any other
+                // upstream fault instead of after it was marked healthy.
+                if upstream.format() != endpoint.format
+                    && serde_json::from_slice::<serde::de::IgnoredAny>(&body_bytes).is_err()
+                {
+                    return Err(ProxyError::Bridge(crate::cooldown::note_failure(
+                        tracker,
+                        model_id,
+                        cooldown_cfg,
+                        aisix_gateway::BridgeError::UpstreamDecode(
+                            "the decision upstream answered with a body that is not JSON".into(),
+                        ),
+                    )));
+                }
                 Ok((
                     body_bytes,
                     upstream,
@@ -724,6 +739,7 @@ fn upstream_url(upstream: Upstream, pk: &aisix_core::ProviderKey) -> Result<Stri
         Upstream::TypeSafe => {
             let base = configured.unwrap_or(TYPESAFE_DEFAULT_API_BASE);
             let base = base.trim_end_matches('/');
+            let base = base.strip_suffix("/systemone").unwrap_or(base);
             format!("{}/v1/systemone", base.strip_suffix("/v1").unwrap_or(base))
         }
         Upstream::Foundry => {
@@ -971,6 +987,26 @@ mod tests {
                 foundry_root(base),
                 "https://acme.services.ai.azure.com",
                 "{base}"
+            );
+        }
+    }
+
+    #[test]
+    fn typesafe_url_tolerates_a_pasted_endpoint() {
+        for base in [
+            None,
+            Some("https://api.typesafe.ai/"),
+            Some("https://api.typesafe.ai/v1"),
+            Some("https://api.typesafe.ai/v1/systemone"),
+        ] {
+            let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+                "display_name": "ts", "secret": "k", "provider": "typesafe", "api_base": base,
+            }))
+            .unwrap();
+            assert_eq!(
+                upstream_url(Upstream::TypeSafe, &pk).unwrap(),
+                "https://api.typesafe.ai/v1/systemone",
+                "{base:?}"
             );
         }
     }
