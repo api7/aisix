@@ -504,7 +504,7 @@ fn fallback(
 }
 
 /// Endpoint a `typesafe` Provider Key reaches when it sets no `api_base`.
-const TYPESAFE_DEFAULT_API_BASE: &str = "https://api.typesafe.ai";
+pub(crate) const TYPESAFE_DEFAULT_API_BASE: &str = "https://api.typesafe.ai";
 
 /// The one question every classifier call asks. The wording is the one the
 /// classifier mode was validated with; change it only against a fresh

@@ -584,8 +584,8 @@ pub struct UsageEvent {
 
     /// What the caller asked the gateway to DO, from a fixed set:
     /// `chat`, `messages`, `count_tokens`, `responses`, `completions`,
-    /// `embeddings`, `rerank`, `image_generation`, `image_edit`,
-    /// `transcription`, `translation`, `speech`, `video_generation`,
+    /// `embeddings`, `rerank`, `systemone`, `decisions`, `image_generation`,
+    /// `image_edit`, `transcription`, `translation`, `speech`, `video_generation`,
     /// `realtime`, `files`, `batches`, `fine_tuning`, `batch_completion`,
     /// `mcp`, `a2a`, `passthrough`.
     ///

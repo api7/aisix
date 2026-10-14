@@ -64,6 +64,10 @@ pub(crate) const COUNT_TOKENS: Surface = Surface::uniform("count_tokens");
 pub(crate) const RESPONSES: Surface = Surface::uniform("responses");
 pub(crate) const EMBEDDINGS: Surface = Surface::uniform("embeddings");
 pub(crate) const RERANK: Surface = Surface::uniform("rerank");
+/// Named after the route, not the upstream format: a System One request an
+/// OpenAI model serves is still `systemone`, and the reverse is `decisions`.
+pub(crate) const SYSTEMONE: Surface = Surface::uniform("systemone");
+pub(crate) const DECISIONS: Surface = Surface::uniform("decisions");
 pub(crate) const REALTIME: Surface = Surface::uniform("realtime");
 pub(crate) const FILES: Surface = Surface::uniform("files");
 pub(crate) const BATCHES: Surface = Surface::uniform("batches");
@@ -131,6 +135,8 @@ pub(crate) fn surface_for_endpoint(endpoint: &str) -> Option<Surface> {
         "/v1/messages" => MESSAGES,
         "/v1/messages/count_tokens" => COUNT_TOKENS,
         "/v1/rerank" => RERANK,
+        "/v1/systemone" => SYSTEMONE,
+        "/v1/decisions" => DECISIONS,
         "/v1/responses" => RESPONSES,
         "/v1/audio/transcriptions" => TRANSCRIPTION,
         "/v1/audio/translations" => TRANSLATION,
@@ -196,6 +202,8 @@ mod tests {
         ("/v1/messages", Emits::Usage(MESSAGES)),
         ("/v1/messages/count_tokens", Emits::Usage(COUNT_TOKENS)),
         ("/v1/rerank", Emits::Usage(RERANK)),
+        ("/v1/systemone", Emits::Usage(SYSTEMONE)),
+        ("/v1/decisions", Emits::Usage(DECISIONS)),
         ("/v1/responses", Emits::Usage(RESPONSES)),
         ("/v1/audio/transcriptions", Emits::Usage(TRANSCRIPTION)),
         ("/v1/audio/translations", Emits::Usage(TRANSLATION)),
@@ -352,6 +360,8 @@ mod tests {
             (RESPONSES, "responses"),
             (EMBEDDINGS, "embeddings"),
             (RERANK, "rerank"),
+            (SYSTEMONE, "systemone"),
+            (DECISIONS, "decisions"),
             (REALTIME, "realtime"),
             (FILES, "files"),
             (BATCHES, "batches"),

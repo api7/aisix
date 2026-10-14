@@ -124,6 +124,22 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
     ("/v1/messages", Posture::Enforced),
     ("/v1/messages/count_tokens", Posture::Enforced),
     ("/v1/rerank", Posture::Enforced),
+    (
+        "/v1/systemone",
+        Posture::Unscreened(
+            "product decision: attached guardrails do not run on the decision endpoints and \
+             nothing is redacted there, the same posture the reference gateway takes. Not a gap \
+             to close without a new decision.",
+        ),
+    ),
+    (
+        "/v1/decisions",
+        Posture::Unscreened(
+            "product decision: attached guardrails do not run on the decision endpoints and \
+             nothing is redacted there, the same posture the reference gateway takes. Not a gap \
+             to close without a new decision.",
+        ),
+    ),
     ("/v1/responses", Posture::Enforced),
     ("/v1/audio/transcriptions", Posture::Enforced),
     ("/v1/audio/translations", Posture::Enforced),

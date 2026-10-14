@@ -453,6 +453,34 @@ impl AzureSecret {
     }
 }
 
+/// The credential a request built outside the bridge sends to an Azure
+/// endpoint, resolved from the Provider Key secret exactly as the bridge
+/// resolves it: a verbatim key goes out as the `api-key` header, the JSON
+/// client-credentials shape as an Entra ID bearer token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AzureCredential {
+    ApiKey(String),
+    Bearer(String),
+}
+
+/// Process-wide token cache for the callers of [`resolve_credential`].
+/// Kept apart from each bridge's own minter; both key their cache by the
+/// whole credential, so sharing would only save a mint per process.
+static SHARED_TOKEN_MINTER: std::sync::LazyLock<TokenMinter> =
+    std::sync::LazyLock::new(|| TokenMinter::new(default_client()));
+
+/// Resolve an Azure Provider Key secret into the credential to send, minting
+/// (or reusing a cached) Entra ID token for the client-credentials shape.
+pub async fn resolve_credential(secret: &str) -> Result<AzureCredential, BridgeError> {
+    match AzureSecret::parse(secret)? {
+        AzureSecret::ApiKey(key) => Ok(AzureCredential::ApiKey(key)),
+        AzureSecret::Aad(creds) => SHARED_TOKEN_MINTER
+            .get_token(&creds)
+            .await
+            .map(AzureCredential::Bearer),
+    }
+}
+
 /// Resolved per-request auth header pair the bridge writes onto the
 /// outbound request. Exactly ONE of `api_key` / `bearer_token` is
 /// `Some`; the other is `None`.

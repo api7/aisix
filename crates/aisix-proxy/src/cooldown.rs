@@ -6,6 +6,7 @@
 //!  - `/v1/responses` (responses.rs — OpenAI Responses API passthrough)
 //!  - `/v1/audio/{speech,transcriptions,translations}` (audio.rs)
 //!  - `/v1/rerank` (rerank.rs)
+//!  - `/v1/systemone`, `/v1/decisions` (decisions.rs)
 //!
 //! Every one of those paths surfaces upstream failures as
 //! [`BridgeError`]. The runtime-status layer (see [`crate::health`])
