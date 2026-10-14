@@ -28,6 +28,12 @@ export interface CapturedSpan {
   endTimeUnixNano: string;
   /** 0-based index of the POST this span arrived in (delivery-retry tests). */
   postIndex: number;
+  /** OTLP `Status.code` (1 = OK, 2 = ERROR); 0 when unset or omitted. */
+  statusCode: number;
+  /** The export's resource attributes, flattened like `attributes`. */
+  resource: Record<string, string | number | boolean>;
+  /** The instrumentation scope the span was exported under. */
+  scope: { name: string; version: string };
 }
 
 export interface MockOtlpOptions {
@@ -95,7 +101,11 @@ export async function startMockOtlp(
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
           resourceSpans?: {
+            resource?: {
+              attributes?: { key: string; value: Record<string, unknown> }[];
+            };
             scopeSpans?: {
+              scope?: { name?: string; version?: string };
               spans?: {
                 name: string;
                 traceId?: string;
@@ -107,11 +117,16 @@ export async function startMockOtlp(
                 startTimeUnixNano?: string;
                 endTimeUnixNano?: string;
                 attributes?: { key: string; value: Record<string, unknown> }[];
+                status?: { code?: number };
               }[];
             }[];
           }[];
         };
         for (const resource of body.resourceSpans ?? []) {
+          const resourceAttributes: Record<string, string | number | boolean> = {};
+          for (const attr of resource.resource?.attributes ?? []) {
+            resourceAttributes[attr.key] = anyValue(attr.value);
+          }
           for (const scope of resource.scopeSpans ?? []) {
             for (const span of scope.spans ?? []) {
               const attributes: Record<string, string | number | boolean> = {};
@@ -130,6 +145,12 @@ export async function startMockOtlp(
                 startTimeUnixNano: span.startTimeUnixNano ?? "0",
                 endTimeUnixNano: span.endTimeUnixNano ?? "0",
                 postIndex,
+                statusCode: span.status?.code ?? 0,
+                resource: resourceAttributes,
+                scope: {
+                  name: scope.scope?.name ?? "",
+                  version: scope.scope?.version ?? "",
+                },
               });
             }
           }

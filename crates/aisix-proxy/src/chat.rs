@@ -126,6 +126,7 @@ pub async fn chat_completions(
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
     let model_name = req.model.clone();
+    crate::span_facts::note_request(&client, Some(crate::span_facts::chat_params(&req)));
 
     // Filled by `dispatch` once the per-request guardrail chain resolves;
     // read below to attach `applied_guardrails` to the telemetry event on

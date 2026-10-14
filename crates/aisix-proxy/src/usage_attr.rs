@@ -1038,14 +1038,43 @@ pub(crate) fn emit_usage(
     // no-op outside a request scope, which is where the detached stream
     // emitters and the cancel guard itself both run.
     crate::attribution::note_usage_emitted(terminal);
+    let provider_key_id = labels.provider_key_id;
     state
         .usage_sink
         .try_emit(surface.handler, event.clone(), labels);
     let exporters = live_exporters(state, snap);
+    if exporters.is_empty() {
+        return;
+    }
+    // Export-only span facts: the request-scoped ones the bundle holds, and
+    // this event's own upstream, read off the request's snapshot. Only the
+    // OTLP encoder reads them, so nothing is resolved without one.
+    let facts = exporters
+        .iter()
+        .any(|e| e.value.enabled && matches!(e.value.kind, aisix_core::ExporterKind::OtlpHttp(_)))
+        .then(|| {
+            let mut upstream = crate::span_facts::upstream_facts(snap, &event, provider_key_id);
+            // An event that never reached its upstream (a cache hit, a
+            // refusal) names the model it addressed but no server it called.
+            if !dispatched {
+                if let Some(u) = upstream.as_mut() {
+                    u.server_address.clear();
+                    u.server_port = None;
+                }
+            }
+            std::sync::Arc::new(match trace {
+                Some(bundle) => bundle.span_facts(upstream),
+                None => aisix_obs::SpanFacts {
+                    upstream,
+                    ..Default::default()
+                },
+            })
+        });
     state.otlp_fan_out.fan_out(
         &event,
         content,
         emission.as_ref(),
+        facts.as_ref(),
         exporters.iter().map(|e| &e.value),
     );
 }

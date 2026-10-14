@@ -25,7 +25,7 @@
 //! the export.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// The W3C `traceparent` request header (Trace Context Level 1 §3.2).
@@ -245,6 +245,11 @@ pub struct RequestTraceBundle {
     /// failed or whose output was blocked): otherwise every already-shipped
     /// sub-call span dangles.
     synthesized_children: AtomicBool,
+    /// The inbound HTTP request the SERVER span describes, stamped at mint.
+    http: Option<Arc<crate::genai::HttpServerFacts>>,
+    /// The caller's GenAI request parameters, set once by the handler that
+    /// parsed the body (the inference families only).
+    request: OnceLock<Arc<crate::genai::GenAiRequestParams>>,
 }
 
 impl RequestTraceBundle {
@@ -267,6 +272,33 @@ impl RequestTraceBundle {
             attempts: Mutex::new(Vec::new()),
             terminal_emitted: AtomicBool::new(false),
             synthesized_children: AtomicBool::new(false),
+            http: None,
+            request: OnceLock::new(),
+        }
+    }
+
+    /// Attach the inbound HTTP request the SERVER span reports.
+    pub fn with_http_server(mut self, http: crate::genai::HttpServerFacts) -> Self {
+        self.http = Some(Arc::new(http));
+        self
+    }
+
+    /// Record the caller's GenAI request parameters. The first call wins:
+    /// they describe the request as the caller sent it.
+    pub fn set_genai_request(&self, params: crate::genai::GenAiRequestParams) {
+        let _ = self.request.set(Arc::new(params));
+    }
+
+    /// The export-only facts of one usage event of this request: the
+    /// request-scoped ones held here, plus the event's own upstream.
+    pub fn span_facts(
+        &self,
+        upstream: Option<crate::genai::UpstreamFacts>,
+    ) -> crate::genai::SpanFacts {
+        crate::genai::SpanFacts {
+            http: self.http.clone(),
+            request: self.request.get().cloned(),
+            upstream,
         }
     }
 

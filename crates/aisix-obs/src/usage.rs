@@ -625,8 +625,9 @@ pub struct UsageEvent {
     /// Consumed today by the exporter sinks — SLS and object storage keep the
     /// name verbatim, Datadog maps it to `aisix.operation`, OTLP carries it
     /// as the `aisix.operation` span attribute beside the semconv
-    /// `gen_ai.operation.name`, whose vocabulary is OpenTelemetry's and
-    /// collapses every OpenAI-shaped route onto `chat`. cp-api binds
+    /// `gen_ai.operation.name`, which uses OpenTelemetry's value where one
+    /// applies (`chat`, `messages` and `responses` all become `chat`) and
+    /// this value verbatim otherwise. cp-api binds
     /// `/dp/telemetry` leniently and currently drops the field; persisting it
     /// and surfacing it in Logs is the control-plane half of
     /// AISIX-Cloud#1461.
@@ -936,6 +937,36 @@ impl UsageEvent {
             self.completion_tokens.saturating_add(self.reasoning_tokens)
         } else {
             self.completion_tokens
+        }
+    }
+
+    /// OTel GenAI `gen_ai.usage.input_tokens`, which includes every cached
+    /// token. An OpenAI-shape record already counts its cache hits and
+    /// writes inside `prompt_tokens`; an Anthropic-shape one keeps
+    /// `cache_read_tokens` / `cache_creation_tokens` beside it, so they are
+    /// added back — the same fold as `UsageStats::total_input_tokens`.
+    pub fn genai_input_tokens(&self) -> u32 {
+        self.prompt_tokens
+            .saturating_add(self.cache_creation_tokens)
+            .saturating_add(self.cache_read_tokens)
+    }
+
+    /// OTel GenAI `gen_ai.usage.cache_read.input_tokens`: the subset-shape
+    /// hit count or the additive-shape read count, whichever the upstream
+    /// reported (one family is always zero).
+    pub fn genai_cache_read_input_tokens(&self) -> u32 {
+        self.cached_prompt_tokens
+            .saturating_add(self.cache_read_tokens)
+    }
+
+    /// OTel GenAI `gen_ai.usage.cache_creation.input_tokens`: Anthropic's
+    /// additive write count, or the OpenAI-shape `cache_write_tokens`, which
+    /// OpenAI's usage contract places inside `prompt_tokens`. `None` when
+    /// the upstream reported neither.
+    pub fn genai_cache_creation_input_tokens(&self) -> Option<u32> {
+        match (self.cache_creation_tokens, self.cache_write_tokens) {
+            (0, None) => None,
+            (creation, write) => Some(creation.saturating_add(write.unwrap_or(0))),
         }
     }
 }

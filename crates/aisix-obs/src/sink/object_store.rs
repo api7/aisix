@@ -1064,6 +1064,9 @@ mod tests {
             prompt: "what is 2+2?".into(),
             response: "4".into(),
             truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
+            max_bytes: None,
         });
         s.append_batch(&batch_of(vec![rec]), &IdempotencyMarker::None)
             .await

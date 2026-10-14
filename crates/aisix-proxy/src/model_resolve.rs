@@ -147,6 +147,14 @@ pub(crate) fn wildcard_row_identity(
     })
 }
 
+/// The concrete upstream model a wildcard `row` dispatches for the
+/// caller-facing name `requested`, as [`resolve_model`] builds it. `None`
+/// when the row's pattern does not cover the name.
+pub(crate) fn wildcard_upstream_model(row: &Model, requested: &str) -> Option<String> {
+    let capture = wildcard_capture(&row.display_name, requested)?;
+    Some(resolve_upstream_model_name(row, &capture))
+}
+
 /// Concrete upstream model id for a wildcard match: substitute the captured
 /// segment into the `model_name` template's `*`, keep the template as-is when it
 /// has no `*` (a fixed upstream for every match), or send the captured segment
@@ -277,5 +285,15 @@ mod tests {
     fn no_match_returns_none() {
         let snap = snapshot_with(vec![("m-star", direct_model("openai/*", Some("*")))]);
         assert!(resolve_model(&snap, "anthropic/claude").is_none());
+    }
+
+    #[test]
+    fn wildcard_upstream_model_rebuilds_what_dispatch_sent() {
+        let row = direct_model("openai/*", Some("*"));
+        assert_eq!(
+            wildcard_upstream_model(&row, "openai/gpt-4o").as_deref(),
+            Some("gpt-4o")
+        );
+        assert_eq!(wildcard_upstream_model(&row, "anthropic/claude"), None);
     }
 }

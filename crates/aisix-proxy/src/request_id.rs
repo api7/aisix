@@ -213,11 +213,10 @@ pub(crate) async fn ensure_request_id(
     // or a duplicated header — degrades to a locally-rooted one, and the
     // caller's `tracestate` is only kept alongside a valid parent.
     let remote = remote_trace_context(request.headers());
-    request
-        .extensions_mut()
-        .insert(std::sync::Arc::new(aisix_obs::RequestTraceBundle::new(
-            remote,
-        )));
+    let http = server_span_request(&request);
+    request.extensions_mut().insert(std::sync::Arc::new(
+        aisix_obs::RequestTraceBundle::new(remote).with_http_server(http),
+    ));
 
     let span = tracing::info_span!(
         "request",
@@ -249,6 +248,28 @@ pub(crate) async fn ensure_request_id(
         }
     }
     response
+}
+
+/// The scheme of the listener a request arrived on — `https` behind a
+/// `tls` block, else `http`. Inserted per listener by the server; read for
+/// the SERVER span's `url.scheme`.
+#[derive(Debug, Clone, Copy)]
+pub struct DownstreamScheme(pub &'static str);
+
+/// The inbound request as the SERVER span reports it. `http.route` is set
+/// only when the path is itself one of the gateway's static routes: every
+/// other path is matched by prefix or parameter, and the HTTP conventions
+/// forbid reporting a raw path as a route.
+fn server_span_request(request: &Request) -> aisix_obs::HttpServerFacts {
+    let path = request.uri().path();
+    let label = crate::normalize_endpoint_label(path);
+    aisix_obs::HttpServerFacts::new(
+        request.method().as_str(),
+        path,
+        (label == path).then_some(label),
+        request.extensions().get::<DownstreamScheme>().map(|s| s.0),
+    )
+    .with_query(request.uri().query())
 }
 
 /// The caller's W3C trace context, when it arrived intact.
