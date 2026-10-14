@@ -23,8 +23,11 @@
 //! - score levels travel as `"label: description"` criteria, and answers come
 //!   back labelled from the request, with a level the upstream gave no
 //!   probability reported as 0;
-//! - an answer that is missing, malformed, or of the wrong type is a refusal
-//!   on the Decisions side and an absent key on the System One side;
+//! - an answer that is missing, or whose `type` is not its question's, is a
+//!   refusal on the Decisions side and an absent key on the System One side;
+//!   a response without its `answers` collection, or with an answer that
+//!   lacks a field its own type requires, fails as a whole instead, since the
+//!   upstream did not answer in its format;
 //! - anything one format has no place for is dropped.
 //!
 //! Object member order is load-bearing here (question order IS answer order on
@@ -820,19 +823,169 @@ pub(crate) fn decisions_usage(body: &Value) -> Option<DecisionUsage> {
     })
 }
 
+const UNEXPECTED: &str = "the decision upstream returned an unexpected decision response";
+
+/// `Err` naming the field when `a.<field>` is absent or fails `ok`.
+fn require(
+    a: &Value,
+    path: &str,
+    field: &str,
+    want: &str,
+    ok: fn(&Value) -> bool,
+) -> Result<(), String> {
+    match a.get(field) {
+        Some(v) if ok(v) => Ok(()),
+        _ => Err(format!(
+            "{UNEXPECTED}: `{path}.{field}` is missing or not {want}"
+        )),
+    }
+}
+
+fn number_map(v: &Value) -> bool {
+    v.as_object()
+        .is_some_and(|m| m.values().all(Value::is_number))
+}
+
+fn integer(v: &Value) -> bool {
+    v.as_i64().is_some()
+        || v.as_f64()
+            .is_some_and(|f| f.fract() == 0.0 && (i64::MIN as f64..i64::MAX as f64).contains(&f))
+}
+
+/// A Decisions response carries `model` and a `usage` with its three counts;
+/// the details objects are optional, but typed when present.
+fn check_decisions_envelope(body: &Value) -> Result<(), String> {
+    if !body.get("model").is_some_and(Value::is_string) {
+        return Err(format!("{UNEXPECTED}: `model` is missing or not a string"));
+    }
+    if !body.get("usage").is_some_and(Value::is_object) {
+        return Err(format!("{UNEXPECTED}: `usage` is missing or not an object"));
+    }
+    let usage = &body["usage"];
+    for field in ["input_tokens", "output_tokens", "total_tokens"] {
+        require(usage, "usage", field, "an integer", integer)?;
+    }
+    for (details, fields) in [
+        (
+            "input_tokens_details",
+            &["cached_tokens", "cache_write_tokens"][..],
+        ),
+        ("output_tokens_details", &["reasoning_tokens"][..]),
+    ] {
+        let Some(d) = usage.get(details) else {
+            continue;
+        };
+        if !d.is_object() {
+            return Err(format!("{UNEXPECTED}: `usage.{details}` is not an object"));
+        }
+        for field in fields {
+            if d.get(field).is_some() {
+                require(d, &format!("usage.{details}"), field, "an integer", integer)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn string_or_bool(v: &Value) -> bool {
+    v.is_string() || v.is_boolean()
+}
+
+/// Every element of the list `a.<field>` checked by `item`.
+fn require_list(
+    a: &Value,
+    path: &str,
+    field: &str,
+    item: fn(&Value, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    require(a, path, field, "a list", Value::is_array)?;
+    a[field]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .try_for_each(|(i, p)| item(p, &format!("{path}.{field}[{i}]")))
+}
+
+/// A System One answer holds every field its `type` requires.
+fn check_systemone_answer(a: &Value, path: &str) -> Result<(), String> {
+    let need = |field, want, ok| require(a, path, field, want, ok);
+    match a.get("type").and_then(Value::as_str) {
+        Some("noul") => need("noul", "a number", Value::is_number),
+        Some("choice") => {
+            need("choice", "a string", Value::is_string)?;
+            need("confidence", "a number", Value::is_number)?;
+            need("probabilities", "an object of numbers", number_map)
+        }
+        Some("score") => {
+            need("score", "a number", Value::is_number)?;
+            need("confidence", "a number", Value::is_number)?;
+            need("legend", "an object", Value::is_object)?;
+            need("probabilities", "an object of numbers", number_map)
+        }
+        _ => Err(format!(
+            "{UNEXPECTED}: `{path}.type` is missing or not one of noul, choice, score"
+        )),
+    }
+}
+
+/// A Decisions answer holds every field its `type` requires.
+fn check_decisions_answer(a: &Value, path: &str) -> Result<(), String> {
+    let need = |field, want, ok| require(a, path, field, want, ok);
+    let kind = a.get("type").and_then(Value::as_str);
+    if matches!(kind, Some("predicate" | "choice" | "score" | "refusal")) {
+        need("name", "a string or null", |v| v.is_string() || v.is_null())?;
+    }
+    match kind {
+        Some("predicate") => need("probability", "a number", Value::is_number),
+        Some("choice") => {
+            need("choice", "a string or boolean", string_or_bool)?;
+            require_list(a, path, "probabilities", |p, path| {
+                require(p, path, "value", "a string or boolean", string_or_bool)?;
+                require(p, path, "probability", "a number", Value::is_number)
+            })?;
+            need("confidence", "a number", Value::is_number)
+        }
+        Some("score") => {
+            need("score", "a number", Value::is_number)?;
+            require_list(a, path, "probabilities", |p, path| {
+                require(p, path, "value", "an integer", integer)?;
+                require(p, path, "label", "a string", Value::is_string)?;
+                require(p, path, "probability", "a number", Value::is_number)
+            })?;
+            need("confidence", "a number", Value::is_number)
+        }
+        Some("refusal") => Ok(()),
+        _ => Err(format!(
+            "{UNEXPECTED}: `{path}.type` is missing or not one of predicate, choice, score, \
+             refusal"
+        )),
+    }
+}
+
 /// Read a System One response's answers in the request's question order.
-pub(crate) fn answers_from_systemone(body: &Value, req: &Request) -> Vec<Answer> {
-    let answers = body.get("answers").and_then(Value::as_object);
-    systemone_keys(&req.questions)
+///
+/// Every answer the upstream returned must hold the fields its own type
+/// requires, or the whole response is an `Err` naming the first one that
+/// does not.
+pub(crate) fn answers_from_systemone(body: &Value, req: &Request) -> Result<Vec<Answer>, String> {
+    let answers = body
+        .get("answers")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{UNEXPECTED}: `answers` is missing or not an object"))?;
+    for (key, a) in answers {
+        check_systemone_answer(a, &format!("answers.{key}"))?;
+    }
+    Ok(systemone_keys(&req.questions)
         .iter()
         .zip(&req.questions)
         .map(|(key, q)| {
             answers
-                .and_then(|a| a.get(key))
+                .get(key)
                 .and_then(|a| systemone_answer(q, a))
                 .unwrap_or(Answer::Refusal)
         })
-        .collect()
+        .collect())
 }
 
 fn systemone_answer(q: &Question, a: &Value) -> Option<Answer> {
@@ -891,19 +1044,29 @@ fn systemone_answer(q: &Question, a: &Value) -> Option<Answer> {
     }
 }
 
-/// Read a Decisions response's answers, matched to questions by position.
-pub(crate) fn answers_from_decisions(body: &Value, req: &Request) -> Vec<Answer> {
-    let answers = body.get("answers").and_then(Value::as_array);
-    req.questions
+/// Read a Decisions response's answers, matched to questions by position,
+/// under the same rule as [`answers_from_systemone`]. Unlike System One, the
+/// format also requires `model` and `usage`.
+pub(crate) fn answers_from_decisions(body: &Value, req: &Request) -> Result<Vec<Answer>, String> {
+    check_decisions_envelope(body)?;
+    let answers = body
+        .get("answers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{UNEXPECTED}: `answers` is missing or not a list"))?;
+    for (i, a) in answers.iter().enumerate() {
+        check_decisions_answer(a, &format!("answers[{i}]"))?;
+    }
+    Ok(req
+        .questions
         .iter()
         .enumerate()
         .map(|(i, q)| {
             answers
-                .and_then(|a| a.get(i))
+                .get(i)
                 .and_then(|a| decisions_answer(q, a))
                 .unwrap_or(Answer::Refusal)
         })
-        .collect()
+        .collect())
 }
 
 fn decisions_answer(q: &Question, a: &Value) -> Option<Answer> {
@@ -933,7 +1096,9 @@ fn decisions_answer(q: &Question, a: &Value) -> Option<Answer> {
                 .as_array()?
                 .iter()
                 .filter_map(|p| {
-                    let value = p.get("value")?.as_i64()?;
+                    let value = p
+                        .get("value")
+                        .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))?;
                     let label = usize::try_from(value)
                         .ok()
                         .and_then(|i| levels.get(i))
@@ -1248,7 +1413,8 @@ mod tests {
             json!({"0":{"type":"noul","instructions":"P?"},"1":{"type":"noul","instructions":"Q?"}})
         );
         let answers =
-            answers_from_systemone(&json!({"answers":{"1":{"type":"noul","noul":0.25}}}), &req);
+            answers_from_systemone(&json!({"answers":{"1":{"type":"noul","noul":0.25}}}), &req)
+                .unwrap();
         let resp = to_value(&to_decisions_response(
             "alias",
             &req,
@@ -1278,7 +1444,8 @@ mod tests {
             &json!({"answers":{"ok":{"type":"choice","choice":"false","confidence":0.9,
                     "probabilities":{"true":0.1,"false":0.9}}}}),
             &req,
-        );
+        )
+        .unwrap();
         let resp = to_value(&to_decisions_response(
             "alias",
             &req,
@@ -1320,7 +1487,8 @@ mod tests {
                     "legend":{"0":"low: cosmetic","1":"mid","2":"high"},
                     "probabilities":{"1":0.1,"2":0.9}}}}),
             &req,
-        );
+        )
+        .unwrap();
         let resp = to_value(&to_decisions_response(
             "alias",
             &req,
@@ -1352,7 +1520,7 @@ mod tests {
              "probabilities":[{"value":0,"label":"{\"rank\":\"low\"}","probability":0.8},
                               {"value":1,"label":"high","probability":0.2}]}],
             "usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}});
-        let answers = answers_from_decisions(&body, &req);
+        let answers = answers_from_decisions(&body, &req).unwrap();
         let usage = decisions_usage(&body).unwrap();
         let resp = to_value(&to_systemone_response("alias", &req, &answers, &usage));
         assert_eq!(
@@ -1364,6 +1532,166 @@ mod tests {
                        "legend":{"0":{"rank":"low"},"1":"high"},
                        "probabilities":{"0":0.8,"1":0.2}}},
                 "usage":{"input_tokens":10,"output_tokens":2}})
+        );
+    }
+
+    /// A field the answer's own type requires is not optional: its absence
+    /// fails the whole response. Only an absent answer, or one of another
+    /// question type, is a refusal.
+    #[test]
+    fn an_answer_missing_a_required_field_fails_the_response() {
+        let usage = || json!({"input_tokens":1,"output_tokens":1,"total_tokens":2});
+        let req = parse_systemone_request(&parse(
+            r#"{"state":"s","questions":{
+                "bug":{"type":"noul","instructions":"Bug?"},
+                "team":{"type":"choice","criteria":{"billing":null,"eng":null}},
+                "sev":{"type":"score","criteria":["low","high"]}}}"#,
+        ))
+        .unwrap();
+        let choice = json!({"type":"choice","choice":"eng","confidence":1.0,
+            "probabilities":{"billing":0.0,"eng":1.0}});
+        let score = json!({"type":"score","score":1.0,"confidence":0.9,
+            "legend":{"0":"low","1":"high"},"probabilities":{"0":0.1,"1":0.9}});
+        let with = |team: &Value, sev: &Value| {
+            answers_from_systemone(
+                &json!({"answers":{"bug":{"type":"noul","noul":0.5},"team":team,"sev":sev}}),
+                &req,
+            )
+        };
+        assert!(with(&choice, &score).is_ok());
+        for (field, team, sev) in [
+            ("answers.team.confidence", "confidence", ""),
+            ("answers.team.probabilities", "probabilities", ""),
+            ("answers.team.choice", "choice", ""),
+            ("answers.sev.probabilities", "", "probabilities"),
+            ("answers.sev.legend", "", "legend"),
+            ("answers.sev.score", "", "score"),
+        ] {
+            let (mut c, mut sc) = (choice.clone(), score.clone());
+            c.as_object_mut().unwrap().remove(team);
+            sc.as_object_mut().unwrap().remove(sev);
+            let err = with(&c, &sc)
+                .err()
+                .unwrap_or_else(|| panic!("{field} accepted"));
+            assert!(err.contains(UNEXPECTED) && err.contains(field), "{err}");
+        }
+        let bad_type = with(&json!({"type":"verdict"}), &score).err().unwrap();
+        assert!(bad_type.contains("answers.team.type"), "{bad_type}");
+
+        // An absent answer and a type mismatch stay refusals.
+        let answers = answers_from_systemone(
+            &json!({"answers":{"team":{"type":"noul","noul":0.5},"sev":score}}),
+            &req,
+        )
+        .unwrap();
+        assert!(matches!(answers[0], Answer::Refusal));
+        assert!(matches!(answers[1], Answer::Refusal));
+        assert!(matches!(answers[2], Answer::Score { .. }));
+
+        let dreq = parse_decisions_request(&parse(
+            r#"{"input":"x","questions":[
+                {"type":"predicate","name":"bug","instructions":"Bug?"},
+                {"type":"choice","name":"team","instructions":"?",
+                 "choices":[{"value":"billing"},{"value":"eng"}]},
+                {"type":"score","name":"sev","instructions":"?",
+                 "levels":[{"label":"low"},{"label":"high"}]}]}"#,
+        ))
+        .unwrap();
+        let dchoice = json!({"type":"choice","name":"team","choice":"eng","confidence":1.0,
+            "probabilities":[{"value":"billing","probability":0.0},{"value":"eng","probability":1.0}]});
+        let dscore = json!({"type":"score","name":"sev","score":1.0,"confidence":0.9,
+            "probabilities":[{"value":0,"label":"low","probability":0.1},
+                             {"value":1,"label":"high","probability":0.9}]});
+        let dwith = |team: &Value, sev: &Value| {
+            answers_from_decisions(
+                &json!({"model":"gpt-x","usage":usage(),
+                        "answers":[{"type":"predicate","name":"bug","probability":0.5},team,sev]}),
+                &dreq,
+            )
+        };
+        assert!(dwith(&dchoice, &dscore).is_ok());
+        for (field, team, sev) in [
+            ("answers[1].confidence", "confidence", ""),
+            ("answers[1].probabilities", "probabilities", ""),
+            ("answers[1].name", "name", ""),
+            ("answers[2].confidence", "", "confidence"),
+            ("answers[2].score", "", "score"),
+        ] {
+            let (mut c, mut sc) = (dchoice.clone(), dscore.clone());
+            c.as_object_mut().unwrap().remove(team);
+            sc.as_object_mut().unwrap().remove(sev);
+            let err = dwith(&c, &sc)
+                .err()
+                .unwrap_or_else(|| panic!("{field} accepted"));
+            assert!(err.contains(field), "{err}");
+        }
+        let mut no_label = dscore.clone();
+        no_label["probabilities"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("label");
+        let err = dwith(&dchoice, &no_label).err().unwrap();
+        assert!(err.contains("answers[2].probabilities[1].label"), "{err}");
+
+        let answers = answers_from_decisions(
+            &json!({"model":"gpt-x","usage":usage(),
+                    "answers":[{"type":"refusal","name":"bug"},
+                               {"type":"predicate","name":"team","probability":0.5}]}),
+            &dreq,
+        )
+        .unwrap();
+        assert!(answers.iter().all(|a| matches!(a, Answer::Refusal)));
+
+        // A whole-number float is an integer level.
+        let mut float_value = dscore.clone();
+        float_value["probabilities"][1]["value"] = json!(1.0);
+        assert!(dwith(&dchoice, &float_value).is_ok());
+        float_value["probabilities"][1]["value"] = json!(1e20);
+        assert!(dwith(&dchoice, &float_value).is_err());
+
+        // No answers at all is not N refusals.
+        for body in [json!({}), json!({"answers": []})] {
+            let err = answers_from_systemone(&body, &req).err().unwrap();
+            assert!(err.contains("`answers`"), "{err}");
+        }
+        for body in [
+            json!({"model":"gpt-x","usage":usage()}),
+            json!({"model":"gpt-x","usage":usage(),"answers": {}}),
+        ] {
+            let err = answers_from_decisions(&body, &dreq).err().unwrap();
+            assert!(err.contains("`answers`"), "{err}");
+        }
+
+        // A Decisions response also needs `model` and the three usage counts;
+        // the details objects are optional.
+        let ok = json!({"model":"gpt-x","usage":usage(),"answers":[]});
+        assert!(answers_from_decisions(&ok, &dreq).is_ok());
+        for (path, field) in [
+            ("", "model"),
+            ("", "usage"),
+            ("usage", "input_tokens"),
+            ("usage", "output_tokens"),
+            ("usage", "total_tokens"),
+        ] {
+            let mut body = ok.clone();
+            let target = if path.is_empty() {
+                &mut body
+            } else {
+                &mut body[path]
+            };
+            target.as_object_mut().unwrap().remove(field);
+            let err = answers_from_decisions(&body, &dreq).err().unwrap();
+            assert!(
+                err.contains(&format!("`{field}`")) || err.contains(&format!(".{field}`")),
+                "{err}"
+            );
+        }
+        let mut bad_details = ok.clone();
+        bad_details["usage"]["input_tokens_details"] = json!({"cached_tokens":"many"});
+        let err = answers_from_decisions(&bad_details, &dreq).err().unwrap();
+        assert!(
+            err.contains("usage.input_tokens_details.cached_tokens"),
+            "{err}"
         );
     }
 

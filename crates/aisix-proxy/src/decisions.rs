@@ -563,22 +563,34 @@ async fn dispatch(
                     ))
                 })?;
                 // A converted answer is read here, inside the attempt, so a 200
-                // that is not JSON counts against the target like any other
-                // upstream fault instead of after it was marked healthy.
-                if upstream.format() != endpoint.format
-                    && serde_json::from_slice::<serde::de::IgnoredAny>(&body_bytes).is_err()
-                {
-                    return Err(ProxyError::Bridge(crate::cooldown::note_failure(
-                        tracker,
-                        model_id,
-                        cooldown_cfg,
-                        aisix_gateway::BridgeError::UpstreamDecode(
-                            "the decision upstream answered with a body that is not JSON".into(),
-                        ),
-                    )));
-                }
+                // that is not JSON, or whose answers lack a field their type
+                // requires, counts against the target like any other upstream
+                // fault instead of after it was marked healthy.
+                let answers = match converted {
+                    Ok(request) if upstream.format() != endpoint.format => {
+                        let read = serde_json::from_slice::<Value>(&body_bytes)
+                            .map_err(|_| {
+                                "the decision upstream answered with a body that is not JSON"
+                                    .to_string()
+                            })
+                            .and_then(|v| match upstream.format() {
+                                Format::SystemOne => convert::answers_from_systemone(&v, request),
+                                Format::Decisions => convert::answers_from_decisions(&v, request),
+                            });
+                        Some(read.map_err(|msg| {
+                            ProxyError::Bridge(crate::cooldown::note_failure(
+                                tracker,
+                                model_id,
+                                cooldown_cfg,
+                                aisix_gateway::BridgeError::UpstreamDecode(msg),
+                            ))
+                        })?)
+                    }
+                    _ => None,
+                };
                 Ok((
                     body_bytes,
+                    answers,
                     upstream,
                     pk.provider.clone(),
                     pk_entry.id.to_string(),
@@ -590,7 +602,7 @@ async fn dispatch(
     .await;
     let captured_prompt = content_cap.map(|_| String::from_utf8_lossy(raw).into_owned());
     let crate::routing::Dispatched {
-        value: (body_bytes, upstream, provider, pk_id, upstream_model),
+        value: (body_bytes, answers, upstream, provider, pk_id, upstream_model),
         target,
         member_reservation,
         ..
@@ -636,33 +648,25 @@ async fn dispatch(
         .commit_tokens(u64::from(usage.input) + u64::from(usage.output))
         .await;
 
-    let client_body = if upstream.format() == endpoint.format {
-        crate::model_echo::restamp_json_bytes(
+    let client_body = match (answers, &converted) {
+        (Some(answers), Ok(request)) => {
+            let doc = match endpoint.format {
+                Format::Decisions => {
+                    convert::to_decisions_response(&model_name, request, &answers, &usage)
+                }
+                Format::SystemOne => {
+                    convert::to_systemone_response(&model_name, request, &answers, &usage)
+                }
+            };
+            Bytes::from(serde_json::to_vec(&doc).unwrap_or_default())
+        }
+        _ => crate::model_echo::restamp_json_bytes(
             &body_bytes,
             &model_name,
             crate::model_echo::top_level_model,
         )
         .map(Bytes::from)
-        .unwrap_or(body_bytes)
-    } else {
-        let (Ok(v), Ok(request)) = (&parsed, &converted) else {
-            return Err(ProxyError::Bridge(
-                aisix_gateway::BridgeError::UpstreamDecode(
-                    "the decision upstream answered with a body that is not JSON".into(),
-                ),
-            ));
-        };
-        let doc = match endpoint.format {
-            Format::Decisions => {
-                let answers = convert::answers_from_systemone(v, request);
-                convert::to_decisions_response(&model_name, request, &answers, &usage)
-            }
-            Format::SystemOne => {
-                let answers = convert::answers_from_decisions(v, request);
-                convert::to_systemone_response(&model_name, request, &answers, &usage)
-            }
-        };
-        Bytes::from(serde_json::to_vec(&doc).unwrap_or_default())
+        .unwrap_or(body_bytes),
     };
 
     let captured_content = match (&captured_prompt, content_cap) {
