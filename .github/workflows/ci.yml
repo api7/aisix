@@ -378,7 +378,7 @@ jobs:
           - serving: work-stealing
             thread_per_core: "false"
     services:
-      # One etcd per vitest fork. The suite ran at maxForks=2 because
+      # One etcd per vitest fork. The suite ran at two forks because
       # 20+ files' gateways watching a SINGLE cluster pushed watch
       # dispatch past `waitConfigPropagation` (#157); the fork count is
       # derived from AISIX_E2E_ETCD_ENDPOINTS below, so removing a
@@ -441,10 +441,7 @@ jobs:
           node-version: 22
       - uses: pnpm/action-setup@v6
         with:
-          # Matches the pnpm developers run locally. The harness's
-          # `tests/e2e/pnpm-workspace.yaml` uses the `allowBuilds` key this
-          # line unlocks — pnpm 9 rejects that file outright, so the two
-          # must move together.
+          # Matches the pnpm developers run locally.
           version: 11
       - name: check harness exists
         id: harness
@@ -478,7 +475,7 @@ jobs:
           # Vector-less redis for the semantic-cache degradation suite;
           # the main 6379 service is redis:8 (vector-capable).
           AISIX_E2E_REDIS_PLAIN: redis://127.0.0.1:6377
-          # One entry per etcd service above. vitest derives maxForks
+          # One entry per etcd service above. vitest derives maxWorkers
           # from this list (see tests/e2e/vitest.config.ts), and
           # harness/etcd.ts hands each fork its own entry.
           AISIX_E2E_ETCD_ENDPOINTS: http://127.0.0.1:2379,http://127.0.0.1:2380,http://127.0.0.1:2381,http://127.0.0.1:2382

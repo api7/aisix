@@ -20,7 +20,7 @@ export default defineConfig({
     // with stable timings (audio-timeout 1283/1409/1543ms against a
     // 2800ms bound, ttft-first-frame 24.59/24.65/24.65s); if that stops
     // holding, lower the budget rather than widening the assertions.
-    // Both constraints that forced maxForks=2 are removed at the source
+    // Both constraints that forced two forks are removed at the source
     // rather than by serialising:
     //
     //   - ports: harness/ports.ts carves a disjoint port range per fork
@@ -33,15 +33,13 @@ export default defineConfig({
     //     after the budget bump). harness/etcd.ts now gives each fork
     //     its own cluster from AISIX_E2E_ETCD_ENDPOINTS, which is what
     //     CI sets; the watchers per cluster go back to what they were
-    //     at maxForks=2.
+    //     at two forks.
     //
     // The cap is DERIVED (see forkBudget) rather than written down next
     // to the endpoint list, so a shortened list cannot silently double
     // forks onto one cluster and bring #157 back.
     pool: "forks",
-    poolOptions: {
-      forks: { singleFork: false, minForks: 1, maxForks: forkBudget() },
-    },
+    maxWorkers: forkBudget(),
     testTimeout: 60_000,
     hookTimeout: 60_000,
     globals: false,

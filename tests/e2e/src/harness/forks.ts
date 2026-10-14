@@ -14,7 +14,7 @@ export function configuredEtcdEndpoints(): string[] {
  * How many vitest forks this run may use.
  *
  * One per etcd cluster, because that is the constraint that forced
- * maxForks=2 in the first place (#157: every fork's gateway watching one
+ * two forks in the first place (#157: every fork's gateway watching one
  * shared cluster blew past waitConfigPropagation). Bounded three ways:
  *
  *   - floor 2, the value the suite ran at before the split, and what a
