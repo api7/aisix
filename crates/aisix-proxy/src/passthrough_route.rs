@@ -10,12 +10,14 @@
 //! ## Envelope detection
 //!
 //! The request body's envelope is detected once per exchange from its
-//! top-level keys ([`detect_protocol`]) and drives guardrail text
-//! extraction, content capture and usage extraction for both the request
-//! and the response (buffered or streamed). Detection never affects the
-//! relay itself — bodies are forwarded verbatim regardless — and every
-//! extraction degrades to the whole lossy-UTF-8 body when the detected
-//! shape yields no text, so a mis-detected envelope loses no audit
+//! top-level keys ([`detect_protocol`]), with the `messages` envelope split
+//! into OpenAI Chat and Anthropic Messages by the request path or the
+//! `anthropic-version` header ([`refine_request_protocol`]). It drives
+//! guardrail text extraction, content capture and usage extraction for both
+//! the request and the response (buffered or streamed). Detection never
+//! affects the relay itself — bodies are forwarded verbatim regardless —
+//! and every extraction degrades to the whole lossy-UTF-8 body when the
+//! detected shape yields no text, so a mis-detected envelope loses no audit
 //! coverage. SSE upstream responses are always relayed incrementally;
 //! anything else is buffered (guardrails and usage need the whole body).
 //!
@@ -26,12 +28,22 @@
 //! capture and streams; only their `model` and a unary JSON response's
 //! token counts are read.
 //!
-//! A DETECTED envelope must observe what the typed endpoint serving that
-//! same envelope observes — every token dimension of
-//! [`aisix_obs::UsageEvent`], the caller's model alias, the guardrail text
-//! including tool calls, TTFT, and a 499 for a stream the client
-//! abandoned. Anything less makes a route a place where enforcement and
-//! metering quietly weaken.
+//! ## What a detected envelope observes
+//!
+//! Usage is read by the TYPED endpoint's own parser for the identified
+//! protocol — the response's envelope first, the request's as a fallback —
+//! so every counter carries that protocol's accounting, and a shape no
+//! typed endpoint serves gets a per-shape adapter that states its own
+//! (see [`PassthroughUsage`]). An identified LLM envelope also records the
+//! `aisix_llm_*` token families the typed endpoints record, and like them
+//! the caller's model alias, TTFT, and a 499 for a stream the client
+//! abandoned.
+//!
+//! Guardrail text and capture are deliberately WIDER than the typed
+//! endpoints' scans: the relay forwards every field of the body, so the
+//! scan reads every decoded string value and leaves out only the slots
+//! known to be opaque (media, signatures, ids), rather than parsing the
+//! body into the typed request and scanning the fields it models.
 //!
 //! ## Entry points
 //!
@@ -624,6 +636,7 @@ async fn dispatch(
         JsonProbe::Protocol(protocol) => (protocol, None),
         JsonProbe::Unevaluable(error) => (PassthroughProtocol::Raw, Some(error)),
     };
+    let protocol = refine_request_protocol(protocol, &path, &incoming_headers);
     let raw_shape = detect_raw_usage_shape(protocol, &body_bytes);
 
     // INPUT guardrails on the (envelope-extracted) request text.
@@ -1002,6 +1015,7 @@ async fn dispatch(
         status: status.as_u16(),
         usage: None,
         requested_model,
+        llm_protocol: protocol != PassthroughProtocol::Raw,
         upstream_ttft_ms: 0,
         downstream_first_ms: None,
         stream_reached_end: false,
@@ -1418,11 +1432,15 @@ enum PassthroughProtocol {
     /// see [`frame_delta`].
     Raw,
     /// OpenAI-compatible chat envelope (`messages`, streamed
-    /// `choices[].delta.content`, final-chunk / response `usage`). Also
-    /// carries Anthropic Messages traffic, whose request is the same
-    /// `messages` shape: its usage spellings and its `message_start` /
-    /// `message_delta` split are read alongside the OpenAI ones.
+    /// `choices[].delta.content`, final-chunk / response `usage`).
     OpenaiChat,
+    /// Anthropic Messages envelope: a `messages` request addressed to a
+    /// `…/messages` path or carrying `anthropic-version`
+    /// ([`refine_request_protocol`]). Its guardrail and capture scans are
+    /// the chat envelope's — those read both event shapes, which are
+    /// disjoint — so the distinction matters for usage, whose cache
+    /// counters sit BESIDE the prompt here rather than inside it.
+    AnthropicMessages,
     /// OpenAI-compatible legacy completions / FIM envelope (`prompt` [+
     /// `suffix`], streamed `choices[].text`, `usage`).
     OpenaiCompletions,
@@ -1472,6 +1490,40 @@ fn detect_protocol(body: &[u8]) -> PassthroughProtocol {
     }
 }
 
+/// Split the `messages` envelope into OpenAI Chat and Anthropic Messages,
+/// which share the request carrier. Anthropic is recognised from what its
+/// SDKs always send: the `anthropic-version` header, or a request path
+/// ending in `/messages` (`/v1/messages`, a provider-prefixed variant),
+/// where OpenAI Chat ends in `/chat/completions`. Neither signal is
+/// consulted for any other envelope.
+///
+/// This is the request-side hint; usage reads the response's own shape
+/// first ([`response_usage`], [`frame_parts`]), so a request that carries
+/// neither signal is still metered as Anthropic when the reply is one.
+fn refine_request_protocol(
+    protocol: PassthroughProtocol,
+    path: &str,
+    headers: &HeaderMap,
+) -> PassthroughProtocol {
+    if protocol == PassthroughProtocol::OpenaiChat
+        && (headers.contains_key("anthropic-version")
+            || path.trim_end_matches('/').ends_with("/messages"))
+    {
+        PassthroughProtocol::AnthropicMessages
+    } else {
+        protocol
+    }
+}
+
+/// The two `messages` envelopes, which the guardrail and capture
+/// extraction treat as one family.
+fn is_messages_family(protocol: PassthroughProtocol) -> bool {
+    matches!(
+        protocol,
+        PassthroughProtocol::OpenaiChat | PassthroughProtocol::AnthropicMessages
+    )
+}
+
 /// The concrete envelope carried by a buffered provider response. This is
 /// intentionally distinct from [`detect_protocol`]: a Chat request may
 /// receive a Responses body (and vice versa), so an output guardrail must
@@ -1516,7 +1568,7 @@ fn detect_buffered_response_protocol(body: &[u8]) -> Result<Option<PassthroughPr
     let anthropic = match raw_top_level_unique_type(body)?.as_deref() {
         Some("message") => response_top_level_array_values(body, "content")?
             .is_some()
-            .then_some(PassthroughProtocol::OpenaiChat)
+            .then_some(PassthroughProtocol::AnthropicMessages)
             .ok_or(())?,
         Some(_) | None => return select_buffered_response_protocol([output, choices, object]),
     };
@@ -1530,7 +1582,11 @@ fn select_buffered_response_protocol<const N: usize>(
     let mut selected = None;
     for candidate in candidates.into_iter().flatten() {
         if let Some(previous) = selected {
-            if previous != candidate {
+            // The two `messages` envelopes share their response selectors,
+            // so a body naming both is not a conflict for the scan; the
+            // first-named carrier stands.
+            let same_family = is_messages_family(previous) && is_messages_family(candidate);
+            if previous != candidate && !same_family {
                 return Err(());
             }
         } else {
@@ -2779,7 +2835,7 @@ fn request_guardrail_text_with_scan_error(
     let raw = || String::from_utf8_lossy(body).into_owned();
     match protocol {
         PassthroughProtocol::Raw => decoded_json_string_values(body).unwrap_or_else(raw),
-        PassthroughProtocol::OpenaiChat => {
+        PassthroughProtocol::OpenaiChat | PassthroughProtocol::AnthropicMessages => {
             // A malformed Chat carrier is unevaluable rather than a reason
             // to send its opaque media source through an input guardrail.
             match decoded_chat_request_string_values(body, scan_error) {
@@ -3214,7 +3270,7 @@ fn response_guardrail_text_with_scan_error(
     let raw = || String::from_utf8_lossy(body).into_owned();
     match protocol {
         PassthroughProtocol::Raw => decoded_json_string_values(body).unwrap_or_else(raw),
-        PassthroughProtocol::OpenaiChat => {
+        PassthroughProtocol::OpenaiChat | PassthroughProtocol::AnthropicMessages => {
             // A detected Chat response can carry opaque multimodal values.
             // Without a successful type-aware selection, relay it but do not
             // send a raw fallback to an external output guardrail.
@@ -3266,7 +3322,7 @@ fn try_response_guardrail_text(
             let text = response_guardrail_text_with_scan_error(protocol, body, &mut scan_error);
             scan_error.map_or(Ok(text), Err)
         }
-        PassthroughProtocol::OpenaiChat => {
+        PassthroughProtocol::OpenaiChat | PassthroughProtocol::AnthropicMessages => {
             let mut scan_error = None;
             let text = response_guardrail_text_with_scan_error(protocol, body, &mut scan_error);
             scan_error.map_or(Ok(text), Err)
@@ -3307,7 +3363,7 @@ fn response_visible_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
         let joined = crate::responses::responses_output_text(&v);
         return if joined.is_empty() { raw() } else { joined };
     }
-    if matches!(protocol, PassthroughProtocol::OpenaiChat) && v.get("choices").is_none() {
+    if is_messages_family(protocol) && v.get("choices").is_none() {
         let text = anthropic_message_output_text(&v);
         if !text.is_empty() {
             return text;
@@ -3318,7 +3374,7 @@ fn response_visible_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
     let texts: Vec<String> = choices
         .iter()
         .filter_map(|c| match protocol {
-            PassthroughProtocol::OpenaiChat => {
+            PassthroughProtocol::OpenaiChat | PassthroughProtocol::AnthropicMessages => {
                 c.get("message").map(|m| message_scan_text(m, false))
             }
             PassthroughProtocol::OpenaiCompletions => {
@@ -3342,14 +3398,14 @@ fn response_capture_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
 }
 
 /// Every token dimension a passthrough exchange can report, mirroring the
-/// token fields of [`aisix_obs::UsageEvent`] 1:1 so a route reports what
-/// the typed endpoint serving the same envelope would.
+/// token fields of [`aisix_obs::UsageEvent`] 1:1.
 ///
-/// Populated from the union of spellings the relayed APIs use — OpenAI's
-/// nested `*_tokens_details`, the Responses API's `input`/`output`
-/// spelling, Anthropic's separate cache counters, DeepSeek's native
-/// `prompt_cache_hit_tokens`, and the flat token object agent backends
-/// report on their own SSE event.
+/// Never filled by reading field names: each report is built by the parser
+/// of the protocol that produced it — the typed endpoint's own for an LLM
+/// envelope ([`PassthroughUsage::from_stats`]), a declared adapter for a
+/// shape no typed endpoint serves — so a counter carries that protocol's
+/// accounting (a cache hit INSIDE the prompt on the OpenAI shape, cache
+/// counters BESIDE it on the Anthropic one).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PassthroughUsage {
     prompt_tokens: u32,
@@ -3366,6 +3422,20 @@ struct PassthroughUsage {
 }
 
 impl PassthroughUsage {
+    /// One report as the typed endpoint's parser read it.
+    fn from_stats(u: &aisix_gateway::UsageStats) -> Self {
+        Self {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            cached_prompt_tokens: u.cached_prompt_tokens,
+            cache_write_tokens: u.cache_write_tokens,
+            reasoning_tokens: u.reasoning_tokens,
+            cache_creation_tokens: u.cache_creation_tokens,
+            cache_read_tokens: u.cache_read_tokens,
+            upstream_total_tokens: (u.upstream_total_tokens > 0).then_some(u.upstream_total_tokens),
+        }
+    }
+
     /// Field-wise max, the accumulation the typed streaming paths use.
     ///
     /// One stream reports usage across several frames — Anthropic's
@@ -3400,7 +3470,20 @@ fn merge_usage(acc: &mut Option<PassthroughUsage>, report: PassthroughUsage) {
     }
 }
 
-/// `usage` figures from a buffered protocol-aware response body.
+/// An OpenAI-shape `usage` object, read exactly as `/v1/chat/completions`
+/// reads it from an OpenAI-compatible upstream.
+fn openai_chat_usage(usage: &serde_json::Value) -> Option<PassthroughUsage> {
+    let wire: aisix_provider_openai::wire::OpenAiUsage =
+        serde_json::from_value(usage.clone()).ok()?;
+    Some(PassthroughUsage::from_stats(
+        &aisix_provider_openai::wire::into_usage(wire),
+    ))
+}
+
+/// `usage` from a buffered response, by the parser of the envelope the
+/// RESPONSE carries — the request protocol only when the response names
+/// none — so an Anthropic reply is metered as one whichever request hint
+/// reached it.
 fn response_usage(
     protocol: PassthroughProtocol,
     raw_shape: Option<RawUsageShape>,
@@ -3412,21 +3495,33 @@ fn response_usage(
     let v = serde_json::from_slice::<serde_json::Value>(body).ok()?;
     match raw_shape {
         Some(RawUsageShape::Rerank) => {
-            crate::rerank::rerank_prompt_tokens(&v).map(|prompt_tokens| PassthroughUsage {
+            return crate::rerank::rerank_prompt_tokens(&v).map(|prompt_tokens| PassthroughUsage {
                 prompt_tokens,
                 ..PassthroughUsage::default()
             })
         }
-        Some(RawUsageShape::DashscopeNative) => dashscope_native_usage(v.get("usage")?),
-        None => usage_of(v.get("usage")?),
+        Some(RawUsageShape::DashscopeNative) => return dashscope_native_usage(v.get("usage")?),
+        None => {}
     }
+    let wire = detect_buffered_response_protocol(body)
+        .ok()
+        .flatten()
+        .unwrap_or(protocol);
+    let stats = match wire {
+        PassthroughProtocol::Raw => None,
+        PassthroughProtocol::OpenaiChat => return openai_chat_usage(v.get("usage")?),
+        PassthroughProtocol::AnthropicMessages => crate::messages::anthropic_usage_stats(&v),
+        PassthroughProtocol::OpenaiCompletions => crate::completions::completion_usage_stats(&v),
+        PassthroughProtocol::OpenaiResponses => crate::responses::response_usage_stats(&v),
+    };
+    stats.as_ref().map(PassthroughUsage::from_stats)
 }
 
-/// Token counts from a DashScope native response's top-level `usage`.
+/// Token counts from a DashScope native response's top-level `usage` — a
+/// shape no typed endpoint serves, so this adapter declares its own
+/// semantics.
 ///
-/// Every dimension the generic reader knows (cache hit, reasoning, …) is
-/// read by [`usage_of`]; only prompt and completion follow DashScope's own
-/// arithmetic. The flat `image_tokens` means different things per service:
+/// The flat `image_tokens` means different things per service:
 /// multimodal generation counts it inside `input_tokens`
 /// (`{input_tokens: 79, image_tokens: 66, output_tokens: 14,
 /// total_tokens: 93}`), while the multimodal embedding and rerank services
@@ -3436,101 +3531,124 @@ fn response_usage(
 /// models omit it, and those report images beside the text), prompt is
 /// `input_tokens` (or `prompt_tokens`) plus the flat `image_tokens`. A
 /// nested `input_tokens_details.image_tokens` is a breakdown already inside
-/// `input_tokens` and is never added.
+/// `input_tokens` and is never added. The cache hit and reasoning count
+/// are OpenAI-style subsets of prompt and completion.
 fn dashscope_native_usage(usage: &serde_json::Value) -> Option<PassthroughUsage> {
+    let num = |v: Option<&serde_json::Value>| {
+        v.and_then(serde_json::Value::as_u64)
+            .map(|n| n.min(u32::MAX as u64) as u32)
+    };
+    let flat = |k: &str| num(usage.get(k));
+    let detail = |parents: [&str; 2], child: &str| {
+        parents
+            .iter()
+            .find_map(|p| num(usage.get(*p).and_then(|d| d.get(child))))
+    };
+    let completion = flat("output_tokens").or_else(|| flat("completion_tokens"));
+    let prompt = match flat("total_tokens") {
+        Some(total) => Some(total.saturating_sub(completion.unwrap_or(0))),
+        None => {
+            let input = flat("input_tokens").or_else(|| flat("prompt_tokens"));
+            let image = flat("image_tokens");
+            (input.is_some() || image.is_some())
+                .then(|| input.unwrap_or(0).saturating_add(image.unwrap_or(0)))
+        }
+    };
+    let cached = detail(
+        ["prompt_tokens_details", "input_tokens_details"],
+        "cached_tokens",
+    );
+    let reasoning = detail(
+        ["completion_tokens_details", "output_tokens_details"],
+        "reasoning_tokens",
+    );
+    if prompt.is_none() && completion.is_none() && cached.is_none() && reasoning.is_none() {
+        return None;
+    }
+    Some(PassthroughUsage {
+        prompt_tokens: prompt.unwrap_or(0),
+        completion_tokens: completion.unwrap_or(0),
+        cached_prompt_tokens: cached.unwrap_or(0),
+        reasoning_tokens: reasoning.unwrap_or(0),
+        upstream_total_tokens: flat("total_tokens"),
+        ..PassthroughUsage::default()
+    })
+}
+
+/// A usage object on an OPAQUE stream, which offers no envelope to say
+/// which protocol produced it — so the object's own carrier fields
+/// identify one, and that protocol's parser reads it whole:
+///
+/// - `prompt_tokens` / `completion_tokens` beside Anthropic-named cache
+///   counters (`cache_read_input_tokens`, `cache_creation_input_tokens`):
+///   the agent-backend token report, [`agent_token_usage`];
+/// - `prompt_tokens` / `completion_tokens` otherwise: OpenAI Chat;
+/// - `input_tokens` / `output_tokens` beside those cache counters:
+///   Anthropic Messages;
+/// - `input_tokens` / `output_tokens` otherwise: OpenAI Responses (the
+///   DashScope native stream reports this spelling too).
+///
+/// Anything else is no report, which keeps a `usage`-shaped object that is
+/// not one from minting zeros.
+fn opaque_usage_report(usage: &serde_json::Value) -> Option<PassthroughUsage> {
+    let has = |k: &str| usage.get(k).is_some();
+    let anthropic_cache = has("cache_read_input_tokens") || has("cache_creation_input_tokens");
+    if has("prompt_tokens") || has("completion_tokens") {
+        if anthropic_cache {
+            agent_token_usage(usage)
+        } else {
+            openai_chat_usage(usage)
+        }
+    } else if has("input_tokens") || has("output_tokens") {
+        let body = serde_json::json!({ "usage": usage });
+        let stats = if anthropic_cache {
+            crate::messages::anthropic_usage_stats(&body)
+        } else {
+            crate::responses::response_usage_stats(&body)
+        };
+        stats.as_ref().map(PassthroughUsage::from_stats)
+    } else {
+        None
+    }
+}
+
+/// The flat token report an IDE agent backend puts on its own
+/// `event: token_usage` frame — no typed endpoint serves it, so this
+/// adapter declares its semantics:
+///
+/// ```text
+/// {"prompt_tokens":14603,"completion_tokens":8,"total_tokens":14611,
+///  "cache_creation_input_tokens":0,"cache_read_input_tokens":14272,
+///  "reasoning_tokens":8}
+/// ```
+///
+/// `total_tokens` is `prompt + completion`, so the prompt is the WHOLE
+/// input and the cache read is a subset of it, as is the reasoning of the
+/// completion: OpenAI accounting under Anthropic-style names. The cache
+/// read is therefore the subset `cached_prompt_tokens`, and the cache write
+/// the subset `cache_write_tokens`. The write's placement is an inference:
+/// every captured report carried `0` for it, and the backend reporting the
+/// prompt as total input says it is inside the prompt too.
+fn agent_token_usage(usage: &serde_json::Value) -> Option<PassthroughUsage> {
     let num = |k: &str| {
         usage
             .get(k)
             .and_then(serde_json::Value::as_u64)
             .map(|n| n.min(u32::MAX as u64) as u32)
     };
-    let completion = num("output_tokens").or_else(|| num("completion_tokens"));
-    let prompt = match num("total_tokens") {
-        Some(total) => Some(total.saturating_sub(completion.unwrap_or(0))),
-        None => {
-            let input = num("input_tokens").or_else(|| num("prompt_tokens"));
-            let image = num("image_tokens");
-            (input.is_some() || image.is_some())
-                .then(|| input.unwrap_or(0).saturating_add(image.unwrap_or(0)))
-        }
-    };
-    let generic = usage_of(usage);
-    if prompt.is_none() && completion.is_none() && generic.is_none() {
+    let prompt = num("prompt_tokens");
+    let completion = num("completion_tokens");
+    if prompt.is_none() && completion.is_none() {
         return None;
     }
     Some(PassthroughUsage {
         prompt_tokens: prompt.unwrap_or(0),
         completion_tokens: completion.unwrap_or(0),
+        cached_prompt_tokens: num("cache_read_input_tokens").unwrap_or(0),
+        cache_write_tokens: num("cache_creation_input_tokens"),
+        reasoning_tokens: num("reasoning_tokens").unwrap_or(0),
         upstream_total_tokens: num("total_tokens"),
-        ..generic.unwrap_or_default()
-    })
-}
-
-/// Read every token dimension out of one `usage` object (or, for the
-/// labelled frame of an opaque stream, a flat token object).
-///
-/// The spellings are read as a union rather than per protocol because a
-/// passthrough route relays whichever API the caller addressed: the same
-/// route carries an OpenAI chat envelope, an Anthropic one, and an agent
-/// backend's private shape. They do not collide — each name belongs to
-/// exactly one API — so reading them all costs nothing and a detected
-/// envelope reports what its typed endpoint would.
-///
-/// `None` when the object carries no recognised counter at all, which is
-/// what keeps a `usage`-shaped object that is not a usage report from
-/// minting zeros.
-fn usage_of(usage: &serde_json::Value) -> Option<PassthroughUsage> {
-    let num = |v: Option<&serde_json::Value>| {
-        v.and_then(serde_json::Value::as_u64)
-            .map(|n| n.min(u32::MAX as u64) as u32)
-    };
-    // Flat counter under any of `names`, first hit wins.
-    let flat = |names: &[&str]| names.iter().find_map(|n| num(usage.get(*n)));
-    // `parent.child` counter, e.g. `prompt_tokens_details.cached_tokens`.
-    let nested = |parent: &str, child: &str| num(usage.get(parent).and_then(|d| d.get(child)));
-
-    let prompt = flat(&["prompt_tokens", "input_tokens"]);
-    let completion = flat(&["completion_tokens", "output_tokens"]);
-    // OpenAI nests the cache hit under `prompt_tokens_details`, the
-    // Responses API under `input_tokens_details`, DeepSeek reports it flat
-    // as `prompt_cache_hit_tokens`. A nested ZERO must not mask a real
-    // native count (the typed OpenAI bridge takes the same precedence).
-    let cached_prompt = nested("prompt_tokens_details", "cached_tokens")
-        .filter(|&n| n > 0)
-        .or_else(|| nested("input_tokens_details", "cached_tokens").filter(|&n| n > 0))
-        .or_else(|| flat(&["prompt_cache_hit_tokens", "cached_tokens"]));
-    let cache_write = nested("prompt_tokens_details", "cache_write_tokens")
-        .or_else(|| nested("input_tokens_details", "cache_write_tokens"));
-    let reasoning = nested("completion_tokens_details", "reasoning_tokens")
-        .filter(|&n| n > 0)
-        .or_else(|| nested("output_tokens_details", "reasoning_tokens").filter(|&n| n > 0))
-        .or_else(|| flat(&["reasoning_tokens"]));
-    // Anthropic's two cache counters sit beside `input_tokens`, and are
-    // ADDITIVE to it rather than a subset.
-    let cache_creation = flat(&["cache_creation_input_tokens", "cache_creation_tokens"]);
-    let cache_read = flat(&["cache_read_input_tokens", "cache_read_tokens"]);
-
-    let dims = [
-        prompt,
-        completion,
-        cached_prompt,
-        cache_write,
-        reasoning,
-        cache_creation,
-        cache_read,
-    ];
-    if dims.iter().all(Option::is_none) {
-        return None;
-    }
-    Some(PassthroughUsage {
-        prompt_tokens: prompt.unwrap_or(0),
-        completion_tokens: completion.unwrap_or(0),
-        cached_prompt_tokens: cached_prompt.unwrap_or(0),
-        cache_write_tokens: cache_write,
-        reasoning_tokens: reasoning.unwrap_or(0),
-        cache_creation_tokens: cache_creation.unwrap_or(0),
-        cache_read_tokens: cache_read.unwrap_or(0),
-        upstream_total_tokens: flat(&["total_tokens"]),
+        ..PassthroughUsage::default()
     })
 }
 
@@ -3858,26 +3976,6 @@ fn is_usage_labelled_frame(frame: &[u8]) -> bool {
     })
 }
 
-/// Text a guardrail scans from one SSE frame, per the protocol hint, plus
-/// a usage probe on the same parsed payload.
-///
-/// Usage is read from, in order of specificity:
-///
-/// - the payload's own top-level `usage` object (every OpenAI-shape
-///   stream, and Anthropic's terminal `message_delta`);
-/// - `message.usage` on an Anthropic `message_start`, which is where the
-///   input and cache counters arrive — its `message_delta` reports only
-///   the output ones, so reading just the top level loses the prompt side
-///   of every Anthropic stream;
-/// - `response.usage` on a Responses stream's terminal event;
-/// - for an OPAQUE (`Raw`) stream only, a FLAT token object on a frame the
-///   server labelled a usage report (`event: token_usage`). An opaque
-///   stream has no envelope to authenticate a payload against, so the
-///   server's own label is the evidence — a payload that merely happens to
-///   carry token-shaped fields must never mint billed tokens.
-///
-/// Frames accumulate field-wise (see [`PassthroughUsage::merge`]) at the
-/// call site, so a partial report never truncates an earlier one.
 /// The upstream failure an SSE frame reports in-band, read with the same
 /// mappings the typed endpoints use for the protocol the route carries. An
 /// opaque (`Raw`) stream has no error envelope the gateway could recognise.
@@ -3896,7 +3994,9 @@ fn frame_in_band_error(
         PassthroughProtocol::OpenaiResponses => crate::responses::responses_in_band_error(&value),
         // The chat envelope carries Anthropic Messages traffic too, whose
         // in-band failure is a `type: "error"` event.
-        PassthroughProtocol::OpenaiChat | PassthroughProtocol::OpenaiCompletions => {
+        PassthroughProtocol::OpenaiChat
+        | PassthroughProtocol::AnthropicMessages
+        | PassthroughProtocol::OpenaiCompletions => {
             if value.get("type").and_then(|t| t.as_str()) == Some("error") {
                 if let Some(body) = value.get("error").and_then(|e| {
                     serde_json::from_value::<
@@ -4871,7 +4971,9 @@ fn stream_source_continuations(
                 }])
             }
         }
-        PassthroughProtocol::OpenaiChat => chat_choice_source_continuations(payload),
+        PassthroughProtocol::OpenaiChat | PassthroughProtocol::AnthropicMessages => {
+            chat_choice_source_continuations(payload)
+        }
         PassthroughProtocol::OpenaiCompletions => completions_source_continuations(payload),
         PassthroughProtocol::OpenaiResponses => responses_source_continuations(payload),
     }
@@ -4950,7 +5052,7 @@ fn frame_guardrail_supplemental_values(
     match protocol {
         // The raw source continuation is the complete decoded payload.
         PassthroughProtocol::Raw => Ok(Vec::new()),
-        PassthroughProtocol::OpenaiChat => {
+        PassthroughProtocol::OpenaiChat | PassthroughProtocol::AnthropicMessages => {
             decoded_chat_frame_supplemental_values(payload.as_bytes()).ok_or(())
         }
         PassthroughProtocol::OpenaiCompletions => Ok(Vec::new()),
@@ -4981,7 +5083,7 @@ fn frame_guardrail_values(protocol: PassthroughProtocol, frame: &[u8]) -> Vec<St
             decoded_json_string_values_vec_where(payload.as_bytes(), |_| true)
                 .unwrap_or_else(|| vec![payload.to_string()])
         }
-        PassthroughProtocol::OpenaiChat => {
+        PassthroughProtocol::OpenaiChat | PassthroughProtocol::AnthropicMessages => {
             decoded_chat_frame_values(payload.as_bytes()).unwrap_or_default()
         }
         PassthroughProtocol::OpenaiCompletions => Vec::new(),
@@ -5008,7 +5110,7 @@ fn frame_guardrail_text(protocol: PassthroughProtocol, frame: &[u8]) -> String {
         PassthroughProtocol::Raw => {
             decoded_json_string_values(payload.as_bytes()).unwrap_or_else(|| payload.to_string())
         }
-        PassthroughProtocol::OpenaiChat => {
+        PassthroughProtocol::OpenaiChat | PassthroughProtocol::AnthropicMessages => {
             // A detected Chat frame can carry opaque multimodal values.
             // Without a successful type-aware selection, relay it but do not
             // send a raw fallback to an external output guardrail.
@@ -5054,7 +5156,7 @@ fn stream_guardrail_text(
     continuation: String,
 ) -> StreamGuardrailText {
     let payload = crate::redact::frame_payload(frame);
-    let hidden_reasoning = matches!(protocol, PassthroughProtocol::OpenaiChat)
+    let hidden_reasoning = is_messages_family(protocol)
         && payload.as_ref().is_some_and(|payload| {
             hidden_chat_stream_reasoning_frame(payload.trim().as_bytes()) == Some(true)
         });
@@ -5069,7 +5171,7 @@ fn stream_guardrail_text(
         || (matches!(protocol, PassthroughProtocol::OpenaiResponses) && !responses_visible_carrier)
     {
         String::new()
-    } else if matches!(protocol, PassthroughProtocol::OpenaiChat) {
+    } else if is_messages_family(protocol) {
         // `frame_parts` retains text-shaped fields for capture and hold-back,
         // including ones on opaque multimodal parts. Its raw scan text must
         // not make such a part an external-guardrail candidate or prevent a
@@ -5369,6 +5471,15 @@ fn stream_guardrail_scan_text(
 /// into what the output guardrails scan and what only counts toward the
 /// hold-back cap, plus any usage it reports. The scan and the cap read the
 /// same extraction, so they cannot disagree about a frame (#513).
+///
+/// Usage on a detected envelope is read by the typed endpoint's own
+/// per-event parser. On an OPAQUE (`Raw`) stream only an explicit `usage`
+/// object is read ([`opaque_usage_report`]), plus a flat token object on a
+/// frame the server labelled a usage report (`event: token_usage`): an
+/// opaque stream has no envelope to authenticate a payload against, so the
+/// server's own label is the evidence — a payload that merely happens to
+/// carry token-shaped fields must never mint billed tokens. Frames
+/// accumulate field-wise ([`PassthroughUsage::merge`]) at the call site.
 fn frame_parts(
     protocol: PassthroughProtocol,
     frame: &[u8],
@@ -5402,14 +5513,14 @@ fn frame_parts(
             // turn a valid deeply nested escaped string into raw source text
             // and let it bypass an output guardrail.
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
-                // An explicit `usage` object is self-describing even for an
-                // opaque stream. A server-labelled event additionally
-                // permits the flat agent-backend usage shape below.
-                if let Some(u) = v.get("usage").and_then(usage_of) {
+                // An explicit `usage` object identifies its own protocol
+                // even on an opaque stream. A server-labelled event
+                // additionally permits a flat token object at the root.
+                if let Some(u) = v.get("usage").and_then(opaque_usage_report) {
                     merge(u);
                 }
                 if usage_labelled {
-                    if let Some(u) = usage_of(&v) {
+                    if let Some(u) = opaque_usage_report(&v) {
                         merge(u);
                     }
                 }
@@ -5437,46 +5548,37 @@ fn frame_parts(
             );
             break 'payload;
         };
-        if let Some(u) = v.get("usage").and_then(usage_of) {
+        // Each frame is read by the typed endpoint's parser for the
+        // protocol that frame belongs to. Anthropic events are identified
+        // by their own `type` (disjoint from an OpenAI chunk's), so a chat
+        // hint that reached an Anthropic upstream still meters it as one.
+        let report = match protocol {
+            PassthroughProtocol::Raw => unreachable!("handled before typed frame parsing"),
+            PassthroughProtocol::OpenaiChat | PassthroughProtocol::AnthropicMessages => {
+                match crate::messages::anthropic_stream_usage_stats(&v) {
+                    Some(stats) => Some(PassthroughUsage::from_stats(&stats)),
+                    None => v.get("usage").and_then(openai_chat_usage),
+                }
+            }
+            PassthroughProtocol::OpenaiCompletions => {
+                crate::completions::completion_usage_stats(&v)
+                    .as_ref()
+                    .map(PassthroughUsage::from_stats)
+            }
+            PassthroughProtocol::OpenaiResponses => {
+                crate::responses::responses_terminal_usage_stats(&v)
+                    .as_ref()
+                    .map(PassthroughUsage::from_stats)
+            }
+        };
+        if let Some(u) = report {
             merge(u);
-        }
-        // Anthropic opens its stream with the prompt + cache counters
-        // nested on `message_start`. Gated on the event type so no other
-        // envelope's `message` object can be read as usage.
-        if v.get("type").and_then(|t| t.as_str()) == Some("message_start") {
-            if let Some(u) = v
-                .get("message")
-                .and_then(|m| m.get("usage"))
-                .and_then(usage_of)
-            {
-                merge(u);
-            }
-        }
-        if matches!(protocol, PassthroughProtocol::OpenaiResponses) {
-            // Responses streams carry usage on the terminal
-            // `response.completed` event's embedded response object. Read
-            // that shape ONLY here: another protocol's frame that happens
-            // to nest `response.usage` must not be read as usage.
-            if let Some(u) = v
-                .get("response")
-                .and_then(|r| r.get("usage"))
-                .and_then(usage_of)
-            {
-                merge(u);
-            }
-        }
-        if usage_labelled {
-            // The agent-backend shape: a flat token object on the
-            // server's own usage event, with no `usage` wrapper.
-            if let Some(u) = usage_of(&v) {
-                merge(u);
-            }
         }
         parts = match protocol {
             PassthroughProtocol::Raw => unreachable!("handled before typed frame parsing"),
             // The chat envelope also carries Anthropic Messages streams; the
             // two event shapes are disjoint, so reading both is exact.
-            PassthroughProtocol::OpenaiChat => {
+            PassthroughProtocol::OpenaiChat | PassthroughProtocol::AnthropicMessages => {
                 let mut p = crate::held_content::chat_chunk_parts(&v);
                 let a = crate::held_content::anthropic_event_parts(&v);
                 p.scan.push_str(&a.scan);
@@ -5813,7 +5915,7 @@ fn stream_response(
                         }
                     }
                 }
-                if anthropic.is_none() && matches!(protocol, PassthroughProtocol::OpenaiChat) {
+                if anthropic.is_none() && is_messages_family(protocol) {
                     anthropic = anthropic_stream_frame(&frame);
                 }
                 if let Some(err) = frame_in_band_error(protocol, &frame) {
@@ -6172,7 +6274,7 @@ fn stream_response(
                         yield Ok(Bytes::from(rest));
                     }
                     None => {
-                if anthropic.is_none() && matches!(protocol, PassthroughProtocol::OpenaiChat) {
+                if anthropic.is_none() && is_messages_family(protocol) {
                     anthropic = anthropic_stream_frame(&rest);
                 }
                 let (parts, usage) = frame_parts(protocol, &rest);
@@ -6572,6 +6674,11 @@ struct RouteTelemetry {
     /// serving that envelope records. Empty for an opaque body, whose
     /// `model`-shaped key means nothing the gateway can trust.
     requested_model: String,
+    /// Whether the exchange was identified as one of the LLM envelopes, whose
+    /// token counts the `aisix_llm_*` token families record as the typed
+    /// endpoint does. An opaque body — including the rerank and DashScope
+    /// shapes — stays out of them.
+    llm_protocol: bool,
     /// Time from the START OF THE ATTEMPT to the upstream's first streamed
     /// frame. Zero on the buffered path, where there is none.
     upstream_ttft_ms: u32,
@@ -6731,6 +6838,8 @@ impl RouteTelemetry {
             Some(AccessLogTokens {
                 prompt: usage.prompt_tokens,
                 completion: usage.completion_tokens,
+                cache_creation: usage.cache_creation_tokens,
+                cache_read: usage.cache_read_tokens,
             }),
             (!self.error_class.is_empty())
                 .then_some((self.error_class.as_str(), self.error_message.as_str())),
@@ -6817,6 +6926,44 @@ impl RouteTelemetry {
         )
         .into_owned();
 
+        if self.llm_protocol {
+            // The token families the typed endpoints record. A route
+            // resolves no Model, so `model` is the caller's body alias
+            // bounded the way the usage event's label is (an unregistered
+            // name folds to `unresolved`), and there is no dispatched
+            // upstream model to name. No spend: a route prices nothing.
+            crate::request_metrics::record_usage(
+                &self.state,
+                ENDPOINT_LABEL,
+                caller.as_caller(),
+                crate::request_metrics::Upstream {
+                    provider: &self.provider_label,
+                    model: &usage_model,
+                    pk: pk.labels(),
+                    ..Default::default()
+                },
+                crate::request_metrics::Tokens {
+                    input: usage.prompt_tokens,
+                    output: usage.completion_tokens,
+                    total: crate::usage_attr::total_tokens_with_cache(
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        usage.cache_creation_tokens,
+                        usage.cache_read_tokens,
+                    )
+                    .min(u64::from(u32::MAX)) as u32,
+                    cached: usage.cached_prompt_tokens,
+                    cache_read: usage.cache_read_tokens,
+                    cache_creation: usage.cache_creation_tokens,
+                    spend_usd: 0.0,
+                    client_type: self
+                        .state
+                        .client_classifier
+                        .classify(&self.client_user_agent),
+                },
+            );
+        }
+
         // Captured content rides ONLY on the exporter fan-out, per the
         // content_mode invariant (never the CP telemetry path).
         let content = match (&self.captured_prompt, self.content_cap) {
@@ -6883,6 +7030,8 @@ fn copy_safe_headers(src: &HeaderMap, dst: &mut HeaderMap) {
 struct AccessLogTokens {
     prompt: u32,
     completion: u32,
+    cache_creation: u32,
+    cache_read: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6921,9 +7070,16 @@ fn emit_access_log(
         api_key_id: Some(api_key_id),
         prompt_tokens: tokens.as_ref().map(|t| u64::from(t.prompt)),
         completion_tokens: tokens.as_ref().map(|t| u64::from(t.completion)),
-        total_tokens: tokens
-            .as_ref()
-            .map(|t| u64::from(t.prompt) + u64::from(t.completion)),
+        // Cache-inclusive, as every typed endpoint's line computes it: the
+        // Anthropic shape keeps its cache counters outside `prompt`.
+        total_tokens: tokens.as_ref().map(|t| {
+            crate::usage_attr::total_tokens_with_cache(
+                t.prompt,
+                t.completion,
+                t.cache_creation,
+                t.cache_read,
+            )
+        }),
         request_id,
         provider_request_id: None,
         served_by_model: None,
@@ -7652,11 +7808,11 @@ mod tests {
     /// no upstream stated.
     #[test]
     fn merged_usage_keeps_a_total_only_while_every_report_carries_one() {
-        let with = usage_of(
+        let with = openai_chat_usage(
             &serde_json::json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}),
         )
         .unwrap();
-        let without = usage_of(&serde_json::json!({"output_tokens": 5})).unwrap();
+        let without = openai_chat_usage(&serde_json::json!({"completion_tokens": 5})).unwrap();
         assert_eq!(with.upstream_total_tokens, Some(10));
         assert_eq!(without.upstream_total_tokens, None);
 
@@ -7669,8 +7825,13 @@ mod tests {
         assert_eq!(acc.unwrap().upstream_total_tokens, None);
     }
 
+    /// A usage object on an opaque stream is read whole by the parser of the
+    /// protocol its own carrier fields name, so one counter name never
+    /// decides a meaning on its own: `cache_read_input_tokens` is additive
+    /// beside Anthropic's `input_tokens` and a subset of an agent backend's
+    /// whole-input `prompt_tokens`.
     #[test]
-    fn usage_of_reads_every_dimension_in_every_spelling() {
+    fn opaque_usage_report_reads_each_shape_with_its_protocol_s_parser() {
         // OpenAI chat: the cache hit is nested under `prompt_tokens_details`
         // and the reasoning count under `completion_tokens_details`.
         let openai = serde_json::json!({
@@ -7680,7 +7841,7 @@ mod tests {
             "completion_tokens_details": {"reasoning_tokens": 12},
         });
         assert_eq!(
-            usage_of(&openai),
+            opaque_usage_report(&openai),
             Some(PassthroughUsage {
                 prompt_tokens: 100,
                 completion_tokens: 20,
@@ -7699,7 +7860,7 @@ mod tests {
             "output_tokens_details": {"reasoning_tokens": 4},
         });
         assert_eq!(
-            usage_of(&responses),
+            opaque_usage_report(&responses),
             Some(PassthroughUsage {
                 prompt_tokens: 30,
                 completion_tokens: 9,
@@ -7717,7 +7878,7 @@ mod tests {
             "cache_read_input_tokens": 1200,
         });
         assert_eq!(
-            usage_of(&anthropic),
+            opaque_usage_report(&anthropic),
             Some(PassthroughUsage {
                 prompt_tokens: 11,
                 completion_tokens: 5,
@@ -7728,37 +7889,47 @@ mod tests {
         );
 
         // DeepSeek reports the cache hit flat, and a ZEROED nested detail
-        // must not mask it (same precedence the typed OpenAI bridge uses).
+        // must not mask it (the typed OpenAI reader's precedence).
         let deepseek = serde_json::json!({
             "prompt_tokens": 40,
             "completion_tokens": 6,
             "prompt_tokens_details": {"cached_tokens": 0},
             "prompt_cache_hit_tokens": 32,
         });
-        assert_eq!(usage_of(&deepseek).unwrap().cached_prompt_tokens, 32);
+        assert_eq!(
+            opaque_usage_report(&deepseek).unwrap().cached_prompt_tokens,
+            32
+        );
 
-        // The flat agent-backend shape, all five dimensions at the root.
-        let flat = serde_json::json!({
+        // The agent-backend report: whole-input `prompt_tokens`, so both
+        // Anthropic-named cache counters are subsets of it.
+        let agent = serde_json::json!({
             "prompt_tokens": 14603,
             "completion_tokens": 8,
+            "total_tokens": 14611,
             "cache_creation_input_tokens": 0,
             "cache_read_input_tokens": 14272,
             "reasoning_tokens": 8,
         });
         assert_eq!(
-            usage_of(&flat),
+            opaque_usage_report(&agent),
             Some(PassthroughUsage {
                 prompt_tokens: 14603,
                 completion_tokens: 8,
-                cache_read_tokens: 14272,
+                cached_prompt_tokens: 14272,
+                cache_write_tokens: Some(0),
                 reasoning_tokens: 8,
+                upstream_total_tokens: Some(14611),
                 ..Default::default()
             })
         );
 
         // An object with no recognised counter mints nothing.
-        assert_eq!(usage_of(&serde_json::json!({"disk": "80%"})), None);
-        assert_eq!(usage_of(&serde_json::Value::Null), None);
+        assert_eq!(
+            opaque_usage_report(&serde_json::json!({"disk": "80%"})),
+            None
+        );
+        assert_eq!(opaque_usage_report(&serde_json::Value::Null), None);
     }
 
     #[test]
@@ -7947,7 +8118,9 @@ mod tests {
             .expect("a server-labelled usage frame must report usage");
         assert_eq!(usage.prompt_tokens, 14603);
         assert_eq!(usage.completion_tokens, 8);
-        assert_eq!(usage.cache_read_tokens, 14272);
+        // A subset of the whole-input prompt, not an additive cache read.
+        assert_eq!(usage.cached_prompt_tokens, 14272);
+        assert_eq!(usage.cache_read_tokens, 0);
         assert_eq!(usage.reasoning_tokens, 8);
 
         // The same flat shape on a frame the server did NOT name a usage
@@ -9789,19 +9962,67 @@ mod tests {
         }
     }
 
+    /// A buffered response is metered by the parser of the envelope it
+    /// carries, the request hint only standing in when it names none.
     #[test]
-    fn response_usage_reads_both_spellings() {
-        let openai = br#"{"usage":{"prompt_tokens":5,"completion_tokens":2}}"#;
+    fn response_usage_follows_the_response_envelope() {
+        let openai = br#"{"object":"chat.completion","choices":[],"usage":{"prompt_tokens":50,"completion_tokens":2,"total_tokens":52,"prompt_tokens_details":{"cached_tokens":40}}}"#;
         assert_eq!(
             response_usage(PassthroughProtocol::OpenaiChat, None, openai),
-            Some(usage_dims(5, 2))
+            Some(PassthroughUsage {
+                cached_prompt_tokens: 40,
+                upstream_total_tokens: Some(52),
+                ..usage_dims(50, 2)
+            })
         );
-        let anthropicish = br#"{"usage":{"input_tokens":9,"output_tokens":4}}"#;
+        let anthropic = br#"{"type":"message","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":9,"output_tokens":4,"cache_creation_input_tokens":100,"cache_read_input_tokens":800}}"#;
+        let additive = Some(PassthroughUsage {
+            cache_creation_tokens: 100,
+            cache_read_tokens: 800,
+            ..usage_dims(9, 4)
+        });
+        // An Anthropic reply is Anthropic usage whichever hint reached it.
+        for hint in [
+            PassthroughProtocol::OpenaiChat,
+            PassthroughProtocol::AnthropicMessages,
+        ] {
+            assert_eq!(response_usage(hint, None, anthropic), additive);
+        }
+        // A bare usage object names no envelope, so the hint decides.
+        let bare =
+            br#"{"usage":{"input_tokens":9,"output_tokens":4,"cache_read_input_tokens":800}}"#;
         assert_eq!(
-            response_usage(PassthroughProtocol::OpenaiChat, None, anthropicish),
-            Some(usage_dims(9, 4))
+            response_usage(PassthroughProtocol::AnthropicMessages, None, bare),
+            Some(PassthroughUsage {
+                cache_read_tokens: 800,
+                ..usage_dims(9, 4)
+            })
         );
         assert_eq!(response_usage(PassthroughProtocol::Raw, None, openai), None);
+    }
+
+    #[test]
+    fn anthropic_messages_is_recognised_from_its_path_or_version_header() {
+        let mut headers = HeaderMap::new();
+        let chat = PassthroughProtocol::OpenaiChat;
+        assert_eq!(
+            refine_request_protocol(chat, "/anthropic/v1/messages", &headers),
+            PassthroughProtocol::AnthropicMessages
+        );
+        assert_eq!(
+            refine_request_protocol(chat, "/llm/v1/chat/completions", &headers),
+            chat
+        );
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        assert_eq!(
+            refine_request_protocol(chat, "/llm/v1/messages/count_tokens", &headers),
+            PassthroughProtocol::AnthropicMessages
+        );
+        // Only the `messages` envelope is split.
+        assert_eq!(
+            refine_request_protocol(PassthroughProtocol::Raw, "/v1/messages", &headers),
+            PassthroughProtocol::Raw
+        );
     }
 
     #[test]

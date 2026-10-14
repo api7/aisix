@@ -3003,6 +3003,34 @@ fn parse_responses_terminal_usage(json: &Value) -> Option<ResponseUsage> {
     .flatten()
 }
 
+impl ResponseUsage {
+    fn usage_stats(&self) -> aisix_gateway::UsageStats {
+        aisix_gateway::UsageStats {
+            cached_prompt_tokens: self.cached_prompt_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            upstream_total_tokens: self.upstream_total_tokens,
+            reasoning_folded_into_completion: self.reasoning_folded_into_completion,
+            ..aisix_gateway::UsageStats::new(self.prompt_tokens, self.completion_tokens)
+        }
+    }
+}
+
+/// This endpoint's reading of a buffered Responses body's usage
+/// ([`extract_response_usage`]), shared with passthrough routes relaying the
+/// same envelope.
+pub(crate) fn response_usage_stats(body: &Value) -> Option<aisix_gateway::UsageStats> {
+    extract_response_usage(body).map(|u| u.usage_stats())
+}
+
+/// This endpoint's reading of one streamed Responses event's usage
+/// ([`parse_responses_terminal_usage`]): only a terminal event reports it.
+pub(crate) fn responses_terminal_usage_stats(event: &Value) -> Option<aisix_gateway::UsageStats> {
+    parse_responses_terminal_usage(event).map(|u| u.usage_stats())
+}
+
 /// Whether the buffered prefix contains at least one complete, parseable
 /// Responses SSE event. Comments, keepalives, `[DONE]`, and partial frames
 /// do not stop the TTFT clock.

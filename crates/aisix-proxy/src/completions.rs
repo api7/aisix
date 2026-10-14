@@ -836,6 +836,20 @@ fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
     })
 }
 
+/// [`extract_completion_usage`] as `UsageStats`: this endpoint's own reading
+/// of a completions body, shared with passthrough routes relaying the same
+/// envelope so the two cannot record one upstream reply differently.
+pub(crate) fn completion_usage_stats(body: &Value) -> Option<UsageStats> {
+    let u = extract_completion_usage(body)?;
+    Some(UsageStats {
+        cached_prompt_tokens: u.cached_prompt_tokens,
+        cache_write_tokens: u.cache_write_tokens,
+        reasoning_tokens: u.reasoning_tokens,
+        upstream_total_tokens: u.upstream_total_tokens,
+        ..UsageStats::new(u.prompt_tokens, u.completion_tokens)
+    })
+}
+
 /// Count the legacy /v1/completions `prompt` for the token-estimation
 /// fallback (AISIX-Cloud#1074): a plain string, an array of strings, an
 /// array of token ids (exact count), or an array of token-id arrays.

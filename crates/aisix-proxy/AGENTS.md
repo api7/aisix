@@ -289,16 +289,26 @@ that returned `Pending`) hands every delivered stream a second, contradicting
 generator, so it fires on an unpolled drop, and that scope is the only reason
 the guard can see that it already spoke.
 
-## A passthrough route that detects an envelope must observe what the typed endpoint does
+## A passthrough route meters an identified protocol with the typed endpoint's parser
 
-`passthrough_route.rs` relays bytes verbatim, but it *detects* the request
-envelope and extracts from it. Whatever it extracts is the whole observation —
-there is no bridge behind it to fill anything in. So a new observation added to
-a typed endpoint has a second home: a new `UsageEvent` token dimension needs
-reading in `usage_of`, a new guardrail scan input needs adding to
-`message_scan_text` / `request_guardrail_text`, a new attribution field needs
-setting on `RouteTelemetry`. Miss it and the route keeps answering 200 while
-metering and enforcement silently weaken.
+`passthrough_route.rs` relays bytes verbatim, but it *identifies* the
+protocol of the exchange and extracts from it — there is no bridge behind it
+to fill anything in. Its usage is read by the typed endpoint's own parser for
+that protocol (`completions::completion_usage_stats`,
+`responses::response_usage_stats`, `messages::anthropic_usage_stats`, the
+OpenAI wire reader, …), never by a reader of its own: a token field's
+meaning depends on the protocol that produced it (`cache_read_input_tokens`
+is additive beside Anthropic's `input_tokens` and a subset of an agent
+backend's whole-input `prompt_tokens`), so a reader keyed on field names
+mis-bills one of them. A new token dimension or a fix to a typed parser
+therefore reaches passthrough by itself; a new protocol needs one dispatch
+arm, and a shape no typed endpoint serves needs an adapter that states which
+counters are subsets and which are additive.
+
+Guardrail text and capture are the exception, and deliberately WIDER than
+the typed scans: the relay forwards every field, so they read every decoded
+string value except known-opaque slots. Do not swap them for a typed parse
+of the request — that narrows what the guardrail sees.
 
 Two rules bound the extraction:
 

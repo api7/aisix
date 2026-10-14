@@ -363,7 +363,7 @@ pub fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
     }
 }
 
-fn into_usage(u: OpenAiUsage) -> UsageStats {
+pub fn into_usage(u: OpenAiUsage) -> UsageStats {
     UsageStats {
         prompt_tokens: u.prompt_tokens,
         completion_tokens: u.completion_tokens,

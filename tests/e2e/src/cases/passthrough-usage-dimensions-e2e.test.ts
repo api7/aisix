@@ -9,9 +9,15 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import {
+  metricDelta,
+  scrapeMetrics,
+  type MetricSample,
+} from "../harness/metrics.js";
 
 // E2E: a passthrough route reports EVERY token dimension the exchange
 // carried, not just the canonical prompt/completion pair.
@@ -37,6 +43,14 @@ import {
 //      (`prompt_tokens_details.cached_tokens`,
 //      `completion_tokens_details.reasoning_tokens`) reach the event, and
 //      the caller's `model` alias attributes the row.
+//
+// A second spec drives every LLM envelope a route identifies — Anthropic
+// Messages (buffered and streamed), OpenAI Responses, a streamed OpenAI
+// Chat — and requires each to be metered the way the typed endpoint for
+// that protocol meters it: the cache counters in that protocol's own
+// accounting (Anthropic's BESIDE the prompt, OpenAI's INSIDE it), a
+// cache-inclusive access-log total, and the `aisix_llm_*` token families.
+// The opaque agent stream stays out of those families.
 //
 // Asserted through a real `datadog` exporter, because that sink serialises
 // the WHOLE `UsageEvent` — the OTLP span builder is an explicit allowlist
@@ -110,9 +124,10 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
 
-  // The agent-backend shape observed on a real forward-proxied IDE: a flat
-  // token object on the server's own `token_usage` event, cache-read
-  // dominating the prompt.
+  // The agent-backend report captured from a real forward-proxied IDE: a
+  // flat token object on the server's own `token_usage` event. Its total is
+  // prompt + completion, so the prompt is the WHOLE input and the cache read
+  // (96% of it) is a part of it, not an addition to it.
   // The upstream holds the first frame this long, then spaces the
   // remaining four out — so the whole stream runs far longer than the wait
   // the caller actually experienced.
@@ -122,10 +137,23 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
   const AGENT_USAGE = {
     prompt_tokens: 14603,
     completion_tokens: 8,
-    cache_creation_input_tokens: 331,
+    total_tokens: 14611,
+    cache_creation_input_tokens: 0,
     cache_read_input_tokens: 14272,
-    reasoning_tokens: 6,
+    reasoning_tokens: 8,
   };
+
+  // Anthropic Messages usage: the cache counters sit BESIDE `input_tokens`.
+  const ANTHROPIC_USAGE = {
+    input_tokens: 12,
+    output_tokens: 7,
+    cache_creation_input_tokens: 300,
+    cache_read_input_tokens: 1200,
+  };
+  const ANTHROPIC_TOTAL_INPUT =
+    ANTHROPIC_USAGE.input_tokens +
+    ANTHROPIC_USAGE.cache_creation_input_tokens +
+    ANTHROPIC_USAGE.cache_read_input_tokens;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -134,6 +162,8 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
 
     dd = await startMockDatadog();
     app = await spawnApp({
+      // The access-log line is written at `info`.
+      logLevel: "info",
       extraEnv: {
         [`DD_CRED_${CREDENTIAL_REF.toUpperCase()}_API_KEY`]: DD_API_KEY,
       },
@@ -204,7 +234,94 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
       firstEventDelayMs: FIRST_FRAME_MS,
       eventDelayMs: TAIL_STEP_MS,
     });
-    upstreams.push(labelled, unlabelled, chat, slow);
+    // 5. Anthropic Messages, buffered.
+    const anthropic = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "msg_dims",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-5",
+        content: [{ type: "text", text: "ok" }],
+        stop_reason: "end_turn",
+        usage: ANTHROPIC_USAGE,
+      },
+    });
+    // 6. Anthropic Messages, streamed: the input and cache counters ride
+    //    `message_start`, the output count the terminal `message_delta`.
+    const anthropicStream = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `event: message_start\ndata: ${JSON.stringify({
+          type: "message_start",
+          message: {
+            id: "msg_dims_stream",
+            type: "message",
+            role: "assistant",
+            model: "claude-sonnet-4-5",
+            content: [],
+            usage: { ...ANTHROPIC_USAGE, output_tokens: 1 },
+          },
+        })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: "ok" },
+        })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+          usage: { output_tokens: ANTHROPIC_USAGE.output_tokens },
+        })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+      ],
+    });
+    // 7. OpenAI Responses, buffered.
+    const responses = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "resp_dims",
+        object: "response",
+        status: "completed",
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "ok" }],
+          },
+        ],
+        usage: {
+          input_tokens: 30,
+          output_tokens: 9,
+          total_tokens: 39,
+          input_tokens_details: { cached_tokens: 25 },
+          output_tokens_details: { reasoning_tokens: 4 },
+        },
+      },
+    });
+    // 8. OpenAI Chat, streamed, cache hit inside the prompt.
+    const chatStream = await startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({ choices: [{ index: 0, delta: { content: "ok" } }] }),
+        JSON.stringify({
+          choices: [],
+          usage: {
+            prompt_tokens: 900,
+            completion_tokens: 25,
+            total_tokens: 925,
+            prompt_tokens_details: { cached_tokens: 768 },
+          },
+        }),
+        "[DONE]",
+      ],
+    });
+    upstreams.push(
+      labelled,
+      unlabelled,
+      chat,
+      slow,
+      anthropic,
+      anthropicStream,
+      responses,
+      chatStream,
+    );
 
     const pk = await seed.createProviderKey({
       display_name: "ptr-dims-pk",
@@ -216,6 +333,10 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
       ["ptr-dims-unlabelled", "/dims-unlabelled", unlabelled],
       ["ptr-dims-chat", "/dims-chat", chat],
       ["ptr-dims-slow", "/dims-slow", slow],
+      ["ptr-dims-anthropic", "/dims-anthropic", anthropic],
+      ["ptr-dims-anthropic-stream", "/dims-anthropic-stream", anthropicStream],
+      ["ptr-dims-responses", "/dims-responses", responses],
+      ["ptr-dims-chat-stream", "/dims-chat-stream", chatStream],
     ] as const) {
       await seed.createPassthroughRoute({
         name,
@@ -240,12 +361,17 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
     await dd?.close();
   });
 
-  const post = (path: string, body: unknown) =>
+  const post = (
+    path: string,
+    body: unknown,
+    headers: Record<string, string> = {},
+  ) =>
     fetch(`${app!.proxyUrl}${path}`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${CALLER_PLAINTEXT}`,
         "content-type": "application/json",
+        ...headers,
       },
       body: JSON.stringify(body),
     });
@@ -293,31 +419,23 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
     await labelledRes.text();
 
     const labelled = await logFor("ptr-dims-labelled");
-    // Pre-fix this row carried 0/0: `usage_of` read only the canonical
-    // pair, and only from a `usage`-wrapped object.
-    // `gen_ai.usage.input_tokens` folds the additive cache counters into the
-    // prompt count. This agent's `prompt_tokens` already includes its cache,
-    // but the passthrough usage mapping stores the flat
-    // `cache_*_input_tokens` in the additive fields, so this figure counts
-    // the cache twice. The mapping is corrected in a separate change, which
-    // updates this expectation.
+    // The agent's `prompt_tokens` is the whole input, so it is the input
+    // count as reported — the cache read is a part of it, not added to it.
     expect(labelled["gen_ai.usage.input_tokens"]).toBe(
-      AGENT_USAGE.prompt_tokens +
-        AGENT_USAGE.cache_creation_input_tokens +
-        AGENT_USAGE.cache_read_input_tokens,
+      AGENT_USAGE.prompt_tokens,
     );
     expect(labelled["gen_ai.usage.output_tokens"]).toBe(
       AGENT_USAGE.completion_tokens,
     );
-    expect(labelled["aisix.cache_creation_tokens"]).toBe(
-      AGENT_USAGE.cache_creation_input_tokens,
-    );
-    expect(labelled["aisix.cache_read_tokens"]).toBe(
+    expect(labelled["aisix.cached_prompt_tokens"]).toBe(
       AGENT_USAGE.cache_read_input_tokens,
     );
+    expect(labelled["aisix.cache_read_tokens"] ?? 0).toBe(0);
+    expect(labelled["aisix.cache_creation_tokens"] ?? 0).toBe(0);
     expect(labelled["aisix.reasoning_tokens"]).toBe(
       AGENT_USAGE.reasoning_tokens,
     );
+    expect(labelled["aisix.total_tokens"]).toBe(AGENT_USAGE.total_tokens);
     // An opaque body's `config_name` is not a model alias, so the row
     // claims no model identity.
     expect(labelled["aisix.requested_model"] ?? "").toBe("");
@@ -402,5 +520,190 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
     // difference — never negative.
     expect(ttft).toBeGreaterThanOrEqual(FIRST_FRAME_MS / 2);
     expect(ttft).toBeLessThanOrEqual(downstream);
+  });
+
+  /** Scrape the gateway's Prometheus counters. */
+  const scrape = (): Promise<MetricSample[]> => scrapeMetrics(app!.metricsUrl);
+
+  const ROUTE_TOKENS = { endpoint: "/passthrough_route" };
+
+  /** The `aisix_llm_*` token counters one action added on route traffic. */
+  function tokenDeltas(before: MetricSample[], after: MetricSample[]) {
+    const d = (name: string) => metricDelta(before, after, name, ROUTE_TOKENS);
+    return {
+      input: d("aisix_llm_input_tokens_total"),
+      output: d("aisix_llm_output_tokens_total"),
+      total: d("aisix_llm_total_tokens_total"),
+      cached: d("aisix_llm_cached_input_tokens_total"),
+      cacheRead: d("aisix_llm_cache_read_input_tokens_total"),
+      cacheCreation: d("aisix_llm_cache_creation_input_tokens_total"),
+    };
+  }
+
+  /**
+   * The token deltas once the route's terminal emit has landed. A streamed
+   * relay emits from its drop, which can trail the client's last read, so
+   * poll until the input count moves rather than reading once.
+   */
+  async function settledTokenDeltas(before: MetricSample[]) {
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      const deltas = tokenDeltas(before, await scrape());
+      if (deltas.input > 0 || Date.now() >= deadline) return deltas;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
+  /** The access-log line of one response, by its request id. */
+  async function accessLineFor(res: Response): Promise<string> {
+    const id = res.headers.get("x-aisix-request-id") ?? "";
+    expect(id, "every response carries x-aisix-request-id").toBeTruthy();
+    return waitForLogLine(
+      app!,
+      (l) =>
+        l.includes("proxy request completed") && l.includes(`request_id="${id}"`),
+      `the access-log line for ${id}`,
+    );
+  }
+
+  test("each identified LLM envelope is metered as its typed endpoint meters it", async (ctx) => {
+    if (!etcdReachable || !app || !seed || !dd) {
+      ctx.skip();
+      return;
+    }
+
+    await waitConfigPropagation(async () => {
+      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      await r.text();
+      return r.status === 200;
+    });
+
+    const anthropicBody = {
+      model: "claude-sonnet-4-5",
+      max_tokens: 64,
+      messages: [{ role: "user", content: "hi" }],
+    };
+    const anthropicHeaders = { "anthropic-version": "2023-06-01" };
+
+    // Anthropic Messages, buffered then streamed: cache counters BESIDE the
+    // prompt, so the input the request processed is all three, and the
+    // access-log total includes the cache like `/v1/messages`' does.
+    for (const [route, prefix, stream] of [
+      ["ptr-dims-anthropic", "/dims-anthropic", false],
+      ["ptr-dims-anthropic-stream", "/dims-anthropic-stream", true],
+    ] as const) {
+      const before = await scrape();
+      const res = await post(
+        `${prefix}/v1/messages`,
+        { ...anthropicBody, stream },
+        anthropicHeaders,
+      );
+      expect(res.status).toBe(200);
+      await res.text();
+
+      const row = await logFor(route);
+      expect(row["gen_ai.usage.input_tokens"], route).toBe(ANTHROPIC_TOTAL_INPUT);
+      expect(row["gen_ai.usage.output_tokens"], route).toBe(
+        ANTHROPIC_USAGE.output_tokens,
+      );
+      expect(row["aisix.cache_creation_tokens"], route).toBe(
+        ANTHROPIC_USAGE.cache_creation_input_tokens,
+      );
+      expect(row["aisix.cache_read_tokens"], route).toBe(
+        ANTHROPIC_USAGE.cache_read_input_tokens,
+      );
+      expect(row["aisix.cached_prompt_tokens"] ?? 0, route).toBe(0);
+      // Anthropic reports no total of its own, and the event records only an
+      // upstream-stated one — exactly as `/v1/messages` records it.
+      expect(row["aisix.total_tokens"] ?? 0, route).toBe(0);
+      expect(row["aisix.requested_model"], route).toBe("claude-sonnet-4-5");
+
+      const line = await accessLineFor(res);
+      expect(line, route).toContain(
+        `total_tokens=${ANTHROPIC_TOTAL_INPUT + ANTHROPIC_USAGE.output_tokens}`,
+      );
+
+      expect(await settledTokenDeltas(before), route).toEqual({
+        input: ANTHROPIC_USAGE.input_tokens,
+        output: ANTHROPIC_USAGE.output_tokens,
+        total: ANTHROPIC_TOTAL_INPUT + ANTHROPIC_USAGE.output_tokens,
+        cached: 0,
+        cacheRead: ANTHROPIC_USAGE.cache_read_input_tokens,
+        cacheCreation: ANTHROPIC_USAGE.cache_creation_input_tokens,
+      });
+    }
+
+    // OpenAI Responses: the `input`/`output` spelling, cache hit inside.
+    {
+      const before = await scrape();
+      const res = await post("/dims-responses/v1/responses", {
+        model: "gpt-5",
+        input: "hi",
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+      const row = await logFor("ptr-dims-responses");
+      expect(row["gen_ai.usage.input_tokens"]).toBe(30);
+      expect(row["gen_ai.usage.output_tokens"]).toBe(9);
+      expect(row["aisix.cached_prompt_tokens"]).toBe(25);
+      expect(row["aisix.reasoning_tokens"]).toBe(4);
+      expect(row["aisix.total_tokens"]).toBe(39);
+      expect(row["aisix.cache_read_tokens"] ?? 0).toBe(0);
+      expect(await accessLineFor(res)).toContain("total_tokens=39");
+      expect(await settledTokenDeltas(before)).toEqual({
+        input: 30,
+        output: 9,
+        total: 39,
+        cached: 25,
+        cacheRead: 0,
+        cacheCreation: 0,
+      });
+    }
+
+    // OpenAI Chat, streamed: the cache hit is a part of the prompt.
+    {
+      const before = await scrape();
+      const res = await post("/dims-chat-stream/v1/chat/completions", {
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+      const row = await logFor("ptr-dims-chat-stream");
+      expect(row["gen_ai.usage.input_tokens"]).toBe(900);
+      expect(row["aisix.cached_prompt_tokens"]).toBe(768);
+      expect(row["aisix.cache_read_tokens"] ?? 0).toBe(0);
+      expect(await accessLineFor(res)).toContain("total_tokens=925");
+      expect(await settledTokenDeltas(before)).toEqual({
+        input: 900,
+        output: 25,
+        total: 925,
+        cached: 768,
+        cacheRead: 0,
+        cacheCreation: 0,
+      });
+    }
+
+    // The opaque agent stream reports usage on its event, but it is not an
+    // LLM envelope the gateway identified, so it stays out of the LLM token
+    // families.
+    {
+      const before = await scrape();
+      const res = await post("/dims-labelled/api/agent/v3/create_agent_task", {
+        config_name: "agent",
+        payload: "opaque",
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+      // The access-log line is written with the usage event, so once it is
+      // visible the request's metrics are too.
+      expect(await accessLineFor(res)).toContain(
+        `total_tokens=${AGENT_USAGE.total_tokens}`,
+      );
+      expect(tokenDeltas(before, await scrape()).input).toBe(0);
+    }
   });
 });
