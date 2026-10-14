@@ -847,7 +847,9 @@ fn number_map(v: &Value) -> bool {
 }
 
 fn integer(v: &Value) -> bool {
-    v.as_i64().is_some() || v.as_f64().is_some_and(|f| f.fract() == 0.0)
+    v.as_i64().is_some()
+        || v.as_f64()
+            .is_some_and(|f| f.fract() == 0.0 && (i64::MIN as f64..i64::MAX as f64).contains(&f))
 }
 
 /// A Decisions response carries `model` and a `usage` with its three counts;
@@ -1644,6 +1646,8 @@ mod tests {
         let mut float_value = dscore.clone();
         float_value["probabilities"][1]["value"] = json!(1.0);
         assert!(dwith(&dchoice, &float_value).is_ok());
+        float_value["probabilities"][1]["value"] = json!(1e20);
+        assert!(dwith(&dchoice, &float_value).is_err());
 
         // No answers at all is not N refusals.
         for body in [json!({}), json!({"answers": []})] {
