@@ -341,8 +341,11 @@ impl<'a> LastTarget<'a> {
 ///
 /// Deliberately absent, and why:
 /// - `/mcp`, `/mcp/{server}`, `/a2a` — tool and agent calls, no model.
-/// - `/passthrough_route` — an opaque relay; even a `protocol`-aware route
-///   resolves no configured Model to attribute.
+/// - `/passthrough_route` — one endpoint for opaque and LLM traffic alike,
+///   and the tier is decided per endpoint. Exchanges identified as an LLM
+///   envelope do feed the token families (attributed to the body's `model`),
+///   so those carry `endpoint="/passthrough_route"` with no request-tier
+///   denominator here.
 /// - `/v1/files`, `/v1/batches`, `/v1/fine_tuning/jobs` — management calls.
 ///
 /// `/v1/realtime` was in that list until the token families reached it too.

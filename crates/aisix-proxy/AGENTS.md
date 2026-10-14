@@ -303,7 +303,9 @@ backend's whole-input `prompt_tokens`), so a reader keyed on field names
 mis-bills one of them. A new token dimension or a fix to a typed parser
 therefore reaches passthrough by itself; a new protocol needs one dispatch
 arm, and a shape no typed endpoint serves needs an adapter that states which
-counters are subsets and which are additive.
+counters are subsets and which are additive. Observations that are not
+parsed from the body still need wiring here by hand: a new attribution field
+needs setting on `RouteTelemetry`.
 
 Guardrail text and capture are the exception, and deliberately WIDER than
 the typed scans: the relay forwards every field, so they read every decoded

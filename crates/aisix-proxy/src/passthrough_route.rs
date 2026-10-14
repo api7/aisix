@@ -3472,18 +3472,36 @@ fn merge_usage(acc: &mut Option<PassthroughUsage>, report: PassthroughUsage) {
 
 /// An OpenAI-shape `usage` object, read exactly as `/v1/chat/completions`
 /// reads it from an OpenAI-compatible upstream.
+///
+/// `None` for an object carrying none of that shape's counters: the wire type
+/// defaults every field, so decoding an object in another spelling would
+/// otherwise mint a zero report.
 fn openai_chat_usage(usage: &serde_json::Value) -> Option<PassthroughUsage> {
-    let wire: aisix_provider_openai::wire::OpenAiUsage =
-        serde_json::from_value(usage.clone()).ok()?;
+    use serde::Deserialize as _;
+    let carries_openai_counter = [
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "prompt_cache_hit_tokens",
+    ]
+    .iter()
+    .any(|k| usage.get(*k).is_some());
+    if !carries_openai_counter {
+        return None;
+    }
+    let wire = aisix_provider_openai::wire::OpenAiUsage::deserialize(usage).ok()?;
     Some(PassthroughUsage::from_stats(
         &aisix_provider_openai::wire::into_usage(wire),
     ))
 }
 
 /// `usage` from a buffered response, by the parser of the envelope the
-/// RESPONSE carries — the request protocol only when the response names
-/// none — so an Anthropic reply is metered as one whichever request hint
-/// reached it.
+/// RESPONSE carries, so an Anthropic reply is metered as one whichever
+/// request hint reached it. A response that names no envelope — an
+/// embeddings list or an image result behind an `input` / `prompt` request,
+/// a bare usage object — or whose envelope parser finds no report, is read
+/// by the protocol its `usage` object's own carrier fields name
+/// ([`opaque_usage_report`]).
 fn response_usage(
     protocol: PassthroughProtocol,
     raw_shape: Option<RawUsageShape>,
@@ -3503,18 +3521,23 @@ fn response_usage(
         Some(RawUsageShape::DashscopeNative) => return dashscope_native_usage(v.get("usage")?),
         None => {}
     }
-    let wire = detect_buffered_response_protocol(body)
-        .ok()
-        .flatten()
-        .unwrap_or(protocol);
-    let stats = match wire {
-        PassthroughProtocol::Raw => None,
-        PassthroughProtocol::OpenaiChat => return openai_chat_usage(v.get("usage")?),
-        PassthroughProtocol::AnthropicMessages => crate::messages::anthropic_usage_stats(&v),
-        PassthroughProtocol::OpenaiCompletions => crate::completions::completion_usage_stats(&v),
-        PassthroughProtocol::OpenaiResponses => crate::responses::response_usage_stats(&v),
+    let envelope = detect_buffered_response_protocol(body).ok().flatten();
+    let report = match envelope {
+        None | Some(PassthroughProtocol::Raw) => None,
+        Some(PassthroughProtocol::OpenaiChat) => v.get("usage").and_then(openai_chat_usage),
+        Some(PassthroughProtocol::AnthropicMessages) => crate::messages::anthropic_usage_stats(&v)
+            .as_ref()
+            .map(PassthroughUsage::from_stats),
+        Some(PassthroughProtocol::OpenaiCompletions) => {
+            crate::completions::completion_usage_stats(&v)
+                .as_ref()
+                .map(PassthroughUsage::from_stats)
+        }
+        Some(PassthroughProtocol::OpenaiResponses) => crate::responses::response_usage_stats(&v)
+            .as_ref()
+            .map(PassthroughUsage::from_stats),
     };
-    stats.as_ref().map(PassthroughUsage::from_stats)
+    report.or_else(|| v.get("usage").and_then(opaque_usage_report))
 }
 
 /// Token counts from a DashScope native response's top-level `usage` — a
@@ -3539,10 +3562,12 @@ fn dashscope_native_usage(usage: &serde_json::Value) -> Option<PassthroughUsage>
             .map(|n| n.min(u32::MAX as u64) as u32)
     };
     let flat = |k: &str| num(usage.get(k));
+    // A zeroed detail must not mask a non-zero count under the other name.
     let detail = |parents: [&str; 2], child: &str| {
         parents
             .iter()
-            .find_map(|p| num(usage.get(*p).and_then(|d| d.get(child))))
+            .filter_map(|p| num(usage.get(*p).and_then(|d| d.get(child))))
+            .max()
     };
     let completion = flat("output_tokens").or_else(|| flat("completion_tokens"));
     let prompt = match flat("total_tokens") {
@@ -5571,7 +5596,11 @@ fn frame_parts(
                     .map(PassthroughUsage::from_stats)
             }
         };
-        if let Some(u) = report {
+        // A frame the hint's parser finds nothing in may still carry a
+        // usage object of another protocol (an `input`-keyed request that is
+        // not Responses, an image stream behind a `prompt` request); its own
+        // carrier fields then name the parser.
+        if let Some(u) = report.or_else(|| v.get("usage").and_then(opaque_usage_report)) {
             merge(u);
         }
         parts = match protocol {
@@ -9999,6 +10028,53 @@ mod tests {
             })
         );
         assert_eq!(response_usage(PassthroughProtocol::Raw, None, openai), None);
+
+        // A reply naming no LLM envelope behind an `input` / `prompt`
+        // request — an embeddings list, an image result — is read by the
+        // protocol its usage object spells, not by the request hint's.
+        let embeddings = br#"{"object":"list","data":[{"embedding":[0.1]}],"usage":{"prompt_tokens":8,"total_tokens":8}}"#;
+        assert_eq!(
+            response_usage(PassthroughProtocol::OpenaiResponses, None, embeddings),
+            Some(PassthroughUsage {
+                upstream_total_tokens: Some(8),
+                ..usage_dims(8, 0)
+            })
+        );
+        let image = br#"{"created":1,"data":[{"b64_json":"x"}],"usage":{"input_tokens":50,"output_tokens":4160,"total_tokens":4210}}"#;
+        assert_eq!(
+            response_usage(PassthroughProtocol::OpenaiCompletions, None, image),
+            Some(PassthroughUsage {
+                upstream_total_tokens: Some(4210),
+                ..usage_dims(50, 4160)
+            })
+        );
+        // A chat reply whose usage is in another spelling is still read.
+        let relayed = br#"{"object":"chat.completion","choices":[],"usage":{"input_tokens":9,"output_tokens":4}}"#;
+        assert_eq!(
+            response_usage(PassthroughProtocol::OpenaiChat, None, relayed),
+            Some(usage_dims(9, 4))
+        );
+    }
+
+    #[test]
+    fn a_stream_frame_the_hint_cannot_read_falls_back_to_its_usage_spelling() {
+        let image_done = br#"data: {"type":"image_generation.completed","usage":{"input_tokens":50,"output_tokens":4160,"total_tokens":4210}}
+
+"#;
+        assert_eq!(
+            frame_delta(PassthroughProtocol::OpenaiCompletions, image_done).1,
+            Some(PassthroughUsage {
+                upstream_total_tokens: Some(4210),
+                ..usage_dims(50, 4160)
+            })
+        );
+        let chat_usage = br#"data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}
+
+"#;
+        assert_eq!(
+            frame_delta(PassthroughProtocol::OpenaiResponses, chat_usage).1,
+            Some(usage_dims(7, 3))
+        );
     }
 
     #[test]
@@ -10088,6 +10164,9 @@ mod tests {
                 ..totalled(120, 30, 150)
             })
         );
+        // A zeroed detail under one name does not mask the count under the other.
+        let both = br#"{"usage":{"input_tokens":100,"output_tokens":1,"prompt_tokens_details":{"cached_tokens":0},"input_tokens_details":{"cached_tokens":80}}}"#;
+        assert_eq!(usage(both).unwrap().cached_prompt_tokens, 80);
         assert_eq!(usage(br#"{"code":"InvalidParameter","message":"x"}"#), None);
     }
 
