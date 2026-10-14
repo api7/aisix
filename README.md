@@ -31,11 +31,11 @@ forever.
 
 ---
 
-**AISIX OSS** is a Rust-native gateway that puts a single, OpenAI-compatible API in
-front of every LLM provider — OpenAI, Anthropic, Google Gemini, AWS Bedrock, Azure OpenAI,
-DeepSeek, and any OpenAI-compatible endpoint. It gives platform teams one place to route,
-govern, secure, and observe LLM traffic, with first-class SSE streaming and low gateway
-overhead.
+**AISIX OSS** is the open-source product built around the Rust-native AISIX gateway. The
+gateway puts a single, OpenAI-compatible API in front of every LLM provider — OpenAI,
+Anthropic, Google Gemini, AWS Bedrock, Azure OpenAI, DeepSeek, and any OpenAI-compatible
+endpoint. It gives platform teams one place to route, govern, secure, and observe LLM
+traffic, with first-class SSE streaming and low gateway overhead.
 
 It runs as a **single static binary** — low cold-start, lock-free config reads, and hot
 configuration reloads with no restarts: declare resources in one `resources.yaml` and

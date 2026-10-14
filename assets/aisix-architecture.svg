@@ -48,7 +48,7 @@
   <!-- CENTER: gateway -->
   <rect class="gw" x="340" y="68" width="440" height="412" rx="22"/>
   <circle class="dot" cx="366" cy="106" r="7"/>
-  <text class="gwtitle" x="384" y="115">AISIX OSS</text>
+  <text class="gwtitle" x="384" y="115">AISIX gateway</text>
   <text class="gwsub" x="385" y="143">open-source core · single Rust binary</text>
 
   <rect class="chip" x="360" y="166" width="192" height="92" rx="13"/>

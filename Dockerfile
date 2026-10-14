@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# Multi-stage build for the AISIX OSS gateway.
+# Multi-stage build for the AISIX gateway.
 #
 # The workspace pins rustc via rust-toolchain.toml (currently 1.93.1).
 # We use the latest Debian-based official Rust image, then copy the

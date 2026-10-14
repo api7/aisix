@@ -197,7 +197,7 @@ jobs:
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
           labels: |
             org.opencontainers.image.title=aisix
-            org.opencontainers.image.description=AISIX — Rust AI Gateway
+            org.opencontainers.image.description=AISIX gateway — Rust-native AI gateway
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.licenses=Apache-2.0
 

@@ -106,7 +106,7 @@ use tokio::sync::watch;
 #[command(
     name = "aisix",
     version = aisix_core::BUILD_VERSION.as_str(),
-    about = "AISIX OSS gateway",
+    about = "AISIX gateway",
     subcommand_negates_reqs = true
 )]
 struct Cli {
