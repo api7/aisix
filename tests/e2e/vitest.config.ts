@@ -39,9 +39,7 @@ export default defineConfig({
     // to the endpoint list, so a shortened list cannot silently double
     // forks onto one cluster and bring #157 back.
     pool: "forks",
-    poolOptions: {
-      forks: { singleFork: false, minForks: 1, maxForks: forkBudget() },
-    },
+    maxWorkers: forkBudget(),
     testTimeout: 60_000,
     hookTimeout: 60_000,
     globals: false,

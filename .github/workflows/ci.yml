@@ -478,7 +478,7 @@ jobs:
           # Vector-less redis for the semantic-cache degradation suite;
           # the main 6379 service is redis:8 (vector-capable).
           AISIX_E2E_REDIS_PLAIN: redis://127.0.0.1:6377
-          # One entry per etcd service above. vitest derives maxForks
+          # One entry per etcd service above. vitest derives maxWorkers
           # from this list (see tests/e2e/vitest.config.ts), and
           # harness/etcd.ts hands each fork its own entry.
           AISIX_E2E_ETCD_ENDPOINTS: http://127.0.0.1:2379,http://127.0.0.1:2380,http://127.0.0.1:2381,http://127.0.0.1:2382
