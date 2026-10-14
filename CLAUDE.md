@@ -215,7 +215,7 @@ notes, and configuration comments:
 
 - **AISIX OSS** is the open-source product implemented by this repository.
   After establishing the product, use **AISIX gateway** or **gateway** for its
-  runtime.
+  runtime. Do not use **AISIX OSS** as the name of the shared gateway runtime.
 - **AISIX Enterprise** is the customer-hosted commercial product. The customer
   operates its control plane, dashboard, data stores, and AISIX gateways.
 - **AISIX Cloud** is the API7-hosted commercial product. API7 operates its
@@ -226,8 +226,11 @@ notes, and configuration comments:
   product-name uses of **On-Premises** from current public prose.
 - The same gateway binary runs in all three products. A shared binary does not
   imply identical product behavior or configuration surfaces.
+- Use **AISIX OSS gateway** only when a sentence must distinguish a gateway in
+  the direct OSS workflow from a gateway connected to a commercial control
+  plane. Otherwise, use **AISIX gateway** or **gateway**.
 - An AISIX gateway is a **data plane** only within AISIX Enterprise or AISIX
-  Cloud architecture. Do not call an AISIX OSS gateway a data plane.
+  Cloud architecture. Do not call a gateway running as AISIX OSS a data plane.
 - Do not use **standalone gateway** as a product label. `standalone mode` and
   `managed mode` remain valid when describing runtime behavior.
 - Avoid unqualified **self-hosted**. Name the component being operated, such as
