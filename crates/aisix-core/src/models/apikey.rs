@@ -1,7 +1,7 @@
 //! `ApiKey` entity — the caller-facing credential presented in
 //! `Authorization: Bearer <plaintext>` (spec §3, §7).
 //!
-//! Self-hosted CP (prd-09a §9A.7B.4): the KV payload stores
+//! The control plane (prd-09a §9A.7B.4) stores a KV payload with
 //! **`key_hash`** (SHA-256 hex of the plaintext bearer) instead of
 //! the plaintext. cp-api stores only the hash and shows the
 //! plaintext to the user exactly once at create time. The DP proxy
