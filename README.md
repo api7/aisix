@@ -1,6 +1,6 @@
 <div align="center">
 
-# AISIX AI Gateway
+# AISIX OSS
 
 ### The open-source, Rust-native AI gateway for LLMs and AI agents
 
@@ -20,18 +20,18 @@ forever.
 [**Start free**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=ai-gateway) ·
 [**Documentation**](https://docs.api7.ai/ai-gateway/) ·
 [**Quickstart**](https://docs.api7.ai/ai-gateway/getting-started/gateway-quickstart) ·
-[**AISIX Cloud**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) ·
+[**AISIX Enterprise and Cloud**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) ·
 [**Roadmap**](ROADMAP.md)
 
 <br>
 
-<img src="assets/aisix-architecture.svg" alt="AISIX AI Gateway architecture — one OpenAI- or Anthropic-compatible API in front of OpenAI, Anthropic, Gemini/Vertex, Bedrock, Azure OpenAI, and DeepSeek, with API key auth, rate and token limits, guardrails, caching, routing and failover, and observability in between" width="100%">
+<img src="assets/aisix-architecture.svg" alt="AISIX OSS architecture — one OpenAI- or Anthropic-compatible API in front of OpenAI, Anthropic, Gemini/Vertex, Bedrock, Azure OpenAI, and DeepSeek, with API key auth, rate and token limits, guardrails, caching, routing and failover, and observability in between" width="100%">
 
 </div>
 
 ---
 
-**AISIX AI Gateway** is a Rust-native gateway that puts a single, OpenAI-compatible API in
+**AISIX OSS** is a Rust-native gateway that puts a single, OpenAI-compatible API in
 front of every LLM provider — OpenAI, Anthropic, Google Gemini, AWS Bedrock, Azure OpenAI,
 DeepSeek, and any OpenAI-compatible endpoint. It gives platform teams one place to route,
 govern, secure, and observe LLM traffic, with first-class SSE streaming and low gateway
@@ -40,19 +40,17 @@ overhead.
 It runs as a **single static binary** — low cold-start, lock-free config reads, and hot
 configuration reloads with no restarts: declare resources in one `resources.yaml` and
 reload on `SIGHUP`, or point the gateway at etcd for a multi-replica cluster. Run the
-open-source gateway in your infrastructure, or connect it to
+gateway in your infrastructure, or connect it to **AISIX Enterprise** or
 **[AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
 for centralized management with team governance, budgets, audit, and a dashboard.
 
-> **AISIX AI Gateway (this repo)** is the open-source product. It runs without a control
-> plane using declarative configuration or etcd. When connected to
-> **[AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud)**,
-> the same gateway serves as the data plane. AISIX Cloud adds a commercial control plane,
-> either hosted by API7 (**Hybrid Cloud**) or hosted by you in your infrastructure
-> (**On-Premises**). In both options, the gateway runs in your environment and calls
-> providers directly; live AI traffic does not pass through the control plane or API7.
-> The proxy API is identical throughout.
-> **[Talk to us about AISIX Cloud →](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
+> **AISIX OSS (this repo)** is the open-source product. It runs without a control plane
+> using declarative configuration or etcd. The same gateway binary serves as the data
+> plane in the commercial products: customers host the control plane with **AISIX
+> Enterprise**, while API7 hosts it with **AISIX Cloud**. In all three products, the
+> gateway runs in your environment and calls providers directly; live AI traffic does not
+> pass through either control plane. The proxy API is identical throughout.
+> **[Talk to us about AISIX Enterprise or Cloud →](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
 
 ## ⚡ Quickstart
 
@@ -135,11 +133,11 @@ For a multi-replica cluster, point the gateway at etcd instead — `resources_fi
 - **A real gateway, in Rust.** Single static binary, low cold-start, lock-free config reads
   on the hot path, native streaming.
 - **Open source, free forever.** Apache-2.0 licensed and built to run in your
-  infrastructure. Choose AISIX Cloud when you want centralized management through a
-  control plane and dashboard.
+  infrastructure. Choose AISIX Enterprise or AISIX Cloud when you want centralized
+  management through a control plane and dashboard.
 - **Production controls built in.** Routing & failover, rate limits, guardrails, caching,
-  and observability ship in the box. (Budgets and spend caps are an AISIX Cloud feature —
-  the gateway enforces the control plane's decisions.)
+  and observability ship in the box. (Budgets and spend caps are AISIX Enterprise and
+  AISIX Cloud features — the gateway enforces the control plane's decisions.)
 
 ## 🧩 Features — available today
 
@@ -222,59 +220,57 @@ Plus specialized handling for vendor quirks (e.g. DeepSeek reasoning content) an
 **rerank / embeddings** vendors (Cohere, Jina). Details in
 [adapter protocol families](https://docs.api7.ai/ai-gateway/providers/adapters).
 
-## ☁️ Open source vs AISIX Cloud
+## ☁️ Choose an AISIX Product
 
 Same gateway binary, same proxy API — in every form the gateway runs in your environment.
-**AISIX Cloud** adds a commercial control plane, either hosted by API7
-(**Hybrid Cloud**) or hosted in your infrastructure (**On-Premises**).
+**AISIX Enterprise** adds a customer-hosted commercial control plane. **AISIX Cloud** adds
+an API7-hosted commercial control plane.
 
 <table>
   <tr>
     <td width="50%" valign="top">
-      <img src="assets/console-overview.png" alt="AISIX Cloud overview — requests, latency p50/p99, error rate and cost today, with a 7-day request-and-cost trend and data-plane health" width="100%"><br>
+      <img src="assets/console-overview.png" alt="AISIX Enterprise and AISIX Cloud overview — requests, latency p50/p99, error rate and cost today, with a 7-day request-and-cost trend and gateway health" width="100%"><br>
       <sub><b>Overview</b> — traffic, latency, error rate &amp; spend at a glance</sub>
       <br><br>
-      <img src="assets/console-models.png" alt="AISIX Cloud models — alias an upstream LLM per provider (OpenAI, Anthropic, AWS Bedrock, DeepSeek) with model IDs and per-model rate limits" width="100%"><br>
+      <img src="assets/console-models.png" alt="AISIX Enterprise and AISIX Cloud models — alias an upstream LLM per provider with model IDs and per-model rate limits" width="100%"><br>
       <sub><b>Models</b> — one alias per upstream: OpenAI, Anthropic, Bedrock, DeepSeek…</sub>
       <br><br>
-      <img src="assets/console-guardrails.png" alt="AISIX Cloud guardrails — pre-input and post-output content policies (keyword blocklist, Azure Content Safety, AWS Bedrock) that block on violation" width="100%"><br>
+      <img src="assets/console-guardrails.png" alt="AISIX Enterprise and AISIX Cloud guardrails — pre-input and post-output content policies that block on violation" width="100%"><br>
       <sub><b>Guardrails</b> — pre-input &amp; post-output policies, block on violation</sub>
     </td>
     <td width="50%" valign="top">
-      <img src="assets/console-playground.png" alt="AISIX Cloud playground — pick a model, set system and user prompts, run, and read the response with live token and cost metering" width="100%"><br>
+      <img src="assets/console-playground.png" alt="AISIX Enterprise and AISIX Cloud playground — pick a model, set prompts, and read the response with live token and cost metering" width="100%"><br>
       <sub><b>Playground</b> — test any model with live token &amp; cost metering</sub>
       <br><br>
-      <img src="assets/console-observability.png" alt="AISIX Cloud observability exporters — fan out chat-completion telemetry to OTLP, Datadog and object storage, with per-target delivery health" width="100%"><br>
+      <img src="assets/console-observability.png" alt="AISIX Enterprise and AISIX Cloud observability exporters — fan out telemetry to OTLP, Datadog and object storage, with per-target delivery health" width="100%"><br>
       <sub><b>Observability</b> — fan out traces &amp; logs to OTLP, Datadog, object storage</sub>
       <br><br>
-      <img src="assets/console-budgets.png" alt="AISIX Cloud budgets — organization and per-environment spend caps with progress bars, hard-stop versus warn-only, including an over-budget policy" width="100%"><br>
+      <img src="assets/console-budgets.png" alt="AISIX Enterprise and AISIX Cloud budgets — organization and per-environment spend caps with hard-stop and warn-only policies" width="100%"><br>
       <sub><b>Budgets</b> — hard-stop spend caps with warn-only tiers</sub>
     </td>
   </tr>
 </table>
 
 <p align="center">
-  <em>The AISIX Cloud dashboard — overview metrics, multi-provider models, guardrails, budgets (with hard-stop spend caps), and observability exporters, across all your gateways.</em>
+  <em>The AISIX Enterprise and AISIX Cloud dashboard — overview metrics, multi-provider models, guardrails, budgets, and observability exporters across all your gateways.</em>
   <br><br>
   <a href="https://aisix-demo.api7.ai/"><b>▶ Try the live dashboard demo — aisix-demo.api7.ai</b></a>
 </p>
 
-| | Open-source gateway (this repo) | [AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) (Hybrid Cloud or On-Premises) |
-|---|---|---|
-| Price | Free · Apache-2.0 · forever | Commercial — [talk to us](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=pricing) |
-| Configuration | Declarative `resources.yaml`, or etcd for a cluster | Dashboard + Cloud Admin API, multi-environment |
-| Tenancy | Single instance / namespace | Org → Team → Member → Environment |
-| Provider keys | In the resources file as `${VAR}` env references, or in etcd | Envelope-encrypted at rest, write-only, in-place rotation |
-| Inbound auth | Caller keys (SHA-256 hashed, model allowlists, expiry), or OIDC/JWT bearers | Same, plus masked reveal, key ownership, and PATs |
-| Budgets | — (rate and token limits only) | Per key / provider / env / org / team, hard-stop & alerts |
-| RBAC | Admin key = read-only resource surface | Org roles (owner / admin / member), invites |
-| Audit log | — | Full org-scoped audit with diff viewer |
-| Usage & cost | Export logs, metrics, and usage events yourself | Managed usage views, model pricing catalog, spend reporting |
-| Surface | Status endpoints, OpenAPI read surface, playground | Full dashboard + per-environment playground |
+| | AISIX OSS (this repo) | AISIX Enterprise | [AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) |
+|---|---|---|---|
+| License | Apache-2.0 | Commercial | Commercial |
+| Control plane | None | Customer-hosted | API7-hosted |
+| Configuration | Declarative `resources.yaml`, or etcd for a cluster | Dashboard + AISIX Cloud Admin API | Dashboard + AISIX Cloud Admin API |
+| Tenancy | Single instance / namespace | Organization-scoped environments, teams, and members | Organization-scoped environments, teams, and members |
+| Provider keys | `${VAR}` references in `resources.yaml`; plaintext credentials in etcd | Encrypted at rest; operator-triggered in-place rotation | Encrypted at rest; operator-triggered in-place rotation |
+| Budgets | — (rate and token limits only) | Per key, provider, environment, organization, and team | Per key, provider, environment, organization, and team |
+| RBAC and audit | Local admin key; no organization layer | Organization roles, invitations, and audit history | Organization roles, invitations, and audit history |
+| Operations | You operate the gateway | You operate the control plane and gateways | API7 operates the control plane; you operate gateways |
 
-→ **Want the AISIX Cloud control plane, governance, budgets, and dashboard?**
+→ **Want centralized governance, budgets, and a dashboard?**
 **[Talk to API7](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=cloud)** about
-Hybrid Cloud or On-Premises, or **[book a demo](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=demo)**.
+AISIX Enterprise or AISIX Cloud, or **[book a demo](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=demo)**.
 
 ## 🏗️ Architecture
 

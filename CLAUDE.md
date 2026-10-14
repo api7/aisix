@@ -213,23 +213,33 @@ Retire it instead: drop the block from `config.example.yaml` / `config.managed.y
 Use the following terms in public prose, generated API descriptions, release
 notes, and configuration comments:
 
-- **AISIX AI Gateway** is the open-source product. Use **open-source AISIX
-  gateway** when the distinction from AISIX Cloud matters; after establishing
-  the product, use **AISIX gateway** or **gateway**.
-- **AISIX Cloud** is the commercial product umbrella. **Hybrid Cloud** is its
-  API7-hosted control-plane option, and **On-Premises** is its customer-hosted
-  control-plane option. Do not present **AISIX Hybrid Cloud** or **AISIX
-  On-Premises** as separate products.
-- An AISIX gateway is a **data plane** only within AISIX Cloud architecture. Do
-  not call an independently operated open-source gateway a data plane.
+- **AISIX OSS** is the open-source product implemented by this repository.
+  After establishing the product, use **AISIX gateway** or **gateway** for its
+  runtime.
+- **AISIX Enterprise** is the customer-hosted commercial product. The customer
+  operates its control plane, dashboard, data stores, and AISIX gateways.
+- **AISIX Cloud** is the API7-hosted commercial product. API7 operates its
+  control plane and dashboard; the customer operates the AISIX gateways.
+- Treat AISIX OSS, AISIX Enterprise, and AISIX Cloud as parallel products. Do
+  not describe AISIX Cloud as an umbrella with Hybrid Cloud and On-Premises
+  deployment options. Retire **AISIX AI Gateway**, **Hybrid Cloud**, and
+  product-name uses of **On-Premises** from current public prose.
+- The same gateway binary runs in all three products. A shared binary does not
+  imply identical product behavior or configuration surfaces.
+- An AISIX gateway is a **data plane** only within AISIX Enterprise or AISIX
+  Cloud architecture. Do not call an AISIX OSS gateway a data plane.
 - Do not use **standalone gateway** as a product label. `standalone mode` and
   `managed mode` remain valid when describing runtime behavior.
 - Avoid unqualified **self-hosted**. Name the component being operated, such as
-  the open-source AISIX gateway, the On-Premises control plane, or a self-hosted
-  upstream service.
+  AISIX OSS, the AISIX Enterprise control plane, or a self-hosted upstream
+  service.
 - The Dashboard is the control plane's user interface, not the whole control
   plane. Live AI requests pass through the gateway directly and do not pass
-  through the AISIX Cloud control plane or API7.
+  through the AISIX Enterprise or AISIX Cloud control plane.
+- Preserve compatibility-sensitive identifiers such as `managed.enabled`,
+  `standalone mode`, `managed mode`, environment-variable names, image names,
+  routes, repository names, and historical release records unless an explicit
+  migration includes them.
 
 ## Documentation Lives in api7/docs
 

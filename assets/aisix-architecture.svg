@@ -1,5 +1,5 @@
 <svg viewBox="0 0 1080 700" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
-  <title id="ttl">AISIX AI Gateway architecture</title>
+  <title id="ttl">AISIX OSS architecture</title>
   <desc id="dsc">Your apps speak one OpenAI- or Anthropic-compatible API to the AISIX gateway, which applies API key auth, rate limiting and budgets, guardrails, caching, routing and failover, and observability, then dispatches to providers including OpenAI, Anthropic, Google Gemini, AWS Bedrock, Azure OpenAI, DeepSeek, and any OpenAI-compatible endpoint.</desc>
   <defs>
     <marker id="arw" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -48,7 +48,7 @@
   <!-- CENTER: gateway -->
   <rect class="gw" x="340" y="68" width="440" height="412" rx="22"/>
   <circle class="dot" cx="366" cy="106" r="7"/>
-  <text class="gwtitle" x="384" y="115">AISIX AI Gateway</text>
+  <text class="gwtitle" x="384" y="115">AISIX OSS</text>
   <text class="gwsub" x="385" y="143">open-source core · single Rust binary</text>
 
   <rect class="chip" x="360" y="166" width="192" height="92" rx="13"/>

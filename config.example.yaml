@@ -47,7 +47,7 @@ etcd:
   # dial_timeout_ms: 5000   # this is the default; 0 = unbounded
   # request_timeout_ms: 5000
   # Optional TLS / mTLS bundle. Required when connecting to an
-  # AISIX Cloud Data Plane Manager (endpoint is https:// and the control plane issues
+  # AISIX Enterprise or AISIX Cloud Data Plane Manager (endpoint is https:// and the control plane issues
   # a client cert via IssueAIDataplaneCertificate). Uncomment and
   # point to your mTLS bundle.
   # tls:
@@ -288,9 +288,9 @@ observability:
     request_headers: []
 
 # Managed-mode switch. Uncomment when connecting the gateway to
-# AISIX Cloud: the admin API and Playground will NOT be bound — all
+# AISIX Enterprise or AISIX Cloud: the admin API and Playground will NOT be bound — all
 # configuration flows from etcd via the mTLS channel above, driven
-# by the AISIX Cloud control plane.
+# by the connected control plane.
 # managed:
 #   enabled: true
 
@@ -606,5 +606,5 @@ shutdown:
 # Models, API keys, provider keys, guardrails, cache policies, and
 # observability exporters are NOT defined in this file. They come from
 # the configured resource source: the `resources_file` above, direct
-# etcd writes, or the AISIX Cloud control plane. This file only
+# etcd writes, or an AISIX Enterprise or AISIX Cloud control plane. This file only
 # bootstraps the gateway.

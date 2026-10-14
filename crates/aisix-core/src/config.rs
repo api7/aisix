@@ -80,7 +80,7 @@ pub struct Config {
     pub shutdown: ShutdownConfig,
     /// Optional managed-mode configuration. When `managed.enabled = true`
     /// the admin API and Playground endpoints are **not** bound — the DP
-    /// is a pure etcd reader driven by the aisix.cloud control plane.
+    /// is a pure etcd reader driven by an AISIX Enterprise or AISIX Cloud control plane.
     /// Missing or `enabled = false` runs standalone.
     #[serde(default)]
     pub managed: ManagedConfig,
@@ -214,7 +214,7 @@ pub struct EtcdTlsConfig {
 
 /// Optional managed-mode configuration (prd-09 §9.2.2).
 ///
-/// When `enabled = true`, aisix runs as a tenant of aisix.cloud:
+/// When `enabled = true`, AISIX runs as a gateway connected to AISIX Enterprise or AISIX Cloud:
 ///
 /// - The admin API listener is **not** bound.
 /// - The Playground endpoint is **not** exposed.
@@ -227,7 +227,7 @@ pub struct EtcdTlsConfig {
 pub struct ManagedConfig {
     pub enabled: bool,
 
-    /// aisix.cloud CP base URL, e.g. "https://api.us.aisix.cloud".
+    /// Control-plane base URL, for example `https://api.us.aisix.cloud`.
     /// Required for heartbeat when managed mode is enabled.
     ///
     /// Normalised once by [`normalise_cp_base_url`] at load, so every
@@ -238,7 +238,7 @@ pub struct ManagedConfig {
     #[serde(default)]
     pub cp_base_url: Option<String>,
 
-    /// aisix.cloud CP etcd endpoint, e.g. "etcd.us.aisix.cloud:7943".
+    /// Control-plane etcd endpoint, for example `etcd.us.aisix.cloud:7943`.
     /// In v2 the CP returned this in the register response; v3
     /// (prd-09a §9A.7.2) no longer ships it back, so the DP must
     /// know its etcd endpoint at boot. Bare `host:port` without
@@ -1347,7 +1347,7 @@ impl ObservabilityConfig {
                  never had a built-in OTLP tracer, and the block has been removed from \
                  the shipped example configs. Delete it. Traces are exported by an \
                  `observability_exporters` entry with kind = otlp_http, declared in \
-                 your resources file or configured in AISIX Cloud.",
+                 your resources file or configured in AISIX Enterprise or AISIX Cloud.",
             );
         }
         if self.metrics.otlp.is_some() {

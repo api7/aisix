@@ -1,6 +1,6 @@
 # Releasing
 
-How an AISIX AI Gateway release is cut. Order matters: the On-Premises package
+How an AISIX OSS release is cut. Order matters: the AISIX Enterprise package
 (artifact name `aisix-self-hosted`) bundles the exact gateway image version, so
 that image must be **published before the package is built** (§4).
 
@@ -132,9 +132,9 @@ version for patch releases.
 
 ## 4. Downstream
 
-The On-Premises package (artifact name `aisix-self-hosted`) bundles
-`docker.io/api7/aisix:X.Y.Z` together with the AISIX Cloud images. When AISIX
-Cloud creates its own `vX.Y.Z` tag no longer matters: packaging is not
+The AISIX Enterprise package (artifact name `aisix-self-hosted`) bundles
+`docker.io/api7/aisix:X.Y.Z` together with the AISIX control-plane images. When
+the control-plane repository creates its own `vX.Y.Z` tag no longer matters: packaging is not
 triggered by that tag push any more, and it never waits for an image — the
 tag-push trigger and the 75-minute Docker Hub poll that idled a runner through
 this repository's PGO build are both gone.

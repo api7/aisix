@@ -38,7 +38,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
   "info": {
     "title": "AISIX Admin API",
     "version": "dev",
-    "description": "The AISIX Admin API is the read-only operational surface of an open-source AISIX gateway: list and inspect the loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, check per-model upstream health, and drive the playground.\n\nResource write endpoints were removed in favor of declarative configuration: declare resources in a `resources_file` (`resources.yaml`) and reload with SIGHUP, or write them to etcd directly. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\nGateways connected to AISIX Cloud do not expose this listener. Configure them through AISIX Cloud."
+    "description": "The AISIX Admin API is the read-only operational surface of an AISIX OSS gateway: list and inspect the loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, check per-model upstream health, and drive the playground.\n\nResource write endpoints were removed in favor of declarative configuration: declare resources in a `resources_file` (`resources.yaml`) and reload with SIGHUP, or write them to etcd directly. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\nGateways connected to AISIX Enterprise or AISIX Cloud do not expose this listener. Configure them through the corresponding control plane."
   },
   "paths": {
     "/livez": {
@@ -2486,7 +2486,7 @@ fn wrap_ref_siblings_for_redoc(v: &mut Value) {
 /// JSON Schema, but ReDoc renders it as a two-tab choice for optional fields.
 /// Collapse that generated nullable shape in the served OpenAPI so optionality
 /// is expressed by the field being absent from `required`, matching the
-/// hand-written API7/AISIX Cloud Admin API style.
+/// hand-written AISIX Cloud Admin API style.
 fn collapse_nullable_any_of(v: &mut Value) {
     match v {
         Value::Object(map) => {
