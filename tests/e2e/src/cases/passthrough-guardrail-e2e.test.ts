@@ -38,6 +38,7 @@ describe("passthrough guardrail (#911 [6])", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let sseUpstream: OpenAiUpstream | undefined;
+  let hybridUpstream: OpenAiUpstream | undefined;
   let seed: SeedClient | undefined;
   let etcdReachable = false;
 
@@ -115,6 +116,31 @@ describe("passthrough guardrail (#911 [6])", () => {
       protocol: "openai_chat",
     });
 
+    // A reply naming two envelopes at once: clean Chat `choices` beside an
+    // Anthropic message body whose `content` carries the forbidden text.
+    hybridUpstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "msg_hybrid",
+        object: "chat.completion",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "all clear" },
+            finish_reason: "stop",
+          },
+        ],
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text: `here it is: ${FORBIDDEN_OUTPUT}` }],
+      },
+    });
+    await seed.createPassthroughRoute({
+      name: "pt-gr-hybrid-tunnel",
+      path_prefix: "/pt-gr-hybrid",
+      target_url: hybridUpstream.baseUrl,
+      provider_key_id: pk.id,
+    });
+
     // Caller key LAST: etcd applies writes in revision order, so a key
     // seeded after every resource it must reach doubles as the
     // propagation barrier for all of them.
@@ -129,6 +155,7 @@ describe("passthrough guardrail (#911 [6])", () => {
     await app?.exit();
     await upstream?.close();
     await sseUpstream?.close();
+    await hybridUpstream?.close();
   });
 
   function passthrough(body: unknown): Promise<Response> {
@@ -390,5 +417,39 @@ describe("passthrough guardrail (#911 [6])", () => {
       }
     }
     expect(upstream.receivedRequests.length - hitsBefore).toBe(0);
+  });
+
+  test("a reply naming both a Chat and an Anthropic envelope is unscannable, so the fail-closed output guardrail refuses it", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    const call = () =>
+      fetch(`${app!.proxyUrl}/pt-gr-hybrid/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [{ role: "user", content: "innocent" }],
+        }),
+      });
+
+    // Gate on the caller key (seeded last): a 401 is the only transient.
+    await waitConfigPropagation(async () => {
+      const r = await call();
+      await r.text();
+      return r.status !== 401;
+    });
+
+    const res = await call();
+    const bodyText = await res.text();
+    // Each selector reads only its own carrier, so scanning the Chat one
+    // alone would let the Anthropic `content` through unscanned.
+    expect(res.status).toBe(422);
+    expect(bodyText).not.toContain(FORBIDDEN_OUTPUT);
   });
 });

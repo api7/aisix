@@ -30,14 +30,18 @@
 //!
 //! ## What a detected envelope observes
 //!
-//! Usage is read by the TYPED endpoint's own parser for the identified
-//! protocol — the response's envelope first, the request's as a fallback —
-//! so every counter carries that protocol's accounting, and a shape no
-//! typed endpoint serves gets a per-shape adapter that states its own
-//! (see [`PassthroughUsage`]). An identified LLM envelope also records the
-//! `aisix_llm_*` token families the typed endpoints record, and like them
-//! the caller's model alias, TTFT, and a 499 for a stream the client
-//! abandoned.
+//! Usage is read by the TYPED endpoint's own parser for the protocol the
+//! exchange is metered as ([`Metering`]): the envelope above, refined by the
+//! request path for embeddings and image surfaces, whose bodies carry
+//! another envelope's key — and for a buffered reply, the envelope the
+//! response itself names first. Every counter then carries that protocol's
+//! accounting; a report its parser cannot read records nothing, as on the
+//! typed endpoint. A shape no typed endpoint serves gets a per-shape adapter
+//! that states its own (see [`PassthroughUsage`]). An exchange metered as a
+//! protocol a typed endpoint serves counts once in the LLM request tier and
+//! records the `aisix_llm_*` token families as that endpoint does, and like
+//! it the caller's model alias, TTFT, and a 499 for a stream the client
+//! abandoned; anything else stays proxy-only.
 //!
 //! Guardrail text and capture are deliberately WIDER than the typed
 //! endpoints' scans: the relay forwards every field of the body, so the
@@ -638,6 +642,7 @@ async fn dispatch(
     };
     let protocol = refine_request_protocol(protocol, &path, &incoming_headers);
     let raw_shape = detect_raw_usage_shape(protocol, &body_bytes);
+    let metering = metering_protocol(protocol, raw_shape, &path);
 
     // INPUT guardrails on the (envelope-extracted) request text.
     if !resolved_chain.is_empty() {
@@ -1015,7 +1020,7 @@ async fn dispatch(
         status: status.as_u16(),
         usage: None,
         requested_model,
-        llm_protocol: protocol != PassthroughProtocol::Raw,
+        metering,
         upstream_ttft_ms: 0,
         downstream_first_ms: None,
         stream_reached_end: false,
@@ -1199,7 +1204,7 @@ async fn dispatch(
         }
     }
 
-    if let Some(u) = response_usage(protocol, raw_shape, &resp_body) {
+    if let Some(u) = response_usage(metering, &resp_body) {
         merge_usage(&mut telemetry.usage, u);
     }
     if telemetry.content_cap.is_some() && !bypass_uninspectable_output {
@@ -1582,11 +1587,10 @@ fn select_buffered_response_protocol<const N: usize>(
     let mut selected = None;
     for candidate in candidates.into_iter().flatten() {
         if let Some(previous) = selected {
-            // The two `messages` envelopes share their response selectors,
-            // so a body naming both is not a conflict for the scan; the
-            // first-named carrier stands.
-            let same_family = is_messages_family(previous) && is_messages_family(candidate);
-            if previous != candidate && !same_family {
+            // Chat `choices` beside an Anthropic `type: "message"` body name
+            // two envelopes, and each selector reads only its own carrier —
+            // so it is as unscannable as `output` beside `choices`.
+            if previous != candidate {
                 return Err(());
             }
         } else {
@@ -1731,6 +1735,70 @@ fn detect_raw_usage_shape(protocol: PassthroughProtocol, body: &[u8]) -> Option<
         Some(RawUsageShape::DashscopeNative)
     } else {
         None
+    }
+}
+
+/// The protocol an exchange is METERED as: which typed endpoint's parser
+/// reads its usage, and whether it belongs to the LLM metric tier.
+///
+/// Finer than [`PassthroughProtocol`], which picks the guardrail and capture
+/// selectors: an embeddings request carries the Responses `input` key and an
+/// image request the Completions `prompt` key, but their usage is read the
+/// way `/v1/embeddings` and `/v1/images/*` read it. Identified by
+/// [`metering_protocol`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Metering {
+    /// Nothing identified: no usage is read, except an agent backend's
+    /// server-labelled token frame ([`agent_token_usage`]).
+    Opaque,
+    Chat,
+    Anthropic,
+    Responses,
+    Completions,
+    Embeddings,
+    Images,
+    Rerank,
+    /// DashScope's native service envelope: read by its own adapter, and
+    /// outside the LLM tier because no typed endpoint serves it.
+    DashscopeNative,
+}
+
+impl Metering {
+    /// Whether the exchange is model inference of a kind a typed endpoint
+    /// serves, and so belongs to the LLM request and token families.
+    fn llm_tier(self) -> bool {
+        !matches!(self, Metering::Opaque | Metering::DashscopeNative)
+    }
+}
+
+/// Identify the metered protocol. The request path decides the two OpenAI
+/// surfaces whose bodies carry another envelope's key — a path ending in
+/// `/embeddings`, or in `/images/generations` / `/images/edits` (whose
+/// multipart body is not JSON at all) — then the body: the raw rerank and
+/// DashScope shapes, and otherwise the request envelope.
+fn metering_protocol(
+    protocol: PassthroughProtocol,
+    raw_shape: Option<RawUsageShape>,
+    path: &str,
+) -> Metering {
+    let path = path.trim_end_matches('/');
+    if path.ends_with("/embeddings") {
+        return Metering::Embeddings;
+    }
+    if path.ends_with("/images/generations") || path.ends_with("/images/edits") {
+        return Metering::Images;
+    }
+    match raw_shape {
+        Some(RawUsageShape::Rerank) => return Metering::Rerank,
+        Some(RawUsageShape::DashscopeNative) => return Metering::DashscopeNative,
+        None => {}
+    }
+    match protocol {
+        PassthroughProtocol::Raw => Metering::Opaque,
+        PassthroughProtocol::OpenaiChat => Metering::Chat,
+        PassthroughProtocol::AnthropicMessages => Metering::Anthropic,
+        PassthroughProtocol::OpenaiResponses => Metering::Responses,
+        PassthroughProtocol::OpenaiCompletions => Metering::Completions,
     }
 }
 
@@ -3495,49 +3563,61 @@ fn openai_chat_usage(usage: &serde_json::Value) -> Option<PassthroughUsage> {
     ))
 }
 
-/// `usage` from a buffered response, by the parser of the envelope the
-/// RESPONSE carries, so an Anthropic reply is metered as one whichever
-/// request hint reached it. A response that names no envelope — an
-/// embeddings list or an image result behind an `input` / `prompt` request,
-/// a bare usage object — or whose envelope parser finds no report, is read
-/// by the protocol its `usage` object's own carrier fields name
-/// ([`opaque_usage_report`]).
-fn response_usage(
-    protocol: PassthroughProtocol,
-    raw_shape: Option<RawUsageShape>,
-    body: &[u8],
-) -> Option<PassthroughUsage> {
-    if matches!(protocol, PassthroughProtocol::Raw) && raw_shape.is_none() {
+/// `usage` from a buffered response, read by the typed endpoint's parser for
+/// the protocol the exchange was identified as — the envelope the RESPONSE
+/// carries when it names one (so an Anthropic reply is metered as one
+/// whichever request hint reached it), the request's otherwise. A report
+/// that parser cannot read records no usage, as on the typed endpoint.
+fn response_usage(metering: Metering, body: &[u8]) -> Option<PassthroughUsage> {
+    if metering == Metering::Opaque {
         return None;
     }
     let v = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-    match raw_shape {
-        Some(RawUsageShape::Rerank) => {
+    match metering {
+        Metering::Rerank => {
             return crate::rerank::rerank_prompt_tokens(&v).map(|prompt_tokens| PassthroughUsage {
                 prompt_tokens,
                 ..PassthroughUsage::default()
             })
         }
-        Some(RawUsageShape::DashscopeNative) => return dashscope_native_usage(v.get("usage")?),
-        None => {}
+        Metering::DashscopeNative => return dashscope_native_usage(v.get("usage")?, false),
+        _ => {}
     }
-    let envelope = detect_buffered_response_protocol(body).ok().flatten();
-    let report = match envelope {
-        None | Some(PassthroughProtocol::Raw) => None,
-        Some(PassthroughProtocol::OpenaiChat) => v.get("usage").and_then(openai_chat_usage),
-        Some(PassthroughProtocol::AnthropicMessages) => crate::messages::anthropic_usage_stats(&v)
-            .as_ref()
-            .map(PassthroughUsage::from_stats),
-        Some(PassthroughProtocol::OpenaiCompletions) => {
-            crate::completions::completion_usage_stats(&v)
-                .as_ref()
-                .map(PassthroughUsage::from_stats)
-        }
-        Some(PassthroughProtocol::OpenaiResponses) => crate::responses::response_usage_stats(&v)
-            .as_ref()
-            .map(PassthroughUsage::from_stats),
+    let wire = response_metering(body, &v).unwrap_or(metering);
+    let stats = match wire {
+        Metering::Chat => return v.get("usage").and_then(openai_chat_usage),
+        Metering::Anthropic => crate::messages::anthropic_usage_stats(&v),
+        Metering::Completions => crate::completions::completion_usage_stats(&v),
+        Metering::Responses => crate::responses::response_usage_stats(&v),
+        Metering::Embeddings => crate::embeddings::embedding_usage_stats(&v),
+        Metering::Images => crate::images::image_usage_stats(&v),
+        Metering::Opaque | Metering::Rerank | Metering::DashscopeNative => None,
     };
-    report.or_else(|| v.get("usage").and_then(opaque_usage_report))
+    stats.as_ref().map(PassthroughUsage::from_stats)
+}
+
+/// The protocol a buffered response's own envelope names, if any: the LLM
+/// envelopes [`detect_buffered_response_protocol`] recognises, and an
+/// embeddings list (`object: "list"` whose `data` items are
+/// `object: "embedding"`).
+fn response_metering(body: &[u8], v: &serde_json::Value) -> Option<Metering> {
+    if let Some(protocol) = detect_buffered_response_protocol(body).ok().flatten() {
+        return match protocol {
+            PassthroughProtocol::Raw => None,
+            PassthroughProtocol::OpenaiChat => Some(Metering::Chat),
+            PassthroughProtocol::AnthropicMessages => Some(Metering::Anthropic),
+            PassthroughProtocol::OpenaiResponses => Some(Metering::Responses),
+            PassthroughProtocol::OpenaiCompletions => Some(Metering::Completions),
+        };
+    }
+    let embedding_list = v.get("object").and_then(|o| o.as_str()) == Some("list")
+        && v.get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|d| d.first())
+            .and_then(|e| e.get("object"))
+            .and_then(|o| o.as_str())
+            == Some("embedding");
+    embedding_list.then_some(Metering::Embeddings)
 }
 
 /// Token counts from a DashScope native response's top-level `usage` — a
@@ -3556,7 +3636,14 @@ fn response_usage(
 /// nested `input_tokens_details.image_tokens` is a breakdown already inside
 /// `input_tokens` and is never added. The cache hit and reasoning count
 /// are OpenAI-style subsets of prompt and completion.
-fn dashscope_native_usage(usage: &serde_json::Value) -> Option<PassthroughUsage> {
+///
+/// A streamed frame (`stream_frame`) reads its prompt as `input_tokens` (or
+/// `prompt_tokens`) alone: the total-less-completion rule is a reading of a
+/// unary reply, not of a frame's running counters.
+fn dashscope_native_usage(
+    usage: &serde_json::Value,
+    stream_frame: bool,
+) -> Option<PassthroughUsage> {
     let num = |v: Option<&serde_json::Value>| {
         v.and_then(serde_json::Value::as_u64)
             .map(|n| n.min(u32::MAX as u64) as u32)
@@ -3570,8 +3657,9 @@ fn dashscope_native_usage(usage: &serde_json::Value) -> Option<PassthroughUsage>
             .max()
     };
     let completion = flat("output_tokens").or_else(|| flat("completion_tokens"));
-    let prompt = match flat("total_tokens") {
+    let prompt = match flat("total_tokens").filter(|_| !stream_frame) {
         Some(total) => Some(total.saturating_sub(completion.unwrap_or(0))),
+        None if stream_frame => flat("input_tokens").or_else(|| flat("prompt_tokens")),
         None => {
             let input = flat("input_tokens").or_else(|| flat("prompt_tokens"));
             let image = flat("image_tokens");
@@ -3598,43 +3686,6 @@ fn dashscope_native_usage(usage: &serde_json::Value) -> Option<PassthroughUsage>
         upstream_total_tokens: flat("total_tokens"),
         ..PassthroughUsage::default()
     })
-}
-
-/// A usage object on an OPAQUE stream, which offers no envelope to say
-/// which protocol produced it — so the object's own carrier fields
-/// identify one, and that protocol's parser reads it whole:
-///
-/// - `prompt_tokens` / `completion_tokens` beside Anthropic-named cache
-///   counters (`cache_read_input_tokens`, `cache_creation_input_tokens`):
-///   the agent-backend token report, [`agent_token_usage`];
-/// - `prompt_tokens` / `completion_tokens` otherwise: OpenAI Chat;
-/// - `input_tokens` / `output_tokens` beside those cache counters:
-///   Anthropic Messages;
-/// - `input_tokens` / `output_tokens` otherwise: OpenAI Responses (the
-///   DashScope native stream reports this spelling too).
-///
-/// Anything else is no report, which keeps a `usage`-shaped object that is
-/// not one from minting zeros.
-fn opaque_usage_report(usage: &serde_json::Value) -> Option<PassthroughUsage> {
-    let has = |k: &str| usage.get(k).is_some();
-    let anthropic_cache = has("cache_read_input_tokens") || has("cache_creation_input_tokens");
-    if has("prompt_tokens") || has("completion_tokens") {
-        if anthropic_cache {
-            agent_token_usage(usage)
-        } else {
-            openai_chat_usage(usage)
-        }
-    } else if has("input_tokens") || has("output_tokens") {
-        let body = serde_json::json!({ "usage": usage });
-        let stats = if anthropic_cache {
-            crate::messages::anthropic_usage_stats(&body)
-        } else {
-            crate::responses::response_usage_stats(&body)
-        };
-        stats.as_ref().map(PassthroughUsage::from_stats)
-    } else {
-        None
-    }
 }
 
 /// The flat token report an IDE agent backend puts on its own
@@ -4041,7 +4092,7 @@ fn frame_in_band_error(
 
 #[cfg(test)]
 fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<PassthroughUsage>) {
-    let (parts, usage) = frame_parts(protocol, frame);
+    let (parts, usage) = frame_parts(protocol, metering_protocol(protocol, None, ""), frame);
     (parts.scan, usage)
 }
 
@@ -5499,7 +5550,8 @@ fn stream_guardrail_scan_text(
 ///
 /// Usage on a detected envelope is read by the typed endpoint's own
 /// per-event parser. On an OPAQUE (`Raw`) stream only an explicit `usage`
-/// object is read ([`opaque_usage_report`]), plus a flat token object on a
+/// object is read only on a DashScope native stream ([`Metering`]), plus a
+/// flat token object on a
 /// frame the server labelled a usage report (`event: token_usage`): an
 /// opaque stream has no envelope to authenticate a payload against, so the
 /// server's own label is the evidence — a payload that merely happens to
@@ -5507,6 +5559,7 @@ fn stream_guardrail_scan_text(
 /// accumulate field-wise ([`PassthroughUsage::merge`]) at the call site.
 fn frame_parts(
     protocol: PassthroughProtocol,
+    metering: Metering,
     frame: &[u8],
 ) -> (crate::held_content::Parts, Option<PassthroughUsage>) {
     let usage_labelled =
@@ -5538,16 +5591,18 @@ fn frame_parts(
             // turn a valid deeply nested escaped string into raw source text
             // and let it bypass an output guardrail.
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
-                // An explicit `usage` object identifies its own protocol
-                // even on an opaque stream. A server-labelled event
-                // additionally permits a flat token object at the root.
-                if let Some(u) = v.get("usage").and_then(opaque_usage_report) {
+                // A DashScope native stream reports cumulative usage on its
+                // frames; any other opaque stream only on a frame the server
+                // labelled a usage report.
+                let report = if metering == Metering::DashscopeNative {
+                    v.get("usage").and_then(|u| dashscope_native_usage(u, true))
+                } else if usage_labelled {
+                    agent_token_usage(&v)
+                } else {
+                    None
+                };
+                if let Some(u) = report {
                     merge(u);
-                }
-                if usage_labelled {
-                    if let Some(u) = opaque_usage_report(&v) {
-                        merge(u);
-                    }
                 }
             }
             parts = crate::held_content::Parts {
@@ -5577,30 +5632,28 @@ fn frame_parts(
         // protocol that frame belongs to. Anthropic events are identified
         // by their own `type` (disjoint from an OpenAI chunk's), so a chat
         // hint that reached an Anthropic upstream still meters it as one.
-        let report = match protocol {
-            PassthroughProtocol::Raw => unreachable!("handled before typed frame parsing"),
-            PassthroughProtocol::OpenaiChat | PassthroughProtocol::AnthropicMessages => {
+        // The surfaces with no streaming parser on their typed endpoint
+        // (embeddings, images, rerank) record no streamed usage.
+        let report = match metering {
+            Metering::Chat | Metering::Anthropic => {
                 match crate::messages::anthropic_stream_usage_stats(&v) {
                     Some(stats) => Some(PassthroughUsage::from_stats(&stats)),
                     None => v.get("usage").and_then(openai_chat_usage),
                 }
             }
-            PassthroughProtocol::OpenaiCompletions => {
-                crate::completions::completion_usage_stats(&v)
-                    .as_ref()
-                    .map(PassthroughUsage::from_stats)
-            }
-            PassthroughProtocol::OpenaiResponses => {
-                crate::responses::responses_terminal_usage_stats(&v)
-                    .as_ref()
-                    .map(PassthroughUsage::from_stats)
-            }
+            Metering::Completions => crate::completions::completion_usage_stats(&v)
+                .as_ref()
+                .map(PassthroughUsage::from_stats),
+            Metering::Responses => crate::responses::responses_terminal_usage_stats(&v)
+                .as_ref()
+                .map(PassthroughUsage::from_stats),
+            Metering::Embeddings
+            | Metering::Images
+            | Metering::Rerank
+            | Metering::DashscopeNative
+            | Metering::Opaque => None,
         };
-        // A frame the hint's parser finds nothing in may still carry a
-        // usage object of another protocol (an `input`-keyed request that is
-        // not Responses, an image stream behind a `prompt` request); its own
-        // carrier fields then name the parser.
-        if let Some(u) = report.or_else(|| v.get("usage").and_then(opaque_usage_report)) {
+        if let Some(u) = report {
             merge(u);
         }
         parts = match protocol {
@@ -5950,7 +6003,7 @@ fn stream_response(
                 if let Some(err) = frame_in_band_error(protocol, &frame) {
                     telemetry.record_failure(&err);
                 }
-                let (parts, usage) = frame_parts(protocol, &frame);
+                let (parts, usage) = frame_parts(protocol, telemetry.metering, &frame);
                 let held = if matches!(protocol, PassthroughProtocol::OpenaiResponses)
                     && policy.hold_cap().is_some()
                     && !fail_opened
@@ -6306,7 +6359,7 @@ fn stream_response(
                 if anthropic.is_none() && is_messages_family(protocol) {
                     anthropic = anthropic_stream_frame(&rest);
                 }
-                let (parts, usage) = frame_parts(protocol, &rest);
+                let (parts, usage) = frame_parts(protocol, telemetry.metering, &rest);
                 let held = if matches!(protocol, PassthroughProtocol::OpenaiResponses)
                     && policy.hold_cap().is_some()
                     && !fail_opened
@@ -6703,11 +6756,10 @@ struct RouteTelemetry {
     /// serving that envelope records. Empty for an opaque body, whose
     /// `model`-shaped key means nothing the gateway can trust.
     requested_model: String,
-    /// Whether the exchange was identified as one of the LLM envelopes, whose
-    /// token counts the `aisix_llm_*` token families record as the typed
-    /// endpoint does. An opaque body — including the rerank and DashScope
-    /// shapes — stays out of them.
-    llm_protocol: bool,
+    /// The protocol the exchange is metered as. One a typed endpoint serves
+    /// ([`Metering::llm_tier`]) records the LLM request and token families
+    /// as that endpoint does; anything else stays proxy-only.
+    metering: Metering,
     /// Time from the START OF THE ATTEMPT to the upstream's first streamed
     /// frame. Zero on the buffered path, where there is none.
     upstream_ttft_ms: u32,
@@ -6876,14 +6928,33 @@ impl RouteTelemetry {
 
         let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &self.pk_id);
         let caller = crate::request_metrics::Caller::from_api_key_id(&snapshot, &self.api_key_id);
-        crate::request_metrics::record(
+        // The model label the usage event's metrics carry (the caller's body
+        // alias, bounded to a configured name or `unresolved`). An exchange
+        // in the LLM tier is labelled with it in the request families too, so
+        // its request and token series join on `model` the way a typed
+        // endpoint's do; an opaque relay keeps the fixed surface label.
+        let usage_model = crate::usage_attr::usage_event_model_label(
+            // The snapshot loaded above: a config swap between two loads
+            // would make this label disagree with the emit's attribution.
+            &snapshot,
+            &self.requested_model,
+        )
+        .into_owned();
+        let llm_tier = self.metering.llm_tier();
+        crate::request_metrics::record_in_tier(
             &self.state,
             ENDPOINT_LABEL,
+            llm_tier,
             caller.as_caller(),
             crate::request_metrics::Upstream {
                 provider: &self.provider_label,
-                model: PASSTHROUGH_MODEL_LABEL,
+                model: if llm_tier {
+                    &usage_model
+                } else {
+                    PASSTHROUGH_MODEL_LABEL
+                },
                 pk: pk.labels(),
+                stream: self.streaming,
                 ..Default::default()
             },
             self.status,
@@ -6947,15 +7018,7 @@ impl RouteTelemetry {
         if self.anonymous {
             event.auth_type = "anonymous".to_string();
         }
-        let usage_model = crate::usage_attr::usage_event_model_label(
-            // The snapshot loaded above: a config swap between two loads
-            // would make this label disagree with the emit's attribution.
-            &snapshot,
-            &event.requested_model,
-        )
-        .into_owned();
-
-        if self.llm_protocol {
+        if llm_tier {
             // The token families the typed endpoints record. A route
             // resolves no Model, so `model` is the caller's body alias
             // bounded the way the usage event's label is (an unregistered
@@ -7158,6 +7221,15 @@ mod tests {
     }
 
     const PK_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+    /// Buffered usage for a request identified from its body alone.
+    fn usage_for(
+        protocol: PassthroughProtocol,
+        raw_shape: Option<RawUsageShape>,
+        body: &[u8],
+    ) -> Option<PassthroughUsage> {
+        response_usage(metering_protocol(protocol, raw_shape, ""), body)
+    }
 
     /// A usage record carrying only the two canonical counters.
     fn usage_dims(prompt: u32, completion: u32) -> PassthroughUsage {
@@ -7772,7 +7844,7 @@ mod tests {
 
     #[test]
     fn sse_splitter_and_usage_label_read_cr_framing() {
-        let frame = b"event: token_usage\rdata: {\"input_tokens\":3,\"output_tokens\":4}\r\r";
+        let frame = b"event: token_usage\rdata: {\"prompt_tokens\":3,\"completion_tokens\":4}\r\r";
         let mut s = SseFrameSplitter::with_max_frame_bytes(MAX_HELD_STREAM_BYTES);
         let frames = s.push(&[&frame[..], b"data: next"].concat());
         assert_eq!(frames.len(), 1);
@@ -7854,13 +7926,18 @@ mod tests {
         assert_eq!(acc.unwrap().upstream_total_tokens, None);
     }
 
-    /// A usage object on an opaque stream is read whole by the parser of the
-    /// protocol its own carrier fields name, so one counter name never
-    /// decides a meaning on its own: `cache_read_input_tokens` is additive
-    /// beside Anthropic's `input_tokens` and a subset of an agent backend's
-    /// whole-input `prompt_tokens`.
+    /// Each identified protocol's usage is read by that protocol's own
+    /// parser, so one counter name never decides a meaning on its own:
+    /// `cache_read_input_tokens` is additive beside Anthropic's
+    /// `input_tokens` and a subset of an agent backend's whole-input
+    /// `prompt_tokens`, and a spelling the identified parser does not read
+    /// records nothing.
     #[test]
-    fn opaque_usage_report_reads_each_shape_with_its_protocol_s_parser() {
+    fn each_protocol_s_usage_is_read_by_its_own_parser() {
+        let bare = |usage: serde_json::Value| serde_json::json!({ "usage": usage }).to_string();
+        let read =
+            |m: Metering, usage: serde_json::Value| response_usage(m, bare(usage).as_bytes());
+
         // OpenAI chat: the cache hit is nested under `prompt_tokens_details`
         // and the reasoning count under `completion_tokens_details`.
         let openai = serde_json::json!({
@@ -7870,7 +7947,7 @@ mod tests {
             "completion_tokens_details": {"reasoning_tokens": 12},
         });
         assert_eq!(
-            opaque_usage_report(&openai),
+            read(Metering::Chat, openai.clone()),
             Some(PassthroughUsage {
                 prompt_tokens: 100,
                 completion_tokens: 20,
@@ -7880,8 +7957,7 @@ mod tests {
             })
         );
 
-        // Responses API: the `input`/`output` spelling, details nested under
-        // the matching names.
+        // Responses API: the `input`/`output` spelling.
         let responses = serde_json::json!({
             "input_tokens": 30,
             "output_tokens": 9,
@@ -7889,7 +7965,7 @@ mod tests {
             "output_tokens_details": {"reasoning_tokens": 4},
         });
         assert_eq!(
-            opaque_usage_report(&responses),
+            read(Metering::Responses, responses.clone()),
             Some(PassthroughUsage {
                 prompt_tokens: 30,
                 completion_tokens: 9,
@@ -7907,7 +7983,7 @@ mod tests {
             "cache_read_input_tokens": 1200,
         });
         assert_eq!(
-            opaque_usage_report(&anthropic),
+            read(Metering::Anthropic, anthropic),
             Some(PassthroughUsage {
                 prompt_tokens: 11,
                 completion_tokens: 5,
@@ -7926,9 +8002,14 @@ mod tests {
             "prompt_cache_hit_tokens": 32,
         });
         assert_eq!(
-            opaque_usage_report(&deepseek).unwrap().cached_prompt_tokens,
+            read(Metering::Chat, deepseek).unwrap().cached_prompt_tokens,
             32
         );
+
+        // A spelling the identified protocol does not use records nothing,
+        // rather than being read as if it were that protocol's.
+        assert_eq!(read(Metering::Chat, responses), None);
+        assert_eq!(read(Metering::Responses, openai), None);
 
         // The agent-backend report: whole-input `prompt_tokens`, so both
         // Anthropic-named cache counters are subsets of it.
@@ -7941,7 +8022,7 @@ mod tests {
             "reasoning_tokens": 8,
         });
         assert_eq!(
-            opaque_usage_report(&agent),
+            agent_token_usage(&agent),
             Some(PassthroughUsage {
                 prompt_tokens: 14603,
                 completion_tokens: 8,
@@ -7952,13 +8033,7 @@ mod tests {
                 ..Default::default()
             })
         );
-
-        // An object with no recognised counter mints nothing.
-        assert_eq!(
-            opaque_usage_report(&serde_json::json!({"disk": "80%"})),
-            None
-        );
-        assert_eq!(opaque_usage_report(&serde_json::Value::Null), None);
+        assert_eq!(agent_token_usage(&serde_json::json!({"disk": "80%"})), None);
     }
 
     #[test]
@@ -8036,12 +8111,11 @@ mod tests {
     fn a_crlf_framed_frame_reads_the_same_as_its_lf_twin() {
         let crlf = b"data: {\"usage\":{\"prompt_tokens\":26,\"completion_tokens\":4}}\r\n\r\n";
         let lf = b"data: {\"usage\":{\"prompt_tokens\":26,\"completion_tokens\":4}}\n\n";
+        for protocol in [PassthroughProtocol::Raw, PassthroughProtocol::OpenaiChat] {
+            assert_eq!(frame_delta(protocol, crlf), frame_delta(protocol, lf));
+        }
         assert_eq!(
-            frame_delta(PassthroughProtocol::Raw, crlf),
-            frame_delta(PassthroughProtocol::Raw, lf),
-        );
-        assert_eq!(
-            frame_delta(PassthroughProtocol::Raw, crlf).1,
+            frame_delta(PassthroughProtocol::OpenaiChat, crlf).1,
             Some(usage_dims(26, 4)),
         );
         // …and the frame splitter agrees about where such a frame ends.
@@ -8165,14 +8239,11 @@ mod tests {
             None
         );
 
-        // An explicit `usage` OBJECT is still read from any opaque frame:
-        // it is self-describing, and this is the pre-existing behaviour.
+        // Nor does a `usage` object on an unidentified stream: no protocol
+        // says which accounting its counters follow.
         let wrapped =
             b"event:done\ndata:{\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2}}\n\n";
-        assert_eq!(
-            frame_delta(PassthroughProtocol::Raw, wrapped).1,
-            Some(usage_dims(4, 2))
-        );
+        assert_eq!(frame_delta(PassthroughProtocol::Raw, wrapped).1, None);
     }
 
     #[test]
@@ -8180,12 +8251,9 @@ mod tests {
         // The no-phantom-tokens guarantee: a REST body that happens to carry
         // a usage-shaped object is not a usage report.
         let rpc = br#"{"jsonrpc":"2.0","id":1,"result":{"usage":{"prompt_tokens":99}}}"#;
-        assert_eq!(response_usage(PassthroughProtocol::Raw, None, rpc), None);
+        assert_eq!(usage_for(PassthroughProtocol::Raw, None, rpc), None);
         let top_level = br#"{"usage":{"prompt_tokens":99,"completion_tokens":9}}"#;
-        assert_eq!(
-            response_usage(PassthroughProtocol::Raw, None, top_level),
-            None
-        );
+        assert_eq!(usage_for(PassthroughProtocol::Raw, None, top_level), None);
     }
 
     #[test]
@@ -8302,6 +8370,17 @@ mod tests {
             (
                 PassthroughProtocol::OpenaiChat,
                 br#"{"choices":[{"message":{"content":"safe"},"text":"BLOCKME"}]}"#.as_slice(),
+            ),
+            // Chat `choices` beside an Anthropic message body: each selector
+            // reads only its own carrier, so the Anthropic `content` would
+            // pass unscanned.
+            (
+                PassthroughProtocol::OpenaiChat,
+                br#"{"choices":[{"message":{"content":"safe"}}],"type":"message","content":[{"type":"text","text":"BLOCKME"}]}"#.as_slice(),
+            ),
+            (
+                PassthroughProtocol::AnthropicMessages,
+                br#"{"type":"message","content":[{"type":"text","text":"BLOCKME"}],"choices":[{"message":{"content":"safe"}}]}"#.as_slice(),
             ),
         ] {
             let error = try_buffered_response_guardrail_text(request_protocol, body).expect_err(
@@ -8768,9 +8847,13 @@ mod tests {
             "BLOCKME".repeat(MAX_RAW_SELECTOR_BYTES / "BLOCKME".len() + 1),
             "BLOCKME",
         );
-        let typed = frame_parts(PassthroughProtocol::OpenaiCompletions, frame.as_bytes())
-            .0
-            .scan;
+        let typed = frame_parts(
+            PassthroughProtocol::OpenaiCompletions,
+            Metering::Completions,
+            frame.as_bytes(),
+        )
+        .0
+        .scan;
         let text = stream_guardrail_text(
             PassthroughProtocol::OpenaiCompletions,
             frame.as_bytes(),
@@ -8828,9 +8911,13 @@ mod tests {
             "\"name\":\"n\",".repeat(MAX_RAW_SELECTOR_ITEMS),
         ));
         for frame in [&malformed, &capped] {
-            let typed = frame_parts(PassthroughProtocol::OpenaiChat, frame.as_bytes())
-                .0
-                .scan;
+            let typed = frame_parts(
+                PassthroughProtocol::OpenaiChat,
+                Metering::Chat,
+                frame.as_bytes(),
+            )
+            .0
+            .scan;
             let text =
                 stream_guardrail_text(PassthroughProtocol::OpenaiChat, frame.as_bytes(), typed);
             assert!(text.unevaluable, "{frame}");
@@ -8887,7 +8974,9 @@ mod tests {
         }
 
         let frame = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"index\":0,\"type\":\"image_url\",\"image_url\":{\"url\":\"STREAM_IMAGE_SENTINEL\"}},{\"index\":1,\"type\":\"input_audio\",\"input_audio\":{\"data\":\"STREAM_AUDIO_SENTINEL\"}},{\"index\":2,\"type\":\"file\",\"file\":{\"file_data\":\"STREAM_FILE_SENTINEL\"}},{\"index\":3,\"type\":\"future_media\",\"text\":\"STREAM_OPAQUE_PART_SENTINEL\"},{\"index\":4,\"type\":\"text\",\"text\":\"STREAM_VISIBLE_SENTINEL\"}],\"reasoning_content\":\"STREAM_REASONING_SENTINEL\",\"metadata\":{\"note\":\"STREAM_METADATA_SENTINEL\"},\"tool_calls\":[{\"index\":0,\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"STREAM_TOOL_ARGUMENT_SENTINEL\"}},{\"index\":1,\"type\":\"custom\",\"custom\":{\"name\":\"custom\",\"input\":\"STREAM_CUSTOM_INPUT_SENTINEL\"}}],\"function_call\":{\"name\":\"legacy\",\"arguments\":\"STREAM_LEGACY_ARGUMENT_SENTINEL\"}}}]}\n\n";
-        let typed = frame_parts(PassthroughProtocol::OpenaiChat, frame).0.scan;
+        let typed = frame_parts(PassthroughProtocol::OpenaiChat, Metering::Chat, frame)
+            .0
+            .scan;
         assert!(typed.contains("STREAM_OPAQUE_PART_SENTINEL"), "{typed:?}");
         let text = stream_guardrail_text(PassthroughProtocol::OpenaiChat, frame, typed);
         assert!(!text.unevaluable);
@@ -8944,16 +9033,20 @@ mod tests {
         let first = stream_guardrail_text(
             PassthroughProtocol::OpenaiChat,
             first_frame,
-            frame_parts(PassthroughProtocol::OpenaiChat, first_frame)
+            frame_parts(PassthroughProtocol::OpenaiChat, Metering::Chat, first_frame)
                 .0
                 .scan,
         );
         let second = stream_guardrail_text(
             PassthroughProtocol::OpenaiChat,
             second_frame,
-            frame_parts(PassthroughProtocol::OpenaiChat, second_frame)
-                .0
-                .scan,
+            frame_parts(
+                PassthroughProtocol::OpenaiChat,
+                Metering::Chat,
+                second_frame,
+            )
+            .0
+            .scan,
         );
         assert!(!first.unevaluable);
         assert!(!second.unevaluable);
@@ -9018,9 +9111,13 @@ mod tests {
             !frame_guardrail_text(PassthroughProtocol::OpenaiResponses, media_frame)
                 .contains("STREAM_MEDIA_SENTINEL")
         );
-        let typed = frame_parts(PassthroughProtocol::OpenaiResponses, media_frame)
-            .0
-            .scan;
+        let typed = frame_parts(
+            PassthroughProtocol::OpenaiResponses,
+            Metering::Responses,
+            media_frame,
+        )
+        .0
+        .scan;
         let media = stream_guardrail_text(PassthroughProtocol::OpenaiResponses, media_frame, typed);
         let scanned = stream_guardrail_scan_text(&[], &media.continuations, &media.supplemental);
         assert!(
@@ -9040,9 +9137,13 @@ mod tests {
         // and audio discriminator it is opaque, rather than a path for audio
         // base64 to reach a text guardrail.
         let conflicting_delta = b"data: {\"type\":\"response.output_audio.delta\",\"type\":\"response.output_text.delta\",\"delta\":\"CONFLICTING_MEDIA_SENTINEL\"}\n\n";
-        let typed = frame_parts(PassthroughProtocol::OpenaiResponses, conflicting_delta)
-            .0
-            .scan;
+        let typed = frame_parts(
+            PassthroughProtocol::OpenaiResponses,
+            Metering::Responses,
+            conflicting_delta,
+        )
+        .0
+        .scan;
         assert!(typed.contains("CONFLICTING_MEDIA_SENTINEL"), "{typed:?}");
         let text = stream_guardrail_text(
             PassthroughProtocol::OpenaiResponses,
@@ -9149,8 +9250,18 @@ mod tests {
     fn stream_guardrail_text_preserves_response_duplicate_carrier_branches() {
         let first = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"one\",\"output_index\":0,\"content_index\":0,\"delta\":\"FOR\",\"delta\":\"ok\"}\n\n";
         let second = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"one\",\"output_index\":0,\"content_index\":0,\"delta\":\"BIDDEN\"}\n\n";
-        let first_parts = frame_parts(PassthroughProtocol::OpenaiResponses, first).0;
-        let second_parts = frame_parts(PassthroughProtocol::OpenaiResponses, second).0;
+        let first_parts = frame_parts(
+            PassthroughProtocol::OpenaiResponses,
+            Metering::Responses,
+            first,
+        )
+        .0;
+        let second_parts = frame_parts(
+            PassthroughProtocol::OpenaiResponses,
+            Metering::Responses,
+            second,
+        )
+        .0;
         let first = stream_guardrail_text(
             PassthroughProtocol::OpenaiResponses,
             first,
@@ -9192,8 +9303,8 @@ mod tests {
     fn stream_guardrail_text_keys_reordered_chat_choices_by_source_index() {
         let first = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"FOR\"}},{\"index\":1,\"delta\":{\"content\":\"noise\"}}]}\n\n";
         let second = b"data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"CLEAN\"}},{\"index\":0,\"delta\":{\"content\":\"BIDDEN\"}}]}\n\n";
-        let first_parts = frame_parts(PassthroughProtocol::OpenaiChat, first).0;
-        let second_parts = frame_parts(PassthroughProtocol::OpenaiChat, second).0;
+        let first_parts = frame_parts(PassthroughProtocol::OpenaiChat, Metering::Chat, first).0;
+        let second_parts = frame_parts(PassthroughProtocol::OpenaiChat, Metering::Chat, second).0;
         let first = stream_guardrail_text(PassthroughProtocol::OpenaiChat, first, first_parts.scan);
         let second =
             stream_guardrail_text(PassthroughProtocol::OpenaiChat, second, second_parts.scan);
@@ -9384,9 +9495,13 @@ mod tests {
             let delta = stream_guardrail_text(
                 PassthroughProtocol::OpenaiResponses,
                 delta.as_bytes(),
-                frame_parts(PassthroughProtocol::OpenaiResponses, delta.as_bytes())
-                    .0
-                    .scan,
+                frame_parts(
+                    PassthroughProtocol::OpenaiResponses,
+                    Metering::Responses,
+                    delta.as_bytes(),
+                )
+                .0
+                .scan,
             );
             append_stream_guardrail_text(
                 &mut continuations,
@@ -9446,7 +9561,9 @@ mod tests {
             ),
         ];
         for (protocol, frame, expected) in cases {
-            let typed = frame_parts(protocol, frame).0.scan;
+            let typed = frame_parts(protocol, metering_protocol(protocol, None, ""), frame)
+                .0
+                .scan;
             let text = stream_guardrail_text(protocol, frame, typed);
             assert!(!text.unevaluable, "{frame:?}");
             let scanned = stream_guardrail_scan_text(&[], &text.continuations, &text.supplemental);
@@ -9454,9 +9571,13 @@ mod tests {
         }
 
         let identityless_part = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"NO_ID\"}]}}]}\n\n";
-        let typed = frame_parts(PassthroughProtocol::OpenaiChat, identityless_part)
-            .0
-            .scan;
+        let typed = frame_parts(
+            PassthroughProtocol::OpenaiChat,
+            Metering::Chat,
+            identityless_part,
+        )
+        .0
+        .scan;
         assert!(
             stream_guardrail_text(PassthroughProtocol::OpenaiChat, identityless_part, typed)
                 .unevaluable
@@ -9478,12 +9599,12 @@ mod tests {
             let first = stream_guardrail_text(
                 PassthroughProtocol::OpenaiChat,
                 first_frame,
-                frame_parts(PassthroughProtocol::OpenaiChat, first_frame).0.scan,
+                frame_parts(PassthroughProtocol::OpenaiChat, Metering::Chat, first_frame).0.scan,
             );
             let second = stream_guardrail_text(
                 PassthroughProtocol::OpenaiChat,
                 second_frame,
-                frame_parts(PassthroughProtocol::OpenaiChat, second_frame).0.scan,
+                frame_parts(PassthroughProtocol::OpenaiChat, Metering::Chat, second_frame).0.scan,
             );
             assert!(!first.unevaluable);
             assert!(!second.unevaluable);
@@ -9584,16 +9705,24 @@ mod tests {
             let first = stream_guardrail_text(
                 PassthroughProtocol::OpenaiResponses,
                 first,
-                frame_parts(PassthroughProtocol::OpenaiResponses, first)
-                    .0
-                    .scan,
+                frame_parts(
+                    PassthroughProtocol::OpenaiResponses,
+                    Metering::Responses,
+                    first,
+                )
+                .0
+                .scan,
             );
             let second = stream_guardrail_text(
                 PassthroughProtocol::OpenaiResponses,
                 second,
-                frame_parts(PassthroughProtocol::OpenaiResponses, second)
-                    .0
-                    .scan,
+                frame_parts(
+                    PassthroughProtocol::OpenaiResponses,
+                    Metering::Responses,
+                    second,
+                )
+                .0
+                .scan,
             );
             assert!(first.unevaluable || second.unevaluable);
         }
@@ -9607,17 +9736,23 @@ mod tests {
         let first = stream_guardrail_text(
             PassthroughProtocol::Raw,
             first_frame,
-            frame_parts(PassthroughProtocol::Raw, first_frame).0.scan,
+            frame_parts(PassthroughProtocol::Raw, Metering::Opaque, first_frame)
+                .0
+                .scan,
         );
         let opaque = stream_guardrail_text(
             PassthroughProtocol::Raw,
             opaque_frame,
-            frame_parts(PassthroughProtocol::Raw, opaque_frame).0.scan,
+            frame_parts(PassthroughProtocol::Raw, Metering::Opaque, opaque_frame)
+                .0
+                .scan,
         );
         let second = stream_guardrail_text(
             PassthroughProtocol::Raw,
             second_frame,
-            frame_parts(PassthroughProtocol::Raw, second_frame).0.scan,
+            frame_parts(PassthroughProtocol::Raw, Metering::Opaque, second_frame)
+                .0
+                .scan,
         );
         assert!(!first.unevaluable);
         assert!(opaque.unevaluable);
@@ -9667,9 +9802,13 @@ mod tests {
         let delta = stream_guardrail_text(
             PassthroughProtocol::OpenaiResponses,
             delta,
-            frame_parts(PassthroughProtocol::OpenaiResponses, delta)
-                .0
-                .scan,
+            frame_parts(
+                PassthroughProtocol::OpenaiResponses,
+                Metering::Responses,
+                delta,
+            )
+            .0
+            .scan,
         );
         let done = stream_guardrail_text(PassthroughProtocol::OpenaiResponses, done, String::new());
         assert!(!done.unevaluable);
@@ -9729,9 +9868,13 @@ mod tests {
         let standalone = stream_guardrail_text(
             PassthroughProtocol::OpenaiResponses,
             standalone_done,
-            frame_parts(PassthroughProtocol::OpenaiResponses, standalone_done)
-                .0
-                .scan,
+            frame_parts(
+                PassthroughProtocol::OpenaiResponses,
+                Metering::Responses,
+                standalone_done,
+            )
+            .0
+            .scan,
         );
         assert!(!standalone.unevaluable);
         assert_eq!(
@@ -9789,7 +9932,9 @@ mod tests {
     fn stream_guardrail_text_scans_a_visible_carrier_once() {
         let email = "carol@example.com";
         let frame = b"data: {\"id\":\"chatcmpl-once\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ask carol@example.com\"}}]}\n\n";
-        let typed = frame_parts(PassthroughProtocol::OpenaiChat, frame).0.scan;
+        let typed = frame_parts(PassthroughProtocol::OpenaiChat, Metering::Chat, frame)
+            .0
+            .scan;
         let text = stream_guardrail_text(PassthroughProtocol::OpenaiChat, frame, typed);
         let scanned = stream_guardrail_scan_text(&[], &text.continuations, &text.supplemental);
         assert_eq!(
@@ -9805,14 +9950,16 @@ mod tests {
     #[test]
     fn stream_guardrail_text_excludes_unambiguous_anthropic_reasoning() {
         let frame = b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"text\":\"BLOCKME\"}}\n\n";
-        let typed = frame_parts(PassthroughProtocol::OpenaiChat, frame).0.scan;
+        let typed = frame_parts(PassthroughProtocol::OpenaiChat, Metering::Chat, frame)
+            .0
+            .scan;
         assert!(typed.contains("BLOCKME"), "{typed:?}");
         let text = stream_guardrail_text(PassthroughProtocol::OpenaiChat, frame, typed);
         let scanned = stream_guardrail_scan_text(&[], &text.continuations, &text.supplemental);
         assert!(!scan_candidates_contain(&scanned, "BLOCKME"), "{scanned:?}");
 
         let signature = b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"signature_delta\",\"signature\":\"BLOCKME\"}}\n\n";
-        let typed = frame_parts(PassthroughProtocol::OpenaiChat, signature)
+        let typed = frame_parts(PassthroughProtocol::OpenaiChat, Metering::Chat, signature)
             .0
             .scan;
         let text = stream_guardrail_text(PassthroughProtocol::OpenaiChat, signature, typed);
@@ -9949,7 +10096,7 @@ mod tests {
             response_guardrail_text(PassthroughProtocol::OpenaiResponses, resp).contains("done")
         );
         assert_eq!(
-            response_usage(PassthroughProtocol::OpenaiResponses, None, resp),
+            usage_for(PassthroughProtocol::OpenaiResponses, None, resp),
             Some(usage_dims(11, 3))
         );
     }
@@ -9997,7 +10144,7 @@ mod tests {
     fn response_usage_follows_the_response_envelope() {
         let openai = br#"{"object":"chat.completion","choices":[],"usage":{"prompt_tokens":50,"completion_tokens":2,"total_tokens":52,"prompt_tokens_details":{"cached_tokens":40}}}"#;
         assert_eq!(
-            response_usage(PassthroughProtocol::OpenaiChat, None, openai),
+            usage_for(PassthroughProtocol::OpenaiChat, None, openai),
             Some(PassthroughUsage {
                 cached_prompt_tokens: 40,
                 upstream_total_tokens: Some(52),
@@ -10015,65 +10162,110 @@ mod tests {
             PassthroughProtocol::OpenaiChat,
             PassthroughProtocol::AnthropicMessages,
         ] {
-            assert_eq!(response_usage(hint, None, anthropic), additive);
+            assert_eq!(usage_for(hint, None, anthropic), additive);
         }
         // A bare usage object names no envelope, so the hint decides.
         let bare =
             br#"{"usage":{"input_tokens":9,"output_tokens":4,"cache_read_input_tokens":800}}"#;
         assert_eq!(
-            response_usage(PassthroughProtocol::AnthropicMessages, None, bare),
+            usage_for(PassthroughProtocol::AnthropicMessages, None, bare),
             Some(PassthroughUsage {
                 cache_read_tokens: 800,
                 ..usage_dims(9, 4)
             })
         );
-        assert_eq!(response_usage(PassthroughProtocol::Raw, None, openai), None);
+        assert_eq!(usage_for(PassthroughProtocol::Raw, None, openai), None);
 
-        // A reply naming no LLM envelope behind an `input` / `prompt`
-        // request — an embeddings list, an image result — is read by the
-        // protocol its usage object spells, not by the request hint's.
-        let embeddings = br#"{"object":"list","data":[{"embedding":[0.1]}],"usage":{"prompt_tokens":8,"total_tokens":8}}"#;
+        // Embeddings and image results are their own protocols: identified
+        // from the path (or, for embeddings, the response's `list` of
+        // `embedding` objects) and read the way `/v1/embeddings` and
+        // `/v1/images/*` read them.
+        let embeddings = br#"{"object":"list","data":[{"object":"embedding","embedding":[0.1]}],"usage":{"prompt_tokens":8,"total_tokens":8}}"#;
         assert_eq!(
-            response_usage(PassthroughProtocol::OpenaiResponses, None, embeddings),
-            Some(PassthroughUsage {
-                upstream_total_tokens: Some(8),
-                ..usage_dims(8, 0)
-            })
+            usage_for(PassthroughProtocol::OpenaiResponses, None, embeddings),
+            Some(usage_dims(8, 0))
+        );
+        let total_only = br#"{"object":"list","data":[],"usage":{"total_tokens":6}}"#;
+        assert_eq!(
+            response_usage(Metering::Embeddings, total_only),
+            Some(usage_dims(6, 0))
         );
         let image = br#"{"created":1,"data":[{"b64_json":"x"}],"usage":{"input_tokens":50,"output_tokens":4160,"total_tokens":4210}}"#;
         assert_eq!(
-            response_usage(PassthroughProtocol::OpenaiCompletions, None, image),
-            Some(PassthroughUsage {
-                upstream_total_tokens: Some(4210),
-                ..usage_dims(50, 4160)
-            })
+            response_usage(Metering::Images, image),
+            Some(usage_dims(50, 4160))
         );
-        // A chat reply whose usage is in another spelling is still read.
+        // Behind the bare request envelope those bodies are identified as,
+        // the identified protocol's parser cannot read them: no usage, as on
+        // that typed endpoint, rather than a reading by field name.
+        assert_eq!(
+            usage_for(PassthroughProtocol::OpenaiCompletions, None, image),
+            None
+        );
         let relayed = br#"{"object":"chat.completion","choices":[],"usage":{"input_tokens":9,"output_tokens":4}}"#;
         assert_eq!(
-            response_usage(PassthroughProtocol::OpenaiChat, None, relayed),
-            Some(usage_dims(9, 4))
+            usage_for(PassthroughProtocol::OpenaiChat, None, relayed),
+            None
         );
     }
 
     #[test]
-    fn a_stream_frame_the_hint_cannot_read_falls_back_to_its_usage_spelling() {
+    fn the_path_identifies_embeddings_and_image_surfaces() {
+        let m = |p, path| metering_protocol(p, None, path);
+        assert_eq!(
+            m(
+                PassthroughProtocol::OpenaiResponses,
+                "/openai/v1/embeddings"
+            ),
+            Metering::Embeddings
+        );
+        assert_eq!(
+            m(
+                PassthroughProtocol::OpenaiCompletions,
+                "/v1/images/generations"
+            ),
+            Metering::Images
+        );
+        // A multipart edit is no JSON envelope at all.
+        assert_eq!(
+            m(PassthroughProtocol::Raw, "/v1/images/edits/"),
+            Metering::Images
+        );
+        assert_eq!(
+            m(PassthroughProtocol::OpenaiResponses, "/v1/responses"),
+            Metering::Responses
+        );
+        assert_eq!(
+            m(PassthroughProtocol::Raw, "/api/agent/v3/x"),
+            Metering::Opaque
+        );
+        assert!(!Metering::Opaque.llm_tier());
+        assert!(!Metering::DashscopeNative.llm_tier());
+        assert!(Metering::Rerank.llm_tier() && Metering::Images.llm_tier());
+    }
+
+    /// A frame carries usage only in the shape its identified protocol's
+    /// stream reports it; a surface whose typed endpoint has no streaming
+    /// parser records none.
+    #[test]
+    fn a_stream_frame_is_read_only_by_its_identified_protocol() {
         let image_done = br#"data: {"type":"image_generation.completed","usage":{"input_tokens":50,"output_tokens":4160,"total_tokens":4210}}
 
 "#;
-        assert_eq!(
-            frame_delta(PassthroughProtocol::OpenaiCompletions, image_done).1,
-            Some(PassthroughUsage {
-                upstream_total_tokens: Some(4210),
-                ..usage_dims(50, 4160)
-            })
+        let (_, usage) = frame_parts(
+            PassthroughProtocol::OpenaiCompletions,
+            Metering::Images,
+            image_done,
         );
-        let chat_usage = br#"data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}
+        assert_eq!(usage, None);
+        // A non-terminal Responses event with a root usage object is not a
+        // Responses usage report.
+        let provisional = br#"data: {"type":"response.in_progress","usage":{"input_tokens":999,"output_tokens":999}}
 
 "#;
         assert_eq!(
-            frame_delta(PassthroughProtocol::OpenaiResponses, chat_usage).1,
-            Some(usage_dims(7, 3))
+            frame_delta(PassthroughProtocol::OpenaiResponses, provisional).1,
+            None
         );
     }
 
@@ -10129,7 +10321,7 @@ mod tests {
     #[test]
     fn dashscope_native_usage_counts_image_tokens_once() {
         let usage = |b: &[u8]| {
-            response_usage(
+            usage_for(
                 PassthroughProtocol::Raw,
                 Some(RawUsageShape::DashscopeNative),
                 b,
@@ -10586,7 +10778,7 @@ mod tests {
     /// arguments for the scan, and its reasoning only for the cap (#513).
     #[test]
     fn frame_parts_split_scan_text_from_reasoning_per_protocol() {
-        let parts = |p, f: &str| frame_parts(p, f.as_bytes()).0;
+        let parts = |p, f: &str| frame_parts(p, metering_protocol(p, None, ""), f.as_bytes()).0;
         let a = parts(
             PassthroughProtocol::OpenaiChat,
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
@@ -10621,7 +10813,7 @@ mod tests {
         let raw = parts(PassthroughProtocol::Raw, "data: {\"x\":1}\n\n");
         assert_eq!((raw.scan.as_str(), raw.held()), ("{\"x\":1}", 7));
         let frame = b"data: {\"state\":\"\\u0042LOCKME\",\"state\":\"clean\"}\n\n";
-        let raw = frame_parts(PassthroughProtocol::Raw, frame).0;
+        let raw = frame_parts(PassthroughProtocol::Raw, Metering::Opaque, frame).0;
         assert_eq!(raw.scan, "BLOCKME\nclean");
         assert_eq!(
             frame_capture_text(PassthroughProtocol::Raw, frame, &raw.scan),
@@ -10630,7 +10822,7 @@ mod tests {
         let deep = deeply_nested_escaped_block_json();
         let frame = format!("data: {}\n\n", String::from_utf8_lossy(&deep));
         assert!(
-            frame_parts(PassthroughProtocol::Raw, frame.as_bytes())
+            frame_parts(PassthroughProtocol::Raw, Metering::Opaque, frame.as_bytes())
                 .0
                 .scan
                 .contains("BLOCKME"),

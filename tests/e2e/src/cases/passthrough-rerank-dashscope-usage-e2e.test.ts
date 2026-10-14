@@ -12,6 +12,7 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { metricDelta, scrapeMetrics } from "../harness/metrics.js";
 
 // AISIX-Cloud#1630: a customer relays DashScope's native services (rerank,
 // multimodal embedding) and Cohere-style rerank APIs through passthrough
@@ -275,6 +276,12 @@ describe("passthrough route meters rerank and DashScope native bodies", () => {
     }
     await waitCallerReady();
 
+    // A rerank is model inference `/v1/rerank` serves, so it counts once in
+    // the LLM request tier; DashScope's native envelope has no typed
+    // counterpart and stays proxy-only.
+    const llmRequests = (before: Awaited<ReturnType<typeof scrapeMetrics>>, after: typeof before) =>
+      metricDelta(before, after, "aisix_llm_requests_total", { endpoint: "/passthrough_route" });
+    const beforeRerank = await scrapeMetrics(app.metricsUrl);
     const jina = await call("/jina/v1/rerank", {
       model: "jina-reranker-v2-base-multilingual",
       query: "what is a gateway",
@@ -287,6 +294,8 @@ describe("passthrough route meters rerank and DashScope native bodies", () => {
       model: "jina-reranker-v2-base-multilingual",
       operation: "passthrough",
     });
+    // `call` waited for the usage row, which is emitted after the metrics.
+    expect(llmRequests(beforeRerank, await scrapeMetrics(app.metricsUrl))).toBe(1);
 
     const cohere = await call("/cohere/v2/rerank", {
       model: "rerank-v3.5",
@@ -312,6 +321,7 @@ describe("passthrough route meters rerank and DashScope native bodies", () => {
       operation: "passthrough",
     });
 
+    const beforeNative = await scrapeMetrics(app.metricsUrl);
     const mmEmbed = await call(
       "/ds-mm-embed/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
       {
@@ -327,6 +337,7 @@ describe("passthrough route meters rerank and DashScope native bodies", () => {
       model: "qwen3-vl-embedding",
       operation: "passthrough",
     });
+    expect(llmRequests(beforeNative, await scrapeMetrics(app.metricsUrl))).toBe(0);
 
     const visionEmbed = await call(
       "/ds-vision-embed/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",

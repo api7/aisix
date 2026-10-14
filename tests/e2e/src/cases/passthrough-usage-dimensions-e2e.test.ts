@@ -44,13 +44,14 @@ import {
 //      `completion_tokens_details.reasoning_tokens`) reach the event, and
 //      the caller's `model` alias attributes the row.
 //
-// A second spec drives every LLM envelope a route identifies — Anthropic
+// A second spec drives every LLM protocol a route identifies — Anthropic
 // Messages (buffered and streamed), OpenAI Responses, a streamed OpenAI
-// Chat — and requires each to be metered the way the typed endpoint for
-// that protocol meters it: the cache counters in that protocol's own
-// accounting (Anthropic's BESIDE the prompt, OpenAI's INSIDE it), a
-// cache-inclusive access-log total, and the `aisix_llm_*` token families.
-// The opaque agent stream stays out of those families.
+// Chat, embeddings, image generation — and requires each to be metered the
+// way the typed endpoint for that protocol meters it: the cache counters in
+// that protocol's own accounting (Anthropic's BESIDE the prompt, OpenAI's
+// INSIDE it), a cache-inclusive access-log total, and one request in the
+// LLM request tier beside its `aisix_llm_*` token families. The opaque agent
+// stream stays out of the LLM tier.
 //
 // Asserted through a real `datadog` exporter, because that sink serialises
 // the WHOLE `UsageEvent` — the OTLP span builder is an explicit allowlist
@@ -312,7 +313,27 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
         "[DONE]",
       ],
     });
+    // 9. OpenAI embeddings: the body carries the Responses `input` key.
+    const embeddings = await startOpenAiUpstream({
+      nonStreamBody: {
+        object: "list",
+        model: "text-embedding-3-small",
+        data: [{ object: "embedding", index: 0, embedding: [0.1, 0.2] }],
+        usage: { prompt_tokens: 8, total_tokens: 8 },
+      },
+    });
+    // 10. OpenAI image generation: the body carries the Completions
+    //     `prompt` key, the usage the Responses-like input/output spelling.
+    const images = await startOpenAiUpstream({
+      nonStreamBody: {
+        created: 1,
+        data: [{ b64_json: "aGk=" }],
+        usage: { input_tokens: 50, output_tokens: 4160, total_tokens: 4210 },
+      },
+    });
     upstreams.push(
+      embeddings,
+      images,
       labelled,
       unlabelled,
       chat,
@@ -337,6 +358,8 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
       ["ptr-dims-anthropic-stream", "/dims-anthropic-stream", anthropicStream],
       ["ptr-dims-responses", "/dims-responses", responses],
       ["ptr-dims-chat-stream", "/dims-chat-stream", chatStream],
+      ["ptr-dims-embeddings", "/dims-embeddings", embeddings],
+      ["ptr-dims-images", "/dims-images", images],
     ] as const) {
       await seed.createPassthroughRoute({
         name,
@@ -531,6 +554,9 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
   function tokenDeltas(before: MetricSample[], after: MetricSample[]) {
     const d = (name: string) => metricDelta(before, after, name, ROUTE_TOKENS);
     return {
+      // The LLM request tier: the denominator of every tokens-per-request
+      // query, so an identified exchange counts here exactly once.
+      requests: d("aisix_llm_requests_total"),
       input: d("aisix_llm_input_tokens_total"),
       output: d("aisix_llm_output_tokens_total"),
       total: d("aisix_llm_total_tokens_total"),
@@ -549,7 +575,7 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
     const deadline = Date.now() + 5_000;
     for (;;) {
       const deltas = tokenDeltas(before, await scrape());
-      if (deltas.input > 0 || Date.now() >= deadline) return deltas;
+      if (deltas.requests > 0 || Date.now() >= deadline) return deltas;
       await new Promise((r) => setTimeout(r, 50));
     }
   }
@@ -626,6 +652,7 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
       );
 
       expect(await settledTokenDeltas(before), route).toEqual({
+        requests: 1,
         input: ANTHROPIC_USAGE.input_tokens,
         output: ANTHROPIC_USAGE.output_tokens,
         total: ANTHROPIC_TOTAL_INPUT + ANTHROPIC_USAGE.output_tokens,
@@ -653,6 +680,7 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
       expect(row["aisix.cache_read_tokens"] ?? 0).toBe(0);
       expect(await accessLineFor(res)).toContain("total_tokens=39");
       expect(await settledTokenDeltas(before)).toEqual({
+        requests: 1,
         input: 30,
         output: 9,
         total: 39,
@@ -678,6 +706,7 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
       expect(row["aisix.cache_read_tokens"] ?? 0).toBe(0);
       expect(await accessLineFor(res)).toContain("total_tokens=925");
       expect(await settledTokenDeltas(before)).toEqual({
+        requests: 1,
         input: 900,
         output: 25,
         total: 925,
@@ -703,7 +732,55 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
       expect(await accessLineFor(res)).toContain(
         `total_tokens=${AGENT_USAGE.total_tokens}`,
       );
-      expect(tokenDeltas(before, await scrape()).input).toBe(0);
+      const deltas = tokenDeltas(before, await scrape());
+      expect(deltas.requests).toBe(0);
+      expect(deltas.input).toBe(0);
+    }
+
+    // OpenAI embeddings and image generation are identified from their
+    // paths and read as `/v1/embeddings` and `/v1/images/generations` read
+    // them — although their bodies carry another envelope's key.
+    {
+      const before = await scrape();
+      const res = await post("/dims-embeddings/v1/embeddings", {
+        model: "text-embedding-3-small",
+        input: "hi",
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+      const row = await logFor("ptr-dims-embeddings");
+      expect(row["gen_ai.usage.input_tokens"]).toBe(8);
+      expect(row["gen_ai.usage.output_tokens"] ?? 0).toBe(0);
+      expect(await settledTokenDeltas(before)).toEqual({
+        requests: 1,
+        input: 8,
+        output: 0,
+        total: 8,
+        cached: 0,
+        cacheRead: 0,
+        cacheCreation: 0,
+      });
+    }
+    {
+      const before = await scrape();
+      const res = await post("/dims-images/v1/images/generations", {
+        model: "gpt-image-1",
+        prompt: "a cat",
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+      const row = await logFor("ptr-dims-images");
+      expect(row["gen_ai.usage.input_tokens"]).toBe(50);
+      expect(row["gen_ai.usage.output_tokens"]).toBe(4160);
+      expect(await settledTokenDeltas(before)).toEqual({
+        requests: 1,
+        input: 50,
+        output: 4160,
+        total: 4210,
+        cached: 0,
+        cacheRead: 0,
+        cacheCreation: 0,
+      });
     }
   });
 });

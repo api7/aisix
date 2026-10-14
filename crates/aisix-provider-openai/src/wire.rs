@@ -638,7 +638,7 @@ pub(crate) struct OpenAiEmbeddingObject {
 /// a gateway-defaulted zero as a provider-reported count.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-pub(crate) struct OpenAiEmbedUsage {
+pub struct OpenAiEmbedUsage {
     pub prompt_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
 }
@@ -690,6 +690,24 @@ pub(crate) fn embed_response_into(raw: OpenAiEmbedResponse) -> EmbeddingResponse
         data,
         usage,
     } = raw;
+    EmbeddingResponse {
+        object,
+        model,
+        data: data
+            .into_iter()
+            .zip(0u32..)
+            .map(|(e, position)| EmbeddingObject {
+                index: e.index.unwrap_or(position),
+                object: e.object,
+                embedding: e.embedding,
+            })
+            .collect(),
+        usage: embed_usage_into(usage),
+    }
+}
+
+/// An OpenAI embeddings `usage` block as [`EmbeddingUsage`].
+pub fn embed_usage_into(usage: Option<OpenAiEmbedUsage>) -> EmbeddingUsage {
     let (prompt_tokens, total_tokens, source) = match usage {
         Some(usage) => {
             let source = if usage.prompt_tokens.is_some() && usage.total_tokens.is_some() {
@@ -705,23 +723,10 @@ pub(crate) fn embed_response_into(raw: OpenAiEmbedResponse) -> EmbeddingResponse
         }
         None => (0, 0, EmbeddingUsageSource::Unavailable),
     };
-    EmbeddingResponse {
-        object,
-        model,
-        data: data
-            .into_iter()
-            .zip(0u32..)
-            .map(|(e, position)| EmbeddingObject {
-                index: e.index.unwrap_or(position),
-                object: e.object,
-                embedding: e.embedding,
-            })
-            .collect(),
-        usage: EmbeddingUsage {
-            prompt_tokens,
-            total_tokens,
-            source,
-        },
+    EmbeddingUsage {
+        prompt_tokens,
+        total_tokens,
+        source,
     }
 }
 

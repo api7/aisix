@@ -341,11 +341,13 @@ impl<'a> LastTarget<'a> {
 ///
 /// Deliberately absent, and why:
 /// - `/mcp`, `/mcp/{server}`, `/a2a` — tool and agent calls, no model.
-/// - `/passthrough_route` — one endpoint for opaque and LLM traffic alike,
-///   and the tier is decided per endpoint. Exchanges identified as an LLM
-///   envelope do feed the token families (attributed to the body's `model`),
-///   so those carry `endpoint="/passthrough_route"` with no request-tier
-///   denominator here.
+/// - `/passthrough_route` — one endpoint for opaque relays and identified
+///   LLM exchanges alike, so its tier is decided per request
+///   ([`record_in_tier`]): an exchange identified as a protocol a typed
+///   endpoint serves (chat, Anthropic messages, responses, completions,
+///   embeddings, images, rerank) counts in the LLM tier and the token
+///   families, exactly once, like that endpoint; an opaque relay, or a shape
+///   no typed endpoint serves, stays proxy-only.
 /// - `/v1/files`, `/v1/batches`, `/v1/fine_tuning/jobs` — management calls.
 ///
 /// `/v1/realtime` was in that list until the token families reached it too.
@@ -402,6 +404,30 @@ pub(crate) fn record(
     status: u16,
     elapsed: Duration,
 ) {
+    record_in_tier(
+        state,
+        endpoint,
+        is_llm_endpoint(endpoint),
+        caller,
+        upstream,
+        status,
+        elapsed,
+    );
+}
+
+/// [`record`] for the one endpoint whose tier is decided per request:
+/// `/passthrough_route`, which carries opaque relays and identified LLM
+/// exchanges alike. `llm` is whether THIS request is model inference of a
+/// kind a typed endpoint serves — see `LLM_ENDPOINTS`.
+pub(crate) fn record_in_tier(
+    state: &ProxyState,
+    endpoint: &'static str,
+    llm: bool,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    elapsed: Duration,
+) {
     // Emit-chokepoint label bounding (#451 class): success paths hand in
     // the caller's requested string, which for a wildcard-served alias
     // is caller-minted — collapse it to the configured row's name here
@@ -414,13 +440,22 @@ pub(crate) fn record(
         upstream_model: upstream_model.as_ref(),
         ..upstream
     };
-    emit(&state.metrics, endpoint, caller, upstream, status, elapsed);
+    emit(
+        &state.metrics,
+        endpoint,
+        llm,
+        caller,
+        upstream,
+        status,
+        elapsed,
+    );
 }
 
 /// Write one request's samples. `upstream` must already be bounded.
 fn emit(
     metrics: &aisix_obs::Metrics,
     endpoint: &'static str,
+    llm: bool,
     caller: Caller<'_>,
     upstream: Upstream<'_>,
     status: u16,
@@ -454,7 +489,7 @@ fn emit(
         status,
         outcome,
     };
-    if is_llm_endpoint(endpoint) {
+    if llm {
         metrics.record_proxy_and_llm_request(labels, elapsed);
     } else {
         metrics.record_proxy_request(labels, elapsed);
@@ -544,6 +579,7 @@ impl PendingRequestMetrics {
         emit(
             &self.metrics,
             self.endpoint,
+            is_llm_endpoint(self.endpoint),
             self.caller.as_caller(),
             upstream,
             status,

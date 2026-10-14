@@ -295,8 +295,10 @@ the guard can see that it already spoke.
 protocol of the exchange and extracts from it — there is no bridge behind it
 to fill anything in. Its usage is read by the typed endpoint's own parser for
 that protocol (`completions::completion_usage_stats`,
-`responses::response_usage_stats`, `messages::anthropic_usage_stats`, the
-OpenAI wire reader, …), never by a reader of its own: a token field's
+`responses::response_usage_stats`, `messages::anthropic_usage_stats`,
+`embeddings::embedding_usage_stats`, `images::image_usage_stats`, the OpenAI
+wire reader, …), never by a reader of its own — and never by guessing a
+protocol from a usage object's field names: a token field's
 meaning depends on the protocol that produced it (`cache_read_input_tokens`
 is additive beside Anthropic's `input_tokens` and a subset of an agent
 backend's whole-input `prompt_tokens`), so a reader keyed on field names
@@ -314,10 +316,10 @@ of the request — that narrows what the guardrail sees.
 
 Two rules bound the extraction:
 
-- An **opaque** (`Raw`) body is never mined for meaning. Buffered opaque
-  responses are not probed for usage at all, and an opaque stream's flat token
-  fields count only on a frame the server itself labelled one
-  (`event: token_usage`) — a caller-shaped body must not be able to mint tokens.
+- An **opaque** (`Raw`) body is never mined for meaning. Opaque responses
+  are not probed for usage at all, buffered or streamed, except a flat token
+  report on a frame the server itself labelled one (`event: token_usage`) —
+  a caller-shaped body must not be able to mint tokens.
 - Usage accumulates **field-wise max** across frames, never last-wins: one
   stream reports it in pieces (Anthropic's `message_start` carries the input
   and cache counters, its `message_delta` only the output ones), so an
