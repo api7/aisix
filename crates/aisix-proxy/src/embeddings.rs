@@ -623,17 +623,16 @@ async fn dispatch(
             // reports nothing at all does the local estimator count the
             // request `input`. Telemetry only — the response body is
             // forwarded untouched.
-            let (prompt_tokens, usage_estimated) = if embed_resp.usage.prompt_tokens > 0 {
-                (embed_resp.usage.prompt_tokens, false)
-            } else if embed_resp.usage.total_tokens > 0 {
-                (embed_resp.usage.total_tokens, false)
-            } else {
-                let upstream_model = model.upstream_model().unwrap_or("unknown");
-                let estimated = req.input.iter().fold(0u32, |acc, s| {
-                    acc.saturating_add(crate::token_estimate::count_text(upstream_model, s))
-                });
-                (estimated, estimated > 0)
-            };
+            let (prompt_tokens, usage_estimated) =
+                if let Some(reported) = reported_prompt_tokens(&embed_resp.usage) {
+                    (reported, false)
+                } else {
+                    let upstream_model = model.upstream_model().unwrap_or("unknown");
+                    let estimated = req.input.iter().fold(0u32, |acc, s| {
+                        acc.saturating_add(crate::token_estimate::count_text(upstream_model, s))
+                    });
+                    (estimated, estimated > 0)
+                };
             // Commit the reservation — release the concurrency permit
             // and finalise RPM. Embeddings do report prompt_tokens via
             // EmbeddingResponse.usage; thread it through so TPM works
@@ -758,6 +757,26 @@ fn emit_access_log(
         request_body_bytes: None,
         response_body_bytes: None,
     });
+}
+
+/// The prompt count an embeddings `usage` block reports: `prompt_tokens`, or
+/// `total_tokens` from a provider that reports only that (embeddings are
+/// input-only). `None` when it reports neither.
+fn reported_prompt_tokens(usage: &aisix_gateway::EmbeddingUsage) -> Option<u32> {
+    [usage.prompt_tokens, usage.total_tokens]
+        .into_iter()
+        .find(|&n| n > 0)
+}
+
+/// This endpoint's reading of an embeddings body's usage, shared with
+/// passthrough routes relaying the same envelope. `None` when the upstream
+/// reported no count (this endpoint estimates one; a relay records none).
+pub(crate) fn embedding_usage_stats(body: &serde_json::Value) -> Option<aisix_gateway::UsageStats> {
+    use serde::Deserialize as _;
+    let wire =
+        aisix_provider_openai::wire::OpenAiEmbedUsage::deserialize(body.get("usage")?).ok()?;
+    let usage = aisix_provider_openai::wire::embed_usage_into(Some(wire));
+    reported_prompt_tokens(&usage).map(|prompt| aisix_gateway::UsageStats::new(prompt, 0))
 }
 
 /// Push one `UsageEvent` onto cp-api's telemetry sink **and** fan it

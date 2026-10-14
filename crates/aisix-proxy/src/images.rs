@@ -598,6 +598,12 @@ pub(crate) fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
     Some((input, output))
 }
 
+/// [`extract_token_usage`] as `UsageStats`, shared with passthrough routes
+/// relaying an image body.
+pub(crate) fn image_usage_stats(body: &Value) -> Option<aisix_gateway::UsageStats> {
+    extract_token_usage(body).map(|(input, output)| aisix_gateway::UsageStats::new(input, output))
+}
+
 /// Issue #407: push one `UsageEvent` onto cp-api's telemetry sink and
 /// fan it out to per-env OTLP exporters. Mirrors
 /// `embeddings::emit_usage_event` (#402). `inbound_protocol = "openai"`

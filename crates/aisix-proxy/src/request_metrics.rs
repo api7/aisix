@@ -341,8 +341,13 @@ impl<'a> LastTarget<'a> {
 ///
 /// Deliberately absent, and why:
 /// - `/mcp`, `/mcp/{server}`, `/a2a` — tool and agent calls, no model.
-/// - `/passthrough_route` — an opaque relay; even a `protocol`-aware route
-///   resolves no configured Model to attribute.
+/// - `/passthrough_route` — one endpoint for opaque relays and identified
+///   LLM exchanges alike, so its tier is decided per request
+///   ([`record_in_tier`]): an exchange identified as a protocol a typed
+///   endpoint serves (chat, Anthropic messages, responses, completions,
+///   embeddings, images, rerank) counts in the LLM tier and the token
+///   families, exactly once, like that endpoint; an opaque relay, or a shape
+///   no typed endpoint serves, stays proxy-only.
 /// - `/v1/files`, `/v1/batches`, `/v1/fine_tuning/jobs` — management calls.
 ///
 /// `/v1/realtime` was in that list until the token families reached it too.
@@ -399,6 +404,30 @@ pub(crate) fn record(
     status: u16,
     elapsed: Duration,
 ) {
+    record_in_tier(
+        state,
+        endpoint,
+        is_llm_endpoint(endpoint),
+        caller,
+        upstream,
+        status,
+        elapsed,
+    );
+}
+
+/// [`record`] for the one endpoint whose tier is decided per request:
+/// `/passthrough_route`, which carries opaque relays and identified LLM
+/// exchanges alike. `llm` is whether THIS request is model inference of a
+/// kind a typed endpoint serves — see `LLM_ENDPOINTS`.
+pub(crate) fn record_in_tier(
+    state: &ProxyState,
+    endpoint: &'static str,
+    llm: bool,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    elapsed: Duration,
+) {
     // Emit-chokepoint label bounding (#451 class): success paths hand in
     // the caller's requested string, which for a wildcard-served alias
     // is caller-minted — collapse it to the configured row's name here
@@ -411,13 +440,22 @@ pub(crate) fn record(
         upstream_model: upstream_model.as_ref(),
         ..upstream
     };
-    emit(&state.metrics, endpoint, caller, upstream, status, elapsed);
+    emit(
+        &state.metrics,
+        endpoint,
+        llm,
+        caller,
+        upstream,
+        status,
+        elapsed,
+    );
 }
 
 /// Write one request's samples. `upstream` must already be bounded.
 fn emit(
     metrics: &aisix_obs::Metrics,
     endpoint: &'static str,
+    llm: bool,
     caller: Caller<'_>,
     upstream: Upstream<'_>,
     status: u16,
@@ -451,7 +489,7 @@ fn emit(
         status,
         outcome,
     };
-    if is_llm_endpoint(endpoint) {
+    if llm {
         metrics.record_proxy_and_llm_request(labels, elapsed);
     } else {
         metrics.record_proxy_request(labels, elapsed);
@@ -541,6 +579,7 @@ impl PendingRequestMetrics {
         emit(
             &self.metrics,
             self.endpoint,
+            is_llm_endpoint(self.endpoint),
             self.caller.as_caller(),
             upstream,
             status,
@@ -588,8 +627,54 @@ fn record_e2e_latency_as(
     with_upstream: bool,
 ) {
     let snap = state.snapshot.load();
+    with_latency_labels(&snap, endpoint, caller, upstream, status, |labels| {
+        // An ensemble's response comes from no single attempt — its terminal
+        // event is the judge's own call, only the last step — so it has no
+        // upstream side to observe, on any path.
+        let ensemble =
+            crate::attribution::current().is_some_and(|r| is_ensemble(&snap, &r.requested_model));
+        if with_upstream && !ensemble {
+            record_e2e_downstream(&state.metrics, labels, elapsed);
+        } else {
+            state
+                .metrics
+                .record_request_e2e_latency(labels, LatencySide::Downstream, elapsed);
+        }
+    });
+}
+
+/// Record a streamed response's time to first token — both sides, on
+/// `aisix_request_ttft_seconds` and `aisix_llm_time_to_first_token_seconds`
+/// — under the same bounded labels [`record_e2e_latency`] uses.
+pub(crate) fn record_stream_ttft(
+    state: &ProxyState,
+    endpoint: &'static str,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    upstream_ttft: Duration,
+    downstream_ttft: Duration,
+) {
+    let snap = state.snapshot.load();
+    with_latency_labels(&snap, endpoint, caller, upstream, status, |labels| {
+        state
+            .metrics
+            .record_ttft(labels, upstream_ttft, downstream_ttft);
+    });
+}
+
+/// The latency families' labels for one request, with the model pair bounded
+/// at this chokepoint like every other emit here.
+fn with_latency_labels(
+    snap: &AisixSnapshot,
+    endpoint: &'static str,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    f: impl FnOnce(aisix_obs::LatencyLabels<'_>),
+) {
     let (model, upstream_model) =
-        crate::usage_attr::metric_model_label_pair(&snap, upstream.model, upstream.upstream_model);
+        crate::usage_attr::metric_model_label_pair(snap, upstream.model, upstream.upstream_model);
     let labels = aisix_obs::LatencyLabels {
         endpoint,
         model: model.as_ref(),
@@ -613,18 +698,7 @@ fn record_e2e_latency_as(
             user_name: caller.user_name,
         },
     };
-    // An ensemble's response comes from no single attempt — its terminal
-    // event is the judge's own call, only the last step — so it has no
-    // upstream side to observe, on any path.
-    let ensemble =
-        crate::attribution::current().is_some_and(|r| is_ensemble(&snap, &r.requested_model));
-    if with_upstream && !ensemble {
-        record_e2e_downstream(&state.metrics, labels, elapsed);
-    } else {
-        state
-            .metrics
-            .record_request_e2e_latency(labels, LatencySide::Downstream, elapsed);
-    }
+    f(labels);
 }
 
 /// Observe a request's `downstream` end-to-end latency, and note its labels
