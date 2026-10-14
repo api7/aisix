@@ -6961,6 +6961,43 @@ impl RouteTelemetry {
             elapsed,
         );
 
+        if llm_tier {
+            let upstream = || crate::request_metrics::Upstream {
+                provider: &self.provider_label,
+                model: &usage_model,
+                pk: pk.labels(),
+                stream: self.streaming,
+                ..Default::default()
+            };
+            // The latency families each typed endpoint records: end-to-end
+            // latency on the three that time it (chat, Anthropic messages,
+            // responses), and time to first token on any streamed reply.
+            if matches!(
+                self.metering,
+                Metering::Chat | Metering::Anthropic | Metering::Responses
+            ) {
+                crate::request_metrics::record_e2e_latency(
+                    &self.state,
+                    ENDPOINT_LABEL,
+                    caller.as_caller(),
+                    upstream(),
+                    self.status,
+                    elapsed,
+                );
+            }
+            if self.streaming && self.upstream_ttft_ms > 0 {
+                crate::request_metrics::record_stream_ttft(
+                    &self.state,
+                    ENDPOINT_LABEL,
+                    caller.as_caller(),
+                    upstream(),
+                    self.status,
+                    Duration::from_millis(u64::from(self.upstream_ttft_ms)),
+                    Duration::from_millis(u64::from(self.downstream_first_ms.unwrap_or(0))),
+                );
+            }
+        }
+
         let mut event = aisix_obs::UsageEvent {
             request_id: self.request_id.clone(),
             occurred_at: aisix_obs::UsageEvent::occurred_at_now(),

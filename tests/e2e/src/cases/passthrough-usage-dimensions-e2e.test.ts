@@ -567,6 +567,21 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
   }
 
   /**
+   * The latency families one action added on route traffic: time to first
+   * token (upstream side) and end-to-end latency, each as an observation
+   * count.
+   */
+  function latencyDeltas(before: MetricSample[], after: MetricSample[]) {
+    const d = (name: string, extra: Record<string, string> = {}) =>
+      metricDelta(before, after, name, { ...ROUTE_TOKENS, ...extra });
+    return {
+      ttft: d("aisix_llm_time_to_first_token_seconds_count", { side: "upstream" }),
+      requestTtft: d("aisix_request_ttft_seconds_count", { side: "upstream" }),
+      e2e: d("aisix_request_e2e_latency_seconds_count", { side: "downstream" }),
+    };
+  }
+
+  /**
    * The token deltas once the route's terminal emit has landed. A streamed
    * relay emits from its drop, which can trail the client's last read, so
    * poll until the input count moves rather than reading once.
@@ -660,6 +675,13 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
         cacheRead: ANTHROPIC_USAGE.cache_read_input_tokens,
         cacheCreation: ANTHROPIC_USAGE.cache_creation_input_tokens,
       });
+      // `/v1/messages` times every request end to end, and a streamed one
+      // to its first token as well.
+      expect(latencyDeltas(before, await scrape()), route).toEqual({
+        ttft: stream ? 1 : 0,
+        requestTtft: stream ? 1 : 0,
+        e2e: 1,
+      });
     }
 
     // OpenAI Responses: the `input`/`output` spelling, cache hit inside.
@@ -714,6 +736,11 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
         cacheRead: 0,
         cacheCreation: 0,
       });
+      expect(latencyDeltas(before, await scrape())).toEqual({
+        ttft: 1,
+        requestTtft: 1,
+        e2e: 1,
+      });
     }
 
     // The opaque agent stream reports usage on its event, but it is not an
@@ -732,9 +759,12 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
       expect(await accessLineFor(res)).toContain(
         `total_tokens=${AGENT_USAGE.total_tokens}`,
       );
-      const deltas = tokenDeltas(before, await scrape());
+      const after = await scrape();
+      const deltas = tokenDeltas(before, after);
       expect(deltas.requests).toBe(0);
       expect(deltas.input).toBe(0);
+      // A streamed reply, but not an LLM protocol: no LLM latency either.
+      expect(latencyDeltas(before, after)).toEqual({ ttft: 0, requestTtft: 0, e2e: 0 });
     }
 
     // OpenAI embeddings and image generation are identified from their
