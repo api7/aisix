@@ -31,7 +31,13 @@ export async function startMockDatadog(): Promise<MockDatadog> {
     });
   });
   const port = await pickFreePort();
-  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
   return {
     site: `127.0.0.1:${port}`,
     logs,
