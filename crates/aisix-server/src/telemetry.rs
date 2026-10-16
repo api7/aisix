@@ -888,6 +888,50 @@ mod tests {
         assert_eq!(body["events"][0]["request_id"], "req-1");
     }
 
+    /// The captured header values are exporter-only: the body posted to
+    /// `/dp/telemetry` carries neither map, while the new metadata fields
+    /// ride it.
+    #[tokio::test]
+    async fn send_never_posts_captured_header_values() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/telemetry"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accepted": 1
+            })))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let cfg = TelemetryConfig::new(format!("{}/dp/telemetry", server.uri()), mtls);
+        let mut event = sample_event("req-headers");
+        event.request_headers = [("x-sub-user".to_string(), "alice".to_string())].into();
+        event.upstream_response_headers = [("x-upstream-id".to_string(), "u-1".to_string())].into();
+        event.api_key_name = "key-a".into();
+        event.gateway_overhead_ms = Some(4);
+        event.upstream_tpot_ms = Some(2.5);
+        event.modality_tokens.prompt_audio_tokens = Some(7);
+        send(&plain_client(), &cfg, Uuid::new_v4(), &[event]).await;
+
+        let received = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        let posted = &body["events"][0];
+        let text = posted.to_string();
+        for absent in [
+            "request_headers",
+            "upstream_response_headers",
+            "alice",
+            "u-1",
+        ] {
+            assert!(!text.contains(absent), "{absent} reached the CP: {text}");
+        }
+        assert_eq!(posted["api_key_name"], "key-a");
+        assert_eq!(posted["gateway_overhead_ms"], 4);
+        assert_eq!(posted["upstream_tpot_ms"], 2.5);
+        assert_eq!(posted["prompt_audio_tokens"], 7);
+        assert!(posted.get("prompt_image_tokens").is_none());
+    }
+
     #[tokio::test]
     async fn send_propagates_non_success_with_body_excerpt() {
         let server = MockServer::start().await;

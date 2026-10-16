@@ -21,6 +21,7 @@ pub mod memory;
 pub mod metric_labels;
 pub mod metrics;
 pub mod otlp_http_sink;
+pub mod output;
 mod prometheus;
 mod scrape;
 pub mod sink;
@@ -47,6 +48,9 @@ pub use metrics::{
     Metrics, RequestLabels, RequestOutcome, UsageEventLabels, UsageLabels,
 };
 pub use otlp_http_sink::{content_capture_cap, OtlpHttpFanOut, OtlpSink};
+pub use output::{
+    responses_finish_reason, OutputCapture, OutputCollector, OutputWire, ResponsesFinishObserver,
+};
 pub use sink::{
     AliyunSlsSink, BatchUnit, CapturedContent, ChannelKey, DatadogSink, EventBatch,
     ExporterPipelines, IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope,

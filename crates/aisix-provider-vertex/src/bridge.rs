@@ -799,6 +799,7 @@ impl Bridge for VertexBridge {
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -944,6 +945,7 @@ impl VertexBridge {
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -1060,6 +1062,7 @@ impl VertexBridge {
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -1169,6 +1172,7 @@ impl VertexBridge {
         })
         .await?;
 
+        aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
             return Err(map_http_error(status, resp).await);
@@ -1307,6 +1311,7 @@ impl VertexBridge {
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -1377,6 +1382,7 @@ impl VertexBridge {
         })
         .await?;
 
+        aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
             return Err(map_http_error(status, resp).await);
@@ -1526,6 +1532,7 @@ impl VertexBridge {
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -1612,6 +1619,7 @@ impl VertexBridge {
         })
         .await?;
 
+        aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
             return Err(map_http_error(status, resp).await);
@@ -1735,6 +1743,7 @@ impl VertexBridge {
         })
         .await?;
 
+        aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
             return Err(map_http_error(status, resp).await);
@@ -2441,6 +2450,11 @@ struct GeminiUsageMetadata {
     /// double-count thinking tokens on tool-calling turns.
     #[serde(default, rename = "toolUsePromptTokenCount")]
     tool_use_prompt_token_count: u32,
+    /// Per-modality breakdowns, `[{modality, tokenCount}]`.
+    #[serde(default, rename = "promptTokensDetails")]
+    prompt_tokens_details: Option<serde_json::Value>,
+    #[serde(default, rename = "candidatesTokensDetails")]
+    candidates_tokens_details: Option<serde_json::Value>,
 }
 
 impl GeminiUsageMetadata {
@@ -2510,6 +2524,10 @@ impl GeminiUsageMetadata {
             reasoning_tokens: self.thoughts_token_count,
             upstream_total_tokens: self.total_token_count,
             reasoning_folded_into_completion,
+            modality: aisix_gateway::ModalityTokens::from_gemini_details(
+                self.prompt_tokens_details.as_ref(),
+                self.candidates_tokens_details.as_ref(),
+            ),
             ..Default::default()
         }
     }

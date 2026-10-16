@@ -791,6 +791,8 @@ pub(crate) struct DecisionUsage {
     pub reasoning: u32,
     /// The upstream's own total; 0 when it reported none.
     pub upstream_total: u32,
+    /// Audio / image breakdowns (Decisions format only).
+    pub modality: aisix_gateway::ModalityTokens,
 }
 
 fn count(v: &Value, pointer: &str) -> Option<u32> {
@@ -820,6 +822,10 @@ pub(crate) fn decisions_usage(body: &Value) -> Option<DecisionUsage> {
         cache_write: count(body, "/usage/input_tokens_details/cache_write_tokens"),
         reasoning: count(body, "/usage/output_tokens_details/reasoning_tokens").unwrap_or(0),
         upstream_total: count(body, "/usage/total_tokens").unwrap_or(0),
+        modality: aisix_gateway::ModalityTokens::from_openai_details(
+            body.pointer("/usage/input_tokens_details"),
+            body.pointer("/usage/output_tokens_details"),
+        ),
     })
 }
 

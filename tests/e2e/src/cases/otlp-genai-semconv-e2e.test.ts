@@ -470,8 +470,10 @@ describe("OTLP spans follow the GenAI semantic conventions", () => {
     expect(JSON.parse(String(a["gen_ai.system_instructions"]))).toEqual([
       { type: "text", content: "be precise" },
     ]);
+    // Each definition carries its description and parameter schema
+    // (Anthropic's `input_schema`) beside its type and name.
     expect(JSON.parse(String(a["gen_ai.tool.definitions"]))).toEqual([
-      { type: "function", name: "lookup" },
+      { type: "function", name: "lookup", description: "look things up", parameters: { type: "object" } },
     ]);
     expect(JSON.parse(String(a["gen_ai.input.messages"]))).toEqual([
       { role: "user", parts: [{ type: "text", content: "fold my cache" }] },

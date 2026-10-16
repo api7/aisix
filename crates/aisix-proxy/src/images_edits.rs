@@ -67,7 +67,7 @@ struct EditsDispatchSuccess {
     /// `(prompt_tokens, completion_tokens)` from the upstream `usage`
     /// block (gpt-image-*). `None` still emits a zero-token event so the
     /// request is visible + attributed.
-    usage: Option<(u32, u32)>,
+    usage: Option<(u32, u32, aisix_gateway::ModalityTokens)>,
     redactions: crate::redact::RedactionCounts,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     captured_content: Option<CapturedContent>,
@@ -175,7 +175,10 @@ pub async fn image_edits(
                 crate::redact::RedactionCounts::new(),
                 &audit,
             );
-            let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
+            let (prompt_tokens, completion_tokens, modality) =
+                success
+                    .usage
+                    .unwrap_or((0, 0, aisix_gateway::ModalityTokens::NONE));
             crate::images::emit_usage_event(
                 &state,
                 &snapshot,
@@ -193,6 +196,7 @@ pub async fn image_edits(
                 elapsed,
                 prompt_tokens,
                 completion_tokens,
+                modality,
                 &client,
                 success.redactions.clone(),
                 success.monitor_hits.clone(),
@@ -648,6 +652,7 @@ async fn dispatch(
                                 crate::dispatch::reqwest_error_to_bridge(&e, send_started),
                             )
                         })?;
+                        aisix_gateway::note_upstream_response(resp.headers());
                         let status = resp.status();
                         if !status.is_success() {
                             let s = status.as_u16();
@@ -729,7 +734,7 @@ async fn dispatch(
     // #911 [21]: commit the actual token cost so TPM/TPD is enforced.
     let usage = crate::images::extract_token_usage(&resp_json);
     let total_tokens = usage
-        .map(|(prompt, completion)| u64::from(prompt) + u64::from(completion))
+        .map(|(prompt, completion, _)| u64::from(prompt) + u64::from(completion))
         .unwrap_or(0);
     reservation.commit_tokens(total_tokens).await;
 

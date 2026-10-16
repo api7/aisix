@@ -872,6 +872,7 @@ async fn count_tokens_to_target(
             )
         })
         .map_err(ProxyError::Bridge)?;
+    aisix_gateway::note_upstream_response(upstream_resp.headers());
 
     let status = upstream_resp.status();
 
@@ -1009,6 +1010,7 @@ fn emit_usage_event(
     crate::usage_attr::apply_caller_identity(
         &mut event,
         client.jwt.as_ref(),
+        client.caller.api_key_name.as_deref(),
         client.caller.user_id.as_deref(),
         client.caller.user_name.as_deref(),
     );

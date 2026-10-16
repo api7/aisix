@@ -417,15 +417,20 @@ impl PromptWire {
     }
 }
 
-/// Convert a captured inbound request body and the assembled response text
-/// into the structured content attributes. A prompt that does not parse as
-/// the expected wire yields no input attributes at all — never a partial or
-/// malformed list. The output message needs the finish reason the schema
+/// Convert a captured inbound request body and the response into the
+/// structured content attributes. A prompt that does not parse as the
+/// expected wire yields no input attributes at all — never a partial or
+/// malformed list.
+///
+/// The output message takes its ordered parts from `output` when the
+/// surface captured them ([`crate::output`]); otherwise it is the assembled
+/// response text as one `text` part. It needs the finish reason the schema
 /// requires, so it is omitted when the event carries none.
 pub fn structured_content(
     wire: PromptWire,
     prompt: &str,
     response: &str,
+    output: Option<&crate::output::OutputCapture>,
     finish_reason: &str,
 ) -> StructuredContent {
     let mut out = StructuredContent::default();
@@ -444,17 +449,51 @@ pub fn structured_content(
                 .map(|t| Value::Array(t).to_string());
         }
     }
-    if !response.is_empty() && !finish_reason.is_empty() {
+    let parts = output
+        .and_then(crate::output::OutputCapture::parts_json)
+        .or_else(|| (!response.is_empty()).then(|| vec![text_part(response)]));
+    if let (Some(parts), false) = (parts, finish_reason.is_empty()) {
         out.output_messages = Some(
             json!([{
                 "role": "assistant",
-                "parts": [text_part(response)],
-                "finish_reason": finish_reason,
+                "parts": parts,
+                "finish_reason": otel_finish_reason(finish_reason),
             }])
             .to_string(),
         );
     }
     out
+}
+
+/// The GenAI conventions' finish-reason enum (v1.41
+/// `gen-ai-output-messages.json`: `stop`, `length`, `content_filter`,
+/// `tool_call`, `error`) for a raw reason any protocol the gateway speaks
+/// reports: OpenAI chat and the Responses-derived values, Anthropic's
+/// `stop_reason`, Gemini / Vertex `finishReason`, Bedrock Converse
+/// `stopReason`. Compared case-insensitively; an unrecognised value is
+/// `stop`, the generation having ended without a stated cause. Only the
+/// output message speaks the enum — `gen_ai.response.finish_reasons` and
+/// the usage event keep the raw value.
+pub fn otel_finish_reason(raw: &str) -> &'static str {
+    match raw.to_ascii_lowercase().as_str() {
+        "tool_calls" | "tool_call" | "function_call" | "tool_use" => "tool_call",
+        "length" | "max_tokens" | "max_output_tokens" | "model_context_window_exceeded" => "length",
+        "content_filter"
+        | "content_filtered"
+        | "refusal"
+        | "safety"
+        | "recitation"
+        | "blocklist"
+        | "prohibited_content"
+        | "spii"
+        | "image_safety"
+        | "language"
+        | "guardrail_intervened" => "content_filter",
+        "malformed_function_call" | "unexpected_tool_call" | "too_many_tool_calls" | "error" => {
+            "error"
+        }
+        _ => "stop",
+    }
 }
 
 type Converted = (Vec<Value>, Option<Vec<Value>>, Option<Vec<Value>>);
@@ -539,6 +578,24 @@ fn openai_content_parts(content: Option<&Value>) -> Option<Vec<Value>> {
     }
 }
 
+/// One `gen_ai.tool.definitions` entry: the tool's type and name, plus its
+/// description and parameter schema when the definition carries them.
+fn tool_definition(
+    kind: &str,
+    name: &str,
+    description: Option<&Value>,
+    parameters: Option<&Value>,
+) -> Value {
+    let mut tool = json!({"type": kind, "name": name});
+    if let Some(d) = description.filter(|d| !d.is_null()) {
+        tool["description"] = d.clone();
+    }
+    if let Some(p) = parameters.filter(|p| !p.is_null()) {
+        tool["parameters"] = p.clone();
+    }
+    tool
+}
+
 fn openai_tools(tools: Option<&Value>) -> Option<Vec<Value>> {
     let tools = tools?.as_array()?;
     Some(
@@ -547,12 +604,17 @@ fn openai_tools(tools: Option<&Value>) -> Option<Vec<Value>> {
             .filter_map(|t| {
                 let kind = t.get("type").and_then(Value::as_str)?;
                 // Chat nests the function; Responses flattens it.
-                let name = t
-                    .get("function")
-                    .and_then(|f| f.get("name"))
+                let def = t.get("function").unwrap_or(t);
+                let name = def
+                    .get("name")
                     .or_else(|| t.get("name"))
                     .and_then(Value::as_str)?;
-                Some(json!({"type": kind, "name": name}))
+                Some(tool_definition(
+                    kind,
+                    name,
+                    def.get("description"),
+                    def.get("parameters"),
+                ))
             })
             .collect(),
     )
@@ -693,7 +755,12 @@ fn anthropic_input(body: &Map<String, Value>) -> Option<Converted> {
                     None | Some("custom") => "function",
                     Some(kind) => kind,
                 };
-                Some(json!({"type": kind, "name": name}))
+                Some(tool_definition(
+                    kind,
+                    name,
+                    t.get("description"),
+                    t.get("input_schema"),
+                ))
             })
             .collect()
     });
@@ -775,6 +842,37 @@ mod tests {
     }
 
     #[test]
+    fn finish_reasons_normalize_onto_the_conventions_enum() {
+        for (raw, expected) in [
+            ("stop", "stop"),
+            ("end_turn", "stop"),
+            ("stop_sequence", "stop"),
+            ("STOP", "stop"),
+            ("pause_turn", "stop"),
+            ("OTHER", "stop"),
+            ("something-new", "stop"),
+            ("length", "length"),
+            ("max_tokens", "length"),
+            ("MAX_TOKENS", "length"),
+            ("model_context_window_exceeded", "length"),
+            ("tool_calls", "tool_call"),
+            ("function_call", "tool_call"),
+            ("tool_use", "tool_call"),
+            ("content_filter", "content_filter"),
+            ("content_filtered", "content_filter"),
+            ("refusal", "content_filter"),
+            ("SAFETY", "content_filter"),
+            ("RECITATION", "content_filter"),
+            ("PROHIBITED_CONTENT", "content_filter"),
+            ("guardrail_intervened", "content_filter"),
+            ("MALFORMED_FUNCTION_CALL", "error"),
+            ("UNEXPECTED_TOOL_CALL", "error"),
+        ] {
+            assert_eq!(otel_finish_reason(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
     fn provider_name_prefers_the_hosting_platform_then_the_vendor() {
         use aisix_core::Adapter;
         assert_eq!(
@@ -847,7 +945,7 @@ mod tests {
             ],
             "tools": [{"type": "function", "name": "w"}, {"type": "web_search"}]
         });
-        let c = structured_content(PromptWire::OpenAiResponses, &body.to_string(), "", "");
+        let c = structured_content(PromptWire::OpenAiResponses, &body.to_string(), "", None, "");
         let input: Value = serde_json::from_str(c.input_messages.as_deref().unwrap()).unwrap();
         assert_eq!(input[0]["parts"][0]["content"], "weather?");
         assert_eq!(input[1]["parts"][0]["type"], "tool_call");
@@ -926,6 +1024,7 @@ mod tests {
             PromptWire::AnthropicMessages,
             &body.to_string(),
             "It rains.",
+            None,
             "end_turn",
         );
         let input: Value = serde_json::from_str(c.input_messages.as_deref().unwrap()).unwrap();
@@ -938,15 +1037,15 @@ mod tests {
         );
         assert_eq!(
             c.tool_definitions.as_deref(),
-            Some(r#"[{"name":"get_weather","type":"function"}]"#)
+            Some(r#"[{"name":"get_weather","parameters":{},"type":"function"}]"#)
         );
         let output: Value = serde_json::from_str(c.output_messages.as_deref().unwrap()).unwrap();
-        assert_eq!(output[0]["finish_reason"], "end_turn");
+        assert_eq!(output[0]["finish_reason"], "stop");
     }
 
     #[test]
     fn unparseable_prompt_or_missing_finish_reason_yields_nothing() {
-        let c = structured_content(PromptWire::OpenAiChat, "{\"messages\": [", "x", "");
+        let c = structured_content(PromptWire::OpenAiChat, "{\"messages\": [", "x", None, "");
         assert_eq!(c, StructuredContent::default());
     }
 
@@ -963,7 +1062,7 @@ mod tests {
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
             ]}
         ]});
-        let c = structured_content(PromptWire::OpenAiChat, &body.to_string(), "", "");
+        let c = structured_content(PromptWire::OpenAiChat, &body.to_string(), "", None, "");
         let input: Value = serde_json::from_str(c.input_messages.as_deref().unwrap()).unwrap();
         assert_eq!(input[0]["role"], "system");
         assert_eq!(input[1]["parts"][0]["arguments"]["a"], 1);

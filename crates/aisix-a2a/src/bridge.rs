@@ -517,6 +517,7 @@ impl A2aBridge for HttpBridge {
             .send()
             .await
             .map_err(|e| A2aError::Connect(e.to_string()))?;
+        aisix_gateway::note_upstream_response(resp.headers());
         if !resp.status().is_success() {
             // Surface the upstream STATUS only — never proxy the upstream error
             // body verbatim to the caller, which could leak upstream internals.
@@ -556,6 +557,7 @@ impl A2aBridge for HttpBridge {
         .await
         .map_err(|_| A2aError::Connect("timed out opening the upstream stream".to_string()))?
         .map_err(|e| A2aError::Connect(e.to_string()))?;
+        aisix_gateway::note_upstream_response(resp.headers());
 
         if !resp.status().is_success() {
             // Status only — never proxy the upstream's error body, same as

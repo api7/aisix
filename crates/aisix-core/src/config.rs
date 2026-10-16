@@ -1203,51 +1203,23 @@ pub struct ObservabilityConfig {
     pub debug: DebugListenerConfig,
     /// Heap-profile dumps written without anyone asking for them.
     pub heap_profiling: HeapProfilingConfig,
-    /// What every usage event records beyond the gateway's own fields.
-    pub usage_event: UsageEventConfig,
+    /// Retired; see [`UsageEventConfig`]. `Option` for the same reason as
+    /// `tracing`.
+    pub usage_event: Option<UsageEventConfig>,
 }
 
-/// `observability.usage_event`.
+/// Tombstone: `observability.usage_event` is consumed and ignored, and
+/// warned about at boot ([`ObservabilityConfig::retired_settings`]). Which
+/// request headers an export records is now chosen per exporter, by the
+/// `request_headers` field of each `observability_exporters` entry, and no
+/// header value is sent to the control plane any more. The block stays
+/// parseable only so a config written against 1.6.0 still loads. Do not
+/// read it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
 pub struct UsageEventConfig {
-    /// Request headers whose values every usage event records under
-    /// `request_headers`, keyed by the name listed here. Lowercase names
-    /// only; credential headers and duplicates are refused at startup.
-    /// Recording a header never changes what is forwarded upstream.
-    /// Empty (the default) records none; changing the list requires a
-    /// restart.
     pub request_headers: Vec<String>,
-}
-
-impl UsageEventConfig {
-    /// Why `request_headers` cannot be used, or `None` when it can.
-    fn validate(&self) -> Option<String> {
-        let mut seen = std::collections::HashSet::new();
-        for name in &self.request_headers {
-            let token = !name.is_empty()
-                && name.bytes().all(|b| {
-                    b.is_ascii_lowercase() || b.is_ascii_digit() || b"!#$%&'*+.^_`|~-".contains(&b)
-                });
-            if !token {
-                return Some(format!(
-                    "{name:?} is not a lowercase HTTP header name \
-                     (allowed: a-z 0-9 ! # $ % & ' * + . ^ _ ` | ~ -)"
-                ));
-            }
-            if crate::forwarded_headers::CREDENTIAL_SLOT_HEADERS.contains(&name.as_str()) {
-                return Some(format!(
-                    "{name:?} carries a credential and is never recorded ({})",
-                    crate::forwarded_headers::CREDENTIAL_SLOT_HEADERS.join(", ")
-                ));
-            }
-            if !seen.insert(name.as_str()) {
-                return Some(format!("{name:?} is listed more than once"));
-            }
-        }
-        None
-    }
 }
 
 /// `observability.debug` — a listener for diagnostics that must never be
@@ -1330,7 +1302,7 @@ impl Default for ObservabilityConfig {
             tracing: None,
             debug: DebugListenerConfig::default(),
             heap_profiling: HeapProfilingConfig::default(),
-            usage_event: UsageEventConfig::default(),
+            usage_event: None,
         }
     }
 }
@@ -1357,6 +1329,16 @@ impl ObservabilityConfig {
                  not push OTLP metrics, and the block has been removed from the shipped \
                  example configs. Delete it. Metrics are served on the Prometheus \
                  endpoint at observability.metrics.prometheus.addr.",
+            );
+        }
+        if self.usage_event.is_some() {
+            out.push(
+                "observability.usage_event is set but does nothing: request headers are \
+                 no longer recorded on every usage event, and the block has been removed \
+                 from the shipped example configs. Delete it. List the headers to export \
+                 in the `request_headers` field of each `observability_exporters` entry \
+                 instead, declared in your resources file or configured in AISIX \
+                 Enterprise or AISIX Cloud.",
             );
         }
         out
@@ -2449,11 +2431,6 @@ impl Config {
                 CREDENTIAL_HEADERS.join(", ")
             )));
         }
-        if let Some(why) = self.observability.usage_event.validate() {
-            return Err(BootstrapError::Config(format!(
-                "observability.usage_event.request_headers rejects {why}"
-            )));
-        }
         // Zero workers would bind no listener at all: the proxy would
         // boot, report healthy, and refuse every connection.
         if self.proxy.workers == Some(0) {
@@ -3178,43 +3155,25 @@ observability:
         Config::load_from_path(Some(f.path()))
     }
 
+    /// The 1.6.0 key still loads — including a list the old validation
+    /// refused, since it no longer feeds anything — and boot warns once,
+    /// pointing at the exporter field that replaced it. Omitting the block
+    /// warns about nothing.
     #[test]
-    fn usage_event_request_headers_default_to_none_and_load_as_listed() {
-        assert!(ObservabilityConfig::default()
-            .usage_event
-            .request_headers
-            .is_empty());
-        let cfg = load_with_usage_event_headers(r#"["x-sub-user", "x-department"]"#).unwrap();
-        assert_eq!(
-            cfg.observability.usage_event.request_headers,
-            vec!["x-sub-user".to_string(), "x-department".to_string()],
-        );
-    }
-
-    /// A name that can never match, a credential, and a duplicate each fail
-    /// the boot naming the key — the credential one because recording it
-    /// would copy a caller's secret into every exported usage event.
-    #[test]
-    fn usage_event_request_headers_are_validated_at_startup() {
-        let mut bad: Vec<String> = ["X-Sub-User", "x sub", "", "x-dept:1", "x-é"]
-            .iter()
-            .map(|n| format!("[{n:?}]"))
-            .collect();
-        bad.extend(
-            crate::forwarded_headers::CREDENTIAL_SLOT_HEADERS
-                .iter()
-                .map(|n| format!("[{n:?}]")),
-        );
-        bad.push(r#"["x-sub-user", "x-sub-user"]"#.to_string());
-        for list in bad {
-            let err = load_with_usage_event_headers(&list)
-                .expect_err(&format!("{list} must be refused"))
-                .to_string();
-            assert!(
-                err.contains("observability.usage_event.request_headers"),
-                "{list}: error must name the key, got: {err}"
-            );
+    fn usage_event_request_headers_is_a_tombstone_that_warns() {
+        for list in [
+            r#"["x-sub-user", "x-department"]"#,
+            "[]",
+            r#"["authorization"]"#,
+        ] {
+            let cfg = load_with_usage_event_headers(list).unwrap();
+            let warnings = cfg.observability.retired_settings();
+            assert_eq!(warnings.len(), 1, "{list}");
+            assert!(warnings[0].contains("observability.usage_event"));
+            assert!(warnings[0].contains("observability_exporters"));
         }
+        assert!(ObservabilityConfig::default().usage_event.is_none());
+        assert!(ObservabilityConfig::default().retired_settings().is_empty());
     }
 
     /// `managed.cp_base_url` reaches four consumers with two different
@@ -4049,8 +4008,11 @@ admin:
             vec!["x-aisix-request-id".to_string(), "x-request-id".to_string()],
         );
         assert_eq!(
-            cfg.observability.usage_event.request_headers,
-            vec!["x-sub-user".to_string(), "x-department".to_string()],
+            cfg.observability
+                .usage_event
+                .as_ref()
+                .map(|u| u.request_headers.clone()),
+            Some(vec!["x-sub-user".to_string(), "x-department".to_string()]),
         );
         assert_eq!(cfg.proxy.url_rewrites.len(), 1);
         assert_eq!(cfg.proxy.listeners.len(), 2);
@@ -5157,10 +5119,12 @@ observability:
             .as_object_mut()
             .unwrap()
             .remove("otlp");
-        expected["observability"]
-            .as_object_mut()
-            .unwrap()
-            .remove("tracing");
+        for retired in ["tracing", "usage_event"] {
+            expected["observability"]
+                .as_object_mut()
+                .unwrap()
+                .remove(retired);
+        }
         let expected = serde_json::json!({
             "defaults": expected,
             "optional_blocks": optional_blocks(&expected),

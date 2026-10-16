@@ -365,6 +365,7 @@ fn base_event(
         Some(client) => usage_attr::apply_caller_identity(
             &mut event,
             client.jwt.as_ref(),
+            client.caller.api_key_name.as_deref(),
             client.caller.user_id.as_deref(),
             client.caller.user_name.as_deref(),
         ),
@@ -373,6 +374,7 @@ fn base_event(
                 usage_attr::apply_caller_identity(
                     &mut event,
                     auth.jwt.as_ref(),
+                    auth.api_key_name(),
                     auth.key().user_id.as_deref(),
                     auth.user_name(),
                 );

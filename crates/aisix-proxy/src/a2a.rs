@@ -269,10 +269,8 @@ async fn dispatch(
     let upstream = upstream_from_a2a_agent(&entry.value);
 
     let (parts, body) = request.into_parts();
-    let request_headers = crate::client_ip::capture_request_headers(
-        &parts.headers,
-        &state.usage_event_request_headers,
-    );
+    let request_headers =
+        crate::client_ip::capture_request_headers(&parts.headers, &state.snapshot.load());
     crate::attribution::note_request_headers(&request_headers);
     // Resolved here rather than inside the bridge: the inbound headers exist
     // only on this side, and the same resolved set serves the buffered and the
@@ -423,7 +421,9 @@ async fn dispatch(
 
     let bridge = HttpBridge::new(upstream).with_forwarded_client_headers(forwarded);
     let started = Instant::now();
+    crate::attribution::note_upstream_wait_begin();
     let result = bridge.send(&value).await;
+    crate::attribution::note_upstream_wait_end(result.is_ok());
     let latency = started.elapsed();
 
     match result {
@@ -561,6 +561,9 @@ async fn dispatch_stream(
 ) -> Response {
     let started = Instant::now();
     let bridge = HttpBridge::new(upstream).with_forwarded_client_headers(forwarded);
+    // Left open for the whole stream: `/a2a` reports the whole stream as the
+    // caller's wait, and the agent is working for all of it.
+    crate::attribution::note_upstream_wait_begin();
     let events = match bridge.send_stream(&request).await {
         Ok(events) => events,
         // The upstream refused before any event: the headers have not gone out,
@@ -1016,6 +1019,7 @@ fn emit_a2a_usage(
     crate::usage_attr::apply_caller_identity(
         &mut event,
         auth.jwt.as_ref(),
+        auth.api_key_name(),
         auth.key().user_id.as_deref(),
         auth.user_name(),
     );

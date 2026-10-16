@@ -678,6 +678,9 @@ struct SessionUsage {
     output_tokens: u64,
     cached_tokens: u64,
     responses: u32,
+    /// Summed across the session's usage frames, `None` where none
+    /// reported the modality.
+    modality: aisix_gateway::ModalityTokens,
 }
 
 impl SessionUsage {
@@ -699,6 +702,12 @@ impl SessionUsage {
                 self.cached_tokens += usage["input_token_details"]["cached_tokens"]
                     .as_u64()
                     .unwrap_or(0);
+                self.modality = self.modality.saturating_add(
+                    &aisix_gateway::ModalityTokens::from_openai_details(
+                        usage.get("input_token_details"),
+                        usage.get("output_token_details"),
+                    ),
+                );
                 self.responses += 1;
             }
             Some("conversation.item.input_audio_transcription.completed") => {
@@ -708,6 +717,12 @@ impl SessionUsage {
                 if usage.get("type").and_then(Value::as_str) == Some("tokens") {
                     self.input_tokens += usage["input_tokens"].as_u64().unwrap_or(0);
                     self.output_tokens += usage["output_tokens"].as_u64().unwrap_or(0);
+                    self.modality = self.modality.saturating_add(
+                        &aisix_gateway::ModalityTokens::from_openai_details(
+                            usage.get("input_token_details"),
+                            None,
+                        ),
+                    );
                     self.responses += 1;
                 }
             }
@@ -749,8 +764,21 @@ async fn run_session(
 
     let (mut client_tx, mut client_rx) = client_ws.split();
 
+    // The upstream wait of a session is everything from the dial on, so
+    // the gateway's own share is the time before it (`gateway_overhead_ms`).
+    // Measured here because the session runs detached from the request's
+    // attribution scope that measures every other family.
+    let dial_started = Instant::now();
+    let mut upstream_response_headers = std::collections::BTreeMap::new();
     let upstream = match connect_upstream(upstream_request).await {
-        Ok((ws, _resp)) => ws,
+        Ok((ws, resp)) => {
+            let names = crate::client_ip::exported_header_names(&state.snapshot.load(), true);
+            if !names.is_empty() {
+                upstream_response_headers =
+                    aisix_gateway::capture_header_values(resp.headers(), &names);
+            }
+            ws
+        }
         Err(e) => {
             tracing::warn!(error = %e, model = %requested_model, "realtime upstream connect failed");
             let _ = client_tx
@@ -1061,11 +1089,19 @@ async fn run_session(
         prompt_tokens: usage.input_tokens.min(u32::MAX as u64) as u32,
         completion_tokens: usage.output_tokens.min(u32::MAX as u64) as u32,
         cached_prompt_tokens: usage.cached_tokens.min(u32::MAX as u64) as u32,
+        modality_tokens: usage.modality,
         status_code: close_status,
         // Single-attempt endpoint: the attempt spans the whole request, so
         // the upstream figure and what the caller waited for coincide.
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        gateway_overhead_ms: Some(
+            dial_started
+                .saturating_duration_since(started)
+                .as_millis()
+                .min(u32::MAX as u128) as u32,
+        ),
+        upstream_response_headers,
         cost_usd: pricing
             .resolve(&model_entry.value)
             .map(|c| c.calculate(usage.input_tokens, usage.output_tokens))
@@ -1104,6 +1140,7 @@ async fn run_session(
     crate::usage_attr::apply_caller_identity(
         &mut event,
         auth.jwt.as_ref(),
+        auth.api_key_name(),
         auth.key().user_id.as_deref(),
         auth.user_name(),
     );

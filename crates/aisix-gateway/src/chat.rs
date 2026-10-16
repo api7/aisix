@@ -474,6 +474,134 @@ pub struct UsageStats {
     /// [`recorded_completion_tokens`].
     #[serde(default, skip_serializing_if = "is_zero")]
     pub reasoning_folded_into_completion: u32,
+    /// Audio / image breakdowns of the two sides, as the upstream reported
+    /// them. Subsets, never added to a total.
+    ///
+    /// Not serialized: a cached `ChatResponse` carries this type, and this
+    /// type denies unknown fields, so writing it would make every entry a
+    /// gateway release without the field shares the cache with (a rolling
+    /// upgrade, a rollback) unreadable. A cache hit reports none.
+    #[serde(skip)]
+    pub modality: ModalityTokens,
+}
+
+/// The per-modality token counts an upstream reports inside its usage
+/// (OpenAI `*_tokens_details.audio_tokens` / `image_tokens`, Gemini
+/// `promptTokensDetails` / `candidatesTokensDetails` by `modality`). Each is
+/// a subset of its side's total, inclusive of any cached portion, and
+/// `None` when the upstream did not report it — distinct from a reported
+/// `0`. Serialized under the usage event's own field names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModalityTokens {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_audio_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_image_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_audio_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_image_tokens: Option<u32>,
+}
+
+impl ModalityTokens {
+    /// Nothing reported.
+    pub const NONE: Self = Self {
+        prompt_audio_tokens: None,
+        prompt_image_tokens: None,
+        completion_audio_tokens: None,
+        completion_image_tokens: None,
+    };
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Read the OpenAI-shape detail objects: `input` is
+    /// `prompt_tokens_details` / `input_tokens_details` /
+    /// `input_token_details`, `output` the completion-side twin. Each
+    /// counter is taken only when the object carries it.
+    pub fn from_openai_details(
+        input: Option<&serde_json::Value>,
+        output: Option<&serde_json::Value>,
+    ) -> Self {
+        let count = |details: Option<&serde_json::Value>, key: &str| {
+            details
+                .and_then(|d| d.get(key))
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n.min(u64::from(u32::MAX)) as u32)
+        };
+        Self {
+            prompt_audio_tokens: count(input, "audio_tokens"),
+            prompt_image_tokens: count(input, "image_tokens"),
+            completion_audio_tokens: count(output, "audio_tokens"),
+            completion_image_tokens: count(output, "image_tokens"),
+        }
+    }
+
+    /// Read Gemini's `promptTokensDetails` / `candidatesTokensDetails`
+    /// arrays of `{modality, tokenCount}`; a modality entry without a count
+    /// reports `0`.
+    pub fn from_gemini_details(
+        prompt: Option<&serde_json::Value>,
+        candidates: Option<&serde_json::Value>,
+    ) -> Self {
+        let count = |details: Option<&serde_json::Value>, modality: &str| {
+            details?
+                .as_array()?
+                .iter()
+                .filter(|d| d.get("modality").and_then(serde_json::Value::as_str) == Some(modality))
+                .map(|d| {
+                    d.get("tokenCount")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                })
+                .reduce(|a, b| a.saturating_add(b))
+                .map(|n| n.min(u64::from(u32::MAX)) as u32)
+        };
+        Self {
+            prompt_audio_tokens: count(prompt, "AUDIO"),
+            prompt_image_tokens: count(prompt, "IMAGE"),
+            completion_audio_tokens: count(candidates, "AUDIO"),
+            completion_image_tokens: count(candidates, "IMAGE"),
+        }
+    }
+
+    /// Field-wise sum, `None` only where neither side reported.
+    pub fn saturating_add(&self, other: &Self) -> Self {
+        fn add(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+            match (a, b) {
+                (None, None) => None,
+                _ => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+            }
+        }
+        Self {
+            prompt_audio_tokens: add(self.prompt_audio_tokens, other.prompt_audio_tokens),
+            prompt_image_tokens: add(self.prompt_image_tokens, other.prompt_image_tokens),
+            completion_audio_tokens: add(
+                self.completion_audio_tokens,
+                other.completion_audio_tokens,
+            ),
+            completion_image_tokens: add(
+                self.completion_image_tokens,
+                other.completion_image_tokens,
+            ),
+        }
+    }
+
+    /// Field-wise maximum, for a stream that reports usage on more than
+    /// one frame.
+    pub fn max_fieldwise(&self, other: &Self) -> Self {
+        Self {
+            prompt_audio_tokens: self.prompt_audio_tokens.max(other.prompt_audio_tokens),
+            prompt_image_tokens: self.prompt_image_tokens.max(other.prompt_image_tokens),
+            completion_audio_tokens: self
+                .completion_audio_tokens
+                .max(other.completion_audio_tokens),
+            completion_image_tokens: self
+                .completion_image_tokens
+                .max(other.completion_image_tokens),
+        }
+    }
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -619,6 +747,7 @@ impl UsageStats {
             reasoning_folded_into_completion: self
                 .reasoning_folded_into_completion
                 .saturating_add(other.reasoning_folded_into_completion),
+            modality: self.modality.saturating_add(&other.modality),
         }
     }
 
@@ -654,6 +783,7 @@ impl UsageStats {
             // Describes the frame's own folded completion, so the latest
             // frame's value stands.
             reasoning_folded_into_completion: other.reasoning_folded_into_completion,
+            modality: self.modality.max_fieldwise(&other.modality),
         }
     }
 
@@ -1338,6 +1468,24 @@ mod tests {
         );
     }
 
+    /// A cached response carries `UsageStats`, and a gateway release that
+    /// predates `modality` denies unknown fields: the field never reaches
+    /// the serialized form a shared cache stores.
+    #[test]
+    fn modality_stays_out_of_the_cached_form() {
+        let u = UsageStats {
+            modality: ModalityTokens {
+                prompt_audio_tokens: Some(0),
+                ..ModalityTokens::NONE
+            },
+            ..UsageStats::new(1, 2)
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        assert!(!json.contains("modality"), "{json}");
+        let back: UsageStats = serde_json::from_str(&json).unwrap();
+        assert!(back.modality.is_empty());
+    }
+
     #[test]
     fn usage_stats_saturating_add_sums_every_field() {
         let a = UsageStats {
@@ -1353,6 +1501,10 @@ mod tests {
             prompt_cache_miss_tokens: None,
             upstream_total_tokens: 15,
             reasoning_folded_into_completion: 3,
+            modality: ModalityTokens {
+                prompt_audio_tokens: Some(4),
+                ..ModalityTokens::NONE
+            },
         };
         let b = UsageStats {
             prompt_tokens: 20,
@@ -1367,8 +1519,22 @@ mod tests {
             prompt_cache_miss_tokens: Some(8),
             upstream_total_tokens: 27,
             reasoning_folded_into_completion: 0,
+            modality: ModalityTokens {
+                prompt_audio_tokens: Some(6),
+                completion_image_tokens: Some(1),
+                ..ModalityTokens::NONE
+            },
         };
         let sum = a.saturating_add(&b);
+        assert_eq!(
+            sum.modality,
+            ModalityTokens {
+                prompt_audio_tokens: Some(10),
+                prompt_image_tokens: None,
+                completion_audio_tokens: None,
+                completion_image_tokens: Some(1),
+            }
+        );
         assert_eq!(sum.prompt_tokens, 30);
         assert_eq!(sum.completion_tokens, 12);
         assert_eq!(sum.total_tokens, 42);

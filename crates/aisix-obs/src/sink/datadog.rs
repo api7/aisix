@@ -228,6 +228,19 @@ impl DatadogSink {
                 obj.insert(map_field_name(&key), rendered);
             }
         }
+        // The headers this exporter selected ride beside the usage fields,
+        // under the same key the usage map gives every other field.
+        for (key, headers) in [
+            ("request_headers", &record.request_headers),
+            (
+                "upstream_response_headers",
+                &record.upstream_response_headers,
+            ),
+        ] {
+            if !headers.is_empty() {
+                obj.insert(map_field_name(key), json!(headers));
+            }
+        }
         // The GenAI input count includes every cached token, which an
         // Anthropic-shape record keeps beside `prompt_tokens`; the output
         // count includes reasoning, which the record's own
@@ -604,6 +617,70 @@ mod tests {
         assert!(log.get("gen_ai.prompt").is_none());
     }
 
+    /// The exporter's selected headers ride beside the usage fields, and a
+    /// record carrying structured output parts encodes its content exactly
+    /// as a flat one does.
+    #[tokio::test]
+    async fn selected_headers_ride_the_log_and_content_stays_flat() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        let sink = sink_for(&server, &[]);
+        let output = crate::output::OutputCollector::from_body(
+            crate::output::OutputWire::OpenAiChat,
+            4096,
+            &serde_json::json!({"choices": [{"index": 0, "message": {
+                "reasoning_content": "pondering", "content": "4"}}]}),
+        );
+        let record = SinkRecord::metadata_only(UsageEvent {
+            request_id: "req-headers".into(),
+            status_code: 200,
+            api_key_name: "key-a".into(),
+            request_headers: [
+                ("x-sub-user".to_string(), "alice".to_string()),
+                ("x-department".to_string(), "eng".to_string()),
+            ]
+            .into(),
+            upstream_response_headers: [("x-upstream-id".to_string(), "u-1".to_string())].into(),
+            ..UsageEvent::default()
+        })
+        .with_exporter_headers(&["x-sub-user".to_string()], &["x-upstream-id".to_string()])
+        .with_content(SinkContent {
+            prompt: "what is 2+2?".into(),
+            response: "4".into(),
+            truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
+            max_bytes: None,
+            output: Some(output),
+        });
+        sink.append_batch(&batch_of(vec![record]), &IdempotencyMarker::None)
+            .await
+            .expect("delivery succeeds");
+
+        let requests = server.received_requests().await.unwrap();
+        let logs = decode_logs(&requests[0]);
+        let log = &logs[0];
+        assert_eq!(
+            log["aisix.request_headers"],
+            serde_json::json!({"x-sub-user": "alice"})
+        );
+        assert_eq!(
+            log["aisix.upstream_response_headers"],
+            serde_json::json!({"x-upstream-id": "u-1"})
+        );
+        assert_eq!(log["aisix.api_key_name"], "key-a");
+        // The flat content is what it always was: the structured parts
+        // ride OTLP only.
+        assert_eq!(log["gen_ai.completion"], "4");
+        assert!(!serde_json::to_string(&logs).unwrap().contains("pondering"));
+        assert!(!String::from_utf8_lossy(&requests[0].body).contains("x-department"));
+    }
+
     #[tokio::test]
     async fn full_content_record_emits_prompt_and_response() {
         let server = MockServer::start().await;
@@ -626,6 +703,7 @@ mod tests {
             prompt_truncated: true,
             response_truncated: false,
             max_bytes: None,
+            output: None,
         });
         sink.append_batch(&batch_of(vec![record]), &IdempotencyMarker::None)
             .await

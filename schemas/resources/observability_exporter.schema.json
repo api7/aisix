@@ -120,12 +120,57 @@
           "minLength": 1,
           "type": "string"
         },
+        "request_headers": {
+          "description": "Request headers whose values this exporter records, by lowercase name. A header the request did not send is left out; a header sent more than once is joined with `, `. Values are stripped of control characters and capped at 256 characters. Credential headers (such as `authorization`, `x-api-key` and `cookie`) and duplicate names are refused. Recording a header never changes what is forwarded upstream. When omitted, no request header is recorded.",
+          "items": {
+            "not": {
+              "enum": [
+                "api-key",
+                "authorization",
+                "cookie",
+                "proxy-authorization",
+                "x-amz-content-sha256",
+                "x-amz-date",
+                "x-amz-security-token",
+                "x-api-key",
+                "x-goog-api-key"
+              ]
+            },
+            "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
         "sample_rate": {
           "description": "Fraction of requests exported as traces, from `0.0` to `1.0`.",
           "format": "double",
           "maximum": 1.0,
           "minimum": 0.0,
           "type": "number"
+        },
+        "upstream_response_headers": {
+          "description": "Upstream response headers whose values this exporter records for each attempt, by lowercase name, read off that attempt's upstream response. Values follow the same rules as `request_headers`. Credential headers, `set-cookie` and duplicate names are refused. When omitted, no upstream response header is recorded.",
+          "items": {
+            "not": {
+              "enum": [
+                "api-key",
+                "authorization",
+                "cookie",
+                "proxy-authorization",
+                "x-amz-content-sha256",
+                "x-amz-date",
+                "x-amz-security-token",
+                "x-api-key",
+                "x-goog-api-key",
+                "set-cookie"
+              ]
+            },
+            "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "required": [
@@ -191,6 +236,51 @@
           "description": "SLS project that prefixes the regional endpoint in signed requests.",
           "minLength": 1,
           "type": "string"
+        },
+        "request_headers": {
+          "description": "Request headers whose values this exporter records, by lowercase name. A header the request did not send is left out; a header sent more than once is joined with `, `. Values are stripped of control characters and capped at 256 characters. Credential headers (such as `authorization`, `x-api-key` and `cookie`) and duplicate names are refused. Recording a header never changes what is forwarded upstream. When omitted, no request header is recorded.",
+          "items": {
+            "not": {
+              "enum": [
+                "api-key",
+                "authorization",
+                "cookie",
+                "proxy-authorization",
+                "x-amz-content-sha256",
+                "x-amz-date",
+                "x-amz-security-token",
+                "x-api-key",
+                "x-goog-api-key"
+              ]
+            },
+            "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "upstream_response_headers": {
+          "description": "Upstream response headers whose values this exporter records for each attempt, by lowercase name, read off that attempt's upstream response. Values follow the same rules as `request_headers`. Credential headers, `set-cookie` and duplicate names are refused. When omitted, no upstream response header is recorded.",
+          "items": {
+            "not": {
+              "enum": [
+                "api-key",
+                "authorization",
+                "cookie",
+                "proxy-authorization",
+                "x-amz-content-sha256",
+                "x-amz-date",
+                "x-amz-security-token",
+                "x-api-key",
+                "x-goog-api-key",
+                "set-cookie"
+              ]
+            },
+            "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "required": [
@@ -302,6 +392,51 @@
           "description": "AWS region for S3 SigV4 signature scope. Set this for S3 buckets outside `us-east-1`. Ignored for GCS and Azure Blob.",
           "minLength": 1,
           "type": "string"
+        },
+        "request_headers": {
+          "description": "Request headers whose values this exporter records, by lowercase name. A header the request did not send is left out; a header sent more than once is joined with `, `. Values are stripped of control characters and capped at 256 characters. Credential headers (such as `authorization`, `x-api-key` and `cookie`) and duplicate names are refused. Recording a header never changes what is forwarded upstream. When omitted, no request header is recorded.",
+          "items": {
+            "not": {
+              "enum": [
+                "api-key",
+                "authorization",
+                "cookie",
+                "proxy-authorization",
+                "x-amz-content-sha256",
+                "x-amz-date",
+                "x-amz-security-token",
+                "x-api-key",
+                "x-goog-api-key"
+              ]
+            },
+            "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "upstream_response_headers": {
+          "description": "Upstream response headers whose values this exporter records for each attempt, by lowercase name, read off that attempt's upstream response. Values follow the same rules as `request_headers`. Credential headers, `set-cookie` and duplicate names are refused. When omitted, no upstream response header is recorded.",
+          "items": {
+            "not": {
+              "enum": [
+                "api-key",
+                "authorization",
+                "cookie",
+                "proxy-authorization",
+                "x-amz-content-sha256",
+                "x-amz-date",
+                "x-amz-security-token",
+                "x-api-key",
+                "x-goog-api-key",
+                "set-cookie"
+              ]
+            },
+            "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "required": [
@@ -361,6 +496,28 @@
           "minLength": 1,
           "type": "string"
         },
+        "request_headers": {
+          "description": "Request headers whose values this exporter records, by lowercase name. A header the request did not send is left out; a header sent more than once is joined with `, `. Values are stripped of control characters and capped at 256 characters. Credential headers (such as `authorization`, `x-api-key` and `cookie`) and duplicate names are refused. Recording a header never changes what is forwarded upstream. When omitted, no request header is recorded.",
+          "items": {
+            "not": {
+              "enum": [
+                "api-key",
+                "authorization",
+                "cookie",
+                "proxy-authorization",
+                "x-amz-content-sha256",
+                "x-amz-date",
+                "x-amz-security-token",
+                "x-api-key",
+                "x-goog-api-key"
+              ]
+            },
+            "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
         "service": {
           "description": "Datadog `service` reserved attribute. Every log from this exporter is tagged with this service name in Datadog Log Explorer.",
           "minLength": 1,
@@ -378,6 +535,29 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "upstream_response_headers": {
+          "description": "Upstream response headers whose values this exporter records for each attempt, by lowercase name, read off that attempt's upstream response. Values follow the same rules as `request_headers`. Credential headers, `set-cookie` and duplicate names are refused. When omitted, no upstream response header is recorded.",
+          "items": {
+            "not": {
+              "enum": [
+                "api-key",
+                "authorization",
+                "cookie",
+                "proxy-authorization",
+                "x-amz-content-sha256",
+                "x-amz-date",
+                "x-amz-security-token",
+                "x-api-key",
+                "x-goog-api-key",
+                "set-cookie"
+              ]
+            },
+            "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "required": [
@@ -400,6 +580,51 @@
       "maxLength": 120,
       "minLength": 1,
       "type": "string"
+    },
+    "request_headers": {
+      "description": "Request headers whose values this exporter records, by lowercase name. A header the request did not send is left out; a header sent more than once is joined with `, `. Values are stripped of control characters and capped at 256 characters. Credential headers (such as `authorization`, `x-api-key` and `cookie`) and duplicate names are refused. Recording a header never changes what is forwarded upstream. When omitted, no request header is recorded.",
+      "items": {
+        "not": {
+          "enum": [
+            "api-key",
+            "authorization",
+            "cookie",
+            "proxy-authorization",
+            "x-amz-content-sha256",
+            "x-amz-date",
+            "x-amz-security-token",
+            "x-api-key",
+            "x-goog-api-key"
+          ]
+        },
+        "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
+        "type": "string"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "upstream_response_headers": {
+      "description": "Upstream response headers whose values this exporter records for each attempt, by lowercase name, read off that attempt's upstream response. Values follow the same rules as `request_headers`. Credential headers, `set-cookie` and duplicate names are refused. When omitted, no upstream response header is recorded.",
+      "items": {
+        "not": {
+          "enum": [
+            "api-key",
+            "authorization",
+            "cookie",
+            "proxy-authorization",
+            "x-amz-content-sha256",
+            "x-amz-date",
+            "x-amz-security-token",
+            "x-api-key",
+            "x-goog-api-key",
+            "set-cookie"
+          ]
+        },
+        "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
+        "type": "string"
+      },
+      "type": "array",
+      "uniqueItems": true
     }
   },
   "required": [

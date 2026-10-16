@@ -1067,6 +1067,7 @@ mod tests {
             prompt_truncated: false,
             response_truncated: false,
             max_bytes: None,
+            output: None,
         });
         s.append_batch(&batch_of(vec![rec]), &IdempotencyMarker::None)
             .await

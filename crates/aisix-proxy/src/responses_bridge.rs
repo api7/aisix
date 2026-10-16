@@ -1579,6 +1579,7 @@ pub struct ResponsesSseEncoder {
     reasoning_tokens: u32,
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    modality: aisix_gateway::ModalityTokens,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
 }
@@ -1617,6 +1618,7 @@ impl ResponsesSseEncoder {
             reasoning_tokens: 0,
             cached_prompt_tokens: 0,
             cache_write_tokens: None,
+            modality: Default::default(),
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
         }
@@ -1663,6 +1665,7 @@ impl ResponsesSseEncoder {
             self.reasoning_tokens = self.reasoning_tokens.max(u.reasoning_tokens);
             self.cached_prompt_tokens = self.cached_prompt_tokens.max(u.cached_prompt_tokens);
             self.cache_write_tokens = self.cache_write_tokens.max(u.cache_write_tokens);
+            self.modality = self.modality.max_fieldwise(&u.modality);
             self.cache_creation_tokens = self.cache_creation_tokens.max(u.cache_creation_tokens);
             self.cache_read_tokens = self.cache_read_tokens.max(u.cache_read_tokens);
         }
@@ -1710,6 +1713,7 @@ impl ResponsesSseEncoder {
             total_tokens: self.total_tokens,
             cached_prompt_tokens: self.cached_prompt_tokens,
             cache_write_tokens: self.cache_write_tokens,
+            modality: self.modality,
             reasoning_tokens: self.reasoning_tokens,
             cache_creation_tokens: self.cache_creation_tokens,
             cache_read_tokens: self.cache_read_tokens,
@@ -2262,6 +2266,7 @@ pub struct ResponsesStreamCompletion {
     pub reasoning_tokens: u32,
     pub cached_prompt_tokens: u32,
     pub cache_write_tokens: Option<u32>,
+    pub modality: aisix_gateway::ModalityTokens,
     pub cache_creation_tokens: u32,
     pub cache_read_tokens: u32,
     /// See `aisix_gateway::chat::merge_stream_upstream_total`.
@@ -2454,6 +2459,7 @@ pub fn build_responses_bridge_stream(
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
                             attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                            crate::attribution::note_upstream_first_frame();
                     }
                     {
                         let comp = guard.comp();
@@ -2511,6 +2517,7 @@ pub fn build_responses_bridge_stream(
                             comp.reasoning_tokens = comp.reasoning_tokens.max(u.reasoning_tokens);
                             comp.cached_prompt_tokens = comp.cached_prompt_tokens.max(u.cached_prompt_tokens);
                             comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);
+                            comp.modality = comp.modality.max_fieldwise(&u.modality);
                             comp.cache_creation_tokens = comp.cache_creation_tokens.max(u.cache_creation_tokens);
                             comp.cache_read_tokens = comp.cache_read_tokens.max(u.cache_read_tokens);
                             aisix_gateway::chat::merge_stream_upstream_total(

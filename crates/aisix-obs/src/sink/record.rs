@@ -6,6 +6,7 @@
 //! single-sourced; content lives in a separate field so the default
 //! metadata-only path can never carry a prompt.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -41,6 +42,11 @@ pub struct SinkContent {
     /// bound. `None` when no cap is known.
     #[serde(skip)]
     pub max_bytes: Option<usize>,
+    /// The response as structured parts, for an encoder that reports them
+    /// (OTLP). `None` when it was not captured that way; the flat
+    /// `response` above is what every other encoder reads, unchanged.
+    #[serde(skip)]
+    pub output: Option<crate::output::OutputCapture>,
 }
 
 impl SinkContent {
@@ -59,6 +65,7 @@ impl SinkContent {
             prompt_truncated: p_cut,
             response_truncated: r_cut,
             max_bytes: Some(max_bytes),
+            output: None,
         }
     }
 }
@@ -81,9 +88,18 @@ pub struct CapturedContent {
     /// Which side the capture cap cut; `truncated` is their OR.
     pub prompt_truncated: bool,
     pub response_truncated: bool,
+    /// The response as structured parts ([`crate::output`]), when the
+    /// surface captures it that way.
+    pub output: Option<crate::output::OutputCapture>,
 }
 
 impl CapturedContent {
+    /// Attach the response's structured parts.
+    pub fn with_output(mut self, output: Option<crate::output::OutputCapture>) -> Self {
+        self.output = output;
+        self
+    }
+
     /// Capture `prompt` and `response`, truncating each to `max_bytes`
     /// (structure-preserving for JSON, UTF-8-boundary cut otherwise) to
     /// bound the held buffer at the largest cap any content-capturing
@@ -98,6 +114,7 @@ impl CapturedContent {
             truncated: p_cut || r_cut,
             prompt_truncated: p_cut,
             response_truncated: r_cut,
+            output: None,
         }
     }
 }
@@ -131,6 +148,15 @@ pub struct SinkRecord {
     /// is part of the usage-event wire.
     #[serde(skip)]
     pub facts: Option<std::sync::Arc<crate::genai::SpanFacts>>,
+    /// The request headers THIS exporter lists, out of the request's
+    /// captured set (`UsageEvent::request_headers`). Never on the control
+    /// plane's wire, which carries the usage event alone.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub request_headers: BTreeMap<String, String>,
+    /// The upstream response headers THIS exporter lists, off this
+    /// attempt's upstream response (`UsageEvent::upstream_response_headers`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub upstream_response_headers: BTreeMap<String, String>,
 }
 
 impl SinkRecord {
@@ -142,7 +168,24 @@ impl SinkRecord {
             content: None,
             trace: None,
             facts: None,
+            request_headers: BTreeMap::new(),
+            upstream_response_headers: BTreeMap::new(),
         }
+    }
+
+    /// Keep the captured headers `request` / `response` name — one
+    /// exporter's own lists.
+    pub fn with_exporter_headers(mut self, request: &[String], response: &[String]) -> Self {
+        let pick = |captured: &BTreeMap<String, String>, names: &[String]| {
+            captured
+                .iter()
+                .filter(|(name, _)| names.contains(name))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        self.request_headers = pick(&self.usage.request_headers, request);
+        self.upstream_response_headers = pick(&self.usage.upstream_response_headers, response);
+        self
     }
 
     /// Attach captured content (`content_mode = full`).
@@ -351,6 +394,7 @@ mod tests {
             prompt_truncated: false,
             response_truncated: false,
             max_bytes: None,
+            output: None,
         });
         let json = serde_json::to_value(&rec).unwrap();
         assert_eq!(json["content"]["prompt"], "hi");

@@ -345,8 +345,33 @@ impl OtlpHttpFanOut {
             // A content-bearing record for an SLS exporter that opted into
             // full capture (and only when the handler captured content); the
             // shared metadata-only record for everyone else.
-            let record =
-                content_record(&exp.kind, event, content, trace, facts).unwrap_or_else(|| {
+            // Each exporter sees only the headers in its own lists, so one
+            // that selects any gets a record of its own.
+            let selects_headers =
+                !exp.request_headers.is_empty() || !exp.upstream_response_headers.is_empty();
+            let record = content_record(&exp.kind, event, content, trace, facts)
+                .map(|record| {
+                    if selects_headers {
+                        Arc::new(Arc::unwrap_or_clone(record).with_exporter_headers(
+                            &exp.request_headers,
+                            &exp.upstream_response_headers,
+                        ))
+                    } else {
+                        record
+                    }
+                })
+                .unwrap_or_else(|| {
+                    if selects_headers {
+                        return Arc::new(
+                            SinkRecord::metadata_only(event.clone())
+                                .with_trace(trace.cloned())
+                                .with_facts(facts.cloned())
+                                .with_exporter_headers(
+                                    &exp.request_headers,
+                                    &exp.upstream_response_headers,
+                                ),
+                        );
+                    }
                     Arc::clone(metadata_record.get_or_insert_with(|| {
                         Arc::new(
                             SinkRecord::metadata_only(event.clone())
@@ -563,6 +588,7 @@ fn content_record(
     sc.truncated = sc.truncated || captured.truncated;
     sc.prompt_truncated = sc.prompt_truncated || captured.prompt_truncated;
     sc.response_truncated = sc.response_truncated || captured.response_truncated;
+    sc.output = captured.output.clone();
     Some(Arc::new(
         SinkRecord::metadata_only(event.clone())
             .with_content(sc)
@@ -798,7 +824,7 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
     let start_unix_nano = end_unix_nano.saturating_sub(latency_nanos);
 
     let mut attributes = event_attributes(record, exporter_name);
-    merge_attributes(&mut attributes, inbound_request_attributes(event));
+    merge_attributes(&mut attributes, inbound_request_attributes(record));
     let error = client_error_type(event);
     if let Some(error_type) = &error {
         attributes.push(attr_string("error.type", error_type));
@@ -1081,7 +1107,8 @@ fn joining_attributes(event: &UsageEvent, exporter_name: &str) -> Vec<Value> {
 /// What the caller's HTTP request looked like, under the HTTP and client
 /// conventions' names: the resolved caller address, its `User-Agent`, and
 /// the operator-selected request headers.
-fn inbound_request_attributes(event: &UsageEvent) -> Vec<Value> {
+fn inbound_request_attributes(record: &SinkRecord) -> Vec<Value> {
+    let event = &record.usage;
     let mut attributes = Vec::new();
     if !event.client_source_ip.is_empty() {
         attributes.push(attr_string("client.address", &event.client_source_ip));
@@ -1091,7 +1118,7 @@ fn inbound_request_attributes(event: &UsageEvent) -> Vec<Value> {
     }
     // `http.request.header.<lowercase name>` is a string array; one element
     // here, because repeated occurrences were already joined into one value.
-    for (name, value) in &event.request_headers {
+    for (name, value) in &record.request_headers {
         attributes.push(attr_string_array(
             &format!("http.request.header.{name}"),
             std::slice::from_ref(value),
@@ -1126,7 +1153,7 @@ fn server_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
         "http.response.status_code",
         event.status_code as i64,
     ));
-    attributes.extend(inbound_request_attributes(event));
+    attributes.extend(inbound_request_attributes(record));
     attributes.extend(joining_attributes(event, exporter_name));
     attributes
 }
@@ -1216,6 +1243,9 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
         // spans back to the AISIX api_key dashboard.
         attributes.push(attr_string("aisix.api_key_id", &event.api_key_id));
     }
+    if !event.api_key_name.is_empty() {
+        attributes.push(attr_string("aisix.api_key_name", &event.api_key_name));
+    }
     // The org member behind the credential (AISIX-Cloud#1389). Exported
     // beside the key rather than derived from it downstream: a member can
     // hold several keys, and a key can be rebound to someone else.
@@ -1248,6 +1278,21 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
         attributes.push(attr_int(
             "aisix.downstream_latency_ms",
             event.downstream_latency_ms as i64,
+        ));
+    }
+    if let Some(overhead) = event.gateway_overhead_ms {
+        attributes.push(attr_int("aisix.gateway_overhead_ms", i64::from(overhead)));
+    }
+    if let Some(tpot) = event.upstream_tpot_ms {
+        attributes.push(attr_double("aisix.upstream_tpot_ms", tpot));
+    }
+    // `http.response.header.<lowercase name>`, a string array like its
+    // request twin: this attempt's upstream response, as the exporter
+    // selected it.
+    for (name, value) in &record.upstream_response_headers {
+        attributes.push(attr_string_array(
+            &format!("http.response.header.{name}"),
+            std::slice::from_ref(value),
         ));
     }
     // Per-attempt telemetry (#655). `request_id` is the trace/group key; a
@@ -1444,6 +1489,23 @@ fn push_usage(attributes: &mut Vec<Value>, event: &UsageEvent, operation: Option
             i64::from(creation),
         ));
     }
+    // Modality breakdowns, as the upstream reported them (each a subset of
+    // its side's total). Named after the GenAI conventions' development
+    // registry, which defines them beyond the v1.41 release.
+    for (key, value) in [
+        (
+            "gen_ai.usage.audio.input_tokens",
+            event.modality_tokens.prompt_audio_tokens,
+        ),
+        (
+            "gen_ai.usage.image.input_tokens",
+            event.modality_tokens.prompt_image_tokens,
+        ),
+    ] {
+        if let Some(v) = value {
+            attributes.push(attr_int(key, i64::from(v)));
+        }
+    }
     if operation == Some("embeddings") {
         return;
     }
@@ -1456,6 +1518,20 @@ fn push_usage(attributes: &mut Vec<Value>, event: &UsageEvent, operation: Option
             "gen_ai.usage.reasoning.output_tokens",
             i64::from(event.reasoning_tokens),
         ));
+    }
+    for (key, value) in [
+        (
+            "gen_ai.usage.audio.output_tokens",
+            event.modality_tokens.completion_audio_tokens,
+        ),
+        (
+            "gen_ai.usage.image.output_tokens",
+            event.modality_tokens.completion_image_tokens,
+        ),
+    ] {
+        if let Some(v) = value {
+            attributes.push(attr_int(key, i64::from(v)));
+        }
     }
 }
 
@@ -1474,6 +1550,9 @@ fn push_content(attributes: &mut Vec<Value>, event: &UsageEvent, content: &SinkC
     // make a complete prompt any less complete.
     let prompt_whole = !content.prompt.is_empty() && !content.prompt_truncated;
     let response_whole = !content.response.is_empty() && !content.response_truncated;
+    // The structured parts stand on their own completeness, not the flat
+    // text's: they hold reasoning and tool calls the text never carried.
+    let output = content.output.as_ref().filter(|o| !o.truncated);
     let mut raw_prompt = !content.prompt.is_empty();
     let mut raw_response = !content.response.is_empty();
     if is_mcp(event) {
@@ -1496,6 +1575,7 @@ fn push_content(attributes: &mut Vec<Value>, event: &UsageEvent, content: &SinkC
             } else {
                 ""
             },
+            output,
             &event.finish_reason,
         );
         if let Some(input) = structured.input_messages.as_deref().filter(|v| {
@@ -2167,6 +2247,7 @@ mod tests {
                     truncated: false,
                     prompt_truncated: false,
                     response_truncated: false,
+                    output: None,
                 }),
                 None,
                 None,
@@ -2211,6 +2292,123 @@ mod tests {
             attr(&cut, "aisix.content_truncated").unwrap()["boolValue"],
             true
         );
+    }
+
+    /// Captured parts become the output message in order — reasoning, text,
+    /// tool call with parsed arguments — while the flat response every other
+    /// sink reads is untouched.
+    #[test]
+    fn structured_output_parts_become_the_output_message() {
+        let mut event = sample_event();
+        event.operation = "chat".into();
+        let prompt =
+            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).to_string();
+        let body = json!({"choices": [{"index": 0, "message": {
+            "role": "assistant",
+            "reasoning_content": "think",
+            "content": "hello",
+            "tool_calls": [{"id": "c1", "type": "function",
+                "function": {"name": "f", "arguments": "{\"a\":1}"}}],
+        }}]});
+        let content = |cap: usize| {
+            CapturedContent::new(&prompt, "hello", 4096).with_output(Some(
+                crate::output::OutputCollector::from_body(
+                    crate::output::OutputWire::OpenAiChat,
+                    cap,
+                    &body,
+                ),
+            ))
+        };
+        let span = |captured: CapturedContent| {
+            let record = content_record(
+                &otlp_kind(SlsContentMode::Full, 4096),
+                &event,
+                Some(&captured),
+                None,
+                None,
+            )
+            .unwrap();
+            build_otlp_span(&record, "x")
+        };
+        let whole = span(content(4096));
+        let output: Value = serde_json::from_str(
+            attr(&whole, "gen_ai.output.messages").unwrap()["stringValue"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            output[0]["parts"],
+            json!([
+                {"type": "reasoning", "content": "think"},
+                {"type": "text", "content": "hello"},
+                {"type": "tool_call", "id": "c1", "name": "f", "arguments": {"a": 1}},
+            ])
+        );
+        assert_eq!(output[0]["finish_reason"], "stop");
+        assert!(attr(&whole, "aisix.content.response").is_none());
+
+        // Parts the cap cut are not reported partially: the flat text
+        // stands in, exactly as before parts were captured.
+        let cut = span(content(6));
+        assert_eq!(
+            attr(&cut, "gen_ai.output.messages").unwrap()["stringValue"],
+            r#"[{"finish_reason":"stop","parts":[{"content":"hello","type":"text"}],"role":"assistant"}]"#
+        );
+    }
+
+    /// The per-request latency breakdown, the key's name, TPOT and the
+    /// modality counts each ride the operation span; absent ones stay off.
+    #[test]
+    fn span_carries_key_name_overhead_tpot_and_modality_counts() {
+        let mut ev = sample_event();
+        ev.api_key_name = "team-a-key".into();
+        ev.gateway_overhead_ms = Some(7);
+        ev.upstream_tpot_ms = Some(12.5);
+        ev.modality_tokens = aisix_gateway::ModalityTokens {
+            prompt_audio_tokens: Some(30),
+            prompt_image_tokens: Some(0),
+            completion_audio_tokens: Some(40),
+            completion_image_tokens: None,
+        };
+        let body = build_otlp_traces_payload(&ev, "x");
+        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(
+            attr(span, "aisix.api_key_name").unwrap()["stringValue"],
+            "team-a-key"
+        );
+        assert_eq!(
+            attr(span, "aisix.gateway_overhead_ms").unwrap()["intValue"],
+            "7"
+        );
+        assert_eq!(
+            attr(span, "aisix.upstream_tpot_ms").unwrap()["doubleValue"],
+            12.5
+        );
+        assert_eq!(
+            attr(span, "gen_ai.usage.audio.input_tokens").unwrap()["intValue"],
+            "30"
+        );
+        assert_eq!(
+            attr(span, "gen_ai.usage.image.input_tokens").unwrap()["intValue"],
+            "0"
+        );
+        assert_eq!(
+            attr(span, "gen_ai.usage.audio.output_tokens").unwrap()["intValue"],
+            "40"
+        );
+        assert!(attr(span, "gen_ai.usage.image.output_tokens").is_none());
+
+        let bare = build_otlp_traces_payload(&sample_event(), "x").to_string();
+        for key in [
+            "aisix.api_key_name",
+            "aisix.gateway_overhead_ms",
+            "aisix.upstream_tpot_ms",
+            "gen_ai.usage.audio.",
+            "gen_ai.usage.image.",
+        ] {
+            assert!(!bare.contains(key), "{key}");
+        }
     }
 
     #[test]
@@ -2279,6 +2477,7 @@ mod tests {
             truncated: false,
             prompt_truncated: false,
             response_truncated: false,
+            output: None,
         };
 
         // otlp on its default (metadata_only) never carries content, even
@@ -2327,6 +2526,7 @@ mod tests {
             truncated: false,
             prompt_truncated: false,
             response_truncated: false,
+            output: None,
         };
         let rec = content_record(
             &sls_kind(SlsContentMode::Full, 16),
@@ -2348,6 +2548,7 @@ mod tests {
             truncated: true,
             prompt_truncated: true,
             response_truncated: false,
+            output: None,
         };
         let rec = content_record(&full, &event, Some(&pre), None, None).unwrap();
         assert!(
@@ -2427,6 +2628,7 @@ mod tests {
             truncated: false,
             prompt_truncated: false,
             response_truncated: false,
+            output: None,
         };
         let rec = content_record(
             &otlp_kind(SlsContentMode::Full, 1024),
@@ -2464,6 +2666,7 @@ mod tests {
             truncated: false,
             prompt_truncated: false,
             response_truncated: false,
+            output: None,
         };
         let rec = content_record(
             &otlp_kind(SlsContentMode::Full, 16),
@@ -3184,21 +3387,39 @@ mod tests {
         assert!(!body.to_string().contains("aisix.client_user_agent"));
     }
 
+    /// Each exporter reports only the names in its own lists: the record
+    /// built for an exporter selecting `x-sub-user` drops `x-department`
+    /// although the request carried it, and response headers ride the
+    /// span under `http.response.header.<name>`.
     #[test]
-    fn payload_carries_request_headers_as_semconv_string_arrays() {
+    fn payload_carries_the_exporters_own_headers_as_semconv_string_arrays() {
         let mut ev = sample_event();
         ev.request_headers = [
             ("x-sub-user".to_string(), "alice".to_string()),
             ("x-department".to_string(), "eng, ops".to_string()),
         ]
         .into();
-        let body = build_otlp_traces_payload(&ev, "test-exp");
+        ev.upstream_response_headers = [
+            ("x-upstream-region".to_string(), "us-east".to_string()),
+            ("x-other".to_string(), "unselected".to_string()),
+        ]
+        .into();
+        let record = SinkRecord::metadata_only(ev).with_exporter_headers(
+            &["x-sub-user".to_string(), "x-department".to_string()],
+            &["x-upstream-region".to_string()],
+        );
+        let body = otlp_export_request(
+            vec![build_otlp_span(&record, "test-exp")],
+            DEFAULT_SERVICE_NAME,
+        );
         let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
             .as_array()
             .unwrap();
+        assert!(!body.to_string().contains("x-other"));
         for (key, value) in [
             ("http.request.header.x-sub-user", "alice"),
             ("http.request.header.x-department", "eng, ops"),
+            ("http.response.header.x-upstream-region", "us-east"),
         ] {
             let attr = attrs
                 .iter()
@@ -3209,7 +3430,9 @@ mod tests {
                 json!({"arrayValue": {"values": [{"stringValue": value}]}}),
             );
         }
-        let none = build_otlp_traces_payload(&sample_event(), "x");
+        let mut unselected = sample_event();
+        unselected.request_headers = [("x-sub-user".to_string(), "alice".to_string())].into();
+        let none = build_otlp_traces_payload(&unselected, "x");
         assert!(!none.to_string().contains("http.request.header."));
     }
 

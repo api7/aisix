@@ -247,6 +247,20 @@ fn to_log(record: &SinkRecord) -> Result<Log, SinkError> {
             }
         }
     }
+    for (key, headers) in [
+        ("request_headers", &record.request_headers),
+        (
+            "upstream_response_headers",
+            &record.upstream_response_headers,
+        ),
+    ] {
+        if !headers.is_empty() {
+            let rendered = serde_json::to_value(headers).unwrap_or_default();
+            if let Some(rendered) = render_scalar(&rendered) {
+                log.add_content_kv(key, rendered);
+            }
+        }
+    }
 
     // Opt-in captured content as flat, queryable fields (the SLS customer case
     // wants prompt / response columns, not a nested blob). Absent on the
@@ -588,6 +602,74 @@ mod tests {
         );
     }
 
+    /// The exporter's selected headers ride beside the usage fields, and a
+    /// record carrying structured output parts encodes its content exactly
+    /// as a flat one does.
+    #[tokio::test]
+    async fn selected_headers_ride_the_log_and_content_stays_flat() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let sink = sink_for(&server);
+        let output = crate::output::OutputCollector::from_body(
+            crate::output::OutputWire::OpenAiChat,
+            4096,
+            &serde_json::json!({"choices": [{"index": 0, "message": {
+                "reasoning_content": "pondering", "content": "4"}}]}),
+        );
+        let record = SinkRecord::metadata_only(UsageEvent {
+            request_id: "req-headers".into(),
+            status_code: 200,
+            api_key_name: "key-a".into(),
+            request_headers: [
+                ("x-sub-user".to_string(), "alice".to_string()),
+                ("x-department".to_string(), "eng".to_string()),
+            ]
+            .into(),
+            upstream_response_headers: [("x-upstream-id".to_string(), "u-1".to_string())].into(),
+            ..UsageEvent::default()
+        })
+        .with_exporter_headers(&["x-sub-user".to_string()], &["x-upstream-id".to_string()])
+        .with_content(SinkContent {
+            prompt: "what is 2+2?".into(),
+            response: "4".into(),
+            truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
+            max_bytes: None,
+            output: Some(output),
+        });
+        sink.append_batch(&batch_of(vec![record]), &IdempotencyMarker::None)
+            .await
+            .expect("delivery succeeds");
+
+        let requests = server.received_requests().await.unwrap();
+        let contents = decode_single_log(&requests[0]);
+        assert_eq!(
+            contents.get("request_headers").map(String::as_str),
+            Some(r#"{"x-sub-user":"alice"}"#)
+        );
+        assert_eq!(
+            contents
+                .get("upstream_response_headers")
+                .map(String::as_str),
+            Some(r#"{"x-upstream-id":"u-1"}"#)
+        );
+        assert_eq!(
+            contents.get("api_key_name").map(String::as_str),
+            Some("key-a")
+        );
+        // The flat content is what it always was: the structured parts
+        // ride OTLP only.
+        assert_eq!(contents.get("response").map(String::as_str), Some("4"));
+        assert!(!contents.values().any(|v| v.contains("pondering")));
+        assert!(!String::from_utf8_lossy(&requests[0].body).contains("x-department"));
+    }
+
     #[tokio::test]
     async fn full_content_record_emits_prompt_and_response() {
         let server = MockServer::start().await;
@@ -610,6 +692,7 @@ mod tests {
             prompt_truncated: true,
             response_truncated: false,
             max_bytes: None,
+            output: None,
         });
         sink.append_batch(&batch_of(vec![record]), &IdempotencyMarker::None)
             .await

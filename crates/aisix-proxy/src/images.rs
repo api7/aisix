@@ -47,7 +47,7 @@ struct ImageDispatchSuccess {
     /// block when the model returns one (gpt-image-1). `None` for
     /// models that don't (dall-e-3) — those still emit a zero-token
     /// event so the request is visible + attributed.
-    usage: Option<(u32, u32)>,
+    usage: Option<(u32, u32, aisix_gateway::ModalityTokens)>,
     /// `false` on the 501 NotImplemented branch (provider lacks image
     /// generation → no upstream call). That path still emits a zero-token
     /// event.
@@ -184,7 +184,10 @@ pub async fn image_generations(
             // documented cross-repo follow-up — needs image-count /
             // size / quality on the wire + cp-api pricing).
             {
-                let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
+                let (prompt_tokens, completion_tokens, modality) =
+                    success
+                        .usage
+                        .unwrap_or((0, 0, aisix_gateway::ModalityTokens::NONE));
                 emit_usage_event(
                     &state,
                     &snapshot,
@@ -202,6 +205,7 @@ pub async fn image_generations(
                     elapsed,
                     prompt_tokens,
                     completion_tokens,
+                    modality,
                     &client,
                     success.redactions.clone(),
                     success.monitor_hits.clone(),
@@ -531,7 +535,7 @@ async fn dispatch(
             // for /v1/images/generations like chat + embeddings. Pre-fix the
             // reservation dropped uncommitted and the token counter never moved.
             let total_tokens = usage
-                .map(|(prompt, completion)| u64::from(prompt) + u64::from(completion))
+                .map(|(prompt, completion, _)| u64::from(prompt) + u64::from(completion))
                 .unwrap_or(0);
             reservation.commit_tokens(total_tokens).await;
             // Content capture (#700): the full response JSON (LiteLLM
@@ -588,20 +592,31 @@ async fn dispatch(
 /// `usage: {input_tokens, output_tokens, total_tokens, ...}`; dall-e-2/3
 /// return no `usage` block → `None`. Wire shape:
 /// <https://platform.openai.com/docs/api-reference/images/object>
-pub(crate) fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
+pub(crate) fn extract_token_usage(
+    body: &Value,
+) -> Option<(u32, u32, aisix_gateway::ModalityTokens)> {
     let usage = body.get("usage")?;
     let input = usage.get("input_tokens").and_then(Value::as_u64)? as u32;
     let output = usage
         .get("output_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0) as u32;
-    Some((input, output))
+    // `input_tokens_details` / `output_tokens_details` split each side
+    // into `text_tokens` and `image_tokens`.
+    let modality = aisix_gateway::ModalityTokens::from_openai_details(
+        usage.get("input_tokens_details"),
+        usage.get("output_tokens_details"),
+    );
+    Some((input, output, modality))
 }
 
 /// [`extract_token_usage`] as `UsageStats`, shared with passthrough routes
 /// relaying an image body.
 pub(crate) fn image_usage_stats(body: &Value) -> Option<aisix_gateway::UsageStats> {
-    extract_token_usage(body).map(|(input, output)| aisix_gateway::UsageStats::new(input, output))
+    extract_token_usage(body).map(|(input, output, modality)| aisix_gateway::UsageStats {
+        modality,
+        ..aisix_gateway::UsageStats::new(input, output)
+    })
 }
 
 /// Issue #407: push one `UsageEvent` onto cp-api's telemetry sink and
@@ -643,6 +658,7 @@ pub(crate) fn emit_usage_event(
     elapsed: Duration,
     prompt_tokens: u32,
     completion_tokens: u32,
+    modality_tokens: aisix_gateway::ModalityTokens,
     client: &ClientContext,
     // Per-detector PII mask counts (#932/#696). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -666,6 +682,7 @@ pub(crate) fn emit_usage_event(
         requested_model: requested_model.to_string(),
         prompt_tokens,
         completion_tokens,
+        modality_tokens,
         // Narrowed to the winning attempt's own latency below
         // (`apply_winning_attempt`) once a failover put earlier attempts
         // in front of it; they emitted their own events.
@@ -689,6 +706,7 @@ pub(crate) fn emit_usage_event(
     crate::usage_attr::apply_caller_identity(
         &mut event,
         client.jwt.as_ref(),
+        client.caller.api_key_name.as_deref(),
         client.caller.user_id.as_deref(),
         client.caller.user_name.as_deref(),
     );
