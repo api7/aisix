@@ -188,6 +188,8 @@ const ROUTE = "sf-route";
 const ROUTE_PREFIX = "/passthrough/sf";
 const ERROR_ROUTE = "sf-route-in-band";
 const ERROR_ROUTE_PREFIX = "/passthrough/sf-in-band";
+const NESTED_ERROR_ROUTE = "sf-route-nested-error";
+const NESTED_ERROR_ROUTE_PREFIX = "/passthrough/sf-nested-error";
 
 interface Seeded {
   upstream: OpenAiUpstreamOptions;
@@ -352,6 +354,20 @@ describe("usage status of a stream that fails after its 200 headers", () => {
       path_prefix: ERROR_ROUTE_PREFIX,
       target_url: errorRouteUpstream.baseUrl,
       provider_key_id: errorRoutePk.id,
+    });
+    // And one onto a Responses upstream that sends the nested-shape error event.
+    const nestedRouteUpstream = await startOpenAiUpstream({ rawStreamFrames: RESPONSES_NESTED_ERROR_FRAMES });
+    upstreams.push(nestedRouteUpstream);
+    const nestedRoutePk = await seed.createProviderKey({
+      display_name: "sf-route-nested-error-pk",
+      secret: "sk-mock",
+      api_base: nestedRouteUpstream.baseUrl,
+    });
+    await seed.createPassthroughRoute({
+      name: NESTED_ERROR_ROUTE,
+      path_prefix: NESTED_ERROR_ROUTE_PREFIX,
+      target_url: nestedRouteUpstream.baseUrl,
+      provider_key_id: nestedRoutePk.id,
     });
     await seed.createModel({
       display_name: ENSEMBLE,
@@ -668,6 +684,22 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     const row = await usageRow(requestId);
     expectUpstreamFailure(row, "429");
     expect(row.get("error_message")).toContain("exceeded your rate limit");
+  });
+
+  test("passthrough route: a nested-shape Responses error event records the upstream's message", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const res = await fetch(`${app.proxyUrl}${NESTED_ERROR_ROUTE_PREFIX}/v1/responses`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-4o", input: "hi", stream: true }),
+    });
+    expect(res.status).toBe(200);
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    expect(requestId).not.toBe("");
+    expect(await res.text(), "the error event reaches the caller unchanged").toContain(NESTED_ERROR_FRAME);
+    const row = await usageRow(requestId);
+    expectUpstreamFailure(row, "502");
+    expect(row.get("error_message")).toContain(NESTED_ERROR_MESSAGE);
   });
 
   // ── The caller leaving ─────────────────────────────────────────────

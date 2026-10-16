@@ -3227,9 +3227,10 @@ fn drain_responses_sse_frames(
 /// The upstream failure a Responses-API stream event reports, if it is one:
 /// an `error` event or `response.failed`, whose Response carries
 /// `error: {code, message}`. The `error` event comes in two shapes — the
-/// published flat one (`{type, code, message, param}`) and the one OpenAI's
-/// own client reads, which nests those fields under `error` — so the nested
-/// object wins when present. Read the way an in-band error on any other wire
+/// flat one of the published `ResponseErrorEvent` (`{type, code, message,
+/// param}`, what openai-python parses and what this crate emits) and the
+/// one the Codex CLI reads, which nests those fields under `error` — so the
+/// nested value wins when present. Read the way an in-band error on any other wire
 /// is, so a code that names no HTTP status maps as one with none.
 pub(crate) fn responses_in_band_error(event: &Value) -> Option<aisix_gateway::BridgeError> {
     let error = match event.get("type").and_then(Value::as_str)? {
