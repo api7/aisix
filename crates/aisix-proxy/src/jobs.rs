@@ -1917,9 +1917,9 @@ fn maybe_attribute_batch(
         tracing::warn!(batch_id = %raw_batch_id, "batch output_file_id failed charset guard; skipping attribution");
         return;
     }
-    if !state.billed_batches.claim(raw_batch_id) {
+    let Some(claimed_at) = state.billed_batches.claim(raw_batch_id) else {
         return;
-    }
+    };
 
     let state = state.clone();
     let api_key_id = auth.entry.id.clone();
@@ -1969,7 +1969,7 @@ fn maybe_attribute_batch(
         .await
         {
             // Release the guard so a later retrieve can retry the download.
-            state.billed_batches.release(&raw_batch_id);
+            state.billed_batches.release(&raw_batch_id, claimed_at);
             tracing::warn!(
                 batch_id = %raw_batch_id,
                 error = %e,
@@ -2524,10 +2524,23 @@ mod tests {
     #[test]
     fn an_expired_batch_claim_is_swept_by_the_next_claim() {
         let billed = crate::state::BilledBatches::default();
-        assert!(billed.claim("batch_old"));
+        assert!(billed.claim("batch_old").is_some());
         billed.advance_clock(crate::state::BilledBatches::TTL);
-        assert!(billed.claim("batch_new"));
+        assert!(billed.claim("batch_new").is_some());
         assert_eq!(billed.len(), 1, "the expired claim must not be kept");
+    }
+
+    #[test]
+    fn a_failed_attribution_does_not_release_a_newer_claim() {
+        let billed = crate::state::BilledBatches::default();
+        let first = billed.claim("batch_1").unwrap();
+        billed.advance_clock(crate::state::BilledBatches::TTL);
+        assert!(billed.claim("batch_1").is_some());
+        billed.release("batch_1", first);
+        assert!(
+            billed.claim("batch_1").is_none(),
+            "the newer claim must survive the older attribution's failure"
+        );
     }
 
     #[tokio::test]

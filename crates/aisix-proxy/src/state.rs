@@ -691,18 +691,18 @@ impl Default for BilledBatches {
 impl BilledBatches {
     pub const TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-    /// Claim `batch_id` for attribution: `true` when it has not been claimed
-    /// within the TTL. A new claim also sweeps the expired entries, which is
-    /// what bounds the set.
-    pub(crate) fn claim(&self, batch_id: &str) -> bool {
+    /// Claim `batch_id` for attribution: the claim's time when it has not
+    /// been claimed within the TTL, `None` when it has. A new claim also
+    /// sweeps the expired entries, which is what bounds the set.
+    pub(crate) fn claim(&self, batch_id: &str) -> Option<std::time::Instant> {
         let now = self.now();
         match self.claimed_at.entry(batch_id.to_string()) {
             dashmap::Entry::Occupied(mut claimed) => {
                 if now.duration_since(*claimed.get()) < self.ttl {
-                    return false;
+                    return None;
                 }
                 claimed.insert(now);
-                return true;
+                return Some(now);
             }
             dashmap::Entry::Vacant(slot) => {
                 slot.insert(now);
@@ -710,12 +710,14 @@ impl BilledBatches {
         }
         self.claimed_at
             .retain(|_, at| now.duration_since(*at) < self.ttl);
-        true
+        Some(now)
     }
 
-    /// Forget a claim whose attribution failed, so the next retrieve retries.
-    pub(crate) fn release(&self, batch_id: &str) {
-        self.claimed_at.remove(batch_id);
+    /// Forget a claim whose attribution failed, so the next retrieve retries
+    /// — unless a later claim has replaced it since.
+    pub(crate) fn release(&self, batch_id: &str, claimed_at: std::time::Instant) {
+        self.claimed_at
+            .remove_if(batch_id, |_, at| *at == claimed_at);
     }
 
     fn now(&self) -> std::time::Instant {
