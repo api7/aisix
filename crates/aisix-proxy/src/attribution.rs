@@ -447,6 +447,15 @@ struct Cell {
     upstream_clock: UpstreamClock,
     /// See [`RequestAttribution::capture_stream_output`].
     stream_output: Option<aisix_obs::OutputCollector>,
+    /// Upstreams were called outside attempt windows (an ensemble's
+    /// concurrent members), so neither the wait nor the "latest response"
+    /// can be attributed: no overhead is reported, and an attempt without
+    /// headers of its own takes none.
+    upstream_unmeasured: bool,
+    /// An attempt has settled through the routing telemetry, which stores
+    /// its headers under its index; from then on the "latest response"
+    /// fallback belongs to nobody.
+    attempts_settled: bool,
     /// Each settled attempt's upstream response headers, by attempt index,
     /// until that attempt's usage event takes them.
     attempt_response_headers:
@@ -561,6 +570,9 @@ struct BodyCounters {
     /// decided before the body was read.
     request_discarded: AtomicBool,
     response_bytes: AtomicU64,
+    /// A streamed output capture is armed, so body frames are worth the
+    /// cell's lock ([`RequestAttribution::observe_response_output`]).
+    capturing_output: AtomicBool,
 }
 
 /// The maximum child embedding bridge invocations retained per parent event.
@@ -746,9 +758,13 @@ impl RequestAttribution {
     /// ([`take_stream_output`]).
     pub(crate) fn capture_stream_output(&self, collector: aisix_obs::OutputCollector) {
         self.lock().stream_output = Some(collector);
+        self.bodies.capturing_output.store(true, Ordering::Relaxed);
     }
 
     pub(crate) fn observe_response_output(&self, data: &[u8]) {
+        if !self.bodies.capturing_output.load(Ordering::Relaxed) {
+            return;
+        }
         let mut cell = self.lock();
         if let Some(collector) = cell.stream_output.as_mut() {
             collector.feed_sse(data);
@@ -1244,6 +1260,7 @@ pub(crate) fn note_attempt_settled(rec: &AttemptRecord) {
     let _ = CURRENT.try_with(|a| {
         let headers = a.response_tap.take();
         let mut cell = a.lock();
+        cell.attempts_settled = true;
         cell.upstream_clock.settle(Instant::now(), rec.success);
         if !headers.is_empty() {
             cell.attempt_response_headers.insert(rec.index, headers);
@@ -1435,8 +1452,17 @@ pub(crate) fn note_upstream_first_frame() {
 /// outside a request.
 pub(crate) fn upstream_wait() -> Option<Duration> {
     CURRENT
-        .try_with(|a| a.lock().upstream_clock.total(Instant::now()))
+        .try_with(|a| {
+            let cell = a.lock();
+            (!cell.upstream_unmeasured).then(|| cell.upstream_clock.total(Instant::now()))
+        })
         .ok()
+        .flatten()
+}
+
+/// See [`Cell::upstream_unmeasured`].
+pub(crate) fn note_upstream_wait_unmeasured() {
+    let _ = CURRENT.try_with(|a| a.lock().upstream_unmeasured = true);
 }
 
 /// The upstream response headers recorded for the attempt `attempt_index`
@@ -1448,8 +1474,15 @@ pub(crate) fn take_attempt_response_headers(
 ) -> std::collections::BTreeMap<String, String> {
     CURRENT
         .try_with(|a| {
-            let stored = a.lock().attempt_response_headers.remove(&attempt_index);
-            stored.unwrap_or_else(|| a.response_tap.take())
+            let mut cell = a.lock();
+            if let Some(stored) = cell.attempt_response_headers.remove(&attempt_index) {
+                return stored;
+            }
+            if cell.attempts_settled || cell.upstream_unmeasured {
+                return Default::default();
+            }
+            drop(cell);
+            a.response_tap.take()
         })
         .unwrap_or_default()
 }

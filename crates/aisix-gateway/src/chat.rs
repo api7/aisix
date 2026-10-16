@@ -476,7 +476,12 @@ pub struct UsageStats {
     pub reasoning_folded_into_completion: u32,
     /// Audio / image breakdowns of the two sides, as the upstream reported
     /// them. Subsets, never added to a total.
-    #[serde(default, skip_serializing_if = "ModalityTokens::is_empty")]
+    ///
+    /// Not serialized: a cached `ChatResponse` carries this type, and this
+    /// type denies unknown fields, so writing it would make every entry a
+    /// gateway release without the field shares the cache with (a rolling
+    /// upgrade, a rollback) unreadable. A cache hit reports none.
+    #[serde(skip)]
     pub modality: ModalityTokens,
 }
 
@@ -1462,6 +1467,24 @@ mod tests {
                 + mixed.anthropic_cache_read_input_tokens(),
             2 * (N + W + R)
         );
+    }
+
+    /// A cached response carries `UsageStats`, and a gateway release that
+    /// predates `modality` denies unknown fields: the field never reaches
+    /// the serialized form a shared cache stores.
+    #[test]
+    fn modality_stays_out_of_the_cached_form() {
+        let u = UsageStats {
+            modality: ModalityTokens {
+                prompt_audio_tokens: Some(0),
+                ..ModalityTokens::NONE
+            },
+            ..UsageStats::new(1, 2)
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        assert!(!json.contains("modality"), "{json}");
+        let back: UsageStats = serde_json::from_str(&json).unwrap();
+        assert!(back.modality.is_empty());
     }
 
     #[test]

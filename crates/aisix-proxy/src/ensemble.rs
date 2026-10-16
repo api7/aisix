@@ -123,6 +123,10 @@ impl ModelCaller for ProxyModelCaller<'_> {
         target: &str,
         req: &RequestBuilder<'_>,
     ) -> Result<ModelCallOutcome, BridgeError> {
+        // Members run concurrently, outside the attempt windows the
+        // upstream clock and the response-header tap key on; say so rather
+        // than report their time as the gateway's.
+        crate::attribution::note_upstream_wait_unmeasured();
         // Resolve the member's display_name against the live snapshot.
         // A missing entry is a misconfigured ensemble (a panel/judge name
         // that no longer points at a real Model) → 400 InvalidUpstreamConfig.

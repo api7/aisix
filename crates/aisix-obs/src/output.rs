@@ -109,9 +109,15 @@ pub struct OutputCollector {
     wire: OutputWire,
     cap: usize,
     slots: BTreeMap<SlotKey, Part>,
-    /// Chat assigns a slot per kind on first sight; this is that order.
+    /// Chat assigns slots in arrival order: a tool call keeps its own by
+    /// index, and text or reasoning opens a new one whenever the kind
+    /// changes, so interleaved reasoning stays where it was received.
     next_sub: u64,
-    chat_kinds: BTreeMap<String, u64>,
+    chat_tools: BTreeMap<u64, u64>,
+    chat_run: Option<(&'static str, u64)>,
+    /// Anthropic `tool_use` slots holding the `{}` a block opened with,
+    /// which the first `input_json_delta` replaces rather than extends.
+    placeholder_args: std::collections::BTreeSet<SlotKey>,
     truncated: bool,
     decoder: aisix_gateway::SseDecoder,
 }
@@ -123,7 +129,9 @@ impl OutputCollector {
             cap,
             slots: BTreeMap::new(),
             next_sub: 0,
-            chat_kinds: BTreeMap::new(),
+            chat_tools: BTreeMap::new(),
+            chat_run: None,
+            placeholder_args: Default::default(),
             truncated: false,
             decoder: aisix_gateway::SseDecoder::new(),
         }
@@ -139,6 +147,9 @@ impl OutputCollector {
     /// Bytes of an SSE response, as handed to the caller.
     pub fn feed_sse(&mut self, bytes: &[u8]) {
         let Ok(events) = self.decoder.feed(bytes) else {
+            // A frame outgrew the decoder: what follows is lost, so the
+            // capture is incomplete.
+            self.truncated = true;
             return;
         };
         for event in events {
@@ -232,16 +243,36 @@ impl OutputCollector {
 
     // ── OpenAI Chat ──────────────────────────────────────────────────────
 
-    fn chat_slot(&mut self, kind: &str) -> SlotKey {
-        let sub = match self.chat_kinds.get(kind) {
-            Some(sub) => *sub,
-            None => {
-                let sub = self.next_sub;
-                self.next_sub += 1;
-                self.chat_kinds.insert(kind.to_string(), sub);
+    fn fresh_sub(&mut self) -> u64 {
+        let sub = self.next_sub;
+        self.next_sub += 1;
+        sub
+    }
+
+    /// The slot text or reasoning extends: the current run's while the kind
+    /// is unchanged, a new one when it changes.
+    fn chat_run_slot(&mut self, kind: &'static str) -> SlotKey {
+        let sub = match self.chat_run {
+            Some((k, sub)) if k == kind => sub,
+            _ => {
+                let sub = self.fresh_sub();
+                self.chat_run = Some((kind, sub));
                 sub
             }
         };
+        SlotKey { position: 0, sub }
+    }
+
+    fn chat_tool_slot(&mut self, index: u64) -> SlotKey {
+        let sub = match self.chat_tools.get(&index) {
+            Some(sub) => *sub,
+            None => {
+                let sub = self.fresh_sub();
+                self.chat_tools.insert(index, sub);
+                sub
+            }
+        };
+        self.chat_run = None;
         SlotKey { position: 0, sub }
     }
 
@@ -254,18 +285,18 @@ impl OutputCollector {
             .filter(|s| !s.is_empty())
             .or_else(|| m.get("reasoning").and_then(Value::as_str));
         if let Some(text) = reasoning {
-            let key = self.chat_slot("reasoning");
+            let key = self.chat_run_slot("reasoning");
             self.append(key, || Part::Reasoning(String::new()), text);
         }
         match m.get("content") {
             Some(Value::String(text)) => {
-                let key = self.chat_slot("text");
+                let key = self.chat_run_slot("text");
                 self.append(key, || Part::Text(String::new()), text);
             }
             Some(Value::Array(parts)) => {
                 for p in parts {
                     if let Some(text) = p.get("text").and_then(Value::as_str) {
-                        let key = self.chat_slot("text");
+                        let key = self.chat_run_slot("text");
                         self.append(key, || Part::Text(String::new()), text);
                     }
                 }
@@ -277,7 +308,7 @@ impl OutputCollector {
                 .get("index")
                 .and_then(Value::as_u64)
                 .unwrap_or(position as u64);
-            let key = self.chat_slot(&format!("tool:{index}"));
+            let key = self.chat_tool_slot(index);
             let id = call.get("id").and_then(Value::as_str);
             let function = call.get("function");
             let name = function.and_then(|f| f.get("name")).and_then(Value::as_str);
@@ -332,13 +363,16 @@ impl OutputCollector {
             }
             Some("tool_use") => {
                 // A streamed block opens with `input: {}` and fills it in
-                // through `input_json_delta`, so an empty object here is a
-                // placeholder rather than the arguments.
+                // through `input_json_delta`, so an empty object is kept as
+                // the arguments only until a delta arrives — a tool that
+                // takes none really is called with `{}`.
                 let arguments = match block.get("input") {
-                    Some(Value::Object(o)) if o.is_empty() => String::new(),
                     Some(input) if !input.is_null() => input.to_string(),
                     _ => String::new(),
                 };
+                if arguments == "{}" {
+                    self.placeholder_args.insert(key);
+                }
                 self.put(
                     key,
                     Part::ToolCall {
@@ -384,6 +418,11 @@ impl OutputCollector {
                     _ => None,
                 };
                 if let Some(text) = fragment.and_then(Value::as_str) {
+                    if self.placeholder_args.remove(&key) {
+                        if let Some(Part::ToolCall { arguments, .. }) = self.slots.get_mut(&key) {
+                            arguments.clear();
+                        }
+                    }
                     self.append(key, unreachable_part, text);
                 }
             }
@@ -571,6 +610,41 @@ mod tests {
                 {"type":"tool_call","id":"call_1","name":"get_time","arguments":{"tz":"UTC"}},
             ])
         );
+    }
+
+    #[test]
+    fn interleaved_reasoning_keeps_its_place() {
+        let mut c = OutputCollector::new(OutputWire::OpenAiChat, 4096);
+        c.feed_sse(&sse(&[
+            json!({"choices":[{"index":0,"delta":{"reasoning_content":"A"}}]}),
+            json!({"choices":[{"index":0,"delta":{"content":"x"}}]}),
+            json!({"choices":[{"index":0,"delta":{"reasoning_content":"B"}}]}),
+        ]));
+        assert_eq!(
+            parts(&c.finish()),
+            json!([
+                {"type":"reasoning","content":"A"},
+                {"type":"text","content":"x"},
+                {"type":"reasoning","content":"B"},
+            ])
+        );
+    }
+
+    #[test]
+    fn a_tool_use_without_arguments_reports_an_empty_object() {
+        let body = json!({"content":[{"type":"tool_use","id":"t","name":"now","input":{}}]});
+        let out = OutputCollector::from_body(OutputWire::AnthropicMessages, 4096, &body);
+        assert_eq!(
+            parts(&out),
+            json!([{"type":"tool_call","id":"t","name":"now","arguments":{}}])
+        );
+    }
+
+    #[test]
+    fn an_oversized_frame_marks_the_capture_cut() {
+        let mut c = OutputCollector::new(OutputWire::OpenAiChat, 4096);
+        c.feed_sse(&vec![b'x'; aisix_gateway::sse::MAX_SSE_FRAME_BYTES + 1]);
+        assert!(c.finish().truncated);
     }
 
     #[test]
