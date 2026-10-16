@@ -416,3 +416,27 @@ parameterised SQL bind.
 silently strands ids, and tightening THAT side alone silently drops the request
 from billing and /logs while the caller still gets a 200 carrying the id. Change
 both or neither.
+
+## An upstream call reports itself to the request's telemetry, by hand
+
+Three request-scoped observations are fed from the point an upstream is
+called, and a call site that skips them reports nothing wrong — the field is
+just absent or off, which reads like a quiet upstream:
+
+- **Response headers.** Every upstream HTTP response that answers an attempt —
+  success or failure — goes through `aisix_gateway::note_upstream_response`
+  as soon as its head is in hand (`stream_timeout::send_with_deadline` and the
+  provider bridges already do; Bedrock through an SDK interceptor). That is
+  the only source of an exporter's `upstream_response_headers`.
+- **Upstream wait.** `gateway_overhead_ms` subtracts the time the request
+  spent inside attempt windows. `RoutingTelemetry::begin_attempt` / `record`
+  open and close them; a surface that dispatches without it calls
+  `attribution::note_upstream_wait_begin` / `note_upstream_wait_end`, and
+  every stream that stamps `upstream_ttft_ms` also calls
+  `attribution::note_upstream_first_frame` at that point.
+- **Streamed output parts.** The structured output an exporter reports is read
+  off the client-facing SSE bytes by the telemetry middleware
+  (`capture_streamed_output`, keyed on the route), so a new streaming family
+  that carries an assistant turn has to be added there; a buffered answer
+  attaches its parts at its own `CapturedContent` site with
+  `aisix_obs::OutputCollector::from_body` over the JSON the caller receives.

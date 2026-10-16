@@ -150,6 +150,7 @@ struct ResponseUsage {
     /// surfaced via `usage.input_tokens_details.cached_tokens`.
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    modality: aisix_gateway::ModalityTokens,
     /// Anthropic `cache_creation_input_tokens` (cache write). Always 0 on
     /// the verbatim OpenAI path; carried for the cross-provider bridge
     /// path (#825) so an Anthropic-backed /v1/responses call bills cache
@@ -1563,6 +1564,7 @@ async fn responses_to_target(
                 if upstream_ttft_ms == 0 && has_complete_responses_sse_event(&buf) {
                     upstream_ttft_ms =
                         attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                    crate::attribution::note_upstream_first_frame();
                 }
                 let end = counted_upto + crate::redact::last_frame_end(&buf[counted_upto..]);
                 held_content.hold(
@@ -1854,11 +1856,17 @@ async fn responses_to_target(
             // read from the POST-redaction buffer so masked PII stays masked
             // in the exported content.
             let captured_content = match (&captured_prompt, content_cap) {
-                (Some(prompt), Some(cap)) => Some(CapturedContent::new(
-                    prompt,
-                    &responses_sse_output_text(&buf),
-                    cap as usize,
-                )),
+                (Some(prompt), Some(cap)) => Some(
+                    CapturedContent::new(prompt, &responses_sse_output_text(&buf), cap as usize)
+                        .with_output(Some({
+                            let mut c = aisix_obs::OutputCollector::new(
+                                aisix_obs::OutputWire::OpenAiResponses,
+                                cap as usize,
+                            );
+                            c.feed_sse(&buf);
+                            c.finish()
+                        })),
+                ),
                 _ => None,
             };
             let mut response = axum::response::Response::new(axum::body::Body::from(buf));
@@ -2294,11 +2302,14 @@ async fn responses_to_target(
         // text, read from the POST-redaction body so masked PII stays masked
         // in the exported content.
         let captured_content = match (&captured_prompt, content_cap) {
-            (Some(prompt), Some(cap)) => Some(CapturedContent::new(
-                prompt,
-                &responses_output_text(&json_body),
-                cap as usize,
-            )),
+            (Some(prompt), Some(cap)) => Some(
+                CapturedContent::new(prompt, &responses_output_text(&json_body), cap as usize)
+                    .with_output(Some(aisix_obs::OutputCollector::from_body(
+                        aisix_obs::OutputWire::OpenAiResponses,
+                        cap as usize,
+                        &json_body,
+                    ))),
+            ),
             _ => None,
         };
 
@@ -2596,6 +2607,7 @@ async fn responses_cross_provider_to_target(
                     reasoning_tokens: comp.reasoning_tokens,
                     cached_prompt_tokens: comp.cached_prompt_tokens,
                     cache_write_tokens: comp.cache_write_tokens,
+                    modality: comp.modality,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
                     upstream_total_tokens: comp.upstream_total_tokens.unwrap_or(0),
@@ -2755,6 +2767,7 @@ async fn responses_cross_provider_to_target(
             reasoning_tokens: resp.usage.reasoning_tokens,
             cached_prompt_tokens: resp.usage.cached_prompt_tokens,
             cache_write_tokens: resp.usage.cache_write_tokens,
+            modality: resp.usage.modality,
             cache_creation_tokens: resp.usage.cache_creation_tokens,
             cache_read_tokens: resp.usage.cache_read_tokens,
             upstream_total_tokens: resp.usage.upstream_total_tokens,
@@ -2886,11 +2899,14 @@ async fn responses_cross_provider_to_target(
     // (post-redaction) is the source, so the exported text matches what the
     // caller received.
     let captured_content = match (&captured_prompt, content_cap) {
-        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
-            prompt,
-            &responses_output_text(&json_body),
-            cap as usize,
-        )),
+        (Some(prompt), Some(cap)) => Some(
+            CapturedContent::new(prompt, &responses_output_text(&json_body), cap as usize)
+                .with_output(Some(aisix_obs::OutputCollector::from_body(
+                    aisix_obs::OutputWire::OpenAiResponses,
+                    cap as usize,
+                    &json_body,
+                ))),
+        ),
         _ => None,
     };
     let mut response = Json(json_body).into_response();
@@ -2967,6 +2983,10 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         reasoning_tokens,
         cached_prompt_tokens,
         cache_write_tokens,
+        modality: aisix_gateway::ModalityTokens::from_openai_details(
+            usage.get("input_tokens_details"),
+            usage.get("output_tokens_details"),
+        ),
         // OpenAI verbatim path: no Anthropic-style cache counters.
         cache_creation_tokens: 0,
         cache_read_tokens: 0,
@@ -3008,6 +3028,7 @@ impl ResponseUsage {
         aisix_gateway::UsageStats {
             cached_prompt_tokens: self.cached_prompt_tokens,
             cache_write_tokens: self.cache_write_tokens,
+            modality: self.modality,
             reasoning_tokens: self.reasoning_tokens,
             cache_creation_tokens: self.cache_creation_tokens,
             cache_read_tokens: self.cache_read_tokens,
@@ -3167,6 +3188,7 @@ fn drain_responses_sse_frames(
                     *first_frame_seen = true;
                     acc.get_or_insert_with(Default::default).upstream_ttft_ms =
                         attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                    crate::attribution::note_upstream_first_frame();
                 }
                 // `resp_…` off any frame that carries the response object —
                 // `response.created` is the first, so a stream that dies
@@ -3946,6 +3968,7 @@ fn emit_usage_event(
         total_tokens: usage.upstream_total_tokens,
         cached_prompt_tokens: usage.cached_prompt_tokens,
         cache_write_tokens: usage.cache_write_tokens,
+        modality_tokens: usage.modality,
         reasoning_tokens: usage.reasoning_tokens,
         // Anthropic cache counters (#825 cross-provider path); 0 on the
         // verbatim OpenAI path.
@@ -3987,6 +4010,7 @@ fn emit_usage_event(
     crate::usage_attr::apply_caller_identity(
         &mut event,
         client.jwt.as_ref(),
+        client.caller.api_key_name.as_deref(),
         client.caller.user_id.as_deref(),
         client.caller.user_name.as_deref(),
     );
@@ -4152,6 +4176,7 @@ fn emit_zero_token_event(
     crate::usage_attr::apply_caller_identity(
         &mut event,
         client.jwt.as_ref(),
+        client.caller.api_key_name.as_deref(),
         client.caller.user_id.as_deref(),
         client.caller.user_name.as_deref(),
     );

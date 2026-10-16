@@ -417,15 +417,20 @@ impl PromptWire {
     }
 }
 
-/// Convert a captured inbound request body and the assembled response text
-/// into the structured content attributes. A prompt that does not parse as
-/// the expected wire yields no input attributes at all — never a partial or
-/// malformed list. The output message needs the finish reason the schema
+/// Convert a captured inbound request body and the response into the
+/// structured content attributes. A prompt that does not parse as the
+/// expected wire yields no input attributes at all — never a partial or
+/// malformed list.
+///
+/// The output message takes its ordered parts from `output` when the
+/// surface captured them ([`crate::output`]); otherwise it is the assembled
+/// response text as one `text` part. It needs the finish reason the schema
 /// requires, so it is omitted when the event carries none.
 pub fn structured_content(
     wire: PromptWire,
     prompt: &str,
     response: &str,
+    output: Option<&crate::output::OutputCapture>,
     finish_reason: &str,
 ) -> StructuredContent {
     let mut out = StructuredContent::default();
@@ -444,11 +449,14 @@ pub fn structured_content(
                 .map(|t| Value::Array(t).to_string());
         }
     }
-    if !response.is_empty() && !finish_reason.is_empty() {
+    let parts = output
+        .and_then(crate::output::OutputCapture::parts_json)
+        .or_else(|| (!response.is_empty()).then(|| vec![text_part(response)]));
+    if let (Some(parts), false) = (parts, finish_reason.is_empty()) {
         out.output_messages = Some(
             json!([{
                 "role": "assistant",
-                "parts": [text_part(response)],
+                "parts": parts,
                 "finish_reason": finish_reason,
             }])
             .to_string(),
@@ -539,6 +547,24 @@ fn openai_content_parts(content: Option<&Value>) -> Option<Vec<Value>> {
     }
 }
 
+/// One `gen_ai.tool.definitions` entry: the tool's type and name, plus its
+/// description and parameter schema when the definition carries them.
+fn tool_definition(
+    kind: &str,
+    name: &str,
+    description: Option<&Value>,
+    parameters: Option<&Value>,
+) -> Value {
+    let mut tool = json!({"type": kind, "name": name});
+    if let Some(d) = description.filter(|d| !d.is_null()) {
+        tool["description"] = d.clone();
+    }
+    if let Some(p) = parameters.filter(|p| !p.is_null()) {
+        tool["parameters"] = p.clone();
+    }
+    tool
+}
+
 fn openai_tools(tools: Option<&Value>) -> Option<Vec<Value>> {
     let tools = tools?.as_array()?;
     Some(
@@ -547,12 +573,17 @@ fn openai_tools(tools: Option<&Value>) -> Option<Vec<Value>> {
             .filter_map(|t| {
                 let kind = t.get("type").and_then(Value::as_str)?;
                 // Chat nests the function; Responses flattens it.
-                let name = t
-                    .get("function")
-                    .and_then(|f| f.get("name"))
+                let def = t.get("function").unwrap_or(t);
+                let name = def
+                    .get("name")
                     .or_else(|| t.get("name"))
                     .and_then(Value::as_str)?;
-                Some(json!({"type": kind, "name": name}))
+                Some(tool_definition(
+                    kind,
+                    name,
+                    def.get("description"),
+                    def.get("parameters"),
+                ))
             })
             .collect(),
     )
@@ -693,7 +724,12 @@ fn anthropic_input(body: &Map<String, Value>) -> Option<Converted> {
                     None | Some("custom") => "function",
                     Some(kind) => kind,
                 };
-                Some(json!({"type": kind, "name": name}))
+                Some(tool_definition(
+                    kind,
+                    name,
+                    t.get("description"),
+                    t.get("input_schema"),
+                ))
             })
             .collect()
     });
@@ -847,7 +883,7 @@ mod tests {
             ],
             "tools": [{"type": "function", "name": "w"}, {"type": "web_search"}]
         });
-        let c = structured_content(PromptWire::OpenAiResponses, &body.to_string(), "", "");
+        let c = structured_content(PromptWire::OpenAiResponses, &body.to_string(), "", None, "");
         let input: Value = serde_json::from_str(c.input_messages.as_deref().unwrap()).unwrap();
         assert_eq!(input[0]["parts"][0]["content"], "weather?");
         assert_eq!(input[1]["parts"][0]["type"], "tool_call");
@@ -926,6 +962,7 @@ mod tests {
             PromptWire::AnthropicMessages,
             &body.to_string(),
             "It rains.",
+            None,
             "end_turn",
         );
         let input: Value = serde_json::from_str(c.input_messages.as_deref().unwrap()).unwrap();
@@ -938,7 +975,7 @@ mod tests {
         );
         assert_eq!(
             c.tool_definitions.as_deref(),
-            Some(r#"[{"name":"get_weather","type":"function"}]"#)
+            Some(r#"[{"name":"get_weather","parameters":{},"type":"function"}]"#)
         );
         let output: Value = serde_json::from_str(c.output_messages.as_deref().unwrap()).unwrap();
         assert_eq!(output[0]["finish_reason"], "end_turn");
@@ -946,7 +983,7 @@ mod tests {
 
     #[test]
     fn unparseable_prompt_or_missing_finish_reason_yields_nothing() {
-        let c = structured_content(PromptWire::OpenAiChat, "{\"messages\": [", "x", "");
+        let c = structured_content(PromptWire::OpenAiChat, "{\"messages\": [", "x", None, "");
         assert_eq!(c, StructuredContent::default());
     }
 
@@ -963,7 +1000,7 @@ mod tests {
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
             ]}
         ]});
-        let c = structured_content(PromptWire::OpenAiChat, &body.to_string(), "", "");
+        let c = structured_content(PromptWire::OpenAiChat, &body.to_string(), "", None, "");
         let input: Value = serde_json::from_str(c.input_messages.as_deref().unwrap()).unwrap();
         assert_eq!(input[0]["role"], "system");
         assert_eq!(input[1]["parts"][0]["arguments"]["a"], 1);

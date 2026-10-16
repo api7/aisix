@@ -1612,6 +1612,7 @@ async fn anthropic_passthrough_dispatch(
                     // `cache_read_input_tokens`, never the OpenAI-shape subset.
                     cached_prompt_tokens: 0,
                     cache_write_tokens: None,
+                    modality: Default::default(),
                     cache_creation_tokens: usage.cache_creation_tokens,
                     cache_read_tokens: usage.cache_read_tokens,
                     reasoning_tokens: 0,
@@ -1918,6 +1919,11 @@ async fn anthropic_passthrough_dispatch(
                 &anthropic_response_text(&json_body),
                 cap as usize,
             )
+            .with_output(Some(aisix_obs::OutputCollector::from_body(
+                aisix_obs::OutputWire::AnthropicMessages,
+                cap as usize,
+                &json_body,
+            )))
         });
 
         Ok(DispatchOutcome {
@@ -2058,6 +2064,7 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
         // Anthropic upstream: see the streaming sibling — no OpenAI-shape subset.
         cached_prompt_tokens: 0,
         cache_write_tokens: None,
+        modality: Default::default(),
         reasoning_tokens: 0,
         upstream_total_tokens: 0,
         reasoning_folded_into_completion: 0,
@@ -2373,6 +2380,7 @@ async fn cross_provider_dispatch(
                     completion_tokens: comp.completion_tokens,
                     cached_prompt_tokens: comp.cached_prompt_tokens,
                     cache_write_tokens: comp.cache_write_tokens,
+                    modality: comp.modality,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
                     reasoning_tokens: comp.reasoning_tokens,
@@ -2571,6 +2579,7 @@ async fn cross_provider_dispatch(
         completion_tokens: resp.usage.completion_tokens,
         cached_prompt_tokens: resp.usage.cached_prompt_tokens,
         cache_write_tokens: resp.usage.cache_write_tokens,
+        modality: resp.usage.modality,
         cache_creation_tokens: resp.usage.cache_creation_tokens,
         cache_read_tokens: resp.usage.cache_read_tokens,
         reasoning_tokens: resp.usage.reasoning_tokens,
@@ -2618,6 +2627,11 @@ async fn cross_provider_dispatch(
             resp.message.content.as_deref().unwrap_or(""),
             cap as usize,
         )
+        .with_output(Some(aisix_obs::OutputCollector::from_body(
+            aisix_obs::OutputWire::AnthropicMessages,
+            cap as usize,
+            &chat_response_into_anthropic_json(&resp, model_name),
+        )))
     });
     let json = chat_response_into_anthropic_json(&resp, model_name);
     Ok(DispatchOutcome {
@@ -2723,6 +2737,7 @@ fn build_anthropic_sse_stream(
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
                             attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                            crate::attribution::note_upstream_first_frame();
                     }
                     let comp = guard.comp();
                     if !chunk.id.is_empty() {
@@ -2739,6 +2754,7 @@ fn build_anthropic_sse_stream(
                         comp.prompt_tokens = comp.prompt_tokens.max(u.prompt_tokens);
                         comp.completion_tokens = comp.completion_tokens.max(u.completion_tokens);
                         comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);
+                        comp.modality = comp.modality.max_fieldwise(&u.modality);
                         comp.cached_prompt_tokens =
                             comp.cached_prompt_tokens.max(u.cached_prompt_tokens);
                         comp.cache_creation_tokens =
@@ -3119,6 +3135,7 @@ struct AnthropicStreamCompletion {
     /// See [`AnthropicUsageMetrics::cached_prompt_tokens`].
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    modality: aisix_gateway::ModalityTokens,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
     reasoning_tokens: u32,
@@ -3300,6 +3317,7 @@ struct AnthropicUsageMetrics {
     /// which sit ON TOP of `prompt_tokens`.
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    modality: aisix_gateway::ModalityTokens,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
     /// Recorded exactly as `/v1/chat/completions` records them, so one
@@ -3414,6 +3432,7 @@ fn emit_anthropic_usage_event(
         total_tokens: metrics.upstream_total_tokens,
         cached_prompt_tokens: metrics.cached_prompt_tokens,
         cache_write_tokens: metrics.cache_write_tokens,
+        modality_tokens: metrics.modality,
         cache_creation_tokens: metrics.cache_creation_tokens,
         cache_read_tokens: metrics.cache_read_tokens,
         usage_estimated: metrics.usage_estimated,
@@ -3459,6 +3478,7 @@ fn emit_anthropic_usage_event(
     crate::usage_attr::apply_caller_identity(
         &mut event,
         client.jwt.as_ref(),
+        client.caller.api_key_name.as_deref(),
         client.caller.user_id.as_deref(),
         client.caller.user_name.as_deref(),
     );
@@ -3663,6 +3683,7 @@ fn update_anthropic_usage(
     if !*first_token_seen {
         *first_token_seen = true;
         acc.upstream_ttft_ms = attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        crate::attribution::note_upstream_first_frame();
     }
     match json.get("type").and_then(Value::as_str) {
         // Anthropic reports a failure inside a committed stream as an

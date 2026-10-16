@@ -66,7 +66,9 @@ use aisix_provider_openai::overrides::{
     apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
     apply_param_renames,
 };
-use aws_sdk_bedrockruntime::config::interceptors::BeforeTransmitInterceptorContextMut;
+use aws_sdk_bedrockruntime::config::interceptors::{
+    BeforeDeserializationInterceptorContextRef, BeforeTransmitInterceptorContextMut,
+};
 use aws_sdk_bedrockruntime::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_smithy_runtime_api::box_error::BoxError;
 
@@ -438,6 +440,7 @@ fn build_client(
     if !headers.is_empty() {
         conf = conf.interceptor(DefaultHeadersInterceptor { headers });
     }
+    conf = conf.interceptor(ResponseHeadersInterceptor);
     Ok(BedrockClient::from_conf(conf.build()))
 }
 
@@ -555,6 +558,36 @@ impl Intercept for DefaultHeadersInterceptor {
                 .headers_mut()
                 .try_insert(name.clone(), value.clone());
         }
+        Ok(())
+    }
+}
+
+/// Hands each response head to [`aisix_gateway::note_upstream_response`],
+/// which the SDK's typed outputs would otherwise hide.
+#[derive(Debug)]
+struct ResponseHeadersInterceptor;
+
+impl Intercept for ResponseHeadersInterceptor {
+    fn name(&self) -> &'static str {
+        "AisixBedrockResponseHeaders"
+    }
+
+    fn read_before_deserialization(
+        &self,
+        context: &BeforeDeserializationInterceptorContextRef<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in context.response().headers() {
+            if let (Ok(name), Ok(value)) = (
+                http::HeaderName::from_bytes(name.as_bytes()),
+                http::HeaderValue::from_str(value),
+            ) {
+                headers.append(name, value);
+            }
+        }
+        aisix_gateway::note_upstream_response(&headers);
         Ok(())
     }
 }

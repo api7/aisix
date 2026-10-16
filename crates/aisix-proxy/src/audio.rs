@@ -53,7 +53,7 @@ struct AudioDispatchSuccess {
     /// block when the model returns one (gpt-4o-transcribe). `None` for
     /// whisper-1 (no usage block) — those still emit a zero-token event
     /// so the request is visible + attributed.
-    usage: Option<(u32, u32)>,
+    usage: Option<(u32, u32, aisix_gateway::ModalityTokens)>,
     /// Set on the streamed-transcription relay (#998): the SSE frames are
     /// consumed by the caller after this handler returns, so the terminal
     /// event's counts are only known inside the stream — its Drop guard
@@ -734,6 +734,7 @@ pub async fn speech(
                     started.elapsed(),
                     0,
                     0,
+                    aisix_gateway::ModalityTokens::NONE,
                     // TTS is billed per input character, not by the length
                     // of the audio it produced — no duration cost basis here.
                     0.0,
@@ -857,7 +858,7 @@ struct StreamedTranscript {
     /// `(prompt, completion)` off the terminal event's `usage` block —
     /// `None` when the stream ended before one arrived (a client that
     /// disconnected, an upstream that reports no tokens).
-    usage: Option<(u32, u32)>,
+    usage: Option<(u32, u32, aisix_gateway::ModalityTokens)>,
     /// The transcript assembled from the `transcript.text.delta` events.
     deltas: String,
     /// The whole transcript as the terminal `transcript.text.done` event
@@ -1695,7 +1696,10 @@ async fn multipart_dispatch(
                 content_cap,
                 eos_scan,
                 move |outcome| {
-                    let (prompt_tokens, completion_tokens) = outcome.usage.unwrap_or((0, 0));
+                    let (prompt_tokens, completion_tokens, modality) =
+                        outcome
+                            .usage
+                            .unwrap_or((0, 0, aisix_gateway::ModalityTokens::NONE));
                     let total = u64::from(prompt_tokens) + u64::from(completion_tokens);
                     for key in &post_stream_keys {
                         limiter.add_tokens_post_stream(key, total);
@@ -1744,6 +1748,7 @@ async fn multipart_dispatch(
                         dispatch_started.elapsed(),
                         prompt_tokens,
                         completion_tokens,
+                        modality,
                         duration_seconds,
                         &client_c,
                         redactions_c,
@@ -1818,7 +1823,7 @@ async fn multipart_dispatch(
     // audio transcription/translation endpoints like chat + embeddings.
     // Pre-fix the reservation dropped uncommitted and the counter never moved.
     let total_tokens = usage
-        .map(|(prompt, completion)| u64::from(prompt) + u64::from(completion))
+        .map(|(prompt, completion, _)| u64::from(prompt) + u64::from(completion))
         .unwrap_or(0);
     reservation.commit_tokens(total_tokens).await;
 
@@ -2415,7 +2420,10 @@ async fn speech_dispatch(
 ///
 /// Gated on the upstream content type so a `text`/`srt`/`vtt` transcript
 /// that happens to contain a `data:` line is never mistaken for a stream.
-fn extract_sse_token_usage(headers: &HeaderMap, body: &[u8]) -> Option<(u32, u32)> {
+fn extract_sse_token_usage(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Option<(u32, u32, aisix_gateway::ModalityTokens)> {
     if !is_event_stream(headers) {
         return None;
     }
@@ -2433,14 +2441,20 @@ fn extract_sse_token_usage(headers: &HeaderMap, body: &[u8]) -> Option<(u32, u32
     })
 }
 
-fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
+fn extract_token_usage(body: &Value) -> Option<(u32, u32, aisix_gateway::ModalityTokens)> {
     let usage = body.get("usage")?;
     let input = usage.get("input_tokens").and_then(Value::as_u64)? as u32;
     let output = usage
         .get("output_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0) as u32;
-    Some((input, output))
+    // The token-billed transcription usage splits its input side as
+    // `input_token_details: {text_tokens, audio_tokens}`.
+    let modality = aisix_gateway::ModalityTokens::from_openai_details(
+        usage.get("input_token_details"),
+        usage.get("output_token_details"),
+    );
+    Some((input, output, modality))
 }
 
 /// Audio length in seconds as the upstream reported it.
@@ -2554,7 +2568,10 @@ fn emit_audio_usage(
     audit: &crate::usage_attr::GuardrailAudit,
     winner: Option<&crate::attempt::AttemptRecord>,
 ) {
-    let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
+    let (prompt_tokens, completion_tokens, modality) =
+        success
+            .usage
+            .unwrap_or((0, 0, aisix_gateway::ModalityTokens::NONE));
     emit_usage_event(
         state,
         snapshot,
@@ -2572,6 +2589,7 @@ fn emit_audio_usage(
         elapsed,
         prompt_tokens,
         completion_tokens,
+        modality,
         success.duration_seconds,
         client,
         success.redactions.clone(),
@@ -2624,6 +2642,7 @@ fn emit_usage_event(
     elapsed: Duration,
     prompt_tokens: u32,
     completion_tokens: u32,
+    modality_tokens: aisix_gateway::ModalityTokens,
     // Cost basis for the duration-billed models (#457); 0 when neither
     // the upstream nor the uploaded file yielded a length.
     audio_duration_seconds: f64,
@@ -2656,6 +2675,7 @@ fn emit_usage_event(
         requested_model: requested_model.to_string(),
         prompt_tokens,
         completion_tokens,
+        modality_tokens,
         audio_duration_seconds,
         // Narrowed to the winning attempt's own latency below
         // (`apply_winning_attempt`) once a failover put earlier attempts
@@ -2688,6 +2708,7 @@ fn emit_usage_event(
     crate::usage_attr::apply_caller_identity(
         &mut event,
         client.jwt.as_ref(),
+        client.caller.api_key_name.as_deref(),
         client.caller.user_id.as_deref(),
         client.caller.user_name.as_deref(),
     );
@@ -3752,7 +3773,10 @@ mod tests {
         let terminal_only = decode(&[r#"{"type":"transcript.text.done","text":"hello world",
                 "usage":{"type":"tokens","input_tokens":26,"output_tokens":12}}"#]);
         assert_eq!(terminal_only.text(), "hello world");
-        assert_eq!(terminal_only.usage, Some((26, 12)));
+        assert_eq!(
+            terminal_only.usage,
+            Some((26, 12, aisix_gateway::ModalityTokens::NONE))
+        );
 
         let deltas_only = decode(&[
             r#"{"type":"transcript.text.delta","delta":"hello"}"#,

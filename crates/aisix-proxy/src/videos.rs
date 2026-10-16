@@ -1252,6 +1252,7 @@ fn provider_call_once<'a>(
             .send()
             .await
             .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))?;
+        aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status().as_u16();
         let bytes = resp
             .bytes()
@@ -2303,6 +2304,7 @@ fn emit_submit_usage_event(
     crate::usage_attr::apply_caller_identity(
         &mut event,
         client.jwt.as_ref(),
+        client.caller.api_key_name.as_deref(),
         client.caller.user_id.as_deref(),
         client.caller.user_name.as_deref(),
     );

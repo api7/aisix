@@ -581,7 +581,9 @@ async fn record_request_telemetry(
     // target, so this layer can attribute a cancelled request to them
     // (AISIX-Cloud#1317). Installed here because a cancelled handler
     // future never gets to hand anything back.
-    let attribution = std::sync::Arc::new(attribution::RequestAttribution::default());
+    let attribution = std::sync::Arc::new(attribution::RequestAttribution::with_response_headers(
+        client_ip::exported_header_names(&state.snapshot.load(), |e| &e.upstream_response_headers),
+    ));
     // The access-log line is held on the cell until the guard below finishes
     // the request, which is when both body sizes are known. Written in the
     // request span this middleware runs in, since the guard writes it from
@@ -649,6 +651,7 @@ async fn record_request_telemetry(
     let mut response = attribution::scope(attribution, next.run(request)).await;
     // The head exists; from here the guard rides the body (see `GuardPhase`).
     guard.attribution.note_head_written();
+    capture_streamed_output(&state, endpoint, &response, &guard.attribution);
     guard.phase = GuardPhase::Body {
         owed: response.status().is_success()
             && http_body::Body::size_hint(response.body())
@@ -663,6 +666,39 @@ async fn record_request_telemetry(
         retire_connection(&version, &mut response);
     }
     hold_until_body_done(response, drain, guard)
+}
+
+/// Arm the structured output capture of a streamed model response (see
+/// `aisix_obs::output`): the frames are read as the caller receives them,
+/// which is after every output guardrail has masked them, and the request's
+/// terminal usage event takes the result (`usage_attr::emit_usage`). Keyed
+/// on the route rather than on each handler, so the native and the bridged
+/// branches of a family cannot differ in what they capture.
+fn capture_streamed_output(
+    state: &ProxyState,
+    endpoint: &str,
+    response: &Response,
+    cell: &attribution::RequestAttribution,
+) {
+    let wire = match endpoint {
+        "/v1/chat/completions" => aisix_obs::OutputWire::OpenAiChat,
+        "/v1/messages" => aisix_obs::OutputWire::AnthropicMessages,
+        "/v1/responses" => aisix_obs::OutputWire::OpenAiResponses,
+        _ => return,
+    };
+    let is_sse = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"));
+    if !is_sse || !response.status().is_success() {
+        return;
+    }
+    let snapshot = state.snapshot.load();
+    let exporters = snapshot.observability_exporters.entries();
+    if let Some(cap) = aisix_obs::content_capture_cap(exporters.iter().map(|e| &e.value)) {
+        cell.capture_stream_output(aisix_obs::OutputCollector::new(wire, cap as usize));
+    }
 }
 
 /// Move `drain` and the cancel guard into the response body, so the drain
@@ -751,6 +787,7 @@ impl axum::body::HttpBody for TelemetryBody {
         if let std::task::Poll::Ready(Some(Ok(frame))) = &polled {
             if let Some(data) = frame.data_ref() {
                 cell.add_response_bytes(data.len() as u64);
+                cell.observe_response_output(data);
             }
         }
         polled

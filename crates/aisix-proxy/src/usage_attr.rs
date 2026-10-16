@@ -484,9 +484,13 @@ pub(crate) fn apply_pk_telemetry(event: &mut UsageEvent, pk: &ResolvedPk<'_>) {
 pub(crate) fn apply_caller_identity(
     event: &mut UsageEvent,
     jwt: Option<&std::sync::Arc<crate::auth::JwtIdentity>>,
+    api_key_name: Option<&str>,
     user_id: Option<&str>,
     user_name: Option<&str>,
 ) {
+    if let Some(name) = api_key_name.filter(|n| !n.is_empty()) {
+        event.api_key_name = sanitize_tag(name.to_string());
+    }
     if let Some(user_id) = user_id {
         event.user_id = sanitize_tag(user_id.to_string());
     }
@@ -755,6 +759,7 @@ pub(crate) fn emit_failed_attempts_as(
         apply_caller_identity(
             &mut event,
             client.jwt.as_ref(),
+            client.caller.api_key_name.as_deref(),
             client.caller.user_id.as_deref(),
             client.caller.user_name.as_deref(),
         );
@@ -859,6 +864,7 @@ pub(crate) fn build_error_usage_event(
     apply_caller_identity(
         &mut event,
         client.jwt.as_ref(),
+        client.caller.api_key_name.as_deref(),
         client.caller.user_id.as_deref(),
         client.caller.user_name.as_deref(),
     );
@@ -1029,6 +1035,13 @@ pub(crate) fn emit_usage(
     if terminal {
         attach_gateway_embedding_audit(&mut event);
     }
+    stamp_latency_breakdown(&mut event, terminal);
+    // A surface that runs detached from the request scope (`/v1/realtime`)
+    // read its own off the upgrade response.
+    if dispatched && event.upstream_response_headers.is_empty() {
+        event.upstream_response_headers =
+            crate::attribution::take_attempt_response_headers(event.attempt_index);
+    }
     let emission = trace.map(|bundle| {
         event.trace_id = bundle.trace_id_hex();
         bundle.emission(
@@ -1051,6 +1064,20 @@ pub(crate) fn emit_usage(
     if exporters.is_empty() {
         return;
     }
+    // A streamed response's parts were read off the frames the caller got;
+    // they belong to the event that ends the request.
+    let streamed;
+    let content = match content {
+        Some(c) if terminal && c.output.is_none() => match crate::attribution::take_stream_output()
+        {
+            Some(output) => {
+                streamed = c.clone().with_output(Some(output));
+                Some(&streamed)
+            }
+            None => Some(c),
+        },
+        other => other,
+    };
     // Export-only span facts: the request-scoped ones the bundle holds, and
     // this event's own upstream, read off the request's snapshot. Only the
     // OTLP encoder reads them, so nothing is resolved without one.
@@ -1082,6 +1109,32 @@ pub(crate) fn emit_usage(
         facts.as_ref(),
         exporters.iter().map(|e| &e.value),
     );
+}
+
+/// `gateway_overhead_ms` on the event that carries `downstream_latency_ms`,
+/// and `upstream_tpot_ms` on a successful streamed attempt. Here, at the
+/// chokepoint, so no family can carry the latency it reports without them.
+///
+/// The overhead's subtrahend is the request's upstream wait, measured from
+/// monotonic timestamps at the attempt boundaries and the winner's first
+/// streamed frame ([`crate::attribution::upstream_wait`]); its window is the
+/// same one `downstream_latency_ms` reports.
+fn stamp_latency_breakdown(event: &mut UsageEvent, terminal: bool) {
+    if terminal && event.downstream_latency_ms > 0 {
+        if let Some(waited) = crate::attribution::upstream_wait() {
+            let window = std::time::Duration::from_millis(u64::from(event.downstream_latency_ms));
+            let overhead = window.saturating_sub(waited).as_millis();
+            event.gateway_overhead_ms = Some(u32::try_from(overhead).unwrap_or(u32::MAX));
+        }
+    }
+    let output_tokens = event.genai_output_tokens();
+    let succeeded = (200..300).contains(&event.status_code) && event.error_class.is_empty();
+    if succeeded && event.upstream_ttft_ms > 0 && output_tokens >= 2 {
+        let generating = event
+            .upstream_latency_ms
+            .saturating_sub(event.upstream_ttft_ms);
+        event.upstream_tpot_ms = Some(f64::from(generating) / f64::from(output_tokens - 1));
+    }
 }
 
 /// Name a `499` that nothing else named: a stream the caller abandoned.

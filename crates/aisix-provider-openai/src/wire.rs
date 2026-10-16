@@ -270,6 +270,11 @@ pub struct OpenAiPromptDetails {
     pub cached_tokens: u32,
     #[serde(default)]
     pub cache_write_tokens: Option<u32>,
+    /// Audio / image input tokens, as reported (audio-input models).
+    #[serde(default)]
+    pub audio_tokens: Option<u32>,
+    #[serde(default)]
+    pub image_tokens: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -279,6 +284,11 @@ pub struct OpenAiCompletionDetails {
     /// reasoning" on the dashboard.
     #[serde(default)]
     pub reasoning_tokens: u32,
+    /// Audio / image output tokens, as reported (audio-output models).
+    #[serde(default)]
+    pub audio_tokens: Option<u32>,
+    #[serde(default)]
+    pub image_tokens: Option<u32>,
 }
 
 pub fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
@@ -408,6 +418,24 @@ pub fn into_usage(u: OpenAiUsage) -> UsageStats {
         // for non-DeepSeek upstreams → the renderer omits the fields.
         prompt_cache_hit_tokens: u.prompt_cache_hit_tokens,
         prompt_cache_miss_tokens: u.prompt_cache_miss_tokens,
+        modality: aisix_gateway::ModalityTokens {
+            prompt_audio_tokens: u
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.audio_tokens),
+            prompt_image_tokens: u
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.image_tokens),
+            completion_audio_tokens: u
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|d| d.audio_tokens),
+            completion_image_tokens: u
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|d| d.image_tokens),
+        },
         // `total_tokens` decodes to 0 when the upstream omits it, which is
         // exactly "not reported".
         upstream_total_tokens: u.total_tokens,

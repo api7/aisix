@@ -536,6 +536,7 @@ async fn dispatch(
                         crate::dispatch::reqwest_error_to_bridge(&e, send_started),
                     ))
                 })?;
+                aisix_gateway::note_upstream_response(upstream_resp.headers());
                 let status = upstream_resp.status();
                 if !status.is_success() {
                     let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
@@ -863,6 +864,7 @@ fn emit_usage_event(
         completion_tokens: usage.output,
         cached_prompt_tokens: usage.cached,
         cache_write_tokens: usage.cache_write,
+        modality_tokens: usage.modality,
         reasoning_tokens: usage.reasoning,
         total_tokens: usage.upstream_total,
         upstream_latency_ms: elapsed_ms,
@@ -881,6 +883,7 @@ fn emit_usage_event(
     crate::usage_attr::apply_caller_identity(
         &mut event,
         client.jwt.as_ref(),
+        client.caller.api_key_name.as_deref(),
         client.caller.user_id.as_deref(),
         client.caller.user_name.as_deref(),
     );

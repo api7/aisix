@@ -411,6 +411,7 @@ async fn send_upstream(
         builder = builder.timeout(d);
     }
 
+    crate::attribution::note_upstream_wait_begin();
     let resp = builder
         .send()
         .await
@@ -426,9 +427,10 @@ async fn send_upstream(
 
     let status = resp.status();
     let headers = resp.headers().clone();
-    let bytes = resp
-        .bytes()
-        .await
+    aisix_gateway::note_upstream_response(&headers);
+    let bytes = resp.bytes().await;
+    crate::attribution::note_upstream_wait_end(bytes.is_ok());
+    let bytes = bytes
         .map_err(|e| {
             crate::cooldown::note_failure(
                 &state.runtime_status,
@@ -682,6 +684,7 @@ fn emit_job_usage_event(
     crate::usage_attr::apply_caller_identity(
         &mut event,
         auth.jwt.as_ref(),
+        auth.api_key_name(),
         auth.key().user_id.as_deref(),
         auth.user_name(),
     );
@@ -1922,6 +1925,7 @@ fn maybe_attribute_batch(
     let state = state.clone();
     let api_key_id = auth.entry.id.clone();
     let user_id = auth.entry.value.user_id.clone();
+    let api_key_name = auth.api_key_name().map(str::to_owned);
     let user_name = auth.user_name().map(str::to_owned);
     let jwt = auth.jwt.clone();
     let request_headers = client.request_headers.clone();
@@ -1950,6 +1954,7 @@ fn maybe_attribute_batch(
             &state,
             &api_key_id,
             jwt.as_ref(),
+            api_key_name.as_deref(),
             user_id.as_deref(),
             user_name.as_deref(),
             &request_headers,
@@ -1985,6 +1990,7 @@ async fn attribute_batch_usage(
     state: &ProxyState,
     api_key_id: &str,
     jwt: Option<&std::sync::Arc<crate::auth::JwtIdentity>>,
+    api_key_name: Option<&str>,
     user_id: Option<&str>,
     user_name: Option<&str>,
     request_headers: &std::collections::BTreeMap<String, String>,
@@ -2040,6 +2046,7 @@ async fn attribute_batch_usage(
         prompt: u64,
         completion: u64,
         cached: u64,
+        modality: aisix_gateway::ModalityTokens,
         lines: u64,
     }
     let mut per_model: std::collections::BTreeMap<String, Agg> = Default::default();
@@ -2065,6 +2072,12 @@ async fn attribute_batch_usage(
         agg.prompt += prompt;
         agg.completion += completion;
         agg.cached += cached;
+        agg.modality =
+            agg.modality
+                .saturating_add(&aisix_gateway::ModalityTokens::from_openai_details(
+                    usage.get("prompt_tokens_details"),
+                    usage.get("completion_tokens_details"),
+                ));
         agg.lines += 1;
     }
 
@@ -2092,6 +2105,7 @@ async fn attribute_batch_usage(
             prompt_tokens: agg.prompt.min(u32::MAX as u64) as u32,
             completion_tokens: agg.completion.min(u32::MAX as u64) as u32,
             cached_prompt_tokens: agg.cached.min(u32::MAX as u64) as u32,
+            modality_tokens: agg.modality,
             status_code: 200,
             provider_model_version: provider_model.clone(),
             cost_usd: cost
@@ -2108,7 +2122,7 @@ async fn attribute_batch_usage(
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
         // Attribution names the identity that observed completion — the
         // same caller the event's api_key_id already reflects.
-        crate::usage_attr::apply_caller_identity(&mut event, jwt, user_id, user_name);
+        crate::usage_attr::apply_caller_identity(&mut event, jwt, api_key_name, user_id, user_name);
         let usage_model =
             crate::usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();
         state.usage_sink.try_emit(

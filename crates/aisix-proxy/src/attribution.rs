@@ -443,6 +443,65 @@ struct Cell {
     terminal_error: Option<(u16, String, String)>,
     /// The `upstream` end-to-end observation has been recorded.
     e2e_upstream_recorded: bool,
+    /// See [`UpstreamClock`].
+    upstream_clock: UpstreamClock,
+    /// See [`RequestAttribution::capture_stream_output`].
+    stream_output: Option<aisix_obs::OutputCollector>,
+    /// Each settled attempt's upstream response headers, by attempt index,
+    /// until that attempt's usage event takes them.
+    attempt_response_headers:
+        std::collections::BTreeMap<u32, std::collections::BTreeMap<String, String>>,
+}
+
+/// How long this request has spent waiting on an upstream, measured from
+/// monotonic timestamps — the subtrahend of `UsageEvent::gateway_overhead_ms`.
+///
+/// An attempt's wait opens when it is dispatched and closes when it settles.
+/// A WINNING attempt that streams is settled at its response head, before
+/// the frame the caller's first token rides in, so its contribution is
+/// replaced by the wait to its first streamed frame once that arrives; a
+/// buffered winner keeps its whole duration. Nothing between attempts —
+/// the retry backoff, guardrail calls, hold-back — is ever inside a window.
+#[derive(Default)]
+struct UpstreamClock {
+    settled: Duration,
+    open: Option<Instant>,
+    /// The winner's dispatch instant and what its settle added, until the
+    /// first streamed frame replaces it.
+    winner: Option<(Instant, Duration)>,
+}
+
+impl UpstreamClock {
+    fn begin(&mut self, now: Instant) {
+        self.settle(now, false);
+        self.open = Some(now);
+    }
+
+    fn settle(&mut self, now: Instant, success: bool) {
+        if let Some(started) = self.open.take() {
+            let waited = now.saturating_duration_since(started);
+            self.settled += waited;
+            if success {
+                self.winner = Some((started, waited));
+            }
+        }
+    }
+
+    fn first_frame(&mut self, now: Instant) {
+        if let Some(started) = self.open.take() {
+            self.settled += now.saturating_duration_since(started);
+        } else if let Some((started, added)) = self.winner.take() {
+            self.settled =
+                self.settled.saturating_sub(added) + now.saturating_duration_since(started);
+        }
+    }
+
+    fn total(&self, now: Instant) -> Duration {
+        self.settled
+            + self.open.map_or(Duration::ZERO, |started| {
+                now.saturating_duration_since(started)
+            })
+    }
 }
 
 impl Cell {
@@ -629,6 +688,9 @@ pub(crate) struct RequestAttribution {
     cell: Mutex<Cell>,
     bodies: BodyCounters,
     gateway_embedding_ledger: Arc<GatewayEmbeddingLedger>,
+    /// The upstream response headers this request's exporters asked for.
+    /// See [`aisix_gateway::response_tap`].
+    response_tap: Arc<aisix_gateway::ResponseHeaderTap>,
 }
 
 impl RequestAttribution {
@@ -640,6 +702,15 @@ impl RequestAttribution {
             cell: Mutex::new(Cell::default()),
             bodies: BodyCounters::default(),
             gateway_embedding_ledger: Arc::clone(&self.gateway_embedding_ledger),
+            response_tap: Arc::default(),
+        }
+    }
+
+    /// A cell whose upstream responses record `names` for the exporters.
+    pub(crate) fn with_response_headers(names: Vec<String>) -> Self {
+        Self {
+            response_tap: Arc::new(aisix_gateway::ResponseHeaderTap::new(names)),
+            ..Self::default()
         }
     }
 
@@ -668,6 +739,20 @@ impl RequestAttribution {
     /// the line is written in, since it is written from `Drop`.
     pub(crate) fn track(&self, span: tracing::Span) {
         self.lock().request_span = Some(span);
+    }
+
+    /// Read the streamed response's output parts off the bytes handed to
+    /// the caller, for the request's terminal usage event to take
+    /// ([`take_stream_output`]).
+    pub(crate) fn capture_stream_output(&self, collector: aisix_obs::OutputCollector) {
+        self.lock().stream_output = Some(collector);
+    }
+
+    pub(crate) fn observe_response_output(&self, data: &[u8]) {
+        let mut cell = self.lock();
+        if let Some(collector) = cell.stream_output.as_mut() {
+            collector.feed_sse(data);
+        }
     }
 
     pub(crate) fn note_head_written(&self) {
@@ -829,7 +914,8 @@ pub(crate) fn scope<F: Future>(
     attribution: Arc<RequestAttribution>,
     fut: F,
 ) -> impl Future<Output = F::Output> {
-    CURRENT.scope(attribution, fut)
+    let tap = attribution.response_tap.clone();
+    CURRENT.scope(attribution, aisix_gateway::response_tap::scope(tap, fut))
 }
 
 /// Install `cell` for the duration of one synchronous call.
@@ -840,7 +926,9 @@ pub(crate) fn scope<F: Future>(
 /// — and the cancel guard must be able to see that it did, or it writes a
 /// second, contradicting row for the same request.
 pub(crate) fn sync_scope<T>(cell: &Arc<RequestAttribution>, f: impl FnOnce() -> T) -> T {
-    CURRENT.sync_scope(cell.clone(), f)
+    CURRENT.sync_scope(cell.clone(), || {
+        aisix_gateway::response_tap::sync_scope(&cell.response_tap, f)
+    })
 }
 
 /// Run `fut` against a throwaway cell, so a sub-call the request makes ON
@@ -859,7 +947,7 @@ pub(crate) fn detached<F: Future>(fut: F) -> impl Future<Output = F::Output> {
     let child = CURRENT
         .try_with(|parent| Arc::new(parent.detached_child()))
         .unwrap_or_else(|_| Arc::new(RequestAttribution::default()));
-    CURRENT.scope(child, fut)
+    scope(child, fut)
 }
 
 /// Note the model name the caller addressed. Called once per request from
@@ -1134,7 +1222,12 @@ pub(crate) fn note_resolved_entry(entry_model_id: &str) {
 /// Model-Group dispatch endpoints cannot record an attempt the cancel path
 /// cannot see.
 pub(crate) fn note_attempt_started(attempt: InFlightAttempt) {
-    with_cancel(|c| c.in_flight = Some(attempt));
+    let _ = CURRENT.try_with(|a| {
+        a.response_tap.take();
+        let mut cell = a.lock();
+        cell.cancel.in_flight = Some(attempt);
+        cell.upstream_clock.begin(Instant::now());
+    });
 }
 
 /// Note that the attempt in flight resolved, one way or the other.
@@ -1148,6 +1241,14 @@ pub(crate) fn note_attempt_started(attempt: InFlightAttempt) {
 /// because the handler writes that one after processing the response, so it
 /// is kept whole (`won`).
 pub(crate) fn note_attempt_settled(rec: &AttemptRecord) {
+    let _ = CURRENT.try_with(|a| {
+        let headers = a.response_tap.take();
+        let mut cell = a.lock();
+        cell.upstream_clock.settle(Instant::now(), rec.success);
+        if !headers.is_empty() {
+            cell.attempt_response_headers.insert(rec.index, headers);
+        }
+    });
     with_cancel(|c| {
         c.in_flight = None;
         c.last_settled_model_id = rec.target_model_id.clone();
@@ -1307,6 +1408,67 @@ pub(crate) fn note_usage_emitted(terminal: bool, attempt_index: u32) {
     });
 }
 
+/// Open an upstream wait for a surface that dispatches without
+/// [`crate::attempt::RoutingTelemetry`]; close it with
+/// [`note_upstream_wait_end`] or [`note_upstream_first_frame`]. See
+/// [`UpstreamClock`].
+pub(crate) fn note_upstream_wait_begin() {
+    let _ = CURRENT.try_with(|a| {
+        a.response_tap.take();
+        a.lock().upstream_clock.begin(Instant::now());
+    });
+}
+
+/// Close the upstream wait [`note_upstream_wait_begin`] opened: the
+/// upstream answered (`success`) or failed.
+pub(crate) fn note_upstream_wait_end(success: bool) {
+    let _ = CURRENT.try_with(|a| a.lock().upstream_clock.settle(Instant::now(), success));
+}
+
+/// The winning attempt's first streamed frame arrived. Every stream that
+/// stamps `upstream_ttft_ms` calls this at the same point.
+pub(crate) fn note_upstream_first_frame() {
+    let _ = CURRENT.try_with(|a| a.lock().upstream_clock.first_frame(Instant::now()));
+}
+
+/// The time this request has spent waiting on upstreams so far, or `None`
+/// outside a request.
+pub(crate) fn upstream_wait() -> Option<Duration> {
+    CURRENT
+        .try_with(|a| a.lock().upstream_clock.total(Instant::now()))
+        .ok()
+}
+
+/// The upstream response headers recorded for the attempt `attempt_index`
+/// names, moved out so each attempt's are reported once. An attempt the
+/// routing telemetry never settled (a surface without it) takes the latest
+/// response the tap saw.
+pub(crate) fn take_attempt_response_headers(
+    attempt_index: u32,
+) -> std::collections::BTreeMap<String, String> {
+    CURRENT
+        .try_with(|a| {
+            let stored = a.lock().attempt_response_headers.remove(&attempt_index);
+            stored.unwrap_or_else(|| a.response_tap.take())
+        })
+        .unwrap_or_default()
+}
+
+/// The streamed output captured so far, moved out (see
+/// [`RequestAttribution::capture_stream_output`]); `None` when the response
+/// was not a captured stream.
+pub(crate) fn take_stream_output() -> Option<aisix_obs::OutputCapture> {
+    CURRENT
+        .try_with(|a| {
+            a.lock()
+                .stream_output
+                .take()
+                .map(aisix_obs::OutputCollector::finish)
+        })
+        .ok()
+        .flatten()
+}
+
 /// The `attempt_index` for a row that speaks for no attempt of its own — a
 /// request's synthesized terminal event, such as a failure after the winner,
 /// or an ensemble's terminal event after its panel rows: the index following
@@ -1389,6 +1551,34 @@ mod tests {
             sum("upstream"),
             sum("downstream")
         );
+    }
+
+    /// Failed attempts count whole, the backoff between them not at all,
+    /// and a streamed winner only up to its first frame.
+    #[test]
+    fn the_upstream_clock_counts_attempts_not_the_gaps_between_them() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut clock = UpstreamClock::default();
+        clock.begin(ms(10));
+        clock.settle(ms(110), false); // failed attempt: 100ms
+        clock.begin(ms(300)); // 190ms backoff in between
+        clock.settle(ms(320), true); // streamed winner's head
+        assert_eq!(clock.total(ms(320)), Duration::from_millis(120));
+        clock.first_frame(ms(350)); // first frame 50ms after dispatch
+        assert_eq!(clock.total(ms(900)), Duration::from_millis(150));
+        clock.first_frame(ms(950)); // later frames change nothing
+        assert_eq!(clock.total(ms(990)), Duration::from_millis(150));
+
+        // A buffered winner keeps its whole duration; an open wait counts
+        // up to now.
+        let mut buffered = UpstreamClock::default();
+        buffered.begin(ms(0));
+        buffered.settle(ms(80), true);
+        assert_eq!(buffered.total(ms(500)), Duration::from_millis(80));
+        let mut open = UpstreamClock::default();
+        open.begin(ms(0));
+        assert_eq!(open.total(ms(40)), Duration::from_millis(40));
     }
 
     /// A write with no request scope must not panic — `resolve_provider_key`

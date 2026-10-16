@@ -32,6 +32,7 @@ pub mod chat;
 pub mod credential;
 pub mod dns_cache;
 pub mod hub;
+pub mod response_tap;
 pub mod sse;
 pub mod structured_output;
 pub mod tool_calls;
@@ -48,11 +49,12 @@ pub use bridge::{
 };
 pub use chat::{
     ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest,
-    EmbeddingResponse, EmbeddingUsage, EmbeddingUsageSource, EmbeddingVector, FinishReason, Role,
-    UsageStats,
+    EmbeddingResponse, EmbeddingUsage, EmbeddingUsageSource, EmbeddingVector, FinishReason,
+    ModalityTokens, Role, UsageStats,
 };
 pub use credential::credential_fingerprint;
 pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};
+pub use response_tap::{capture_header_values, note_upstream_response, ResponseHeaderTap};
 pub use sse::{SseDecoder, SseEvent, SseFrameTooLarge};
 pub use structured_output::{
     apply_schema_limits, close_object_schemas, json_schema_from_response_format,

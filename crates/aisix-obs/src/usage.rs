@@ -147,6 +147,13 @@ pub struct UsageEvent {
     #[serde(default)]
     pub api_key_id: String,
 
+    /// Display name of the ApiKey `api_key_id` names, snapshotted at request
+    /// time so a later rename does not rewrite who made the call.
+    /// Control-character-stripped and capped at 256 characters. Omitted when
+    /// the key has no name, or when auth failed before resolution.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub api_key_name: String,
+
     /// UUID of the org member the authenticating ApiKey is owned by
     /// (`ApiKey.user_id`), snapshotted at request time so the Logs
     /// member filter keeps naming who actually made the call
@@ -350,6 +357,40 @@ pub struct UsageEvent {
     /// gateway overhead there — it is the rest of the agent's own work.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub downstream_latency_ms: u32,
+
+    /// The part of `downstream_latency_ms` the gateway itself spent, in
+    /// milliseconds: the same window (request arrival to the caller's first
+    /// usable data) minus the time spent waiting on an upstream inside it —
+    /// the whole upstream duration of every earlier failed, retried or
+    /// fallback attempt, plus the winning attempt's upstream time up to its
+    /// first streamed frame (streaming) or its full upstream latency
+    /// (non-streaming). Retry backoff, guardrail calls (external guardrail
+    /// services included) and output-guardrail hold-back therefore count
+    /// as gateway time. Measured from monotonic timestamps, not derived
+    /// from the rounded fields beside it.
+    ///
+    /// Set on exactly the event that carries `downstream_latency_ms`; absent
+    /// on every other one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_overhead_ms: Option<u32>,
+
+    /// Mean time per output token of THIS attempt's stream, in
+    /// milliseconds: `(upstream_latency_ms - upstream_ttft_ms) /
+    /// (output tokens - 1)`, with output tokens counted the way OTel's
+    /// `gen_ai.usage.output_tokens` counts them (reasoning included). Only
+    /// on a successful streamed attempt that produced at least two output
+    /// tokens; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_tpot_ms: Option<f64>,
+
+    /// `prompt_audio_tokens`, `prompt_image_tokens`,
+    /// `completion_audio_tokens`, `completion_image_tokens`: modality
+    /// breakdowns exactly as the upstream reported them — each a subset of
+    /// `prompt_tokens` / `completion_tokens` (inclusive of any cached
+    /// portion), never added to them. Each is absent when the upstream does
+    /// not report it (Anthropic and Bedrock Converse never do).
+    #[serde(flatten)]
+    pub modality_tokens: aisix_gateway::ModalityTokens,
 
     /// HTTP status code the proxy returned to the downstream caller.
     pub status_code: u16,
@@ -760,15 +801,27 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_user_agent: String,
 
-    /// Values of the request headers the operator listed in
-    /// `observability.usage_event.request_headers`, keyed by that
-    /// (lowercase) name. A header the request did not carry has no key;
-    /// repeated occurrences are joined with `", "` in arrival order; each
-    /// value is control-character-stripped and capped like
-    /// `client_user_agent`. Every event of a request carries the same map.
-    /// Empty — and off the wire — when nothing is configured or matched.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    /// Values of the request headers any enabled exporter lists in its
+    /// `request_headers`, keyed by the (lowercase) name. A header the
+    /// request did not carry has no key; repeated occurrences are joined
+    /// with `", "` in arrival order; each value is control-character-stripped
+    /// and capped like `client_user_agent`. Every event of a request carries
+    /// the same map.
+    ///
+    /// Exporter-only, never on the control-plane wire: each exporter
+    /// receives just the names in its own list ([`crate::SinkRecord`]).
+    #[serde(skip)]
     pub request_headers: std::collections::BTreeMap<String, String>,
+
+    /// Values of the upstream RESPONSE headers any enabled exporter lists
+    /// in its `upstream_response_headers`, read off THIS attempt's upstream
+    /// response, with the same value rules as `request_headers`. Empty on
+    /// an attempt that received no response head.
+    ///
+    /// Exporter-only, never on the control-plane wire, like
+    /// `request_headers`.
+    #[serde(skip)]
+    pub upstream_response_headers: std::collections::BTreeMap<String, String>,
 
     // ─── MCP gateway attribution ───
     /// Registered name of the upstream MCP server a `tools/call` was routed
@@ -2031,22 +2084,20 @@ mod tests {
         assert!(json.contains(r#""client_user_agent":"codex-cli/1.2""#));
     }
 
+    /// Captured header values are exporter-only: the control plane's wire
+    /// never carries either map, whatever the request recorded.
     #[test]
-    fn request_headers_serialise_as_one_object() {
+    fn header_maps_never_reach_the_control_plane_wire() {
         let ev = UsageEvent {
             request_id: "req-headers".into(),
-            request_headers: [
-                ("x-sub-user".to_string(), "alice".to_string()),
-                ("x-department".to_string(), "eng, ops".to_string()),
-            ]
-            .into(),
+            request_headers: [("x-sub-user".to_string(), "alice".to_string())].into(),
+            upstream_response_headers: [("x-upstream-id".to_string(), "u-1".to_string())].into(),
             ..Default::default()
         };
-        let json: serde_json::Value = serde_json::to_value(&ev).unwrap();
-        assert_eq!(
-            json["request_headers"],
-            serde_json::json!({"x-sub-user": "alice", "x-department": "eng, ops"})
-        );
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(!json.contains("request_headers"), "{json}");
+        assert!(!json.contains("upstream_response_headers"), "{json}");
+        assert!(!json.contains("alice"), "{json}");
     }
 
     #[test]

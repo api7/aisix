@@ -958,6 +958,7 @@ async fn dispatch(
     // own pre-dispatch work (auth, guardrail scan, rate-limit reservation)
     // — that belongs to `downstream_latency_ms`, which runs from `started`.
     let attempt_started = Instant::now();
+    crate::attribution::note_upstream_wait_begin();
     let send_fut = builder.send();
     let sent = match exchange_timeout {
         Some(d) => match tokio::time::timeout(d, send_fut).await {
@@ -975,6 +976,7 @@ async fn dispatch(
 
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
+    aisix_gateway::note_upstream_response(&resp_headers);
     // Explicit `text/event-stream` only. Deliberately STRICTER than
     // `dispatch::upstream_body_is_sse`, which the typed relays use: a
     // passthrough route carries arbitrary REST traffic where most responses
@@ -1007,6 +1009,7 @@ async fn dispatch(
         path: path.clone(),
         request_id: client.request_id.clone(),
         api_key_id: auth.entry.id.clone(),
+        api_key_name: auth.api_key_name().map(str::to_owned),
         user_id: auth.entry.value.user_id.clone(),
         user_name: auth.user_name().map(str::to_owned),
         jwt: auth.jwt.clone(),
@@ -1117,6 +1120,7 @@ async fn dispatch(
         },
         None => body_fut.await,
     };
+    crate::attribution::note_upstream_wait_end(read.is_ok());
     let resp_body = read.map_err(|e| {
         telemetry.emitted = true;
         RouteError::of(
@@ -3480,6 +3484,7 @@ struct PassthroughUsage {
     completion_tokens: u32,
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    modality: aisix_gateway::ModalityTokens,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
@@ -3497,6 +3502,7 @@ impl PassthroughUsage {
             completion_tokens: u.completion_tokens,
             cached_prompt_tokens: u.cached_prompt_tokens,
             cache_write_tokens: u.cache_write_tokens,
+            modality: u.modality,
             reasoning_tokens: u.reasoning_tokens,
             cache_creation_tokens: u.cache_creation_tokens,
             cache_read_tokens: u.cache_read_tokens,
@@ -3517,6 +3523,7 @@ impl PassthroughUsage {
         self.completion_tokens = self.completion_tokens.max(other.completion_tokens);
         self.cached_prompt_tokens = self.cached_prompt_tokens.max(other.cached_prompt_tokens);
         self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
+        self.modality = self.modality.max_fieldwise(&other.modality);
         self.reasoning_tokens = self.reasoning_tokens.max(other.reasoning_tokens);
         self.cache_creation_tokens = self.cache_creation_tokens.max(other.cache_creation_tokens);
         self.cache_read_tokens = self.cache_read_tokens.max(other.cache_read_tokens);
@@ -5797,6 +5804,7 @@ fn stream_opaque_response(
                             .elapsed()
                             .as_millis()
                             .min(u32::MAX as u128) as u32;
+                        crate::attribution::note_upstream_first_frame();
                     }
                     telemetry.mark_first_delivery();
                     yield Ok::<_, std::convert::Infallible>(chunk);
@@ -5957,6 +5965,7 @@ fn stream_response(
                     .elapsed()
                     .as_millis()
                     .min(u32::MAX as u128) as u32;
+                crate::attribution::note_upstream_first_frame();
             }
             for frame in splitter.push(&chunk) {
                 // Both completed and splitter-overflowed frames take the
@@ -6731,6 +6740,8 @@ struct RouteTelemetry {
     /// (AISIX-Cloud#1455). Both `None` for a key bound to no member —
     /// including the anonymous route key, which belongs to the route
     /// rather than to a person.
+    /// The authenticating key's display name (`UsageEvent::api_key_name`).
+    api_key_name: Option<String>,
     user_id: Option<String>,
     user_name: Option<String>,
     jwt: Option<Arc<crate::auth::JwtIdentity>>,
@@ -7008,6 +7019,7 @@ impl RouteTelemetry {
             completion_tokens: usage.completion_tokens,
             cached_prompt_tokens: usage.cached_prompt_tokens,
             cache_write_tokens: usage.cache_write_tokens,
+            modality_tokens: usage.modality,
             reasoning_tokens: usage.reasoning_tokens,
             total_tokens: usage.upstream_total_tokens.unwrap_or(0),
             cache_creation_tokens: usage.cache_creation_tokens,
@@ -7049,6 +7061,7 @@ impl RouteTelemetry {
         crate::usage_attr::apply_caller_identity(
             &mut event,
             self.jwt.as_ref(),
+            self.api_key_name.as_deref(),
             self.user_id.as_deref(),
             self.user_name.as_deref(),
         );

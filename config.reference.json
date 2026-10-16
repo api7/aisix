@@ -75,10 +75,7 @@
           "path": "/metrics"
         }
       },
-      "service_name": "aisix",
-      "usage_event": {
-        "request_headers": []
-      }
+      "service_name": "aisix"
     },
     "proxy": {
       "addr": "0.0.0.0:3000",

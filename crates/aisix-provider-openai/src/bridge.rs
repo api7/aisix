@@ -535,6 +535,7 @@ impl Bridge for OpenAiBridge {
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -588,6 +589,7 @@ impl Bridge for OpenAiBridge {
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -651,6 +653,7 @@ impl Bridge for OpenAiBridge {
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -712,6 +715,7 @@ impl Bridge for OpenAiBridge {
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -777,6 +781,7 @@ impl Bridge for OpenAiBridge {
         })
         .await?;
 
+        aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
             return Err(map_http_error(status, resp).await);

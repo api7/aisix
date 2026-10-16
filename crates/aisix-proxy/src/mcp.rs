@@ -199,10 +199,8 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
         auth,
         anonymous_allowlist,
     } = caller;
-    let request_headers = crate::client_ip::capture_request_headers(
-        &parts.headers,
-        &state.usage_event_request_headers,
-    );
+    let request_headers =
+        crate::client_ip::capture_request_headers(&parts.headers, &state.snapshot.load());
     crate::attribution::note_request_headers(&request_headers);
     let request = Request::from_parts(parts, body);
     // #698: /mcp emits the same access log + request metrics as every other
@@ -809,10 +807,14 @@ async fn dispatch(
     // `StreamableHttpService` is a tower service that dispatches on method and
     // never fails (`Error = Infallible`); map its boxed body back to axum's.
     let started = Instant::now();
+    // The whole exchange is this family's upstream attempt
+    // (`upstream_latency_ms` is the same span).
+    crate::attribution::note_upstream_wait_begin();
     let response = match service.oneshot(request).await {
         Ok(response) => response.map(Body::new),
         Err(infallible) => match infallible {},
     };
+    crate::attribution::note_upstream_wait_end(true);
     let latency = started.elapsed();
 
     // `tools/list` only — nothing else writes the slot. An empty list where
@@ -1546,6 +1548,7 @@ fn emit_tool_call_usage(
     crate::usage_attr::apply_caller_identity(
         &mut event,
         auth.jwt.as_ref(),
+        auth.api_key_name(),
         auth.key().user_id.as_deref(),
         auth.user_name(),
     );

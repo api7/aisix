@@ -137,7 +137,7 @@ pub(crate) async fn send_with_deadline(
     deadline: Option<Duration>,
     started: Instant,
 ) -> Result<reqwest::Response, BridgeError> {
-    match deadline {
+    let sent = match deadline {
         Some(d) => match tokio::time::timeout(d, req.send()).await {
             Ok(res) => res.map_err(|e| crate::dispatch::reqwest_error_to_bridge(&e, started)),
             Err(_) => Err(BridgeError::Timeout {
@@ -149,7 +149,11 @@ pub(crate) async fn send_with_deadline(
             .send()
             .await
             .map_err(|e| crate::dispatch::reqwest_error_to_bridge(&e, started)),
+    };
+    if let Ok(resp) = &sent {
+        aisix_gateway::note_upstream_response(resp.headers());
     }
+    sent
 }
 
 #[cfg(test)]
