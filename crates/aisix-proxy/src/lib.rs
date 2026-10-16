@@ -11699,6 +11699,82 @@ data: [DONE]\n\n";
         assert_attempt_indices_increase(&events);
     }
 
+    /// A streaming ensemble cancelled while its judge connects: the panel had
+    /// already round-tripped its upstreams, so its rows are owed beside the
+    /// 499 row, which follows them.
+    #[tokio::test]
+    async fn ensemble_stream_cancelled_while_the_judge_connects_still_emits_the_panel() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("Answer 1:"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: [DONE]\n\n")
+                    .set_delay(std::time::Duration::from_secs(5)),
+            )
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-panel",
+                "model": "panel-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "a panel candidate answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16}
+            })))
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        seed_two_member_council(&snap);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+
+        let mut req = cancellable_chat_request("council");
+        *req.body_mut() = Body::from(
+            serde_json::json!({
+                "model": "council",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            })
+            .to_string(),
+        );
+        cancel_in_flight(app, req).await;
+
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+        {
+            events.push(ev);
+        }
+        assert_eq!(
+            events.len(),
+            3,
+            "two panel rows and the 499 row: {events:?}"
+        );
+        assert!(
+            events[..2].iter().all(|e| e.attempt_kind == "panel"
+                && e.prompt_tokens == 5
+                && e.completion_tokens == 11),
+            "{events:?}"
+        );
+        assert_eq!(events[2].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
+        assert_eq!(events[2].error_message, cancel::CANCELLED_BEFORE_HEAD);
+        assert_eq!(events[2].attempt_kind, "", "{events:?}");
+        assert_attempt_indices_increase(&events);
+    }
+
     /// Like `ensemble_model_entry` but with an explicit `min_responses`.
     fn ensemble_model_entry_min(
         id: &str,

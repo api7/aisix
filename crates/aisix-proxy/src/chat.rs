@@ -3880,9 +3880,9 @@ async fn dispatch_ensemble(
     // path, which likewise holds the socket bytes-free across panel + judge;
     // warming it would need an early SSE handshake before the panel completes.
     if req.is_streaming() {
-        // Emit the already-billed panel survivors, then build the failure.
-        // Shared by both streaming error exits (panel exhausted, or judge
-        // connect failed): in either case every surviving panel member
+        // Emit the already-billed panel survivors, then build the failure,
+        // for the exits that fail the panel itself (once the panel succeeds,
+        // `panel_rows` below owns its rows). Every surviving panel member
         // round-tripped an upstream and must be billed, exactly like the
         // non-streaming error paths. `charge: None` — the per-member events
         // already carry the bill.
@@ -3890,10 +3890,10 @@ async fn dispatch_ensemble(
         // The token commit is NOT done here: `MultiReservation::commit_tokens`
         // is async (#607's cluster-Redis path), and this helper is sync so
         // `emit_panel_member` stays callable across every exit. Each call site
-        // therefore `.await`s `reservation.commit_tokens(survivor_total)`
-        // inline FIRST (mirroring the non-streaming ensemble path), then calls
-        // this for the emit + `DispatchFailure`. `panel` is borrowed so the
-        // call site still owns it to compute `survivor_total`.
+        // emits through this FIRST and then `.await`s the commit, so a caller
+        // that leaves during the commit does not take the rows with it.
+        // `panel` is borrowed so the call site still owns it to compute
+        // `survivor_total`.
         let emit_panel_then_fail =
             |panel: &[crate::ensemble::PanelOutcome], proxy_err: ProxyError| -> DispatchFailure {
                 for (index, member) in panel.iter().enumerate() {
@@ -3911,142 +3911,24 @@ async fn dispatch_ensemble(
             match crate::ensemble::run_ensemble_panel(req, ensemble_cfg, &caller).await {
                 Ok(triple) => triple,
                 Err(crate::ensemble::EnsembleError::InsufficientPanel { panel, .. }) => {
-                    reservation.commit_tokens(survivor_total(&panel)).await;
-                    return Err(emit_panel_then_fail(
+                    let failure = emit_panel_then_fail(
                         &panel,
                         ProxyError::Bridge(BridgeError::upstream_status(
                             502,
                             "ensemble panel did not reach the required number of responses",
                         )),
-                    ));
+                    );
+                    reservation.commit_tokens(survivor_total(&panel)).await;
+                    return Err(failure);
                 }
                 // `run_ensemble_panel` never returns `Judge` (it stops before
                 // the judge call), but the enum is non-exhaustive to us here.
                 Err(crate::ensemble::EnsembleError::Judge { panel, source }) => {
+                    let failure = emit_panel_then_fail(&panel, ProxyError::Bridge(source));
                     reservation.commit_tokens(survivor_total(&panel)).await;
-                    return Err(emit_panel_then_fail(&panel, ProxyError::Bridge(source)));
+                    return Err(failure);
                 }
             };
-
-        // The judge's prompt renders the caller's messages, so it is rebuilt
-        // where it is needed (`build_judge_req` below) rather than held
-        // through the judge's upstream wait.
-        drop(judge_req);
-        // Resolve the judge model from the snapshot. Effectively unreachable
-        // (the panel calls already resolved member names against the same
-        // snapshot, and the judge is required config), but stay total: bill the
-        // panel + fail rather than panic if the entry vanished mid-request.
-        let Some(judge_entry) = snapshot.models.get_by_name(&ensemble_cfg.judge.model) else {
-            reservation.commit_tokens(survivor_total(&panel)).await;
-            return Err(emit_panel_then_fail(
-                &panel,
-                ProxyError::Bridge(BridgeError::InvalidUpstreamConfig(
-                    "ensemble judge references an unknown model".into(),
-                )),
-            ));
-        };
-        let judge_model = &judge_entry.value;
-        // Stream the judge's synthesized answer: the request the executor
-        // builds, flipped to streaming (it is built non-streaming for the
-        // buffered path), with the judge's effort mapping applied.
-        let build_judge_req = || {
-            let mut judge_req =
-                crate::ensemble::judge_request(req, &ensemble_cfg.judge, &candidates);
-            judge_req.stream = Some(true);
-            match crate::effort_mapping::chat_request(&judge_req, judge_model) {
-                std::borrow::Cow::Owned(mapped) => mapped,
-                std::borrow::Cow::Borrowed(_) => judge_req,
-            }
-        };
-        let judge_pk = match crate::dispatch::resolve_provider_key(snapshot, judge_model) {
-            Ok(pk) => pk,
-            Err(e) => {
-                tracing::warn!(error = %e, "ensemble judge provider key unresolved");
-                reservation.commit_tokens(survivor_total(&panel)).await;
-                return Err(emit_panel_then_fail(
-                    &panel,
-                    ProxyError::Bridge(BridgeError::InvalidUpstreamConfig(
-                        "ensemble judge has an unresolved provider key".into(),
-                    )),
-                ));
-            }
-        };
-        let Some(judge_bridge) = crate::dispatch::resolve_bridge(&state.hub, &judge_pk.value)
-        else {
-            reservation.commit_tokens(survivor_total(&panel)).await;
-            return Err(emit_panel_then_fail(
-                &panel,
-                ProxyError::Bridge(BridgeError::Config(
-                    "ensemble judge has no registered bridge".into(),
-                )),
-            ));
-        };
-        let mut judge_ctx = crate::dispatch::bridge_ctx(
-            request_id,
-            &judge_entry.id,
-            Arc::new(judge_model.clone()),
-            &judge_pk.id,
-            Arc::new(judge_pk.value.clone()),
-            Some(client),
-        );
-        if let Some(deadline) =
-            crate::routing::effective_timeouts(judge_model, None, state.default_timeouts).request
-        {
-            judge_ctx = judge_ctx.with_deadline(deadline);
-        }
-
-        // #620: enforce the judge's OWN model rate limit for the streamed
-        // synthesis too. The panel was reserved per-member in
-        // `run_ensemble_panel` (via `ProxyModelCaller::call`), and the
-        // non-streaming judge is reserved on that same path — but the streaming
-        // judge is dispatched here via `chat_stream`, bypassing it. Reserve
-        // before opening the stream so a rate-limited judge fails fast (429);
-        // the slot is then held for the stream's lifetime and the judge's own
-        // tokens are added post-stream, mirroring the entry reservation below.
-        let judge_reservation = match crate::quota::reserve_model_only(
-            state,
-            snapshot,
-            auth,
-            &ensemble_cfg.judge.model,
-            &judge_entry.id,
-            judge_model,
-            Some(crate::quota::RoutingParent {
-                name: &virtual_entry.value.display_name,
-                entry_id: &virtual_entry.id,
-            }),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(_) => {
-                reservation.commit_tokens(survivor_total(&panel)).await;
-                return Err(emit_panel_then_fail(
-                    &panel,
-                    ProxyError::Bridge(BridgeError::upstream_status(
-                        429,
-                        "rate limit exceeded for the ensemble judge",
-                    )),
-                ));
-            }
-        };
-
-        // The judge is this response's upstream call, so its own clock is
-        // what `upstream_ttft_ms` should be measured against — `started`
-        // additionally covers the whole panel that ran before it.
-        let judge_started = Instant::now();
-        let judge_stream = match judge_bridge
-            .chat_stream_cow(std::borrow::Cow::Owned(build_judge_req()), &judge_ctx)
-            .await
-        {
-            Ok(s) => s,
-            // Judge connect failed AFTER the panel round-tripped: bill the
-            // panel (same invariant as the non-streaming judge-failure path),
-            // then surface the bridge error (5xx → 502, 4xx preserved).
-            Err(be) => {
-                reservation.commit_tokens(survivor_total(&panel)).await;
-                return Err(emit_panel_then_fail(&panel, ProxyError::Bridge(be)));
-            }
-        };
 
         // Pre-resolve every owned value the `'static` on_complete needs. It
         // CANNOT borrow `state`/`snapshot`/`req`/`client` (the closure outlives
@@ -4094,6 +3976,184 @@ async fn dispatch_ensemble(
             .fold(aisix_gateway::chat::UsageStats::default(), |acc, p| {
                 acc.saturating_add(&p.usage)
             });
+        // The panel has round-tripped its upstreams, so from here its rows are
+        // owed on every ending. They ride a guard rather than `on_complete`
+        // alone: a caller that leaves while the judge connects drops this
+        // future, and one that leaves before the body's first poll drops
+        // `on_complete` uncalled — either way the guard's drop emits them,
+        // ahead of the 499 row the cancel guard writes.
+        let panel_rows = {
+            let state = state.clone();
+            let request_id = request_id.to_string();
+            let client_model = req.model.clone();
+            let api_key_id = api_key_id.to_string();
+            let applied_guardrails = applied_guardrails.to_vec();
+            let audit = audit.clone();
+            let client = client.clone();
+            let bypass = bypass_reason.clone().unwrap_or_default();
+            PanelRows(Some(Box::new(move |blocked: bool, first_index: u32| {
+                let snap = state.snapshot.load();
+                for (index, member) in panel_telem.iter().enumerate() {
+                    let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &member.provider_key_id);
+                    emit_usage_event(
+                        &state,
+                        &snap,
+                        &pk,
+                        &request_id,
+                        &member.model_id,
+                        &client_model,
+                        &api_key_id,
+                        200,
+                        started.elapsed(),
+                        member.usage.prompt_tokens,
+                        member.usage.completion_tokens,
+                        UsageExtras {
+                            cached_prompt_tokens: member.usage.cached_prompt_tokens,
+                            cache_write_tokens: member.usage.cache_write_tokens,
+                            reasoning_tokens: member.usage.reasoning_tokens,
+                            upstream_total_tokens: member.usage.upstream_total_tokens,
+                            reasoning_folded_into_completion: member
+                                .usage
+                                .reasoning_folded_into_completion,
+                            cache_creation_tokens: member.usage.cache_creation_tokens,
+                            cache_read_tokens: member.usage.cache_read_tokens,
+                            usage_estimated: member.usage_estimated,
+                            bypass_reason: bypass.clone(),
+                            cache_status: CacheStatus::Disabled.as_str().to_string(),
+                            attempt_index: first_index + index as u32,
+                            attempt_kind: "panel".to_string(),
+                            attempt_model: member.attempt_model.clone(),
+                            applied_guardrails: applied_guardrails.clone(),
+                            ..UsageExtras::default()
+                        },
+                        /* cost_usd */ 0.0,
+                        blocked,
+                        &client,
+                        /* content */ None,
+                        /* terminal */ false,
+                        /* dispatched */ true,
+                        &audit,
+                    );
+                }
+            })))
+        };
+
+        // The judge's prompt renders the caller's messages, so it is rebuilt
+        // where it is needed (`build_judge_req` below) rather than held
+        // through the judge's upstream wait.
+        drop(judge_req);
+        // Resolve the judge model from the snapshot. Effectively unreachable
+        // (the panel calls already resolved member names against the same
+        // snapshot, and the judge is required config), but stay total: bill the
+        // panel + fail rather than panic if the entry vanished mid-request.
+        let Some(judge_entry) = snapshot.models.get_by_name(&ensemble_cfg.judge.model) else {
+            panel_rows.emit(/* blocked */ false, 0);
+            reservation.commit_tokens(panel_total).await;
+            return Err(with_model(ProxyError::Bridge(
+                BridgeError::InvalidUpstreamConfig(
+                    "ensemble judge references an unknown model".into(),
+                ),
+            )));
+        };
+        let judge_model = &judge_entry.value;
+        // Stream the judge's synthesized answer: the request the executor
+        // builds, flipped to streaming (it is built non-streaming for the
+        // buffered path), with the judge's effort mapping applied.
+        let build_judge_req = || {
+            let mut judge_req =
+                crate::ensemble::judge_request(req, &ensemble_cfg.judge, &candidates);
+            judge_req.stream = Some(true);
+            match crate::effort_mapping::chat_request(&judge_req, judge_model) {
+                std::borrow::Cow::Owned(mapped) => mapped,
+                std::borrow::Cow::Borrowed(_) => judge_req,
+            }
+        };
+        let judge_pk = match crate::dispatch::resolve_provider_key(snapshot, judge_model) {
+            Ok(pk) => pk,
+            Err(e) => {
+                tracing::warn!(error = %e, "ensemble judge provider key unresolved");
+                panel_rows.emit(/* blocked */ false, 0);
+                reservation.commit_tokens(panel_total).await;
+                return Err(with_model(ProxyError::Bridge(
+                    BridgeError::InvalidUpstreamConfig(
+                        "ensemble judge has an unresolved provider key".into(),
+                    ),
+                )));
+            }
+        };
+        let Some(judge_bridge) = crate::dispatch::resolve_bridge(&state.hub, &judge_pk.value)
+        else {
+            panel_rows.emit(/* blocked */ false, 0);
+            reservation.commit_tokens(panel_total).await;
+            return Err(with_model(ProxyError::Bridge(BridgeError::Config(
+                "ensemble judge has no registered bridge".into(),
+            ))));
+        };
+        let mut judge_ctx = crate::dispatch::bridge_ctx(
+            request_id,
+            &judge_entry.id,
+            Arc::new(judge_model.clone()),
+            &judge_pk.id,
+            Arc::new(judge_pk.value.clone()),
+            Some(client),
+        );
+        if let Some(deadline) =
+            crate::routing::effective_timeouts(judge_model, None, state.default_timeouts).request
+        {
+            judge_ctx = judge_ctx.with_deadline(deadline);
+        }
+
+        // #620: enforce the judge's OWN model rate limit for the streamed
+        // synthesis too. The panel was reserved per-member in
+        // `run_ensemble_panel` (via `ProxyModelCaller::call`), and the
+        // non-streaming judge is reserved on that same path — but the streaming
+        // judge is dispatched here via `chat_stream`, bypassing it. Reserve
+        // before opening the stream so a rate-limited judge fails fast (429);
+        // the slot is then held for the stream's lifetime and the judge's own
+        // tokens are added post-stream, mirroring the entry reservation below.
+        let judge_reservation = match crate::quota::reserve_model_only(
+            state,
+            snapshot,
+            auth,
+            &ensemble_cfg.judge.model,
+            &judge_entry.id,
+            judge_model,
+            Some(crate::quota::RoutingParent {
+                name: &virtual_entry.value.display_name,
+                entry_id: &virtual_entry.id,
+            }),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                panel_rows.emit(/* blocked */ false, 0);
+                reservation.commit_tokens(panel_total).await;
+                return Err(with_model(ProxyError::Bridge(
+                    BridgeError::upstream_status(429, "rate limit exceeded for the ensemble judge"),
+                )));
+            }
+        };
+
+        // The judge is this response's upstream call, so its own clock is
+        // what `upstream_ttft_ms` should be measured against — `started`
+        // additionally covers the whole panel that ran before it.
+        let judge_started = Instant::now();
+        let judge_stream = match judge_bridge
+            .chat_stream_cow(std::borrow::Cow::Owned(build_judge_req()), &judge_ctx)
+            .await
+        {
+            Ok(s) => s,
+            // Judge connect failed AFTER the panel round-tripped: bill the
+            // panel (same invariant as the non-streaming judge-failure path),
+            // then surface the bridge error (5xx → 502, 4xx preserved).
+            Err(be) => {
+                panel_rows.emit(/* blocked */ false, 0);
+                reservation.commit_tokens(panel_total).await;
+                return Err(with_model(ProxyError::Bridge(be)));
+            }
+        };
+
         // The streamed judge estimator keys off `judge_model.upstream_model()`
         // directly (below), so resolve_sub's upstream_model is unused here.
         let (judge_model_id, judge_provider_key_id, _) = resolve_sub(&ensemble_cfg.judge.model);
@@ -4164,65 +4224,6 @@ async fn dispatch_ensemble(
             judge_model.upstream_model().unwrap_or("unknown"),
             crate::token_estimate::PromptInput::Chat(Box::new(build_judge_req())),
         );
-        // The panel rows ride a guard rather than `on_complete` alone: a body
-        // dropped before its first poll never starts the stream, so
-        // `on_complete` is dropped uncalled, and the panel's upstream spend
-        // would go unrecorded beside the 499 row the cancel guard writes.
-        let panel_rows = {
-            let state = state.clone();
-            let request_id = request_id.to_string();
-            let client_model = req.model.clone();
-            let api_key_id = api_key_id.to_string();
-            let applied_guardrails = applied_guardrails.to_vec();
-            let audit = audit.clone();
-            let client = client.clone();
-            let bypass = bypass_reason.clone().unwrap_or_default();
-            PanelRows(Some(Box::new(move |blocked: bool, first_index: u32| {
-                let snap = state.snapshot.load();
-                for (index, member) in panel_telem.iter().enumerate() {
-                    let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &member.provider_key_id);
-                    emit_usage_event(
-                        &state,
-                        &snap,
-                        &pk,
-                        &request_id,
-                        &member.model_id,
-                        &client_model,
-                        &api_key_id,
-                        200,
-                        started.elapsed(),
-                        member.usage.prompt_tokens,
-                        member.usage.completion_tokens,
-                        UsageExtras {
-                            cached_prompt_tokens: member.usage.cached_prompt_tokens,
-                            cache_write_tokens: member.usage.cache_write_tokens,
-                            reasoning_tokens: member.usage.reasoning_tokens,
-                            upstream_total_tokens: member.usage.upstream_total_tokens,
-                            reasoning_folded_into_completion: member
-                                .usage
-                                .reasoning_folded_into_completion,
-                            cache_creation_tokens: member.usage.cache_creation_tokens,
-                            cache_read_tokens: member.usage.cache_read_tokens,
-                            usage_estimated: member.usage_estimated,
-                            bypass_reason: bypass.clone(),
-                            cache_status: CacheStatus::Disabled.as_str().to_string(),
-                            attempt_index: first_index + index as u32,
-                            attempt_kind: "panel".to_string(),
-                            attempt_model: member.attempt_model.clone(),
-                            applied_guardrails: applied_guardrails.clone(),
-                            ..UsageExtras::default()
-                        },
-                        /* cost_usd */ 0.0,
-                        blocked,
-                        &client,
-                        /* content */ None,
-                        /* terminal */ false,
-                        /* dispatched */ true,
-                        &audit,
-                    );
-                }
-            })))
-        };
         let sse_stream = build_sse_stream(
             judge_stream,
             created_ts,
