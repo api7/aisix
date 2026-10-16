@@ -550,6 +550,79 @@ impl OutputCollector {
     }
 }
 
+/// The finish reason a Responses result reports, in OpenAI chat's
+/// vocabulary (the one the usage event's `finish_reason` speaks for chat):
+/// a `completed` response is `tool_calls` when its output asks for a tool
+/// (a `function_call` or `custom_tool_call` item) and `stop` otherwise; an
+/// `incomplete` one is `content_filter` when that is its reason and
+/// `length` otherwise. Any other status (`failed`, `cancelled`, …) names
+/// none.
+pub fn responses_finish_reason(response: &Value) -> Option<&'static str> {
+    match response.get("status").and_then(Value::as_str)? {
+        "completed" => {
+            let calls_tool = array(response.get("output")).iter().any(|item| {
+                matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("function_call") | Some("custom_tool_call")
+                )
+            });
+            Some(if calls_tool { "tool_calls" } else { "stop" })
+        }
+        "incomplete" => {
+            let reason = response
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str);
+            Some(if reason == Some("content_filter") {
+                "content_filter"
+            } else {
+                "length"
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Reads a streamed Responses result's finish reason off the frames the
+/// caller receives: the terminal `response.completed` / `response.incomplete`
+/// / `response.failed` event carries the response object.
+#[derive(Debug, Default)]
+pub struct ResponsesFinishObserver {
+    decoder: aisix_gateway::SseDecoder,
+    finish: Option<&'static str>,
+}
+
+impl ResponsesFinishObserver {
+    pub fn feed_sse(&mut self, bytes: &[u8]) {
+        let Ok(events) = self.decoder.feed(bytes) else {
+            return;
+        };
+        for event in events {
+            let aisix_gateway::SseEvent::Data(payload) = event else {
+                continue;
+            };
+            // Only the terminal events are worth a parse.
+            if !(payload.contains("response.completed")
+                || payload.contains("response.incomplete")
+                || payload.contains("response.failed"))
+            {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(&payload) {
+                if matches!(
+                    value.get("type").and_then(Value::as_str),
+                    Some("response.completed" | "response.incomplete" | "response.failed")
+                ) {
+                    self.finish = value.get("response").and_then(responses_finish_reason);
+                }
+            }
+        }
+    }
+
+    pub fn finish(&self) -> Option<&'static str> {
+        self.finish
+    }
+}
+
 /// Orders a reasoning item's clear-text content after its summary.
 const REASONING_TEXT_BASE: u64 = 1 << 32;
 
@@ -610,6 +683,44 @@ mod tests {
                 {"type":"tool_call","id":"call_1","name":"get_time","arguments":{"tz":"UTC"}},
             ])
         );
+    }
+
+    #[test]
+    fn responses_finish_reason_follows_status_and_output() {
+        let cases = [
+            (
+                json!({"status":"completed","output":[{"type":"message"}]}),
+                Some("stop"),
+            ),
+            (
+                json!({"status":"completed","output":[{"type":"function_call"}]}),
+                Some("tool_calls"),
+            ),
+            (
+                json!({"status":"completed","output":[{"type":"custom_tool_call"}]}),
+                Some("tool_calls"),
+            ),
+            (
+                json!({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}),
+                Some("length"),
+            ),
+            (
+                json!({"status":"incomplete","incomplete_details":{"reason":"content_filter"}}),
+                Some("content_filter"),
+            ),
+            (json!({"status":"failed"}), None),
+            (json!({"status":"cancelled"}), None),
+            (json!({}), None),
+        ];
+        for (response, expected) in cases {
+            assert_eq!(responses_finish_reason(&response), expected, "{response}");
+        }
+        let mut o = ResponsesFinishObserver::default();
+        o.feed_sse(&sse(&[
+            json!({"type":"response.created","response":{"status":"in_progress"}}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call"}]}}),
+        ]));
+        assert_eq!(o.finish(), Some("tool_calls"));
     }
 
     #[test]

@@ -48,7 +48,9 @@ pub use metrics::{
     Metrics, RequestLabels, RequestOutcome, UsageEventLabels, UsageLabels,
 };
 pub use otlp_http_sink::{content_capture_cap, OtlpHttpFanOut, OtlpSink};
-pub use output::{OutputCapture, OutputCollector, OutputWire};
+pub use output::{
+    responses_finish_reason, OutputCapture, OutputCollector, OutputWire, ResponsesFinishObserver,
+};
 pub use sink::{
     AliyunSlsSink, BatchUnit, CapturedContent, ChannelKey, DatadogSink, EventBatch,
     ExporterPipelines, IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope,

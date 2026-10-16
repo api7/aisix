@@ -694,6 +694,9 @@ fn capture_streamed_output(
     if !is_sse || !response.status().is_success() {
         return;
     }
+    if wire == aisix_obs::OutputWire::OpenAiResponses {
+        cell.observe_responses_finish();
+    }
     let snapshot = state.snapshot.load();
     let exporters = snapshot.observability_exporters.entries();
     if let Some(cap) = aisix_obs::content_capture_cap(exporters.iter().map(|e| &e.value)) {

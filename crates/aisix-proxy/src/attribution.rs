@@ -447,6 +447,11 @@ struct Cell {
     upstream_clock: UpstreamClock,
     /// See [`RequestAttribution::capture_stream_output`].
     stream_output: Option<aisix_obs::OutputCollector>,
+    /// A `/v1/responses` result's finish reason, read off what the caller
+    /// received: the streamed frames (armed by the telemetry middleware)
+    /// or a buffered body ([`note_responses_result`]).
+    responses_finish: Option<aisix_obs::ResponsesFinishObserver>,
+    responses_finish_value: Option<Option<&'static str>>,
     /// Upstreams were called outside attempt windows (an ensemble's
     /// concurrent members), so neither the wait nor the "latest response"
     /// can be attributed: no overhead is reported, and an attempt without
@@ -769,6 +774,16 @@ impl RequestAttribution {
         if let Some(collector) = cell.stream_output.as_mut() {
             collector.feed_sse(data);
         }
+        if let Some(observer) = cell.responses_finish.as_mut() {
+            observer.feed_sse(data);
+        }
+    }
+
+    /// Read a streamed `/v1/responses` result's finish reason off the
+    /// frames handed to the caller ([`take_responses_finish`]).
+    pub(crate) fn observe_responses_finish(&self) {
+        self.lock().responses_finish = Some(aisix_obs::ResponsesFinishObserver::default());
+        self.bodies.capturing_output.store(true, Ordering::Relaxed);
     }
 
     pub(crate) fn note_head_written(&self) {
@@ -1497,6 +1512,34 @@ pub(crate) fn take_stream_output() -> Option<aisix_obs::OutputCapture> {
                 .stream_output
                 .take()
                 .map(aisix_obs::OutputCollector::finish)
+        })
+        .ok()
+        .flatten()
+}
+
+/// Note a buffered `/v1/responses` result as the caller receives it, for
+/// the request's terminal usage event's `finish_reason`.
+pub(crate) fn note_responses_result(response: &serde_json::Value) {
+    note_responses_finish(aisix_obs::responses_finish_reason(response));
+}
+
+/// [`note_responses_result`] for a result already read.
+pub(crate) fn note_responses_finish(finish: Option<&'static str>) {
+    let _ = CURRENT.try_with(|a| {
+        a.lock().responses_finish_value = Some(finish);
+    });
+}
+
+/// The finish reason of this request's `/v1/responses` result, buffered or
+/// streamed; `None` when the result named none (or there was none).
+pub(crate) fn take_responses_finish() -> Option<&'static str> {
+    CURRENT
+        .try_with(|a| {
+            let mut cell = a.lock();
+            if let Some(buffered) = cell.responses_finish_value.take() {
+                return buffered;
+            }
+            cell.responses_finish.as_ref().and_then(|o| o.finish())
         })
         .ok()
         .flatten()

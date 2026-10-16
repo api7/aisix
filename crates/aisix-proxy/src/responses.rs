@@ -1852,6 +1852,11 @@ async fn responses_to_target(
                 requested_model,
                 crate::model_echo::responses_snapshot_model,
             );
+            {
+                let mut finish = aisix_obs::ResponsesFinishObserver::default();
+                finish.feed_sse(&buf);
+                crate::attribution::note_responses_finish(finish.finish());
+            }
             // Content capture (AISIX-Cloud#947): the assembled output text,
             // read from the POST-redaction buffer so masked PII stays masked
             // in the exported content.
@@ -2298,6 +2303,7 @@ async fn responses_to_target(
         let mut output_redactions = crate::redact::redact_responses_response(chain, &mut json_body);
         crate::redact::merge_counts(&mut output_redactions, output_seg_counts);
 
+        crate::attribution::note_responses_result(&json_body);
         // Content capture (AISIX-Cloud#947): the assistant's assembled output
         // text, read from the POST-redaction body so masked PII stays masked
         // in the exported content.
@@ -2895,6 +2901,7 @@ async fn responses_cross_provider_to_target(
         created_at,
         &reply,
     );
+    crate::attribution::note_responses_result(&json_body);
     // Content capture (AISIX-Cloud#947): the client-visible Responses JSON
     // (post-redaction) is the source, so the exported text matches what the
     // caller received.
@@ -3892,8 +3899,9 @@ fn apply_passthrough_headers(
 /// Other fields left at `UsageEvent::default()`:
 ///   - cache_creation_tokens / cache_read_tokens — populated only on the
 ///     #825 cross-provider bridge path (Anthropic backends); 0 otherwise
-///   - provider_model_version / finish_reason — not yet plumbed for
-///     non-chat handlers (follow-up)
+///   - provider_model_version — not yet plumbed for non-chat handlers
+///     (follow-up). `finish_reason` is derived from the client-facing
+///     result at the emission chokepoint (`usage_attr::emit_usage`).
 ///   - cost_usd — cp-api computes server-side from pricing catalog
 ///   - cache_status / cache_hit_* / ttft_ms — no caching/streaming
 ///     surface on Responses API non-streaming

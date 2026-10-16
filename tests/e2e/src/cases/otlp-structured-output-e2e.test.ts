@@ -196,6 +196,16 @@ const RESPONSES_STREAM = [
   }),
 ];
 
+const RESPONSES_INCOMPLETE_BODY = {
+  id: "resp_3",
+  object: "response",
+  status: "incomplete",
+  incomplete_details: { reason: "max_output_tokens" },
+  model: "gpt-4o-mini",
+  output: [MESSAGE_ITEM],
+  usage: RESPONSES_USAGE,
+};
+
 const RESPONSES_BODY = {
   id: "resp_2",
   object: "response",
@@ -224,6 +234,7 @@ describe("OTLP output messages keep reasoning, text and tool calls apart", () =>
     upstreams.anthropic = await startOpenAiUpstream({ rawStreamFrames: ANTHROPIC_STREAM });
     upstreams.responsesStream = await startOpenAiUpstream({ rawStreamFrames: RESPONSES_STREAM });
     upstreams.responsesBody = await startOpenAiUpstream({ nonStreamBody: RESPONSES_BODY });
+    upstreams.responsesIncomplete = await startOpenAiUpstream({ nonStreamBody: RESPONSES_INCOMPLETE_BODY });
     otlp = await startMockOtlp();
     sls = await startMockSls();
 
@@ -275,6 +286,7 @@ describe("OTLP output messages keep reasoning, text and tool calls apart", () =>
     });
     await model("so-responses-stream", upstreams.responsesStream);
     await model("so-responses-body", upstreams.responsesBody);
+    await model("so-responses-incomplete", upstreams.responsesIncomplete);
     // No `/v1/responses` on this key: the gateway bridges to chat.
     await model("so-responses-bridged", upstreams.chatStream, { apis: {} });
     await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"] });
@@ -327,13 +339,18 @@ describe("OTLP output messages keep reasoning, text and tool calls apart", () =>
     const messages = JSON.parse(String(span.attributes["gen_ai.output.messages"]));
     expect(messages).toHaveLength(1);
     expect(messages[0].role).toBe("assistant");
-    expect(typeof messages[0].finish_reason).toBe("string");
+    // The conventions' enum, whatever raw value the protocol reported
+    // (`tool_calls`, `tool_use`, or the one derived for Responses).
+    expect(messages[0].finish_reason).toBe("tool_call");
     return messages[0].parts;
   }
 
+  async function slsRow(requestId: string): Promise<Map<string, string>> {
+    return waitForSlsLog(sls!, LOGSTORE, (l) => l.get("request_id") === requestId, "SLS row");
+  }
+
   async function slsResponse(requestId: string): Promise<string | undefined> {
-    const row = await waitForSlsLog(sls!, LOGSTORE, (l) => l.get("request_id") === requestId, "SLS row");
-    return row.get("response");
+    return (await slsRow(requestId)).get("response");
   }
 
   test("chat, streamed: ordered parts, parsed arguments, full tool definitions", async (ctx) => {
@@ -436,6 +453,10 @@ describe("OTLP output messages keep reasoning, text and tool calls apart", () =>
     const span = await operationSpan(requestId);
     expect(outputParts(span)).toEqual(EXPECTED_PARTS);
     expect(String(span.attributes["gen_ai.output.messages"])).not.toContain("ENCRYPTED-REASONING");
+    // A Responses result names no finish reason; the event's is derived
+    // from it in chat's vocabulary, and the span reports that raw value.
+    expect(span.attributes["gen_ai.response.finish_reasons"]).toBe("tool_calls");
+    expect((await slsRow(requestId)).get("finish_reason")).toBe("tool_calls");
     expect(JSON.parse(String(span.attributes["gen_ai.tool.definitions"]))).toEqual([
       {
         type: "function",
@@ -454,6 +475,21 @@ describe("OTLP output messages keep reasoning, text and tool calls apart", () =>
     });
     expect(status).toBe(200);
     expect(outputParts(await operationSpan(requestId))).toEqual(EXPECTED_PARTS);
+    expect((await slsRow(requestId)).get("finish_reason")).toBe("tool_calls");
+  });
+
+  test("responses, incomplete for max_output_tokens: finish_reason length", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const { status, requestId } = await post("/v1/responses", {
+      model: "so-responses-incomplete",
+      input: "weather in Paris?",
+    });
+    expect(status).toBe(200);
+    expect((await slsRow(requestId)).get("finish_reason")).toBe("length");
+    const span = await operationSpan(requestId);
+    const messages = JSON.parse(String(span.attributes["gen_ai.output.messages"]));
+    expect(messages[0].finish_reason).toBe("length");
+    expect(messages[0].parts).toEqual([{ type: "text", content: ANSWER }]);
   });
 
   test("responses, bridged stream from a chat upstream", async (ctx) => {
@@ -466,5 +502,6 @@ describe("OTLP output messages keep reasoning, text and tool calls apart", () =>
     });
     expect(status).toBe(200);
     expect(outputParts(await operationSpan(requestId))).toEqual(EXPECTED_PARTS);
+    expect((await slsRow(requestId)).get("finish_reason")).toBe("tool_calls");
   });
 });

@@ -1036,6 +1036,13 @@ pub(crate) fn emit_usage(
         attach_gateway_embedding_audit(&mut event);
     }
     stamp_latency_breakdown(&mut event, terminal);
+    // A Responses result carries no finish reason of its own; it is derived
+    // from what the caller received, native or bridged alike.
+    if terminal && surface.operation == crate::operation::RESPONSES.operation {
+        if let Some(finish) = crate::attribution::take_responses_finish() {
+            event.finish_reason = finish.to_string();
+        }
+    }
     // A surface that runs detached from the request scope (`/v1/realtime`)
     // read its own off the upgrade response.
     if dispatched && event.upstream_response_headers.is_empty() {

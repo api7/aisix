@@ -457,12 +457,43 @@ pub fn structured_content(
             json!([{
                 "role": "assistant",
                 "parts": parts,
-                "finish_reason": finish_reason,
+                "finish_reason": otel_finish_reason(finish_reason),
             }])
             .to_string(),
         );
     }
     out
+}
+
+/// The GenAI conventions' finish-reason enum (v1.41
+/// `gen-ai-output-messages.json`: `stop`, `length`, `content_filter`,
+/// `tool_call`, `error`) for a raw reason any protocol the gateway speaks
+/// reports: OpenAI chat and the Responses-derived values, Anthropic's
+/// `stop_reason`, Gemini / Vertex `finishReason`, Bedrock Converse
+/// `stopReason`. Compared case-insensitively; an unrecognised value is
+/// `stop`, the generation having ended without a stated cause. Only the
+/// output message speaks the enum — `gen_ai.response.finish_reasons` and
+/// the usage event keep the raw value.
+pub fn otel_finish_reason(raw: &str) -> &'static str {
+    match raw.to_ascii_lowercase().as_str() {
+        "tool_calls" | "tool_call" | "function_call" | "tool_use" => "tool_call",
+        "length" | "max_tokens" | "max_output_tokens" | "model_context_window_exceeded" => "length",
+        "content_filter"
+        | "content_filtered"
+        | "refusal"
+        | "safety"
+        | "recitation"
+        | "blocklist"
+        | "prohibited_content"
+        | "spii"
+        | "image_safety"
+        | "language"
+        | "guardrail_intervened" => "content_filter",
+        "malformed_function_call" | "unexpected_tool_call" | "too_many_tool_calls" | "error" => {
+            "error"
+        }
+        _ => "stop",
+    }
 }
 
 type Converted = (Vec<Value>, Option<Vec<Value>>, Option<Vec<Value>>);
@@ -811,6 +842,37 @@ mod tests {
     }
 
     #[test]
+    fn finish_reasons_normalize_onto_the_conventions_enum() {
+        for (raw, expected) in [
+            ("stop", "stop"),
+            ("end_turn", "stop"),
+            ("stop_sequence", "stop"),
+            ("STOP", "stop"),
+            ("pause_turn", "stop"),
+            ("OTHER", "stop"),
+            ("something-new", "stop"),
+            ("length", "length"),
+            ("max_tokens", "length"),
+            ("MAX_TOKENS", "length"),
+            ("model_context_window_exceeded", "length"),
+            ("tool_calls", "tool_call"),
+            ("function_call", "tool_call"),
+            ("tool_use", "tool_call"),
+            ("content_filter", "content_filter"),
+            ("content_filtered", "content_filter"),
+            ("refusal", "content_filter"),
+            ("SAFETY", "content_filter"),
+            ("RECITATION", "content_filter"),
+            ("PROHIBITED_CONTENT", "content_filter"),
+            ("guardrail_intervened", "content_filter"),
+            ("MALFORMED_FUNCTION_CALL", "error"),
+            ("UNEXPECTED_TOOL_CALL", "error"),
+        ] {
+            assert_eq!(otel_finish_reason(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
     fn provider_name_prefers_the_hosting_platform_then_the_vendor() {
         use aisix_core::Adapter;
         assert_eq!(
@@ -978,7 +1040,7 @@ mod tests {
             Some(r#"[{"name":"get_weather","parameters":{},"type":"function"}]"#)
         );
         let output: Value = serde_json::from_str(c.output_messages.as_deref().unwrap()).unwrap();
-        assert_eq!(output[0]["finish_reason"], "end_turn");
+        assert_eq!(output[0]["finish_reason"], "stop");
     }
 
     #[test]

@@ -432,8 +432,14 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider_model_version: String,
 
-    /// finish_reason / stop_reason from the upstream response. Empty
+    /// finish_reason / stop_reason from the upstream response, raw. Empty
     /// for upstream errors and guardrail blocks.
+    ///
+    /// A `/v1/responses` result names none, so its terminal event carries
+    /// one derived from the result the caller received, in OpenAI chat's
+    /// vocabulary: `completed` is `tool_calls` when the output asks for a
+    /// tool and `stop` otherwise; `incomplete` is `content_filter` or
+    /// `length`; any other status leaves it empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub finish_reason: String,
 
