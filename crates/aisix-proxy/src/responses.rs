@@ -4310,7 +4310,11 @@ mod tests {
             "type": "response.failed",
             "response": {"id": "resp_1", "error": {"code": "server_error", "message": "late boom"}},
         });
-        for (event, message) in [(flat, "boom"), (nested, "nested boom"), (failed, "late boom")] {
+        for (event, message) in [
+            (flat, "boom"),
+            (nested, "nested boom"),
+            (failed, "late boom"),
+        ] {
             let err = super::responses_in_band_error(&event).expect("a failure event");
             assert_eq!(err.http_status(), 502);
             assert_eq!(
