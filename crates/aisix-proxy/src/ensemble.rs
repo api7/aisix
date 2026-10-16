@@ -222,9 +222,13 @@ impl ModelCaller for ProxyModelCaller<'_> {
             &response.usage,
             &crate::chat::estimation_output_text(&response),
         );
-        reservation
-            .commit_tokens(u64::from(effective.usage.total_tokens))
-            .await;
+        // Synchronous, so nothing between the upstream answering and the
+        // executor recording this sub-call can be cancelled.
+        crate::chat::charge_reservation_now(
+            self.state,
+            reservation,
+            u64::from(effective.usage.total_tokens),
+        );
         Ok(ModelCallOutcome {
             response,
             effective_usage: effective.usage,
@@ -284,7 +288,17 @@ pub struct EnsembleProgress {
 struct ProgressInner {
     /// `(slot in the configured panel, outcome)`, in completion order.
     panel: Vec<(usize, PanelOutcome)>,
-    judge: Option<PanelOutcome>,
+    judge: Option<JudgeReturn>,
+}
+
+/// A judge call that returned: its accounting plus the response identity its
+/// usage row reports.
+#[derive(Debug)]
+pub(crate) struct JudgeReturn {
+    pub outcome: PanelOutcome,
+    pub response_id: String,
+    pub response_model: String,
+    pub finish_reason: aisix_gateway::FinishReason,
 }
 
 impl EnsembleProgress {
@@ -292,14 +306,18 @@ impl EnsembleProgress {
         self.inner.lock().unwrap().panel.push((slot, outcome));
     }
 
-    fn record_judge(&self, outcome: PanelOutcome) {
-        self.inner.lock().unwrap().judge = Some(outcome);
+    fn record_judge(&self, model: &str, judge: &ModelCallOutcome) {
+        self.inner.lock().unwrap().judge = Some(JudgeReturn {
+            outcome: PanelOutcome::of(model, judge),
+            response_id: judge.response.id.clone(),
+            response_model: judge.response.model.clone(),
+            finish_reason: judge.response.finish_reason.clone(),
+        });
     }
 
     /// The panel members that returned, in configured order, and the judge
-    /// if it returned. `PanelOutcome::model` names the judge model for the
-    /// judge entry.
-    pub(crate) fn take(&self) -> (Vec<PanelOutcome>, Option<PanelOutcome>) {
+    /// if it returned.
+    pub(crate) fn take(&self) -> (Vec<PanelOutcome>, Option<JudgeReturn>) {
         let mut inner = self.inner.lock().unwrap();
         let mut panel = std::mem::take(&mut inner.panel);
         panel.sort_by_key(|(slot, _)| *slot);
@@ -457,7 +475,7 @@ pub async fn run_ensemble(
         // failure so the dispatch layer commits + emits them too.
         Err(source) => return Err(EnsembleError::Judge { source, panel }),
     };
-    progress.record_judge(PanelOutcome::of(&config.judge.model, &judge));
+    progress.record_judge(&config.judge.model, &judge);
 
     Ok(EnsembleOutcome {
         response: judge.response,

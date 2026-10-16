@@ -3789,65 +3789,41 @@ async fn dispatch_ensemble(
                 estimated: member.usage_estimated,
             }
         };
+    let row_ctx = EnsembleRowCtx {
+        request_id: request_id.to_string(),
+        client_model: req.model.clone(),
+        api_key_id: api_key_id.to_string(),
+        applied_guardrails: applied_guardrails.to_vec(),
+        audit: audit.clone(),
+        client: client.clone(),
+        started,
+    };
     // Emit one usage event for a single (already-billed) panel member.
     // Defined before the `run_ensemble` match so the InsufficientPanel arm
     // can bill the survivors too — they hit upstream just like a full panel.
     // `bypass` is passed per call (not captured) so the closure holds no
     // borrow of the mutable `bypass_reason`. `attempt_index` is the member's
     // 0-based slot; `blocked` sets the event's `guardrail_blocked` flag.
-    let emit_panel_member = |member: &crate::ensemble::PanelOutcome,
-                             index: usize,
-                             prepared: Option<&EffectiveSubcallUsage>,
-                             blocked: bool,
-                             bypass: &str| {
-        let (sub_model_id, sub_provider_key_id, _) = resolve_sub(&member.model);
-        let computed;
-        let effective = match prepared {
-            Some(usage) => usage,
-            None => {
-                computed = effective_panel_member_usage(member);
-                &computed
-            }
-        };
-        let pk = crate::usage_attr::ResolvedPk::resolve(snapshot, &sub_provider_key_id);
-        emit_usage_event(
-            state,
-            snapshot,
-            &pk,
-            request_id,
-            &sub_model_id,
-            &req.model,
-            api_key_id,
-            200,
-            started.elapsed(),
-            effective.usage.prompt_tokens,
-            effective.usage.completion_tokens,
-            UsageExtras {
-                cached_prompt_tokens: effective.usage.cached_prompt_tokens,
-                cache_write_tokens: effective.usage.cache_write_tokens,
-                reasoning_tokens: effective.usage.reasoning_tokens,
-                upstream_total_tokens: effective.usage.upstream_total_tokens,
-                reasoning_folded_into_completion: effective.usage.reasoning_folded_into_completion,
-                cache_creation_tokens: effective.usage.cache_creation_tokens,
-                cache_read_tokens: effective.usage.cache_read_tokens,
-                usage_estimated: effective.estimated,
-                bypass_reason: bypass.to_string(),
-                cache_status: CacheStatus::Disabled.as_str().to_string(),
-                attempt_index: index as u32,
-                attempt_kind: "panel".to_string(),
+    let emit_panel_member =
+        |member: &crate::ensemble::PanelOutcome, index: usize, blocked: bool, bypass: &str| {
+            let (model_id, provider_key_id, _) = resolve_sub(&member.model);
+            EnsembleSubcall {
+                model_id,
+                provider_key_id,
                 attempt_model: member.model.clone(),
-                applied_guardrails: applied_guardrails.to_vec(),
-                ..UsageExtras::default()
-            },
-            /* cost_usd */ 0.0,
-            blocked,
-            client,
-            /* content */ None,
-            /* terminal */ false,
-            /* dispatched */ true,
-            audit,
-        );
-    };
+                usage: member.effective_usage.clone(),
+                usage_estimated: member.usage_estimated,
+            }
+            .emit(
+                state,
+                snapshot,
+                &row_ctx,
+                "panel",
+                index as u32,
+                blocked,
+                bypass,
+            );
+        };
     // Failure exits bill every successful panel member even when the
     // upstream omitted usage. Share the same normalized accounting used by
     // UsageEvent emission so quota and telemetry cannot diverge.
@@ -3870,15 +3846,6 @@ async fn dispatch_ensemble(
         },
     };
 
-    let row_ctx = EnsembleRowCtx {
-        request_id: request_id.to_string(),
-        client_model: req.model.clone(),
-        api_key_id: api_key_id.to_string(),
-        applied_guardrails: applied_guardrails.to_vec(),
-        audit: audit.clone(),
-        client: client.clone(),
-        started,
-    };
     // Until the run's own exits settle it, a dropped handler leaves the
     // sub-calls that already returned to this guard.
     let mut abandoned = AbandonedEnsemble {
@@ -3887,6 +3854,9 @@ async fn dispatch_ensemble(
         entry_keys: reservation.keys(),
         stream: req.is_streaming(),
         progress: crate::ensemble::EnsembleProgress::default(),
+        bypass: bypass_reason.clone().unwrap_or_default(),
+        input_redactions: input_redactions.clone(),
+        input_monitor_hits: input_monitor_hits.clone(),
         tokens_owed: true,
         armed: true,
     };
@@ -3906,21 +3876,13 @@ async fn dispatch_ensemble(
         // `panel_rows` below owns its rows). Every surviving panel member
         // round-tripped an upstream and must be billed, exactly like the
         // non-streaming error paths. `charge: None` — the per-member events
-        // already carry the bill.
-        //
-        // The token commit is NOT done here: `MultiReservation::commit_tokens`
-        // is async (#607's cluster-Redis path), and this helper is sync so
-        // `emit_panel_member` stays callable across every exit. Each call site
-        // emits through this FIRST and then `.await`s the commit, so a caller
-        // that leaves during the commit does not take the rows with it.
-        // `panel` is borrowed so the call site still owns it to compute
-        // `survivor_total`.
+        // already carry the bill. `panel` is borrowed so the call site still
+        // owns it to compute `survivor_total` for `charge_reservation_now`.
+        let input_bypass = bypass_reason.as_deref().unwrap_or_default();
         let emit_panel_then_fail =
             |panel: &[crate::ensemble::PanelOutcome], proxy_err: ProxyError| -> DispatchFailure {
                 for (index, member) in panel.iter().enumerate() {
-                    emit_panel_member(
-                        member, index, None, /* blocked */ false, /* bypass */ "",
-                    );
+                    emit_panel_member(member, index, /* blocked */ false, input_bypass);
                 }
                 DispatchFailure::new(Some(model_id.to_string()), None, proxy_err)
             };
@@ -3944,14 +3906,14 @@ async fn dispatch_ensemble(
                         "ensemble panel did not reach the required number of responses",
                     )),
                 );
-                reservation.commit_tokens(survivor_total(&panel)).await;
+                charge_reservation_now(state, reservation, survivor_total(&panel));
                 return Err(failure);
             }
             // `run_ensemble_panel` never returns `Judge` (it stops before
             // the judge call), but the enum is non-exhaustive to us here.
             Err(crate::ensemble::EnsembleError::Judge { panel, source }) => {
                 let failure = emit_panel_then_fail(&panel, ProxyError::Bridge(source));
-                reservation.commit_tokens(survivor_total(&panel)).await;
+                charge_reservation_now(state, reservation, survivor_total(&panel));
                 return Err(failure);
             }
         };
@@ -4016,7 +3978,7 @@ async fn dispatch_ensemble(
         // panel + fail rather than panic if the entry vanished mid-request.
         let Some(judge_entry) = snapshot.models.get_by_name(&ensemble_cfg.judge.model) else {
             panel_rows.rows_only(/* blocked */ false, 0);
-            reservation.commit_tokens(panel_total).await;
+            charge_reservation_now(state, reservation, panel_total);
             return Err(with_model(ProxyError::Bridge(
                 BridgeError::InvalidUpstreamConfig(
                     "ensemble judge references an unknown model".into(),
@@ -4041,7 +4003,7 @@ async fn dispatch_ensemble(
             Err(e) => {
                 tracing::warn!(error = %e, "ensemble judge provider key unresolved");
                 panel_rows.rows_only(/* blocked */ false, 0);
-                reservation.commit_tokens(panel_total).await;
+                charge_reservation_now(state, reservation, panel_total);
                 return Err(with_model(ProxyError::Bridge(
                     BridgeError::InvalidUpstreamConfig(
                         "ensemble judge has an unresolved provider key".into(),
@@ -4052,7 +4014,7 @@ async fn dispatch_ensemble(
         let Some(judge_bridge) = crate::dispatch::resolve_bridge(&state.hub, &judge_pk.value)
         else {
             panel_rows.rows_only(/* blocked */ false, 0);
-            reservation.commit_tokens(panel_total).await;
+            charge_reservation_now(state, reservation, panel_total);
             return Err(with_model(ProxyError::Bridge(BridgeError::Config(
                 "ensemble judge has no registered bridge".into(),
             ))));
@@ -4096,7 +4058,7 @@ async fn dispatch_ensemble(
             Ok(r) => r,
             Err(_) => {
                 panel_rows.rows_only(/* blocked */ false, 0);
-                reservation.commit_tokens(panel_total).await;
+                charge_reservation_now(state, reservation, panel_total);
                 return Err(with_model(ProxyError::Bridge(
                     BridgeError::upstream_status(429, "rate limit exceeded for the ensemble judge"),
                 )));
@@ -4117,7 +4079,7 @@ async fn dispatch_ensemble(
             // then surface the bridge error (5xx → 502, 4xx preserved).
             Err(be) => {
                 panel_rows.rows_only(/* blocked */ false, 0);
-                reservation.commit_tokens(panel_total).await;
+                charge_reservation_now(state, reservation, panel_total);
                 return Err(with_model(ProxyError::Bridge(be)));
             }
         };
@@ -4379,11 +4341,10 @@ async fn dispatch_ensemble(
                     )),
                 ),
             };
-            reservation.commit_tokens(survivor_total(&panel)).await;
+            charge_reservation_now(state, reservation, survivor_total(&panel));
+            let input_bypass = bypass_reason.as_deref().unwrap_or_default();
             for (index, member) in panel.iter().enumerate() {
-                emit_panel_member(
-                    member, index, None, /* blocked */ false, /* bypass */ "",
-                );
+                emit_panel_member(member, index, /* blocked */ false, input_bypass);
             }
             return Err(DispatchFailure::new(
                 Some(model_id.to_string()),
@@ -4411,10 +4372,8 @@ async fn dispatch_ensemble(
         .map(|u| u64::from(u.usage.total_tokens))
         .sum();
     let total_tokens = panel_total + u64::from(effective_judge.usage.total_tokens);
-    // Cleared ahead of the await: a caller leaving mid-commit may leave the
-    // entry layers short, never charged twice.
     abandoned.tokens_owed = false;
-    reservation.commit_tokens(total_tokens).await;
+    charge_reservation_now(state, reservation, total_tokens);
 
     // Emit one usage event per sub-call (each panel member + the judge),
     // all sharing `request_id`. `attempt_kind` is `"panel"` / `"judge"`;
@@ -4437,13 +4396,7 @@ async fn dispatch_ensemble(
                          hits: &[aisix_core::GuardrailMonitorHit],
                          terminal_judge: bool| {
         for (index, member) in outcome.panel.iter().enumerate() {
-            emit_panel_member(
-                member,
-                index,
-                Some(&effective_panel[index]),
-                blocked,
-                bypass,
-            );
+            emit_panel_member(member, index, blocked, bypass);
         }
         let (judge_model_id, judge_provider_key_id, _) = resolve_sub(&outcome.judge_model);
         let judge_pk = crate::usage_attr::ResolvedPk::resolve(snapshot, &judge_provider_key_id);
@@ -5371,6 +5324,22 @@ struct StreamGuardrailContext {
     model_name: String,
 }
 
+/// Charge `tokens` to every layer of an ensemble reservation and release it,
+/// synchronously: `MultiReservation::commit_tokens` commits layer by layer
+/// across awaits, so a caller leaving part-way would leave the later layers
+/// uncharged, and no ensemble step may yield between a sub-call returning and
+/// it being charged and recorded.
+pub(crate) fn charge_reservation_now(
+    state: &ProxyState,
+    reservation: aisix_ratelimit::MultiReservation,
+    tokens: u64,
+) {
+    for key in reservation.keys() {
+        state.limiter.add_tokens_post_stream(&key, tokens);
+    }
+    drop(reservation);
+}
+
 /// The request-scoped inputs every ensemble sub-call row carries, owned so
 /// they can outlive the dispatch frame (a stream's completion, a guard that
 /// fires on drop).
@@ -5426,6 +5395,44 @@ impl EnsembleSubcall {
         blocked: bool,
         bypass: &str,
     ) {
+        let extras = self.extras(ctx, attempt_kind, attempt_index, bypass);
+        self.emit_extras(state, snap, ctx, extras, blocked);
+    }
+
+    fn extras(
+        &self,
+        ctx: &EnsembleRowCtx,
+        attempt_kind: &str,
+        attempt_index: u32,
+        bypass: &str,
+    ) -> UsageExtras {
+        UsageExtras {
+            cached_prompt_tokens: self.usage.cached_prompt_tokens,
+            cache_write_tokens: self.usage.cache_write_tokens,
+            reasoning_tokens: self.usage.reasoning_tokens,
+            upstream_total_tokens: self.usage.upstream_total_tokens,
+            reasoning_folded_into_completion: self.usage.reasoning_folded_into_completion,
+            cache_creation_tokens: self.usage.cache_creation_tokens,
+            cache_read_tokens: self.usage.cache_read_tokens,
+            usage_estimated: self.usage_estimated,
+            bypass_reason: bypass.to_string(),
+            cache_status: CacheStatus::Disabled.as_str().to_string(),
+            attempt_index,
+            attempt_kind: attempt_kind.to_string(),
+            attempt_model: self.attempt_model.clone(),
+            applied_guardrails: ctx.applied_guardrails.clone(),
+            ..UsageExtras::default()
+        }
+    }
+
+    fn emit_extras(
+        &self,
+        state: &ProxyState,
+        snap: &AisixSnapshot,
+        ctx: &EnsembleRowCtx,
+        extras: UsageExtras,
+        blocked: bool,
+    ) {
         let pk = crate::usage_attr::ResolvedPk::resolve(snap, &self.provider_key_id);
         emit_usage_event(
             state,
@@ -5439,23 +5446,7 @@ impl EnsembleSubcall {
             ctx.started.elapsed(),
             self.usage.prompt_tokens,
             self.usage.completion_tokens,
-            UsageExtras {
-                cached_prompt_tokens: self.usage.cached_prompt_tokens,
-                cache_write_tokens: self.usage.cache_write_tokens,
-                reasoning_tokens: self.usage.reasoning_tokens,
-                upstream_total_tokens: self.usage.upstream_total_tokens,
-                reasoning_folded_into_completion: self.usage.reasoning_folded_into_completion,
-                cache_creation_tokens: self.usage.cache_creation_tokens,
-                cache_read_tokens: self.usage.cache_read_tokens,
-                usage_estimated: self.usage_estimated,
-                bypass_reason: bypass.to_string(),
-                cache_status: CacheStatus::Disabled.as_str().to_string(),
-                attempt_index,
-                attempt_kind: attempt_kind.to_string(),
-                attempt_model: self.attempt_model.clone(),
-                applied_guardrails: ctx.applied_guardrails.clone(),
-                ..UsageExtras::default()
-            },
+            extras,
             /* cost_usd */ 0.0,
             blocked,
             &ctx.client,
@@ -5737,7 +5728,13 @@ struct AbandonedEnsemble<'a> {
     entry_keys: Vec<String>,
     stream: bool,
     progress: crate::ensemble::EnsembleProgress,
-    /// Cleared once the run has committed its tokens to the entry layers.
+    /// The input guardrail's fail-open reason, which every sub-call row of
+    /// the request carries.
+    bypass: String,
+    /// Input-side mask counts and monitor hits, which ride the judge row.
+    input_redactions: crate::redact::RedactionCounts,
+    input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// Cleared once the run has charged its tokens to the entry layers.
     tokens_owed: bool,
     armed: bool,
 }
@@ -5750,20 +5747,38 @@ impl Drop for AbandonedEnsemble<'_> {
         let snap = self.state.snapshot.load();
         let (panel, judge) = self.progress.take();
         let mut usage = aisix_gateway::chat::UsageStats::default();
-        let rows = panel
-            .into_iter()
-            .map(|outcome| ("panel", outcome))
-            .chain(judge.map(|outcome| ("judge", outcome)));
-        for (kind, outcome) in rows {
+        for outcome in panel {
             usage = usage.saturating_add(&outcome.effective_usage);
             EnsembleSubcall::resolve(&snap, outcome).emit(
                 self.state,
                 &snap,
                 &self.ctx,
-                kind,
+                "panel",
                 crate::attribution::next_attempt_index(),
                 /* blocked */ false,
-                /* bypass */ "",
+                &self.bypass,
+            );
+        }
+        if let Some(judge) = judge {
+            usage = usage.saturating_add(&judge.outcome.effective_usage);
+            let sub = EnsembleSubcall::resolve(&snap, judge.outcome);
+            let extras = UsageExtras {
+                provider_request_id: crate::usage_attr::sanitize_provider_response_id(
+                    &judge.response_id,
+                ),
+                provider_model_version: judge.response_model,
+                finish_reason: finish_reason_label(&judge.finish_reason),
+                redacted_entity_counts: std::mem::take(&mut self.input_redactions),
+                guardrail_monitor_hits: std::mem::take(&mut self.input_monitor_hits),
+                ..sub.extras(
+                    &self.ctx,
+                    "judge",
+                    crate::attribution::next_attempt_index(),
+                    &self.bypass,
+                )
+            };
+            sub.emit_extras(
+                self.state, &snap, &self.ctx, extras, /* blocked */ false,
             );
         }
         let charge = EnsembleCharge::new(

@@ -11987,6 +11987,7 @@ data: [DONE]\n\n";
         let kinds: Vec<&str> = events.iter().map(|e| e.attempt_kind.as_str()).collect();
         assert_eq!(kinds, ["panel", "panel", "judge", ""], "{events:?}");
         assert_eq!(events[2].prompt_tokens, 30, "{events:?}");
+        assert_eq!(events[2].provider_request_id, "cmpl-judge", "{events:?}");
         assert_eq!(events[3].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
         assert_attempt_indices_increase(&events);
         assert_council_charged(&state, app, 69).await;
