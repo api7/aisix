@@ -974,10 +974,16 @@ async fn dispatch(
     let sent = match exchange_timeout {
         Some(d) => match tokio::time::timeout(d, send_fut).await {
             Ok(r) => r,
-            Err(_) => return Err(RouteError::of(ProxyError::Bridge(bridge_timeout(d)), &auth)),
+            Err(_) => {
+                crate::attribution::note_upstream_wait_end(false);
+                return Err(RouteError::of(ProxyError::Bridge(bridge_timeout(d)), &auth));
+            }
         },
         None => send_fut.await,
     };
+    if sent.is_err() {
+        crate::attribution::note_upstream_wait_end(false);
+    }
     let upstream_resp = sent.map_err(|e| {
         RouteError::of(
             ProxyError::Bridge(crate::dispatch::reqwest_error_to_bridge(&e, started)),

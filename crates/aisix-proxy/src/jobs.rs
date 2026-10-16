@@ -412,9 +412,11 @@ async fn send_upstream(
     }
 
     crate::attribution::note_upstream_wait_begin();
-    let resp = builder
-        .send()
-        .await
+    let sent = builder.send().await;
+    if sent.is_err() {
+        crate::attribution::note_upstream_wait_end(false);
+    }
+    let resp = sent
         .map_err(|e| {
             crate::cooldown::note_failure(
                 &state.runtime_status,

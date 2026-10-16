@@ -2614,6 +2614,7 @@ async fn cross_provider_dispatch(
     // Capture the prompt (the Anthropic request body) + assembled assistant
     // text for content-capturing exporters (gated); threaded to `fan_out` via
     // `DispatchOutcome`, never to the CP sink.
+    let json = chat_response_into_anthropic_json(&resp, model_name);
     let captured_content = content_capture_cap(
         snapshot
             .observability_exporters
@@ -2630,10 +2631,9 @@ async fn cross_provider_dispatch(
         .with_output(Some(aisix_obs::OutputCollector::from_body(
             aisix_obs::OutputWire::AnthropicMessages,
             cap as usize,
-            &chat_response_into_anthropic_json(&resp, model_name),
+            &json,
         )))
     });
-    let json = chat_response_into_anthropic_json(&resp, model_name);
     Ok(DispatchOutcome {
         response: Json(json).into_response(),
         provider_label,
