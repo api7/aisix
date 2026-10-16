@@ -29,6 +29,7 @@ pub use datadog::{resolve_datadog_credential, DatadogSink};
 pub use manager::ExporterPipelines;
 pub use object_store::{build_object_store_sink, ObjectStoreSink};
 pub use pipeline::{PipelineConfig, SinkHandle, SinkPipeline, SinkStatsSnapshot};
+pub(crate) use record::is_mcp;
 pub use record::{CapturedContent, EventBatch, SinkContent, SinkRecord, SCHEMA_VERSION};
 pub use redact::ErrorRedactor;
 pub use sls::{resolve_sls_credential, AliyunSlsSink};

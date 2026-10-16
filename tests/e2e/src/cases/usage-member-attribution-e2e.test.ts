@@ -227,7 +227,7 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
     const log = await waitForSlsLog(
       sls,
       LOGSTORE,
-      (l) => (l.get("prompt") ?? "").includes(marker),
+      (l) => (l.get("input_messages") ?? "").includes(marker),
       "api-key usage row",
     );
     expect(log.get("user_id")).toBe(ALICE);
@@ -245,7 +245,7 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
     const log = await waitForSlsLog(
       sls,
       LOGSTORE,
-      (l) => (l.get("prompt") ?? "").includes(marker),
+      (l) => (l.get("input_messages") ?? "").includes(marker),
       "jwt usage row",
     );
     // Same person, different credential: this is what a query-time join on
@@ -266,7 +266,7 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
     const log = await waitForSlsLog(
       sls,
       LOGSTORE,
-      (l) => (l.get("prompt") ?? "").includes(marker),
+      (l) => (l.get("input_messages") ?? "").includes(marker),
       "unowned-key usage row",
     );
     // Absent, not a placeholder: a member filter must not sweep up traffic
@@ -310,7 +310,7 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
     const log = await waitForSlsLog(
       sls,
       LOGSTORE,
-      (l) => (l.get("prompt") ?? "").includes("uma-gw429-refused"),
+      (l) => (l.get("input_messages") ?? "").includes("uma-gw429-refused"),
       "gateway-throttled usage row",
     );
     expect(log.get("status_code")).toBe("429");
@@ -345,7 +345,7 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
     const log = await waitForSlsLog(
       sls,
       LOGSTORE,
-      (l) => (l.get("prompt") ?? "").includes(marker),
+      (l) => (l.get("input_messages") ?? "").includes(marker),
       "throttled usage row",
     );
     expect(log.get("user_id")).toBe(ALICE);

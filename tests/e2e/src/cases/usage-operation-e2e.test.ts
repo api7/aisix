@@ -375,8 +375,9 @@ describe("usage operation e2e (AISIX-Cloud#1461)", () => {
       // metadata_only means metadata only — the classification rode along
       // without turning the exporter into a content sink.
       for (const row of [chatRow, responsesRow, speechRow, videoRow]) {
-        expect(row.has("prompt")).toBe(false);
-        expect(row.has("response")).toBe(false);
+        for (const field of ["prompt", "response", "input_messages", "output_messages"]) {
+          expect(row.has(field)).toBe(false);
+        }
       }
 
       // --- a refusal reports what was ASKED for --------------------------

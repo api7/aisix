@@ -203,7 +203,7 @@ describe("guardrail_blocked e2e: a /v1/responses refusal reaches the Blocked vie
       const log = await waitForSlsLog(
         sls,
         LOGSTORE,
-        (l) => (l.get("prompt") ?? "").includes(marker),
+        (l) => (l.get("input_messages") ?? "").includes(marker),
         `${model} stream=${stream} usage row`,
       );
       // …and the Blocked view's predicate finds it.
@@ -219,7 +219,7 @@ describe("guardrail_blocked e2e: a /v1/responses refusal reaches the Blocked vie
       // target is contacted, so a group parent must not also emit a
       // per-attempt row.
       const rows = slsLogsFor(sls, LOGSTORE).filter((l) =>
-        (l.get("prompt") ?? "").includes(marker),
+        (l.get("input_messages") ?? "").includes(marker),
       );
       expect(rows).toHaveLength(1);
     });
@@ -237,7 +237,7 @@ describe("guardrail_blocked e2e: a /v1/responses refusal reaches the Blocked vie
     const log = await waitForSlsLog(
       sls,
       LOGSTORE,
-      (l) => (l.get("prompt") ?? "").includes(marker),
+      (l) => (l.get("input_messages") ?? "").includes(marker),
       "allowed request usage row",
     );
     expect(log.get("guardrail_blocked")).not.toBe("true");

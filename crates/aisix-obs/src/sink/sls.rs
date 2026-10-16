@@ -262,12 +262,30 @@ fn to_log(record: &SinkRecord) -> Result<Log, SinkError> {
         }
     }
 
-    // Opt-in captured content as flat, queryable fields (the SLS customer case
-    // wants prompt / response columns, not a nested blob). Absent on the
+    // Opt-in captured content, one field per piece: the GenAI conventions'
+    // structured messages as compact JSON strings, and a side that could not
+    // be structured as flat `prompt` / `response` text. Absent on the
     // default metadata-only path, so prompts never leak there.
     if let Some(content) = &record.content {
-        log.add_content_kv("prompt", content.prompt.as_str());
-        log.add_content_kv("response", content.response.as_str());
+        let enc = content.encode(&record.usage);
+        for (key, value) in [
+            ("input_messages", enc.structured.input_messages.as_deref()),
+            (
+                "system_instructions",
+                enc.structured.system_instructions.as_deref(),
+            ),
+            (
+                "tool_definitions",
+                enc.structured.tool_definitions.as_deref(),
+            ),
+            ("output_messages", enc.structured.output_messages.as_deref()),
+            ("prompt", enc.raw_prompt.or(enc.tool_call_arguments)),
+            ("response", enc.raw_response.or(enc.tool_call_result)),
+        ] {
+            if let Some(value) = value {
+                log.add_content_kv(key, value);
+            }
+        }
         if content.truncated {
             log.add_content_kv("content_truncated", "true");
         }
@@ -603,10 +621,11 @@ mod tests {
     }
 
     /// The exporter's selected headers ride beside the usage fields, and a
-    /// record carrying structured output parts encodes its content exactly
-    /// as a flat one does.
+    /// complete chat capture is reported as the GenAI conventions'
+    /// structured messages, each a compact JSON string, with no flat
+    /// prompt/response.
     #[tokio::test]
-    async fn selected_headers_ride_the_log_and_content_stays_flat() {
+    async fn selected_headers_ride_the_log_and_content_is_structured() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
@@ -624,6 +643,8 @@ mod tests {
         let record = SinkRecord::metadata_only(UsageEvent {
             request_id: "req-headers".into(),
             status_code: 200,
+            operation: "chat".into(),
+            finish_reason: "stop".into(),
             api_key_name: "key-a".into(),
             request_headers: [
                 ("x-sub-user".to_string(), "alice".to_string()),
@@ -635,7 +656,11 @@ mod tests {
         })
         .with_exporter_headers(&["x-sub-user".to_string()], &["x-upstream-id".to_string()])
         .with_content(SinkContent {
-            prompt: "what is 2+2?".into(),
+            prompt: serde_json::json!({"model": "m",
+                "messages": [{"role": "user", "content": "what is 2+2?"}],
+                "tools": [{"type": "function", "function": {"name": "add",
+                    "description": "Add", "parameters": {"type": "object"}}}]})
+            .to_string(),
             response: "4".into(),
             truncated: false,
             prompt_truncated: false,
@@ -663,15 +688,38 @@ mod tests {
             contents.get("api_key_name").map(String::as_str),
             Some("key-a")
         );
-        // The flat content is what it always was: the structured parts
-        // ride OTLP only.
-        assert_eq!(contents.get("response").map(String::as_str), Some("4"));
-        assert!(!contents.values().any(|v| v.contains("pondering")));
+        let json = |key: &str| -> serde_json::Value {
+            serde_json::from_str(contents.get(key).expect(key)).unwrap()
+        };
+        assert_eq!(
+            json("input_messages"),
+            serde_json::json!([{"role": "user",
+                "parts": [{"type": "text", "content": "what is 2+2?"}]}])
+        );
+        assert_eq!(
+            json("tool_definitions"),
+            serde_json::json!([{"type": "function", "name": "add",
+                "description": "Add", "parameters": {"type": "object"}}])
+        );
+        assert_eq!(
+            json("output_messages"),
+            serde_json::json!([{"role": "assistant", "finish_reason": "stop", "parts": [
+                {"type": "reasoning", "content": "pondering"},
+                {"type": "text", "content": "4"},
+            ]}])
+        );
+        // Chat keeps its system message inside `input_messages`.
+        assert!(!contents.contains_key("system_instructions"));
+        assert!(!contents.contains_key("prompt"));
+        assert!(!contents.contains_key("response"));
+        assert!(!contents.contains_key("content_truncated"));
         assert!(!String::from_utf8_lossy(&requests[0].body).contains("x-department"));
     }
 
+    /// A side the cap cut stays flat text with the truncated marker; the
+    /// other side is still structured.
     #[tokio::test]
-    async fn full_content_record_emits_prompt_and_response() {
+    async fn truncated_side_falls_back_to_flat_text() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
@@ -683,10 +731,12 @@ mod tests {
         let record = SinkRecord::metadata_only(UsageEvent {
             request_id: "req-content".into(),
             status_code: 200,
+            operation: "chat".into(),
+            finish_reason: "stop".into(),
             ..UsageEvent::default()
         })
         .with_content(SinkContent {
-            prompt: "what is 2+2?".into(),
+            prompt: r#"{"messages":[{"role":"user","content":"what is"#.into(),
             response: "4".into(),
             truncated: true,
             prompt_truncated: true,
@@ -702,9 +752,15 @@ mod tests {
         let contents = decode_single_log(&requests[0]);
         assert_eq!(
             contents.get("prompt").map(String::as_str),
-            Some("what is 2+2?")
+            Some(r#"{"messages":[{"role":"user","content":"what is"#)
         );
-        assert_eq!(contents.get("response").map(String::as_str), Some("4"));
+        assert!(!contents.contains_key("input_messages"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&contents["output_messages"]).unwrap(),
+            serde_json::json!([{"role": "assistant", "finish_reason": "stop",
+                "parts": [{"type": "text", "content": "4"}]}])
+        );
+        assert!(!contents.contains_key("response"));
         assert_eq!(
             contents.get("content_truncated").map(String::as_str),
             Some("true")

@@ -42,9 +42,9 @@ pub struct SinkContent {
     /// bound. `None` when no cap is known.
     #[serde(skip)]
     pub max_bytes: Option<usize>,
-    /// The response as structured parts, for an encoder that reports them
-    /// (OTLP). `None` when it was not captured that way; the flat
-    /// `response` above is what every other encoder reads, unchanged.
+    /// The response as structured parts, for the encoders that report them
+    /// through [`SinkContent::encode`]. `None` when it was not captured that
+    /// way.
     #[serde(skip)]
     pub output: Option<crate::output::OutputCapture>,
 }
@@ -67,6 +67,80 @@ impl SinkContent {
             max_bytes: Some(max_bytes),
             output: None,
         }
+    }
+}
+
+/// How one record's captured content is reported — the decision every
+/// content-carrying encoder (OTLP, Datadog, SLS) shares, so the three agree
+/// on which side is structured and which falls back to flat text.
+///
+/// A message-shaped side whose capture is complete becomes the GenAI
+/// conventions' structured content, each value held to the exporter's
+/// per-field cap; the two sides are judged independently. Everything else —
+/// a non-message payload, content the cap cut, content that does not
+/// convert — is left in `raw_prompt` / `raw_response`. An MCP call's whole
+/// arguments and successful result are named on their own.
+#[derive(Debug, Default)]
+pub(crate) struct ContentEncoding<'a> {
+    /// Only the sides that were accepted are set.
+    pub structured: crate::genai::StructuredContent,
+    pub tool_call_arguments: Option<&'a str>,
+    pub tool_call_result: Option<&'a str>,
+    pub raw_prompt: Option<&'a str>,
+    pub raw_response: Option<&'a str>,
+}
+
+pub(crate) fn is_mcp(event: &UsageEvent) -> bool {
+    event.operation == "mcp" || event.inbound_protocol == "mcp"
+}
+
+impl SinkContent {
+    pub(crate) fn encode(&self, event: &UsageEvent) -> ContentEncoding<'_> {
+        let fits = |value: &str| self.max_bytes.is_none_or(|cap| value.len() <= cap);
+        // Each side is judged on its own: a long answer cut by the cap does
+        // not make a complete prompt any less complete.
+        let prompt_whole = !self.prompt.is_empty() && !self.prompt_truncated;
+        let response_whole = !self.response.is_empty() && !self.response_truncated;
+        // The structured parts stand on their own completeness, not the flat
+        // text's: they hold reasoning and tool calls the text never carried.
+        let output = self.output.as_ref().filter(|o| !o.truncated);
+        let mut enc = ContentEncoding {
+            raw_prompt: (!self.prompt.is_empty()).then_some(self.prompt.as_str()),
+            raw_response: (!self.response.is_empty()).then_some(self.response.as_str()),
+            ..Default::default()
+        };
+        if is_mcp(event) {
+            // Arguments and result are captured as JSON already; the result
+            // is reported only for a call that succeeded.
+            if prompt_whole {
+                enc.tool_call_arguments = enc.raw_prompt.take();
+            }
+            if response_whole && (200..300).contains(&event.status_code) {
+                enc.tool_call_result = enc.raw_response.take();
+            }
+        } else if let Some(wire) = crate::genai::PromptWire::for_operation(&event.operation) {
+            let structured = crate::genai::structured_content(
+                wire,
+                if prompt_whole { &self.prompt } else { "" },
+                if response_whole { &self.response } else { "" },
+                output,
+                &event.finish_reason,
+            );
+            let input_fits = structured.input_messages.as_deref().is_some_and(fits)
+                && structured.system_instructions.as_deref().is_none_or(fits)
+                && structured.tool_definitions.as_deref().is_none_or(fits);
+            if input_fits {
+                enc.structured.input_messages = structured.input_messages;
+                enc.structured.system_instructions = structured.system_instructions;
+                enc.structured.tool_definitions = structured.tool_definitions;
+                enc.raw_prompt = None;
+            }
+            if let Some(output) = structured.output_messages.filter(|v| fits(v)) {
+                enc.structured.output_messages = Some(output);
+                enc.raw_response = None;
+            }
+        }
+        enc
     }
 }
 
