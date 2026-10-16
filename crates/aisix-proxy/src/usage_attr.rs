@@ -921,11 +921,14 @@ pub(crate) fn emit_prepared_usage_event(
     state: &ProxyState,
     snap: &AisixSnapshot,
     surface: Surface,
-    event: UsageEvent,
+    mut event: UsageEvent,
     labels: UsageEventLabels<'_>,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
 ) {
-    // An error event is the request's terminal (and only) emission. Its
+    // It speaks for no attempt of its own: after the failed attempts of a
+    // single-shot failover whose winner then failed, it follows them.
+    event.attempt_index = crate::attribution::next_attempt_index();
+    // An error event is the request's terminal emission. Its
     // builder leaves `upstream_latency_ms` at 0, so no upstream span is
     // derivable either way — `dispatched: false` states the common case
     // (most error events never reached a provider).
@@ -1037,7 +1040,7 @@ pub(crate) fn emit_usage(
     // landing in the moments after cannot double it (AISIX-Cloud#1571). A
     // no-op outside a request scope, which is where the detached stream
     // emitters and the cancel guard itself both run.
-    crate::attribution::note_usage_emitted(terminal);
+    crate::attribution::note_usage_emitted(terminal, event.attempt_index);
     let provider_key_id = labels.provider_key_id;
     state
         .usage_sink

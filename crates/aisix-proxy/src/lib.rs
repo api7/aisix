@@ -8636,6 +8636,18 @@ data: [DONE]\n\n";
         );
     }
 
+    /// The control plane counts a request by its one `attempt_index = 0`
+    /// row, so one request's rows, in emission order, must start at 0 and
+    /// never repeat or go back.
+    fn assert_attempt_indices_increase(events: &[aisix_obs::UsageEvent]) {
+        let indices: Vec<u32> = events.iter().map(|e| e.attempt_index).collect();
+        assert_eq!(indices.first(), Some(&0), "{indices:?}");
+        assert!(
+            indices.windows(2).all(|w| w[0] < w[1]),
+            "attempt indices must be distinct and increasing: {indices:?}",
+        );
+    }
+
     async fn next_event(
         rx: &mut tokio::sync::mpsc::Receiver<aisix_obs::UsageEvent>,
     ) -> aisix_obs::UsageEvent {
@@ -8807,6 +8819,68 @@ data: [DONE]\n\n";
         assert_eq!(terminal.model_id, "m-secondary");
         assert_eq!(terminal.requested_model, "smart");
         assert!(rx.try_recv().is_err(), "two attempts, two events");
+    }
+
+    /// A cancel in the retry backoff between two attempts on the same
+    /// target: nothing is in flight and nothing has won, so the terminal
+    /// event speaks for no attempt of its own. It must still not repeat
+    /// index 0 — the control plane counts a request by its one
+    /// `attempt_index = 0` row, and the replayed failed attempt already is
+    /// that row.
+    #[tokio::test]
+    async fn head_phase_cancel_in_retry_backoff_keeps_one_index_zero_row() {
+        use aisix_obs::UsageSink;
+
+        let flaky = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    // Honoured as the backoff, which outlives the caller.
+                    .insert_header("retry-after", "5")
+                    .set_body_string("overloaded"),
+            )
+            .mount(&flaky)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-m-primary", &flaky.uri()));
+        snap.models
+            .insert(model_entry_with_id("m-primary", "primary", "pk-m-primary"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary"],
+            Some(1),
+            None,
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        cancel_in_flight(app, cancellable_chat_request("smart")).await;
+
+        let failed = next_event(&mut rx).await;
+        assert_eq!(failed.error_class, "upstream_status", "{failed:?}");
+        assert_eq!(failed.attempt_index, 0);
+        assert_eq!(failed.attempt_kind, "initial");
+
+        let terminal = next_event(&mut rx).await;
+        assert_head_phase_cancel(&terminal);
+        assert_eq!(
+            terminal.attempt_index, 1,
+            "the terminal event follows the attempt rows already emitted",
+        );
+        assert_eq!(terminal.model_id, "m-primary");
+        assert!(
+            rx.try_recv().is_err(),
+            "one attempt plus the terminal event"
+        );
     }
 
     /// A cancel does not only land INSIDE an attempt. Here the winning
@@ -11518,6 +11592,7 @@ data: [DONE]\n\n";
             events.iter().all(|e| e.attempt_kind != "judge"),
             "the judge connect failed, so no judge usage event"
         );
+        assert_attempt_indices_increase(&events);
     }
 
     /// Like `ensemble_model_entry` but with an explicit `min_responses`.
@@ -11646,14 +11721,11 @@ data: [DONE]\n\n";
             tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
         {
             events.push(ev);
-            if events.len() == 3 {
-                break;
-            }
         }
         assert_eq!(
             events.len(),
-            3,
-            "expected 3 usage events (2 panel + judge) on the block path; got {}",
+            4,
+            "expected 2 panel + judge + the request's terminal event on the block path; got {}",
             events.len()
         );
         let panel_events: Vec<_> = events
@@ -11679,6 +11751,7 @@ data: [DONE]\n\n";
         );
         assert_eq!(judge_events[0].prompt_tokens, 30);
         assert_eq!(judge_events[0].completion_tokens, 7);
+        assert_attempt_indices_increase(&events);
     }
 
     /// A panel that can't reach `min_responses` (one member 503s, min=2 on a
@@ -11790,6 +11863,7 @@ data: [DONE]\n\n";
             events.iter().all(|e| e.attempt_kind != "judge"),
             "the judge never ran, so no judge usage event"
         );
+        assert_attempt_indices_increase(&events);
     }
 
     /// Mount the standard panel + judge upstreams (judge matched by its
@@ -12166,6 +12240,7 @@ data: [DONE]\n\n";
             events.iter().all(|e| e.attempt_kind != "judge"),
             "the judge produced no response, so no judge usage event"
         );
+        assert_attempt_indices_increase(&events);
     }
 
     // ─────────────────────────────────────────────────────────────────

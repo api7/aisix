@@ -234,6 +234,9 @@ pub(crate) struct CancelContext {
     /// would have added, so the guard defers to whatever was written.
     pub emitted_any: bool,
     pub emitted_terminal: bool,
+    /// One past the highest `attempt_index` this request has emitted, `0`
+    /// before its first event. See [`next_attempt_index`].
+    pub next_attempt_index: u32,
 }
 
 /// A streamed response's access-log line, parked by its handler until the
@@ -1271,11 +1274,27 @@ pub(crate) fn emit_deferred_access_log(event: &aisix_obs::UsageEvent) {
 
 /// Note that a usage event has just left the emission chokepoint on this
 /// request's own task. See [`CancelContext::emitted_any`].
-pub(crate) fn note_usage_emitted(terminal: bool) {
+pub(crate) fn note_usage_emitted(terminal: bool, attempt_index: u32) {
     with_cancel(|c| {
         c.emitted_any = true;
         c.emitted_terminal |= terminal;
+        c.next_attempt_index = c.next_attempt_index.max(attempt_index.saturating_add(1));
     });
+}
+
+/// The `attempt_index` for a row that speaks for no attempt of its own — a
+/// request's synthesized terminal event, such as a failure after the winner,
+/// or an ensemble's terminal event after its panel rows: the index following
+/// the last one this request has already emitted, `0` when it has emitted
+/// none.
+///
+/// The control plane counts a request by its `attempt_index = 0` row, so
+/// every request must have exactly one; a synthesized row left at the
+/// default `0` after attempt rows is a second one.
+pub(crate) fn next_attempt_index() -> u32 {
+    CURRENT
+        .try_with(|a| a.lock().cancel.next_attempt_index)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1583,7 +1602,7 @@ mod tests {
     struct EmitOnDrop;
     impl Drop for EmitOnDrop {
         fn drop(&mut self) {
-            note_usage_emitted(true);
+            note_usage_emitted(true, 0);
         }
     }
 

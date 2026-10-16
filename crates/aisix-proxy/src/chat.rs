@@ -670,6 +670,11 @@ pub async fn chat_completions(
                         /* prompt_tokens */ 0,
                         /* completion_tokens */ 0,
                         UsageExtras {
+                            // An ensemble's failure exits have already
+                            // emitted their panel (and judge) rows, which
+                            // record no routing attempt; this row follows
+                            // them.
+                            attempt_index: crate::attribution::next_attempt_index(),
                             attempt_kind: "initial".to_string(),
                             // Bounded ProxyError class so the dashboard can
                             // show why the request never reached an upstream.

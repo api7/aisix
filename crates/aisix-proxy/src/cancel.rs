@@ -254,7 +254,16 @@ pub(crate) fn emit(
             .unwrap_or_else(|| ctx.entry_model_id.clone()),
         status_code: crate::CLIENT_CLOSED_REQUEST,
         upstream_latency_ms: attempt.as_ref().map(|a| a.latency_ms).unwrap_or(0),
-        attempt_index: attempt.as_ref().map(|a| a.index).unwrap_or(0),
+        // With no attempt of its own (the cancel landed in the retry
+        // backoff), it follows the rows already out — the handler's, and
+        // the failed attempts replayed above — rather than repeating
+        // index 0.
+        attempt_index: attempt.as_ref().map(|a| a.index).unwrap_or_else(|| {
+            ctx.failed_attempts
+                .iter()
+                .map(|rec| rec.index.saturating_add(1))
+                .fold(ctx.next_attempt_index, u32::max)
+        }),
         attempt_kind: attempt
             .as_ref()
             .map(|a| a.kind.to_string())
