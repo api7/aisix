@@ -222,13 +222,9 @@ impl ModelCaller for ProxyModelCaller<'_> {
             &response.usage,
             &crate::chat::estimation_output_text(&response),
         );
-        // Synchronous, so nothing between the upstream answering and the
-        // executor recording this sub-call can be cancelled.
-        crate::chat::charge_reservation_now(
-            self.state,
-            reservation,
-            u64::from(effective.usage.total_tokens),
-        );
+        reservation
+            .commit_tokens(u64::from(effective.usage.total_tokens))
+            .await;
         Ok(ModelCallOutcome {
             response,
             effective_usage: effective.usage,

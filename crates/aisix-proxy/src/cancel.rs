@@ -39,6 +39,11 @@
 //! exists to avoid. And an attempt that had already SUCCEEDED is not
 //! re-emitted: its token counts live in the handler's response processing,
 //! not in the attempt record, so there is nothing to bill it with.
+//!
+//! An ensemble's returned sub-calls are the exception to both: the ensemble
+//! publishes each one's accounting as it returns, together with the input-side
+//! guardrail attribution its rows carry on every other path, so those rows
+//! are re-emitted with their tokens and that attribution.
 
 use aisix_obs::UsageEvent;
 

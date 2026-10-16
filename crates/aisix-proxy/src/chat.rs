@@ -3760,28 +3760,8 @@ async fn dispatch_ensemble(
     let ensemble_cfg = ensemble_cfg.with_refs_resolved(snapshot);
     let ensemble_cfg = &ensemble_cfg;
 
-    // Resolve a sub-call's target by display_name → (model_id, provider_key_id,
-    // upstream_model). The first two are telemetry attribution; the third is
-    // the tokenizer key for the #1074 estimation fallback — the estimator keys
-    // off the real upstream model, not the operator alias, exactly as the
-    // direct and streaming-judge paths do (a `gpt-4o` alias must select
-    // o200k_base, not the cl100k default an unrecognised alias falls back to).
-    // Empty ids if the target was deleted between dispatch and emit (cp-api
-    // stores NULL); the tokenizer then degrades to the display name.
-    let resolve_sub = |display_name: &str| -> (String, String, String) {
-        match snapshot.models.get_by_name(display_name) {
-            Some(entry) => (
-                entry.id.clone(),
-                entry.value.provider_key_id.clone().unwrap_or_default(),
-                entry
-                    .value
-                    .upstream_model()
-                    .unwrap_or(display_name)
-                    .to_string(),
-            ),
-            None => (String::new(), String::new(), display_name.to_string()),
-        }
-    };
+    let resolve_sub =
+        |display_name: &str| -> (String, String, String) { subcall_target(snapshot, display_name) };
     let effective_panel_member_usage =
         |member: &crate::ensemble::PanelOutcome| -> EffectiveSubcallUsage {
             EffectiveSubcallUsage {
@@ -3876,7 +3856,7 @@ async fn dispatch_ensemble(
         // round-tripped an upstream and must be billed, exactly like the
         // non-streaming error paths. `charge: None` — the per-member events
         // already carry the bill. `panel` is borrowed so the call site still
-        // owns it to compute `survivor_total` for `charge_reservation_now`.
+        // owns it to compute `survivor_total` for the commit.
         let input_bypass = bypass_reason.as_deref().unwrap_or_default();
         let emit_panel_then_fail =
             |panel: &[crate::ensemble::PanelOutcome], proxy_err: ProxyError| -> DispatchFailure {
@@ -3904,14 +3884,14 @@ async fn dispatch_ensemble(
                         "ensemble panel did not reach the required number of responses",
                     )),
                 );
-                charge_reservation_now(state, reservation, survivor_total(&panel));
+                reservation.commit_tokens(survivor_total(&panel)).await;
                 return Err(failure);
             }
             // `run_ensemble_panel` never returns `Judge` (it stops before
             // the judge call), but the enum is non-exhaustive to us here.
             Err(crate::ensemble::EnsembleError::Judge { panel, source }) => {
                 let failure = emit_panel_then_fail(&panel, ProxyError::Bridge(source));
-                charge_reservation_now(state, reservation, survivor_total(&panel));
+                reservation.commit_tokens(survivor_total(&panel)).await;
                 return Err(failure);
             }
         };
@@ -3945,7 +3925,7 @@ async fn dispatch_ensemble(
                     "ensemble judge references an unknown model".into(),
                 )),
             );
-            charge_reservation_now(state, reservation, panel_total);
+            reservation.commit_tokens(panel_total).await;
             return Err(failure);
         };
         let judge_model = &judge_entry.value;
@@ -3972,7 +3952,7 @@ async fn dispatch_ensemble(
                         "ensemble judge has an unresolved provider key".into(),
                     )),
                 );
-                charge_reservation_now(state, reservation, panel_total);
+                reservation.commit_tokens(panel_total).await;
                 return Err(failure);
             }
         };
@@ -3985,7 +3965,7 @@ async fn dispatch_ensemble(
                     "ensemble judge has no registered bridge".into(),
                 )),
             );
-            charge_reservation_now(state, reservation, panel_total);
+            reservation.commit_tokens(panel_total).await;
             return Err(failure);
         };
         let mut judge_ctx = crate::dispatch::bridge_ctx(
@@ -4034,7 +4014,7 @@ async fn dispatch_ensemble(
                         "rate limit exceeded for the ensemble judge",
                     )),
                 );
-                charge_reservation_now(state, reservation, panel_total);
+                reservation.commit_tokens(panel_total).await;
                 return Err(failure);
             }
         };
@@ -4054,7 +4034,7 @@ async fn dispatch_ensemble(
             Err(be) => {
                 crate::attribution::settle_ensemble();
                 let failure = emit_panel_then_fail(&panel, ProxyError::Bridge(be));
-                charge_reservation_now(state, reservation, panel_total);
+                reservation.commit_tokens(panel_total).await;
                 return Err(failure);
             }
         };
@@ -4349,11 +4329,11 @@ async fn dispatch_ensemble(
                         )),
                     ),
                 };
-                charge_reservation_now(state, reservation, survivor_total(&panel));
                 let input_bypass = bypass_reason.as_deref().unwrap_or_default();
                 for (index, member) in panel.iter().enumerate() {
                     emit_panel_member(member, index, /* blocked */ false, input_bypass);
                 }
+                reservation.commit_tokens(survivor_total(&panel)).await;
                 return Err(DispatchFailure::new(
                     Some(model_id.to_string()),
                     None,
@@ -4381,7 +4361,7 @@ async fn dispatch_ensemble(
         .sum();
     let total_tokens = panel_total + u64::from(effective_judge.usage.total_tokens);
     crate::attribution::note_ensemble_tokens_charged();
-    charge_reservation_now(state, reservation, total_tokens);
+    reservation.commit_tokens(total_tokens).await;
 
     // Emit one usage event per sub-call (each panel member + the judge),
     // all sharing `request_id`. `attempt_kind` is `"panel"` / `"judge"`;
@@ -5332,20 +5312,28 @@ struct StreamGuardrailContext {
     model_name: String,
 }
 
-/// Charge `tokens` to every layer of an ensemble reservation and release it,
-/// synchronously: `MultiReservation::commit_tokens` commits layer by layer
-/// across awaits, so a caller leaving part-way would leave the later layers
-/// uncharged, and no ensemble step may yield between a sub-call returning and
-/// it being charged and recorded.
-pub(crate) fn charge_reservation_now(
-    state: &ProxyState,
-    reservation: aisix_ratelimit::MultiReservation,
-    tokens: u64,
-) {
-    for key in reservation.keys() {
-        state.limiter.add_tokens_post_stream(&key, tokens);
+/// An ensemble sub-call's target by display_name → (model_id,
+/// provider_key_id, upstream_model). The first two are telemetry
+/// attribution; the third is the tokenizer key for the #1074 estimation
+/// fallback — the estimator keys off the real upstream model, not the
+/// operator alias, exactly as the direct and streaming-judge paths do (a
+/// `gpt-4o` alias must select o200k_base, not the cl100k default an
+/// unrecognised alias falls back to). Empty ids if the target was deleted
+/// between dispatch and emit (cp-api stores NULL); the tokenizer then
+/// degrades to the display name.
+fn subcall_target(snap: &AisixSnapshot, display_name: &str) -> (String, String, String) {
+    match snap.models.get_by_name(display_name) {
+        Some(entry) => (
+            entry.id.clone(),
+            entry.value.provider_key_id.clone().unwrap_or_default(),
+            entry
+                .value
+                .upstream_model()
+                .unwrap_or(display_name)
+                .to_string(),
+        ),
+        None => (String::new(), String::new(), display_name.to_string()),
     }
-    drop(reservation);
 }
 
 /// The request-scoped inputs every ensemble sub-call row carries, owned so
@@ -5373,16 +5361,9 @@ struct EnsembleSubcall {
 }
 
 impl EnsembleSubcall {
-    /// Resolve `outcome`'s target against `snap`; empty ids when it was
-    /// deleted meanwhile (cp-api stores NULL), as `resolve_sub` does.
+    /// Resolve `outcome`'s target against `snap` (see [`subcall_target`]).
     fn resolve(snap: &AisixSnapshot, outcome: crate::ensemble::PanelOutcome) -> Self {
-        let (model_id, provider_key_id) = match snap.models.get_by_name(&outcome.model) {
-            Some(entry) => (
-                entry.id.clone(),
-                entry.value.provider_key_id.clone().unwrap_or_default(),
-            ),
-            None => (String::new(), String::new()),
-        };
+        let (model_id, provider_key_id, _) = subcall_target(snap, &outcome.model);
         Self {
             model_id,
             provider_key_id,
@@ -5713,6 +5694,9 @@ pub(crate) fn emit_abandoned_ensemble(
     first_index: u32,
 ) -> u32 {
     let (panel, judge) = pending.progress.take();
+    if panel.is_empty() && judge.is_none() {
+        return first_index;
+    }
     let mut index = first_index;
     let mut usage = aisix_gateway::chat::UsageStats::default();
     for outcome in panel {
