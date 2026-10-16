@@ -657,6 +657,7 @@ pub async fn chat_completions(
                     );
                 }
                 None if routing.attempts.is_empty() => {
+                    let terminal_index = crate::attribution::next_attempt_index();
                     emit_usage_event(
                         &state,
                         &snapshot,
@@ -673,9 +674,11 @@ pub async fn chat_completions(
                             // An ensemble's failure exits have already
                             // emitted their panel (and judge) rows, which
                             // record no routing attempt; this row follows
-                            // them.
-                            attempt_index: crate::attribution::next_attempt_index(),
-                            attempt_kind: "initial".to_string(),
+                            // them, and like every other synthesized row
+                            // that follows attempt rows it names no kind.
+                            attempt_index: terminal_index,
+                            attempt_kind: if terminal_index == 0 { "initial" } else { "" }
+                                .to_string(),
                             // Bounded ProxyError class so the dashboard can
                             // show why the request never reached an upstream.
                             error_class: crate::attempt::error_class(&err).to_string(),
@@ -4161,6 +4164,65 @@ async fn dispatch_ensemble(
             judge_model.upstream_model().unwrap_or("unknown"),
             crate::token_estimate::PromptInput::Chat(Box::new(build_judge_req())),
         );
+        // The panel rows ride a guard rather than `on_complete` alone: a body
+        // dropped before its first poll never starts the stream, so
+        // `on_complete` is dropped uncalled, and the panel's upstream spend
+        // would go unrecorded beside the 499 row the cancel guard writes.
+        let panel_rows = {
+            let state = state.clone();
+            let request_id = request_id.to_string();
+            let client_model = req.model.clone();
+            let api_key_id = api_key_id.to_string();
+            let applied_guardrails = applied_guardrails.to_vec();
+            let audit = audit.clone();
+            let client = client.clone();
+            let bypass = bypass_reason.clone().unwrap_or_default();
+            PanelRows(Some(Box::new(move |blocked: bool, first_index: u32| {
+                let snap = state.snapshot.load();
+                for (index, member) in panel_telem.iter().enumerate() {
+                    let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &member.provider_key_id);
+                    emit_usage_event(
+                        &state,
+                        &snap,
+                        &pk,
+                        &request_id,
+                        &member.model_id,
+                        &client_model,
+                        &api_key_id,
+                        200,
+                        started.elapsed(),
+                        member.usage.prompt_tokens,
+                        member.usage.completion_tokens,
+                        UsageExtras {
+                            cached_prompt_tokens: member.usage.cached_prompt_tokens,
+                            cache_write_tokens: member.usage.cache_write_tokens,
+                            reasoning_tokens: member.usage.reasoning_tokens,
+                            upstream_total_tokens: member.usage.upstream_total_tokens,
+                            reasoning_folded_into_completion: member
+                                .usage
+                                .reasoning_folded_into_completion,
+                            cache_creation_tokens: member.usage.cache_creation_tokens,
+                            cache_read_tokens: member.usage.cache_read_tokens,
+                            usage_estimated: member.usage_estimated,
+                            bypass_reason: bypass.clone(),
+                            cache_status: CacheStatus::Disabled.as_str().to_string(),
+                            attempt_index: first_index + index as u32,
+                            attempt_kind: "panel".to_string(),
+                            attempt_model: member.attempt_model.clone(),
+                            applied_guardrails: applied_guardrails.clone(),
+                            ..UsageExtras::default()
+                        },
+                        /* cost_usd */ 0.0,
+                        blocked,
+                        &client,
+                        /* content */ None,
+                        /* terminal */ false,
+                        /* dispatched */ true,
+                        &audit,
+                    );
+                }
+            })))
+        };
         let sse_stream = build_sse_stream(
             judge_stream,
             created_ts,
@@ -4220,48 +4282,7 @@ async fn dispatch_ensemble(
                 // mirrors the non-streaming ensemble's per-sub-call emission,
                 // moved into on_complete because the judge counts only land on
                 // the terminal SSE chunk.
-                for (index, member) in panel_telem.iter().enumerate() {
-                    let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &member.provider_key_id);
-                    emit_usage_event(
-                        &state_for_telem,
-                        &snap,
-                        &pk,
-                        &request_id_for_telem,
-                        &member.model_id,
-                        &client_model_for_telem,
-                        &api_key_id_for_telem,
-                        200,
-                        started.elapsed(),
-                        member.usage.prompt_tokens,
-                        member.usage.completion_tokens,
-                        UsageExtras {
-                            cached_prompt_tokens: member.usage.cached_prompt_tokens,
-                            cache_write_tokens: member.usage.cache_write_tokens,
-                            reasoning_tokens: member.usage.reasoning_tokens,
-                            upstream_total_tokens: member.usage.upstream_total_tokens,
-                            reasoning_folded_into_completion: member
-                                .usage
-                                .reasoning_folded_into_completion,
-                            cache_creation_tokens: member.usage.cache_creation_tokens,
-                            cache_read_tokens: member.usage.cache_read_tokens,
-                            usage_estimated: member.usage_estimated,
-                            bypass_reason: bypass_for_telem.clone(),
-                            cache_status: CacheStatus::Disabled.as_str().to_string(),
-                            attempt_index: index as u32,
-                            attempt_kind: "panel".to_string(),
-                            attempt_model: member.attempt_model.clone(),
-                            applied_guardrails: applied_guardrails_for_telem.clone(),
-                            ..UsageExtras::default()
-                        },
-                        /* cost_usd */ 0.0,
-                        comp.guardrail_blocked,
-                        &client_for_telem,
-                        /* content */ None,
-                        /* terminal */ false,
-                        /* dispatched */ true,
-                        &audit_for_telem,
-                    );
-                }
+                panel_rows.emit(comp.guardrail_blocked, 0);
                 let judge_pk =
                     crate::usage_attr::ResolvedPk::resolve(&snap, &judge_provider_key_id);
                 let stream_error = crate::attempt::stream_error_fields(
@@ -5497,6 +5518,29 @@ struct StreamGuardrailContext {
     /// Surface in tracing only; the wire envelope is intentionally
     /// generic per #153 ("response blocked by content policy").
     model_name: String,
+}
+
+/// A streaming ensemble's panel rows, emitted exactly once: by the stream's
+/// `on_complete` through [`PanelRows::emit`], or by `Drop` when `on_complete`
+/// was dropped uncalled — the body went away before its first poll — in which
+/// case they follow whatever the request has emitted and precede the cancel
+/// guard's 499 row. The closure takes `(guardrail_blocked, first_index)`.
+struct PanelRows(Option<Box<dyn FnOnce(bool, u32) + Send>>);
+
+impl PanelRows {
+    fn emit(mut self, blocked: bool, first_index: u32) {
+        if let Some(emit) = self.0.take() {
+            emit(blocked, first_index);
+        }
+    }
+}
+
+impl Drop for PanelRows {
+    fn drop(&mut self) {
+        if let Some(emit) = self.0.take() {
+            emit(false, crate::attribution::next_attempt_index());
+        }
+    }
 }
 
 /// Fires `on_complete` with whatever `StreamCompletion` has been

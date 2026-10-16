@@ -8646,6 +8646,24 @@ data: [DONE]\n\n";
             indices.windows(2).all(|w| w[0] < w[1]),
             "attempt indices must be distinct and increasing: {indices:?}",
         );
+        assert!(
+            events
+                .iter()
+                .all(|e| e.attempt_kind != "initial" || e.attempt_index == 0),
+            "only the index-0 row may be labelled initial: {events:?}",
+        );
+    }
+
+    /// An ensemble failure exit's own terminal row follows the panel (and
+    /// judge) rows and, speaking for no attempt, names no kind.
+    fn assert_ensemble_terminal_row_names_no_kind(events: &[aisix_obs::UsageEvent]) {
+        let terminal: Vec<_> = events
+            .iter()
+            .filter(|e| e.attempt_kind != "panel" && e.attempt_kind != "judge")
+            .collect();
+        assert_eq!(terminal.len(), 1, "{events:?}");
+        assert_eq!(terminal[0].attempt_kind, "", "{events:?}");
+        assert_ne!(terminal[0].attempt_index, 0, "{events:?}");
     }
 
     async fn next_event(
@@ -11593,6 +11611,92 @@ data: [DONE]\n\n";
             "the judge connect failed, so no judge usage event"
         );
         assert_attempt_indices_increase(&events);
+        assert_ensemble_terminal_row_names_no_kind(&events);
+    }
+
+    /// A streaming ensemble whose body is dropped before its first poll: the
+    /// panel had already round-tripped its upstreams, so its rows are owed
+    /// beside the 499 row, which follows them.
+    #[tokio::test]
+    async fn ensemble_stream_dropped_before_its_first_poll_still_emits_the_panel() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::start().await;
+        let judge_sse = "\
+data: {\"id\":\"cmpl-judge\",\"model\":\"judge-upstream\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"synthesized final answer\"},\"finish_reason\":null}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("Answer 1:"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(judge_sse),
+            )
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-panel",
+                "model": "panel-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "a panel candidate answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16}
+            })))
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        seed_two_member_council(&snap);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "council",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": true
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "the head must exist");
+        drop_body_unpolled(response);
+
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+        {
+            events.push(ev);
+        }
+        assert_eq!(
+            events.len(),
+            3,
+            "two panel rows and the 499 row: {events:?}"
+        );
+        assert!(
+            events[..2].iter().all(|e| e.attempt_kind == "panel"
+                && e.prompt_tokens == 5
+                && e.completion_tokens == 11),
+            "{events:?}"
+        );
+        assert_eq!(events[2].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
+        assert_eq!(events[2].error_message, cancel::CANCELLED_BEFORE_BODY);
+        assert_eq!(events[2].attempt_kind, "", "{events:?}");
+        assert_attempt_indices_increase(&events);
     }
 
     /// Like `ensemble_model_entry` but with an explicit `min_responses`.
@@ -11752,6 +11856,7 @@ data: [DONE]\n\n";
         assert_eq!(judge_events[0].prompt_tokens, 30);
         assert_eq!(judge_events[0].completion_tokens, 7);
         assert_attempt_indices_increase(&events);
+        assert_ensemble_terminal_row_names_no_kind(&events);
     }
 
     /// A panel that can't reach `min_responses` (one member 503s, min=2 on a
@@ -11864,6 +11969,7 @@ data: [DONE]\n\n";
             "the judge never ran, so no judge usage event"
         );
         assert_attempt_indices_increase(&events);
+        assert_ensemble_terminal_row_names_no_kind(&events);
     }
 
     /// Mount the standard panel + judge upstreams (judge matched by its
@@ -12241,6 +12347,7 @@ data: [DONE]\n\n";
             "the judge produced no response, so no judge usage event"
         );
         assert_attempt_indices_increase(&events);
+        assert_ensemble_terminal_row_names_no_kind(&events);
     }
 
     // ─────────────────────────────────────────────────────────────────
