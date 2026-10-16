@@ -255,11 +255,33 @@ impl DatadogSink {
             json!(record.usage.genai_output_tokens()),
         );
 
-        // Opt-in captured content as flat, queryable fields. Absent on the
+        // Opt-in captured content: the GenAI conventions' structured
+        // messages as nested JSON, and a side that could not be structured
+        // as flat `gen_ai.prompt` / `gen_ai.completion` text. Absent on the
         // default metadata-only path, so prompts never leak there.
         if let Some(content) = &record.content {
-            obj.insert("gen_ai.prompt".into(), json!(content.prompt));
-            obj.insert("gen_ai.completion".into(), json!(content.response));
+            let enc = content.encode(&record.usage);
+            for (key, value) in [
+                ("gen_ai.input.messages", &enc.structured.input_messages),
+                (
+                    "gen_ai.system_instructions",
+                    &enc.structured.system_instructions,
+                ),
+                ("gen_ai.tool.definitions", &enc.structured.tool_definitions),
+                ("gen_ai.output.messages", &enc.structured.output_messages),
+            ] {
+                if let Some(parsed) = value.as_deref().and_then(|v| serde_json::from_str(v).ok()) {
+                    obj.insert(key.into(), parsed);
+                }
+            }
+            for (key, value) in [
+                ("gen_ai.prompt", enc.flat_prompt()),
+                ("gen_ai.completion", enc.flat_response()),
+            ] {
+                if let Some(value) = value {
+                    obj.insert(key.into(), json!(value));
+                }
+            }
             if content.truncated {
                 obj.insert("content_truncated".into(), json!(true));
             }
@@ -618,10 +640,10 @@ mod tests {
     }
 
     /// The exporter's selected headers ride beside the usage fields, and a
-    /// record carrying structured output parts encodes its content exactly
-    /// as a flat one does.
+    /// complete chat capture is reported as the GenAI conventions'
+    /// structured messages, nested, with no flat prompt/completion.
     #[tokio::test]
-    async fn selected_headers_ride_the_log_and_content_stays_flat() {
+    async fn selected_headers_ride_the_log_and_content_is_structured() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
@@ -639,6 +661,8 @@ mod tests {
         let record = SinkRecord::metadata_only(UsageEvent {
             request_id: "req-headers".into(),
             status_code: 200,
+            operation: "chat".into(),
+            finish_reason: "stop".into(),
             api_key_name: "key-a".into(),
             request_headers: [
                 ("x-sub-user".to_string(), "alice".to_string()),
@@ -650,7 +674,7 @@ mod tests {
         })
         .with_exporter_headers(&["x-sub-user".to_string()], &["x-upstream-id".to_string()])
         .with_content(SinkContent {
-            prompt: "what is 2+2?".into(),
+            prompt: r#"{"model":"m","messages":[{"role":"user","content":"what is 2+2?"}]}"#.into(),
             response: "4".into(),
             truncated: false,
             prompt_truncated: false,
@@ -674,15 +698,28 @@ mod tests {
             serde_json::json!({"x-upstream-id": "u-1"})
         );
         assert_eq!(log["aisix.api_key_name"], "key-a");
-        // The flat content is what it always was: the structured parts
-        // ride OTLP only.
-        assert_eq!(log["gen_ai.completion"], "4");
-        assert!(!serde_json::to_string(&logs).unwrap().contains("pondering"));
+        assert_eq!(
+            log["gen_ai.input.messages"],
+            serde_json::json!([{"role": "user",
+                "parts": [{"type": "text", "content": "what is 2+2?"}]}])
+        );
+        assert_eq!(
+            log["gen_ai.output.messages"],
+            serde_json::json!([{"role": "assistant", "finish_reason": "stop", "parts": [
+                {"type": "reasoning", "content": "pondering"},
+                {"type": "text", "content": "4"},
+            ]}])
+        );
+        assert!(log.get("gen_ai.prompt").is_none());
+        assert!(log.get("gen_ai.completion").is_none());
+        assert!(log.get("content_truncated").is_none());
         assert!(!String::from_utf8_lossy(&requests[0].body).contains("x-department"));
     }
 
+    /// A side the cap cut stays flat text with the truncated marker; the
+    /// other side is still structured.
     #[tokio::test]
-    async fn full_content_record_emits_prompt_and_response() {
+    async fn truncated_side_falls_back_to_flat_text() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
@@ -694,10 +731,12 @@ mod tests {
         let record = SinkRecord::metadata_only(UsageEvent {
             request_id: "req-content".into(),
             status_code: 200,
+            operation: "chat".into(),
+            finish_reason: "stop".into(),
             ..UsageEvent::default()
         })
         .with_content(SinkContent {
-            prompt: "what is 2+2?".into(),
+            prompt: r#"{"messages":[{"role":"user","content":"what is"#.into(),
             response: "4".into(),
             truncated: true,
             prompt_truncated: true,
@@ -712,8 +751,17 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         let logs = decode_logs(&requests[0]);
         let log = &logs[0];
-        assert_eq!(log["gen_ai.prompt"], "what is 2+2?");
-        assert_eq!(log["gen_ai.completion"], "4");
+        assert_eq!(
+            log["gen_ai.prompt"],
+            r#"{"messages":[{"role":"user","content":"what is"#
+        );
+        assert!(log.get("gen_ai.input.messages").is_none());
+        assert_eq!(
+            log["gen_ai.output.messages"],
+            serde_json::json!([{"role": "assistant", "finish_reason": "stop",
+                "parts": [{"type": "text", "content": "4"}]}])
+        );
+        assert!(log.get("gen_ai.completion").is_none());
         assert_eq!(log["content_truncated"], true);
         // ddtags is omitted entirely when no tags are configured.
         assert!(log.get("ddtags").is_none(), "empty ddtags must be omitted");

@@ -13,6 +13,7 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { startMockDatadog, waitForDatadogLog, type MockDatadog } from "../harness/datadog-mock.js";
 
 // AISIX-Cloud#1014: when a captured prompt/response exceeds the exporter's
 // `content_max_bytes`, the logged field must stay VALID JSON — structure
@@ -23,6 +24,12 @@ import {
 // `aliyun_sls` exporter (content_mode=full, tiny cap) into a mock SLS
 // endpoint, decodes the delivered protobuf, and JSON-parses the `prompt`
 // field back.
+//
+// The cut side is reported on its own: the prompt that did not fit stays
+// in the flat `prompt` field (Datadog: `gen_ai.prompt`) with the truncated
+// marker, while the response that did fit is still the structured
+// `output_messages` (Datadog: `gen_ai.output.messages`) — a Datadog
+// exporter with the same cap rides alongside to pin the same decision.
 
 const CALLER_PLAINTEXT = "sk-sls-trunc-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -136,6 +143,7 @@ function logsFor(sls: MockSls, logstore: string): Map<string, string>[] {
 describe("sls e2e: oversized captured content is truncated structurally (#1014)", () => {
   let upstream: OpenAiUpstream | undefined;
   let sls: MockSls | undefined;
+  let dd: MockDatadog | undefined;
   let app: SpawnedApp | undefined;
   let etcdReachable = false;
 
@@ -145,6 +153,7 @@ describe("sls e2e: oversized captured content is truncated structurally (#1014)"
     if (!etcdReachable) return;
 
     sls = await startMockSls();
+    dd = await startMockDatadog();
     upstream = await startOpenAiUpstream({
       nonStreamBody: {
         id: "cmpl-trunc",
@@ -166,6 +175,7 @@ describe("sls e2e: oversized captured content is truncated structurally (#1014)"
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: MOCK_AK_ID,
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: MOCK_AK_SECRET,
+        [`DD_CRED_${CREDENTIAL_REF.toUpperCase()}_API_KEY`]: "dd-mock-key",
       },
     });
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -178,6 +188,16 @@ describe("sls e2e: oversized captured content is truncated structurally (#1014)"
       project: SLS_PROJECT,
       logstore: LOGSTORE,
       credential_ref: CREDENTIAL_REF,
+      content_mode: "full",
+      content_max_bytes: CONTENT_MAX_BYTES,
+    });
+    await seed.createObservabilityExporter({
+      name: "datadog-structured-trunc",
+      enabled: true,
+      kind: "datadog",
+      site: dd.site,
+      credential_ref: CREDENTIAL_REF,
+      service: "structured-trunc-e2e",
       content_mode: "full",
       content_max_bytes: CONTENT_MAX_BYTES,
     });
@@ -203,6 +223,7 @@ describe("sls e2e: oversized captured content is truncated structurally (#1014)"
     await app?.exit();
     await upstream?.close();
     await sls?.close();
+    await dd?.close();
   });
 
   test("oversized JSON prompt lands in SLS as valid JSON with array sampling markers", async (ctx) => {
@@ -275,5 +296,21 @@ describe("sls e2e: oversized captured content is truncated structurally (#1014)"
     const omitted = placeholder!.omitted_items as number;
     expect(omitted).toBeGreaterThan(0);
     expect(parsed.messages.length - 1 + omitted).toBe(messages.length);
+
+    // The cut prompt is not also reported structured; the whole response is.
+    const expectedOutput = [
+      { role: "assistant", finish_reason: "stop", parts: [{ type: "text", content: "short reply" }] },
+    ];
+    expect(captured!.has("input_messages")).toBe(false);
+    expect(captured!.has("response")).toBe(false);
+    expect(JSON.parse(captured!.get("output_messages")!)).toEqual(expectedOutput);
+
+    const requestId = captured!.get("request_id");
+    const log = await waitForDatadogLog(dd!, (l) => l["aisix.request_id"] === requestId, "Datadog log");
+    expect(log["gen_ai.prompt"]).toBe(prompt);
+    expect(log["content_truncated"]).toBe(true);
+    expect(log["gen_ai.input.messages"]).toBeUndefined();
+    expect(log["gen_ai.completion"]).toBeUndefined();
+    expect(log["gen_ai.output.messages"]).toEqual(expectedOutput);
   });
 });

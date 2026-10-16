@@ -21,12 +21,12 @@ import {
 // real `aisix` binary + etcd against a hard-failing mock upstream and a
 // keyword guardrail, and reads the delivered SLS protobuf back:
 //
-//   1. upstream failure (chat)        → record carries `prompt`
-//   2. guardrail input block 422      → record carries `prompt`
-//   3. 403 model-forbidden            → record exists WITHOUT `prompt`
+//   1. upstream failure (chat)        → record carries `input_messages`
+//   2. guardrail input block 422      → record carries `input_messages`
+//   3. 403 model-forbidden            → record exists WITHOUT any content
 //      (auth-class failures stay body-less by design)
-//   4. /v1/messages upstream failure  → record carries `prompt`
-//   5. /v1/responses upstream failure → record carries `prompt`
+//   4. /v1/messages upstream failure  → record carries `input_messages`
+//   5. /v1/responses upstream failure → record carries `input_messages`
 //
 // A metadata_only exporter runs alongside and must never see any prompt.
 
@@ -276,17 +276,21 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
 
     const log = await waitForLog(
       sls,
-      (l) => (l.get("prompt") ?? "").includes(UPSTREAM_FAIL_SENTINEL),
+      (l) => (l.get("input_messages") ?? "").includes(UPSTREAM_FAIL_SENTINEL),
       "failed-upstream chat record with prompt",
     );
     // It is the FAILED request's record: non-2xx status, no response text.
     expect(Number(log.get("status_code"))).toBeGreaterThanOrEqual(400);
-    expect(log.get("response") ?? "").toBe("");
-    // The prompt is the request body — valid JSON with the messages array.
-    const prompt = JSON.parse(log.get("prompt")!) as {
-      messages: Array<{ content: string }>;
-    };
-    expect(prompt.messages[0]!.content).toContain(UPSTREAM_FAIL_SENTINEL);
+    // The empty response stays the flat field it always was.
+    expect(log.get("response")).toBe("");
+    expect(log.has("output_messages")).toBe(false);
+    // The request's messages, in the GenAI conventions' shape.
+    const input = JSON.parse(log.get("input_messages")!) as Array<{
+      role: string;
+      parts: Array<{ type: string; content: string }>;
+    }>;
+    expect(input[0]!.role).toBe("user");
+    expect(input[0]!.parts[0]!.content).toContain(UPSTREAM_FAIL_SENTINEL);
   });
 
   test("guardrail input block (422): the record carries the prompt", async (ctx) => {
@@ -299,7 +303,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
 
     const log = await waitForLog(
       sls,
-      (l) => (l.get("prompt") ?? "").includes(GUARDRAIL_SENTINEL),
+      (l) => (l.get("input_messages") ?? "").includes(GUARDRAIL_SENTINEL),
       "guardrail-blocked record with prompt",
     );
     expect(log.get("status_code")).toBe("422");
@@ -322,10 +326,13 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
         (l.get("requested_model") ?? "") === "failure-content-offlimits",
       "403 record",
     );
-    // …but carries no prompt, and the sentinel never reaches the logstore.
+    // …but carries no content, and the sentinel never reaches the logstore.
     expect(log.get("prompt")).toBeUndefined();
+    expect(log.get("input_messages")).toBeUndefined();
     for (const l of logsFor(sls, FULL_LOGSTORE)) {
-      expect(l.get("prompt") ?? "").not.toContain(FORBIDDEN_MODEL_SENTINEL);
+      for (const v of l.values()) {
+        expect(v).not.toContain(FORBIDDEN_MODEL_SENTINEL);
+      }
     }
   });
 
@@ -352,7 +359,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
 
     const log = await waitForLog(
       sls,
-      (l) => (l.get("prompt") ?? "").includes(MESSAGES_SENTINEL),
+      (l) => (l.get("input_messages") ?? "").includes(MESSAGES_SENTINEL),
       "failed /v1/messages record with prompt",
     );
     expect(Number(log.get("status_code"))).toBeGreaterThanOrEqual(400);
@@ -379,7 +386,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
 
     const log = await waitForLog(
       sls,
-      (l) => (l.get("prompt") ?? "").includes(RESPONSES_SENTINEL),
+      (l) => (l.get("input_messages") ?? "").includes(RESPONSES_SENTINEL),
       "failed /v1/responses record with prompt",
     );
     expect(Number(log.get("status_code"))).toBeGreaterThanOrEqual(400);
@@ -401,11 +408,11 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
 
     const log = await waitForLog(
       sls,
-      (l) => (l.get("prompt") ?? "").includes(MASKED_BLOCK_SENTINEL),
+      (l) => (l.get("input_messages") ?? "").includes(MASKED_BLOCK_SENTINEL),
       "pii-blocked record with prompt",
     );
     expect(log.get("guardrail_blocked")).toBe("true");
-    const prompt = log.get("prompt")!;
+    const prompt = log.get("input_messages")!;
     expect(prompt).toContain("[EMAIL_REDACTED]");
     expect(prompt).not.toContain(EMAIL);
     // And the raw address never reaches the logstore in any record.
@@ -426,7 +433,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
 
     const withPrompt = await waitForLog(
       sls,
-      (l) => (l.get("prompt") ?? "").includes(GROUP_SENTINEL),
+      (l) => (l.get("input_messages") ?? "").includes(GROUP_SENTINEL),
       "all-targets-failed record with prompt",
     );
     const requestId = withPrompt.get("request_id")!;
@@ -440,7 +447,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     // …but exactly ONE carries the prompt, and it is the LAST attempt
     // (the failure the caller actually saw), not the first.
     const promptBearers = requestLogs.filter((l) =>
-      (l.get("prompt") ?? "").includes(GROUP_SENTINEL),
+      (l.get("input_messages") ?? "").includes(GROUP_SENTINEL),
     );
     expect(promptBearers.length).toBe(1);
     const maxAttempt = Math.max(
@@ -461,7 +468,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     const successLog = await waitForLog(
       sls,
       (l) =>
-        (l.get("prompt") ?? "").includes(RECOVER_SENTINEL) &&
+        (l.get("input_messages") ?? "").includes(RECOVER_SENTINEL) &&
         l.get("status_code") === "200",
       "recovered request's success record with prompt",
     );
@@ -479,6 +486,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     }
     expect(failedAttempt, "failed attempt record").toBeDefined();
     expect(failedAttempt!.get("prompt")).toBeUndefined();
+    expect(failedAttempt!.get("input_messages")).toBeUndefined();
   });
 
   test("metadata_only exporter never receives any failed-request prompt", async (ctx) => {
@@ -512,6 +520,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     }
     for (const l of logsFor(sls, META_LOGSTORE)) {
       expect(l.get("prompt")).toBeUndefined();
+      expect(l.get("input_messages")).toBeUndefined();
     }
   });
 });

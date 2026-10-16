@@ -58,6 +58,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::metrics::Metrics;
+use crate::sink::is_mcp;
 use crate::sink::{
     build_object_store_sink, resolve_datadog_credential, resolve_sls_credential, AliyunSlsSink,
     BatchUnit, CapturedContent, DatadogSink, ErrorRedactor, EventBatch, ExporterPipelines,
@@ -1019,10 +1020,6 @@ fn genai_operation_name(event: &UsageEvent) -> Option<&str> {
     }
 }
 
-fn is_mcp(event: &UsageEvent) -> bool {
-    event.operation == "mcp" || event.inbound_protocol == "mcp"
-}
-
 fn is_a2a(event: &UsageEvent) -> bool {
     event.operation == "a2a" || event.inbound_protocol == "a2a"
 }
@@ -1545,63 +1542,32 @@ fn push_usage(attributes: &mut Vec<Value>, event: &UsageEvent, operation: Option
 /// `aisix.content.response`, with `aisix.content_truncated` when cut, so a
 /// `gen_ai.*` content attribute is never malformed or partial.
 fn push_content(attributes: &mut Vec<Value>, event: &UsageEvent, content: &SinkContent) {
-    let fits = |value: &str| content.max_bytes.is_none_or(|cap| value.len() <= cap);
-    // Each side is judged on its own: a long answer cut by the cap does not
-    // make a complete prompt any less complete.
-    let prompt_whole = !content.prompt.is_empty() && !content.prompt_truncated;
-    let response_whole = !content.response.is_empty() && !content.response_truncated;
-    // The structured parts stand on their own completeness, not the flat
-    // text's: they hold reasoning and tool calls the text never carried.
-    let output = content.output.as_ref().filter(|o| !o.truncated);
-    let mut raw_prompt = !content.prompt.is_empty();
-    let mut raw_response = !content.response.is_empty();
-    if is_mcp(event) {
-        // Arguments and result are captured as JSON already; the result is
-        // reported only for a call that succeeded.
-        if prompt_whole {
-            attributes.push(attr_string("gen_ai.tool.call.arguments", &content.prompt));
-            raw_prompt = false;
+    let enc = content.encode(event);
+    for (key, value) in [
+        ("gen_ai.tool.call.arguments", enc.tool_call_arguments),
+        ("gen_ai.tool.call.result", enc.tool_call_result),
+        (
+            "gen_ai.input.messages",
+            enc.structured.input_messages.as_deref(),
+        ),
+        (
+            "gen_ai.system_instructions",
+            enc.structured.system_instructions.as_deref(),
+        ),
+        (
+            "gen_ai.tool.definitions",
+            enc.structured.tool_definitions.as_deref(),
+        ),
+        (
+            "gen_ai.output.messages",
+            enc.structured.output_messages.as_deref(),
+        ),
+        ("aisix.content.prompt", enc.raw_prompt),
+        ("aisix.content.response", enc.raw_response),
+    ] {
+        if let Some(value) = value {
+            attributes.push(attr_string(key, value));
         }
-        if response_whole && (200..300).contains(&event.status_code) {
-            attributes.push(attr_string("gen_ai.tool.call.result", &content.response));
-            raw_response = false;
-        }
-    } else if let Some(wire) = crate::genai::PromptWire::for_operation(&event.operation) {
-        let structured = crate::genai::structured_content(
-            wire,
-            if prompt_whole { &content.prompt } else { "" },
-            if response_whole {
-                &content.response
-            } else {
-                ""
-            },
-            output,
-            &event.finish_reason,
-        );
-        if let Some(input) = structured.input_messages.as_deref().filter(|v| {
-            fits(v)
-                && structured.system_instructions.as_deref().is_none_or(fits)
-                && structured.tool_definitions.as_deref().is_none_or(fits)
-        }) {
-            attributes.push(attr_string("gen_ai.input.messages", input));
-            if let Some(system) = &structured.system_instructions {
-                attributes.push(attr_string("gen_ai.system_instructions", system));
-            }
-            if let Some(tools) = &structured.tool_definitions {
-                attributes.push(attr_string("gen_ai.tool.definitions", tools));
-            }
-            raw_prompt = false;
-        }
-        if let Some(output) = structured.output_messages.as_deref().filter(|v| fits(v)) {
-            attributes.push(attr_string("gen_ai.output.messages", output));
-            raw_response = false;
-        }
-    }
-    if raw_prompt {
-        attributes.push(attr_string("aisix.content.prompt", &content.prompt));
-    }
-    if raw_response {
-        attributes.push(attr_string("aisix.content.response", &content.response));
     }
     if content.truncated {
         attributes.push(attr_bool("aisix.content_truncated", true));
@@ -2295,8 +2261,7 @@ mod tests {
     }
 
     /// Captured parts become the output message in order — reasoning, text,
-    /// tool call with parsed arguments — while the flat response every other
-    /// sink reads is untouched.
+    /// tool call with parsed arguments.
     #[test]
     fn structured_output_parts_become_the_output_message() {
         let mut event = sample_event();

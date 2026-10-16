@@ -339,7 +339,7 @@ describe("datadog exporter e2e (#688): DP delivers a gzip JSON intake to Datadog
   );
 
   test(
-    "content_mode=full ships gen_ai.prompt/completion; metadata_only ships neither",
+    "content_mode=full ships the structured gen_ai input/output messages; metadata_only ships neither",
     async (ctx) => {
       if (!etcdReachable || !upstream || !dd) {
         ctx.skip();
@@ -405,17 +405,37 @@ describe("datadog exporter e2e (#688): DP delivers a gzip JSON intake to Datadog
         const metaIntake = await waitForIntake(ddMeta);
 
         const fullLog = asRecord(fullIntake.logs[0]);
-        // Full capture carries both the prompt and the assembled response.
-        expect(fullLog["gen_ai.prompt"]).toBeTypeOf("string");
-        expect(fullLog["gen_ai.completion"]).toBeTypeOf("string");
+        // Full capture carries the request and the assembled response as
+        // the GenAI conventions' messages, nested, and no flat text.
+        expect(fullLog["gen_ai.input.messages"]).toEqual([
+          {
+            role: "user",
+            parts: [{ type: "text", content: `please remember the token ${PROMPT_TOKEN}` }],
+          },
+        ]);
+        expect(fullLog["gen_ai.output.messages"]).toEqual([
+          {
+            role: "assistant",
+            finish_reason: "stop",
+            parts: [{ type: "text", content: `sure, ${RESPONSE_TOKEN} noted` }],
+          },
+        ]);
+        expect(fullLog["gen_ai.prompt"]).toBeUndefined();
+        expect(fullLog["gen_ai.completion"]).toBeUndefined();
         expect(fullIntake.bodyText).toContain(PROMPT_TOKEN);
         expect(fullIntake.bodyText).toContain(RESPONSE_TOKEN);
 
         // Metadata-only carries NEITHER the prompt nor the response — content
         // gating holds end-to-end through the real binary.
         const metaLog = asRecord(metaIntake.logs[0]);
-        expect(metaLog["gen_ai.prompt"]).toBeUndefined();
-        expect(metaLog["gen_ai.completion"]).toBeUndefined();
+        for (const field of [
+          "gen_ai.prompt",
+          "gen_ai.completion",
+          "gen_ai.input.messages",
+          "gen_ai.output.messages",
+        ]) {
+          expect(metaLog[field]).toBeUndefined();
+        }
         expect(metaIntake.bodyText).not.toContain(PROMPT_TOKEN);
         expect(metaIntake.bodyText).not.toContain(RESPONSE_TOKEN);
       } finally {
