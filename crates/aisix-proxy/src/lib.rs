@@ -11654,9 +11654,10 @@ data: [DONE]\n\n";
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = new_snap(&upstream.uri());
-        seed_two_member_council(&snap);
+        seed_council_with_a_tpm_cap(&snap);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state.clone());
 
         let req = Request::builder()
             .method("POST")
@@ -11672,7 +11673,7 @@ data: [DONE]\n\n";
                 .to_string(),
             ))
             .unwrap();
-        let response = app.oneshot(req).await.unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK, "the head must exist");
         drop_body_unpolled(response);
 
@@ -11697,6 +11698,7 @@ data: [DONE]\n\n";
         assert_eq!(events[2].error_message, cancel::CANCELLED_BEFORE_BODY);
         assert_eq!(events[2].attempt_kind, "", "{events:?}");
         assert_attempt_indices_increase(&events);
+        assert_council_charged(&state, app, 32).await;
     }
 
     /// A streaming ensemble cancelled while its judge connects: the panel had
@@ -11737,9 +11739,10 @@ data: [DONE]\n\n";
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = new_snap(&upstream.uri());
-        seed_two_member_council(&snap);
+        seed_council_with_a_tpm_cap(&snap);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state.clone());
 
         let mut req = cancellable_chat_request("council");
         *req.body_mut() = Body::from(
@@ -11750,7 +11753,7 @@ data: [DONE]\n\n";
             })
             .to_string(),
         );
-        cancel_in_flight(app, req).await;
+        cancel_in_flight(app.clone(), req).await;
 
         let mut events = Vec::new();
         while let Ok(Some(ev)) =
@@ -11773,6 +11776,258 @@ data: [DONE]\n\n";
         assert_eq!(events[2].error_message, cancel::CANCELLED_BEFORE_HEAD);
         assert_eq!(events[2].attempt_kind, "", "{events:?}");
         assert_attempt_indices_increase(&events);
+        assert_council_charged(&state, app, 32).await;
+    }
+
+    /// A 2-member council whose caller key is capped at 10 tokens a minute,
+    /// below what one panel member costs (16), so whether an abandoned
+    /// request charged the key shows in the next request's admission.
+    fn seed_council_with_a_tpm_cap(snap: &AisixSnapshot) {
+        seed_two_member_council(snap);
+        snap.apikeys.insert(apikey_entry_with_limits(
+            "sk-caller",
+            &["council"],
+            Some(serde_json::json!({"tpm": 10})),
+        ));
+    }
+
+    /// An abandoned council request charged its returned sub-calls'
+    /// `tokens`: to the caller key's rate limit (the next request is refused
+    /// at admission) and to the request-level token families under the
+    /// ensemble alias.
+    async fn assert_council_charged(state: &ProxyState, app: Router, tokens: u64) {
+        let scrape = state.metrics.render();
+        let consumed = scrape
+            .lines()
+            .find(|l| {
+                l.starts_with("aisix_tokens_consumed_total{")
+                    && l.contains(r#"provider="ensemble""#)
+                    && l.contains(r#"model="council""#)
+            })
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse::<u64>().ok());
+        assert_eq!(consumed, Some(tokens), "{scrape}");
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.oneshot(cancellable_chat_request("council")),
+        )
+        .await
+        .expect("the next request must be refused at admission, not dispatched")
+        .unwrap();
+        assert_eq!(next.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// Mount a council upstream whose judge never answers in time (and,
+    /// with `slow_panel_b`, whose second panel member does not either), so a
+    /// request can be cancelled with only part of the ensemble returned.
+    async fn mount_council_with_a_slow_tail(upstream: &MockServer, slow_panel_b: bool) {
+        let slow = ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({
+                "id": "cmpl-slow",
+                "model": "judge-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "too late"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 7, "total_tokens": 37}
+            }))
+            .set_delay(std::time::Duration::from_secs(5));
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("Answer 1:"))
+            .respond_with(slow.clone())
+            .with_priority(1)
+            .mount(upstream)
+            .await;
+        if slow_panel_b {
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .and(wiremock::matchers::body_string_contains("slow-upstream"))
+                .respond_with(slow)
+                .with_priority(1)
+                .mount(upstream)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-panel",
+                "model": "panel-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "a panel candidate answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16}
+            })))
+            .with_priority(2)
+            .mount(upstream)
+            .await;
+    }
+
+    async fn collect_events(
+        rx: &mut tokio::sync::mpsc::Receiver<aisix_obs::UsageEvent>,
+    ) -> Vec<aisix_obs::UsageEvent> {
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+        {
+            events.push(ev);
+        }
+        events
+    }
+
+    /// A non-streaming ensemble cancelled while its judge runs: both panel
+    /// members had answered, so their rows are owed ahead of the 499 row and
+    /// their tokens are charged as the completed run would have charged them.
+    #[tokio::test]
+    async fn ensemble_cancelled_while_the_judge_runs_emits_and_charges_the_panel() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::start().await;
+        mount_council_with_a_slow_tail(&upstream, false).await;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        seed_council_with_a_tpm_cap(&snap);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state.clone());
+
+        cancel_in_flight(app.clone(), cancellable_chat_request("council")).await;
+
+        let events = collect_events(&mut rx).await;
+        assert_eq!(
+            events.len(),
+            3,
+            "two panel rows and the 499 row: {events:?}"
+        );
+        assert!(
+            events[..2].iter().all(|e| e.attempt_kind == "panel"
+                && e.status_code == 200
+                && e.prompt_tokens == 5
+                && e.completion_tokens == 11),
+            "{events:?}"
+        );
+        assert_eq!(events[2].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
+        assert_eq!(events[2].error_message, cancel::CANCELLED_BEFORE_HEAD);
+        assert_attempt_indices_increase(&events);
+        assert_council_charged(&state, app, 32).await;
+    }
+
+    /// A non-streaming ensemble cancelled while one panel member is still
+    /// out: the member that already answered is owed its row and its charge.
+    #[tokio::test]
+    async fn ensemble_cancelled_during_the_panel_emits_and_charges_the_finished_member() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::start().await;
+        mount_council_with_a_slow_tail(&upstream, true).await;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        seed_council_with_a_tpm_cap(&snap);
+        snap.models
+            .insert(direct_model_entry("m-panel-b", "panel-b", "slow-upstream"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state.clone());
+
+        cancel_in_flight(app.clone(), cancellable_chat_request("council")).await;
+
+        let events = collect_events(&mut rx).await;
+        assert_eq!(events.len(), 2, "one panel row and the 499 row: {events:?}");
+        assert_eq!(events[0].attempt_kind, "panel", "{events:?}");
+        assert_eq!(events[0].attempt_model, "panel-a", "{events:?}");
+        assert_eq!(events[0].prompt_tokens, 5, "{events:?}");
+        assert_eq!(events[1].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
+        assert_eq!(events[1].error_message, cancel::CANCELLED_BEFORE_HEAD);
+        assert_attempt_indices_increase(&events);
+        assert_council_charged(&state, app, 16).await;
+    }
+
+    /// A non-streaming ensemble cancelled while its output guardrail checks
+    /// the synthesized answer: the whole ensemble had returned, so every
+    /// sub-call's row is owed ahead of the 499 row, and the request-level
+    /// token families are owed what the handler would have recorded.
+    #[tokio::test]
+    async fn ensemble_cancelled_during_the_output_guardrail_emits_every_subcall() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::start().await;
+        mount_panel_and_judge(&upstream).await;
+        Mock::given(method("POST"))
+            .and(path("/moderations"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"flagged": false}]}))
+                    .set_delay(std::time::Duration::from_secs(5)),
+            )
+            .mount(&upstream)
+            .await;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        seed_council_with_a_tpm_cap(&snap);
+        let row: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "slow-output-check",
+            "enabled": true,
+            "kind": "openai_moderation",
+            "hook_point": "output",
+            "endpoint": upstream.uri(),
+            "api_key": "k",
+        }))
+        .unwrap();
+        seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-slow-output", row, 1));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state.clone());
+
+        cancel_in_flight(app.clone(), cancellable_chat_request("council")).await;
+
+        let events = collect_events(&mut rx).await;
+        let kinds: Vec<&str> = events.iter().map(|e| e.attempt_kind.as_str()).collect();
+        assert_eq!(kinds, ["panel", "panel", "judge", ""], "{events:?}");
+        assert_eq!(events[2].prompt_tokens, 30, "{events:?}");
+        assert_eq!(events[3].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
+        assert_attempt_indices_increase(&events);
+        assert_council_charged(&state, app, 69).await;
+    }
+
+    /// The streaming sibling: cancelled while one panel member is still out,
+    /// before any stream exists.
+    #[tokio::test]
+    async fn ensemble_stream_cancelled_during_the_panel_emits_and_charges_the_finished_member() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::start().await;
+        mount_council_with_a_slow_tail(&upstream, true).await;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        seed_council_with_a_tpm_cap(&snap);
+        snap.models
+            .insert(direct_model_entry("m-panel-b", "panel-b", "slow-upstream"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state.clone());
+
+        let mut req = cancellable_chat_request("council");
+        *req.body_mut() = Body::from(
+            serde_json::json!({
+                "model": "council",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            })
+            .to_string(),
+        );
+        cancel_in_flight(app.clone(), req).await;
+
+        let events = collect_events(&mut rx).await;
+        assert_eq!(events.len(), 2, "one panel row and the 499 row: {events:?}");
+        assert_eq!(events[0].attempt_kind, "panel", "{events:?}");
+        assert_eq!(events[0].attempt_model, "panel-a", "{events:?}");
+        assert_eq!(events[1].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
+        assert_eq!(events[1].error_message, cancel::CANCELLED_BEFORE_HEAD);
+        assert_attempt_indices_increase(&events);
+        assert_council_charged(&state, app, 16).await;
     }
 
     /// Like `ensemble_model_entry` but with an explicit `min_responses`.
