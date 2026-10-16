@@ -90,6 +90,28 @@ pub(crate) struct ContentEncoding<'a> {
     pub raw_response: Option<&'a str>,
 }
 
+impl ContentEncoding<'_> {
+    /// The flat prompt text for a sink without the MCP-specific fields:
+    /// whatever was not structured, written even when empty, as these
+    /// sinks always have.
+    pub fn flat_prompt(&self) -> Option<&str> {
+        self.raw_prompt.or(self.tool_call_arguments).or(self
+            .structured
+            .input_messages
+            .is_none()
+            .then_some(""))
+    }
+
+    /// The flat response counterpart of [`Self::flat_prompt`].
+    pub fn flat_response(&self) -> Option<&str> {
+        self.raw_response.or(self.tool_call_result).or(self
+            .structured
+            .output_messages
+            .is_none()
+            .then_some(""))
+    }
+}
+
 pub(crate) fn is_mcp(event: &UsageEvent) -> bool {
     event.operation == "mcp" || event.inbound_protocol == "mcp"
 }

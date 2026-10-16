@@ -281,7 +281,8 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     );
     // It is the FAILED request's record: non-2xx status, no response text.
     expect(Number(log.get("status_code"))).toBeGreaterThanOrEqual(400);
-    expect(log.has("response")).toBe(false);
+    // The empty response stays the flat field it always was.
+    expect(log.get("response")).toBe("");
     expect(log.has("output_messages")).toBe(false);
     // The request's messages, in the GenAI conventions' shape.
     const input = JSON.parse(log.get("input_messages")!) as Array<{

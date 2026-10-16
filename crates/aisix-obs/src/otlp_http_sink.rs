@@ -2261,8 +2261,7 @@ mod tests {
     }
 
     /// Captured parts become the output message in order — reasoning, text,
-    /// tool call with parsed arguments — while the flat response every other
-    /// sink reads is untouched.
+    /// tool call with parsed arguments.
     #[test]
     fn structured_output_parts_become_the_output_message() {
         let mut event = sample_event();

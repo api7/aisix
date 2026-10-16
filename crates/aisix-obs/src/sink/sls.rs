@@ -279,8 +279,8 @@ fn to_log(record: &SinkRecord) -> Result<Log, SinkError> {
                 enc.structured.tool_definitions.as_deref(),
             ),
             ("output_messages", enc.structured.output_messages.as_deref()),
-            ("prompt", enc.raw_prompt.or(enc.tool_call_arguments)),
-            ("response", enc.raw_response.or(enc.tool_call_result)),
+            ("prompt", enc.flat_prompt()),
+            ("response", enc.flat_response()),
         ] {
             if let Some(value) = value {
                 log.add_content_kv(key, value);

@@ -275,11 +275,8 @@ impl DatadogSink {
                 }
             }
             for (key, value) in [
-                ("gen_ai.prompt", enc.raw_prompt.or(enc.tool_call_arguments)),
-                (
-                    "gen_ai.completion",
-                    enc.raw_response.or(enc.tool_call_result),
-                ),
+                ("gen_ai.prompt", enc.flat_prompt()),
+                ("gen_ai.completion", enc.flat_response()),
             ] {
                 if let Some(value) = value {
                     obj.insert(key.into(), json!(value));
