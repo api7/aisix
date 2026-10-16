@@ -3225,17 +3225,23 @@ fn drain_responses_sse_frames(
 }
 
 /// The upstream failure a Responses-API stream event reports, if it is one:
-/// the flat `error` event (`{type, code, message, param}`) or
-/// `response.failed`, whose Response carries `error: {code, message}`. Read
-/// the way an in-band error on any other wire is, so a code that names no
-/// HTTP status maps as one with none.
+/// an `error` event or `response.failed`, whose Response carries
+/// `error: {code, message}`. The `error` event comes in two shapes — the
+/// flat one of the published `ResponseErrorEvent` (`{type, code, message,
+/// param}`, what openai-python parses and what this crate emits) and the
+/// one the Codex CLI reads, which nests those fields under `error` — so the
+/// nested value wins when present. Read the way an in-band error on any other wire
+/// is, so a code that names no HTTP status maps as one with none.
 pub(crate) fn responses_in_band_error(event: &Value) -> Option<aisix_gateway::BridgeError> {
     let error = match event.get("type").and_then(Value::as_str)? {
-        "error" => serde_json::json!({
-            "message": event.get("message"),
-            "code": event.get("code"),
-            "param": event.get("param"),
-        }),
+        "error" => match event.get("error") {
+            Some(nested) if !nested.is_null() => nested.clone(),
+            _ => serde_json::json!({
+                "message": event.get("message"),
+                "code": event.get("code"),
+                "param": event.get("param"),
+            }),
+        },
         "response.failed" => event
             .pointer("/response/error")
             .cloned()
@@ -4289,18 +4295,27 @@ fn emit_access_log(
 mod tests {
 
     /// The two ways a Responses-API stream reports a failure in-band are
-    /// both read as an upstream error; any other event is not one. A code
+    /// both read as an upstream error — the `error` event in its flat and
+    /// its nested shape alike; any other event is not one. A code
     /// naming no HTTP status maps as a status-less in-band error.
     #[test]
     fn responses_in_band_errors_are_read_from_both_failure_events() {
         let flat = serde_json::json!({
             "type": "error", "code": "server_error", "message": "boom", "param": null,
         });
+        let nested = serde_json::json!({
+            "type": "error", "sequence_number": 3,
+            "error": {"type": "server_error", "code": null, "message": "nested boom", "param": null},
+        });
         let failed = serde_json::json!({
             "type": "response.failed",
             "response": {"id": "resp_1", "error": {"code": "server_error", "message": "late boom"}},
         });
-        for (event, message) in [(flat, "boom"), (failed, "late boom")] {
+        for (event, message) in [
+            (flat, "boom"),
+            (nested, "nested boom"),
+            (failed, "late boom"),
+        ] {
             let err = super::responses_in_band_error(&event).expect("a failure event");
             assert_eq!(err.http_status(), 502);
             assert_eq!(
