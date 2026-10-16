@@ -772,9 +772,7 @@ async fn run_session(
     let mut upstream_response_headers = std::collections::BTreeMap::new();
     let upstream = match connect_upstream(upstream_request).await {
         Ok((ws, resp)) => {
-            let names = crate::client_ip::exported_header_names(&state.snapshot.load(), |e| {
-                &e.upstream_response_headers
-            });
+            let names = crate::client_ip::exported_header_names(&state.snapshot.load(), true);
             if !names.is_empty() {
                 upstream_response_headers =
                     aisix_gateway::capture_header_values(resp.headers(), &names);

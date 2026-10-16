@@ -106,7 +106,7 @@ That is the tolerance the split exists for: an optional field a newer
 control plane adds inside a nested config object is ignored and reported,
 instead of taking the whole row down.
 
-For **five** resources the read contract relaxes a requirement as well,
+For **six** resources the read contract relaxes a requirement as well,
 so a consumer that models the lenient set as "the strict set with
 `additionalProperties` stripped" is wrong about them:
 
@@ -116,6 +116,7 @@ so a consumer that models the lenient set as "the strict set with
 | `guardrail` | the `semantic` kind requires neither an embedding model (under either spelling) nor a threshold beside each example list |
 | `mcp_policy` | `allow` is not required; the `McpToolRef` relaxations above apply here too, as does the absent `deny`-beside-`deny_ids` guard (its team-scope guard is on both sets) |
 | `mcp_server` | the label pattern (`name`, and its former spelling `display_name`) still forbids `__` and a trailing `_`, but not a `*` |
+| `observability_exporter` | `request_headers` / `upstream_response_headers` names are not checked (pattern, duplicates, refused credential and `set-cookie` names) — the gateway drops a refused name when capturing rather than the whole exporter |
 | `model` | the per-kind `not`/`anyOf` lists that forbid a knob a kind never resolves are shorter — a stored row keeps loading and `Model::strip_kind_inapplicable` drops the dead knob; and an `effort_mapping` target value may be empty, which the write path refuses |
 
 Three of those are worth spelling out. A half-written `McpToolRef` entry
@@ -138,7 +139,7 @@ required on **both** sets. A scriptless `custom` row screens nothing
 either way, so rejecting it is what makes it visible in
 `GET /status/config`'s `rejected[]`.
 
-These come from the five producers that take a `strict` flag in
+These come from the six producers that take a `strict` flag in
 `crates/aisix-core/src/models/schema.rs` and are deliberate.
 
 One consequence is registered rather than fixed: the gateway's own Admin

@@ -467,8 +467,9 @@ mod tests {
 
     /// Both header lists on every kind: lowercase token names only, no
     /// duplicates, never a credential slot — and never `set-cookie` among
-    /// the response headers. The rules hold on the read path too, so a
-    /// stored row cannot carry a credential header into an export.
+    /// the response headers. Refused on the write path only: a stored row
+    /// naming one still loads (the gateway drops the name when capturing),
+    /// so a later tightening cannot take a whole exporter dark.
     #[test]
     fn header_lists_are_validated_on_every_kind_on_both_paths() {
         let kinds = [
@@ -523,15 +524,17 @@ mod tests {
                 );
                 for names in bad {
                     let v = doc(kind, field, names);
-                    assert_eq!(both(&v), (false, false), "{v}");
+                    assert_eq!(both(&v), (false, true), "{v}");
                 }
+                let wrong_type = doc(kind, field, serde_json::json!("x-sub-user"));
+                assert_eq!(both(&wrong_type), (false, false), "{wrong_type}");
             }
             let cookie = doc(
                 kind,
                 "upstream_response_headers",
                 serde_json::json!(["set-cookie"]),
             );
-            assert_eq!(both(&cookie), (false, false));
+            assert_eq!(both(&cookie), (false, true));
             let req_cookie = doc(kind, "request_headers", serde_json::json!(["set-cookie"]));
             assert_eq!(both(&req_cookie), (true, true));
         }

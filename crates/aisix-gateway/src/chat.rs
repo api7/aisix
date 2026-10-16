@@ -492,7 +492,6 @@ pub struct UsageStats {
 /// `None` when the upstream did not report it — distinct from a reported
 /// `0`. Serialized under the usage event's own field names.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ModalityTokens {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_audio_tokens: Option<u32>,

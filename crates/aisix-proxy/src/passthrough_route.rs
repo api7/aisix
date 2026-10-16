@@ -294,7 +294,7 @@ fn match_route(
 /// pipeline, and owns the request-level telemetry for both outcomes.
 pub async fn entry(
     State(state): State<ProxyState>,
-    client: crate::client_ip::ClientContext,
+    mut client: crate::client_ip::ClientContext,
     req: Request,
 ) -> Response {
     let started = Instant::now();
@@ -325,6 +325,17 @@ pub async fn entry(
     // cancel guard needs it to file a row for a caller that hangs up while
     // the upstream is still thinking (AISIX-Cloud#1571).
     crate::attribution::note_passthrough_route(&route_name);
+    // The route names its own credential slot (`auth_header_name`), which
+    // no exporter list may capture: it carries the caller's gateway key.
+    if let Some(slot) = matched.entry.value.auth_header_name.as_deref() {
+        if client
+            .request_headers
+            .remove(&slot.to_ascii_lowercase())
+            .is_some()
+        {
+            crate::attribution::note_request_headers(&client.request_headers);
+        }
+    }
 
     // Filled inside `dispatch` at chain resolution, so the failure branch
     // — where an input-guardrail block lands — stamps the enforced hits

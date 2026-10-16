@@ -40,6 +40,7 @@ const MODEL = "urh-model";
 const BROKEN_MODEL = "urh-broken";
 const FLAKY_MODEL = "urh-flaky";
 const ROUTE_PREFIX = "/urh-route";
+const KEYED_ROUTE_PREFIX = "/urh-keyed-route";
 
 type Headers = Record<string, string | string[]>;
 
@@ -150,7 +151,9 @@ describe("exporters record the request and upstream response headers they list",
       name: "urh-sls-a",
       enabled: true,
       ...sink(STORE_A),
-      request_headers: ["x-sub-user", "x-department"],
+      // `x-gw-key` is the header-key route's credential slot below: listed
+      // here, it must still never be recorded.
+      request_headers: ["x-sub-user", "x-department", "x-gw-key"],
       upstream_response_headers: ["x-upstream-region"],
     });
     await seed.createObservabilityExporter({
@@ -189,6 +192,14 @@ describe("exporters record the request and upstream response headers they list",
       path_prefix: ROUTE_PREFIX,
       target_url: `${upstream.baseUrl}/v1`,
       provider_key_id: pk.id,
+    });
+    await seed.createPassthroughRoute({
+      name: "urh-keyed-route",
+      path_prefix: KEYED_ROUTE_PREFIX,
+      target_url: `${upstream.baseUrl}/v1`,
+      provider_key_id: pk.id,
+      auth_mode: "header_key",
+      auth_header_name: "x-gw-key",
     });
     await seed.update("mcp_servers", randomUUID(), {
       display_name: "urh",
@@ -295,6 +306,18 @@ describe("exporters record the request and upstream response headers they list",
     expect(row.get("passthrough_route_name")).toBe("urh-route");
     expect(map(row, "request_headers")).toEqual({ "x-sub-user": "erin", "x-department": "legal" });
     expect(map(row, "upstream_response_headers")).toEqual({ "x-upstream-region": "us-east" });
+  });
+
+  test("a header-key route's credential slot is never recorded, even when an exporter lists it", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const res = await send(`${KEYED_ROUTE_PREFIX}/chat/completions`, chat, {
+      authorization: "",
+      "x-gw-key": PLAINTEXT,
+      "x-sub-user": "heidi",
+    });
+    expect(res.status).toBe(200);
+    const row = await rowFor(STORE_A, res.requestId, "header-key route row");
+    expect(map(row, "request_headers")).toEqual({ "x-sub-user": "heidi" });
   });
 
   test("a request whose upstream fails records both maps on its failure row", async (ctx) => {

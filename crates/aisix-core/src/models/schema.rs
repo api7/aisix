@@ -134,7 +134,7 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "guardrail" => guardrail_root_schema(strict),
         "guardrail_attachment" => guardrail_attachment_root_schema(),
         "cache_policy" => cache_policy_root_schema(),
-        "observability_exporter" => observability_exporter_root_schema(),
+        "observability_exporter" => observability_exporter_root_schema(strict),
         "rate_limit_policy" => rate_limit_policy_root_schema(),
         "mcp_server" => mcp_server_root_schema(strict),
         "mcp_policy" => mcp_policy_root_schema(strict),
@@ -2279,7 +2279,7 @@ pub fn user_root_schema() -> Value {
 /// Re-closing each branch also rejects cross-kind field leakage (e.g. a
 /// `datadog` exporter carrying an otlp `project`) that the previous
 /// single-union-object validator silently accepted; no valid config mixes kinds.
-pub fn observability_exporter_root_schema() -> Value {
+pub fn observability_exporter_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::ObservabilityExporter>(false);
     let obj = schema
         .as_object_mut()
@@ -2288,9 +2288,15 @@ pub fn observability_exporter_root_schema() -> Value {
     // The header-name rules `schemars` cannot derive: lowercase HTTP token
     // names, no duplicates, never a credential slot (and never `set-cookie`
     // on the response side, which carries a session the upstream issued).
-    // They hold on the read path too, so a stored row cannot smuggle a
-    // credential header into an export either.
-    if let Some(props) = obj.get_mut("properties").and_then(Value::as_object_mut) {
+    // Write path only: a stored row naming a header a later release refuses
+    // must still load, or the whole exporter goes dark. The gateway drops
+    // such names at capture time instead
+    // (`aisix_proxy::client_ip::exported_header_names`).
+    if let Some(props) = obj
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .filter(|_| strict)
+    {
         let credential = crate::forwarded_headers::CREDENTIAL_SLOT_HEADERS;
         for (key, extra) in [
             ("request_headers", &[][..]),

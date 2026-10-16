@@ -180,24 +180,45 @@ pub(crate) fn capture_request_headers(
     headers: &HeaderMap,
     snap: &aisix_core::AisixSnapshot,
 ) -> BTreeMap<String, String> {
-    let names = exported_header_names(snap, |e| &e.request_headers);
+    let names = exported_header_names(snap, false);
     if names.is_empty() {
         return BTreeMap::new();
     }
     aisix_gateway::capture_header_values(headers, &names)
 }
 
-/// The union of one header list across the snapshot's enabled exporters.
+/// The union of one header list across the snapshot's enabled exporters
+/// (`response` picks `upstream_response_headers`), keeping only names the
+/// write path admits: a lowercase token, never a credential slot, and never
+/// `set-cookie` on the response side. A stored row may predate a tightening
+/// of those rules, and it still loads (the read schema leaves them out), so
+/// this is where they hold.
 pub(crate) fn exported_header_names(
     snap: &aisix_core::AisixSnapshot,
-    list: impl Fn(&aisix_core::ObservabilityExporter) -> &Vec<String>,
+    response: bool,
 ) -> Vec<String> {
+    let admitted = |name: &&String| {
+        !name.is_empty()
+            && name.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || b"!#$%&'*+.^_`|~-".contains(&b)
+            })
+            && !aisix_core::forwarded_headers::CREDENTIAL_SLOT_HEADERS.contains(&name.as_str())
+            && (!response || name.as_str() != "set-cookie")
+    };
     let mut names: Vec<String> = snap
         .observability_exporters
         .entries()
         .iter()
         .filter(|e| e.value.enabled)
-        .flat_map(|e| list(&e.value).iter().cloned())
+        .flat_map(|e| {
+            if response {
+                e.value.upstream_response_headers.iter()
+            } else {
+                e.value.request_headers.iter()
+            }
+        })
+        .filter(admitted)
+        .cloned()
         .collect();
     names.sort_unstable();
     names.dedup();
@@ -329,6 +350,30 @@ pub(crate) fn ip_in_cidrs(source_ip: &str, cidrs: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A stored exporter may name a header the write path refuses; the
+    /// capture drops it rather than recording a credential.
+    #[test]
+    fn exported_header_names_drop_what_the_write_path_refuses() {
+        let snap = aisix_core::AisixSnapshot::new();
+        let exporter: aisix_core::ObservabilityExporter =
+            serde_json::from_value(serde_json::json!({
+                "name": "x", "kind": "otlp_http", "endpoint": "https://x",
+                "request_headers": ["x-sub-user", "authorization", "X-Upper", "x-sub-user"],
+                "upstream_response_headers": ["x-region", "set-cookie", "x-api-key"],
+            }))
+            .unwrap();
+        snap.observability_exporters
+            .insert(aisix_core::ResourceEntry::new("e1", exporter, 1));
+        assert_eq!(
+            exported_header_names(&snap, false),
+            vec!["x-sub-user".to_string()]
+        );
+        assert_eq!(
+            exported_header_names(&snap, true),
+            vec!["x-region".to_string()]
+        );
+    }
+
     #[test]
     fn cidr_match_is_closed_on_bad_input() {
         let cidrs = vec!["10.0.0.0/8".to_string(), "2001:db8::/32".to_string()];

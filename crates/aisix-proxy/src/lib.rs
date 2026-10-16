@@ -582,7 +582,7 @@ async fn record_request_telemetry(
     // (AISIX-Cloud#1317). Installed here because a cancelled handler
     // future never gets to hand anything back.
     let attribution = std::sync::Arc::new(attribution::RequestAttribution::with_response_headers(
-        client_ip::exported_header_names(&state.snapshot.load(), |e| &e.upstream_response_headers),
+        client_ip::exported_header_names(&state.snapshot.load(), true),
     ));
     // The access-log line is held on the cell until the guard below finishes
     // the request, which is when both body sizes are known. Written in the
