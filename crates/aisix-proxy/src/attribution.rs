@@ -237,6 +237,9 @@ pub(crate) struct CancelContext {
     /// One past the highest `attempt_index` this request has emitted, `0`
     /// before its first event. See [`next_attempt_index`].
     pub next_attempt_index: u32,
+    /// An ensemble's returned sub-calls, while no exit of the request's own
+    /// has settled them. See [`crate::chat::PendingEnsemble`].
+    pub ensemble: Option<crate::chat::PendingEnsemble>,
 }
 
 /// A streamed response's access-log line, parked by its handler until the
@@ -1002,6 +1005,28 @@ fn with(f: impl FnOnce(&mut Resolved)) {
 /// Same, for the cancel half of the cell.
 fn with_cancel(f: impl FnOnce(&mut CancelContext)) {
     let _ = CURRENT.try_with(|a| f(&mut a.lock().cancel));
+}
+
+/// Publish an ensemble's pending sub-calls for the cancel guard to report.
+/// See [`crate::chat::PendingEnsemble`].
+pub(crate) fn publish_ensemble(pending: crate::chat::PendingEnsemble) {
+    with_cancel(|c| c.ensemble = Some(pending));
+}
+
+/// The ensemble has charged its tokens to its entry layers, so a cancel from
+/// here on reports its rows without charging them again.
+pub(crate) fn note_ensemble_tokens_charged() {
+    with_cancel(|c| {
+        if let Some(pending) = c.ensemble.as_mut() {
+            pending.tokens_owed = false;
+        }
+    });
+}
+
+/// One of the request's own exits is settling the ensemble's sub-calls, so
+/// the cancel guard no longer speaks for them.
+pub(crate) fn settle_ensemble() {
+    with_cancel(|c| c.ensemble = None);
 }
 
 /// Note the caller behind this request. Called once, from the

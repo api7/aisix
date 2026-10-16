@@ -246,6 +246,17 @@ pub struct PanelOutcome {
     pub usage_estimated: bool,
 }
 
+impl PanelOutcome {
+    fn of(model: &str, outcome: &ModelCallOutcome) -> Self {
+        Self {
+            model: model.to_string(),
+            usage: outcome.response.usage.clone(),
+            effective_usage: outcome.effective_usage.clone(),
+            usage_estimated: outcome.usage_estimated,
+        }
+    }
+}
+
 /// Everything the dispatch layer needs after an ensemble run: the judge's
 /// response (the client-facing answer, whose `usage` is the judge call's
 /// own), plus the per-sub-call accounting for telemetry and the aggregate
@@ -257,6 +268,60 @@ pub struct EnsembleOutcome {
     pub judge_model: String,
     pub judge_effective_usage: UsageStats,
     pub judge_usage_estimated: bool,
+}
+
+/// The sub-calls of one ensemble run that have already returned, recorded as
+/// each one completes rather than when the run does. A run whose future is
+/// dropped part-way (the caller hung up) never returns its outcome, yet every
+/// sub-call recorded here already round-tripped an upstream and is owed its
+/// usage row; the dispatch layer reads this to emit them.
+#[derive(Debug, Default)]
+pub struct EnsembleProgress {
+    inner: std::sync::Mutex<ProgressInner>,
+}
+
+#[derive(Debug, Default)]
+struct ProgressInner {
+    /// `(slot in the configured panel, outcome)`, in completion order.
+    panel: Vec<(usize, PanelOutcome)>,
+    judge: Option<JudgeReturn>,
+}
+
+/// A judge call that returned: its accounting plus the response identity its
+/// usage row reports.
+#[derive(Debug)]
+pub(crate) struct JudgeReturn {
+    pub outcome: PanelOutcome,
+    pub response_id: String,
+    pub response_model: String,
+    pub finish_reason: aisix_gateway::FinishReason,
+}
+
+impl EnsembleProgress {
+    fn record_panel(&self, slot: usize, outcome: PanelOutcome) {
+        self.inner.lock().unwrap().panel.push((slot, outcome));
+    }
+
+    fn record_judge(&self, model: &str, judge: &ModelCallOutcome) {
+        self.inner.lock().unwrap().judge = Some(JudgeReturn {
+            outcome: PanelOutcome::of(model, judge),
+            response_id: judge.response.id.clone(),
+            response_model: judge.response.model.clone(),
+            finish_reason: judge.response.finish_reason.clone(),
+        });
+    }
+
+    /// The panel members that returned, in configured order, and the judge
+    /// if it returned.
+    pub(crate) fn take(&self) -> (Vec<PanelOutcome>, Option<JudgeReturn>) {
+        let mut inner = self.inner.lock().unwrap();
+        let mut panel = std::mem::take(&mut inner.panel);
+        panel.sort_by_key(|(slot, _)| *slot);
+        (
+            panel.into_iter().map(|(_, outcome)| outcome).collect(),
+            inner.judge.take(),
+        )
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -316,16 +381,20 @@ pub(crate) async fn run_ensemble_panel(
     req: &ChatFormat,
     config: &EnsembleConfig,
     caller: &dyn ModelCaller,
+    progress: &EnsembleProgress,
 ) -> Result<(Vec<PanelOutcome>, Vec<ChatResponse>, ChatFormat), EnsembleError> {
     let per_call_timeout = config.timeout();
 
     // Phase 1: fan out to every panel member concurrently.
-    let calls = config.panel.iter().map(|member| {
+    let calls = config.panel.iter().enumerate().map(|(slot, member)| {
         let model = member.model.clone();
         async move {
             let member_req = || panel_request(req, member);
             let result =
                 call_with_optional_timeout(caller, &model, &member_req, per_call_timeout).await;
+            if let Ok(outcome) = &result {
+                progress.record_panel(slot, PanelOutcome::of(&model, outcome));
+            }
             (model, result)
         }
     });
@@ -373,9 +442,10 @@ pub async fn run_ensemble(
     req: &ChatFormat,
     config: &EnsembleConfig,
     caller: &dyn ModelCaller,
+    progress: &EnsembleProgress,
 ) -> Result<EnsembleOutcome, EnsembleError> {
     // Phases 1-2 + judge-request construction.
-    let (panel, candidates, judge_req) = run_ensemble_panel(req, config, caller).await?;
+    let (panel, candidates, judge_req) = run_ensemble_panel(req, config, caller, progress).await?;
     // The judge's prompt renders the caller's messages, so it is rebuilt per
     // attempt like a panel member's request rather than held for the wait.
     drop(judge_req);
@@ -401,6 +471,7 @@ pub async fn run_ensemble(
         // failure so the dispatch layer commits + emits them too.
         Err(source) => return Err(EnsembleError::Judge { source, panel }),
     };
+    progress.record_judge(&config.judge.model, &judge);
 
     Ok(EnsembleOutcome {
         response: judge.response,
@@ -621,7 +692,9 @@ mod tests {
         let mut req = user_request("what is 2+2?");
         req.extra
             .insert("reasoning_effort".to_string(), "medium".into());
-        let out = run_ensemble(&req, &cfg, &caller).await.unwrap();
+        let out = run_ensemble(&req, &cfg, &caller, &EnsembleProgress::default())
+            .await
+            .unwrap();
 
         assert_eq!(out.response.message.content_str(), "synthesized answer");
         assert_eq!(out.panel.len(), 2);
@@ -656,9 +729,14 @@ mod tests {
         let cfg =
             config(r#"{"panel":[{"model":"gpt"},{"model":"claude"}],"judge":{"model":"judge"}}"#);
 
-        let err = run_ensemble(&user_request("hi"), &cfg, &caller)
-            .await
-            .unwrap_err();
+        let err = run_ensemble(
+            &user_request("hi"),
+            &cfg,
+            &caller,
+            &EnsembleProgress::default(),
+        )
+        .await
+        .unwrap_err();
 
         match err {
             EnsembleError::InsufficientPanel { got, needed, panel } => {
@@ -687,9 +765,14 @@ mod tests {
             r#"{"panel":[{"model":"a"},{"model":"b"},{"model":"c"}],"judge":{"model":"judge"}}"#,
         );
 
-        let out = run_ensemble(&user_request("hi"), &cfg, &caller)
-            .await
-            .unwrap();
+        let out = run_ensemble(
+            &user_request("hi"),
+            &cfg,
+            &caller,
+            &EnsembleProgress::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(out.panel.len(), 2);
         let judge_prompt = caller.calls_to("judge")[0].messages[0]
@@ -722,9 +805,14 @@ mod tests {
             );
         let cfg = config(r#"{"panel":[{"model":"a"},{"model":"b"}],"judge":{"model":"judge"}}"#);
 
-        let err = run_ensemble(&user_request("hi"), &cfg, &caller)
-            .await
-            .unwrap_err();
+        let err = run_ensemble(
+            &user_request("hi"),
+            &cfg,
+            &caller,
+            &EnsembleProgress::default(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(caller.calls_to("judge").len(), 1);
         assert!(matches!(err, EnsembleError::Judge { .. }));
@@ -741,9 +829,14 @@ mod tests {
             );
         let cfg = config(r#"{"panel":[{"model":"a"},{"model":"b"}],"judge":{"model":"judge"}}"#);
 
-        let err = run_ensemble(&user_request("hi"), &cfg, &caller)
-            .await
-            .unwrap_err();
+        let err = run_ensemble(
+            &user_request("hi"),
+            &cfg,
+            &caller,
+            &EnsembleProgress::default(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err.http_status(), 400); // judge 4xx preserved
         assert_eq!(caller.calls_to("judge").len(), 1); // not retried
@@ -773,7 +866,9 @@ mod tests {
         let mut req = user_request("hi");
         req.temperature = Some(0.2);
 
-        run_ensemble(&req, &cfg, &caller).await.unwrap();
+        run_ensemble(&req, &cfg, &caller, &EnsembleProgress::default())
+            .await
+            .unwrap();
 
         assert_eq!(caller.calls_to("hot")[0].temperature, Some(1.0));
         assert_eq!(caller.calls_to("inherit")[0].temperature, Some(0.2));
@@ -793,9 +888,14 @@ mod tests {
             r#"{"panel":[{"model":"secret-vendor-x"},{"model":"secret-vendor-y"}],"judge":{"model":"judge"}}"#,
         );
 
-        run_ensemble(&user_request("hi"), &cfg, &caller)
-            .await
-            .unwrap();
+        run_ensemble(
+            &user_request("hi"),
+            &cfg,
+            &caller,
+            &EnsembleProgress::default(),
+        )
+        .await
+        .unwrap();
 
         let judge_prompt = caller.calls_to("judge")[0].messages[0]
             .content_str()
@@ -814,9 +914,14 @@ mod tests {
             r#"{"panel":[{"model":"a"},{"model":"b"}],"judge":{"model":"judge","synthesis_prompt":"PICK BEST. Q={original_request} A={labeled_candidates}"}}"#,
         );
 
-        run_ensemble(&user_request("which?"), &cfg, &caller)
-            .await
-            .unwrap();
+        run_ensemble(
+            &user_request("which?"),
+            &cfg,
+            &caller,
+            &EnsembleProgress::default(),
+        )
+        .await
+        .unwrap();
 
         let judge_prompt = caller.calls_to("judge")[0].messages[0]
             .content_str()

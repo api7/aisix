@@ -1045,7 +1045,9 @@ fn log_provider_call(handler: &'static str, event: &UsageEvent) {
         request_id = event.request_id.as_str(),
         provider_request_id = event.provider_request_id.as_str(),
         attempt_index = event.attempt_index,
-        attempt_kind = if event.attempt_kind.is_empty() {
+        // A blank kind reads as `initial` only on the request's first row; a
+        // later blank row is a synthesized one that speaks for no attempt.
+        attempt_kind = if event.attempt_kind.is_empty() && event.attempt_index == 0 {
             "initial"
         } else {
             event.attempt_kind.as_str()
@@ -1392,6 +1394,20 @@ mod tests {
             out.contains("attempt_kind=\"initial\"") || out.contains("attempt_kind=initial"),
             "{out}"
         );
+    }
+
+    /// A blank kind after the first row belongs to a synthesized row that
+    /// follows the request's attempts, so it is not labelled `initial`.
+    #[test]
+    fn provider_call_log_leaves_a_later_blank_attempt_kind_blank() {
+        let mut ev = sample_event("req-later-blank");
+        ev.provider_request_id = "cmpl-2".into();
+        ev.attempt_index = 3;
+        let out = capture_logs(|| {
+            UsageSink::disabled().try_emit("chat", ev, UsageEventLabels::default())
+        });
+        assert!(out.contains("attempt_index=3"), "{out}");
+        assert!(out.contains("attempt_kind=\"\""), "{out}");
     }
 
     #[tokio::test]

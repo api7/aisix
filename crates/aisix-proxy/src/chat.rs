@@ -657,6 +657,7 @@ pub async fn chat_completions(
                     );
                 }
                 None if routing.attempts.is_empty() => {
+                    let terminal_index = crate::attribution::next_attempt_index();
                     emit_usage_event(
                         &state,
                         &snapshot,
@@ -673,9 +674,11 @@ pub async fn chat_completions(
                             // An ensemble's failure exits have already
                             // emitted their panel (and judge) rows, which
                             // record no routing attempt; this row follows
-                            // them.
-                            attempt_index: crate::attribution::next_attempt_index(),
-                            attempt_kind: "initial".to_string(),
+                            // them, and like every other synthesized row
+                            // that follows attempt rows it names no kind.
+                            attempt_index: terminal_index,
+                            attempt_kind: if terminal_index == 0 { "initial" } else { "" }
+                                .to_string(),
                             // Bounded ProxyError class so the dashboard can
                             // show why the request never reached an upstream.
                             error_class: crate::attempt::error_class(&err).to_string(),
@@ -3757,28 +3760,8 @@ async fn dispatch_ensemble(
     let ensemble_cfg = ensemble_cfg.with_refs_resolved(snapshot);
     let ensemble_cfg = &ensemble_cfg;
 
-    // Resolve a sub-call's target by display_name → (model_id, provider_key_id,
-    // upstream_model). The first two are telemetry attribution; the third is
-    // the tokenizer key for the #1074 estimation fallback — the estimator keys
-    // off the real upstream model, not the operator alias, exactly as the
-    // direct and streaming-judge paths do (a `gpt-4o` alias must select
-    // o200k_base, not the cl100k default an unrecognised alias falls back to).
-    // Empty ids if the target was deleted between dispatch and emit (cp-api
-    // stores NULL); the tokenizer then degrades to the display name.
-    let resolve_sub = |display_name: &str| -> (String, String, String) {
-        match snapshot.models.get_by_name(display_name) {
-            Some(entry) => (
-                entry.id.clone(),
-                entry.value.provider_key_id.clone().unwrap_or_default(),
-                entry
-                    .value
-                    .upstream_model()
-                    .unwrap_or(display_name)
-                    .to_string(),
-            ),
-            None => (String::new(), String::new(), display_name.to_string()),
-        }
-    };
+    let resolve_sub =
+        |display_name: &str| -> (String, String, String) { subcall_target(snapshot, display_name) };
     let effective_panel_member_usage =
         |member: &crate::ensemble::PanelOutcome| -> EffectiveSubcallUsage {
             EffectiveSubcallUsage {
@@ -3786,65 +3769,41 @@ async fn dispatch_ensemble(
                 estimated: member.usage_estimated,
             }
         };
+    let row_ctx = EnsembleRowCtx {
+        request_id: request_id.to_string(),
+        client_model: req.model.clone(),
+        api_key_id: api_key_id.to_string(),
+        applied_guardrails: applied_guardrails.to_vec(),
+        audit: audit.clone(),
+        client: client.clone(),
+        started,
+    };
     // Emit one usage event for a single (already-billed) panel member.
     // Defined before the `run_ensemble` match so the InsufficientPanel arm
     // can bill the survivors too — they hit upstream just like a full panel.
     // `bypass` is passed per call (not captured) so the closure holds no
     // borrow of the mutable `bypass_reason`. `attempt_index` is the member's
     // 0-based slot; `blocked` sets the event's `guardrail_blocked` flag.
-    let emit_panel_member = |member: &crate::ensemble::PanelOutcome,
-                             index: usize,
-                             prepared: Option<&EffectiveSubcallUsage>,
-                             blocked: bool,
-                             bypass: &str| {
-        let (sub_model_id, sub_provider_key_id, _) = resolve_sub(&member.model);
-        let computed;
-        let effective = match prepared {
-            Some(usage) => usage,
-            None => {
-                computed = effective_panel_member_usage(member);
-                &computed
-            }
-        };
-        let pk = crate::usage_attr::ResolvedPk::resolve(snapshot, &sub_provider_key_id);
-        emit_usage_event(
-            state,
-            snapshot,
-            &pk,
-            request_id,
-            &sub_model_id,
-            &req.model,
-            api_key_id,
-            200,
-            started.elapsed(),
-            effective.usage.prompt_tokens,
-            effective.usage.completion_tokens,
-            UsageExtras {
-                cached_prompt_tokens: effective.usage.cached_prompt_tokens,
-                cache_write_tokens: effective.usage.cache_write_tokens,
-                reasoning_tokens: effective.usage.reasoning_tokens,
-                upstream_total_tokens: effective.usage.upstream_total_tokens,
-                reasoning_folded_into_completion: effective.usage.reasoning_folded_into_completion,
-                cache_creation_tokens: effective.usage.cache_creation_tokens,
-                cache_read_tokens: effective.usage.cache_read_tokens,
-                usage_estimated: effective.estimated,
-                bypass_reason: bypass.to_string(),
-                cache_status: CacheStatus::Disabled.as_str().to_string(),
-                attempt_index: index as u32,
-                attempt_kind: "panel".to_string(),
+    let emit_panel_member =
+        |member: &crate::ensemble::PanelOutcome, index: usize, blocked: bool, bypass: &str| {
+            let (model_id, provider_key_id, _) = resolve_sub(&member.model);
+            EnsembleSubcall {
+                model_id,
+                provider_key_id,
                 attempt_model: member.model.clone(),
-                applied_guardrails: applied_guardrails.to_vec(),
-                ..UsageExtras::default()
-            },
-            /* cost_usd */ 0.0,
-            blocked,
-            client,
-            /* content */ None,
-            /* terminal */ false,
-            /* dispatched */ true,
-            audit,
-        );
-    };
+                usage: member.effective_usage.clone(),
+                usage_estimated: member.usage_estimated,
+            }
+            .emit(
+                state,
+                snapshot,
+                &row_ctx,
+                "panel",
+                index as u32,
+                blocked,
+                bypass,
+            );
+        };
     // Failure exits bill every successful panel member even when the
     // upstream omitted usage. Share the same normalized accounting used by
     // UsageEvent emission so quota and telemetry cannot diverge.
@@ -3867,6 +3826,21 @@ async fn dispatch_ensemble(
         },
     };
 
+    // Until one of the request's own exits settles them, the sub-calls that
+    // already returned are the cancel guard's to report (see
+    // `PendingEnsemble`).
+    let progress = Arc::new(crate::ensemble::EnsembleProgress::default());
+    crate::attribution::publish_ensemble(PendingEnsemble {
+        ctx: row_ctx.clone(),
+        entry_keys: reservation.keys(),
+        stream: req.is_streaming(),
+        progress: Arc::clone(&progress),
+        bypass: bypass_reason.clone().unwrap_or_default(),
+        input_redactions: input_redactions.clone(),
+        input_monitor_hits: input_monitor_hits.clone(),
+        tokens_owed: true,
+    });
+
     // Streaming ensemble (OPTION A): the panel must be buffered to synthesize,
     // so phases 1-2 run NON-streaming; only the judge's tokens are streamed,
     // by reusing `build_sse_stream` exactly as the single-upstream path does.
@@ -3877,26 +3851,17 @@ async fn dispatch_ensemble(
     // path, which likewise holds the socket bytes-free across panel + judge;
     // warming it would need an early SSE handshake before the panel completes.
     if req.is_streaming() {
-        // Emit the already-billed panel survivors, then build the failure.
-        // Shared by both streaming error exits (panel exhausted, or judge
-        // connect failed): in either case every surviving panel member
+        // Emit the already-billed panel survivors, then build the failure,
+        // for every exit before the stream exists. Every surviving panel member
         // round-tripped an upstream and must be billed, exactly like the
         // non-streaming error paths. `charge: None` — the per-member events
-        // already carry the bill.
-        //
-        // The token commit is NOT done here: `MultiReservation::commit_tokens`
-        // is async (#607's cluster-Redis path), and this helper is sync so
-        // `emit_panel_member` stays callable across every exit. Each call site
-        // therefore `.await`s `reservation.commit_tokens(survivor_total)`
-        // inline FIRST (mirroring the non-streaming ensemble path), then calls
-        // this for the emit + `DispatchFailure`. `panel` is borrowed so the
-        // call site still owns it to compute `survivor_total`.
+        // already carry the bill. `panel` is borrowed so the call site still
+        // owns it to compute `survivor_total` for the commit.
+        let input_bypass = bypass_reason.as_deref().unwrap_or_default();
         let emit_panel_then_fail =
             |panel: &[crate::ensemble::PanelOutcome], proxy_err: ProxyError| -> DispatchFailure {
                 for (index, member) in panel.iter().enumerate() {
-                    emit_panel_member(
-                        member, index, None, /* blocked */ false, /* bypass */ "",
-                    );
+                    emit_panel_member(member, index, /* blocked */ false, input_bypass);
                 }
                 DispatchFailure::new(Some(model_id.to_string()), None, proxy_err)
             };
@@ -3904,26 +3869,45 @@ async fn dispatch_ensemble(
         // Phases 1-2 + judge-request construction. An exhausted panel bills
         // the survivors and returns 502 (same status mapping as the
         // non-streaming `InsufficientPanel` path).
-        let (panel, candidates, judge_req) =
-            match crate::ensemble::run_ensemble_panel(req, ensemble_cfg, &caller).await {
-                Ok(triple) => triple,
-                Err(crate::ensemble::EnsembleError::InsufficientPanel { panel, .. }) => {
-                    reservation.commit_tokens(survivor_total(&panel)).await;
-                    return Err(emit_panel_then_fail(
-                        &panel,
-                        ProxyError::Bridge(BridgeError::upstream_status(
-                            502,
-                            "ensemble panel did not reach the required number of responses",
-                        )),
-                    ));
-                }
-                // `run_ensemble_panel` never returns `Judge` (it stops before
-                // the judge call), but the enum is non-exhaustive to us here.
-                Err(crate::ensemble::EnsembleError::Judge { panel, source }) => {
-                    reservation.commit_tokens(survivor_total(&panel)).await;
-                    return Err(emit_panel_then_fail(&panel, ProxyError::Bridge(source)));
-                }
-            };
+        let panel_run =
+            crate::ensemble::run_ensemble_panel(req, ensemble_cfg, &caller, &progress).await;
+        if panel_run.is_err() {
+            crate::attribution::settle_ensemble();
+        }
+        let (panel, candidates, judge_req) = match panel_run {
+            Ok(triple) => triple,
+            Err(crate::ensemble::EnsembleError::InsufficientPanel { panel, .. }) => {
+                let failure = emit_panel_then_fail(
+                    &panel,
+                    ProxyError::Bridge(BridgeError::upstream_status(
+                        502,
+                        "ensemble panel did not reach the required number of responses",
+                    )),
+                );
+                reservation.commit_tokens(survivor_total(&panel)).await;
+                return Err(failure);
+            }
+            // `run_ensemble_panel` never returns `Judge` (it stops before
+            // the judge call), but the enum is non-exhaustive to us here.
+            Err(crate::ensemble::EnsembleError::Judge { panel, source }) => {
+                let failure = emit_panel_then_fail(&panel, ProxyError::Bridge(source));
+                reservation.commit_tokens(survivor_total(&panel)).await;
+                return Err(failure);
+            }
+        };
+
+        // #614: field-wise panel usage sum (not just total_tokens) folded into
+        // the client-facing terminal usage chunk via build_sse_stream's
+        // `base_usage`, so a streamed ensemble reports the full panel+judge
+        // aggregate — matching the non-streaming path.
+        let panel_usage_sum = panel
+            .iter()
+            .fold(aisix_gateway::chat::UsageStats::default(), |acc, p| {
+                acc.saturating_add(&p.usage)
+            });
+        // From here to the stream's completion the published
+        // `PendingEnsemble` still speaks for the panel if the caller leaves.
+        let panel_total = survivor_total(&panel);
 
         // The judge's prompt renders the caller's messages, so it is rebuilt
         // where it is needed (`build_judge_req` below) rather than held
@@ -3934,13 +3918,15 @@ async fn dispatch_ensemble(
         // snapshot, and the judge is required config), but stay total: bill the
         // panel + fail rather than panic if the entry vanished mid-request.
         let Some(judge_entry) = snapshot.models.get_by_name(&ensemble_cfg.judge.model) else {
-            reservation.commit_tokens(survivor_total(&panel)).await;
-            return Err(emit_panel_then_fail(
+            crate::attribution::settle_ensemble();
+            let failure = emit_panel_then_fail(
                 &panel,
                 ProxyError::Bridge(BridgeError::InvalidUpstreamConfig(
                     "ensemble judge references an unknown model".into(),
                 )),
-            ));
+            );
+            reservation.commit_tokens(panel_total).await;
+            return Err(failure);
         };
         let judge_model = &judge_entry.value;
         // Stream the judge's synthesized answer: the request the executor
@@ -3959,24 +3945,28 @@ async fn dispatch_ensemble(
             Ok(pk) => pk,
             Err(e) => {
                 tracing::warn!(error = %e, "ensemble judge provider key unresolved");
-                reservation.commit_tokens(survivor_total(&panel)).await;
-                return Err(emit_panel_then_fail(
+                crate::attribution::settle_ensemble();
+                let failure = emit_panel_then_fail(
                     &panel,
                     ProxyError::Bridge(BridgeError::InvalidUpstreamConfig(
                         "ensemble judge has an unresolved provider key".into(),
                     )),
-                ));
+                );
+                reservation.commit_tokens(panel_total).await;
+                return Err(failure);
             }
         };
         let Some(judge_bridge) = crate::dispatch::resolve_bridge(&state.hub, &judge_pk.value)
         else {
-            reservation.commit_tokens(survivor_total(&panel)).await;
-            return Err(emit_panel_then_fail(
+            crate::attribution::settle_ensemble();
+            let failure = emit_panel_then_fail(
                 &panel,
                 ProxyError::Bridge(BridgeError::Config(
                     "ensemble judge has no registered bridge".into(),
                 )),
-            ));
+            );
+            reservation.commit_tokens(panel_total).await;
+            return Err(failure);
         };
         let mut judge_ctx = crate::dispatch::bridge_ctx(
             request_id,
@@ -4016,14 +4006,16 @@ async fn dispatch_ensemble(
         {
             Ok(r) => r,
             Err(_) => {
-                reservation.commit_tokens(survivor_total(&panel)).await;
-                return Err(emit_panel_then_fail(
+                crate::attribution::settle_ensemble();
+                let failure = emit_panel_then_fail(
                     &panel,
                     ProxyError::Bridge(BridgeError::upstream_status(
                         429,
                         "rate limit exceeded for the ensemble judge",
                     )),
-                ));
+                );
+                reservation.commit_tokens(panel_total).await;
+                return Err(failure);
             }
         };
 
@@ -4040,57 +4032,13 @@ async fn dispatch_ensemble(
             // panel (same invariant as the non-streaming judge-failure path),
             // then surface the bridge error (5xx → 502, 4xx preserved).
             Err(be) => {
-                reservation.commit_tokens(survivor_total(&panel)).await;
-                return Err(emit_panel_then_fail(&panel, ProxyError::Bridge(be)));
+                crate::attribution::settle_ensemble();
+                let failure = emit_panel_then_fail(&panel, ProxyError::Bridge(be));
+                reservation.commit_tokens(panel_total).await;
+                return Err(failure);
             }
         };
 
-        // Pre-resolve every owned value the `'static` on_complete needs. It
-        // CANNOT borrow `state`/`snapshot`/`req`/`client` (the closure outlives
-        // this frame — it fires on stream drop), so the `emit_panel_member` /
-        // `resolve_sub` borrowing closures above are unusable inside it. Clone
-        // the per-member + judge telemetry inputs up front.
-        // Copy the accounting already resolved by `ProxyModelCaller` so
-        // member quota, parent quota, UsageEvent, and Prometheus share the
-        // same counters inside the `'static` completion closure.
-        struct PanelTelem {
-            model_id: String,
-            provider_key_id: String,
-            attempt_model: String,
-            usage: aisix_gateway::chat::UsageStats,
-            usage_estimated: bool,
-        }
-        let panel_telem: Vec<PanelTelem> = panel
-            .iter()
-            .map(|p| {
-                let (model_id, provider_key_id, _) = resolve_sub(&p.model);
-                PanelTelem {
-                    model_id,
-                    provider_key_id,
-                    attempt_model: p.model.clone(),
-                    usage: p.effective_usage.clone(),
-                    usage_estimated: p.usage_estimated,
-                }
-            })
-            .collect();
-        let panel_total: u64 = panel_telem
-            .iter()
-            .map(|p| u64::from(p.usage.total_tokens))
-            .sum();
-        // #614: field-wise panel usage sum (not just total_tokens) folded into
-        // the client-facing terminal usage chunk via build_sse_stream's
-        // `base_usage`, so a streamed ensemble reports the full panel+judge
-        // aggregate — matching the non-streaming path.
-        let panel_usage_sum = panel
-            .iter()
-            .fold(aisix_gateway::chat::UsageStats::default(), |acc, p| {
-                acc.saturating_add(&p.usage)
-            });
-        let panel_usage_for_metrics = panel_telem
-            .iter()
-            .fold(aisix_gateway::chat::UsageStats::default(), |acc, p| {
-                acc.saturating_add(&p.usage)
-            });
         // The streamed judge estimator keys off `judge_model.upstream_model()`
         // directly (below), so resolve_sub's upstream_model is unused here.
         let (judge_model_id, judge_provider_key_id, _) = resolve_sub(&ensemble_cfg.judge.model);
@@ -4127,9 +4075,6 @@ async fn dispatch_ensemble(
         let state_for_telem = state.clone();
         let request_id_for_telem = request_id.to_string();
         let client_model_for_telem = req.model.clone();
-        let bounded_model_for_telem =
-            crate::usage_attr::metric_model_label(snapshot, &req.model).into_owned();
-        let metric_caller = crate::request_metrics::Caller::from_api_key_id(snapshot, api_key_id);
         let api_key_id_for_telem = api_key_id.to_string();
         let applied_guardrails_for_telem = applied_guardrails.to_vec();
         // See the single-upstream streaming path.
@@ -4142,16 +4087,42 @@ async fn dispatch_ensemble(
         // Input-side monitor hits (AISIX-Cloud#562), merged the same way.
         let input_monitor_hits_for_telem = input_monitor_hits.clone();
 
-        // Hold concurrency for the stream's full lifetime (#450). Snapshot the
-        // keys BEFORE consuming the reservation into the owned guard.
-        let post_stream_keys = reservation.keys();
+        // What the stream's completion owes the panel: its rows, and its
+        // charge through the helper an abandoned stream settles with too.
+        // Resolved here because `on_complete` cannot borrow this frame.
+        let panel_charge = EnsembleCharge::new(
+            state,
+            snapshot,
+            reservation.keys(),
+            panel
+                .iter()
+                .fold(aisix_gateway::chat::UsageStats::default(), |acc, p| {
+                    acc.saturating_add(&p.effective_usage)
+                }),
+            &row_ctx,
+        );
+        let panel_rows: Vec<EnsembleSubcall> = panel
+            .iter()
+            .map(|p| {
+                let (model_id, provider_key_id, _) = resolve_sub(&p.model);
+                EnsembleSubcall {
+                    model_id,
+                    provider_key_id,
+                    attempt_model: p.model.clone(),
+                    usage: p.effective_usage.clone(),
+                    usage_estimated: p.usage_estimated,
+                }
+            })
+            .collect();
+        let row_ctx_for_telem = row_ctx.clone();
+        // Hold concurrency for the stream's full lifetime (#450); its token
+        // accounting rides `panel_charge`, which snapshotted its keys.
         let stream_concurrency_hold = reservation.into_stream_hold();
         // #620: hold the judge's own concurrency slot for the stream lifetime
         // and add its tokens post-stream, the same way the entry reservation is
         // handled (snapshot keys before consuming into the owned guard).
         let judge_post_stream_keys = judge_reservation.keys();
         let judge_concurrency_hold = judge_reservation.into_stream_hold();
-        let limiter = Arc::clone(&state.limiter);
 
         // Token-estimation fallback (AISIX-Cloud#1074) for the streamed
         // judge: `comp` carries the JUDGE's stream-only counts, so the
@@ -4175,44 +4146,10 @@ async fn dispatch_ensemble(
             panel_usage_sum,
             Some(judge_estimator),
             move |comp: StreamCompletion| {
-                // Rate-limit accounting: the panel tokens (already round-tripped)
-                // plus the streamed judge's final total, against every layer.
-                for key in &post_stream_keys {
-                    limiter.add_tokens_post_stream(key, panel_total + comp.total_tokens);
-                }
-                // #620: the judge's own model bucket gets only the judge's
-                // streamed tokens (each panel member was billed per-member).
-                for key in &judge_post_stream_keys {
-                    limiter.add_tokens_post_stream(key, comp.total_tokens);
-                }
                 // Fresh snapshot at stream end, shared by every emit in this
                 // closure (#941) — see the single-model streaming path.
                 let snap = state_for_telem.snapshot.load();
                 let terminal_status = stream_terminal_status(&comp);
-                let aggregate_input = panel_usage_for_metrics
-                    .prompt_tokens
-                    .saturating_add(comp.prompt_tokens);
-                let aggregate_output = panel_usage_for_metrics
-                    .completion_tokens
-                    .saturating_add(comp.completion_tokens);
-                let aggregate_cached = panel_usage_for_metrics
-                    .cached_prompt_tokens
-                    .saturating_add(comp.cached_prompt_tokens);
-                let aggregate_cache_read = panel_usage_for_metrics
-                    .cache_read_tokens
-                    .saturating_add(comp.cache_read_tokens);
-                let aggregate_cache_creation = panel_usage_for_metrics
-                    .cache_creation_tokens
-                    .saturating_add(comp.cache_creation_tokens);
-                let aggregate_total = cache_inclusive_total(
-                    u64::from(panel_usage_for_metrics.total_tokens)
-                        .saturating_add(comp.total_tokens),
-                    aggregate_input,
-                    aggregate_output,
-                    aggregate_cache_creation,
-                    aggregate_cache_read,
-                )
-                .min(u64::from(u32::MAX)) as u32;
                 // Telemetry: one event per panel member (attempt_kind "panel",
                 // index 0..N) carrying that member's own buffered usage, then
                 // one judge event (attempt_kind "judge", index N) from the
@@ -4220,48 +4157,20 @@ async fn dispatch_ensemble(
                 // mirrors the non-streaming ensemble's per-sub-call emission,
                 // moved into on_complete because the judge counts only land on
                 // the terminal SSE chunk.
-                for (index, member) in panel_telem.iter().enumerate() {
-                    let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &member.provider_key_id);
-                    emit_usage_event(
+                // The stream owns the panel from here, whichever way it ended.
+                crate::attribution::settle_ensemble();
+                for (index, member) in panel_rows.iter().enumerate() {
+                    member.emit(
                         &state_for_telem,
                         &snap,
-                        &pk,
-                        &request_id_for_telem,
-                        &member.model_id,
-                        &client_model_for_telem,
-                        &api_key_id_for_telem,
-                        200,
-                        started.elapsed(),
-                        member.usage.prompt_tokens,
-                        member.usage.completion_tokens,
-                        UsageExtras {
-                            cached_prompt_tokens: member.usage.cached_prompt_tokens,
-                            cache_write_tokens: member.usage.cache_write_tokens,
-                            reasoning_tokens: member.usage.reasoning_tokens,
-                            upstream_total_tokens: member.usage.upstream_total_tokens,
-                            reasoning_folded_into_completion: member
-                                .usage
-                                .reasoning_folded_into_completion,
-                            cache_creation_tokens: member.usage.cache_creation_tokens,
-                            cache_read_tokens: member.usage.cache_read_tokens,
-                            usage_estimated: member.usage_estimated,
-                            bypass_reason: bypass_for_telem.clone(),
-                            cache_status: CacheStatus::Disabled.as_str().to_string(),
-                            attempt_index: index as u32,
-                            attempt_kind: "panel".to_string(),
-                            attempt_model: member.attempt_model.clone(),
-                            applied_guardrails: applied_guardrails_for_telem.clone(),
-                            ..UsageExtras::default()
-                        },
-                        /* cost_usd */ 0.0,
+                        &row_ctx_for_telem,
+                        "panel",
+                        index as u32,
                         comp.guardrail_blocked,
-                        &client_for_telem,
-                        /* content */ None,
-                        /* terminal */ false,
-                        /* dispatched */ true,
-                        &audit_for_telem,
+                        &bypass_for_telem,
                     );
                 }
+                panel_charge.settle_stream(&judge_post_stream_keys, &comp);
                 let judge_pk =
                     crate::usage_attr::ResolvedPk::resolve(&snap, &judge_provider_key_id);
                 let stream_error = crate::attempt::stream_error_fields(
@@ -4335,100 +4244,6 @@ async fn dispatch_ensemble(
                     /* dispatched */ true,
                     &audit_for_telem,
                 );
-                // The per-sub-call UsageEvents above preserve billing
-                // attribution. Prometheus token families are request-level,
-                // so record the client-visible panel+judge aggregate against
-                // the ensemble alias rather than dropping the request from
-                // those series entirely.
-                let caller = metric_caller.as_caller();
-                let ensemble_pk =
-                    crate::usage_attr::ResolvedPk::resolve(&snap, crate::request_metrics::UNKNOWN);
-                crate::request_metrics::record_usage(
-                    &state_for_telem,
-                    "/v1/chat/completions",
-                    caller,
-                    crate::request_metrics::Upstream {
-                        provider: "ensemble",
-                        model: &bounded_model_for_telem,
-                        upstream_model: crate::request_metrics::UNKNOWN,
-                        pk: ensemble_pk.labels(),
-                        stream: true,
-                        is_fallback: false,
-                    },
-                    crate::request_metrics::Tokens {
-                        input: aggregate_input,
-                        output: aggregate_output,
-                        total: aggregate_total,
-                        cached: aggregate_cached,
-                        cache_read: aggregate_cache_read,
-                        cache_creation: aggregate_cache_creation,
-                        spend_usd: 0.0,
-                        client_type: state_for_telem
-                            .client_classifier
-                            .classify(&client_for_telem.user_agent),
-                    },
-                );
-                // SLO histograms (AISIX-Cloud#1011): the handler's
-                // record_success is stream-gated, so the ensemble stream
-                // records its e2e/TTFT here like the plain streaming path.
-                // `downstream` only: no one attempt produced an ensemble's
-                // response, so there is no upstream side to observe.
-                state_for_telem.metrics.record_request_e2e_latency(
-                    LatencyLabels {
-                        endpoint: "/v1/chat/completions",
-                        model: &bounded_model_for_telem,
-                        // Matches the legacy series: no single provider
-                        // governs an ensemble response.
-                        provider: "ensemble",
-                        status: terminal_status,
-                        streaming: true,
-                        details: UsageLabels {
-                            endpoint: "/v1/chat/completions",
-                            inbound_protocol: "openai",
-                            upstream_protocol: ensemble_pk.labels().protocol(),
-                            provider: "ensemble",
-                            model: &bounded_model_for_telem,
-                            upstream_model: crate::request_metrics::UNKNOWN,
-                            provider_key_id: ensemble_pk.labels().id(),
-                            provider_key_name: ensemble_pk.labels().name(),
-                            api_key_id: caller.api_key_id,
-                            api_key_name: caller.api_key_name,
-                            team_id: caller.team_id,
-                            team_name: caller.team_name,
-                            user_id: caller.user_id,
-                            user_name: caller.user_name,
-                        },
-                    },
-                    aisix_obs::LatencySide::Downstream,
-                    started.elapsed(),
-                );
-                state_for_telem.metrics.record_ttft(
-                    LatencyLabels {
-                        endpoint: "/v1/chat/completions",
-                        model: &bounded_model_for_telem,
-                        provider: "ensemble",
-                        status: terminal_status,
-                        streaming: true,
-                        details: UsageLabels {
-                            endpoint: "/v1/chat/completions",
-                            inbound_protocol: "openai",
-                            upstream_protocol: ensemble_pk.labels().protocol(),
-                            provider: "ensemble",
-                            model: &bounded_model_for_telem,
-                            upstream_model: crate::request_metrics::UNKNOWN,
-                            provider_key_id: ensemble_pk.labels().id(),
-                            provider_key_name: ensemble_pk.labels().name(),
-                            api_key_id: caller.api_key_id,
-                            api_key_name: caller.api_key_name,
-                            team_id: caller.team_id,
-                            team_name: caller.team_name,
-                            user_id: caller.user_id,
-                            user_name: caller.user_name,
-                        },
-                    },
-                    Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
-                    Duration::from_millis(u64::from(comp.downstream_latency_ms)),
-                );
                 // Release the concurrency permit(s) now the stream is done
                 // (or was cancelled) — on_complete fires on both paths (#450).
                 drop(stream_concurrency_hold);
@@ -4481,50 +4296,51 @@ async fn dispatch_ensemble(
         });
     }
 
-    let mut outcome = match crate::ensemble::run_ensemble(req, ensemble_cfg, &caller).await {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            // Both error variants carry the panel members that already
-            // succeeded — those hit upstream and were billed, so the
-            // "successful panel members are always billed" invariant must
-            // hold on the failure exits too (same class as the output-block
-            // path). Extract the survivors + the client-facing ProxyError,
-            // then commit + emit them BEFORE returning. No judge usage event:
-            // the judge either never ran (InsufficientPanel) or produced no
-            // response (Judge). `charge: None` — the per-member events
-            // already carry the bill, so passing a charge would double-count.
-            //
-            // `EnsembleError::http_status` is the single source of truth for
-            // the status (judge → its bridge status; exhausted panel → 502);
-            // read it before destructuring.
-            let status = err.http_status();
-            let (panel, proxy_err) = match err {
-                crate::ensemble::EnsembleError::Judge { source, panel } => {
-                    // Carry the bridge error itself so its full envelope +
-                    // status mapping survives (richer than a bare status).
-                    (panel, ProxyError::Bridge(source))
+    let mut outcome =
+        match crate::ensemble::run_ensemble(req, ensemble_cfg, &caller, &progress).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                crate::attribution::settle_ensemble();
+                // Both error variants carry the panel members that already
+                // succeeded — those hit upstream and were billed, so the
+                // "successful panel members are always billed" invariant must
+                // hold on the failure exits too (same class as the output-block
+                // path). Extract the survivors + the client-facing ProxyError,
+                // then commit + emit them BEFORE returning. No judge usage event:
+                // the judge either never ran (InsufficientPanel) or produced no
+                // response (Judge). `charge: None` — the per-member events
+                // already carry the bill, so passing a charge would double-count.
+                //
+                // `EnsembleError::http_status` is the single source of truth for
+                // the status (judge → its bridge status; exhausted panel → 502);
+                // read it before destructuring.
+                let status = err.http_status();
+                let (panel, proxy_err) = match err {
+                    crate::ensemble::EnsembleError::Judge { source, panel } => {
+                        // Carry the bridge error itself so its full envelope +
+                        // status mapping survives (richer than a bare status).
+                        (panel, ProxyError::Bridge(source))
+                    }
+                    crate::ensemble::EnsembleError::InsufficientPanel { panel, .. } => (
+                        panel,
+                        ProxyError::Bridge(BridgeError::upstream_status(
+                            status,
+                            "ensemble panel did not reach the required number of responses",
+                        )),
+                    ),
+                };
+                let input_bypass = bypass_reason.as_deref().unwrap_or_default();
+                for (index, member) in panel.iter().enumerate() {
+                    emit_panel_member(member, index, /* blocked */ false, input_bypass);
                 }
-                crate::ensemble::EnsembleError::InsufficientPanel { panel, .. } => (
-                    panel,
-                    ProxyError::Bridge(BridgeError::upstream_status(
-                        status,
-                        "ensemble panel did not reach the required number of responses",
-                    )),
-                ),
-            };
-            reservation.commit_tokens(survivor_total(&panel)).await;
-            for (index, member) in panel.iter().enumerate() {
-                emit_panel_member(
-                    member, index, None, /* blocked */ false, /* bypass */ "",
-                );
+                reservation.commit_tokens(survivor_total(&panel)).await;
+                return Err(DispatchFailure::new(
+                    Some(model_id.to_string()),
+                    None,
+                    proxy_err,
+                ));
             }
-            return Err(DispatchFailure::new(
-                Some(model_id.to_string()),
-                None,
-                proxy_err,
-            ));
-        }
-    };
+        };
 
     // Aggregate client-facing usage: every billed sub-call (panel members
     // + judge) counts against quota, since each one already hit an
@@ -4544,6 +4360,7 @@ async fn dispatch_ensemble(
         .map(|u| u64::from(u.usage.total_tokens))
         .sum();
     let total_tokens = panel_total + u64::from(effective_judge.usage.total_tokens);
+    crate::attribution::note_ensemble_tokens_charged();
     reservation.commit_tokens(total_tokens).await;
 
     // Emit one usage event per sub-call (each panel member + the judge),
@@ -4567,13 +4384,7 @@ async fn dispatch_ensemble(
                          hits: &[aisix_core::GuardrailMonitorHit],
                          terminal_judge: bool| {
         for (index, member) in outcome.panel.iter().enumerate() {
-            emit_panel_member(
-                member,
-                index,
-                Some(&effective_panel[index]),
-                blocked,
-                bypass,
-            );
+            emit_panel_member(member, index, blocked, bypass);
         }
         let (judge_model_id, judge_provider_key_id, _) = resolve_sub(&outcome.judge_model);
         let judge_pk = crate::usage_attr::ResolvedPk::resolve(snapshot, &judge_provider_key_id);
@@ -4669,6 +4480,7 @@ async fn dispatch_ensemble(
             );
             // Block is not a bypass, so the output guardrail did not mutate
             // `bypass_reason`; carry the input-only bypass (if any).
+            crate::attribution::settle_ensemble();
             emit_subcalls(
                 &outcome,
                 true,
@@ -4702,6 +4514,7 @@ async fn dispatch_ensemble(
         &mut ensemble_redactions,
         crate::redact::redact_chat_response(resolved_chain.as_ref(), &mut outcome.response),
     );
+    crate::attribution::settle_ensemble();
     emit_subcalls(
         &outcome,
         false,
@@ -5497,6 +5310,431 @@ struct StreamGuardrailContext {
     /// Surface in tracing only; the wire envelope is intentionally
     /// generic per #153 ("response blocked by content policy").
     model_name: String,
+}
+
+/// An ensemble sub-call's target by display_name → (model_id,
+/// provider_key_id, upstream_model). The first two are telemetry
+/// attribution; the third is the tokenizer key for the #1074 estimation
+/// fallback — the estimator keys off the real upstream model, not the
+/// operator alias, exactly as the direct and streaming-judge paths do (a
+/// `gpt-4o` alias must select o200k_base, not the cl100k default an
+/// unrecognised alias falls back to). Empty ids if the target was deleted
+/// between dispatch and emit (cp-api stores NULL); the tokenizer then
+/// degrades to the display name.
+fn subcall_target(snap: &AisixSnapshot, display_name: &str) -> (String, String, String) {
+    match snap.models.get_by_name(display_name) {
+        Some(entry) => (
+            entry.id.clone(),
+            entry.value.provider_key_id.clone().unwrap_or_default(),
+            entry
+                .value
+                .upstream_model()
+                .unwrap_or(display_name)
+                .to_string(),
+        ),
+        None => (String::new(), String::new(), display_name.to_string()),
+    }
+}
+
+/// The request-scoped inputs every ensemble sub-call row carries, owned so
+/// they can outlive the dispatch frame (a stream's completion, a guard that
+/// fires on drop).
+#[derive(Clone)]
+struct EnsembleRowCtx {
+    request_id: String,
+    client_model: String,
+    api_key_id: String,
+    applied_guardrails: Vec<AppliedGuardrail>,
+    audit: crate::usage_attr::GuardrailAudit,
+    client: ClientContext,
+    started: Instant,
+}
+
+/// One ensemble sub-call that round-tripped an upstream, resolved for its
+/// usage row.
+struct EnsembleSubcall {
+    model_id: String,
+    provider_key_id: String,
+    attempt_model: String,
+    usage: aisix_gateway::chat::UsageStats,
+    usage_estimated: bool,
+}
+
+impl EnsembleSubcall {
+    /// Resolve `outcome`'s target against `snap` (see [`subcall_target`]).
+    fn resolve(snap: &AisixSnapshot, outcome: crate::ensemble::PanelOutcome) -> Self {
+        let (model_id, provider_key_id, _) = subcall_target(snap, &outcome.model);
+        Self {
+            model_id,
+            provider_key_id,
+            attempt_model: outcome.model,
+            usage: outcome.effective_usage,
+            usage_estimated: outcome.usage_estimated,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &self,
+        state: &ProxyState,
+        snap: &AisixSnapshot,
+        ctx: &EnsembleRowCtx,
+        attempt_kind: &str,
+        attempt_index: u32,
+        blocked: bool,
+        bypass: &str,
+    ) {
+        let extras = self.extras(ctx, attempt_kind, attempt_index, bypass);
+        self.emit_extras(state, snap, ctx, extras, blocked);
+    }
+
+    fn extras(
+        &self,
+        ctx: &EnsembleRowCtx,
+        attempt_kind: &str,
+        attempt_index: u32,
+        bypass: &str,
+    ) -> UsageExtras {
+        UsageExtras {
+            cached_prompt_tokens: self.usage.cached_prompt_tokens,
+            cache_write_tokens: self.usage.cache_write_tokens,
+            reasoning_tokens: self.usage.reasoning_tokens,
+            upstream_total_tokens: self.usage.upstream_total_tokens,
+            reasoning_folded_into_completion: self.usage.reasoning_folded_into_completion,
+            cache_creation_tokens: self.usage.cache_creation_tokens,
+            cache_read_tokens: self.usage.cache_read_tokens,
+            usage_estimated: self.usage_estimated,
+            bypass_reason: bypass.to_string(),
+            cache_status: CacheStatus::Disabled.as_str().to_string(),
+            attempt_index,
+            attempt_kind: attempt_kind.to_string(),
+            attempt_model: self.attempt_model.clone(),
+            applied_guardrails: ctx.applied_guardrails.clone(),
+            ..UsageExtras::default()
+        }
+    }
+
+    fn emit_extras(
+        &self,
+        state: &ProxyState,
+        snap: &AisixSnapshot,
+        ctx: &EnsembleRowCtx,
+        extras: UsageExtras,
+        blocked: bool,
+    ) {
+        let pk = crate::usage_attr::ResolvedPk::resolve(snap, &self.provider_key_id);
+        emit_usage_event(
+            state,
+            snap,
+            &pk,
+            &ctx.request_id,
+            &self.model_id,
+            &ctx.client_model,
+            &ctx.api_key_id,
+            200,
+            ctx.started.elapsed(),
+            self.usage.prompt_tokens,
+            self.usage.completion_tokens,
+            extras,
+            /* cost_usd */ 0.0,
+            blocked,
+            &ctx.client,
+            /* content */ None,
+            /* terminal */ false,
+            /* dispatched */ true,
+            &ctx.audit,
+        );
+    }
+}
+
+/// What an ensemble's sub-calls charge beyond their own rows: their tokens
+/// against the entry's rate-limit layers, and the request-level Prometheus
+/// families under the ensemble alias. A streaming ensemble's completion and
+/// every abandoned ending (the caller left before the stream could complete)
+/// settle through [`EnsembleCharge::settle_stream`], so the two cannot charge
+/// differently; an abandoned non-streaming run settles through
+/// [`EnsembleCharge::settle_abandoned`].
+struct EnsembleCharge {
+    state: ProxyState,
+    /// The entry reservation's layers, which a completed run would commit.
+    entry_keys: Vec<String>,
+    /// The panel's (or, abandoned, every returned sub-call's) usage.
+    usage: aisix_gateway::chat::UsageStats,
+    bounded_model: String,
+    metric_caller: crate::request_metrics::Owned,
+    client: ClientContext,
+    started: Instant,
+}
+
+impl EnsembleCharge {
+    fn new(
+        state: &ProxyState,
+        snapshot: &AisixSnapshot,
+        entry_keys: Vec<String>,
+        usage: aisix_gateway::chat::UsageStats,
+        rows: &EnsembleRowCtx,
+    ) -> Self {
+        Self {
+            state: state.clone(),
+            entry_keys,
+            usage,
+            bounded_model: crate::usage_attr::metric_model_label(snapshot, &rows.client_model)
+                .into_owned(),
+            metric_caller: crate::request_metrics::Caller::from_api_key_id(
+                snapshot,
+                &rows.api_key_id,
+            ),
+            client: rows.client.clone(),
+            started: rows.started,
+        }
+    }
+
+    /// Settle a streaming ensemble with what its judge streamed: `comp` is
+    /// the judge's completion, or `StreamCompletion::default()` when the
+    /// request was abandoned before the judge produced anything — which
+    /// charges the panel alone and reports the request as a `499`.
+    fn settle_stream(&self, judge_keys: &[String], comp: &StreamCompletion) {
+        let state = &self.state;
+        let limiter = &state.limiter;
+        // Rate-limit accounting: the panel tokens (already round-tripped)
+        // plus the streamed judge's final total, against every layer.
+        let panel_total = u64::from(self.usage.total_tokens);
+        for key in &self.entry_keys {
+            limiter.add_tokens_post_stream(key, panel_total + comp.total_tokens);
+        }
+        // #620: the judge's own model bucket gets only the judge's
+        // streamed tokens (each panel member was billed per-member).
+        for key in judge_keys {
+            limiter.add_tokens_post_stream(key, comp.total_tokens);
+        }
+        let terminal_status = stream_terminal_status(comp);
+        let aggregate_input = self.usage.prompt_tokens.saturating_add(comp.prompt_tokens);
+        let aggregate_output = self
+            .usage
+            .completion_tokens
+            .saturating_add(comp.completion_tokens);
+        let aggregate_cached = self
+            .usage
+            .cached_prompt_tokens
+            .saturating_add(comp.cached_prompt_tokens);
+        let aggregate_cache_read = self
+            .usage
+            .cache_read_tokens
+            .saturating_add(comp.cache_read_tokens);
+        let aggregate_cache_creation = self
+            .usage
+            .cache_creation_tokens
+            .saturating_add(comp.cache_creation_tokens);
+        let aggregate_total = cache_inclusive_total(
+            panel_total.saturating_add(comp.total_tokens),
+            aggregate_input,
+            aggregate_output,
+            aggregate_cache_creation,
+            aggregate_cache_read,
+        )
+        .min(u64::from(u32::MAX)) as u32;
+        // The per-sub-call UsageEvents preserve billing attribution.
+        // Prometheus token families are request-level, so record the
+        // client-visible panel+judge aggregate against the ensemble alias
+        // rather than dropping the request from those series entirely.
+        self.record_tokens(
+            /* stream */ true,
+            crate::request_metrics::Tokens {
+                input: aggregate_input,
+                output: aggregate_output,
+                total: aggregate_total,
+                cached: aggregate_cached,
+                cache_read: aggregate_cache_read,
+                cache_creation: aggregate_cache_creation,
+                spend_usd: 0.0,
+                client_type: state.client_classifier.classify(&self.client.user_agent),
+            },
+        );
+        let caller = self.metric_caller.as_caller();
+        let ensemble_pk = crate::usage_attr::ResolvedPk::resolve(
+            &state.snapshot.load(),
+            crate::request_metrics::UNKNOWN,
+        );
+        let details = UsageLabels {
+            endpoint: "/v1/chat/completions",
+            inbound_protocol: "openai",
+            upstream_protocol: ensemble_pk.labels().protocol(),
+            provider: "ensemble",
+            model: &self.bounded_model,
+            upstream_model: crate::request_metrics::UNKNOWN,
+            provider_key_id: ensemble_pk.labels().id(),
+            provider_key_name: ensemble_pk.labels().name(),
+            api_key_id: caller.api_key_id,
+            api_key_name: caller.api_key_name,
+            team_id: caller.team_id,
+            team_name: caller.team_name,
+            user_id: caller.user_id,
+            user_name: caller.user_name,
+        };
+        let labels = LatencyLabels {
+            endpoint: "/v1/chat/completions",
+            model: &self.bounded_model,
+            // Matches the legacy series: no single provider governs an
+            // ensemble response.
+            provider: "ensemble",
+            status: terminal_status,
+            streaming: true,
+            details,
+        };
+        // SLO histograms (AISIX-Cloud#1011): the handler's record_success is
+        // stream-gated, so the ensemble stream records its e2e/TTFT here
+        // like the plain streaming path. `downstream` only: no one attempt
+        // produced an ensemble's response, so there is no upstream side to
+        // observe.
+        state.metrics.record_request_e2e_latency(
+            labels,
+            aisix_obs::LatencySide::Downstream,
+            self.started.elapsed(),
+        );
+        state.metrics.record_ttft(
+            labels,
+            Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
+            Duration::from_millis(u64::from(comp.downstream_latency_ms)),
+        );
+    }
+
+    /// Settle a non-streaming ensemble whose handler was dropped before it
+    /// returned: the tokens of every sub-call that returned, against the
+    /// entry's layers when `tokens_owed` (the run had not committed them
+    /// yet), and the request-level token families the handler would have
+    /// recorded from its `Success`.
+    fn settle_abandoned(&self, tokens_owed: bool) {
+        if tokens_owed {
+            for key in &self.entry_keys {
+                self.state
+                    .limiter
+                    .add_tokens_post_stream(key, u64::from(self.usage.total_tokens));
+            }
+        }
+        self.record_tokens(
+            /* stream */ false,
+            crate::request_metrics::Tokens {
+                input: self.usage.prompt_tokens,
+                output: self.usage.completion_tokens,
+                total: self.usage.total_tokens,
+                cached: self.usage.cached_prompt_tokens,
+                cache_read: self.usage.cache_read_tokens,
+                cache_creation: self.usage.cache_creation_tokens,
+                spend_usd: 0.0,
+                client_type: self
+                    .state
+                    .client_classifier
+                    .classify(&self.client.user_agent),
+            },
+        );
+    }
+
+    fn record_tokens(&self, stream: bool, tokens: crate::request_metrics::Tokens<'_>) {
+        let ensemble_pk = crate::usage_attr::ResolvedPk::resolve(
+            &self.state.snapshot.load(),
+            crate::request_metrics::UNKNOWN,
+        );
+        crate::request_metrics::record_usage(
+            &self.state,
+            "/v1/chat/completions",
+            self.metric_caller.as_caller(),
+            crate::request_metrics::Upstream {
+                provider: "ensemble",
+                model: &self.bounded_model,
+                upstream_model: crate::request_metrics::UNKNOWN,
+                pk: ensemble_pk.labels(),
+                stream,
+                is_fallback: false,
+            },
+            tokens,
+        );
+    }
+}
+
+/// An ensemble's sub-calls that already returned, published into the
+/// request's attribution cell (`attribution::publish_ensemble`) for as long as
+/// a cancelled request would owe their rows and charge: from before the
+/// fan-out until one of the request's own exits settles them
+/// (`attribution::settle_ensemble`). `ClientCancelGuard` reads it through
+/// [`emit_abandoned_ensemble`]: a caller that leaves before then takes the
+/// handler future with it, so nothing in that future can speak for these
+/// sub-calls. A streaming ensemble keeps it published past the response head,
+/// until the stream's `on_complete` settles it, because a body dropped before
+/// its first poll drops `on_complete` uncalled.
+pub(crate) struct PendingEnsemble {
+    ctx: EnsembleRowCtx,
+    /// The entry reservation's layers, which a completed run would charge.
+    entry_keys: Vec<String>,
+    stream: bool,
+    /// Filled by the executor as each sub-call returns.
+    progress: Arc<crate::ensemble::EnsembleProgress>,
+    /// The input guardrail's fail-open reason, which every sub-call row of
+    /// the request carries.
+    bypass: String,
+    /// Input-side mask counts and monitor hits, which ride the judge row.
+    input_redactions: crate::redact::RedactionCounts,
+    input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// Cleared (`attribution::note_ensemble_tokens_charged`) once the run has
+    /// charged its tokens to the entry layers.
+    pub(crate) tokens_owed: bool,
+}
+
+/// Emit the rows of a cancelled request's returned ensemble sub-calls from
+/// `first_index` on, and charge them as the completed run would have: their
+/// tokens to the entry layers (unless the run already had) and the
+/// request-level ensemble token families — for a stream through
+/// [`EnsembleCharge::settle_stream`], the helper a stream's completion uses,
+/// so the two cannot charge differently. Returns the index after the last
+/// row, which the cancel guard's own 499 row takes. Called only by
+/// `cancel::emit`.
+pub(crate) fn emit_abandoned_ensemble(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    mut pending: PendingEnsemble,
+    first_index: u32,
+) -> u32 {
+    let (panel, judge) = pending.progress.take();
+    if panel.is_empty() && judge.is_none() {
+        return first_index;
+    }
+    let mut index = first_index;
+    let mut usage = aisix_gateway::chat::UsageStats::default();
+    for outcome in panel {
+        usage = usage.saturating_add(&outcome.effective_usage);
+        EnsembleSubcall::resolve(snap, outcome).emit(
+            state,
+            snap,
+            &pending.ctx,
+            "panel",
+            index,
+            /* blocked */ false,
+            &pending.bypass,
+        );
+        index += 1;
+    }
+    if let Some(judge) = judge {
+        usage = usage.saturating_add(&judge.outcome.effective_usage);
+        let sub = EnsembleSubcall::resolve(snap, judge.outcome);
+        let extras = UsageExtras {
+            provider_request_id: crate::usage_attr::sanitize_provider_response_id(
+                &judge.response_id,
+            ),
+            provider_model_version: judge.response_model,
+            finish_reason: finish_reason_label(&judge.finish_reason),
+            redacted_entity_counts: std::mem::take(&mut pending.input_redactions),
+            guardrail_monitor_hits: std::mem::take(&mut pending.input_monitor_hits),
+            ..sub.extras(&pending.ctx, "judge", index, &pending.bypass)
+        };
+        sub.emit_extras(state, snap, &pending.ctx, extras, /* blocked */ false);
+        index += 1;
+    }
+    let charge = EnsembleCharge::new(state, snap, pending.entry_keys, usage, &pending.ctx);
+    if pending.stream {
+        charge.settle_stream(&[], &StreamCompletion::default());
+    } else {
+        charge.settle_abandoned(pending.tokens_owed);
+    }
+    index
 }
 
 /// Fires `on_complete` with whatever `StreamCompletion` has been

@@ -328,10 +328,15 @@ pub struct ProxyStateInner {
     /// Wired from the watch supervisor in aisix-server; `None` here means
     /// no freshness signal, so readiness gates on shutdown only (#591).
     pub config_apply_age: Option<Arc<dyn Fn() -> Option<std::time::Duration> + Send + Sync>>,
-    /// Batch ids whose completed output has already been attributed to
-    /// UsageEvents by THIS process (#720). Process-local dedup only — the
-    /// deterministic `request_id = "batch-<id>"` on the emitted events is
-    /// what keeps cross-restart re-emission idempotent on the cp-api side.
+    /// Batch ids whose completed output this process has already attributed
+    /// (#720), kept for the life of the process and never pruned. It spares
+    /// one process from re-downloading a batch's output and re-emitting its
+    /// rows on every retrieve; it is not what makes attribution exactly-once.
+    /// Across restarts and replicas the same rows go out again under the same
+    /// deterministic `request_id` (see `jobs::batch_attribution_request_id`),
+    /// and the control plane drops a re-sent batch-attribution row at ingest
+    /// by `(env_id, request_id)` — but only while the original row is still
+    /// within usage retention, which is why an entry here must not expire.
     pub billed_batches: Arc<dashmap::DashSet<String>>,
     /// Boot-compiled User-Agent → `client_type` classifier: operator
     /// rules from `observability.metrics.client_type_rules` first, then

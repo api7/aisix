@@ -16,6 +16,9 @@
 //!
 //! - one non-terminal event per attempt that had already FAILED, byte-for-
 //!   byte what `emit_failed_attempts` would have written for it;
+//! - one non-terminal event per ensemble sub-call that had returned and that
+//!   no exit of the handler settled, with its tokens charged as the run
+//!   would have charged them (`crate::chat::PendingEnsemble`);
 //! - one terminal event for the request itself, `499` /
 //!   `client_disconnected`, zero tokens and zero cost, naming the target
 //!   that was in flight when the caller went away.
@@ -36,6 +39,11 @@
 //! exists to avoid. And an attempt that had already SUCCEEDED is not
 //! re-emitted: its token counts live in the handler's response processing,
 //! not in the attempt record, so there is nothing to bill it with.
+//!
+//! An ensemble's returned sub-calls are the exception to both: the ensemble
+//! publishes each one's accounting as it returns, together with the input-side
+//! guardrail attribution its rows carry on every other path, so those rows
+//! are re-emitted with their tokens and that attribution.
 
 use aisix_obs::UsageEvent;
 
@@ -119,7 +127,7 @@ pub(crate) fn emit(
     endpoint: &'static str,
     request_id: &str,
     resolved: &Resolved,
-    ctx: CancelContext,
+    mut ctx: CancelContext,
     phase: Phase,
     // The request's trace bundle, read off its extensions by the middleware
     // — not off the `ClientContext`, which two of the metering families
@@ -188,6 +196,14 @@ pub(crate) fn emit(
             false,
             rec.dispatched,
         );
+    }
+
+    // An ensemble's sub-calls that had returned and that no exit of the
+    // handler settled: their rows come next, ahead of the terminal event,
+    // which then follows them.
+    if let Some(ensemble) = ctx.ensemble.take() {
+        ctx.next_attempt_index =
+            crate::chat::emit_abandoned_ensemble(state, &snap, ensemble, ctx.next_attempt_index);
     }
 
     // The request's own terminal event — unless the handler got its own

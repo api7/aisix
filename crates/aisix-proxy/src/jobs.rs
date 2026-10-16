@@ -1870,11 +1870,12 @@ async fn forward_simple(
 
 /// Deterministic UUIDv5 request_id for a batch attribution event.
 ///
-/// The `/dp/telemetry` contract requires `request_id` to be a UUID
-/// (cp-api rejects the event otherwise — and with it the whole flush),
-/// while attribution needs a *stable* id per (batch, model-slice) so
-/// re-emission after a DP restart + re-retrieve doesn't mint a new
-/// identity. UUIDv5 over the batch identity gives both.
+/// The same (batch, model-slice) always gets the same id: a restarted
+/// process or another replica re-emits a batch's rows under it, and the
+/// control plane drops the re-sent row at ingest by `(env_id, request_id)`
+/// while the original is still within usage retention. A UUID rather than a
+/// readable id keeps a synthesized batch row distinguishable from a
+/// caller-supplied request id.
 fn batch_attribution_request_id(raw_batch_id: &str, idx: usize, multi: bool) -> String {
     let name = if multi {
         format!("aisix:batch:{raw_batch_id}:{idx}")
@@ -1884,11 +1885,11 @@ fn batch_attribution_request_id(raw_batch_id: &str, idx: usize, multi: bool) -> 
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, name.as_bytes()).to_string()
 }
 
-/// First-completed-observation hook: dedup via the process-local billed
-/// set, then attribute usage in a detached task. The deterministic
-/// UUIDv5 `request_id` (see [`batch_attribution_request_id`]) keeps
-/// repeated emission (DP restart + re-retrieve) stable per
-/// (batch, model-slice) on the cp-api side.
+/// First-completed-observation hook: claim the batch in the process-lifetime
+/// billed set (so this process attributes it once), then attribute usage in
+/// a detached task. Re-emission from a restarted process or another replica
+/// is deduplicated by the control plane on the deterministic `request_id`
+/// (see [`batch_attribution_request_id`]).
 fn maybe_attribute_batch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -2601,20 +2602,22 @@ mod tests {
         assert_eq!(agg.provider_model_version, "gpt-4o-2024-08-06");
         assert_eq!(agg.requested_model, "jobs-a");
 
-        // Second retrieve: management event only — the attribution is
-        // process-deduped.
-        let resp = app.clone().oneshot(mk_req()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("management event expected")
-            .expect("sink closed");
-        assert_ne!(ev.inbound_protocol, "batch");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "no second aggregated event for the same batch"
-        );
+        // Every later retrieve: management event only — this process
+        // attributes a batch once for as long as it runs.
+        for _ in 0..3 {
+            let resp = app.clone().oneshot(mk_req()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .expect("management event expected")
+                .expect("sink closed");
+            assert_ne!(ev.inbound_protocol, "batch");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                rx.try_recv().is_err(),
+                "no second aggregated event for the same batch"
+            );
+        }
     }
 
     // ---- fine-tuning ----
