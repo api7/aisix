@@ -927,7 +927,9 @@ pub(crate) fn emit_prepared_usage_event(
 ) {
     // It speaks for no attempt of its own: after the failed attempts of a
     // single-shot failover whose winner then failed, it follows them.
-    event.attempt_index = crate::attribution::next_attempt_index();
+    event.attempt_index = event
+        .attempt_index
+        .max(crate::attribution::next_attempt_index());
     // An error event is the request's terminal emission. Its
     // builder leaves `upstream_latency_ms` at 0, so no upstream span is
     // derivable either way — `dispatched: false` states the common case
