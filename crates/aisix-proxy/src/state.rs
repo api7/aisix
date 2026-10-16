@@ -329,8 +329,15 @@ pub struct ProxyStateInner {
     /// no freshness signal, so readiness gates on shutdown only (#591).
     pub config_apply_age: Option<Arc<dyn Fn() -> Option<std::time::Duration> + Send + Sync>>,
     /// Batch ids whose completed output this process has already attributed
-    /// (#720). See [`BilledBatches`].
-    pub billed_batches: Arc<BilledBatches>,
+    /// (#720), kept for the life of the process and never pruned. It spares
+    /// one process from re-downloading a batch's output and re-emitting its
+    /// rows on every retrieve; it is not what makes attribution exactly-once.
+    /// Across restarts and replicas the same rows go out again under the same
+    /// deterministic `request_id` (see `jobs::batch_attribution_request_id`),
+    /// and the control plane drops a re-sent batch-attribution row at ingest
+    /// by `(env_id, request_id)` — but only while the original row is still
+    /// within usage retention, which is why an entry here must not expire.
+    pub billed_batches: Arc<dashmap::DashSet<String>>,
     /// Boot-compiled User-Agent → `client_type` classifier: operator
     /// rules from `observability.metrics.client_type_rules` first, then
     /// the built-in allowlist (AISIX-Cloud#1045). Default = built-ins
@@ -449,7 +456,7 @@ impl ProxyState {
                 .unwrap_or_default()
                 .into(),
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
-            billed_batches: Arc::new(BilledBatches::default()),
+            billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             usage_event_request_headers: Arc::from([]),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
@@ -502,7 +509,7 @@ impl ProxyState {
                 .unwrap_or_default()
                 .into(),
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
-            billed_batches: Arc::new(BilledBatches::default()),
+            billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             usage_event_request_headers: Arc::from([]),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
@@ -569,7 +576,7 @@ impl ProxyState {
                 .unwrap_or_default()
                 .into(),
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
-            billed_batches: Arc::new(BilledBatches::default()),
+            billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             usage_event_request_headers: Arc::from([]),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
@@ -655,86 +662,6 @@ impl ProxyState {
     ) -> Self {
         Arc::make_mut(&mut self.inner).config_apply_age = Some(probe);
         self
-    }
-}
-
-/// Completed batches this process has attributed, each remembered for
-/// [`BilledBatches::TTL`] so a caller polling a finished batch does not make
-/// the gateway re-download its output and re-emit its attribution rows on
-/// every retrieve.
-///
-/// This only saves work within one process. It is not what makes attribution
-/// exactly-once: a restart, another replica, or a retrieve after the entry
-/// expires emits the same rows again, under the same deterministic
-/// `request_id`, and the control plane keeps the first `inbound_protocol =
-/// "batch"` row per `(env_id, request_id)` at ingest.
-#[derive(Debug)]
-pub struct BilledBatches {
-    ttl: std::time::Duration,
-    claimed_at: dashmap::DashMap<String, std::time::Instant>,
-    /// How far the tests have moved this set's clock forward.
-    #[cfg(test)]
-    skew: std::sync::Mutex<std::time::Duration>,
-}
-
-impl Default for BilledBatches {
-    fn default() -> Self {
-        Self {
-            ttl: Self::TTL,
-            claimed_at: dashmap::DashMap::new(),
-            #[cfg(test)]
-            skew: std::sync::Mutex::default(),
-        }
-    }
-}
-
-impl BilledBatches {
-    pub const TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-
-    /// Claim `batch_id` for attribution: the claim's time when it has not
-    /// been claimed within the TTL, `None` when it has. A new claim also
-    /// sweeps the expired entries, which is what bounds the set.
-    pub(crate) fn claim(&self, batch_id: &str) -> Option<std::time::Instant> {
-        let now = self.now();
-        match self.claimed_at.entry(batch_id.to_string()) {
-            dashmap::Entry::Occupied(mut claimed) => {
-                if now.duration_since(*claimed.get()) < self.ttl {
-                    return None;
-                }
-                claimed.insert(now);
-                return Some(now);
-            }
-            dashmap::Entry::Vacant(slot) => {
-                slot.insert(now);
-            }
-        }
-        self.claimed_at
-            .retain(|_, at| now.duration_since(*at) < self.ttl);
-        Some(now)
-    }
-
-    /// Forget a claim whose attribution failed, so the next retrieve retries
-    /// — unless a later claim has replaced it since.
-    pub(crate) fn release(&self, batch_id: &str, claimed_at: std::time::Instant) {
-        self.claimed_at
-            .remove_if(batch_id, |_, at| *at == claimed_at);
-    }
-
-    fn now(&self) -> std::time::Instant {
-        let now = std::time::Instant::now();
-        #[cfg(test)]
-        let now = now + *self.skew.lock().unwrap();
-        now
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.claimed_at.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn advance_clock(&self, by: std::time::Duration) {
-        *self.skew.lock().unwrap() += by;
     }
 }
 

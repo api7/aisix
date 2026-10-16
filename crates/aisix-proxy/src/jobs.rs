@@ -1870,14 +1870,12 @@ async fn forward_simple(
 
 /// Deterministic UUIDv5 request_id for a batch attribution event.
 ///
-/// The same (batch, model-slice) always gets the same id, so every emission
-/// of a batch's attribution — a later retrieve after the in-process claim
-/// expires, a restarted process, another replica — carries the one
-/// `request_id`, and the control plane's ingest keeps the first
-/// `inbound_protocol = "batch"` row per `(env_id, request_id)`. That ingest
-/// dedupe, not [`crate::state::BilledBatches`], is what makes attribution
-/// exactly-once. A UUID rather than a readable id keeps a synthesized batch
-/// row distinguishable from a caller-supplied request id.
+/// The same (batch, model-slice) always gets the same id: a restarted
+/// process or another replica re-emits a batch's rows under it, and the
+/// control plane drops the re-sent row at ingest by `(env_id, request_id)`
+/// while the original is still within usage retention. A UUID rather than a
+/// readable id keeps a synthesized batch row distinguishable from a
+/// caller-supplied request id.
 fn batch_attribution_request_id(raw_batch_id: &str, idx: usize, multi: bool) -> String {
     let name = if multi {
         format!("aisix:batch:{raw_batch_id}:{idx}")
@@ -1887,11 +1885,11 @@ fn batch_attribution_request_id(raw_batch_id: &str, idx: usize, multi: bool) -> 
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, name.as_bytes()).to_string()
 }
 
-/// Completed-batch hook: claim the batch in [`crate::state::BilledBatches`]
-/// (which only spares this process a re-download and re-emit for 24h), then
-/// attribute usage in a detached task. Re-emission beyond that is expected
-/// and is deduplicated by the control plane on the deterministic
-/// `request_id` (see [`batch_attribution_request_id`]).
+/// First-completed-observation hook: claim the batch in the process-lifetime
+/// billed set (so this process attributes it once), then attribute usage in
+/// a detached task. Re-emission from a restarted process or another replica
+/// is deduplicated by the control plane on the deterministic `request_id`
+/// (see [`batch_attribution_request_id`]).
 fn maybe_attribute_batch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -1917,9 +1915,9 @@ fn maybe_attribute_batch(
         tracing::warn!(batch_id = %raw_batch_id, "batch output_file_id failed charset guard; skipping attribution");
         return;
     }
-    let Some(claimed_at) = state.billed_batches.claim(raw_batch_id) else {
-        return;
-    };
+    if !state.billed_batches.insert(raw_batch_id.to_string()) {
+        return; // already attributed by this process
+    }
 
     let state = state.clone();
     let api_key_id = auth.entry.id.clone();
@@ -1969,7 +1967,7 @@ fn maybe_attribute_batch(
         .await
         {
             // Release the guard so a later retrieve can retry the download.
-            state.billed_batches.release(&raw_batch_id, claimed_at);
+            state.billed_batches.remove(&raw_batch_id);
             tracing::warn!(
                 batch_id = %raw_batch_id,
                 error = %e,
@@ -2233,23 +2231,6 @@ mod tests {
             .without_cache()
             .with_usage_sink(UsageSink::new(tx));
         (crate::build_router(state), rx)
-    }
-
-    fn build_app_with_sink_and_billed(
-        snap: AisixSnapshot,
-    ) -> (
-        axum::Router,
-        tokio::sync::mpsc::Receiver<ObsUsageEvent>,
-        Arc<crate::state::BilledBatches>,
-    ) {
-        let (tx, rx) = tokio::sync::mpsc::channel::<ObsUsageEvent>(32);
-        let hub = Arc::new(Hub::new());
-        let handle = SnapshotHandle::new(snap);
-        let state = crate::ProxyState::new(handle, hub, &cfg())
-            .without_cache()
-            .with_usage_sink(UsageSink::new(tx));
-        let billed = Arc::clone(&state.billed_batches);
-        (crate::build_router(state), rx, billed)
     }
 
     // ---- id codec ----
@@ -2521,30 +2502,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_expired_batch_claim_is_swept_by_the_next_claim() {
-        let billed = crate::state::BilledBatches::default();
-        assert!(billed.claim("batch_old").is_some());
-        billed.advance_clock(crate::state::BilledBatches::TTL);
-        assert!(billed.claim("batch_new").is_some());
-        assert_eq!(billed.len(), 1, "the expired claim must not be kept");
-    }
-
-    #[test]
-    fn a_failed_attribution_does_not_release_a_newer_claim() {
-        let billed = crate::state::BilledBatches::default();
-        let first = billed.claim("batch_1").unwrap();
-        billed.advance_clock(crate::state::BilledBatches::TTL);
-        assert!(billed.claim("batch_1").is_some());
-        billed.release("batch_1", first);
-        assert!(
-            billed.claim("batch_1").is_none(),
-            "the newer claim must survive the older attribution's failure"
-        );
-    }
-
     #[tokio::test]
-    async fn completed_batch_retrieve_attributes_usage_once_per_ttl() {
+    async fn completed_batch_retrieve_attributes_usage_once() {
         let upstream = MockServer::start().await;
         Mock::given(wm_method("GET"))
             .and(path("/v1/batches/batch_1"))
@@ -2587,7 +2546,7 @@ mod tests {
         snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
         snap.models.insert(model("m-a", "jobs-a", PK_A));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        let (app, mut rx, billed) = build_app_with_sink_and_billed(snap);
+        let (app, mut rx) = build_app_with_sink(snap);
 
         let encoded = encode_routed_id("batch_1", "jobs-a");
         let mk_req = || {
@@ -2643,39 +2602,22 @@ mod tests {
         assert_eq!(agg.provider_model_version, "gpt-4o-2024-08-06");
         assert_eq!(agg.requested_model, "jobs-a");
 
-        // Second retrieve: management event only — the attribution is
-        // process-deduped.
-        let resp = app.clone().oneshot(mk_req()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("management event expected")
-            .expect("sink closed");
-        assert_ne!(ev.inbound_protocol, "batch");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "no second aggregated event for the same batch"
-        );
-
-        // Once the claim has expired, a retrieve attributes the batch again,
-        // under the same request_id the control plane deduplicates on.
-        billed.advance_clock(crate::state::BilledBatches::TTL);
-        let resp = app.clone().oneshot(mk_req()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let mut again = None;
-        for _ in 0..2 {
+        // Every later retrieve: management event only — this process
+        // attributes a batch once for as long as it runs.
+        for _ in 0..3 {
+            let resp = app.clone().oneshot(mk_req()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
             let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
                 .await
-                .expect("expected a usage event")
+                .expect("management event expected")
                 .expect("sink closed");
-            if ev.inbound_protocol == "batch" {
-                again = Some(ev);
-            }
+            assert_ne!(ev.inbound_protocol, "batch");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                rx.try_recv().is_err(),
+                "no second aggregated event for the same batch"
+            );
         }
-        let again = again.expect("an expired claim must re-attribute the batch");
-        assert_eq!(again.request_id, agg.request_id);
-        assert_eq!(again.prompt_tokens, 17);
     }
 
     // ---- fine-tuning ----
