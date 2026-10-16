@@ -2891,6 +2891,62 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// A submit whose retry WON at the attempt level and then failed to
+    /// parse: the failed first attempt has its row, and the request's
+    /// terminal error row must follow it rather than repeat index 0 — the
+    /// control plane counts a request by its one `attempt_index = 0` row.
+    #[tokio::test]
+    async fn failure_after_a_retried_winner_keeps_one_index_zero_row() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(DASHSCOPE_SUBMIT_PATH))
+            .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(DASHSCOPE_SUBMIT_PATH))
+            // JSON, so the attempt itself succeeds; it names no task, so
+            // the submit fails afterwards.
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"request_id": "r-1"})),
+            )
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let handle = SnapshotHandle::new(new_snap(&upstream.uri(), "alibaba", ""));
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, Arc::new(Hub::new()), &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_videos(serde_json::json!({"model": "my-video", "prompt": "a city"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 2);
+
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await
+        {
+            events.push(ev);
+        }
+        assert_eq!(events.len(), 2, "{events:?}");
+        let indices: Vec<u32> = events.iter().map(|e| e.attempt_index).collect();
+        assert_eq!(indices, vec![0, 1], "{events:?}");
+        assert_eq!(events[0].attempt_kind, "initial");
+        assert_eq!(events[1].status_code, 502);
+    }
+
     #[tokio::test]
     async fn poll_maps_running_to_in_progress() {
         let upstream = MockServer::start().await;
