@@ -131,6 +131,35 @@ const RESPONSES_FAILED_FRAMES = [
   }),
 ];
 
+// The `error` event in the shape that nests its fields under `error` (the
+// one OpenAI's own client reads), followed by a `response.failed` with a
+// different message. The error event is the stream's first failure, so its
+// message is the one the row must carry.
+const NESTED_ERROR_MESSAGE = "The deployment hit an internal error while generating.";
+const NESTED_ERROR_FRAME = sseFrame("error", {
+  type: "error",
+  sequence_number: 2,
+  error: { type: "server_error", code: null, message: NESTED_ERROR_MESSAGE, param: null },
+});
+const RESPONSES_NESTED_ERROR_FRAMES = [
+  RESPONSES_FAILED_FRAMES[0]!,
+  RESPONSES_FAILED_FRAMES[1]!,
+  NESTED_ERROR_FRAME,
+  sseFrame("response.failed", {
+    type: "response.failed",
+    sequence_number: 3,
+    response: {
+      id: "resp_sf",
+      object: "response",
+      status: "failed",
+      model: "gpt-4o",
+      output: [],
+      error: { code: "server_error", message: "A later summary of the failure." },
+      usage: null,
+    },
+  }),
+];
+
 // A streamed transcription that delivers one delta, then loses its
 // connection.
 const TRANSCRIPT_CUT: OpenAiUpstreamOptions = {
@@ -185,6 +214,15 @@ const MODELS: Record<string, Seeded> = {
   },
   "sf-responses-native-failed-held": {
     upstream: { rawStreamFrames: RESPONSES_FAILED_FRAMES },
+    kind: "responses-native",
+    holdBack: true,
+  },
+  "sf-responses-native-nested-error": {
+    upstream: { rawStreamFrames: RESPONSES_NESTED_ERROR_FRAMES },
+    kind: "responses-native",
+  },
+  "sf-responses-native-nested-error-held": {
+    upstream: { rawStreamFrames: RESPONSES_NESTED_ERROR_FRAMES },
     kind: "responses-native",
     holdBack: true,
   },
@@ -356,6 +394,10 @@ describe("usage status of a stream that fails after its 200 headers", () => {
   };
 
   async function streamToEnd(path: string, model: string): Promise<string> {
+    return (await streamWithBody(path, model)).requestId;
+  }
+
+  async function streamWithBody(path: string, model: string): Promise<{ requestId: string; body: string }> {
     const res = await fetch(`${app!.proxyUrl}${path}`, {
       method: "POST",
       headers: { authorization: `Bearer ${CALLER_PLAINTEXT}`, "content-type": "application/json" },
@@ -366,8 +408,8 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     expect(requestId).not.toBe("");
     // A relay that ends on a transport error aborts the body; that is the
     // failure under test, not the caller's.
-    await res.text().catch(() => undefined);
-    return requestId;
+    const body = (await res.text().catch(() => undefined)) ?? "";
+    return { requestId, body };
   }
 
   async function abandonAfterFirstRead(path: string, model: string): Promise<string> {
@@ -475,6 +517,18 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     expect(row.get("error_message")).toContain("failed partway through the response");
     await expectRequestFamily(before, "/v1/responses", "sf-responses-native-failed", "502");
   });
+
+  for (const model of ["sf-responses-native-nested-error", "sf-responses-native-nested-error-held"]) {
+    test(`responses (native, ${model}): a nested-shape error event records the upstream's message`, async (ctx) => {
+      if (!etcdReachable || !app || !sls) return ctx.skip();
+      const { requestId, body } = await streamWithBody("/v1/responses", model);
+      expect(body, "the error event reaches the caller unchanged").toContain(NESTED_ERROR_FRAME);
+      const row = await usageRow(requestId);
+      expectUpstreamFailure(row, "502");
+      expect(row.get("error_class")).toBe("upstream_in_band");
+      expect(row.get("error_message")).toContain(NESTED_ERROR_MESSAGE);
+    });
+  }
 
   test("responses (native, held back by an output guardrail): an upstream response.failed is still a 502", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();

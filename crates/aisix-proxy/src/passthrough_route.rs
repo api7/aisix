@@ -7909,6 +7909,12 @@ mod tests {
 
 "#;
         assert!(frame_in_band_error(PassthroughProtocol::OpenaiResponses, responses).is_some());
+        let nested = br#"event: error
+data: {"type":"error","error":{"type":"server_error","code":null,"message":"nested boom","param":null}}
+
+"#;
+        let err = frame_in_band_error(PassthroughProtocol::OpenaiResponses, nested).unwrap();
+        assert!(err.to_string().contains("nested boom"), "{err}");
         // An opaque stream is never read for one, and ordinary frames are not one.
         assert!(frame_in_band_error(PassthroughProtocol::Raw, openai).is_none());
         let delta = br#"data: {"choices":[{"delta":{"content":"hel"}}]}
