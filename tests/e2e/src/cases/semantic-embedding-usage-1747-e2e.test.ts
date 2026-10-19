@@ -299,6 +299,7 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
   let failedUsageRouterModelID = "";
   let cancelledEmbeddingModelID = "";
   let routeTargetModelID = "";
+  let routerModelID = "";
   let routeDefaultModelID = "";
   let streamRouteTargetModelID = "";
   let outputGuardrailRouterModelID = "";
@@ -488,7 +489,7 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     const outputGuardrailTarget = await createChatModel(OUTPUT_GUARDRAIL_TARGET);
     outputGuardrailTargetModelID = outputGuardrailTarget.id;
 
-    await seed.createModel({
+    const router = await seed.createModel({
       display_name: ROUTER_MODEL,
       semantic: {
         embedding_model: EMBED_MODEL,
@@ -504,6 +505,7 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
         match: { threshold: 0.9 },
       },
     });
+    routerModelID = router.id;
     const failedUsageRouter = await seed.createModel({
       display_name: FAILED_USAGE_ROUTER_MODEL,
       semantic: {
@@ -709,6 +711,8 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     // The route target, not the detached embedding model, still owns the
     // parent event's pricing and attempt attribution.
     expect(row.get("model_id")).toBe(routeTargetModelID);
+    // The entry the caller addressed is the router, by id.
+    expect(row.get("requested_model_id")).toBe(routerModelID);
     expect(row.get("attempt_model")).toBe(ROUTE_TARGET);
     expect(row.get("attempt_model")).not.toBe(EMBED_MODEL);
   });

@@ -6701,6 +6701,12 @@ data: [DONE]\n\n";
             events.iter().all(|e| e.requested_model == "smart"),
             "every attempt records the requested group alias"
         );
+        assert!(
+            events
+                .iter()
+                .all(|e| e.requested_model_id == "router-smart"),
+            "every attempt records the requested group's id beside the target's"
+        );
 
         // initial attempt on `primary` failed with the upstream's 502
         assert_eq!(events[0].attempt_index, 0);
@@ -7112,6 +7118,12 @@ data: [DONE]\n\n";
             events.iter().all(|e| e.requested_model == "smart"),
             "every attempt records the requested group alias"
         );
+        assert!(
+            events
+                .iter()
+                .all(|e| e.requested_model_id == "router-smart"),
+            "every attempt records the requested group's id beside the target's"
+        );
 
         // initial attempt on `primary` failed with the upstream's 502
         assert_eq!(events[0].attempt_index, 0);
@@ -7238,6 +7250,12 @@ data: [DONE]\n\n";
         assert!(
             events.iter().all(|e| e.requested_model == "smart"),
             "every attempt records the requested group alias"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| e.requested_model_id == "router-smart"),
+            "every attempt records the requested group's id beside the target's"
         );
 
         // initial attempt on `primary` failed with the upstream's 502
@@ -7464,6 +7482,7 @@ data: [DONE]\n\n";
         assert_eq!(event.requested_model, "my-gpt4");
         // Direct request: target == requested entry, id unchanged.
         assert_eq!(event.model_id, "model-id-1");
+        assert_eq!(event.requested_model_id, "model-id-1");
 
         // Anthropic protocol: /v1/messages (cross-provider dispatch to
         // the same OpenAI upstream).
@@ -7490,6 +7509,7 @@ data: [DONE]\n\n";
         assert_eq!(event.requested_model, "my-gpt4");
         assert_eq!(event.model_id, "model-id-1");
         assert_eq!(event.inbound_protocol, "anthropic");
+        assert_eq!(event.requested_model_id, "model-id-1");
     }
 
     #[tokio::test]
@@ -8764,6 +8784,10 @@ data: [DONE]\n\n";
         assert_eq!(
             event.model_id, "",
             "the group the caller addressed must never be reported as the model that served",
+        );
+        assert_eq!(
+            event.requested_model_id, "router-smart",
+            "the group is still the entry the caller addressed",
         );
         assert_eq!(event.attempt_model, "", "no attempt had begun");
         assert_eq!(event.attempt_kind, "");
@@ -12228,6 +12252,13 @@ data: [DONE]\n\n";
         );
         assert_eq!(judge_events[0].prompt_tokens, 30);
         assert_eq!(judge_events[0].completion_tokens, 7);
+        // Members and judge each name their own target, and every one of
+        // them names the ensemble the caller addressed.
+        assert!(
+            events.iter().all(|e| e.requested_model_id == "m-council"),
+            "every sub-call event carries the ensemble's id"
+        );
+        assert!(panel_events.iter().all(|e| e.model_id != "m-council"));
         assert_attempt_indices_increase(&events);
         assert_ensemble_terminal_row_names_no_kind(&events);
     }

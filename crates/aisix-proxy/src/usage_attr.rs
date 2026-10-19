@@ -939,6 +939,26 @@ pub(crate) fn emit_prepared_usage_event(
     );
 }
 
+/// Fill `requested_model_id` from the request's attribution cell, where
+/// `resolve_model` recorded the entry the caller's name resolved to. Read
+/// here, at the one point every usage event passes through, so every
+/// attempt, ensemble member and judge event of a group request carries the
+/// group's id beside its own target's `model_id`, and no family can miss it.
+///
+/// Only taken when the event's `requested_model` is the name that resolved:
+/// a name the request never resolved (an unknown model, the passthrough
+/// namespace's body `model`) borrows no entry's id. An emitter that runs
+/// outside the request scope (the realtime session end, the batch poll)
+/// sets the field itself.
+fn stamp_requested_model_id(event: &mut UsageEvent) {
+    if !event.requested_model_id.is_empty() || event.requested_model.is_empty() {
+        return;
+    }
+    if let Some(id) = crate::attribution::requested_model_id(&event.requested_model) {
+        event.requested_model_id = id;
+    }
+}
+
 /// THE emission chokepoint (AISIX-Cloud#1279): every usage event leaves
 /// through here, so the CP telemetry leg and the exporter fan-out cannot
 /// drift, and the trace snapshot is taken in exactly one place.
@@ -976,6 +996,7 @@ pub(crate) fn emit_usage(
     // present on a family's success path and missing from its error or
     // streaming one (AISIX-Cloud#1461).
     event.operation = surface.operation.to_string();
+    stamp_requested_model_id(&mut event);
     // Same reasoning, for the other shape of a caller walking away
     // (AISIX-Cloud#1571). A stream the consumer abandoned is reported as
     // 499 by six different families, each through its own emit helper and

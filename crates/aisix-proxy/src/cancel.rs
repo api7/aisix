@@ -336,6 +336,7 @@ fn base_event(
         // The name the CALLER addressed — the group for a routing request,
         // matching every other event of the same request.
         requested_model: resolved.requested_model.clone(),
+        requested_model_id: resolved.requested_model_id.clone(),
         inbound_protocol: inbound_protocol.to_string(),
         provider_kind: crate::chat::sanitize_tag(
             tags.kind.map(|k| k.as_str().to_owned()).unwrap_or_default(),

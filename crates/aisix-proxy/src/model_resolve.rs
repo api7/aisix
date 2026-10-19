@@ -31,12 +31,12 @@ pub(crate) fn resolve_model(
     // terminal emitters that run after the handler is gone read it back off
     // the request's attribution cell (see `attribution`).
     if let Some(exact) = snapshot.models.get_by_name(requested) {
-        crate::attribution::note_requested_model(requested);
+        crate::attribution::note_requested_model(requested, &exact.id);
         note_dispatchable_entry(&exact);
         return Some(exact);
     }
     let (entry, upstream) = best_wildcard_row(snapshot, requested)?;
-    crate::attribution::note_requested_model(requested);
+    crate::attribution::note_requested_model(requested, &entry.id);
     // A wildcard row is a direct model, and attribution stays on the ROW
     // (see the module docs), so the synthetic clone below inherits its id.
     note_dispatchable_entry(&entry);

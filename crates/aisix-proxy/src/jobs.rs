@@ -665,6 +665,9 @@ fn emit_job_usage_event(
         model_id: target.model_entry.id.clone(),
         api_key_id: auth.entry.id.clone(),
         requested_model: target.display_name().to_string(),
+        // The jobs surface only routes to a direct model, which is the entry
+        // `requested_model` names here, including the auto-selected one.
+        requested_model_id: target.model_entry.id.clone(),
         status_code,
         // Single-attempt endpoint: the attempt spans the whole request, so
         // the upstream figure and what the caller waited for coincide.
@@ -2094,6 +2097,11 @@ async fn attribute_batch_usage(
             model_id: model_id.to_string(),
             api_key_id: api_key_id.to_string(),
             requested_model: display_name.to_string(),
+            // A batch dispatches to one direct model, which is the entry
+            // its caller addressed. Taken from the batch's own record, not
+            // looked up by name: the poll runs long after the request, and
+            // the model may have been renamed since.
+            requested_model_id: model_id.to_string(),
             prompt_tokens: agg.prompt.min(u32::MAX as u64) as u32,
             completion_tokens: agg.completion.min(u32::MAX as u64) as u32,
             cached_prompt_tokens: agg.cached.min(u32::MAX as u64) as u32,

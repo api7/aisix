@@ -75,6 +75,9 @@ pub(crate) struct Resolved {
     /// label (#451). Kept raw here because the bounding needs a snapshot
     /// and only the readers have one.
     pub requested_model: String,
+    /// Id of the entry `requested_model` resolved to — for a routing group,
+    /// semantic router or ensemble the group's own id, never a target's.
+    pub requested_model_id: String,
     /// Vendor id of the last target the request selected.
     pub provider: String,
     /// That target's upstream model id.
@@ -981,16 +984,34 @@ pub(crate) fn detached<F: Future>(fut: F) -> impl Future<Output = F::Output> {
     scope(child, fut)
 }
 
-/// Note the model name the caller addressed. Called once per request from
-/// the resolution chokepoint, and only when the name resolved — an
-/// unresolvable name never reaches a target and its request fails before
-/// anything can read the cell.
-pub(crate) fn note_requested_model(requested: &str) {
+/// Note the model name the caller addressed and the id of the entry it
+/// resolved to. Called from the resolution chokepoint, and only when the
+/// name resolved — an unresolvable name never reaches a target and its
+/// request fails before anything can read the cell. The first resolution
+/// wins, so the sub-dispatches a group makes to its members never replace
+/// the entry the caller addressed.
+pub(crate) fn note_requested_model(requested: &str, entry_id: &str) {
     with(|r| {
         if r.requested_model.is_empty() {
             r.requested_model = requested.to_string();
+            r.requested_model_id = entry_id.to_string();
         }
     });
+}
+
+/// The id of the entry the current request resolved `requested` to, when
+/// `requested` is the name it resolved. `None` outside a request scope, or
+/// when the request never resolved that name through `resolve_model`.
+pub(crate) fn requested_model_id(requested: &str) -> Option<String> {
+    CURRENT
+        .try_with(|a| {
+            let cell = a.lock();
+            (!cell.resolved.requested_model_id.is_empty()
+                && cell.resolved.requested_model == requested)
+                .then(|| cell.resolved.requested_model_id.clone())
+        })
+        .ok()
+        .flatten()
 }
 
 /// Note the target this request is about to dispatch to. Called for every
@@ -1661,7 +1682,7 @@ mod tests {
     /// also runs from the background health checker.
     #[test]
     fn writes_outside_a_request_are_dropped() {
-        note_requested_model("gpt-4o");
+        note_requested_model("gpt-4o", "m-1");
         note_target(&model("openai", "gpt-4o"), "pk-1");
         assert!(current().is_none());
     }
@@ -1816,7 +1837,7 @@ mod tests {
     #[tokio::test]
     async fn the_last_attempted_target_is_what_a_failure_reads() {
         scope(Arc::new(RequestAttribution::default()), async {
-            note_requested_model("my-group");
+            note_requested_model("my-group", "g-1");
             note_target(&model("openai", "gpt-4o"), "pk-openai");
             // The group fell back; the caller's error came from the second
             // target, so that is the one the terminal emit must name.
@@ -1852,7 +1873,7 @@ mod tests {
     #[tokio::test]
     async fn a_group_cache_hit_erases_the_preflight_target() {
         scope(Arc::new(RequestAttribution::default()), async {
-            note_requested_model("my-group");
+            note_requested_model("my-group", "g-1");
             note_target(&model("openai", "gpt-4o"), "pk-openai");
             note_cache_hit_entry(&group_model(), "exact");
             let r = current().expect("in scope");
@@ -1879,7 +1900,7 @@ mod tests {
     async fn a_direct_cache_hit_keeps_the_entrys_own_mapping() {
         scope(Arc::new(RequestAttribution::default()), async {
             let direct = model("openai", "gpt-4o");
-            note_requested_model("m");
+            note_requested_model("m", "m-1");
             note_cache_hit_entry(&direct, "semantic");
             let r = current().expect("in scope");
             assert_eq!(r.provider, "openai");
@@ -1940,9 +1961,13 @@ mod tests {
     #[tokio::test]
     async fn the_requested_model_is_not_overwritten_by_a_target() {
         scope(Arc::new(RequestAttribution::default()), async {
-            note_requested_model("my-group");
-            note_requested_model("gpt-4o");
+            note_requested_model("my-group", "g-1");
+            note_requested_model("gpt-4o", "m-1");
             assert_eq!(current().unwrap().requested_model, "my-group");
+            assert_eq!(current().unwrap().requested_model_id, "g-1");
+            assert_eq!(requested_model_id("my-group").as_deref(), Some("g-1"));
+            // A name the request never resolved borrows nothing.
+            assert_eq!(requested_model_id("gpt-4o"), None);
         })
         .await;
     }

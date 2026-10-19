@@ -1261,6 +1261,12 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
     if !event.model_id.is_empty() {
         attributes.push(attr_string("aisix.model_id", &event.model_id));
     }
+    if !event.requested_model_id.is_empty() {
+        attributes.push(attr_string(
+            "aisix.requested_model_id",
+            &event.requested_model_id,
+        ));
+    }
     // Duration cost basis (#457): only the duration-billed audio models
     // carry it, so it stays off every other span.
     if event.audio_duration_seconds > 0.0 {
@@ -3150,6 +3156,30 @@ mod tests {
             attr(&span, "gen_ai.request.model").unwrap()["stringValue"],
             "anything-the-caller-sent"
         );
+    }
+
+    #[test]
+    fn requested_model_id_rides_beside_model_id() {
+        // A group request: the addressed group and the dispatched target are
+        // two ids, and a span must carry both so it stays joinable to the
+        // group across a rename.
+        let mut ev = sample_event();
+        ev.requested_model = "smart-group".into();
+        ev.requested_model_id = "group-uuid".into();
+        let span = build_otlp_span(&SinkRecord::metadata_only(ev), "x");
+        assert_eq!(
+            attr(&span, "aisix.requested_model_id").unwrap()["stringValue"],
+            "group-uuid"
+        );
+        assert_eq!(
+            attr(&span, "aisix.model_id").unwrap()["stringValue"],
+            "mod-uuid"
+        );
+
+        // Nothing resolved: no blank attribute, the same as `aisix.model_id`.
+        let span = build_otlp_span(&SinkRecord::metadata_only(UsageEvent::default()), "x");
+        assert!(attr(&span, "aisix.requested_model_id").is_none());
+        assert!(attr(&span, "aisix.model_id").is_none());
     }
 
     #[test]
