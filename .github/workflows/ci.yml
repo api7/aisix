@@ -84,7 +84,7 @@ jobs:
               spec = json.load(f)
 
           assert spec["openapi"].startswith("3.")
-          assert spec["info"]["title"] == "Open-Source AISIX Gateway Admin API"
+          assert spec["info"]["title"] == "AISIX OSS Admin API"
           assert spec["info"]["version"] == "dev"
           assert "/admin/v1/models" in spec["paths"]
           assert "Model" in spec["components"]["schemas"]
