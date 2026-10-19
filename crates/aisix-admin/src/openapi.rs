@@ -36,9 +36,9 @@ use serde_json::{json, Map, Value};
 const OPENAPI_JSON_BASE: &str = r##"{
   "openapi": "3.1.0",
   "info": {
-    "title": "AISIX Admin API",
+    "title": "AISIX OSS Admin API",
     "version": "dev",
-    "description": "The AISIX Admin API is the read-only operational surface of an open-source AISIX gateway: list and inspect the loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, check per-model upstream health, and drive the playground.\n\nResource write endpoints were removed in favor of declarative configuration: declare resources in a `resources_file` (`resources.yaml`) and reload with SIGHUP, or write them to etcd directly. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\nGateways connected to AISIX Enterprise or AISIX Cloud do not expose this listener. Configure them through the corresponding control plane."
+    "description": "The AISIX OSS Admin API is an optional operational interface for inspecting a directly operated open-source AISIX gateway. Its resource-management routes are read-only: they list loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, and report per-model upstream health. The same listener provides a playground that forwards test completion requests through the gateway.\n\nConfigure resources declaratively through a `resources_file` (`resources.yaml`, reloaded on SIGHUP) or direct etcd writes. The API does not create, update, or delete resources. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\nGateways connected to AISIX Enterprise or AISIX Cloud do not expose this listener. Configure them through the corresponding control plane."
   },
   "paths": {
     "/livez": {
@@ -2614,6 +2614,15 @@ mod tests {
         // Validate by parsing — guards against typos in the literal block.
         let parsed: serde_json::Value =
             serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        assert_eq!(parsed["info"]["title"], "AISIX OSS Admin API");
+        let description = parsed["info"]["description"]
+            .as_str()
+            .expect("info.description must be a string");
+        assert!(description.contains("resource-management routes are read-only"));
+        assert!(description.contains("open-source AISIX gateway"));
+        assert!(description.contains("playground that forwards test completion requests"));
+        assert!(description.contains("does not create, update, or delete resources"));
+        assert!(description.contains("AISIX Enterprise or AISIX Cloud"));
         // Every route mounted in build_router should be documented.
         for path in [
             "/livez",
