@@ -38,7 +38,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
   "info": {
     "title": "AISIX OSS Admin API",
     "version": "dev",
-    "description": "The AISIX OSS Admin API is an optional, read-only operational interface for inspecting a directly operated open-source AISIX gateway. It lists loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, reports per-model upstream health, and provides the playground.\n\nConfigure resources declaratively through a `resources_file` (`resources.yaml`, reloaded on SIGHUP) or direct etcd writes. The API does not create, update, or delete resources. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\nGateways connected to AISIX Enterprise or AISIX Cloud do not expose this listener. Configure them through the corresponding control plane."
+    "description": "The AISIX OSS Admin API is an optional operational interface for inspecting a directly operated open-source AISIX gateway. Its resource-management routes are read-only: they list loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, and report per-model upstream health. The same listener provides a playground that forwards test completion requests through the gateway.\n\nConfigure resources declaratively through a `resources_file` (`resources.yaml`, reloaded on SIGHUP) or direct etcd writes. The API does not create, update, or delete resources. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\nGateways connected to AISIX Enterprise or AISIX Cloud do not expose this listener. Configure them through the corresponding control plane."
   },
   "paths": {
     "/livez": {
@@ -2618,8 +2618,9 @@ mod tests {
         let description = parsed["info"]["description"]
             .as_str()
             .expect("info.description must be a string");
-        assert!(description.contains("optional, read-only operational interface"));
+        assert!(description.contains("resource-management routes are read-only"));
         assert!(description.contains("open-source AISIX gateway"));
+        assert!(description.contains("playground that forwards test completion requests"));
         assert!(description.contains("does not create, update, or delete resources"));
         assert!(description.contains("AISIX Enterprise or AISIX Cloud"));
         // Every route mounted in build_router should be documented.
