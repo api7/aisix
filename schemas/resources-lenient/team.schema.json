@@ -11,7 +11,10 @@
         "type": "string"
       },
       "description": "Cost-attribution tags of this team, as tag key to tag value. Each request made with an API key whose `team_id` names this team is attributed to them, per tag key, unless the key itself sets the same key; they take precedence over the owning member's tags. Keys match `^[a-z][a-z0-9_]{0,62}$`, values are 1 to 128 characters, and at most 32 entries are allowed. Omitted or empty means the team adds no tags.",
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     }
   },
   "required": [

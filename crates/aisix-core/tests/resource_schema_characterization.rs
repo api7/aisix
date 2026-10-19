@@ -1026,6 +1026,7 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
             "/properties/tags/additionalProperties/minLength",
             "/properties/tags/maxProperties",
             "/properties/tags/propertyNames",
+            "/properties/tags/type",
         ],
     ),
     (
@@ -1109,6 +1110,7 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
             "/properties/tags/additionalProperties/minLength",
             "/properties/tags/maxProperties",
             "/properties/tags/propertyNames",
+            "/properties/tags/type",
         ],
     ),
     (
@@ -1118,6 +1120,7 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
             "/properties/tags/additionalProperties/minLength",
             "/properties/tags/maxProperties",
             "/properties/tags/propertyNames",
+            "/properties/tags/type",
         ],
     ),
 ];

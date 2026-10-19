@@ -40,15 +40,24 @@ pub fn effective_tags<'a>(key: &'a Tags, team: Option<&'a Tags>, user: Option<&'
     out
 }
 
-/// The schema `schemars` renders for a `tags` field: an object of strings.
-/// This is the read shape; [`constrain_tags_property`] adds the write-path
-/// limits to the strict schema only.
+/// The schema `schemars` renders for a `tags` field: an object of strings,
+/// or `null` read as no tags ([`null_as_empty`]). This is the read shape;
+/// [`constrain_tags_property`] narrows it to the write-path contract — an
+/// object within the limits — on the strict schema only.
 pub(crate) fn tags_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
     serde_json::from_value(json!({
-        "type": "object",
+        "type": ["object", "null"],
         "additionalProperties": { "type": "string" },
     }))
     .expect("tags schema is a valid schema")
+}
+
+/// Deserialize a `tags` field, reading `null` as no tags: a stored row
+/// carrying it must not be skipped, which for an `api_key` would stop the
+/// key authenticating.
+pub(crate) fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Tags, D::Error> {
+    use serde::Deserialize;
+    Ok(Option::<Tags>::deserialize(d)?.unwrap_or_default())
 }
 
 /// Add the key grammar, value length and entry cap to a strict root
@@ -65,6 +74,7 @@ pub(crate) fn constrain_tags_property(schema: &mut Value) {
     else {
         return;
     };
+    tags.insert("type".into(), json!("object"));
     tags.insert("maxProperties".into(), json!(MAX_TAGS));
     tags.insert(
         "propertyNames".into(),
@@ -106,6 +116,22 @@ mod tests {
         );
         assert_eq!(effective_tags(&Tags::new(), None, Some(&user)), user,);
         assert!(effective_tags(&Tags::new(), None, None).is_empty());
+    }
+
+    #[test]
+    fn null_tags_read_as_none_on_every_tagged_document() {
+        let key: crate::models::ApiKey =
+            serde_json::from_value(json!({"key_hash": "h", "tags": null})).unwrap();
+        assert!(key.tags.is_empty());
+        let team: crate::models::Team =
+            serde_json::from_value(json!({"name": "t", "tags": null})).unwrap();
+        assert!(team.tags.is_empty());
+        let user: crate::models::User =
+            serde_json::from_value(json!({"name": "u", "tags": null})).unwrap();
+        assert!(user.tags.is_empty());
+        let null = json!({"key_hash": "h", "tags": null});
+        assert!(crate::models::validate_apikey_lenient(&null).is_ok());
+        assert!(crate::models::validate_apikey(&null).is_err());
     }
 
     #[test]

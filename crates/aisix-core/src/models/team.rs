@@ -27,7 +27,11 @@ pub struct Team {
     /// key; they take precedence over the owning member's tags. Keys match
     /// `^[a-z][a-z0-9_]{0,62}$`, values are 1 to 128 characters, and at most
     /// 32 entries are allowed. Omitted or empty means the team adds no tags.
-    #[serde(default, skip_serializing_if = "crate::models::Tags::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "crate::models::tags::null_as_empty",
+        skip_serializing_if = "crate::models::Tags::is_empty"
+    )]
     #[schemars(schema_with = "crate::models::tags::tags_schema")]
     pub tags: crate::models::Tags,
 
