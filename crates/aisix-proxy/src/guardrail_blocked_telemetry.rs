@@ -532,8 +532,10 @@ async fn a_refusal_before_dispatch_names_only_a_dispatchable_model() {
             .expect("a group per model family");
         let (status, events) =
             drive_request(fixture_for(surface, group, &format!("please {BLOCK} now"))).await;
-        if events.is_empty() {
-            wrong.push(format!("{surface} (group): {status} with no usage event"));
+        // The group must reach the same guardrail refusal, or an event that
+        // is empty for some unrelated reason would satisfy the check below.
+        if status != 422 || !events.iter().any(|e| e.guardrail_blocked) {
+            wrong.push(format!("{surface} (group): {status} with no refusal event"));
             continue;
         }
         for event in &events {
