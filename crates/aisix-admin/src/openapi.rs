@@ -38,7 +38,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
   "info": {
     "title": "AISIX OSS Admin API",
     "version": "dev",
-    "description": "The AISIX OSS Admin API is the read-only operational surface of an open-source AISIX gateway: list and inspect the loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, check per-model upstream health, and drive the playground.\n\nResource write endpoints were removed in favor of declarative configuration: declare resources in a `resources_file` (`resources.yaml`) and reload with SIGHUP, or write them to etcd directly. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\nGateways connected to AISIX Enterprise or AISIX Cloud do not expose this listener. Configure them through the corresponding control plane."
+    "description": "The AISIX OSS Admin API is an optional, read-only operational interface for inspecting a directly operated open-source AISIX gateway. It lists loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, reports per-model upstream health, and provides the playground.\n\nConfigure resources declaratively through a `resources_file` (`resources.yaml`, reloaded on SIGHUP) or direct etcd writes. The API does not create, update, or delete resources. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\nGateways connected to AISIX Enterprise or AISIX Cloud do not expose this listener. Configure them through the corresponding control plane."
   },
   "paths": {
     "/livez": {
@@ -2618,7 +2618,9 @@ mod tests {
         let description = parsed["info"]["description"]
             .as_str()
             .expect("info.description must be a string");
+        assert!(description.contains("optional, read-only operational interface"));
         assert!(description.contains("open-source AISIX gateway"));
+        assert!(description.contains("does not create, update, or delete resources"));
         assert!(description.contains("AISIX Enterprise or AISIX Cloud"));
         // Every route mounted in build_router should be documented.
         for path in [
