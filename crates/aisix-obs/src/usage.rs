@@ -463,7 +463,10 @@ pub struct UsageEvent {
     /// The service tier the upstream response reports it actually served
     /// this attempt on, verbatim: OpenAI-shape `service_tier`, Anthropic
     /// `usage.speed` when it is not `"standard"` and otherwise
-    /// `usage.service_tier`, Bedrock `serviceTier.type`. Never the tier the
+    /// `usage.service_tier`, Bedrock `serviceTier.type`, Gemini
+    /// `usageMetadata.serviceTier` or else the `x-gemini-service-tier`
+    /// response header. On a batch attribution row, the tier every line of
+    /// the row agrees on, absent otherwise. Never the tier the
     /// request asked for and never a default — absent when the upstream
     /// reported none, and on a cache hit, which no upstream served. Any
     /// string: tier names differ across providers and change over time.

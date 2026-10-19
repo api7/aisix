@@ -930,6 +930,31 @@ pub fn anthropic_service_tier(speed: Option<&str>, service_tier: Option<&str>) -
         .map(str::to_owned)
 }
 
+/// The response header a Gemini upstream names its serving tier in.
+pub const GEMINI_SERVICE_TIER_HEADER: &str = "x-gemini-service-tier";
+
+/// The tier the `x-gemini-service-tier` response header names, verbatim.
+/// Only Google sends it, so it is read off any upstream response; it is the
+/// fallback for a response whose body reported no tier.
+pub fn gemini_header_service_tier(headers: &http::HeaderMap) -> Option<ServiceTier> {
+    ServiceTier::native(
+        headers
+            .get(GEMINI_SERVICE_TIER_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_owned()),
+    )
+}
+
+/// Gemini `usageMetadata.serviceTier`, verbatim; an `unspecified` value (in
+/// any spelling, `SERVICE_TIER_UNSPECIFIED` included) reports nothing.
+pub fn gemini_usage_service_tier(value: Option<&str>) -> Option<ServiceTier> {
+    ServiceTier::native(
+        value
+            .filter(|v| !v.to_ascii_lowercase().ends_with("unspecified"))
+            .map(str::to_owned),
+    )
+}
+
 /// [`anthropic_service_tier`] over a raw Anthropic `usage` object.
 pub fn anthropic_usage_service_tier(usage: &serde_json::Value) -> Option<String> {
     let field = |k: &str| usage.get(k).and_then(serde_json::Value::as_str);
@@ -954,6 +979,14 @@ pub struct ChatResponse {
 }
 
 impl ChatResponse {
+    /// Take `fallback` as the tier when the body reported none.
+    pub fn with_fallback_service_tier(mut self, fallback: Option<ServiceTier>) -> Self {
+        if self.service_tier.is_none() {
+            self.service_tier = fallback;
+        }
+        self
+    }
+
     /// The client-visible output text that content/DLP output guardrails
     /// must inspect: the assistant `content` plus any `tool_calls`
     /// material (function names + arguments, and Anthropic `tool_use`
@@ -995,6 +1028,16 @@ pub struct ChatChunk {
     /// [`ChatResponse::service_tier`] for why it is not serialized.
     #[serde(skip)]
     pub service_tier: Option<ServiceTier>,
+}
+
+impl ChatChunk {
+    /// Take `fallback` as the tier when this chunk's body reported none.
+    pub fn with_fallback_service_tier(mut self, fallback: &Option<ServiceTier>) -> Self {
+        if self.service_tier.is_none() {
+            self.service_tier.clone_from(fallback);
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

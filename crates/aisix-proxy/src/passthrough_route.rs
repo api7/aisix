@@ -1037,6 +1037,7 @@ async fn dispatch(
         attempt_started,
         status: status.as_u16(),
         usage: None,
+        service_tier: None,
         requested_model,
         metering,
         upstream_ttft_ms: 0,
@@ -1224,9 +1225,11 @@ async fn dispatch(
         }
     }
 
-    if let Some(u) = response_usage(metering, &resp_body) {
+    let (usage, tier) = response_usage_and_tier(metering, &resp_body);
+    if let Some(u) = usage {
         merge_usage(&mut telemetry.usage, u);
     }
+    telemetry.service_tier = tier;
     if telemetry.content_cap.is_some() && !bypass_uninspectable_output {
         telemetry.response_text = response_capture_text(protocol, &resp_body);
     }
@@ -3591,14 +3594,46 @@ fn openai_chat_usage(usage: &serde_json::Value) -> Option<PassthroughUsage> {
 /// carries when it names one (so an Anthropic reply is metered as one
 /// whichever request hint reached it), the request's otherwise. A report
 /// that parser cannot read records no usage, as on the typed endpoint.
+#[cfg(test)]
 fn response_usage(metering: Metering, body: &[u8]) -> Option<PassthroughUsage> {
+    response_usage_and_tier(metering, body).0
+}
+
+/// [`response_usage`], plus the service tier the response reports it was
+/// served on, read under the same protocol's rule as the typed endpoint.
+fn response_usage_and_tier(
+    metering: Metering,
+    body: &[u8],
+) -> (Option<PassthroughUsage>, Option<String>) {
     if metering == Metering::Opaque {
-        return None;
+        return (None, None);
     }
-    let v = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return (None, None);
+    };
+    let wire = response_metering(body, &v).unwrap_or(metering);
+    let tier = match wire {
+        Metering::Chat | Metering::Responses => v
+            .get("service_tier")
+            .and_then(|t| t.as_str())
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned),
+        Metering::Anthropic => v
+            .get("usage")
+            .and_then(aisix_gateway::chat::anthropic_usage_service_tier),
+        _ => None,
+    };
+    (buffered_usage(metering, wire, &v), tier)
+}
+
+fn buffered_usage(
+    metering: Metering,
+    wire: Metering,
+    v: &serde_json::Value,
+) -> Option<PassthroughUsage> {
     match metering {
         Metering::Rerank => {
-            return crate::rerank::rerank_prompt_tokens(&v).map(|prompt_tokens| PassthroughUsage {
+            return crate::rerank::rerank_prompt_tokens(v).map(|prompt_tokens| PassthroughUsage {
                 prompt_tokens,
                 ..PassthroughUsage::default()
             })
@@ -3606,14 +3641,13 @@ fn response_usage(metering: Metering, body: &[u8]) -> Option<PassthroughUsage> {
         Metering::DashscopeNative => return dashscope_native_usage(v.get("usage")?, false),
         _ => {}
     }
-    let wire = response_metering(body, &v).unwrap_or(metering);
     let stats = match wire {
         Metering::Chat => return v.get("usage").and_then(openai_chat_usage),
-        Metering::Anthropic => crate::messages::anthropic_usage_stats(&v),
-        Metering::Completions => crate::completions::completion_usage_stats(&v),
-        Metering::Responses => crate::responses::response_usage_stats(&v),
-        Metering::Embeddings => crate::embeddings::embedding_usage_stats(&v),
-        Metering::Images => crate::images::image_usage_stats(&v),
+        Metering::Anthropic => crate::messages::anthropic_usage_stats(v),
+        Metering::Completions => crate::completions::completion_usage_stats(v),
+        Metering::Responses => crate::responses::response_usage_stats(v),
+        Metering::Embeddings => crate::embeddings::embedding_usage_stats(v),
+        Metering::Images => crate::images::image_usage_stats(v),
         Metering::Opaque | Metering::Rerank | Metering::DashscopeNative => None,
     };
     stats.as_ref().map(PassthroughUsage::from_stats)
@@ -5580,11 +5614,30 @@ fn stream_guardrail_scan_text(
 /// server's own label is the evidence — a payload that merely happens to
 /// carry token-shaped fields must never mint billed tokens. Frames
 /// accumulate field-wise ([`PassthroughUsage::merge`]) at the call site.
+#[cfg(test)]
 fn frame_parts(
     protocol: PassthroughProtocol,
     metering: Metering,
     frame: &[u8],
 ) -> (crate::held_content::Parts, Option<PassthroughUsage>) {
+    let (parts, usage, _) = frame_parts_and_tier(protocol, metering, frame);
+    (parts, usage)
+}
+
+/// [`frame_parts`], plus the service tier the frame reports, read by the
+/// same protocol's rule as the typed streaming endpoint: an OpenAI chunk's
+/// top-level `service_tier`, an Anthropic `message_start` / `message_delta`
+/// usage, a terminal Responses snapshot.
+fn frame_parts_and_tier(
+    protocol: PassthroughProtocol,
+    metering: Metering,
+    frame: &[u8],
+) -> (
+    crate::held_content::Parts,
+    Option<PassthroughUsage>,
+    Option<String>,
+) {
+    let mut tier = None;
     let usage_labelled =
         matches!(protocol, PassthroughProtocol::Raw) && is_usage_labelled_frame(frame);
     let mut parts = crate::held_content::Parts::default();
@@ -5657,6 +5710,23 @@ fn frame_parts(
         // hint that reached an Anthropic upstream still meters it as one.
         // The surfaces with no streaming parser on their typed endpoint
         // (embeddings, images, rerank) record no streamed usage.
+        tier = match metering {
+            Metering::Chat | Metering::Anthropic => match v.get("type").and_then(|t| t.as_str()) {
+                Some("message_start") => v
+                    .pointer("/message/usage")
+                    .and_then(aisix_gateway::chat::anthropic_usage_service_tier),
+                Some("message_delta") => v
+                    .get("usage")
+                    .and_then(aisix_gateway::chat::anthropic_usage_service_tier),
+                _ => v
+                    .get("service_tier")
+                    .and_then(|t| t.as_str())
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_owned),
+            },
+            Metering::Responses => crate::responses::terminal_response_service_tier(&v),
+            _ => None,
+        };
         let report = match metering {
             Metering::Chat | Metering::Anthropic => {
                 match crate::messages::anthropic_stream_usage_stats(&v) {
@@ -5696,7 +5766,7 @@ fn frame_parts(
             PassthroughProtocol::OpenaiResponses => crate::held_content::responses_event_parts(&v),
         };
     }
-    (parts, usage)
+    (parts, usage, tier)
 }
 
 /// The text persisted for a streamed response. Raw passthrough capture keeps
@@ -6028,7 +6098,11 @@ fn stream_response(
                 if let Some(err) = frame_in_band_error(protocol, &frame) {
                     telemetry.record_failure(&err);
                 }
-                let (parts, usage) = frame_parts(protocol, telemetry.metering, &frame);
+                let (parts, usage, tier) =
+                    frame_parts_and_tier(protocol, telemetry.metering, &frame);
+                if tier.is_some() {
+                    telemetry.service_tier = tier;
+                }
                 let held = if matches!(protocol, PassthroughProtocol::OpenaiResponses)
                     && policy.hold_cap().is_some()
                     && !fail_opened
@@ -6384,7 +6458,11 @@ fn stream_response(
                 if anthropic.is_none() && is_messages_family(protocol) {
                     anthropic = anthropic_stream_frame(&rest);
                 }
-                let (parts, usage) = frame_parts(protocol, telemetry.metering, &rest);
+                let (parts, usage, tier) =
+                    frame_parts_and_tier(protocol, telemetry.metering, &rest);
+                if tier.is_some() {
+                    telemetry.service_tier = tier;
+                }
                 let held = if matches!(protocol, PassthroughProtocol::OpenaiResponses)
                     && policy.hold_cap().is_some()
                     && !fail_opened
@@ -6773,6 +6851,9 @@ struct RouteTelemetry {
     /// Every token dimension the exchange reported, accumulated field-wise
     /// across the response (buffered) or its frames (streamed).
     usage: Option<PassthroughUsage>,
+    /// The tier the upstream reported serving on, by the metered protocol's
+    /// rule; the last one reported on a stream.
+    service_tier: Option<String>,
     /// The model alias the caller addressed, read from a DETECTED
     /// envelope's own `model` field — the same value the typed endpoint
     /// serving that envelope records. Empty for an opaque body, whose
@@ -7035,6 +7116,7 @@ impl RouteTelemetry {
             total_tokens: usage.upstream_total_tokens.unwrap_or(0),
             cache_creation_tokens: usage.cache_creation_tokens,
             cache_read_tokens: usage.cache_read_tokens,
+            service_tier: self.service_tier.clone(),
             upstream_latency_ms: self
                 .attempt_started
                 .elapsed()
@@ -7939,6 +8021,114 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
 
 "#;
         assert!(frame_in_band_error(PassthroughProtocol::OpenaiChat, delta).is_none());
+    }
+
+    /// A passthrough route records the served tier under the metered
+    /// protocol's rule, buffered and streamed alike.
+    #[test]
+    fn passthrough_reads_the_served_tier_per_protocol() {
+        let tier = |m: Metering, body: serde_json::Value| {
+            response_usage_and_tier(m, body.to_string().as_bytes()).1
+        };
+        assert_eq!(
+            tier(
+                Metering::Chat,
+                serde_json::json!({
+                    "object": "chat.completion", "choices": [], "service_tier": "priority",
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                })
+            )
+            .as_deref(),
+            Some("priority")
+        );
+        assert_eq!(
+            tier(
+                Metering::Anthropic,
+                serde_json::json!({
+                    "type": "message", "role": "assistant", "content": [],
+                    "usage": {"input_tokens": 1, "output_tokens": 1,
+                              "service_tier": "standard", "speed": "fast"}
+                })
+            )
+            .as_deref(),
+            Some("fast")
+        );
+        assert_eq!(
+            tier(
+                Metering::Responses,
+                serde_json::json!({
+                    "object": "response", "output": [], "service_tier": "flex",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })
+            )
+            .as_deref(),
+            Some("flex")
+        );
+        assert_eq!(
+            tier(
+                Metering::Chat,
+                serde_json::json!({
+                    "object": "chat.completion", "choices": [],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                })
+            ),
+            None
+        );
+        assert_eq!(
+            tier(Metering::Opaque, serde_json::json!({"service_tier": "x"})),
+            None
+        );
+
+        let frame_tier = |p: PassthroughProtocol, m: Metering, payload: serde_json::Value| {
+            frame_parts_and_tier(p, m, format!("data: {payload}\n\n").as_bytes()).2
+        };
+        let chat = PassthroughProtocol::OpenaiChat;
+        assert_eq!(
+            frame_tier(
+                chat,
+                Metering::Chat,
+                serde_json::json!({
+                    "choices": [{"delta": {"content": "hi"}}], "service_tier": "scale"
+                })
+            )
+            .as_deref(),
+            Some("scale")
+        );
+        assert_eq!(
+            frame_tier(
+                chat,
+                Metering::Anthropic,
+                serde_json::json!({
+                    "type": "message_start",
+                    "message": {"usage": {"input_tokens": 1, "service_tier": "priority"}}
+                })
+            )
+            .as_deref(),
+            Some("priority")
+        );
+        let responses = PassthroughProtocol::OpenaiResponses;
+        // Only the terminal snapshot names the served tier.
+        assert_eq!(
+            frame_tier(
+                responses,
+                Metering::Responses,
+                serde_json::json!({
+                    "type": "response.created", "response": {"service_tier": "auto"}
+                })
+            ),
+            None
+        );
+        assert_eq!(
+            frame_tier(
+                responses,
+                Metering::Responses,
+                serde_json::json!({
+                    "type": "response.completed", "response": {"service_tier": "flex"}
+                })
+            )
+            .as_deref(),
+            Some("flex")
+        );
     }
 
     #[test]

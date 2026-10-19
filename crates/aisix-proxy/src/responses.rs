@@ -3035,7 +3035,7 @@ fn response_service_tier(response: &Value) -> Option<String> {
 /// not it carries usage. Only a terminal snapshot is read: the earlier ones
 /// (`response.created`, `response.in_progress`) can still name the tier the
 /// request asked for, such as `auto`.
-fn terminal_response_service_tier(event: &Value) -> Option<String> {
+pub(crate) fn terminal_response_service_tier(event: &Value) -> Option<String> {
     matches!(
         event.get("type").and_then(Value::as_str),
         Some("response.completed" | "response.incomplete" | "response.failed")

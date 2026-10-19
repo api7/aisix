@@ -1879,6 +1879,34 @@ async fn forward_simple(
 /// while the original is still within usage retention. A UUID rather than a
 /// readable id keeps a synthesized batch row distinguishable from a
 /// caller-supplied request id.
+/// The service tier of one aggregated batch row: known only while every
+/// line folded into the row reports the same non-empty tier.
+#[derive(Default)]
+enum TierAgreement {
+    #[default]
+    NoLines,
+    Agreed(String),
+    Mixed,
+}
+
+impl TierAgreement {
+    fn observe(&mut self, line_tier: Option<&str>) {
+        let line_tier = line_tier.filter(|t| !t.is_empty());
+        *self = match (std::mem::take(self), line_tier) {
+            (Self::NoLines, Some(t)) => Self::Agreed(t.to_owned()),
+            (Self::Agreed(prev), Some(t)) if prev == t => Self::Agreed(prev),
+            _ => Self::Mixed,
+        };
+    }
+
+    fn agreed(&self) -> Option<&str> {
+        match self {
+            Self::Agreed(t) => Some(t),
+            Self::NoLines | Self::Mixed => None,
+        }
+    }
+}
+
 fn batch_attribution_request_id(raw_batch_id: &str, idx: usize, multi: bool) -> String {
     let name = if multi {
         format!("aisix:batch:{raw_batch_id}:{idx}")
@@ -2044,6 +2072,7 @@ async fn attribute_batch_usage(
         cached: u64,
         modality: aisix_gateway::ModalityTokens,
         lines: u64,
+        service_tier: TierAgreement,
     }
     let mut per_model: std::collections::BTreeMap<String, Agg> = Default::default();
     for line in body.split(|b| *b == b'\n') {
@@ -2075,6 +2104,7 @@ async fn attribute_batch_usage(
                     usage.get("completion_tokens_details"),
                 ));
         agg.lines += 1;
+        agg.service_tier.observe(resp_body["service_tier"].as_str());
     }
 
     if per_model.is_empty() {
@@ -2109,6 +2139,13 @@ async fn attribute_batch_usage(
             modality_tokens: agg.modality,
             status_code: 200,
             provider_model_version: provider_model.clone(),
+            // This path bypasses the emission chokepoint, so the bound it
+            // applies is applied here.
+            service_tier: agg
+                .service_tier
+                .agreed()
+                .map(|t| crate::chat::sanitize_tag(t.to_owned()))
+                .filter(|t| !t.is_empty()),
             cost_usd: cost
                 .map(|c| c.calculate(agg.prompt, agg.completion))
                 .unwrap_or(0.0),
@@ -2249,6 +2286,23 @@ mod tests {
     }
 
     // ---- id codec ----
+
+    #[test]
+    fn a_batch_row_has_a_tier_only_when_every_line_agrees() {
+        let fold = |lines: &[Option<&str>]| {
+            let mut t = TierAgreement::default();
+            for l in lines {
+                t.observe(*l);
+            }
+            t.agreed().map(str::to_owned)
+        };
+        assert_eq!(fold(&[Some("flex"), Some("flex")]).as_deref(), Some("flex"));
+        assert_eq!(fold(&[Some("flex"), Some("default")]), None);
+        assert_eq!(fold(&[Some("flex"), None]), None);
+        assert_eq!(fold(&[None, Some("flex")]), None);
+        assert_eq!(fold(&[Some("")]), None);
+        assert_eq!(fold(&[]), None);
+    }
 
     #[test]
     fn batch_attribution_request_id_is_a_stable_uuid() {
@@ -2536,6 +2590,7 @@ mod tests {
             "custom_id": "r1",
             "response": {"status_code": 200, "body": {
                 "model": "gpt-4o-2024-08-06",
+                "service_tier": "default",
                 "usage": {"prompt_tokens": 10, "completion_tokens": 5,
                            "prompt_tokens_details": {"cached_tokens": 2}}
             }}
@@ -2545,6 +2600,7 @@ mod tests {
             "custom_id": "r2",
             "response": {"status_code": 200, "body": {
                 "model": "gpt-4o-2024-08-06",
+                "service_tier": "default",
                 "usage": {"prompt_tokens": 7, "completion_tokens": 3}
             }}
         });
@@ -2615,6 +2671,8 @@ mod tests {
         assert_eq!(agg.completion_tokens, 8);
         assert_eq!(agg.cached_prompt_tokens, 2);
         assert_eq!(agg.provider_model_version, "gpt-4o-2024-08-06");
+        // Every line of the row reported the same tier.
+        assert_eq!(agg.service_tier.as_deref(), Some("default"));
         assert_eq!(agg.requested_model, "jobs-a");
 
         // Every later retrieve: management event only — this process

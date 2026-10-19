@@ -23,6 +23,8 @@ import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 // - Anthropic `/v1/messages`: `usage.speed` when it is not "standard",
 //   otherwise `usage.service_tier`.
 // - An upstream that reports nothing leaves the field absent.
+// - A configured passthrough route records it under the same rule for the
+//   protocol it meters, buffered and streamed.
 //
 // And the client-visible bodies report the served tier, not the requested
 // one: a chat completion carries the OpenAI-shape upstream's own
@@ -53,6 +55,8 @@ const MSG_STREAM = "tier-messages-stream";
 const BRIDGE = "tier-bridge";
 const BRIDGE_NONE = "tier-bridge-none";
 const BRIDGE_STREAM = "tier-bridge-stream";
+const ROUTE_CHAT = "tier-route-chat";
+const ROUTE_MSG_STREAM = "tier-route-messages-stream";
 
 function chatBody(tier?: string): Record<string, unknown> {
   return {
@@ -235,8 +239,27 @@ describe("usage events record the service tier the upstream served on", () => {
     await model(BRIDGE_NONE, "deepseek", { nonStreamBody: chatBody() });
     await model(BRIDGE_STREAM, "deepseek", { streamEvents: chatStream("scale") });
 
+    const routePk = await seed.createProviderKey({
+      display_name: "tier-route-pk",
+      secret: "sk-mock",
+      api_base: "http://unused-on-routes",
+    });
+    for (const [route, opts] of [
+      [ROUTE_CHAT, { nonStreamBody: chatBody("priority") }],
+      [ROUTE_MSG_STREAM, { rawStreamFrames: ANTHROPIC_STREAM }],
+    ] as const) {
+      const upstream = await startOpenAiUpstream(opts);
+      upstreams.push(upstream);
+      await seed.createPassthroughRoute({
+        name: route,
+        path_prefix: `/${route}`,
+        target_url: upstream.baseUrl,
+        provider_key_id: routePk.id,
+      });
+    }
+
     // Seeded last: its authenticating implies every row above is loaded.
-    await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"] });
+    await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"], allowed_routes: ["*"] });
     await waitConfigPropagation(async () => {
       const res = await fetch(`${app!.proxyUrl}/v1/models`, {
         headers: { authorization: `Bearer ${CALLER}` },
@@ -389,5 +412,22 @@ describe("usage events record the service tier the upstream served on", () => {
     expect(responses.length).toBeGreaterThan(0);
     for (const r of responses) expect(r.service_tier).toBe("scale");
     expect((await usageRow(BRIDGE_STREAM)).get("service_tier")).toBe("scale");
+  });
+
+  test("a passthrough route records the tier of the protocol it meters", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const routeRow = (route: string) =>
+      waitForSlsLog(sls!, LOGSTORE, (l) => l.get("passthrough_route_name") === route, `usage row for ${route}`, 15_000);
+
+    await call(`/${ROUTE_CHAT}/v1/chat/completions`, chatRequest("gpt-4o-mini"));
+    expect((await routeRow(ROUTE_CHAT)).get("service_tier")).toBe("priority");
+
+    await call(`/${ROUTE_MSG_STREAM}/v1/messages`, {
+      model: "claude-3-5-haiku-20241022",
+      max_tokens: 16,
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect((await routeRow(ROUTE_MSG_STREAM)).get("service_tier")).toBe("fast");
   });
 });
