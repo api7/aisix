@@ -82,7 +82,7 @@ use aisix_provider_openai::wire::{
 // targeted keys are absent, so they are safe to call uniformly across the
 // five publisher rails (the Gemini `contents` shape simply does not match the
 // OpenAI-style top-level keys the request transforms look for).
-use aisix_gateway::{apply_request_headers, UpstreamHeaderContext};
+use aisix_gateway::{apply_request_headers, ServiceTier, UpstreamHeaderContext};
 use aisix_provider_openai::overrides::{
     apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
     apply_param_renames,
@@ -950,11 +950,13 @@ impl VertexBridge {
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
+            let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
             let parsed: GeminiGenerateContentResponse = resp
                 .json()
                 .await
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            Ok(gemini_response_into_chat_response(parsed, upstream_id))
+            Ok(gemini_response_into_chat_response(parsed, upstream_id)
+                .with_fallback_service_tier(header_tier))
         })
         .await
     }
@@ -1316,11 +1318,12 @@ impl VertexBridge {
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
+            let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
             let parsed: OpenAiResponse = resp
                 .json()
                 .await
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            Ok(openai_response_into_chat_response(parsed))
+            Ok(openai_response_into_chat_response(parsed).with_fallback_service_tier(header_tier))
         })
         .await
     }
@@ -1388,6 +1391,7 @@ impl VertexBridge {
             return Err(map_http_error(status, resp).await);
         }
 
+        let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
         let byte_stream = resp.bytes_stream();
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
@@ -1403,7 +1407,8 @@ impl VertexBridge {
                                 &data,
                                 "vertex openai-shim stream chunk parse",
                             )?;
-                            yield openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer);
+                            yield openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer)
+                    .with_fallback_service_tier(&header_tier);
                         }
                         // OpenAI shim terminates with `data: [DONE]`;
                         // stop emitting on the sentinel.
@@ -1421,7 +1426,8 @@ impl VertexBridge {
                     &data,
                     "vertex openai-shim stream tail parse",
                 )?;
-                yield openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer);
+                yield openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer)
+                    .with_fallback_service_tier(&header_tier);
             }
         };
 
@@ -1537,11 +1543,12 @@ impl VertexBridge {
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
+            let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
             let parsed: OpenAiResponse = resp
                 .json()
                 .await
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            Ok(openai_response_into_chat_response(parsed))
+            Ok(openai_response_into_chat_response(parsed).with_fallback_service_tier(header_tier))
         })
         .await
     }
@@ -1625,6 +1632,7 @@ impl VertexBridge {
             return Err(map_http_error(status, resp).await);
         }
 
+        let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
         let byte_stream = resp.bytes_stream();
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
@@ -1640,7 +1648,8 @@ impl VertexBridge {
                                 &data,
                                 "vertex partner :streamRawPredict chunk parse",
                             )?;
-                            yield openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer);
+                            yield openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer)
+                    .with_fallback_service_tier(&header_tier);
                         }
                         // OpenAI-compatible upstreams (Mistral / AI21)
                         // terminate with `data: [DONE]`; stop on the sentinel.
@@ -1656,7 +1665,8 @@ impl VertexBridge {
                     &data,
                     "vertex partner :streamRawPredict tail parse",
                 )?;
-                yield openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer);
+                yield openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer)
+                    .with_fallback_service_tier(&header_tier);
             }
         };
 
@@ -1750,6 +1760,7 @@ impl VertexBridge {
         }
 
         let upstream_id_owned = upstream_id.to_string();
+        let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
         let byte_stream = resp.bytes_stream();
 
         // try_stream! adapts the byte stream into a Stream of
@@ -1758,7 +1769,11 @@ impl VertexBridge {
         // `aisix-provider-openai::build_chunk_stream`.
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
-            let mut state = GeminiStreamState::default();
+            // The header is the fallback; a body tier replaces it.
+            let mut state = GeminiStreamState {
+                service_tier: header_tier,
+                ..Default::default()
+            };
             let mut byte_stream = Box::pin(byte_stream);
 
             while let Some(item) = byte_stream.next().await {
@@ -1812,6 +1827,8 @@ struct GeminiStreamState {
     emitted_role: bool,
     /// Tool calls emitted so far — the next call's `index`.
     tool_calls: usize,
+    /// The last tier the stream reported, stamped on every chunk.
+    service_tier: Option<ServiceTier>,
 }
 
 /// Translate one Gemini stream chunk into the gateway's
@@ -1866,6 +1883,13 @@ fn gemini_chunk_into_chat_chunks(
     // only on the last; the earlier ones carry `trafficType` alone. Such a
     // frame is not a usage report: read as one, its missing
     // `totalTokenCount` would make the whole stream's total unreported.
+    if let Some(tier) = raw
+        .usage_metadata
+        .as_ref()
+        .and_then(GeminiUsageMetadata::service_tier)
+    {
+        state.service_tier = Some(tier);
+    }
     let usage = raw
         .usage_metadata
         .filter(GeminiUsageMetadata::reports_counts)
@@ -1885,6 +1909,7 @@ fn gemini_chunk_into_chat_chunks(
             },
             finish_reason: None,
             usage: None,
+            service_tier: state.service_tier.clone(),
         });
     }
 
@@ -1911,6 +1936,7 @@ fn gemini_chunk_into_chat_chunks(
             },
             finish_reason,
             usage,
+            service_tier: state.service_tier.clone(),
         });
     }
 
@@ -2455,9 +2481,21 @@ struct GeminiUsageMetadata {
     prompt_tokens_details: Option<serde_json::Value>,
     #[serde(default, rename = "candidatesTokensDetails")]
     candidates_tokens_details: Option<serde_json::Value>,
+    /// The tier that served the request. Raw, so an unexpected type cannot
+    /// fail the decode.
+    #[serde(default, rename = "serviceTier")]
+    service_tier: Option<serde_json::Value>,
 }
 
 impl GeminiUsageMetadata {
+    fn service_tier(&self) -> Option<ServiceTier> {
+        aisix_gateway::chat::gemini_usage_service_tier(
+            self.service_tier
+                .as_ref()
+                .and_then(serde_json::Value::as_str),
+        )
+    }
+
     fn reports_counts(&self) -> bool {
         self.prompt_token_count > 0
             || self.candidates_token_count > 0
@@ -2560,6 +2598,10 @@ fn gemini_response_into_chat_response(
         }
         None => (ChatMessage::assistant(""), FinishReason::Stop),
     };
+    let service_tier = raw
+        .usage_metadata
+        .as_ref()
+        .and_then(GeminiUsageMetadata::service_tier);
     let usage = raw
         .usage_metadata
         .map(GeminiUsageMetadata::into_usage_stats)
@@ -2570,6 +2612,7 @@ fn gemini_response_into_chat_response(
         message,
         finish_reason: finish,
         usage,
+        service_tier,
     }
 }
 
@@ -6551,6 +6594,48 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             body["toolConfig"],
             serde_json::json!({"functionCallingConfig": {"mode": "ANY"}})
         );
+    }
+
+    #[test]
+    fn gemini_usage_metadata_reports_the_served_tier() {
+        let tier = |t: serde_json::Value| {
+            gemini_response_into_chat_response(
+                function_call_response(serde_json::json!({
+                    "candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]},
+                                    "finishReason": "STOP"}],
+                    "usageMetadata": {"promptTokenCount": 1, "serviceTier": t}
+                })),
+                "gemini-2.5-flash",
+            )
+            .service_tier
+        };
+        assert_eq!(
+            tier("priority".into()),
+            Some(ServiceTier::Native("priority".into()))
+        );
+        assert_eq!(tier("unspecified".into()), None);
+        assert_eq!(tier("SERVICE_TIER_UNSPECIFIED".into()), None);
+        assert_eq!(tier("".into()), None);
+        assert_eq!(tier(3.into()), None);
+
+        // Streamed: a frame carrying only the tier still sets it, and every
+        // chunk after carries it.
+        let mut state = GeminiStreamState {
+            service_tier: Some(ServiceTier::Native("standard".into())),
+            ..Default::default()
+        };
+        let chunks = gemini_chunk_into_chat_chunks(
+            function_call_response(serde_json::json!({
+                "candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]}}],
+                "usageMetadata": {"serviceTier": "flex"}
+            })),
+            "gemini-2.5-flash",
+            &mut state,
+        );
+        assert!(!chunks.is_empty());
+        for c in &chunks {
+            assert_eq!(c.service_tier, Some(ServiceTier::Native("flex".into())));
+        }
     }
 
     fn function_call_response(json: serde_json::Value) -> GeminiGenerateContentResponse {

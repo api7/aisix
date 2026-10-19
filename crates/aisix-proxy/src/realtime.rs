@@ -1229,6 +1229,7 @@ async fn guardrail_block_event(
             message: aisix_gateway::ChatMessage::assistant(text.to_string()),
             finish_reason: aisix_gateway::FinishReason::Stop,
             usage: aisix_gateway::UsageStats::default(),
+            service_tier: None,
         };
         aisix_guardrails::Guardrail::check_output_unmaskable_observed(chain, &synth).await
     };

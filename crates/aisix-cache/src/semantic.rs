@@ -180,10 +180,12 @@ impl SemanticCacheStore for MemorySemanticCache {
         scope_fp: &str,
         exact_key: &str,
         embedding: Vec<f32>,
-        response: ChatResponse,
+        mut response: ChatResponse,
         ttl: Duration,
         max_entries: u32,
     ) -> Result<(), CacheError> {
+        // Same as a serialized entry: a hit was served by no upstream.
+        response.service_tier = None;
         let now = Instant::now();
         // Opportunistic reclamation of OTHER policies' storage: a policy
         // that was deleted (or just went idle) never runs its own store
@@ -254,6 +256,7 @@ mod tests {
             message: ChatMessage::assistant(text),
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(2, 3),
+            service_tier: None,
         }
     }
 

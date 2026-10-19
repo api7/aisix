@@ -540,12 +540,13 @@ impl Bridge for OpenAiBridge {
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
+            let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
 
             let parsed: OpenAiResponse = resp
                 .json()
                 .await
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            Ok(response_into_chat_response(parsed))
+            Ok(response_into_chat_response(parsed).with_fallback_service_tier(header_tier))
         })
         .await
     }
@@ -803,6 +804,7 @@ impl Bridge for OpenAiBridge {
         let bridge_name = "openai";
         let request_id_for_log = ctx.request_id.clone();
 
+        let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
         let byte_stream = resp.bytes_stream();
         let stream = build_chunk_stream(
             byte_stream,
@@ -810,6 +812,7 @@ impl Bridge for OpenAiBridge {
             done_marker_policy,
             bridge_name,
             request_id_for_log,
+            header_tier,
         );
         Ok(Box::pin(stream))
     }
@@ -821,6 +824,7 @@ fn build_chunk_stream<S>(
     done_marker_policy: Option<StreamDoneMarker>,
     bridge_name: &'static str,
     request_id: String,
+    header_tier: Option<aisix_gateway::ServiceTier>,
 ) -> impl futures::Stream<Item = Result<ChatChunk, BridgeError>> + Send
 where
     S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
@@ -840,7 +844,8 @@ where
                     }
                     SseEvent::Data(payload) => {
                         let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                        yield stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer);
+                        yield stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer)
+                    .with_fallback_service_tier(&header_tier);
                     }
                 }
             }
@@ -858,7 +863,8 @@ where
             }
             Some(SseEvent::Data(payload)) => {
                 let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                yield stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer);
+                yield stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer)
+                    .with_fallback_service_tier(&header_tier);
             }
             None => {}
         }
@@ -1437,6 +1443,72 @@ mod tests {
         assert!(matches!(err, BridgeError::InvalidUpstreamCredentials(_)));
         assert_eq!(err.http_status(), 401);
         assert_eq!(err.error_type(), "authentication_error");
+    }
+
+    /// Gemini names its serving tier in a response header; the body's own
+    /// `service_tier` wins, and the header is the fallback.
+    #[tokio::test]
+    async fn the_gemini_tier_header_is_the_fallback_for_a_body_without_one() {
+        use aisix_gateway::ServiceTier;
+        let body = |tier: Option<&str>| {
+            let mut b = serde_json::json!({
+                "id": "c", "model": "gemini-2.5-flash",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"},
+                             "finish_reason": "stop"}]
+            });
+            if let Some(t) = tier {
+                b["service_tier"] = t.into();
+            }
+            b
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-gemini-service-tier", "priority")
+                    .set_body_json(body(None)),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-gemini-service-tier", "standard")
+                    .set_body_json(body(Some("flex"))),
+            )
+            .mount(&server)
+            .await;
+        let bridge = OpenAiBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        assert_eq!(
+            bridge.chat(&req(), &ctx).await.unwrap().service_tier,
+            Some(ServiceTier::Native("priority".into()))
+        );
+        assert_eq!(
+            bridge.chat(&req(), &ctx).await.unwrap().service_tier,
+            Some(ServiceTier::OpenAi("flex".into()))
+        );
+
+        let stream_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .insert_header("x-gemini-service-tier", "flex")
+                    .set_body_string(
+                        "data: {\"id\":\"s\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+                    ),
+            )
+            .mount(&stream_server)
+            .await;
+        let ctx = sample_ctx(&stream_server.uri());
+        let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
+        let chunk = stream.next().await.unwrap().unwrap();
+        assert_eq!(chunk.service_tier, Some(ServiceTier::Native("flex".into())));
     }
 
     #[tokio::test]

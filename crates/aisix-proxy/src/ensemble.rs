@@ -248,6 +248,8 @@ pub struct PanelOutcome {
     /// request-level metrics. Local estimates never replace `usage` above.
     pub effective_usage: UsageStats,
     pub usage_estimated: bool,
+    /// The tier the member's upstream reported it served on.
+    pub service_tier: Option<String>,
 }
 
 impl PanelOutcome {
@@ -257,8 +259,13 @@ impl PanelOutcome {
             usage: outcome.response.usage.clone(),
             effective_usage: outcome.effective_usage.clone(),
             usage_estimated: outcome.usage_estimated,
+            service_tier: tier_value(&outcome.response),
         }
     }
+}
+
+pub(crate) fn tier_value(resp: &ChatResponse) -> Option<String> {
+    resp.service_tier.as_ref().map(|t| t.as_str().to_owned())
 }
 
 /// Everything the dispatch layer needs after an ensemble run: the judge's
@@ -416,6 +423,7 @@ pub(crate) async fn run_ensemble_panel(
                     usage: resp.usage.clone(),
                     effective_usage: outcome.effective_usage,
                     usage_estimated: outcome.usage_estimated,
+                    service_tier: tier_value(&resp),
                 });
                 candidates.push(resp);
             }
@@ -673,6 +681,7 @@ mod tests {
             message: ChatMessage::assistant(content),
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(10, 20),
+            service_tier: None,
         })
     }
 

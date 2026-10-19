@@ -38,6 +38,10 @@ pub struct ChatCompletion {
     pub model: String,
     pub choices: Vec<NonStreamChoice>,
     pub usage: Usage,
+    /// The upstream's own `service_tier`, passed through only from an
+    /// OpenAI-shape upstream and omitted when it sent none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,6 +181,9 @@ pub struct ChatCompletionChunk {
     pub choices: Vec<StreamChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// See [`ChatCompletion::service_tier`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -228,6 +235,7 @@ pub fn render_response(
             finish_reason: finish_to_str(&resp.finish_reason).to_string(),
         }],
         usage: Usage::from_stats(&resp.usage),
+        service_tier: openai_service_tier(resp.service_tier.as_ref()),
     }
 }
 
@@ -259,7 +267,12 @@ pub fn render_chunk(
                 .map(|f| finish_to_str(f).to_string()),
         }],
         usage: chunk.usage.as_ref().map(Usage::from_stats),
+        service_tier: openai_service_tier(chunk.service_tier.as_ref()),
     }
+}
+
+fn openai_service_tier(tier: Option<&aisix_gateway::ServiceTier>) -> Option<String> {
+    tier.and_then(|t| t.openai_value()).map(str::to_owned)
 }
 
 /// Inject the `x-ratelimit-*` response headers that OpenAI SDK clients
@@ -350,6 +363,7 @@ mod tests {
             message: ChatMessage::assistant("hello"),
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(3, 2),
+            service_tier: None,
         };
         let out = render_response(42, r, "m");
         let json = serde_json::to_value(&out).unwrap();
@@ -369,6 +383,47 @@ mod tests {
         );
         assert!(json["usage"].get("completion_tokens_details").is_none());
         assert!(json["usage"].get("prompt_cache_hit_tokens").is_none());
+    }
+
+    #[test]
+    fn service_tier_passes_through_only_from_an_openai_shape_upstream() {
+        use aisix_gateway::ServiceTier;
+        let resp = |tier| ChatResponse {
+            id: "c".into(),
+            model: "m".into(),
+            message: ChatMessage::assistant("hi"),
+            finish_reason: FinishReason::Stop,
+            usage: UsageStats::new(1, 1),
+            service_tier: tier,
+        };
+        let body = |tier| serde_json::to_value(render_response(0, resp(tier), "m")).unwrap();
+        assert_eq!(
+            body(Some(ServiceTier::OpenAi("priority".into())))["service_tier"],
+            "priority"
+        );
+        assert!(body(None).get("service_tier").is_none());
+        // Another protocol's vocabulary is never written into this body.
+        assert!(body(Some(ServiceTier::Native("standard".into())))
+            .get("service_tier")
+            .is_none());
+
+        let chunk = |tier| ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: Default::default(),
+            finish_reason: None,
+            usage: None,
+            service_tier: tier,
+        };
+        let frame = |tier| serde_json::to_value(render_chunk(0, chunk(tier), "m")).unwrap();
+        assert_eq!(
+            frame(Some(ServiceTier::OpenAi("flex".into())))["service_tier"],
+            "flex"
+        );
+        assert!(frame(None).get("service_tier").is_none());
+        assert!(frame(Some(ServiceTier::Native("fast".into())))
+            .get("service_tier")
+            .is_none());
     }
 
     /// #395: a tool_calls response carries `content: null` from the
@@ -399,6 +454,7 @@ mod tests {
             message,
             finish_reason: FinishReason::ToolCalls,
             usage: UsageStats::new(3, 2),
+            service_tier: None,
         };
         let out = render_response(0, r, "m");
 
@@ -439,6 +495,7 @@ mod tests {
             message: ChatMessage::assistant("hi"),
             finish_reason: FinishReason::Stop,
             usage,
+            service_tier: None,
         };
         let json = serde_json::to_value(render_response(0, r, "m")).unwrap();
         assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 800);
@@ -474,6 +531,7 @@ mod tests {
             message: ChatMessage::assistant("hi"),
             finish_reason: FinishReason::Stop,
             usage,
+            service_tier: None,
         };
         let json = serde_json::to_value(render_response(0, r, "ds-alias")).unwrap();
         // Normalized OpenAI-canonical shape
@@ -510,6 +568,7 @@ mod tests {
             },
             finish_reason: Some(FinishReason::Stop),
             usage: Some(usage),
+            service_tier: None,
         };
         let json = serde_json::to_value(render_chunk(0, chunk, "m")).unwrap();
         assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 32);
@@ -531,6 +590,7 @@ mod tests {
             message: ChatMessage::assistant("hi"),
             finish_reason: FinishReason::Stop,
             usage: UsageStats::default(),
+            service_tier: None,
         };
         let out = render_response(0, r, "failover-group-XXX");
         let json = serde_json::to_value(&out).unwrap();
@@ -553,6 +613,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         };
         let out = render_chunk(1, chunk, "m");
         let json = serde_json::to_value(&out).unwrap();
@@ -578,6 +639,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         };
         let out = render_chunk(0, chunk, "failover-group-XXX");
         let json = serde_json::to_value(&out).unwrap();
@@ -592,6 +654,7 @@ mod tests {
             message: ChatMessage::assistant(""),
             finish_reason: FinishReason::Other("weird".into()),
             usage: UsageStats::default(),
+            service_tier: None,
         };
         let out = render_response(0, r, "m");
         let json = serde_json::to_value(&out).unwrap();

@@ -2034,6 +2034,7 @@ mod tests {
             message: ChatMessage::assistant("leaking AKIAEXAMPLE"),
             finish_reason: aisix_gateway::FinishReason::Stop,
             usage: aisix_gateway::UsageStats::new(0, 0),
+            service_tier: None,
         };
         assert!(!chain.check_output(&resp).await.is_block());
     }
@@ -4458,6 +4459,7 @@ mod tests {
             message: ChatMessage::assistant("secret"),
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(0, 0),
+            service_tier: None,
         };
         assert!(!chain.check_output(&resp).await.is_block());
     }

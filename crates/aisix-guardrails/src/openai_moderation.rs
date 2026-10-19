@@ -615,6 +615,7 @@ mod tests {
             message: ChatMessage::assistant("model output"),
             finish_reason: aisix_gateway::FinishReason::Stop,
             usage: aisix_gateway::UsageStats::new(0, 0),
+            service_tier: None,
         };
         assert!(g.check_output(&resp).await.is_block());
     }

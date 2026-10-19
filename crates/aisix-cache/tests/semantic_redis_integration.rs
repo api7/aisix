@@ -47,6 +47,7 @@ fn resp(content: &str) -> ChatResponse {
         message: ChatMessage::assistant(content),
         finish_reason: FinishReason::Stop,
         usage: UsageStats::new(3, 5),
+        service_tier: None,
     }
 }
 

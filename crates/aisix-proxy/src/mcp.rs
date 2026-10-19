@@ -1351,6 +1351,7 @@ async fn apply_output_guardrails(
         message: aisix_gateway::ChatMessage::assistant(result_text),
         finish_reason: aisix_gateway::FinishReason::Stop,
         usage: aisix_gateway::UsageStats::new(0, 0),
+        service_tier: None,
     };
     // Segment-moderating members answer through the segment pass below,
     // the local kinds through the local pass right after.

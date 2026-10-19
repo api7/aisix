@@ -30,7 +30,7 @@ use aisix_gateway::structured_output::{
 };
 use aisix_gateway::{
     BridgeError, ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, FinishReason, Role,
-    UsageStats,
+    ServiceTier, UsageStats,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1367,6 +1367,22 @@ pub struct AnthropicResponse {
     pub usage: Option<AnthropicUsage>,
 }
 
+/// The tier an Anthropic usage object's raw `speed` / `service_tier`
+/// report. Both are kept as raw values so a non-string in either cannot fail
+/// the whole decode.
+fn usage_service_tier(
+    speed: &Option<serde_json::Value>,
+    service_tier: &Option<serde_json::Value>,
+) -> Option<ServiceTier> {
+    fn s(v: &Option<serde_json::Value>) -> Option<&str> {
+        v.as_ref().and_then(serde_json::Value::as_str)
+    }
+    ServiceTier::native(aisix_gateway::chat::anthropic_service_tier(
+        s(speed),
+        s(service_tier),
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum AnthropicResponseBlock {
@@ -1419,6 +1435,10 @@ pub struct AnthropicUsage {
     /// Tokens served from the prompt cache (0.10× input rate).
     #[serde(default)]
     pub cache_read_input_tokens: u32,
+    #[serde(default)]
+    pub speed: Option<serde_json::Value>,
+    #[serde(default)]
+    pub service_tier: Option<serde_json::Value>,
 }
 
 pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
@@ -1506,6 +1526,10 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
         );
     }
 
+    let service_tier = raw
+        .usage
+        .as_ref()
+        .and_then(|u| usage_service_tier(&u.speed, &u.service_tier));
     let usage = raw
         .usage
         .map(|u| {
@@ -1536,6 +1560,7 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
         },
         finish_reason: map_stop_reason(raw.stop_reason.as_deref()),
         usage,
+        service_tier,
     }
 }
 
@@ -1710,6 +1735,10 @@ pub struct AnthropicStreamStartUsage {
     pub cache_creation_input_tokens: Option<u32>,
     #[serde(default)]
     pub cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    pub speed: Option<serde_json::Value>,
+    #[serde(default)]
+    pub service_tier: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1753,6 +1782,10 @@ pub struct AnthropicStreamUsage {
     pub cache_creation_input_tokens: Option<u32>,
     #[serde(default)]
     pub cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    pub speed: Option<serde_json::Value>,
+    #[serde(default)]
+    pub service_tier: Option<serde_json::Value>,
 }
 
 /// Rolling state the Bridge carries across a stream so chunks can be
@@ -1770,6 +1803,9 @@ pub struct StreamState {
     /// onto the terminal usage so the bridge doesn't drop them (#906).
     pub cache_creation_tokens: u32,
     pub cache_read_tokens: u32,
+    /// The tier the last `message_start` / `message_delta` usage reported,
+    /// stamped on every chunk after it.
+    pub service_tier: Option<ServiceTier>,
     /// Index of the last thinking block that produced text, and whether the
     /// current delta opens a later one — whose text then starts on a new
     /// line, as the non-streaming path joins blocks with `"\n"`.
@@ -1812,6 +1848,13 @@ impl StreamState {
                     .as_ref()
                     .and_then(|u| u.cache_read_input_tokens)
                     .unwrap_or(0);
+                if let Some(tier) = message
+                    .usage
+                    .as_ref()
+                    .and_then(|u| usage_service_tier(&u.speed, &u.service_tier))
+                {
+                    self.service_tier = Some(tier);
+                }
             }
             AnthropicStreamEvent::ContentBlockDelta {
                 index,
@@ -1866,6 +1909,9 @@ impl StreamState {
                 if let Some(t) = usage.cache_read_input_tokens {
                     self.cache_read_tokens = self.cache_read_tokens.max(t);
                 }
+                if let Some(tier) = usage_service_tier(&usage.speed, &usage.service_tier) {
+                    self.service_tier = Some(tier);
+                }
             }
             _ => {}
         }
@@ -1888,6 +1934,7 @@ impl StreamState {
             },
             finish_reason: None,
             usage: None,
+            service_tier: self.service_tier.clone(),
         }
     }
 
@@ -1931,6 +1978,7 @@ impl StreamState {
                 },
                 finish_reason: None,
                 usage: None,
+                service_tier: self.service_tier.clone(),
             }),
             AnthropicStreamEvent::ContentBlockDelta {
                 delta: AnthropicStreamDelta::ThinkingDelta { thinking },
@@ -1950,6 +1998,7 @@ impl StreamState {
                 },
                 finish_reason: None,
                 usage: None,
+                service_tier: self.service_tier.clone(),
             }),
             AnthropicStreamEvent::MessageDelta { delta, usage } => {
                 let finish = delta
@@ -1975,6 +2024,7 @@ impl StreamState {
                     delta: ChatDelta::default(),
                     finish_reason: finish,
                     usage,
+                    service_tier: self.service_tier.clone(),
                 })
             }
             _ => None,
@@ -5044,6 +5094,71 @@ mod tests {
     }
 
     #[test]
+    fn served_tier_prefers_a_non_standard_speed_then_service_tier() {
+        let tier = |usage: serde_json::Value| {
+            let raw: AnthropicResponse = serde_json::from_value(serde_json::json!({
+                "id": "m", "model": "claude", "content": [], "usage": usage
+            }))
+            .unwrap();
+            response_into_chat_response(raw).service_tier
+        };
+        assert_eq!(
+            tier(serde_json::json!({"service_tier": "standard", "speed": "fast"})),
+            Some(ServiceTier::Native("fast".into()))
+        );
+        assert_eq!(
+            tier(serde_json::json!({"service_tier": "priority", "speed": "standard"})),
+            Some(ServiceTier::Native("priority".into()))
+        );
+        assert_eq!(
+            tier(serde_json::json!({"service_tier": "batch"})),
+            Some(ServiceTier::Native("batch".into()))
+        );
+        assert_eq!(tier(serde_json::json!({"input_tokens": 1})), None);
+        // A non-string is ignored, not a decode failure.
+        assert_eq!(tier(serde_json::json!({"service_tier": 1})), None);
+    }
+
+    #[test]
+    fn stream_state_stamps_the_last_reported_tier_on_every_chunk() {
+        let mut state = StreamState::default();
+        let start: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"message_start","message":{"id":"m","model":"claude","usage":{"input_tokens":1,"service_tier":"standard","speed":"fast"}}}"#,
+        )
+        .unwrap();
+        state.update(&start);
+        let delta: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+        )
+        .unwrap();
+        state.update(&delta);
+        assert_eq!(
+            state.to_chunk(&delta).unwrap().service_tier,
+            Some(ServiceTier::Native("fast".into()))
+        );
+        // A later usage that reports nothing keeps the earlier value; one
+        // that reports a tier replaces it.
+        let end: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
+        )
+        .unwrap();
+        state.update(&end);
+        assert_eq!(
+            state.to_chunk(&end).unwrap().service_tier,
+            Some(ServiceTier::Native("fast".into()))
+        );
+        let end: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3,"service_tier":"priority"}}"#,
+        )
+        .unwrap();
+        state.update(&end);
+        assert_eq!(
+            state.to_chunk(&end).unwrap().service_tier,
+            Some(ServiceTier::Native("priority".into()))
+        );
+    }
+
+    #[test]
     fn stream_state_emits_finish_on_message_delta() {
         let state = StreamState {
             id: "msg".into(),
@@ -5882,6 +5997,7 @@ mod tests {
             message: ChatMessage::assistant("hello"),
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(7, 3),
+            service_tier: None,
         };
         let json = chat_response_into_anthropic_json(&resp, "my-claude-alias");
         assert_eq!(json["id"], "cmpl-1");
@@ -5905,6 +6021,7 @@ mod tests {
                 message: ChatMessage::assistant(""),
                 finish_reason: fr,
                 usage: UsageStats::new(0, 0),
+                service_tier: None,
             };
             chat_response_into_anthropic_json(&resp, "m")["stop_reason"]
                 .as_str()
@@ -5938,6 +6055,7 @@ mod tests {
                 cached_prompt_tokens: 60_000,
                 ..UsageStats::default()
             },
+            service_tier: None,
         };
         let usage = &chat_response_into_anthropic_json(&resp, "tencent-minimax-m3")["usage"];
         assert_eq!(usage["input_tokens"], 8_274);
@@ -5967,6 +6085,7 @@ mod tests {
             message: ChatMessage::assistant("ok"),
             finish_reason: FinishReason::Stop,
             usage: UsageStats::with_cache(10, 4, 200, 800),
+            service_tier: None,
         };
         let usage = &chat_response_into_anthropic_json(&resp, "m")["usage"];
         assert_eq!(usage["input_tokens"], 10);
@@ -5982,6 +6101,7 @@ mod tests {
             message: ChatMessage::assistant("ok"),
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(7, 3),
+            service_tier: None,
         };
         let usage = &chat_response_into_anthropic_json(&resp, "m")["usage"];
         assert_eq!(usage["input_tokens"], 7);
@@ -6003,6 +6123,7 @@ mod tests {
                 cached_prompt_tokens: 900,
                 ..UsageStats::default()
             },
+            service_tier: None,
         };
         let usage = &chat_response_into_anthropic_json(&resp, "m")["usage"];
         assert_eq!(usage["input_tokens"], 0);
@@ -6031,6 +6152,7 @@ mod tests {
             message: msg,
             finish_reason: FinishReason::ToolCalls,
             usage: UsageStats::new(10, 5),
+            service_tier: None,
         };
         let json = chat_response_into_anthropic_json(&resp, "my-model");
         assert_eq!(json["stop_reason"], "tool_use");
@@ -6055,6 +6177,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         }
     }
 
@@ -6065,6 +6188,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::Stop),
             usage: Some(UsageStats::new(0, out_tokens)),
+            service_tier: None,
         }
     }
 
@@ -6131,6 +6255,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::Stop),
             usage: None,
+            service_tier: None,
         };
         let events = enc.next_events(&stop_no_usage);
         let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
@@ -6145,6 +6270,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: None,
             usage: Some(UsageStats::new(17, 23)),
+            service_tier: None,
         };
         let events = enc.next_events(&usage_only);
         let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
@@ -6232,6 +6358,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::Stop),
             usage: None,
+            service_tier: None,
         };
         let _ = enc.next_events(&stop_no_usage);
 
@@ -6247,6 +6374,7 @@ mod tests {
                 cached_prompt_tokens: 60_000,
                 ..UsageStats::default()
             }),
+            service_tier: None,
         };
         let events = enc.next_events(&usage_only);
         let usage = &events[0].data["usage"];
@@ -6266,6 +6394,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::Stop),
             usage: Some(UsageStats::with_cache(10, 4, 200, 800)),
+            service_tier: None,
         };
         let events = enc.next_events(&stop_with_usage);
         let delta = events
@@ -6287,6 +6416,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::Stop),
             usage: Some(UsageStats::new(17, 23)),
+            service_tier: None,
         });
         let delta = events
             .iter()
@@ -6312,6 +6442,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::ToolCalls),
             usage: None,
+            service_tier: None,
         };
         let _ = enc.next_events(&stop_no_usage);
         assert!(!enc.is_finished());
@@ -6401,6 +6532,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         }
     }
 
@@ -6411,6 +6543,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::ToolCalls),
             usage: Some(UsageStats::new(10, 5)),
+            service_tier: None,
         }
     }
 
@@ -6517,6 +6650,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         }
     }
 
@@ -6553,6 +6687,7 @@ mod tests {
             message: msg,
             finish_reason: FinishReason::ToolCalls,
             usage: UsageStats::new(1, 1),
+            service_tier: None,
         };
         let json = chat_response_into_anthropic_json(&resp, "m");
         let types: Vec<_> = json["content"]
@@ -6578,6 +6713,7 @@ mod tests {
             message: msg,
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(1, 1),
+            service_tier: None,
         };
         let json = chat_response_into_anthropic_json(&resp, "m");
         assert_eq!(

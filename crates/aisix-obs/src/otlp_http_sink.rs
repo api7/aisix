@@ -1267,6 +1267,11 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
             &event.requested_model_id,
         ));
     }
+    // The tier the upstream served on. `openai.request.service_tier`
+    // beside it is what the request asked for, which can differ.
+    if let Some(tier) = &event.service_tier {
+        attributes.push(attr_string("aisix.service_tier", tier));
+    }
     // Duration cost basis (#457): only the duration-billed audio models
     // carry it, so it stays off every other span.
     if event.audio_duration_seconds > 0.0 {
@@ -3180,6 +3185,20 @@ mod tests {
         let span = build_otlp_span(&SinkRecord::metadata_only(UsageEvent::default()), "x");
         assert!(attr(&span, "aisix.requested_model_id").is_none());
         assert!(attr(&span, "aisix.model_id").is_none());
+    }
+
+    #[test]
+    fn served_service_tier_is_its_own_attribute() {
+        let mut ev = sample_event();
+        ev.service_tier = Some("priority".into());
+        let span = build_otlp_span(&SinkRecord::metadata_only(ev), "x");
+        assert_eq!(
+            attr(&span, "aisix.service_tier").unwrap()["stringValue"],
+            "priority"
+        );
+
+        let span = build_otlp_span(&SinkRecord::metadata_only(sample_event()), "x");
+        assert!(attr(&span, "aisix.service_tier").is_none());
     }
 
     #[test]

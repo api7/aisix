@@ -999,6 +999,13 @@ pub(crate) fn emit_usage(
     // streaming one (AISIX-Cloud#1461).
     event.operation = surface.operation.to_string();
     stamp_requested_model_id(&mut event);
+    // Upstream-supplied text bound for line-oriented stores: the same
+    // control-character strip and cap as the provider's response id.
+    event.service_tier = event
+        .service_tier
+        .take()
+        .map(crate::chat::sanitize_tag)
+        .filter(|t| !t.is_empty());
     // Same reasoning, for the other shape of a caller walking away
     // (AISIX-Cloud#1571). A stream the consumer abandoned is reported as
     // 499 by six different families, each through its own emit helper and

@@ -22,7 +22,7 @@ use aisix_gateway::structured_output::{
 use aisix_gateway::{
     Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatFormat,
     ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingUsage, EmbeddingUsageSource, EmbeddingVector, FinishReason, Role,
+    EmbeddingUsage, EmbeddingUsageSource, EmbeddingVector, FinishReason, Role, ServiceTier,
     UpstreamHeaderContext, UsageStats,
 };
 use async_trait::async_trait;
@@ -1506,7 +1506,16 @@ fn converse_output_into_chat_response(
         message,
         finish_reason: finish,
         usage,
+        service_tier: converse_service_tier(resp.service_tier()),
     }
+}
+
+/// Converse `serviceTier.type`, verbatim (an SDK-unknown value keeps its
+/// raw string).
+fn converse_service_tier(
+    tier: Option<&aws_sdk_bedrockruntime::types::ServiceTier>,
+) -> Option<ServiceTier> {
+    ServiceTier::native(tier.map(|t| t.r#type().as_str().to_owned()))
 }
 
 /// Translate a Converse `toolUse` content block into an OpenAI
@@ -1611,6 +1620,7 @@ fn emit_converse_chunk(
                     },
                     finish_reason: None,
                     usage: None,
+                    service_tier: None,
                 });
             }
         }
@@ -1644,6 +1654,7 @@ fn emit_converse_chunk(
                         },
                         finish_reason: None,
                         usage: None,
+                        service_tier: None,
                     });
                 }
                 // #560: a tool-use `arguments` fragment. Correlate to the
@@ -1679,6 +1690,7 @@ fn emit_converse_chunk(
                         },
                         finish_reason: None,
                         usage: None,
+                        service_tier: None,
                     });
                 }
                 _ => {}
@@ -1691,9 +1703,13 @@ fn emit_converse_chunk(
                 delta: ChatDelta::default(),
                 finish_reason: Some(map_stop_reason(&m.stop_reason)),
                 usage: None,
+                service_tier: None,
             });
         }
         ConverseStreamOutput::Metadata(m) => {
+            // The tier rides the usage chunk; a metadata event without usage
+            // yields no chunk, as before, so no empty frame trails the finish.
+            let service_tier = converse_service_tier(m.service_tier());
             if let Some(u) = m.usage {
                 out.push(ChatChunk {
                     id: String::new(),
@@ -1712,6 +1728,7 @@ fn emit_converse_chunk(
                             as u32,
                         ..Default::default()
                     }),
+                    service_tier,
                 });
             }
         }
@@ -1766,6 +1783,7 @@ fn tool_call_chunk(
         },
         finish_reason: None,
         usage: None,
+        service_tier: None,
     }
 }
 
@@ -4799,6 +4817,7 @@ mod tests {
                     "cacheReadInputTokens": 800,
                     "cacheWriteInputTokens": 200
                 },
+                "serviceTier": {"type": "priority"},
                 "metrics": {"latencyMs": 1}
             })))
             .expect(1)
@@ -4819,6 +4838,10 @@ mod tests {
 
         assert_eq!(chat.usage.cache_read_tokens, 800);
         assert_eq!(chat.usage.cache_creation_tokens, 200);
+        assert_eq!(
+            chat.service_tier,
+            Some(ServiceTier::Native("priority".into()))
+        );
         // The upstream's own input and total counts pass through
         // untouched — the cache counters sit beside them, and adding
         // them in here would double-count against the gateway's
@@ -5043,6 +5066,56 @@ mod tests {
         );
         assert_eq!(results[0].tool_use_id(), "call_1");
         assert_eq!(results[1].tool_use_id(), "call_2");
+    }
+
+    #[test]
+    fn converse_stream_metadata_reports_the_served_tier() {
+        use aws_sdk_bedrockruntime::types::{
+            ConverseStreamMetadataEvent, ServiceTier as SdkTier, ServiceTierType, TokenUsage,
+        };
+        let mut state = ConverseStreamState::default();
+        let usage = || {
+            TokenUsage::builder()
+                .input_tokens(3)
+                .output_tokens(1)
+                .total_tokens(4)
+                .build()
+                .unwrap()
+        };
+        let meta = |tier: Option<ServiceTierType>, with_usage: bool| {
+            ConverseStreamOutput::Metadata(
+                ConverseStreamMetadataEvent::builder()
+                    .set_usage(with_usage.then(usage))
+                    .set_service_tier(tier.map(|t| SdkTier::builder().r#type(t).build().unwrap()))
+                    .build(),
+            )
+        };
+        let chunks = emit_converse_chunk(meta(Some(ServiceTierType::Flex), true), "m", &mut state);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].service_tier,
+            Some(ServiceTier::Native("flex".into()))
+        );
+        assert_eq!(chunks[0].usage.as_ref().unwrap().prompt_tokens, 3);
+        // A value this SDK release does not model keeps its raw string.
+        let chunks = emit_converse_chunk(
+            meta(Some(ServiceTierType::from("turbo")), true),
+            "m",
+            &mut state,
+        );
+        assert_eq!(
+            chunks[0].service_tier,
+            Some(ServiceTier::Native("turbo".into()))
+        );
+        assert_eq!(
+            emit_converse_chunk(meta(None, true), "m", &mut state)[0].service_tier,
+            None
+        );
+        // No usage, no chunk: nothing trails the finish frame.
+        assert!(
+            emit_converse_chunk(meta(Some(ServiceTierType::Flex), false), "m", &mut state)
+                .is_empty()
+        );
     }
 
     #[test]
