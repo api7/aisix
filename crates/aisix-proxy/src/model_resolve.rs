@@ -49,18 +49,29 @@ pub(crate) fn resolve_model(
     )))
 }
 
-/// Record the resolved entry's uuid for the terminal emitters that run
-/// after the handler is gone (AISIX-Cloud#1571) — but only when the entry
-/// dispatches to an upstream itself. A routing group, an ensemble and a
-/// semantic router are addressed by the caller and served by something
-/// else; their uuid prices nothing, so the cancel path leaves `model_id`
-/// empty for them and takes the target's id from the attempt instead.
-fn note_dispatchable_entry(entry: &ResourceEntry<Model>) {
+/// The `model_id` an event that selected no target reports for `entry`:
+/// its own id when it dispatches to an upstream itself (a direct or
+/// embedding model, or the wildcard row an alias resolved to), empty for a
+/// routing group, an ensemble or a semantic router. Those are addressed by
+/// the caller and served by something else; their uuid prices nothing, so
+/// `model_id` waits for the target an attempt selects.
+pub(crate) fn dispatchable_entry_id(entry: &ResourceEntry<Model>) -> &str {
     let model = &entry.value;
     if model.is_routing() || model.is_ensemble() || model.is_semantic() {
-        return;
+        return "";
     }
-    crate::attribution::note_resolved_entry(&entry.id);
+    &entry.id
+}
+
+/// Record [`dispatchable_entry_id`] for the emitters that read the
+/// request's attribution cell rather than the entry — the terminal ones
+/// that run after the handler is gone (AISIX-Cloud#1571) and
+/// [`crate::attribution::unattempted_model_id`].
+fn note_dispatchable_entry(entry: &ResourceEntry<Model>) {
+    let id = dispatchable_entry_id(entry);
+    if !id.is_empty() {
+        crate::attribution::note_resolved_entry(id);
+    }
 }
 
 /// Wildcard fallback: the most specific direct Model whose `*`-glob

@@ -529,10 +529,10 @@ pub(crate) fn apply_caller_identity(
 /// zero-token event per failed attempt; the single-attempt non-chat handlers
 /// emit one terminal event here.
 ///
-/// `model_id` is intentionally left empty — on the error path the resolved
-/// Model id isn't threaded back out of dispatch, but `requested_model`,
-/// `api_key_id`, `status_code` and `error_class` are enough for the request to
-/// appear in Logs. `label` is the usage_sink bucket (#408).
+/// `model_id` follows [`crate::attribution::unattempted_model_id`]: the
+/// target that settled, else the addressed entry when it is a direct model,
+/// else empty (a group that failed before selecting a target).
+/// `label` is the usage_sink bucket (#408).
 /// `inbound_protocol` must match what the caller's success path emits (e.g.
 /// `"passthrough"` for `/passthrough/...`, `"realtime"` for `/v1/realtime`,
 /// `"openai"` for the OpenAI-shaped handlers) so Logs protocol filtering sees
@@ -839,14 +839,16 @@ pub(crate) fn build_error_usage_event(
     // See [`emit_error_usage_event`].
     bypass: String,
 ) -> UsageEvent {
+    let requested_model = match error.model {
+        Some(model) if requested_model.is_empty() => model,
+        _ => requested_model.to_string(),
+    };
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         api_key_id: api_key_id.to_string(),
-        requested_model: match error.model {
-            Some(model) if requested_model.is_empty() => model,
-            _ => requested_model.to_string(),
-        },
+        model_id: crate::attribution::unattempted_model_id(&requested_model),
+        requested_model,
         status_code,
         inbound_protocol: inbound_protocol.to_string(),
         error_class: error.class.to_string(),

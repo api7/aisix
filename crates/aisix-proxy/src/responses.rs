@@ -559,14 +559,16 @@ pub async fn responses(
             );
             // Pre-dispatch failure (model-not-found, auth, budget) records no
             // attempts — emit a single terminal event carrying the failure
-            // class (`model_id` empty: the model never resolved). When
-            // attempts were recorded, each was already emitted.
+            // class. `model_id` is the addressed model's own id when it is a
+            // direct model, empty for a group (no target was selected) or a
+            // name that never resolved. When attempts were recorded, each
+            // was already emitted.
             if routing.attempts.is_empty() {
                 emit_zero_token_event(
                     &state,
                     &snapshot,
                     &request_id,
-                    "",
+                    &crate::attribution::unattempted_model_id(&model_name),
                     &model_name,
                     &api_key_id,
                     // Pre-dispatch failure resolved no provider key → wire NULL.

@@ -466,7 +466,7 @@ pub async fn messages(
                     // No attempt won, so no wire was spoken.
                     aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN,
                     &request_id,
-                    &model_id,
+                    &crate::attribution::unattempted_model_id(&model_name),
                     &api_key_id,
                     "unknown",
                     &model_name,
