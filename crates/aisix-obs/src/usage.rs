@@ -143,6 +143,8 @@ pub struct UsageEvent {
     /// semantic group or an ensemble reports the target the event's attempt
     /// selected, and nothing when it failed before selecting one — a
     /// group's own id prices nothing. Empty when the name never resolved.
+    /// Not yet on this rule: a group's response-cache hit and an ensemble's
+    /// aggregate and post-panel failure rows still carry the entry's own id.
     /// `requested_model_id` names the addressed entry.
     #[serde(default)]
     pub model_id: String,
