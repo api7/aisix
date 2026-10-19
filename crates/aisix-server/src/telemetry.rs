@@ -910,6 +910,7 @@ mod tests {
         event.api_key_name = "key-a".into();
         event.gateway_overhead_ms = Some(4);
         event.upstream_tpot_ms = Some(2.5);
+        event.service_tier = Some("priority".into());
         event.modality_tokens.prompt_audio_tokens = Some(7);
         send(&plain_client(), &cfg, Uuid::new_v4(), &[event]).await;
 
@@ -928,6 +929,7 @@ mod tests {
         assert_eq!(posted["api_key_name"], "key-a");
         assert_eq!(posted["gateway_overhead_ms"], 4);
         assert_eq!(posted["upstream_tpot_ms"], 2.5);
+        assert_eq!(posted["service_tier"], "priority");
         assert_eq!(posted["prompt_audio_tokens"], 7);
         assert!(posted.get("prompt_image_tokens").is_none());
     }

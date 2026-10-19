@@ -298,6 +298,7 @@ pub async fn chat_completions(
                         usage_estimated: success.usage_estimated,
                         provider_request_id: success.provider_request_id.clone(),
                         provider_model_version: success.provider_model_version.clone(),
+                        service_tier: success.service_tier.clone(),
                         finish_reason: success.finish_reason.clone(),
                         bypass_reason: success.bypass_reason.clone().unwrap_or_default(),
                         cache_status: success.cache_status.as_str().to_string(),
@@ -618,6 +619,7 @@ pub async fn chat_completions(
                             usage_estimated: c.usage_estimated,
                             provider_request_id: c.provider_request_id,
                             provider_model_version: c.provider_model_version,
+                            service_tier: c.service_tier,
                             finish_reason: c.finish_reason,
                             bypass_reason: c.bypass_reason,
                             cache_status: c.cache_status.as_str().to_string(),
@@ -761,6 +763,9 @@ struct Success {
     /// the model the ORIGINAL upstream reported for the stored body — the
     /// producer — not anything about this request.
     provider_model_version: String,
+    /// The tier the upstream reported it served on; see
+    /// `UsageEvent::service_tier`.
+    service_tier: Option<String>,
     provider_key_id: String,
     upstream_model: String,
     /// finish_reason / stop_reason as the upstream returned it. Empty
@@ -1461,6 +1466,7 @@ struct UpstreamCharge {
     reasoning_folded_into_completion: u32,
     provider_request_id: String,
     provider_model_version: String,
+    service_tier: Option<String>,
     finish_reason: String,
     /// First bypass reason observed on this request (input or output
     /// guardrail returned `Bypass` because a remote-API guardrail was
@@ -2364,6 +2370,7 @@ async fn dispatch(
                         usage_estimated: comp.usage_estimated,
                         provider_request_id: comp.provider_request_id,
                         provider_model_version: comp.provider_model_version,
+                        service_tier: comp.service_tier,
                         finish_reason: comp.finish_reason,
                         // Per #204 audit H1: merge input-side bypass
                         // (`bypass_reason_for_telem` captured before
@@ -2554,6 +2561,7 @@ async fn dispatch(
             cache_read_tokens: 0,
             provider_request_id: String::new(),
             provider_model_version: String::new(),
+            service_tier: None,
             provider_key_id: pk_id.clone(),
             upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
             finish_reason: String::new(),
@@ -3010,6 +3018,7 @@ async fn dispatch(
                     // (AISIX-Cloud#1571). Empty only when the stored
                     // response carried no model name.
                     provider_model_version: producer_model,
+                    service_tier: None,
                     provider_key_id,
                     upstream_model,
                     finish_reason: String::new(),
@@ -3409,6 +3418,10 @@ async fn dispatch(
     let cache_read_tokens = upstream.usage.cache_read_tokens;
     let provider_request_id = crate::usage_attr::sanitize_provider_response_id(&upstream.id);
     let provider_model_version = upstream.model.clone();
+    let service_tier = upstream
+        .service_tier
+        .as_ref()
+        .map(|t| t.as_str().to_owned());
     let finish_reason = finish_reason_label(&upstream.finish_reason);
     // Fold the winning target's model-layer reservation in so one commit
     // bills the member's TPM/TPD alongside the request-level layers
@@ -3471,6 +3484,7 @@ async fn dispatch(
                 cache_read_tokens,
                 provider_request_id: provider_request_id.clone(),
                 provider_model_version: provider_model_version.clone(),
+                service_tier: service_tier.clone(),
                 finish_reason: finish_reason.clone(),
                 bypass_reason: bypass_reason.clone().unwrap_or_default(),
                 cache_status,
@@ -3668,6 +3682,7 @@ async fn dispatch(
         cache_read_tokens,
         provider_request_id,
         provider_model_version,
+        service_tier,
         provider_key_id,
         upstream_model,
         finish_reason,
@@ -3806,6 +3821,7 @@ async fn dispatch_ensemble(
                 attempt_model: member.model.clone(),
                 usage: member.effective_usage.clone(),
                 usage_estimated: member.usage_estimated,
+                service_tier: member.service_tier.clone(),
             }
             .emit(
                 state,
@@ -4124,6 +4140,7 @@ async fn dispatch_ensemble(
                     attempt_model: p.model.clone(),
                     usage: p.effective_usage.clone(),
                     usage_estimated: p.usage_estimated,
+                    service_tier: p.service_tier.clone(),
                 }
             })
             .collect();
@@ -4216,6 +4233,7 @@ async fn dispatch_ensemble(
                         usage_estimated: comp.usage_estimated,
                         provider_request_id: comp.provider_request_id,
                         provider_model_version: comp.provider_model_version,
+                        service_tier: comp.service_tier,
                         finish_reason: comp.finish_reason,
                         bypass_reason: if !bypass_for_telem.is_empty() {
                             bypass_for_telem.clone()
@@ -4291,6 +4309,7 @@ async fn dispatch_ensemble(
             cache_read_tokens: 0,
             provider_request_id: String::new(),
             provider_model_version: String::new(),
+            service_tier: None,
             provider_key_id: crate::request_metrics::UNKNOWN.to_string(),
             upstream_model: crate::request_metrics::UNKNOWN.to_string(),
             finish_reason: String::new(),
@@ -4431,6 +4450,7 @@ async fn dispatch_ensemble(
                     &outcome.response.id,
                 ),
                 provider_model_version: outcome.response.model.clone(),
+                service_tier: crate::ensemble::tier_value(&outcome.response),
                 finish_reason: finish_reason_label(&outcome.response.finish_reason),
                 bypass_reason: bypass.to_string(),
                 cache_status: CacheStatus::Disabled.as_str().to_string(),
@@ -4586,6 +4606,7 @@ async fn dispatch_ensemble(
         cache_read_tokens: metric_usage.cache_read_tokens,
         provider_request_id: String::new(),
         provider_model_version: String::new(),
+        service_tier: None,
         provider_key_id: crate::request_metrics::UNKNOWN.to_string(),
         upstream_model: crate::request_metrics::UNKNOWN.to_string(),
         finish_reason: String::new(),
@@ -4817,6 +4838,7 @@ fn emit_usage_event(
         status_code,
         provider_request_id: extras.provider_request_id,
         provider_model_version: extras.provider_model_version,
+        service_tier: extras.service_tier,
         finish_reason: extras.finish_reason,
         cost_usd,
         guardrail_blocked,
@@ -4965,6 +4987,7 @@ struct UsageExtras {
     usage_estimated: bool,
     provider_request_id: String,
     provider_model_version: String,
+    service_tier: Option<String>,
     finish_reason: String,
     /// Set when at least one guardrail returned `Bypass` for this
     /// request (remote-API guardrail upstream unreachable +
@@ -5231,6 +5254,7 @@ struct StreamCompletion {
     cache_read_tokens: u32,
     provider_request_id: String,
     provider_model_version: String,
+    service_tier: Option<String>,
     finish_reason: String,
     /// `true` when an OUTPUT guardrail blocked the response at
     /// end-of-stream (per #204). Read by the on_complete telemetry
@@ -5387,6 +5411,7 @@ struct EnsembleSubcall {
     attempt_model: String,
     usage: aisix_gateway::chat::UsageStats,
     usage_estimated: bool,
+    service_tier: Option<String>,
 }
 
 impl EnsembleSubcall {
@@ -5399,6 +5424,7 @@ impl EnsembleSubcall {
             attempt_model: outcome.model,
             usage: outcome.effective_usage,
             usage_estimated: outcome.usage_estimated,
+            service_tier: outcome.service_tier,
         }
     }
 
@@ -5434,6 +5460,7 @@ impl EnsembleSubcall {
             cache_creation_tokens: self.usage.cache_creation_tokens,
             cache_read_tokens: self.usage.cache_read_tokens,
             usage_estimated: self.usage_estimated,
+            service_tier: self.service_tier.clone(),
             bypass_reason: bypass.to_string(),
             cache_status: CacheStatus::Disabled.as_str().to_string(),
             attempt_index,
@@ -6082,6 +6109,9 @@ where
                     if !chunk.model.is_empty() {
                         comp.provider_model_version = chunk.model.clone();
                     }
+                    if let Some(tier) = &chunk.service_tier {
+                        comp.service_tier = Some(tier.as_str().to_owned());
+                    }
                     if let Some(fr) = chunk.finish_reason.as_ref() {
                         comp.finish_reason = finish_reason_label(fr);
                     }
@@ -6333,6 +6363,7 @@ where
                                             comp.prompt_tokens,
                                             comp.completion_tokens,
                                         ),
+                                        service_tier: None,
                                     }
                                 };
                                 let (verdict, hits) =
@@ -6479,6 +6510,7 @@ where
                 delta: Default::default(),
                 finish_reason: None,
                 usage: Some(judge_usage.saturating_add(&base_usage)),
+                service_tier: None,
             };
             if !hold_back || cap_released {
                 let ev = chunk_event!(chunk);
@@ -6541,6 +6573,7 @@ where
                                     comp.prompt_tokens,
                                     comp.completion_tokens,
                                 ),
+                                service_tier: None,
                             }
                         };
                         let (verdict, hits) = ctx
@@ -6667,6 +6700,7 @@ where
                         guard.comp().prompt_tokens,
                         guard.comp().completion_tokens,
                     ),
+                    service_tier: None,
                 };
                 let (verdict, hits) = ctx
                     .chain
@@ -6691,6 +6725,7 @@ where
                         },
                         finish_reason: None,
                         usage: None,
+                        service_tier: None,
                     }];
                     let mut segments = crate::redact::collect_segments(|g| {
                         let _ = crate::redact::redact_chat_chunks(g, &mut chunks);
@@ -7344,6 +7379,7 @@ mod complete_on_drop_tests {
             },
             finish_reason: aisix_gateway::chat::FinishReason::Stop,
             usage,
+            service_tier: None,
         }
     }
 

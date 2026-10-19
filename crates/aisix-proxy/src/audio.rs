@@ -1867,6 +1867,7 @@ async fn multipart_dispatch(
                 message: ChatMessage::assistant(scan.text),
                 finish_reason: FinishReason::Stop,
                 usage: UsageStats::default(),
+                service_tier: None,
             };
             let (verdict, hits) =
                 aisix_guardrails::Guardrail::check_output_observed(&resolved_chain, &synth).await;

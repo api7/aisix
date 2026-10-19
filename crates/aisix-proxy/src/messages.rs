@@ -1621,6 +1621,7 @@ async fn anthropic_passthrough_dispatch(
                     usage_estimated: usage.usage_estimated,
                     provider_request_id: usage.provider_request_id,
                     provider_model_version: usage.provider_model_version,
+                    service_tier: usage.service_tier,
                     finish_reason: usage.finish_reason,
                     upstream_ttft_ms: usage.upstream_ttft_ms,
                     downstream_latency_ms: usage.downstream_latency_ms,
@@ -1849,6 +1850,7 @@ async fn anthropic_passthrough_dispatch(
                     message: aisix_gateway::ChatMessage::assistant(out_text),
                     finish_reason: aisix_gateway::FinishReason::Stop,
                     usage: aisix_gateway::UsageStats::new(0, 0),
+                    service_tier: None,
                 };
                 let (verdict, hits) =
                     aisix_guardrails::Guardrail::check_output_non_segment_observed(
@@ -2085,6 +2087,7 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
             .and_then(Value::as_u64)
             .unwrap_or(0) as u32,
         provider_request_id: crate::usage_attr::provider_response_id(body),
+        service_tier: usage.and_then(aisix_gateway::chat::anthropic_usage_service_tier),
         provider_model_version: body
             .get("model")
             .and_then(Value::as_str)
@@ -2389,6 +2392,7 @@ async fn cross_provider_dispatch(
                     usage_estimated: comp.usage_estimated,
                     provider_request_id: comp.provider_request_id,
                     provider_model_version: comp.provider_model_version,
+                    service_tier: comp.service_tier,
                     finish_reason: comp.finish_reason,
                     upstream_ttft_ms: comp.upstream_ttft_ms,
                     downstream_latency_ms: comp.downstream_latency_ms,
@@ -2588,6 +2592,7 @@ async fn cross_provider_dispatch(
         usage_estimated: false,
         provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
         provider_model_version: resp.model.clone(),
+        service_tier: resp.service_tier.as_ref().map(|t| t.as_str().to_owned()),
         finish_reason: finish_reason_label(&resp.finish_reason),
         upstream_ttft_ms: 0,
         // Non-streaming: stamped by the handler, which holds the request clock.
@@ -2747,6 +2752,9 @@ fn build_anthropic_sse_stream(
                     if !chunk.model.is_empty() {
                         comp.provider_model_version = chunk.model.clone();
                     }
+                    if let Some(tier) = &chunk.service_tier {
+                        comp.service_tier = Some(tier.as_str().to_owned());
+                    }
                     if let Some(fr) = chunk.finish_reason.as_ref() {
                         comp.finish_reason = finish_reason_label(fr);
                     }
@@ -2905,6 +2913,7 @@ fn build_anthropic_sse_stream(
                     message,
                     finish_reason: aisix_gateway::FinishReason::Stop,
                     usage: aisix_gateway::UsageStats::new(0, 0),
+                    service_tier: None,
                 };
                 let (verdict, hits) =
                     aisix_guardrails::Guardrail::check_output_non_segment_observed(
@@ -3148,6 +3157,7 @@ struct AnthropicStreamCompletion {
     usage_estimated: bool,
     provider_request_id: String,
     provider_model_version: String,
+    service_tier: Option<String>,
     finish_reason: String,
     /// Attempt-scoped time to the upstream's first generated chunk.
     upstream_ttft_ms: u32,
@@ -3332,6 +3342,7 @@ struct AnthropicUsageMetrics {
     usage_estimated: bool,
     provider_request_id: String,
     provider_model_version: String,
+    service_tier: Option<String>,
     finish_reason: String,
     upstream_ttft_ms: u32,
     downstream_latency_ms: u32,
@@ -3441,6 +3452,7 @@ fn emit_anthropic_usage_event(
         status_code,
         provider_request_id: metrics.provider_request_id,
         provider_model_version: metrics.provider_model_version,
+        service_tier: metrics.service_tier,
         finish_reason: metrics.finish_reason,
         upstream_ttft_ms: metrics.upstream_ttft_ms,
         inbound_protocol: "anthropic".to_string(),
@@ -3614,6 +3626,7 @@ struct AnthropicStreamUsage {
     usage_estimated: bool,
     provider_request_id: String,
     provider_model_version: String,
+    service_tier: Option<String>,
     finish_reason: String,
     /// Attempt-scoped time to the upstream's first streamed frame,
     /// whatever its type — see `UsageEvent::upstream_ttft_ms`.
@@ -3703,6 +3716,9 @@ fn update_anthropic_usage(
         Some("message_start") => {
             let msg = json.get("message");
             if let Some(usage) = msg.and_then(|m| m.get("usage")) {
+                if let Some(tier) = aisix_gateway::chat::anthropic_usage_service_tier(usage) {
+                    acc.service_tier = Some(tier);
+                }
                 if let Some(t) = usage.get("input_tokens").and_then(Value::as_u64) {
                     acc.prompt_tokens = t as u32;
                 }
@@ -3781,6 +3797,9 @@ fn update_anthropic_usage(
         }
         Some("message_delta") => {
             if let Some(usage) = json.get("usage") {
+                if let Some(tier) = aisix_gateway::chat::anthropic_usage_service_tier(usage) {
+                    acc.service_tier = Some(tier);
+                }
                 if let Some(v) = usage.get("output_tokens") {
                     if let Some(t) = v.as_u64() {
                         acc.completion_tokens = acc.completion_tokens.max(t as u32);
@@ -4397,6 +4416,7 @@ where
                     message: aisix_gateway::ChatMessage::assistant(text),
                     finish_reason: aisix_gateway::FinishReason::Stop,
                     usage: aisix_gateway::UsageStats::new(0, 0),
+                    service_tier: None,
                 };
                 let (verdict, hits) =
                     aisix_guardrails::Guardrail::check_output_non_segment_observed(

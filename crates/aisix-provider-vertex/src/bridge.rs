@@ -1885,6 +1885,7 @@ fn gemini_chunk_into_chat_chunks(
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         });
     }
 
@@ -1911,6 +1912,7 @@ fn gemini_chunk_into_chat_chunks(
             },
             finish_reason,
             usage,
+            service_tier: None,
         });
     }
 
@@ -2570,6 +2572,7 @@ fn gemini_response_into_chat_response(
         message,
         finish_reason: finish,
         usage,
+        service_tier: None,
     }
 }
 

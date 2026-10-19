@@ -2963,6 +2963,7 @@ mod tests {
             message: ChatMessage::assistant("mail a@x.com"),
             finish_reason: aisix_gateway::FinishReason::Stop,
             usage: aisix_gateway::UsageStats::new(0, 0),
+            service_tier: None,
         };
         assert!(redact_chat_response(input_only.as_ref(), &mut resp).is_empty());
         assert_eq!(resp.message.content.as_deref(), Some("mail a@x.com"));
@@ -2996,6 +2997,7 @@ mod tests {
             message: msg,
             finish_reason: aisix_gateway::FinishReason::Stop,
             usage: aisix_gateway::UsageStats::new(0, 0),
+            service_tier: None,
         };
         let counts = redact_chat_response(chain.as_ref(), &mut resp);
         assert_eq!(
@@ -3100,6 +3102,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         }
     }
 
@@ -3143,6 +3146,7 @@ mod tests {
                 },
                 finish_reason: None,
                 usage: None,
+                service_tier: None,
             },
             ChatChunk {
                 id: "c".into(),
@@ -3156,6 +3160,7 @@ mod tests {
                 },
                 finish_reason: None,
                 usage: None,
+                service_tier: None,
             },
         ];
         let counts = redact_chat_chunks(chain.as_ref(), &mut chunks);

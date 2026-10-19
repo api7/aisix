@@ -565,6 +565,7 @@ async fn scan_output_blob(
         message: aisix_gateway::ChatMessage::assistant(String::from_utf8_lossy(blob).into_owned()),
         finish_reason: aisix_gateway::FinishReason::Stop,
         usage: aisix_gateway::UsageStats::default(),
+        service_tier: None,
     };
     let (verdict, hits) =
         aisix_guardrails::Guardrail::check_output_unmaskable_observed(&chain, &synth).await;

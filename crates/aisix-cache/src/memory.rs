@@ -90,24 +90,17 @@ impl Cache for MemoryCache {
     }
 
     async fn put(&self, key: &str, value: ChatResponse) -> Result<(), CacheError> {
-        self.inner
-            .insert(
-                key.to_string(),
-                Entry {
-                    response: value,
-                    ttl: self.ttl,
-                },
-            )
-            .await;
-        Ok(())
+        self.put_with_ttl(key, value, self.ttl).await
     }
 
     async fn put_with_ttl(
         &self,
         key: &str,
-        value: ChatResponse,
+        mut value: ChatResponse,
         ttl: Duration,
     ) -> Result<(), CacheError> {
+        // Same as a serialized entry: a hit was served by no upstream.
+        value.service_tier = None;
         self.inner
             .insert(
                 key.to_string(),
@@ -133,6 +126,7 @@ mod tests {
             message: ChatMessage::assistant("hi back"),
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(2, 3),
+            service_tier: None,
         }
     }
 
@@ -143,6 +137,16 @@ mod tests {
         let got = cache.get("k1").await.unwrap().unwrap();
         assert_eq!(got.message.content_str(), "hi back");
         assert_eq!(got.usage.total_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn a_hit_reports_no_service_tier() {
+        // Like a serialized entry: no upstream served a hit.
+        let cache = MemoryCache::with_defaults();
+        let mut resp = sample_response();
+        resp.service_tier = Some(aisix_gateway::ServiceTier::OpenAi("priority".into()));
+        cache.put("k1", resp).await.unwrap();
+        assert_eq!(cache.get("k1").await.unwrap().unwrap().service_tier, None);
     }
 
     #[tokio::test]

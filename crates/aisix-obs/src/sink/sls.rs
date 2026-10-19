@@ -531,6 +531,7 @@ mod tests {
             occurred_at: "2026-05-01T12:00:00Z".into(),
             model_id: "gpt-4o".into(),
             requested_model_id: "group-uuid".into(),
+            service_tier: Some("flex".into()),
             status_code: 200,
             prompt_tokens: 5,
             completion_tokens: 7,
@@ -605,6 +606,10 @@ mod tests {
         assert_eq!(
             contents.get("requested_model_id").map(String::as_str),
             Some("group-uuid")
+        );
+        assert_eq!(
+            contents.get("service_tier").map(String::as_str),
+            Some("flex")
         );
         assert_eq!(contents.get("status_code").map(String::as_str), Some("200"));
         assert_eq!(contents.get("prompt_tokens").map(String::as_str), Some("5"));

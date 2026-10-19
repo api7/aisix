@@ -1459,6 +1459,7 @@ mod tests {
             message: aisix_gateway::ChatMessage::assistant(String::new()),
             finish_reason: aisix_gateway::FinishReason::Stop,
             usage: aisix_gateway::UsageStats::default(),
+            service_tier: None,
         };
         let verdict = guardrail(&cfg, false).check_output(&resp).await;
         assert!(

@@ -1188,6 +1188,7 @@ async fn dispatch(
                 message: aisix_gateway::ChatMessage::assistant(text),
                 finish_reason: aisix_gateway::FinishReason::Stop,
                 usage: aisix_gateway::UsageStats::default(),
+                service_tier: None,
             };
             let (verdict, hits) = aisix_guardrails::Guardrail::check_output_unmaskable_observed(
                 &resolved_chain,
@@ -6674,6 +6675,7 @@ async fn scan_output(
         message: aisix_gateway::ChatMessage::assistant(text.to_string()),
         finish_reason: aisix_gateway::FinishReason::Stop,
         usage: aisix_gateway::UsageStats::default(),
+        service_tier: None,
     };
     let (verdict, hits) = chain.check_output_unmaskable_observed(&synth).await;
     telemetry.monitor_hits.extend(hits);

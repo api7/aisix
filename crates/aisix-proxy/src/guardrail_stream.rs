@@ -29,6 +29,7 @@ pub(crate) fn synth_chat_response(model: &str, text: String) -> ChatResponse {
         message: ChatMessage::assistant(text),
         finish_reason: FinishReason::Stop,
         usage: UsageStats::default(),
+        service_tier: None,
     }
 }
 

@@ -1055,6 +1055,7 @@ pub fn chat_response_to_responses_json(
             usage: responses_usage_json(&resp.usage),
             incomplete_reason,
             error: None,
+            service_tier: resp.service_tier.as_ref().and_then(|t| t.openai_value()),
         },
     )
 }
@@ -1072,6 +1073,10 @@ struct ResponseState<'a> {
     incomplete_reason: Option<&'static str>,
     /// `(code, message)` of a failed response.
     error: Option<(&'a str, &'a str)>,
+    /// The tier an OpenAI-shape upstream reported serving on. Another
+    /// protocol's tier is not in the Responses vocabulary, so it is never
+    /// passed here.
+    service_tier: Option<&'a str>,
 }
 
 /// A complete Response object — the full top-level field set the Responses
@@ -1093,6 +1098,10 @@ fn response_resource(reply: &ResponsesReplyContext, state: ResponseState<'_>) ->
     );
     obj.insert("status".to_string(), json!(state.status));
     obj.insert("model".to_string(), json!(state.model));
+    obj.insert(
+        "service_tier".to_string(),
+        json!(state.service_tier.unwrap_or("default")),
+    );
     obj.insert("output".to_string(), state.output);
     obj.insert("usage".to_string(), state.usage);
     obj.insert(
@@ -1202,7 +1211,6 @@ fn response_echo_fields(body: &Value) -> Map<String, Value> {
     m.insert("max_tool_calls".into(), int_or_null("max_tool_calls"));
     m.insert("store".into(), bool_or("store", true));
     m.insert("background".into(), bool_or("background", false));
-    m.insert("service_tier".into(), string_or("service_tier", "default"));
     m.insert(
         "metadata".into(),
         get("metadata")
@@ -1582,6 +1590,8 @@ pub struct ResponsesSseEncoder {
     modality: aisix_gateway::ModalityTokens,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// The last tier an OpenAI-shape upstream reported on this stream.
+    service_tier: Option<String>,
 }
 
 impl ResponsesSseEncoder {
@@ -1621,6 +1631,7 @@ impl ResponsesSseEncoder {
             modality: Default::default(),
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            service_tier: None,
         }
     }
 
@@ -1778,6 +1789,7 @@ impl ResponsesSseEncoder {
                 },
                 incomplete_reason,
                 error,
+                service_tier: self.service_tier.as_deref(),
             },
         )
     }
@@ -1813,6 +1825,9 @@ impl ResponsesSseEncoder {
             return Vec::new();
         }
         self.accumulate_usage(chunk);
+        if let Some(tier) = chunk.service_tier.as_ref().and_then(|t| t.openai_value()) {
+            self.service_tier = Some(tier.to_owned());
+        }
 
         // Terminal status withheld for a trailing usage frame: release it
         // once usage lands. Post-finish chunks carry no renderable content.
@@ -2279,6 +2294,8 @@ pub struct ResponsesStreamCompletion {
     /// mints for the client. The minted one is a gateway value and would be
     /// useless in the provider's console (AISIX-Cloud#1289).
     pub provider_request_id: String,
+    /// The last tier the upstream reported, in any protocol's vocabulary.
+    pub service_tier: Option<String>,
     /// Attempt-scoped time to the upstream's first generated chunk.
     pub upstream_ttft_ms: u32,
     /// Request-scoped time until the caller got its first response bytes.
@@ -2466,6 +2483,9 @@ pub fn build_responses_bridge_stream(
                         if !chunk.id.is_empty() {
                             comp.provider_request_id =
                                 crate::usage_attr::sanitize_provider_response_id(&chunk.id);
+                        }
+                        if let Some(tier) = &chunk.service_tier {
+                            comp.service_tier = Some(tier.as_str().to_owned());
                         }
                         if let Some(fr) = chunk.finish_reason.as_ref() {
                             comp.finish_reason = finish_reason_label(fr);
@@ -2735,6 +2755,7 @@ pub fn build_responses_bridge_stream(
                 message,
                 finish_reason: FinishReason::Stop,
                 usage: UsageStats::new(0, 0),
+                service_tier: None,
             };
             let (verdict, hits) =
                 aisix_guardrails::Guardrail::check_output_non_segment_observed(
@@ -3798,6 +3819,7 @@ mod tests {
             },
             finish_reason: fr,
             usage: UsageStats::new(11, 7),
+            service_tier: None,
         }
     }
 
@@ -3915,6 +3937,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         }
     }
 
@@ -3935,6 +3958,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::Stop),
             usage: Some(UsageStats::new(5, 2)),
+            service_tier: None,
         }));
         let types = types_of(&all);
         assert_eq!(
@@ -3977,6 +4001,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::Stop),
             usage: None,
+            service_tier: None,
         });
         assert!(!types_of(&at_finish).contains(&"response.completed"));
         assert!(!enc.is_finished());
@@ -3987,6 +4012,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: None,
             usage: Some(UsageStats::new(3, 4)),
+            service_tier: None,
         });
         assert_eq!(types_of(&usage_frame), vec!["response.completed"]);
         assert_eq!(usage_frame[0].data["response"]["usage"]["output_tokens"], 4);
@@ -4007,6 +4033,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         };
         let mut all = enc.next_events(&chunk);
         all.extend(enc.next_events(&ChatChunk {
@@ -4020,6 +4047,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         }));
         all.extend(enc.next_events(&ChatChunk {
             id: "c".into(),
@@ -4027,6 +4055,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::ToolCalls),
             usage: Some(UsageStats::new(4, 6)),
+            service_tier: None,
         }));
         let types = types_of(&all);
         assert!(types.contains(&"response.output_item.added"));
@@ -4059,6 +4088,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         });
         all.extend(enc.next_events(&ChatChunk {
             id: "c".into(),
@@ -4071,6 +4101,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         }));
         all.extend(enc.next_events(&ChatChunk {
             id: "c".into(),
@@ -4078,6 +4109,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::ToolCalls),
             usage: Some(UsageStats::new(4, 6)),
+            service_tier: None,
         }));
 
         assert_eq!(
@@ -4150,6 +4182,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         });
         all.extend(enc.next_events(&ChatChunk {
             id: "c".into(),
@@ -4162,6 +4195,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         }));
         all.extend(enc.force_finish());
 
@@ -4195,6 +4229,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         });
         all.extend(enc.force_finish());
         let types = types_of(&all);
@@ -4221,6 +4256,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         });
         all.extend(enc.next_events(&ChatChunk {
             id: "c".into(),
@@ -4228,6 +4264,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::ToolCalls),
             usage: Some(UsageStats::new(4, 6)),
+            service_tier: None,
         }));
         let types = types_of(&all);
         assert!(types.contains(&"response.function_call_arguments.delta"));
@@ -4259,6 +4296,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: None,
             usage: Some(UsageStats::new(10, 0)),
+            service_tier: None,
         };
         assert!(enc.next_events(&usage_only).is_empty());
         assert!(!enc.has_output());
@@ -4283,6 +4321,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         });
         let at_finish = enc.next_events(&ChatChunk {
             id: "c".into(),
@@ -4290,6 +4329,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::ToolCalls),
             usage: None,
+            service_tier: None,
         });
         assert_eq!(
             types_of(&at_finish)
@@ -4326,6 +4366,7 @@ mod tests {
                 delta: ChatDelta::default(),
                 finish_reason: Some(FinishReason::Stop),
                 usage: Some(usage),
+                service_tier: None,
             });
             done.last().unwrap().data["response"]["usage"].clone()
         }
@@ -4365,6 +4406,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::Length),
             usage: Some(UsageStats::new(3, 9)),
+            service_tier: None,
         });
         let completed = done.last().unwrap();
         assert_eq!(completed.event_type, "response.incomplete");
@@ -4543,6 +4585,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         }
     }
 
@@ -4553,6 +4596,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::Stop),
             usage,
+            service_tier: None,
         }
     }
 
@@ -4625,6 +4669,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         }));
         all.extend(enc.next_events(&finish_chunk(Some(UsageStats::new(1, 2)))));
         assert_eq!(
@@ -4749,6 +4794,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: Some(FinishReason::Stop),
             usage: None,
+            service_tier: None,
         });
         // …the trailing usage frame never arrives; the relay hands the
         // encoder the same estimate it wrote to the usage record.
@@ -4802,6 +4848,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: None,
             usage: Some(partial),
+            service_tier: None,
         });
         enc.set_estimated_usage(3, 7);
         let events = enc.force_finish();
@@ -4822,6 +4869,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: None,
             usage: Some(UsageStats::new(3, 4)),
+            service_tier: None,
         });
         enc.set_estimated_usage(99, 99);
         let events = enc.force_finish();
@@ -5133,6 +5181,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         });
         events.extend(enc.next_events(&ChatChunk {
             id: "c".into(),
@@ -5145,6 +5194,7 @@ mod tests {
             },
             finish_reason: Some(FinishReason::ToolCalls),
             usage: Some(UsageStats::new(3, 2)),
+            service_tier: None,
         }));
         let item_of = |t: &str| {
             events
@@ -5268,6 +5318,49 @@ mod tests {
         assert!(out["completed_at"].as_i64().is_some());
     }
 
+    /// `service_tier` reports what the upstream served on, never what the
+    /// request asked for: an OpenAI-shape upstream's own value, otherwise
+    /// `"default"` — including for another protocol's tier, which is not in
+    /// the Responses vocabulary.
+    #[test]
+    fn service_tier_reports_the_served_tier_not_the_requested_one() {
+        use aisix_gateway::ServiceTier;
+        let reply = ResponsesReplyContext::from_request(&json!({"service_tier": "priority"}));
+        let body = |tier| {
+            let mut resp = chat_response_with(Some("hi"), None, FinishReason::Stop);
+            resp.service_tier = tier;
+            chat_response_to_responses_json(&resp, "m", 1, &reply)["service_tier"].clone()
+        };
+        assert_eq!(body(None), "default");
+        assert_eq!(body(Some(ServiceTier::OpenAi("flex".into()))), "flex");
+        assert_eq!(
+            body(Some(ServiceTier::Native("priority".into()))),
+            "default"
+        );
+
+        let tiers = |tier: Option<ServiceTier>| {
+            let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, reply.clone());
+            let mut first = content_chunk("hi");
+            first.service_tier = tier;
+            let mut events = enc.next_events(&first);
+            events.extend(enc.next_events(&finish_chunk(Some(UsageStats::new(3, 1)))));
+            events
+                .iter()
+                .filter_map(|e| e.data.get("response"))
+                .map(|r| r["service_tier"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            tiers(Some(ServiceTier::OpenAi("scale".into()))),
+            vec![json!("scale"); 3]
+        );
+        assert_eq!(tiers(None), vec![json!("default"); 3]);
+        assert_eq!(
+            tiers(Some(ServiceTier::Native("fast".into()))),
+            vec![json!("default"); 3]
+        );
+    }
+
     /// Every lifecycle event carries the full object too, `usage: null`
     /// until the response has finished.
     #[test]
@@ -5347,6 +5440,7 @@ mod tests {
             delta: ChatDelta::default(),
             finish_reason: None,
             usage: Some(UsageStats::new(10, 0)),
+            service_tier: None,
         };
         let (events, comp) = relay(vec![Ok(usage_only)]).await;
         assert_eq!(event_names(&events), FAILED_BEFORE_ANY_OUTPUT);

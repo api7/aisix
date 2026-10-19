@@ -927,6 +927,7 @@ mod tests {
                 message: ChatMessage::assistant(String::new()),
                 finish_reason: FinishReason::Stop,
                 usage: UsageStats::default(),
+                service_tier: None,
             })
         }
         async fn chat_stream(

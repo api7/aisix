@@ -657,6 +657,7 @@ async fn dispatch(
                     message: ChatMessage::assistant(completion_output_text(&resp_json)),
                     finish_reason: FinishReason::Stop,
                     usage: UsageStats::default(),
+                    service_tier: None,
                 };
                 let (verdict, hits) =
                     aisix_guardrails::Guardrail::check_output_non_segment_observed(

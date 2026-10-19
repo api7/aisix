@@ -568,6 +568,7 @@ mod tests {
             occurred_at: "2026-05-01T12:00:00Z".into(),
             model_id: "gpt-4o".into(),
             requested_model_id: "group-uuid".into(),
+            service_tier: Some("flex".into()),
             status_code: 200,
             prompt_tokens: 5,
             completion_tokens: 7,
@@ -623,6 +624,7 @@ mod tests {
         assert_eq!(log["aisix.model_id"], "gpt-4o");
         // The addressed entry's id rides beside the dispatched target's.
         assert_eq!(log["aisix.requested_model_id"], "group-uuid");
+        assert_eq!(log["aisix.service_tier"], "flex");
         assert_eq!(log["aisix.upstream_latency_ms"], 123);
         // The request's kind, under the `aisix.` prefix every field without a
         // semconv key takes (AISIX-Cloud#1461). Datadog is the sink where a

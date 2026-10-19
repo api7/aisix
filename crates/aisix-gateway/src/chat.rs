@@ -879,6 +879,63 @@ impl UsageStats {
     }
 }
 
+/// The service tier an upstream response reports it actually served the
+/// request on, verbatim — never the tier the request asked for, and never
+/// a default the gateway filled in. Tier names differ across providers and
+/// change over time, so the value is any string; which wire it came from
+/// decides whether an OpenAI-shape client body may repeat it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceTier {
+    /// The top-level `service_tier` of an OpenAI-shape response (chat
+    /// completions or Responses), in the vocabulary an OpenAI client reads.
+    OpenAi(String),
+    /// Any other protocol's indicator (Anthropic `usage.speed` /
+    /// `usage.service_tier`, Bedrock `serviceTier.type`). Recorded, never
+    /// written into an OpenAI-shape body.
+    Native(String),
+}
+
+impl ServiceTier {
+    /// An OpenAI-shape tier, `None` for an absent or empty value.
+    pub fn openai(value: Option<String>) -> Option<Self> {
+        value.filter(|v| !v.is_empty()).map(Self::OpenAi)
+    }
+
+    /// Another protocol's tier, `None` for an absent or empty value.
+    pub fn native(value: Option<String>) -> Option<Self> {
+        value.filter(|v| !v.is_empty()).map(Self::Native)
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::OpenAi(v) | Self::Native(v) => v,
+        }
+    }
+
+    /// The value an OpenAI-shape client body may carry.
+    pub fn openai_value(&self) -> Option<&str> {
+        match self {
+            Self::OpenAi(v) => Some(v),
+            Self::Native(_) => None,
+        }
+    }
+}
+
+/// The tier an Anthropic `usage` object reports: `speed` when it names
+/// something other than `"standard"` (fast mode), else `service_tier`.
+pub fn anthropic_service_tier(speed: Option<&str>, service_tier: Option<&str>) -> Option<String> {
+    speed
+        .filter(|v| !v.is_empty() && *v != "standard")
+        .or(service_tier.filter(|v| !v.is_empty()))
+        .map(str::to_owned)
+}
+
+/// [`anthropic_service_tier`] over a raw Anthropic `usage` object.
+pub fn anthropic_usage_service_tier(usage: &serde_json::Value) -> Option<String> {
+    let field = |k: &str| usage.get(k).and_then(serde_json::Value::as_str);
+    anthropic_service_tier(field("speed"), field("service_tier"))
+}
+
 /// Full (non-streaming) chat response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -888,6 +945,12 @@ pub struct ChatResponse {
     pub message: ChatMessage,
     pub finish_reason: FinishReason,
     pub usage: UsageStats,
+    /// Not serialized: a cached response was served by no upstream, so a
+    /// cache hit reports no tier — and this type denies unknown fields, so
+    /// writing it would make every cache entry unreadable to a gateway
+    /// release without the field.
+    #[serde(skip)]
+    pub service_tier: Option<ServiceTier>,
 }
 
 impl ChatResponse {
@@ -928,6 +991,10 @@ pub struct ChatChunk {
     pub finish_reason: Option<FinishReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageStats>,
+    /// The tier the upstream reported so far on this stream; see
+    /// [`ChatResponse::service_tier`] for why it is not serialized.
+    #[serde(skip)]
+    pub service_tier: Option<ServiceTier>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1763,6 +1830,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
         };
         let json = serde_json::to_string(&chunk).unwrap();
         assert!(!json.contains("\"finish_reason\""));

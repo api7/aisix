@@ -1810,6 +1810,7 @@ mod tests {
                     message: ChatMessage::assistant("stub"),
                     finish_reason: FinishReason::Stop,
                     usage: UsageStats::new(0, 0),
+                    service_tier: None,
                 })
             }
 

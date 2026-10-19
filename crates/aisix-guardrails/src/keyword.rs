@@ -226,6 +226,7 @@ mod tests {
             message: ChatMessage::assistant(content),
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(0, 0),
+            service_tier: None,
         }
     }
 
@@ -358,6 +359,7 @@ mod tests {
             message: msg,
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(0, 0),
+            service_tier: None,
         };
         assert!(g.check_output(&r).await.is_block());
     }

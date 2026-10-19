@@ -182,6 +182,16 @@ pub struct OpenAiResponse {
     pub choices: Vec<OpenAiChoice>,
     #[serde(default)]
     pub usage: Option<OpenAiUsage>,
+    /// The tier the upstream served the request on. Read as a raw value so
+    /// a compatible server that puts something other than a string here
+    /// cannot fail the whole response decode.
+    #[serde(default)]
+    pub service_tier: Option<serde_json::Value>,
+}
+
+/// The tier a top-level OpenAI-shape `service_tier` names, verbatim.
+pub fn service_tier_of(raw: Option<&serde_json::Value>) -> Option<aisix_gateway::ServiceTier> {
+    aisix_gateway::ServiceTier::openai(raw.and_then(|v| v.as_str()).map(str::to_owned))
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,6 +380,7 @@ pub fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
         message,
         finish_reason: finish,
         usage,
+        service_tier: service_tier_of(raw.service_tier.as_ref()),
     }
 }
 
@@ -478,6 +489,9 @@ pub struct OpenAiStreamChunk {
     pub choices: Vec<OpenAiStreamChoice>,
     #[serde(default)]
     pub usage: Option<OpenAiUsage>,
+    /// See [`OpenAiResponse::service_tier`].
+    #[serde(default)]
+    pub service_tier: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -601,6 +615,7 @@ pub fn stream_chunk_into_chat_chunk(
         delta,
         finish_reason: finish,
         usage: raw.usage.map(into_usage),
+        service_tier: service_tier_of(raw.service_tier.as_ref()),
     }
 }
 
@@ -1660,6 +1675,39 @@ mod tests {
 
     fn stream_chunk(json: serde_json::Value) -> OpenAiStreamChunk {
         serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn the_served_service_tier_is_read_verbatim() {
+        use aisix_gateway::ServiceTier;
+        let resp = |tier: serde_json::Value| {
+            let raw: OpenAiResponse = serde_json::from_value(serde_json::json!({
+                "id": "x", "choices": [], "service_tier": tier
+            }))
+            .unwrap();
+            response_into_chat_response(raw).service_tier
+        };
+        assert_eq!(
+            resp("ultrafast".into()),
+            Some(ServiceTier::OpenAi("ultrafast".into()))
+        );
+        assert_eq!(resp(serde_json::Value::Null), None);
+        assert_eq!(resp("".into()), None);
+        // A compatible server's odd value is ignored, not a decode failure.
+        assert_eq!(resp(7.into()), None);
+
+        let chunk = stream_chunk(serde_json::json!({
+            "id": "x", "choices": [], "service_tier": "flex"
+        }));
+        assert_eq!(
+            stream_chunk_into_chat_chunk(chunk, &mut ToolCallIndexer::default()).service_tier,
+            Some(ServiceTier::OpenAi("flex".into()))
+        );
+        let chunk = stream_chunk(serde_json::json!({"id": "x", "choices": []}));
+        assert_eq!(
+            stream_chunk_into_chat_chunk(chunk, &mut ToolCallIndexer::default()).service_tier,
+            None
+        );
     }
 
     #[test]

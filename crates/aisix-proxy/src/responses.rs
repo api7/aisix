@@ -180,6 +180,9 @@ struct ResponseUsage {
     /// upstream's own id on the #825 cross-provider path. Empty when the
     /// upstream returned no id (AISIX-Cloud#1289).
     provider_request_id: String,
+    /// The tier the upstream reported serving on: the Response object's
+    /// `service_tier`, or the bridged upstream's on the #825 path.
+    service_tier: Option<String>,
     /// The upstream failure that ended a stream after its `200` went out.
     /// `None` on the non-streaming paths, whose failures never get this far.
     failure: Option<crate::attempt::StreamFailure>,
@@ -1724,6 +1727,9 @@ async fn responses_to_target(
             if usage.provider_request_id.is_empty() {
                 usage.provider_request_id = responses_sse_provider_request_id(&buf);
             }
+            if let Some(tier) = responses_sse_service_tier(&buf) {
+                usage.service_tier = Some(tier);
+            }
             if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
                 let est = crate::token_estimate::Estimator::new(
                     &upstream_model,
@@ -2198,6 +2204,9 @@ async fn responses_to_target(
             if u.provider_request_id.is_empty() {
                 u.provider_request_id = crate::usage_attr::provider_response_id(&json_body);
             }
+            if u.service_tier.is_none() {
+                u.service_tier = response_service_tier(&json_body);
+            }
             if u.prompt_tokens == 0 || u.completion_tokens == 0 {
                 let est = crate::token_estimate::Estimator::new(
                     &upstream_model,
@@ -2622,6 +2631,7 @@ async fn responses_cross_provider_to_target(
                     upstream_ttft_ms: comp.upstream_ttft_ms,
                     downstream_latency_ms: comp.downstream_latency_ms,
                     provider_request_id: comp.provider_request_id,
+                    service_tier: comp.service_tier,
                     failure: comp.failure.clone(),
                 };
                 // A clean stream is a committed 200; an output-guardrail block
@@ -2785,6 +2795,7 @@ async fn responses_cross_provider_to_target(
             // below — that one is minted here and means nothing to the
             // provider (AISIX-Cloud#1289).
             provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
+            service_tier: resp.service_tier.as_ref().map(|t| t.as_str().to_owned()),
             failure: None,
         };
         // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
@@ -3008,8 +3019,19 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         // id it saw on an earlier frame across this replacement, so an
         // upstream that only stamps it on `response.created` still records.
         provider_request_id: crate::usage_attr::provider_response_id(body),
+        service_tier: response_service_tier(body),
         failure: None,
     })
+}
+
+/// A Response object's top-level `service_tier` — the tier the upstream
+/// actually served on, which can differ from the one requested.
+fn response_service_tier(response: &Value) -> Option<String> {
+    response
+        .get("service_tier")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 /// Pull usage out of one parsed Responses-API SSE event if it is a terminal
@@ -3137,6 +3159,16 @@ fn responses_sse_provider_request_id(bytes: &[u8]) -> String {
     String::new()
 }
 
+/// The last `service_tier` any frame's Response object carried in a
+/// fully-buffered Responses-API SSE body.
+fn responses_sse_service_tier(bytes: &[u8]) -> Option<String> {
+    crate::redact::sse_frame_payloads(bytes)
+        .into_iter()
+        .rev()
+        .filter_map(|payload| serde_json::from_str::<Value>(payload.trim()).ok())
+        .find_map(|json| json.get("response").and_then(response_service_tier))
+}
+
 /// Drain every complete SSE frame from `buf`, updating `acc` with the latest
 /// terminal-event usage (#808) and feeding each parsed event to the optional
 /// content capture (AISIX-Cloud#947). A frame ends at the first blank line;
@@ -3210,12 +3242,16 @@ fn drain_responses_sse_frames(
                     acc.get_or_insert_with(Default::default).provider_request_id =
                         crate::usage_attr::sanitize_provider_response_id(id);
                 }
+                // Every Response snapshot carries the tier; the last one wins.
+                if let Some(tier) = json.get("response").and_then(response_service_tier) {
+                    acc.get_or_insert_with(Default::default).service_tier = Some(tier);
+                }
                 if let Some(u) = parse_responses_terminal_usage(&json) {
                     // The terminal frame replaces the token counters; carry
                     // the latency figures and the id observed before it
                     // across — an upstream that stamps the id only on
                     // `response.created` would otherwise lose it here.
-                    let (ttft, down, prev_id, prev_failure) = acc
+                    let (ttft, down, prev_id, prev_failure, prev_tier) = acc
                         .as_ref()
                         .map(|a| {
                             (
@@ -3223,6 +3259,7 @@ fn drain_responses_sse_frames(
                                 a.downstream_latency_ms,
                                 a.provider_request_id.clone(),
                                 a.failure.clone(),
+                                a.service_tier.clone(),
                             )
                         })
                         .unwrap_or_default();
@@ -3235,6 +3272,7 @@ fn drain_responses_sse_frames(
                         upstream_ttft_ms: ttft,
                         downstream_latency_ms: down,
                         provider_request_id,
+                        service_tier: u.service_tier.clone().or(prev_tier),
                         failure: prev_failure,
                         ..u
                     });
@@ -3988,6 +4026,7 @@ fn emit_usage_event(
         downstream_latency_ms: usage.downstream_latency_ms,
         status_code,
         provider_request_id: usage.provider_request_id.clone(),
+        service_tier: usage.service_tier.clone(),
         inbound_protocol: "openai".to_string(),
         attempt_index: attempt.index,
         attempt_kind: attempt.kind,
@@ -6574,6 +6613,22 @@ mod tests {
             "fixture has no usage block, so this must be the estimated path",
         );
         assert_eq!(ev.provider_request_id, "resp_1289_estimated");
+    }
+
+    /// The buffered-SSE reader takes the tier off the last Response snapshot
+    /// that carries one, whether or not a terminal frame reported usage.
+    #[test]
+    fn buffered_sse_tier_is_the_last_snapshot_s() {
+        let body = b"\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"service_tier\":\"auto\"}}\n\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"service_tier\":\"priority\"}}\n\n\
+data: [DONE]\n\n";
+        assert_eq!(
+            super::responses_sse_service_tier(body).as_deref(),
+            Some("priority")
+        );
+        assert_eq!(super::responses_sse_service_tier(b"data: [DONE]\n\n"), None);
     }
 
     /// The buffered-SSE reader (the output-guardrail path holds the whole

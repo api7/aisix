@@ -588,6 +588,7 @@ pub fn response_into_fake_stream_chunks(resp: ChatResponse) -> Vec<ChatChunk> {
         message,
         finish_reason,
         usage,
+        service_tier,
     } = resp;
     let chunk = |delta, finish_reason, usage| ChatChunk {
         id: id.clone(),
@@ -595,6 +596,7 @@ pub fn response_into_fake_stream_chunks(resp: ChatResponse) -> Vec<ChatChunk> {
         delta,
         finish_reason,
         usage,
+        service_tier: service_tier.clone(),
     };
     // The non-streaming `tool_calls` shape carries no `index`, but the
     // streaming one must: OpenAI SDKs accumulate by it, and this repo's

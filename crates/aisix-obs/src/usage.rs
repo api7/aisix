@@ -460,6 +460,16 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider_model_version: String,
 
+    /// The service tier the upstream response reports it actually served
+    /// this attempt on, verbatim: OpenAI-shape `service_tier`, Anthropic
+    /// `usage.speed` when it is not `"standard"` and otherwise
+    /// `usage.service_tier`, Bedrock `serviceTier.type`. Never the tier the
+    /// request asked for and never a default — absent when the upstream
+    /// reported none, and on a cache hit, which no upstream served. Any
+    /// string: tier names differ across providers and change over time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+
     /// finish_reason / stop_reason from the upstream response, raw. Empty
     /// for upstream errors and guardrail blocks.
     ///
@@ -1840,6 +1850,7 @@ mod tests {
             api_key_id: "ak-uuid".into(),
             requested_model: "smart-group".into(),
             requested_model_id: "group-uuid".into(),
+            service_tier: Some("priority".into()),
             prompt_tokens: 12,
             completion_tokens: 34,
             upstream_latency_ms: 56,
@@ -1855,6 +1866,7 @@ mod tests {
         // so the dashboard can show the group a routed request used.
         assert!(json.contains(r#""requested_model":"smart-group""#));
         assert!(json.contains(r#""requested_model_id":"group-uuid""#));
+        assert!(json.contains(r#""service_tier":"priority""#));
         assert!(json.contains(r#""prompt_tokens":12"#));
         assert!(json.contains(r#""completion_tokens":34"#));
         assert!(json.contains(r#""guardrail_blocked":false"#));
@@ -1933,6 +1945,8 @@ mod tests {
         // Requested alias (AISIX-Cloud#790): absent when the request
         // never carried a resolvable model name.
         assert!(!json.contains(r#""requested_model""#));
+        // No tier reported by the upstream: no key, never a default.
+        assert!(!json.contains("service_tier"));
         // Applied guardrails (#379): absent when no guardrail governed the
         // request (the dominant guardrail-free deployment). Empty must not
         // appear on the wire — cp-api treats absent as the empty set.
