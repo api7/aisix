@@ -6054,6 +6054,7 @@ where
         let fold_base = base_usage != aisix_gateway::chat::UsageStats::default();
         let mut last_chunk_id = String::new();
         let mut last_chunk_model = String::new();
+        let mut last_chunk_tier = None;
         // Render + serialise one held/live chunk into an SSE Event.
         // Serialisation of these plain structs can't realistically fail;
         // the Err arm mirrors the pre-hold-back defensive error frame.
@@ -6100,6 +6101,9 @@ where
                     }
                     if !chunk.model.is_empty() {
                         last_chunk_model.clone_from(&chunk.model);
+                    }
+                    if chunk.service_tier.is_some() {
+                        last_chunk_tier.clone_from(&chunk.service_tier);
                     }
                     let comp = guard.comp();
                     if !chunk.id.is_empty() {
@@ -6510,7 +6514,7 @@ where
                 delta: Default::default(),
                 finish_reason: None,
                 usage: Some(judge_usage.saturating_add(&base_usage)),
-                service_tier: None,
+                service_tier: last_chunk_tier.take(),
             };
             if !hold_back || cap_released {
                 let ev = chunk_event!(chunk);

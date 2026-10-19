@@ -1707,14 +1707,16 @@ fn emit_converse_chunk(
             });
         }
         ConverseStreamOutput::Metadata(m) => {
+            // The tier rides the usage chunk; a metadata event without usage
+            // yields no chunk, as before, so no empty frame trails the finish.
             let service_tier = converse_service_tier(m.service_tier());
-            if m.usage.is_some() || service_tier.is_some() {
+            if let Some(u) = m.usage {
                 out.push(ChatChunk {
                     id: String::new(),
                     model: upstream_id.to_string(),
                     delta: ChatDelta::default(),
                     finish_reason: None,
-                    usage: m.usage.map(|u| UsageStats {
+                    usage: Some(UsageStats {
                         prompt_tokens: u.input_tokens.max(0) as u32,
                         completion_tokens: u.output_tokens.max(0) as u32,
                         total_tokens: u.total_tokens.max(0) as u32,
@@ -5069,31 +5071,51 @@ mod tests {
     #[test]
     fn converse_stream_metadata_reports_the_served_tier() {
         use aws_sdk_bedrockruntime::types::{
-            ConverseStreamMetadataEvent, ServiceTier as SdkTier, ServiceTierType,
+            ConverseStreamMetadataEvent, ServiceTier as SdkTier, ServiceTierType, TokenUsage,
         };
         let mut state = ConverseStreamState::default();
-        let meta = |tier: Option<ServiceTierType>| {
+        let usage = || {
+            TokenUsage::builder()
+                .input_tokens(3)
+                .output_tokens(1)
+                .total_tokens(4)
+                .build()
+                .unwrap()
+        };
+        let meta = |tier: Option<ServiceTierType>, with_usage: bool| {
             ConverseStreamOutput::Metadata(
                 ConverseStreamMetadataEvent::builder()
+                    .set_usage(with_usage.then(usage))
                     .set_service_tier(tier.map(|t| SdkTier::builder().r#type(t).build().unwrap()))
                     .build(),
             )
         };
-        let chunks = emit_converse_chunk(meta(Some(ServiceTierType::Flex)), "m", &mut state);
+        let chunks = emit_converse_chunk(meta(Some(ServiceTierType::Flex), true), "m", &mut state);
         assert_eq!(chunks.len(), 1);
         assert_eq!(
             chunks[0].service_tier,
             Some(ServiceTier::Native("flex".into()))
         );
-        assert!(chunks[0].usage.is_none());
+        assert_eq!(chunks[0].usage.as_ref().unwrap().prompt_tokens, 3);
         // A value this SDK release does not model keeps its raw string.
-        let chunks =
-            emit_converse_chunk(meta(Some(ServiceTierType::from("turbo"))), "m", &mut state);
+        let chunks = emit_converse_chunk(
+            meta(Some(ServiceTierType::from("turbo")), true),
+            "m",
+            &mut state,
+        );
         assert_eq!(
             chunks[0].service_tier,
             Some(ServiceTier::Native("turbo".into()))
         );
-        assert!(emit_converse_chunk(meta(None), "m", &mut state).is_empty());
+        assert_eq!(
+            emit_converse_chunk(meta(None, true), "m", &mut state)[0].service_tier,
+            None
+        );
+        // No usage, no chunk: nothing trails the finish frame.
+        assert!(
+            emit_converse_chunk(meta(Some(ServiceTierType::Flex), false), "m", &mut state)
+                .is_empty()
+        );
     }
 
     #[test]

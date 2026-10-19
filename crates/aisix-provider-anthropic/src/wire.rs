@@ -1367,25 +1367,20 @@ pub struct AnthropicResponse {
     pub usage: Option<AnthropicUsage>,
 }
 
-/// Anthropic `usage.speed` / `usage.service_tier`, kept as raw values so a
-/// non-string in either cannot fail the whole decode.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct AnthropicUsageTier {
-    pub speed: Option<serde_json::Value>,
-    pub service_tier: Option<serde_json::Value>,
-}
-
-impl AnthropicUsageTier {
-    pub fn service_tier(&self) -> Option<ServiceTier> {
-        fn s(v: &Option<serde_json::Value>) -> Option<&str> {
-            v.as_ref().and_then(serde_json::Value::as_str)
-        }
-        ServiceTier::native(aisix_gateway::chat::anthropic_service_tier(
-            s(&self.speed),
-            s(&self.service_tier),
-        ))
+/// The tier an Anthropic usage object's raw `speed` / `service_tier`
+/// report. Both are kept as raw values so a non-string in either cannot fail
+/// the whole decode.
+fn usage_service_tier(
+    speed: &Option<serde_json::Value>,
+    service_tier: &Option<serde_json::Value>,
+) -> Option<ServiceTier> {
+    fn s(v: &Option<serde_json::Value>) -> Option<&str> {
+        v.as_ref().and_then(serde_json::Value::as_str)
     }
+    ServiceTier::native(aisix_gateway::chat::anthropic_service_tier(
+        s(speed),
+        s(service_tier),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1440,8 +1435,10 @@ pub struct AnthropicUsage {
     /// Tokens served from the prompt cache (0.10× input rate).
     #[serde(default)]
     pub cache_read_input_tokens: u32,
-    #[serde(flatten)]
-    pub tier: AnthropicUsageTier,
+    #[serde(default)]
+    pub speed: Option<serde_json::Value>,
+    #[serde(default)]
+    pub service_tier: Option<serde_json::Value>,
 }
 
 pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
@@ -1529,7 +1526,10 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
         );
     }
 
-    let service_tier = raw.usage.as_ref().and_then(|u| u.tier.service_tier());
+    let service_tier = raw
+        .usage
+        .as_ref()
+        .and_then(|u| usage_service_tier(&u.speed, &u.service_tier));
     let usage = raw
         .usage
         .map(|u| {
@@ -1735,8 +1735,10 @@ pub struct AnthropicStreamStartUsage {
     pub cache_creation_input_tokens: Option<u32>,
     #[serde(default)]
     pub cache_read_input_tokens: Option<u32>,
-    #[serde(flatten)]
-    pub tier: AnthropicUsageTier,
+    #[serde(default)]
+    pub speed: Option<serde_json::Value>,
+    #[serde(default)]
+    pub service_tier: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1780,8 +1782,10 @@ pub struct AnthropicStreamUsage {
     pub cache_creation_input_tokens: Option<u32>,
     #[serde(default)]
     pub cache_read_input_tokens: Option<u32>,
-    #[serde(flatten)]
-    pub tier: AnthropicUsageTier,
+    #[serde(default)]
+    pub speed: Option<serde_json::Value>,
+    #[serde(default)]
+    pub service_tier: Option<serde_json::Value>,
 }
 
 /// Rolling state the Bridge carries across a stream so chunks can be
@@ -1844,7 +1848,11 @@ impl StreamState {
                     .as_ref()
                     .and_then(|u| u.cache_read_input_tokens)
                     .unwrap_or(0);
-                if let Some(tier) = message.usage.as_ref().and_then(|u| u.tier.service_tier()) {
+                if let Some(tier) = message
+                    .usage
+                    .as_ref()
+                    .and_then(|u| usage_service_tier(&u.speed, &u.service_tier))
+                {
                     self.service_tier = Some(tier);
                 }
             }
@@ -1901,7 +1909,7 @@ impl StreamState {
                 if let Some(t) = usage.cache_read_input_tokens {
                     self.cache_read_tokens = self.cache_read_tokens.max(t);
                 }
-                if let Some(tier) = usage.tier.service_tier() {
+                if let Some(tier) = usage_service_tier(&usage.speed, &usage.service_tier) {
                     self.service_tier = Some(tier);
                 }
             }
