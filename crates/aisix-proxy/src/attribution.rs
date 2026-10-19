@@ -1014,6 +1014,29 @@ pub(crate) fn requested_model_id(requested: &str) -> Option<String> {
         .flatten()
 }
 
+/// `model_id` for an event no attempt of its own answers for — a failure
+/// before any target was selected, or one after the winning attempt
+/// settled. `model_id` only ever names a dispatchable model: the last
+/// target that settled when there was one, else the entry `requested`
+/// resolved to when that entry dispatches itself (see
+/// [`note_resolved_entry`]), else empty — so a routing group, semantic
+/// router or ensemble that failed before selecting a target reports none,
+/// as the cancel path does. Empty outside a request scope.
+pub(crate) fn unattempted_model_id(requested: &str) -> String {
+    CURRENT
+        .try_with(|a| {
+            let cell = a.lock();
+            if !cell.cancel.last_settled_model_id.is_empty() {
+                cell.cancel.last_settled_model_id.clone()
+            } else if cell.resolved.requested_model == requested {
+                cell.cancel.entry_model_id.clone()
+            } else {
+                String::new()
+            }
+        })
+        .unwrap_or_default()
+}
+
 /// Note the target this request is about to dispatch to. Called for every
 /// attempt, so the cell holds the last one — the target whose failure the
 /// caller was ultimately served.
@@ -1968,6 +1991,43 @@ mod tests {
             assert_eq!(requested_model_id("my-group").as_deref(), Some("g-1"));
             // A name the request never resolved borrows nothing.
             assert_eq!(requested_model_id("gpt-4o"), None);
+        })
+        .await;
+    }
+
+    /// An event no attempt answers for names only a dispatchable model:
+    /// the addressed direct model, nothing for a group that selected no
+    /// target, and the selected target once one settled.
+    #[tokio::test]
+    async fn an_unattempted_event_names_only_a_dispatchable_model() {
+        scope(Arc::new(RequestAttribution::default()), async {
+            note_requested_model("m", "m-1");
+            note_resolved_entry("m-1");
+            assert_eq!(unattempted_model_id("m"), "m-1");
+            // A name the request never resolved borrows nothing.
+            assert_eq!(unattempted_model_id("other"), "");
+        })
+        .await;
+
+        scope(Arc::new(RequestAttribution::default()), async {
+            // A group: `resolve_model` notes no dispatchable entry.
+            note_requested_model("my-group", "g-1");
+            assert_eq!(unattempted_model_id("my-group"), "");
+            note_attempt_settled(&AttemptRecord {
+                index: 0,
+                kind: "initial",
+                target_model: "gpt-4o".into(),
+                target_model_id: "m-target".into(),
+                provider_key_id: "pk-1".into(),
+                status: 200,
+                success: true,
+                error_class: String::new(),
+                error_message: String::new(),
+                latency_ms: 5,
+                dispatched: true,
+            });
+            // A failure after the winner settled names the winner.
+            assert_eq!(unattempted_model_id("my-group"), "m-target");
         })
         .await;
     }

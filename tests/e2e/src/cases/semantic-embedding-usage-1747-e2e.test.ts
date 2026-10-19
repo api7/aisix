@@ -834,15 +834,16 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     expect(call.outcome).toBe("failed");
 
     // The bridge selected no target, so its zero usage is child-only. The
-    // parent identifies the resolved semantic router, never the embedding or
-    // a direct target attempt.
+    // parent names the semantic router as the entry the caller addressed;
+    // `model_id` names only a dispatchable model, and none was selected.
     expect(row.get("prompt_tokens") ?? "0").toBe("0");
     expect(row.get("completion_tokens") ?? "0").toBe("0");
     expect(row.get("total_tokens") ?? "0").toBe("0");
     expect(Number(row.get("cost_usd") ?? "0")).toBe(0);
     expect(row.get("requested_model")).toBe(FAILED_USAGE_ROUTER_MODEL);
     expect(failedUsageRouterModelID).not.toBe("");
-    expect(row.get("model_id")).toBe(failedUsageRouterModelID);
+    expect(row.get("requested_model_id")).toBe(failedUsageRouterModelID);
+    expect(row.get("model_id") ?? "").toBe("");
     expect(row.get("attempt_model") ?? "").toBe("");
     expect(row.get("model_id") ?? "").not.toBe(failedUsageEmbeddingModelID);
     expect(row.get("attempt_model") ?? "").not.toBe(FAILED_USAGE_EMBED_MODEL);

@@ -151,6 +151,17 @@ fn snapshot() -> AisixSnapshot {
         snap.models.insert(ResourceEntry::new(id, model, 1));
     }
 
+    // One routing group per model family, each fronting the direct row
+    // above, so the same fixtures can address a group instead.
+    for (id, name, target) in GROUPS {
+        let group: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": name,
+            "routing": { "strategy": "failover", "targets": [{ "model": target }] },
+        }))
+        .expect("valid routing group");
+        snap.models.insert(ResourceEntry::new(*id, group, 1));
+    }
+
     let agent: aisix_core::A2aAgent = serde_json::from_value(serde_json::json!({
         "name": "agent-under-test",
         "url": format!("{DEAD_UPSTREAM}/a2a"),
@@ -206,9 +217,35 @@ fn router() -> (axum::Router, tokio::sync::mpsc::Receiver<UsageEvent>) {
     (crate::build_router(state), rx)
 }
 
+/// `(id, display_name, target)` of the routing groups [`snapshot`] seeds.
+const GROUPS: &[(&str, &str, &str)] = &[
+    ("g-openai", "gpt-group-under-test", "gpt-under-test"),
+    (
+        "g-anthropic",
+        "claude-group-under-test",
+        "claude-under-test",
+    ),
+    ("g-embedding", "embed-group-under-test", "embed-under-test"),
+];
+
+/// The direct model a surface's fixture addresses, as `(id, display_name)`.
+fn direct_model(surface: &str) -> (&'static str, &'static str) {
+    match surface {
+        "/v1/messages" => ("m-anthropic", "claude-under-test"),
+        "/v1/embeddings" => ("m-embedding", "embed-under-test"),
+        _ => ("m-openai", "gpt-under-test"),
+    }
+}
+
 /// One driveable request per surface, with `text` in the field a caller
 /// authors — the field an input guardrail screens.
 fn fixture(surface: &str, text: &str) -> Request<Body> {
+    fixture_for(surface, direct_model(surface).1, text)
+}
+
+/// [`fixture`], addressing `model` instead of the surface's direct model.
+/// Ignored by the surfaces that carry no model (`/a2a`, `/passthrough/byo`).
+fn fixture_for(surface: &str, model: &str, text: &str) -> Request<Body> {
     let json = |uri: &str, body: serde_json::Value| {
         Request::builder()
             .method("POST")
@@ -222,17 +259,17 @@ fn fixture(surface: &str, text: &str) -> Request<Body> {
         "/v1/chat/completions" => json(
             surface,
             serde_json::json!({
-                "model": "gpt-under-test",
+                "model": model,
                 "messages": [{ "role": "user", "content": text }],
             }),
         ),
         "/v1/completions" => json(
             surface,
-            serde_json::json!({ "model": "gpt-under-test", "prompt": text }),
+            serde_json::json!({ "model": model, "prompt": text }),
         ),
         "/v1/responses" => json(
             surface,
-            serde_json::json!({ "model": "gpt-under-test", "input": text }),
+            serde_json::json!({ "model": model, "input": text }),
         ),
         "/v1/messages" => Request::builder()
             .method("POST")
@@ -242,7 +279,7 @@ fn fixture(surface: &str, text: &str) -> Request<Body> {
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({
-                    "model": "claude-under-test",
+                    "model": model,
                     "max_tokens": 16,
                     "messages": [{ "role": "user", "content": text }],
                 })
@@ -251,27 +288,27 @@ fn fixture(surface: &str, text: &str) -> Request<Body> {
             .unwrap(),
         "/v1/embeddings" => json(
             surface,
-            serde_json::json!({ "model": "embed-under-test", "input": text }),
+            serde_json::json!({ "model": model, "input": text }),
         ),
         "/v1/rerank" => json(
             surface,
             serde_json::json!({
-                "model": "gpt-under-test",
+                "model": model,
                 "query": text,
                 "documents": ["a document"],
             }),
         ),
         "/v1/images/generations" => json(
             surface,
-            serde_json::json!({ "model": "gpt-under-test", "prompt": text }),
+            serde_json::json!({ "model": model, "prompt": text }),
         ),
         "/v1/audio/speech" => json(
             surface,
-            serde_json::json!({ "model": "gpt-under-test", "input": text, "voice": "alloy" }),
+            serde_json::json!({ "model": model, "input": text, "voice": "alloy" }),
         ),
         "/v1/videos" => json(
             surface,
-            serde_json::json!({ "model": "gpt-under-test", "prompt": text }),
+            serde_json::json!({ "model": model, "prompt": text }),
         ),
         // JSON-RPC rather than an OpenAI envelope: the screened text is
         // `params.message`, the only caller-authored content A2A carries.
@@ -343,11 +380,12 @@ const SURFACES: &[&str] = &[
 /// failed attempt), and pinning it here would make this file fail for
 /// reasons that have nothing to do with the flag.
 async fn drive(surface: &str, text: &str) -> (u16, Vec<UsageEvent>) {
+    drive_request(fixture(surface, text)).await
+}
+
+async fn drive_request(request: Request<Body>) -> (u16, Vec<UsageEvent>) {
     let (router, mut rx) = router();
-    let response = router
-        .oneshot(fixture(surface, text))
-        .await
-        .expect("router must answer");
+    let response = router.oneshot(request).await.expect("router must answer");
     let status = response.status().as_u16();
     // Drain the body: a streaming surface emits from its end-of-stream
     // guard, which only runs once the body is polled to completion.
@@ -454,4 +492,59 @@ async fn an_ordinary_failure_is_not_marked_as_a_guardrail_block() {
          a flag set by every 4xx/5xx makes the Blocked view useless:\n  {}",
         wrong.join("\n  "),
     );
+}
+
+/// The surfaces whose fixture addresses a Model.
+fn model_surfaces() -> impl Iterator<Item = &'static str> {
+    SURFACES
+        .iter()
+        .copied()
+        .filter(|s| !matches!(*s, "/a2a" | "/passthrough/byo"))
+}
+
+/// `model_id` names only a model that dispatches to an upstream. A refusal
+/// before any target was selected therefore reports the addressed model's
+/// own id when the caller named a direct model, and no `model_id` at all
+/// when it named a group — on every surface, whichever emitter it uses.
+/// `requested_model_id` names the addressed entry either way.
+#[tokio::test]
+async fn a_refusal_before_dispatch_names_only_a_dispatchable_model() {
+    let mut wrong = Vec::new();
+    for surface in model_surfaces() {
+        let (id, _) = direct_model(surface);
+        let (status, events) = drive(surface, &format!("please {BLOCK} now")).await;
+        let Some(event) = events.iter().find(|e| e.guardrail_blocked) else {
+            wrong.push(format!(
+                "{surface} (direct): {status} with no refusal event"
+            ));
+            continue;
+        };
+        if event.model_id != id || event.requested_model_id != id {
+            wrong.push(format!(
+                "{surface} (direct): model_id {:?}, requested_model_id {:?}, expected {id:?} for both",
+                event.model_id, event.requested_model_id,
+            ));
+        }
+
+        let (group_id, group, _) = GROUPS
+            .iter()
+            .find(|(_, _, target)| *target == direct_model(surface).1)
+            .expect("a group per model family");
+        let (status, events) =
+            drive_request(fixture_for(surface, group, &format!("please {BLOCK} now"))).await;
+        if events.is_empty() {
+            wrong.push(format!("{surface} (group): {status} with no usage event"));
+            continue;
+        }
+        for event in &events {
+            if !event.model_id.is_empty() || event.requested_model_id != *group_id {
+                wrong.push(format!(
+                    "{surface} (group): {status} event model_id {:?}, requested_model_id {:?}; \
+                     expected \"\" and {group_id:?}",
+                    event.model_id, event.requested_model_id,
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

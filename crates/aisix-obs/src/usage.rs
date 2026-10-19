@@ -137,8 +137,13 @@ pub struct UsageEvent {
     /// [`UsageEvent::occurred_at_now`], never by hand.
     pub occurred_at: String,
 
-    /// UUID of the v3 Model row this request resolved to. Empty when
-    /// the request never reached model resolution.
+    /// UUID of the Model row this event is attributed to. A direct model
+    /// (or the wildcard row an alias resolved to) reports its own id on
+    /// every event, a failure before dispatch included; a routing /
+    /// semantic group or an ensemble reports the target the event's attempt
+    /// selected, and nothing when it failed before selecting one — a
+    /// group's own id prices nothing. Empty when the name never resolved.
+    /// `requested_model_id` names the addressed entry.
     #[serde(default)]
     pub model_id: String,
 

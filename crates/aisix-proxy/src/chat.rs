@@ -508,9 +508,12 @@ pub async fn chat_completions(
                 None,
             );
             // `resolved_model_id` is populated by `dispatch` once
-            // `req.model` resolves against the snapshot, so a guardrail /
-            // budget / rate-limit / bridge error after that point still
-            // records which model the request targeted. ContentFiltered
+            // `req.model` resolves against the snapshot: a direct model's
+            // own id, so a guardrail / budget / rate-limit / bridge error
+            // after that point still records the model that would have
+            // served; empty for a routing / semantic group that failed
+            // before selecting a target (its own id prices nothing); an
+            // ensemble's id once its members ran. ContentFiltered
             // (guardrail) sets `guardrail_blocked` for the Blocked tab —
             // through the shared predicate every handler now reads, so the
             // family cannot answer this question two different ways
@@ -1535,14 +1538,17 @@ async fn dispatch(
         })?;
     let model_id = virtual_entry.id.clone();
 
-    // Every error from here on attaches the resolved model_id so the
-    // failure-path telemetry event in `chat_completions` can surface
-    // which model the request targeted.
+    // Every error from here on attaches the `model_id` its failure event
+    // reports when no attempt answers for it: the entry's own id when the
+    // caller addressed a direct model, empty for a group — before a target
+    // is selected nothing dispatchable was involved, and once one is, the
+    // attempt rows name it.
     // Pre-upstream errors carry `None` for the charge — by definition
     // they fire before any provider billing happens. The output-filter
     // path below is the only site that builds a `Some(UpstreamCharge)`
     // (manually, not via this helper).
-    let with_model = |e: ProxyError| DispatchFailure::new(Some(model_id.clone()), None, e);
+    let failure_model_id = crate::model_resolve::dispatchable_entry_id(&virtual_entry).to_string();
+    let with_model = |e: ProxyError| DispatchFailure::new(Some(failure_model_id.clone()), None, e);
 
     if !auth.key().can_access(snapshot, &req.model) {
         return Err(with_model(ProxyError::ModelForbidden(req.model.clone())));
@@ -3734,7 +3740,9 @@ async fn dispatch_ensemble(
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<Success, DispatchFailure> {
     let started = Instant::now();
-    let with_model = |e: ProxyError| DispatchFailure::new(Some(model_id.to_string()), None, e);
+    // Refusals before any member is called: like any group that selected
+    // no target, the ensemble reports no `model_id` of its own.
+    let refuse_before_panel = |e: ProxyError| DispatchFailure::new(Some(String::new()), None, e);
 
     // The ensemble executor needs every panel member's full answer to
     // synthesize, so a tool-USING request can't be fanned out coherently
@@ -3753,7 +3761,7 @@ async fn dispatch_ensemble(
         .get("tool_choice")
         .is_some_and(|v| v != "none" && v != "auto");
     if has_tools || forces_tool {
-        return Err(with_model(ProxyError::InvalidRequest(
+        return Err(refuse_before_panel(ProxyError::InvalidRequest(
             "ensemble models do not support tools".into(),
         )));
     }
@@ -3761,7 +3769,7 @@ async fn dispatch_ensemble(
     // here; surface a 400 rather than panic if a future refactor breaks
     // that invariant.
     let ensemble_cfg = virtual_entry.value.ensemble.as_ref().ok_or_else(|| {
-        with_model(ProxyError::InvalidRequest(
+        refuse_before_panel(ProxyError::InvalidRequest(
             "model is not an ensemble".into(),
         ))
     })?;

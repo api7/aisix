@@ -866,6 +866,8 @@ async fn run_session(
                 crate::usage_attr::bypass_reason(&audit),
             );
             // Same reason as the session-end event: no attribution cell here.
+            // Realtime serves only direct models, so the entry is the target.
+            event.model_id = model_entry.id.clone();
             event.requested_model_id = model_entry.id.clone();
             let model = crate::usage_attr::usage_event_model_label(&snap, &requested_model);
             crate::usage_attr::emit_prepared_usage_event(
