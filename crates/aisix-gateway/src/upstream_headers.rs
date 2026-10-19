@@ -83,11 +83,13 @@ pub struct CallerIdentity {
 }
 
 impl CallerIdentity {
-    /// Read the identity off the authenticated key's snapshot entry and
-    /// the owner names resolved for it.
+    /// Read the identity off the authenticated key's snapshot entry, the
+    /// owner names resolved for it and the effective tags resolved from
+    /// both ([`aisix_core::KeyOwnerNames::effective_tags`]).
     pub fn from_entry(
         entry: &aisix_core::ResourceEntry<aisix_core::ApiKey>,
         owner: &aisix_core::KeyOwnerNames,
+        tags: std::sync::Arc<aisix_core::Tags>,
     ) -> Self {
         Self {
             api_key_id: entry.id.clone(),
@@ -95,7 +97,7 @@ impl CallerIdentity {
             team_id: entry.value.team_id.clone(),
             user_id: entry.value.user_id.clone(),
             user_name: owner.user_name(&entry.value).map(str::to_owned),
-            tags: std::sync::Arc::new(owner.effective_tags(&entry.value)),
+            tags,
         }
     }
 }

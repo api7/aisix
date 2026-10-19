@@ -113,25 +113,16 @@ fn tag_dimension_pattern() -> String {
 }
 
 impl PolicyDimension {
-    /// The fixed dimensions with their wire names, in declaration order.
-    const FIXED: [(Self, &'static str); 6] = [
-        (Self::Team, "team"),
-        (Self::Member, "member"),
-        (Self::ApiKey, "api_key"),
-        (Self::Model, "model"),
-        (Self::ModelName, "model_name"),
-        (Self::Provider, "provider"),
-    ];
-
     /// The wire name: a fixed name, or `tag:<key>`.
     pub fn name(&self) -> std::borrow::Cow<'static, str> {
         match self {
+            Self::Team => "team".into(),
+            Self::Member => "member".into(),
+            Self::ApiKey => "api_key".into(),
+            Self::Model => "model".into(),
+            Self::ModelName => "model_name".into(),
+            Self::Provider => "provider".into(),
             Self::Tag(key) => format!("{TAG_PREFIX}{key}").into(),
-            fixed => Self::FIXED
-                .iter()
-                .find(|(d, _)| d == fixed)
-                .map(|(_, n)| (*n).into())
-                .expect("every fixed dimension is listed"),
         }
     }
 
@@ -155,12 +146,17 @@ impl std::str::FromStr for PolicyDimension {
     type Err = String;
 
     fn from_str(name: &str) -> Result<Self, Self::Err> {
-        if let Some((d, _)) = Self::FIXED.iter().find(|(_, n)| *n == name) {
-            return Ok(d.clone());
-        }
-        parse_tag_dimension(name)
-            .map(Self::Tag)
-            .ok_or_else(|| format!("unknown condition dimension `{name}`"))
+        Ok(match name {
+            "team" => Self::Team,
+            "member" => Self::Member,
+            "api_key" => Self::ApiKey,
+            "model" => Self::Model,
+            "model_name" => Self::ModelName,
+            "provider" => Self::Provider,
+            other => parse_tag_dimension(other)
+                .map(Self::Tag)
+                .ok_or_else(|| format!("unknown condition dimension `{other}`"))?,
+        })
     }
 }
 
@@ -241,43 +237,31 @@ pub enum GroupByDimension {
 }
 
 impl GroupByDimension {
-    /// The fixed dimensions with their wire names, in canonical
-    /// bucket-segment order.
-    const FIXED: [(Self, &'static str); 5] = [
-        (Self::Team, "team"),
-        (Self::Member, "member"),
-        (Self::ApiKey, "api_key"),
-        (Self::Model, "model"),
-        (Self::Provider, "provider"),
-    ];
-
     /// The wire name: a fixed name, or `tag:<key>`.
     pub fn name(&self) -> std::borrow::Cow<'static, str> {
         match self {
+            Self::Team => "team".into(),
+            Self::Member => "member".into(),
+            Self::ApiKey => "api_key".into(),
+            Self::Model => "model".into(),
+            Self::Provider => "provider".into(),
             Self::Tag(key) => format!("{TAG_PREFIX}{key}").into(),
-            fixed => Self::FIXED
-                .iter()
-                .find(|(d, _)| d == fixed)
-                .map(|(_, n)| (*n).into())
-                .expect("every fixed dimension is listed"),
         }
     }
 
     /// Canonical bucket-segment order. Bucket keys append `group_by`
     /// segments in this order regardless of the row's declared order,
     /// so `[team, model]` and `[model, team]` address the same bucket:
-    /// the fixed dimensions in [`Self::FIXED`] order, then the `tag:`
+    /// `team`, `member`, `api_key`, `model`, `provider`, then the `tag:`
     /// dimensions by key.
-    pub fn canonical_rank(&self) -> (usize, &str) {
+    pub fn canonical_rank(&self) -> (u8, &str) {
         match self {
-            Self::Tag(key) => (Self::FIXED.len(), key.as_str()),
-            fixed => (
-                Self::FIXED
-                    .iter()
-                    .position(|(d, _)| d == fixed)
-                    .expect("every fixed dimension is listed"),
-                "",
-            ),
+            Self::Team => (0, ""),
+            Self::Member => (1, ""),
+            Self::ApiKey => (2, ""),
+            Self::Model => (3, ""),
+            Self::Provider => (4, ""),
+            Self::Tag(key) => (5, key.as_str()),
         }
     }
 }
@@ -286,12 +270,16 @@ impl std::str::FromStr for GroupByDimension {
     type Err = String;
 
     fn from_str(name: &str) -> Result<Self, Self::Err> {
-        if let Some((d, _)) = Self::FIXED.iter().find(|(_, n)| *n == name) {
-            return Ok(d.clone());
-        }
-        parse_tag_dimension(name)
-            .map(Self::Tag)
-            .ok_or_else(|| format!("unknown group_by dimension `{name}`"))
+        Ok(match name {
+            "team" => Self::Team,
+            "member" => Self::Member,
+            "api_key" => Self::ApiKey,
+            "model" => Self::Model,
+            "provider" => Self::Provider,
+            other => parse_tag_dimension(other)
+                .map(Self::Tag)
+                .ok_or_else(|| format!("unknown group_by dimension `{other}`"))?,
+        })
     }
 }
 

@@ -50,6 +50,11 @@ pub struct AuthenticatedKey {
     pub tags: Arc<aisix_core::Tags>,
 }
 
+/// The principal's effective tags, published beside its owner names so
+/// `ClientContext` reuses them instead of resolving them again.
+#[derive(Clone)]
+pub(crate) struct EffectiveTags(pub(crate) Arc<aisix_core::Tags>);
+
 /// The verified JWT identity a request authenticated as.
 pub struct JwtIdentity {
     /// Value of the trust provider's identity claim (`sub` by default).
@@ -146,10 +151,13 @@ impl AuthenticatedKey {
     }
 
     /// Publish the principal to the request's extensions, where
-    /// `ClientContext` reads the key and its resolved owner names.
+    /// `ClientContext` reads the key, its resolved owner names and tags.
     pub(crate) fn publish(&self, parts: &mut Parts) {
         parts.extensions.insert(self.entry.clone());
         parts.extensions.insert(self.owner.clone());
+        parts
+            .extensions
+            .insert(EffectiveTags(Arc::clone(&self.tags)));
     }
 
     /// The key's display name, for the `api_key_name` metric label.
@@ -170,10 +178,7 @@ impl AuthenticatedKey {
     /// The caller identity a usage event is attributed to, resolved from
     /// the same owner rows as [`Self::user_name`].
     pub(crate) fn caller(&self) -> aisix_gateway::CallerIdentity {
-        aisix_gateway::CallerIdentity {
-            tags: Arc::clone(&self.tags),
-            ..aisix_gateway::CallerIdentity::from_entry(&self.entry, &self.owner)
-        }
+        aisix_gateway::CallerIdentity::from_entry(&self.entry, &self.owner, Arc::clone(&self.tags))
     }
 }
 

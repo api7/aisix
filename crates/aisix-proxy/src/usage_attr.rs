@@ -493,8 +493,13 @@ pub(crate) fn apply_caller_identity(
     }
     // Request-scoped, like the member pair: resolved once from the
     // snapshot the request authenticated on, so every event of the request
-    // carries the same set. The values are bounded by the resource schema.
-    event.tags = (*caller.tags).clone();
+    // carries the same set. Values are operator-typed text bound for line-
+    // oriented sinks, so they get the same treatment as the ids above.
+    event.tags = caller
+        .tags
+        .iter()
+        .map(|(k, v)| (k.clone(), sanitize_tag(v.clone())))
+        .collect();
     if let Some(user_name) = caller.user_name.as_deref() {
         // NOT `sanitize_tag`, unlike the id above. That call exists to keep
         // operator-typed text safe on the cp-api wire and in the log line;
