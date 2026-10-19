@@ -242,10 +242,18 @@ fn to_log(record: &SinkRecord) -> Result<Log, SinkError> {
         .map_err(|e| SinkError::Permanent(format!("sls: serialize usage: {e}")))?;
     if let serde_json::Value::Object(fields) = usage {
         for (key, value) in fields {
+            // One field per cost-attribution tag, so each is a column an
+            // SLS query can filter on without parsing JSON.
+            if key == "tags" {
+                continue;
+            }
             if let Some(rendered) = render_scalar(&value) {
                 log.add_content_kv(key, rendered);
             }
         }
+    }
+    for (key, value) in &record.usage.tags {
+        log.add_content_kv(format!("tags.{key}"), value.as_str());
     }
     for (key, headers) in [
         ("request_headers", &record.request_headers),
@@ -696,9 +704,11 @@ mod tests {
         );
         assert_eq!(contents.get("team_id").map(String::as_str), Some("team-1"));
         assert_eq!(
-            contents.get("tags").map(String::as_str),
-            Some(r#"{"bg":"cloud","department":"rnd"}"#)
+            contents.get("tags.department").map(String::as_str),
+            Some("rnd")
         );
+        assert_eq!(contents.get("tags.bg").map(String::as_str), Some("cloud"));
+        assert!(!contents.contains_key("tags"));
         let json = |key: &str| -> serde_json::Value {
             serde_json::from_str(contents.get(key).expect(key)).unwrap()
         };

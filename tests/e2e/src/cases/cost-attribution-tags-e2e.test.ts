@@ -278,19 +278,18 @@ describe("cost-attribution tags e2e", () => {
     });
     expect(span.attributes["aisix.team_id"]).toBe(TEAM);
 
-    // The same row as a log consumer reads it: the usage event's own field
-    // names, the tags as one JSON object.
+    // The same row as a log consumer reads it: one `tags.<key>` field per
+    // tag beside the usage event's own field names.
     const log = await waitForSlsLog(
       sls,
       LOGSTORE,
       (l) => l.get("request_id") === full.requestId,
       "full-key usage row",
     );
-    expect(JSON.parse(log.get("tags") ?? "{}")).toEqual({
-      department: "key-dept",
-      bg: "team-bg",
-      subsidiary: "user-sub",
-    });
+    expect(log.get("tags.department")).toBe("key-dept");
+    expect(log.get("tags.bg")).toBe("team-bg");
+    expect(log.get("tags.subsidiary")).toBe("user-sub");
+    expect(log.get("tags")).toBeUndefined();
     expect(log.get("team_id")).toBe(TEAM);
 
     const memberOnly = await chat(MEMBER_ONLY_KEY, "cat-precedence-member");
@@ -314,7 +313,7 @@ describe("cost-attribution tags e2e", () => {
       (l) => l.get("request_id") === bare.requestId,
       "bare-key usage row",
     );
-    expect(bareLog.get("tags")).toBeUndefined();
+    expect([...bareLog.keys()].filter((k) => k.startsWith("tags"))).toEqual([]);
     expect(bareLog.get("team_id")).toBeUndefined();
   });
 
