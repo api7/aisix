@@ -162,6 +162,17 @@ fn snapshot() -> AisixSnapshot {
         snap.models.insert(ResourceEntry::new(*id, group, 1));
     }
 
+    let ensemble: aisix_core::Model = serde_json::from_value(serde_json::json!({
+        "display_name": "ens-under-test",
+        "ensemble": {
+            "panel": [{ "model": "gpt-under-test" }],
+            "judge": { "model": "gpt-under-test" },
+        },
+    }))
+    .expect("valid ensemble");
+    snap.models
+        .insert(ResourceEntry::new("g-ensemble", ensemble, 1));
+
     let agent: aisix_core::A2aAgent = serde_json::from_value(serde_json::json!({
         "name": "agent-under-test",
         "url": format!("{DEAD_UPSTREAM}/a2a"),
@@ -549,4 +560,44 @@ async fn a_refusal_before_dispatch_names_only_a_dispatchable_model() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The same rule for refusals that are not guardrail blocks: an ensemble
+/// refusing tools before its panel runs, and chat's empty-`messages` check,
+/// which runs ahead of model resolution.
+#[tokio::test]
+async fn other_refusals_before_dispatch_name_only_a_dispatchable_model() {
+    let chat = |body: serde_json::Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", format!("Bearer {CALLER}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    let (status, events) = drive_request(chat(serde_json::json!({
+        "model": "ens-under-test",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "tools": [{ "type": "function", "function": { "name": "f", "parameters": {} } }],
+    })))
+    .await;
+    assert_eq!(status, 400);
+    assert!(!events.is_empty(), "the refusal emitted no usage event");
+    for event in &events {
+        assert_eq!(event.model_id, "", "{event:?}");
+        assert_eq!(event.requested_model_id, "g-ensemble", "{event:?}");
+    }
+
+    let (status, events) = drive_request(chat(serde_json::json!({
+        "model": "gpt-under-test",
+        "messages": [],
+    })))
+    .await;
+    assert_eq!(status, 400);
+    assert!(!events.is_empty(), "the refusal emitted no usage event");
+    for event in &events {
+        assert_eq!(event.model_id, "m-openai", "{event:?}");
+    }
 }

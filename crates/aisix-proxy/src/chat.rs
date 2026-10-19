@@ -1515,8 +1515,12 @@ async fn dispatch(
     audit_out: &mut crate::usage_attr::GuardrailAudit,
 ) -> Result<Success, DispatchFailure> {
     if req.messages.is_empty() {
+        // Refused ahead of model resolution, but a resolvable name still
+        // reports the model it addressed, like every later refusal.
+        let model_id = crate::model_resolve::resolve_model(snapshot, &req.model)
+            .map(|entry| crate::model_resolve::dispatchable_entry_id(&entry).to_string());
         return Err(DispatchFailure::new(
-            None,
+            model_id,
             None,
             ProxyError::InvalidRequest("messages array must not be empty".into()),
         ));

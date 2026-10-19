@@ -1571,6 +1571,30 @@ mod tests {
         (addr, seen_handshake, seen_frames)
     }
 
+    /// The upstream dial failing is still the direct model's event: it
+    /// names that model in `model_id`, not just in `requested_model_id`.
+    #[tokio::test]
+    async fn a_failed_upstream_dial_names_the_direct_model() {
+        let snap = snapshot("http://127.0.0.1:1/v1", "openai", "openai");
+        let (addr, _state, mut rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let _client = tokio_tungstenite::connect_async(req).await;
+
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("usage event expected")
+            .expect("sink closed");
+        assert_eq!(ev.status_code, 502, "{ev:?}");
+        assert_eq!(ev.error_class, "transport", "{ev:?}");
+        assert_eq!(ev.model_id, "m-rt");
+        assert_eq!(ev.requested_model_id, "m-rt");
+    }
+
     #[tokio::test]
     async fn relays_frames_and_emits_aggregated_usage_event() {
         let (up_addr, handshake, frames) = spawn_upstream().await;
