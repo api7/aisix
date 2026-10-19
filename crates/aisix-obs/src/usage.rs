@@ -206,6 +206,16 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub requested_model: String,
 
+    /// UUID of the Model entry `requested_model` names — the entry the
+    /// caller addressed, so a group's rows stay joinable across a rename.
+    /// Equals `model_id` for a direct model (a wildcard alias names its
+    /// row); for a routing / semantic group or an ensemble it is the
+    /// group's id on every event of the request, while `model_id` names
+    /// the target each event dispatched to. Empty when the name resolved
+    /// to no entry.
+    #[serde(default)]
+    pub requested_model_id: String,
+
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
 
@@ -1829,6 +1839,7 @@ mod tests {
             model_id: "mod-uuid".into(),
             api_key_id: "ak-uuid".into(),
             requested_model: "smart-group".into(),
+            requested_model_id: "group-uuid".into(),
             prompt_tokens: 12,
             completion_tokens: 34,
             upstream_latency_ms: 56,
@@ -1843,6 +1854,7 @@ mod tests {
         // AISIX-Cloud#790: the client-sent alias rides next to model_id
         // so the dashboard can show the group a routed request used.
         assert!(json.contains(r#""requested_model":"smart-group""#));
+        assert!(json.contains(r#""requested_model_id":"group-uuid""#));
         assert!(json.contains(r#""prompt_tokens":12"#));
         assert!(json.contains(r#""completion_tokens":34"#));
         assert!(json.contains(r#""guardrail_blocked":false"#));
@@ -1920,7 +1932,7 @@ mod tests {
         assert!(!json.contains("request_headers"));
         // Requested alias (AISIX-Cloud#790): absent when the request
         // never carried a resolvable model name.
-        assert!(!json.contains("requested_model"));
+        assert!(!json.contains(r#""requested_model""#));
         // Applied guardrails (#379): absent when no guardrail governed the
         // request (the dominant guardrail-free deployment). Empty must not
         // appear on the wire — cp-api treats absent as the empty set.

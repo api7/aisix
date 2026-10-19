@@ -2112,6 +2112,11 @@ async fn attribute_batch_usage(
             ..Default::default()
         };
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
+        crate::usage_attr::stamp_requested_model_id(
+            &snap,
+            crate::operation::BATCH_COMPLETION,
+            &mut event,
+        );
         // Attribution names the identity that observed completion — the
         // same caller the event's api_key_id already reflects.
         crate::usage_attr::apply_caller_identity(&mut event, jwt, caller);

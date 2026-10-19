@@ -939,6 +939,26 @@ pub(crate) fn emit_prepared_usage_event(
     );
 }
 
+/// Fill `requested_model_id` with the id of the entry `requested_model`
+/// names, looked up on the snapshot the event is emitted against, so every
+/// family stamps it the same way and a group's id rides on every attempt,
+/// member and judge event of the request beside the target's `model_id`.
+///
+/// The passthrough namespace records the body's `model` for attribution but
+/// never resolves it against the Model table, so it names no entry.
+pub(crate) fn stamp_requested_model_id(
+    snap: &AisixSnapshot,
+    surface: Surface,
+    event: &mut UsageEvent,
+) {
+    if surface == crate::operation::PASSTHROUGH || event.requested_model.is_empty() {
+        return;
+    }
+    if let Some(id) = crate::model_resolve::resolved_entry_id(snap, &event.requested_model) {
+        event.requested_model_id = id;
+    }
+}
+
 /// THE emission chokepoint (AISIX-Cloud#1279): every usage event leaves
 /// through here, so the CP telemetry leg and the exporter fan-out cannot
 /// drift, and the trace snapshot is taken in exactly one place.
@@ -976,6 +996,7 @@ pub(crate) fn emit_usage(
     // present on a family's success path and missing from its error or
     // streaming one (AISIX-Cloud#1461).
     event.operation = surface.operation.to_string();
+    stamp_requested_model_id(snap, surface, &mut event);
     // Same reasoning, for the other shape of a caller walking away
     // (AISIX-Cloud#1571). A stream the consumer abandoned is reported as
     // 499 by six different families, each through its own emit helper and
@@ -1161,6 +1182,35 @@ fn attach_gateway_embedding_audit(event: &mut UsageEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The passthrough namespace records the body's `model` but never
+    /// resolves it, so a name that happens to match a configured Model must
+    /// not borrow that Model's id; every other surface takes the entry's id.
+    #[test]
+    fn requested_model_id_is_the_resolved_entry_except_on_passthrough() {
+        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "my-gpt4",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+        }))
+        .unwrap();
+        let snap = AisixSnapshot::new();
+        snap.models
+            .insert(ResourceEntry::new("model-uuid", model, 1));
+        let stamped = |surface, name: &str| {
+            let mut event = UsageEvent {
+                requested_model: name.into(),
+                ..Default::default()
+            };
+            stamp_requested_model_id(&snap, surface, &mut event);
+            event.requested_model_id
+        };
+        assert_eq!(stamped(crate::operation::CHAT, "my-gpt4"), "model-uuid");
+        assert_eq!(stamped(crate::operation::CHAT, "unknown-model"), "");
+        assert_eq!(stamped(crate::operation::CHAT, ""), "");
+        assert_eq!(stamped(crate::operation::PASSTHROUGH, "my-gpt4"), "");
+    }
 
     #[tokio::test]
     async fn terminal_event_receives_the_bounded_gateway_embedding_audit_once() {
