@@ -43,6 +43,11 @@ pub struct AuthenticatedKey {
     /// [`AuthenticatedKey::user_name`], never off the key directly — the
     /// key's own `user_name` is only the fallback.
     pub owner: aisix_core::KeyOwnerNames,
+    /// The request's effective cost-attribution tags, resolved from the key
+    /// and its `owner` rows ([`aisix_core::KeyOwnerNames::effective_tags`]).
+    /// Read by the `tag:` rate-limit policy dimensions and stamped on every
+    /// usage event through [`AuthenticatedKey::caller`].
+    pub tags: Arc<aisix_core::Tags>,
 }
 
 /// The verified JWT identity a request authenticated as.
@@ -126,8 +131,10 @@ impl AuthenticatedKey {
         jwt: Option<Arc<JwtIdentity>>,
         anonymous: bool,
     ) -> Self {
+        let owner = aisix_core::KeyOwnerNames::resolve(snapshot, &entry.value);
         Self {
-            owner: aisix_core::KeyOwnerNames::resolve(snapshot, &entry.value),
+            tags: Arc::new(owner.effective_tags(&entry.value)),
+            owner,
             entry,
             jwt,
             anonymous,
@@ -158,6 +165,15 @@ impl AuthenticatedKey {
     /// See [`aisix_core::KeyOwnerNames::user_name`].
     pub(crate) fn user_name(&self) -> Option<&str> {
         self.owner.user_name(self.key())
+    }
+
+    /// The caller identity a usage event is attributed to, resolved from
+    /// the same owner rows as [`Self::user_name`].
+    pub(crate) fn caller(&self) -> aisix_gateway::CallerIdentity {
+        aisix_gateway::CallerIdentity {
+            tags: Arc::clone(&self.tags),
+            ..aisix_gateway::CallerIdentity::from_entry(&self.entry, &self.owner)
+        }
     }
 }
 

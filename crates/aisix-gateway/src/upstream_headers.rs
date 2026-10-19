@@ -76,6 +76,10 @@ pub struct CallerIdentity {
     /// four `request.api_key.*` keys, and `HeaderVars::resolve` matches
     /// them one by one — this is not among them.
     pub user_name: Option<String>,
+    /// The request's effective cost-attribution tags
+    /// ([`aisix_core::KeyOwnerNames::effective_tags`]). Not a header-template
+    /// variable either.
+    pub tags: std::sync::Arc<aisix_core::Tags>,
 }
 
 impl CallerIdentity {
@@ -91,6 +95,7 @@ impl CallerIdentity {
             team_id: entry.value.team_id.clone(),
             user_id: entry.value.user_id.clone(),
             user_name: owner.user_name(&entry.value).map(str::to_owned),
+            tags: std::sync::Arc::new(owner.effective_tags(&entry.value)),
         }
     }
 }

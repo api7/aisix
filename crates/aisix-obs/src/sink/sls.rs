@@ -646,6 +646,12 @@ mod tests {
             operation: "chat".into(),
             finish_reason: "stop".into(),
             api_key_name: "key-a".into(),
+            team_id: "team-1".into(),
+            tags: [
+                ("department".to_string(), "rnd".to_string()),
+                ("bg".to_string(), "cloud".to_string()),
+            ]
+            .into(),
             request_headers: [
                 ("x-sub-user".to_string(), "alice".to_string()),
                 ("x-department".to_string(), "eng".to_string()),
@@ -687,6 +693,11 @@ mod tests {
         assert_eq!(
             contents.get("api_key_name").map(String::as_str),
             Some("key-a")
+        );
+        assert_eq!(contents.get("team_id").map(String::as_str), Some("team-1"));
+        assert_eq!(
+            contents.get("tags").map(String::as_str),
+            Some(r#"{"bg":"cloud","department":"rnd"}"#)
         );
         let json = |key: &str| -> serde_json::Value {
             serde_json::from_str(contents.get(key).expect(key)).unwrap()

@@ -1026,9 +1026,7 @@ async fn dispatch(
         path: path.clone(),
         request_id: client.request_id.clone(),
         api_key_id: auth.entry.id.clone(),
-        api_key_name: auth.api_key_name().map(str::to_owned),
-        user_id: auth.entry.value.user_id.clone(),
-        user_name: auth.user_name().map(str::to_owned),
+        caller: auth.caller(),
         jwt: auth.jwt.clone(),
         anonymous: auth.anonymous,
         client_identity,
@@ -6752,15 +6750,9 @@ struct RouteTelemetry {
     path: String,
     request_id: String,
     api_key_id: String,
-    /// Org member the authenticating key belongs to (AISIX-Cloud#1389),
-    /// and that member's display name for the `user_name` metric label
-    /// (AISIX-Cloud#1455). Both `None` for a key bound to no member —
-    /// including the anonymous route key, which belongs to the route
-    /// rather than to a person.
-    /// The authenticating key's display name (`UsageEvent::api_key_name`).
-    api_key_name: Option<String>,
-    user_id: Option<String>,
-    user_name: Option<String>,
+    /// Who the authenticating key is: its display name, member, team and
+    /// effective tags, stamped onto the usage event.
+    caller: aisix_gateway::CallerIdentity,
     jwt: Option<Arc<crate::auth::JwtIdentity>>,
     /// Whether the caller reached this route through `auth_mode:
     /// anonymous` rather than a credential of its own. Stamped onto the
@@ -7075,13 +7067,7 @@ impl RouteTelemetry {
             ..Default::default()
         };
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
-        crate::usage_attr::apply_caller_identity(
-            &mut event,
-            self.jwt.as_ref(),
-            self.api_key_name.as_deref(),
-            self.user_id.as_deref(),
-            self.user_name.as_deref(),
-        );
+        crate::usage_attr::apply_caller_identity(&mut event, self.jwt.as_ref(), &self.caller);
         if self.anonymous {
             event.auth_type = "anonymous".to_string();
         }

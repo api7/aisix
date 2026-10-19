@@ -461,40 +461,41 @@ pub(crate) fn apply_pk_telemetry(event: &mut UsageEvent, pk: &ResolvedPk<'_>) {
 }
 
 /// Stamp the caller-identity attribution fields onto an in-progress
-/// UsageEvent: the JWT identity (AISIX-Cloud#564) and the org member the
-/// authenticating key belongs to (AISIX-Cloud#1389). A `None` in either
-/// argument leaves its fields empty, which skip-serialize to wire NULL.
-/// One source of truth for the mapping so the handler family can't drift —
-/// same rationale as [`apply_pk_telemetry`]. The values are sanitised
-/// like every other externally-influenced tag: the subject is a claim
-/// from a verified token, but the identity provider is still not a
-/// trusted emitter of control characters or unbounded strings.
+/// UsageEvent: the JWT identity (AISIX-Cloud#564), the org member and team
+/// the authenticating key belongs to (AISIX-Cloud#1389), and the request's
+/// effective cost-attribution tags. An absent value leaves its field empty,
+/// which skip-serializes to wire NULL. One source of truth for the mapping
+/// so the handler family can't drift — same rationale as
+/// [`apply_pk_telemetry`]. The ids are sanitised like every other
+/// externally-influenced tag: the subject is a claim from a verified token,
+/// but the identity provider is still not a trusted emitter of control
+/// characters or unbounded strings.
 ///
-/// `user_id` takes both halves of the auth surface: on the API-key path it
-/// is the key's own `user_id`, and on the JWT path it is the `user_id` of
-/// the key the token resolved to — a JWT request runs AS a key, so one
-/// argument covers both and the member filter sees every credential a
+/// `caller` is one ApiKey row's identity, resolved once against the
+/// snapshot the request authenticated on, so every event of a request
+/// carries the same member, team and tags, and a name can never sit beside
+/// another member's id. A JWT request runs AS a key, so the same identity
+/// covers both auth surfaces and the member filter sees every credential a
 /// member calls through.
-///
-/// `user_name` is that member's display name for the metric label of the
-/// same name (AISIX-Cloud#1455). It is a separate argument rather than a
-/// separate call so the compiler makes every emitting path hand over both
-/// halves of one ApiKey row: a name sourced anywhere but beside its id is
-/// a name that will eventually label the wrong member.
 pub(crate) fn apply_caller_identity(
     event: &mut UsageEvent,
     jwt: Option<&std::sync::Arc<crate::auth::JwtIdentity>>,
-    api_key_name: Option<&str>,
-    user_id: Option<&str>,
-    user_name: Option<&str>,
+    caller: &aisix_gateway::CallerIdentity,
 ) {
-    if let Some(name) = api_key_name.filter(|n| !n.is_empty()) {
+    if let Some(name) = caller.api_key_name.as_deref().filter(|n| !n.is_empty()) {
         event.api_key_name = sanitize_tag(name.to_string());
     }
-    if let Some(user_id) = user_id {
+    if let Some(user_id) = caller.user_id.as_deref() {
         event.user_id = sanitize_tag(user_id.to_string());
     }
-    if let Some(user_name) = user_name {
+    if let Some(team_id) = caller.team_id.as_deref() {
+        event.team_id = sanitize_tag(team_id.to_string());
+    }
+    // Request-scoped, like the member pair: resolved once from the
+    // snapshot the request authenticated on, so every event of the request
+    // carries the same set. The values are bounded by the resource schema.
+    event.tags = (*caller.tags).clone();
+    if let Some(user_name) = caller.user_name.as_deref() {
         // NOT `sanitize_tag`, unlike the id above. That call exists to keep
         // operator-typed text safe on the cp-api wire and in the log line;
         // `user_name` reaches neither (`#[serde(skip)]`, and
@@ -756,13 +757,7 @@ pub(crate) fn emit_failed_attempts_as(
         };
         let pk = ResolvedPk::resolve(snap, &rec.provider_key_id);
         apply_pk_telemetry(&mut event, &pk);
-        apply_caller_identity(
-            &mut event,
-            client.jwt.as_ref(),
-            client.caller.api_key_name.as_deref(),
-            client.caller.user_id.as_deref(),
-            client.caller.user_name.as_deref(),
-        );
+        apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
         emit_usage(
             state,
             snap,
@@ -861,13 +856,7 @@ pub(crate) fn build_error_usage_event(
         guardrail_bypassed_reason: bypass,
         ..Default::default()
     };
-    apply_caller_identity(
-        &mut event,
-        client.jwt.as_ref(),
-        client.caller.api_key_name.as_deref(),
-        client.caller.user_id.as_deref(),
-        client.caller.user_name.as_deref(),
-    );
+    apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     event
 }
 
@@ -1557,6 +1546,98 @@ mod tests {
             missing.is_empty(),
             "these UsageEvent literals do not set request_headers: {missing:?}"
         );
+    }
+
+    /// Every `UsageEvent` this crate builds carries the caller identity —
+    /// the member, the team and the request's effective cost-attribution
+    /// tags — so every row of a request (each attempt, the terminal and
+    /// cancel rows, the after-the-fact batch rows) is attributed alike. The
+    /// fields default to empty, which reads as "no team, no tags" rather
+    /// than as a missing stamp, so no behavioural test of another family
+    /// can see an emitter that forgot it.
+    ///
+    /// The stamp is `apply_caller_identity`, called on the built event in
+    /// the rest of the block the literal sits in; the cancel emitter's
+    /// literals spread a base event that calls it. An emitter with no
+    /// authenticated caller behind it says so with a `NO-CALLER-IDENTITY:`
+    /// comment.
+    #[test]
+    fn every_usage_event_this_crate_builds_carries_the_caller_identity() {
+        const EXEMPT: &str = "NO-CALLER-IDENTITY:";
+        let literals = usage_event_literals_in_context();
+        assert!(
+            literals.len() >= 18,
+            "the UsageEvent literal scan found only {}",
+            literals.len()
+        );
+        let missing: Vec<&str> = literals
+            .iter()
+            .filter(|(_, block, rest)| {
+                !block.contains("..base_event(")
+                    && !block.contains(EXEMPT)
+                    && !rest.contains("apply_caller_identity(")
+            })
+            .map(|(site, _, _)| site.as_str())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these UsageEvent literals are never handed to apply_caller_identity: {missing:?}"
+        );
+    }
+
+    /// [`usage_event_literals`] with, for each, the rest of the innermost
+    /// block the literal sits in — where the event it builds is stamped.
+    fn usage_event_literals_in_context() -> Vec<(String, String, String)> {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        for path in crate_rs_files(&src_dir) {
+            let src = std::fs::read_to_string(&path).expect("source must read");
+            let name = path
+                .strip_prefix(&src_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            let code = code_mask(&src);
+            for (idx, _) in src.match_indices("UsageEvent {") {
+                if !code[idx] {
+                    continue;
+                }
+                let before = src[..idx]
+                    .trim_end()
+                    .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
+                    .trim_end();
+                if before.ends_with("->") {
+                    continue;
+                }
+                let open = idx + "UsageEvent ".len();
+                let block = braced_block(&src, &code, open).expect("balanced literal");
+                let after = open + block.len();
+                let b = src.as_bytes();
+                let mut depth = 0i64;
+                let mut end = b.len();
+                for i in after..b.len() {
+                    if !code[i] {
+                        continue;
+                    }
+                    match b[i] {
+                        b'{' => depth += 1,
+                        b'}' if depth == 0 => {
+                            end = i;
+                            break;
+                        }
+                        b'}' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                let line = src[..idx].lines().count();
+                out.push((
+                    format!("{name}:{line}"),
+                    block.to_string(),
+                    src[after..end].to_string(),
+                ));
+            }
+        }
+        out
     }
 
     /// Every `UsageEvent { .. }` literal in this crate's source, as

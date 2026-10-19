@@ -52,6 +52,8 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
+use super::tags::{is_valid_tag_key, Tags, TAG_KEY_PATTERN};
+
 /// Maximum group-nesting depth of a condition tree (top-level nodes are
 /// depth 1). Mirrored by cp-api validation and the dashboard builder.
 pub const MAX_CONDITION_DEPTH: usize = 3;
@@ -62,9 +64,13 @@ pub const MAX_CONDITION_VALUES: usize = 64;
 /// Maximum length of one regex pattern (`~~`/`~*`).
 pub const MAX_CONDITION_REGEX_LEN: usize = 256;
 
-/// Request dimension a condition leaf matches on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
+/// Request dimension a condition leaf matches on: one of the fixed
+/// dimensions, or `tag:<key>` for a cost-attribution tag.
+///
+/// Serialized as its name (`team`, `model_name`, `tag:department`, …); the
+/// schema is written by hand in [`PolicyDimension::json_schema`] because
+/// `schemars` cannot render the pattern branch beside the fixed names.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PolicyDimension {
     /// `ApiKey.team_id` (UUID).
     Team,
@@ -84,24 +90,55 @@ pub enum PolicyDimension {
     ModelName,
     /// Dispatched model's `provider` (models.dev catalog id).
     Provider,
+    /// `tag:<key>`: the request's effective value of a cost-attribution
+    /// tag ([`crate::models::KeyOwnerNames::effective_tags`]). Holds the
+    /// key, already checked against [`TAG_KEY_PATTERN`].
+    Tag(String),
+}
+
+/// The wire prefix of the tag dimension, shared by both dimension enums.
+const TAG_PREFIX: &str = "tag:";
+
+/// Parse `tag:<key>`, `None` when `name` is not a well-formed tag
+/// dimension.
+fn parse_tag_dimension(name: &str) -> Option<String> {
+    name.strip_prefix(TAG_PREFIX)
+        .filter(|key| is_valid_tag_key(key))
+        .map(str::to_owned)
+}
+
+/// The `tag:<key>` branch of both dimension schemas.
+fn tag_dimension_pattern() -> String {
+    format!("^{TAG_PREFIX}{}", &TAG_KEY_PATTERN[1..])
 }
 
 impl PolicyDimension {
-    pub fn as_str(&self) -> &'static str {
+    /// The fixed dimensions with their wire names, in declaration order.
+    const FIXED: [(Self, &'static str); 6] = [
+        (Self::Team, "team"),
+        (Self::Member, "member"),
+        (Self::ApiKey, "api_key"),
+        (Self::Model, "model"),
+        (Self::ModelName, "model_name"),
+        (Self::Provider, "provider"),
+    ];
+
+    /// The wire name: a fixed name, or `tag:<key>`.
+    pub fn name(&self) -> std::borrow::Cow<'static, str> {
         match self {
-            Self::Team => "team",
-            Self::Member => "member",
-            Self::ApiKey => "api_key",
-            Self::Model => "model",
-            Self::ModelName => "model_name",
-            Self::Provider => "provider",
+            Self::Tag(key) => format!("{TAG_PREFIX}{key}").into(),
+            fixed => Self::FIXED
+                .iter()
+                .find(|(d, _)| d == fixed)
+                .map(|(_, n)| (*n).into())
+                .expect("every fixed dimension is listed"),
         }
     }
 
     /// Identity dimensions carry opaque ids: only equality/set
-    /// operators are meaningful. String dimensions additionally admit
-    /// the regex operators.
-    fn is_identity(self) -> bool {
+    /// operators are meaningful. String dimensions — `tag:` among them —
+    /// additionally admit the regex operators.
+    fn is_identity(&self) -> bool {
         matches!(self, Self::Team | Self::Member | Self::ApiKey | Self::Model)
     }
 
@@ -109,14 +146,82 @@ impl PolicyDimension {
     /// (vs. the caller identity). Decides the reservation point: the
     /// quota gate evaluates model-property policies where the concrete
     /// model is known (per routing target), see `aisix-proxy::quota`.
-    pub fn is_model_property(self) -> bool {
+    pub fn is_model_property(&self) -> bool {
         matches!(self, Self::Model | Self::ModelName | Self::Provider)
+    }
+}
+
+impl std::str::FromStr for PolicyDimension {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        if let Some((d, _)) = Self::FIXED.iter().find(|(_, n)| *n == name) {
+            return Ok(d.clone());
+        }
+        parse_tag_dimension(name)
+            .map(Self::Tag)
+            .ok_or_else(|| format!("unknown condition dimension `{name}`"))
     }
 }
 
 impl std::fmt::Display for PolicyDimension {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(&self.name())
+    }
+}
+
+impl Serialize for PolicyDimension {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyDimension {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        name.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl schemars::JsonSchema for PolicyDimension {
+    fn schema_name() -> String {
+        "PolicyDimension".into()
+    }
+
+    fn json_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        let fixed = |name: &str, description: &str| serde_json::json!({ "type": "string", "enum": [name], "description": description });
+        serde_json::from_value(serde_json::json!({
+            "description": "Request dimension a condition leaf matches on.",
+            "oneOf": [
+                fixed("team", "`ApiKey.team_id` (UUID)."),
+                fixed("member", "`ApiKey.user_id` (UUID)."),
+                fixed("api_key", "Authenticated api_key entry id (UUID)."),
+                fixed(
+                    "model",
+                    "Model entry id (UUID). Matches the dispatched model; on a Model-Group / \
+                     semantic-router / ensemble dispatch it also matches the requested parent \
+                     entry, so a group's own id selects every request addressed to that group.",
+                ),
+                fixed(
+                    "model_name",
+                    "Model display name — the string dimension for regex/prefix matching \
+                     (\"every gpt-4-family alias\"). Matches the dispatched model's name, and on \
+                     a virtual-parent dispatch also the requested parent's name.",
+                ),
+                fixed("provider", "Dispatched model's `provider` (models.dev catalog id)."),
+                {
+                    "type": "string",
+                    "pattern": tag_dimension_pattern(),
+                    "description": "`tag:<key>` — the request's effective value of the \
+                        cost-attribution tag `<key>`: the API key's own `tags[<key>]`, else that \
+                        of the team its `team_id` names, else that of the member its `user_id` \
+                        names. A string dimension: it admits `==`, `~=`, `in`, `~~` and `~*`. A \
+                        request with no value for the key matches neither the condition nor its \
+                        negation, exactly like `team` on a key that belongs to no team.",
+                },
+            ],
+        }))
+        .expect("PolicyDimension schema is a valid schema")
     }
 }
 
@@ -124,42 +229,116 @@ impl std::fmt::Display for PolicyDimension {
 /// [`PolicyDimension`] with a stable per-request value to key a bucket
 /// segment on — `model_name` is excluded (it duplicates `model` as a
 /// bucket identity, less precisely).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GroupByDimension {
     Team,
     Member,
     ApiKey,
     Model,
     Provider,
+    /// `tag:<key>`: one counter per effective value of the tag.
+    Tag(String),
 }
 
 impl GroupByDimension {
-    pub fn as_str(&self) -> &'static str {
+    /// The fixed dimensions with their wire names, in canonical
+    /// bucket-segment order.
+    const FIXED: [(Self, &'static str); 5] = [
+        (Self::Team, "team"),
+        (Self::Member, "member"),
+        (Self::ApiKey, "api_key"),
+        (Self::Model, "model"),
+        (Self::Provider, "provider"),
+    ];
+
+    /// The wire name: a fixed name, or `tag:<key>`.
+    pub fn name(&self) -> std::borrow::Cow<'static, str> {
         match self {
-            Self::Team => "team",
-            Self::Member => "member",
-            Self::ApiKey => "api_key",
-            Self::Model => "model",
-            Self::Provider => "provider",
+            Self::Tag(key) => format!("{TAG_PREFIX}{key}").into(),
+            fixed => Self::FIXED
+                .iter()
+                .find(|(d, _)| d == fixed)
+                .map(|(_, n)| (*n).into())
+                .expect("every fixed dimension is listed"),
         }
     }
 
     /// Canonical bucket-segment order. Bucket keys append `group_by`
     /// segments in this order regardless of the row's declared order,
-    /// so `[team, model]` and `[model, team]` address the same bucket.
-    pub const CANONICAL_ORDER: [GroupByDimension; 5] = [
-        Self::Team,
-        Self::Member,
-        Self::ApiKey,
-        Self::Model,
-        Self::Provider,
-    ];
+    /// so `[team, model]` and `[model, team]` address the same bucket:
+    /// the fixed dimensions in [`Self::FIXED`] order, then the `tag:`
+    /// dimensions by key.
+    pub fn canonical_rank(&self) -> (usize, &str) {
+        match self {
+            Self::Tag(key) => (Self::FIXED.len(), key.as_str()),
+            fixed => (
+                Self::FIXED
+                    .iter()
+                    .position(|(d, _)| d == fixed)
+                    .expect("every fixed dimension is listed"),
+                "",
+            ),
+        }
+    }
+}
+
+impl std::str::FromStr for GroupByDimension {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        if let Some((d, _)) = Self::FIXED.iter().find(|(_, n)| *n == name) {
+            return Ok(d.clone());
+        }
+        parse_tag_dimension(name)
+            .map(Self::Tag)
+            .ok_or_else(|| format!("unknown group_by dimension `{name}`"))
+    }
 }
 
 impl std::fmt::Display for GroupByDimension {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(&self.name())
+    }
+}
+
+impl Serialize for GroupByDimension {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for GroupByDimension {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        name.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl schemars::JsonSchema for GroupByDimension {
+    fn schema_name() -> String {
+        "GroupByDimension".into()
+    }
+
+    fn json_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        serde_json::from_value(serde_json::json!({
+            "description": "Dimension a policy's counters split on (`group_by`). The subset of \
+                the condition dimensions with a stable per-request value to key a counter on — \
+                `model_name` is excluded (it duplicates `model` as a counter identity, less \
+                precisely).",
+            "oneOf": [
+                { "type": "string", "enum": ["team", "member", "api_key", "model", "provider"] },
+                {
+                    "type": "string",
+                    "pattern": tag_dimension_pattern(),
+                    "description": "`tag:<key>` — one counter per effective value of the \
+                        cost-attribution tag `<key>` (the API key's own value, else its team's, \
+                        else its member's). A matched request with no value for the key is not \
+                        subject to the policy, exactly like `team` on a key that belongs to no \
+                        team.",
+                },
+            ],
+        }))
+        .expect("GroupByDimension schema is a valid schema")
     }
 }
 
@@ -216,7 +395,7 @@ impl ConditionOperator {
     /// (UUID values) take equality/set operators only; string dimensions
     /// additionally take the regex pair. The remaining tokens are wire
     /// vocabulary reserved for future array/numeric/IP dimensions.
-    fn admitted_by(self, dimension: PolicyDimension) -> bool {
+    fn admitted_by(self, dimension: &PolicyDimension) -> bool {
         match self {
             Self::Eq | Self::Ne | Self::In => true,
             Self::Regex | Self::RegexCi => !dimension.is_identity(),
@@ -339,7 +518,7 @@ fn validate_node(node: &ConditionNode, depth: usize, leaves: &mut usize) -> Resu
 
 fn validate_leaf(leaf: &PolicyCondition) -> Result<(), String> {
     let ctx = |msg: String| format!("condition on `{}`: {msg}", leaf.dimension);
-    if !leaf.operator.admitted_by(leaf.dimension) {
+    if !leaf.operator.admitted_by(&leaf.dimension) {
         return Err(ctx(format!(
             "operator `{}` is not supported on this dimension",
             leaf.operator
@@ -411,10 +590,14 @@ pub struct ConditionInput<'a> {
     /// Display name of that parent, the `model_name` twin of
     /// [`Self::routing_parent_model`].
     pub routing_parent_model_name: Option<&'a str>,
+    /// The request's effective cost-attribution tags, read by the
+    /// `tag:<key>` dimensions. `None` — like an empty set — means the
+    /// request carries no tag dimension at all.
+    pub tags: Option<&'a Tags>,
 }
 
 impl<'a> ConditionInput<'a> {
-    pub fn get(&self, dimension: PolicyDimension) -> Option<&'a str> {
+    pub fn get(&self, dimension: &PolicyDimension) -> Option<&'a str> {
         match dimension {
             PolicyDimension::Team => self.team,
             PolicyDimension::Member => self.member,
@@ -422,7 +605,12 @@ impl<'a> ConditionInput<'a> {
             PolicyDimension::Model => self.model,
             PolicyDimension::ModelName => self.model_name,
             PolicyDimension::Provider => self.provider,
+            PolicyDimension::Tag(key) => self.tag(key),
         }
+    }
+
+    fn tag(&self, key: &str) -> Option<&'a str> {
+        self.tags.and_then(|tags| tags.get(key)).map(String::as_str)
     }
 
     /// The caller-addressed parent's value for a model-property
@@ -430,7 +618,7 @@ impl<'a> ConditionInput<'a> {
     /// that parent selected. Identity/provider dimensions have no
     /// parent variant (the parent shares the caller identity and
     /// carries no provider).
-    fn routing_parent(&self, dimension: PolicyDimension) -> Option<&'a str> {
+    fn routing_parent(&self, dimension: &PolicyDimension) -> Option<&'a str> {
         match dimension {
             PolicyDimension::Model => self.routing_parent_model,
             PolicyDimension::ModelName => self.routing_parent_model_name,
@@ -438,13 +626,14 @@ impl<'a> ConditionInput<'a> {
         }
     }
 
-    pub fn get_group_by(&self, dimension: GroupByDimension) -> Option<&'a str> {
+    pub fn get_group_by(&self, dimension: &GroupByDimension) -> Option<&'a str> {
         match dimension {
             GroupByDimension::Team => self.team,
             GroupByDimension::Member => self.member,
             GroupByDimension::ApiKey => self.api_key,
             GroupByDimension::Model => self.model,
             GroupByDimension::Provider => self.provider,
+            GroupByDimension::Tag(key) => self.tag(key),
         }
     }
 }
@@ -472,7 +661,7 @@ fn eval_leaf(leaf: &PolicyCondition, input: &ConditionInput<'_>) -> bool {
     // A request without the dimension matches neither the condition nor
     // its negation: it is outside the dimension's universe, not in the
     // complement set. (`team ∉ {T}` must not capture team-less keys.)
-    let Some(var) = input.get(leaf.dimension) else {
+    let Some(var) = input.get(&leaf.dimension) else {
         return false;
     };
     // Model dimensions carry a {dispatched target, requested parent}
@@ -485,7 +674,7 @@ fn eval_leaf(leaf: &PolicyCondition, input: &ConditionInput<'_>) -> bool {
     // operator vocabulary (and the dashboard's normalization) is
     // built on; `negate` then flips the combined result, so a negated
     // leaf excluding the parent excludes every request addressed to it.
-    let parent = input.routing_parent(leaf.dimension);
+    let parent = input.routing_parent(&leaf.dimension);
     let raw = if leaf.operator == ConditionOperator::Ne {
         eval_operator(leaf, var) && parent.is_none_or(|p| eval_operator(leaf, p))
     } else {
@@ -621,6 +810,7 @@ mod tests {
             provider: Some("openai"),
             routing_parent_model: None,
             routing_parent_model_name: None,
+            tags: None,
         }
     }
 
@@ -995,5 +1185,83 @@ mod tests {
             { "dimension": "team", "operator": "regex", "value": "^t" }
         ]));
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn tag_dimensions_round_trip_and_reject_a_malformed_key() {
+        let dim: PolicyDimension =
+            serde_json::from_value(serde_json::json!("tag:department")).unwrap();
+        assert_eq!(dim, PolicyDimension::Tag("department".into()));
+        assert_eq!(serde_json::to_value(&dim).unwrap(), "tag:department");
+        let by: GroupByDimension = serde_json::from_value(serde_json::json!("tag:bg")).unwrap();
+        assert_eq!(serde_json::to_value(&by).unwrap(), "tag:bg");
+        assert_eq!(
+            serde_json::to_value(PolicyDimension::ModelName).unwrap(),
+            "model_name"
+        );
+        for bad in ["tag:", "tag:Dept", "tag:1x", "tags:dept", "department"] {
+            assert!(
+                serde_json::from_value::<PolicyDimension>(serde_json::json!(bad)).is_err(),
+                "{bad}"
+            );
+            assert!(
+                serde_json::from_value::<GroupByDimension>(serde_json::json!(bad)).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn tag_leaf_reads_the_effective_tag_and_an_absent_one_matches_neither_way() {
+        let tags: Tags = [("department".to_string(), "rnd".to_string())].into();
+        let with = ConditionInput {
+            tags: Some(&tags),
+            ..input()
+        };
+        let dept = || PolicyDimension::Tag("department".into());
+        assert!(eval_condition_nodes(
+            &[leaf(dept(), ConditionOperator::Eq, one("rnd"))],
+            &with
+        ));
+        assert!(!eval_condition_nodes(
+            &[leaf(dept(), ConditionOperator::Eq, one("ops"))],
+            &with
+        ));
+        assert!(eval_condition_nodes(
+            &[leaf(dept(), ConditionOperator::Regex, one("^r"))],
+            &with
+        ));
+        // A string dimension: the regex operators validate.
+        assert!(
+            validate_condition_nodes(&[leaf(dept(), ConditionOperator::RegexCi, one("^R"))])
+                .is_ok()
+        );
+
+        let bg = || PolicyDimension::Tag("bg".into());
+        for node in [
+            leaf(bg(), ConditionOperator::Eq, one("x")),
+            leaf(bg(), ConditionOperator::Ne, one("x")),
+            neg_leaf(bg(), ConditionOperator::Eq, one("x")),
+        ] {
+            assert!(!eval_condition_nodes(&[node], &with));
+        }
+        assert!(!eval_condition_nodes(
+            &[neg_leaf(dept(), ConditionOperator::Eq, one("x"))],
+            &input()
+        ));
+    }
+
+    #[test]
+    fn group_by_tags_sort_after_the_fixed_dimensions_by_key() {
+        let mut dims: Vec<GroupByDimension> = serde_json::from_value(serde_json::json!([
+            "tag:subsidiary",
+            "model",
+            "tag:bg",
+            "team"
+        ]))
+        .unwrap();
+        dims.sort_by(|a, b| a.canonical_rank().cmp(&b.canonical_rank()));
+        let names: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
+        assert_eq!(names, ["team", "model", "tag:bg", "tag:subsidiary"]);
     }
 }

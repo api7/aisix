@@ -664,6 +664,12 @@ mod tests {
             operation: "chat".into(),
             finish_reason: "stop".into(),
             api_key_name: "key-a".into(),
+            team_id: "team-1".into(),
+            tags: [
+                ("department".to_string(), "rnd".to_string()),
+                ("bg".to_string(), "cloud".to_string()),
+            ]
+            .into(),
             request_headers: [
                 ("x-sub-user".to_string(), "alice".to_string()),
                 ("x-department".to_string(), "eng".to_string()),
@@ -698,6 +704,11 @@ mod tests {
             serde_json::json!({"x-upstream-id": "u-1"})
         );
         assert_eq!(log["aisix.api_key_name"], "key-a");
+        assert_eq!(log["aisix.team_id"], "team-1");
+        assert_eq!(
+            log["aisix.tags"],
+            serde_json::json!({"department": "rnd", "bg": "cloud"})
+        );
         assert_eq!(
             log["gen_ai.input.messages"],
             serde_json::json!([{"role": "user",

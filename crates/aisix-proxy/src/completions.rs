@@ -986,13 +986,7 @@ fn emit_usage_event(
         event.error_class = crate::attempt::GUARDRAIL_BLOCK_CLASS.to_string();
         event.error_message = guardrail_block_message.to_string();
     }
-    crate::usage_attr::apply_caller_identity(
-        &mut event,
-        client.jwt.as_ref(),
-        client.caller.api_key_name.as_deref(),
-        client.caller.user_id.as_deref(),
-        client.caller.user_name.as_deref(),
-    );
+    crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
     crate::usage_attr::emit_usage(

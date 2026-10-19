@@ -4015,13 +4015,7 @@ fn emit_usage_event(
     event.reasoning_unfolded_from_completion = usage
         .completion_tokens
         .saturating_sub(event.completion_tokens);
-    crate::usage_attr::apply_caller_identity(
-        &mut event,
-        client.jwt.as_ref(),
-        client.caller.api_key_name.as_deref(),
-        client.caller.user_id.as_deref(),
-        client.caller.user_name.as_deref(),
-    );
+    crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
     crate::usage_attr::emit_usage(
         state,
@@ -4181,13 +4175,7 @@ fn emit_zero_token_event(
         guardrail_blocked: terminal && guardrail_blocked,
         ..Default::default()
     };
-    crate::usage_attr::apply_caller_identity(
-        &mut event,
-        client.jwt.as_ref(),
-        client.caller.api_key_name.as_deref(),
-        client.caller.user_id.as_deref(),
-        client.caller.user_name.as_deref(),
-    );
+    crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
     crate::usage_attr::emit_usage(
         state,

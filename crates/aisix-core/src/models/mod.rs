@@ -40,6 +40,7 @@ pub mod routing;
 pub mod schema;
 pub mod semantic;
 pub mod snapshot;
+pub mod tags;
 pub mod team;
 pub mod user;
 
@@ -109,5 +110,6 @@ pub use semantic::{
     Semantic, SemanticClassifier, SemanticMatch, SemanticRoute, TYPESAFE_PROVIDER,
 };
 pub use snapshot::{AisixSnapshot, KeyOwnerNames};
+pub use tags::{effective_tags, is_valid_tag_key, Tags, TAG_KEY_PATTERN};
 pub use team::Team;
 pub use user::User;
