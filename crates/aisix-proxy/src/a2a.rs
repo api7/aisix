@@ -1016,13 +1016,7 @@ fn emit_a2a_usage(
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(&call.guardrail_audit),
         ..Default::default()
     };
-    crate::usage_attr::apply_caller_identity(
-        &mut event,
-        auth.jwt.as_ref(),
-        auth.api_key_name(),
-        auth.key().user_id.as_deref(),
-        auth.user_name(),
-    );
+    crate::usage_attr::apply_caller_identity(&mut event, auth.jwt.as_ref(), &auth.caller());
     // The client-perceived duration of the call. Recorded here rather than at
     // the stream's drop guard so the unary, quota-rejected and failed-to-open
     // paths are in the sample too — a streaming-only series would report

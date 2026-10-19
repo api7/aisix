@@ -299,6 +299,16 @@
       ],
       "description": "Request, token, and concurrency limits for this key."
     },
+    "tags": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Cost-attribution tags, as tag key to tag value — for example `{\"department\": \"rnd\", \"subsidiary\": \"emea\"}`. Every request this key authenticates is attributed to one value per tag key, resolved when the request is made with the nearest setting winning: this key's own value, else the value in the `tags` of the team `team_id` names, else the value in the `tags` of the member `user_id` names. Different keys combine, so a request can carry tags from all three. Tags are never read from the request itself. Keys match `^[a-z][a-z0-9_]{0,62}$`, values are 1 to 128 characters, and at most 32 entries are allowed. Omitted or empty means the key adds no tags of its own.",
+      "type": [
+        "object",
+        "null"
+      ]
+    },
     "team_id": {
       "description": "Team this API key belongs to. Used for matching team-scope rate limit policies.",
       "minLength": 1,

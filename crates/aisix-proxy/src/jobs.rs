@@ -683,13 +683,7 @@ fn emit_job_usage_event(
     };
     let pk = crate::usage_attr::ResolvedPk::resolve(snap, &target.pk_entry.id);
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
-    crate::usage_attr::apply_caller_identity(
-        &mut event,
-        auth.jwt.as_ref(),
-        auth.api_key_name(),
-        auth.key().user_id.as_deref(),
-        auth.user_name(),
-    );
+    crate::usage_attr::apply_caller_identity(&mut event, auth.jwt.as_ref(), &auth.caller());
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
     crate::usage_attr::emit_usage(
@@ -1926,9 +1920,9 @@ fn maybe_attribute_batch(
 
     let state = state.clone();
     let api_key_id = auth.entry.id.clone();
-    let user_id = auth.entry.value.user_id.clone();
-    let api_key_name = auth.api_key_name().map(str::to_owned);
-    let user_name = auth.user_name().map(str::to_owned);
+    // The key that observed the batch complete, resolved now: its
+    // member, team and tags are what the attribution rows carry.
+    let caller = auth.caller();
     let jwt = auth.jwt.clone();
     let request_headers = client.request_headers.clone();
     let model_id = target.model_entry.id.clone();
@@ -1956,9 +1950,7 @@ fn maybe_attribute_batch(
             &state,
             &api_key_id,
             jwt.as_ref(),
-            api_key_name.as_deref(),
-            user_id.as_deref(),
-            user_name.as_deref(),
+            &caller,
             &request_headers,
             &model_id,
             &display_name,
@@ -1992,9 +1984,7 @@ async fn attribute_batch_usage(
     state: &ProxyState,
     api_key_id: &str,
     jwt: Option<&std::sync::Arc<crate::auth::JwtIdentity>>,
-    api_key_name: Option<&str>,
-    user_id: Option<&str>,
-    user_name: Option<&str>,
+    caller: &aisix_gateway::CallerIdentity,
     request_headers: &std::collections::BTreeMap<String, String>,
     model_id: &str,
     display_name: &str,
@@ -2124,7 +2114,7 @@ async fn attribute_batch_usage(
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
         // Attribution names the identity that observed completion — the
         // same caller the event's api_key_id already reflects.
-        crate::usage_attr::apply_caller_identity(&mut event, jwt, api_key_name, user_id, user_name);
+        crate::usage_attr::apply_caller_identity(&mut event, jwt, caller);
         let usage_model =
             crate::usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();
         state.usage_sink.try_emit(

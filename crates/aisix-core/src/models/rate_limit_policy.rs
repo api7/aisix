@@ -260,8 +260,10 @@ pub struct RateLimitPolicy {
     pub conditions: Option<Vec<ConditionNode>>,
     /// Dimensions the counters split on; `[]`/absent = one shared
     /// bucket for every matched request. A matched request missing a
-    /// `group_by` dimension is not subject to the policy (mirrors
-    /// `team_member` only applying to keys that carry a `user_id`).
+    /// `group_by` dimension — a `team` or `member` its key does not
+    /// carry, or a `tag:<key>` it has no value for — is not subject to the
+    /// policy (mirrors `team_member` only applying to keys that carry a
+    /// `user_id`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_by: Option<Vec<GroupByDimension>>,
     /// Full 7-field limits (`rps/rpm/rph/rpd/tpm/tpd/concurrency`) —
@@ -359,7 +361,7 @@ impl RateLimitPolicy {
                     if seen.contains(dim) {
                         return Err(format!("`group_by` repeats dimension `{dim}`"));
                     }
-                    seen.push(*dim);
+                    seen.push(dim.clone());
                 }
             }
             return Ok(());

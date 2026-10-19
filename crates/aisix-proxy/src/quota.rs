@@ -108,6 +108,7 @@ fn condition_input<'a>(
         provider: model_rl.and_then(|m| m.provider.as_deref()),
         routing_parent_model: routing_parent.map(|p| p.entry_id),
         routing_parent_model_name: routing_parent.map(|p| p.name),
+        tags: Some(&auth.tags),
     }
 }
 
@@ -213,12 +214,15 @@ fn match_conditional_layer(
     // order never changes the bucket identity. A matched request
     // missing a split dimension is not subject to the policy (mirrors
     // `team_member` only applying to keys carrying a `user_id`).
-    let group_by = policy.group_by.as_deref().unwrap_or_default();
+    let mut group_by: Vec<&GroupByDimension> = policy
+        .group_by
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .collect();
+    group_by.sort_by_key(|dim| dim.canonical_rank());
     let mut bucket_key = format!("policy:v2:{policy_entry_id}");
-    for dim in GroupByDimension::CANONICAL_ORDER {
-        if !group_by.contains(&dim) {
-            continue;
-        }
+    for dim in group_by {
         let value = input.get_group_by(dim)?;
         bucket_key = format!("{bucket_key}:{dim}={}", escape_bucket_segment(value));
     }
@@ -687,6 +691,7 @@ mod tests {
             )),
             jwt: None,
             owner: Default::default(),
+            tags: Default::default(),
         }
     }
 
@@ -793,6 +798,7 @@ mod tests {
                     provider: value,
                     routing_parent_model: parent,
                     routing_parent_model_name: parent,
+                    tags: None,
                 };
                 for phase in [REQUEST, REQUEST_DEFERRING, PolicyPhase::ModelTarget] {
                     let layer = |entry: &ResourceEntry<RateLimitPolicy>| {
@@ -990,6 +996,56 @@ mod tests {
             layer.bucket_key,
             "policy:v2:pol-2:team=team-1:model=model-1"
         );
+    }
+
+    #[test]
+    fn tag_conditions_and_group_by_follow_the_effective_tags() {
+        let policy = make_conditional_policy(serde_json::json!({
+            "name": "per-department",
+            "conditions": [
+                { "dimension": "tag:bg", "operator": "==", "value": "cloud" }
+            ],
+            "group_by": ["tag:department", "team"],
+            "limits": { "rpm": 20 },
+        }));
+        let mut auth = make_auth(Some("team-1"), None);
+        auth.tags = std::sync::Arc::new(
+            [
+                ("bg".to_string(), "cloud".to_string()),
+                ("department".to_string(), "r:d".to_string()),
+            ]
+            .into(),
+        );
+        let layer = match_policy_layer(
+            &policy,
+            "pol-t",
+            &condition_input(&auth, None, None),
+            REQUEST,
+        )
+        .expect("matches");
+        assert_eq!(
+            layer.bucket_key,
+            "policy:v2:pol-t:team=team-1:tag:department=r%3Ad"
+        );
+
+        // No value for a group_by tag: not subject to the policy.
+        auth.tags = std::sync::Arc::new([("bg".to_string(), "cloud".to_string())].into());
+        assert!(match_policy_layer(
+            &policy,
+            "pol-t",
+            &condition_input(&auth, None, None),
+            REQUEST
+        )
+        .is_none());
+        // No value for the condition tag: unmatched.
+        auth.tags = Default::default();
+        assert!(match_policy_layer(
+            &policy,
+            "pol-t",
+            &condition_input(&auth, None, None),
+            REQUEST
+        )
+        .is_none());
     }
 
     #[test]

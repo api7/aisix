@@ -362,22 +362,12 @@ fn base_event(
     // families resolve, or from the auth extractor alone on `/mcp` and
     // `/a2a`, which never build one. Both read the same `api_key` row.
     match ctx.client.as_ref() {
-        Some(client) => usage_attr::apply_caller_identity(
-            &mut event,
-            client.jwt.as_ref(),
-            client.caller.api_key_name.as_deref(),
-            client.caller.user_id.as_deref(),
-            client.caller.user_name.as_deref(),
-        ),
+        Some(client) => {
+            usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller)
+        }
         None => {
             if let Some(auth) = ctx.auth.as_ref() {
-                usage_attr::apply_caller_identity(
-                    &mut event,
-                    auth.jwt.as_ref(),
-                    auth.api_key_name(),
-                    auth.key().user_id.as_deref(),
-                    auth.user_name(),
-                );
+                usage_attr::apply_caller_identity(&mut event, auth.jwt.as_ref(), &auth.caller());
             }
         }
     }

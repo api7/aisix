@@ -1249,6 +1249,15 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
     if !event.user_id.is_empty() {
         attributes.push(attr_string("aisix.user_id", &event.user_id));
     }
+    if !event.team_id.is_empty() {
+        attributes.push(attr_string("aisix.team_id", &event.team_id));
+    }
+    // The request's effective cost-attribution tags, one attribute per tag
+    // key — the same `aisix.tags.<key>` path the Datadog log's nested
+    // `aisix.tags` object facets on.
+    for (key, value) in &event.tags {
+        attributes.push(attr_string(&format!("aisix.tags.{key}"), value));
+    }
     if !event.model_id.is_empty() {
         attributes.push(attr_string("aisix.model_id", &event.model_id));
     }
@@ -2322,12 +2331,19 @@ mod tests {
         );
     }
 
-    /// The per-request latency breakdown, the key's name, TPOT and the
-    /// modality counts each ride the operation span; absent ones stay off.
+    /// The per-request latency breakdown, the key's name, team and tags,
+    /// TPOT and the modality counts each ride the operation span; absent
+    /// ones stay off.
     #[test]
-    fn span_carries_key_name_overhead_tpot_and_modality_counts() {
+    fn span_carries_key_identity_tags_overhead_tpot_and_modality_counts() {
         let mut ev = sample_event();
         ev.api_key_name = "team-a-key".into();
+        ev.team_id = "team-1".into();
+        ev.tags = [
+            ("department".to_string(), "rnd".to_string()),
+            ("bg".to_string(), "cloud".to_string()),
+        ]
+        .into();
         ev.gateway_overhead_ms = Some(7);
         ev.upstream_tpot_ms = Some(12.5);
         ev.modality_tokens = aisix_gateway::ModalityTokens {
@@ -2342,6 +2358,15 @@ mod tests {
             attr(span, "aisix.api_key_name").unwrap()["stringValue"],
             "team-a-key"
         );
+        assert_eq!(
+            attr(span, "aisix.team_id").unwrap()["stringValue"],
+            "team-1"
+        );
+        assert_eq!(
+            attr(span, "aisix.tags.department").unwrap()["stringValue"],
+            "rnd"
+        );
+        assert_eq!(attr(span, "aisix.tags.bg").unwrap()["stringValue"], "cloud");
         assert_eq!(
             attr(span, "aisix.gateway_overhead_ms").unwrap()["intValue"],
             "7"
@@ -2367,6 +2392,8 @@ mod tests {
         let bare = build_otlp_traces_payload(&sample_event(), "x").to_string();
         for key in [
             "aisix.api_key_name",
+            "aisix.team_id",
+            "aisix.tags.",
             "aisix.gateway_overhead_ms",
             "aisix.upstream_tpot_ms",
             "gen_ai.usage.audio.",

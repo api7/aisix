@@ -4868,13 +4868,7 @@ fn emit_usage_event(
     };
     event.reasoning_unfolded_from_completion =
         completion_tokens.saturating_sub(event.completion_tokens);
-    crate::usage_attr::apply_caller_identity(
-        &mut event,
-        client.jwt.as_ref(),
-        client.caller.api_key_name.as_deref(),
-        client.caller.user_id.as_deref(),
-        client.caller.user_name.as_deref(),
-    );
+    crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     // Handler label "chat" matches the documented enumeration for
     // `aisix_usage_events_emitted_total` (#408). Keep `&'static str`
     // so prometheus cardinality stays bounded. Both emit legs (CP sink +

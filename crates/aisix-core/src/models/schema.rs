@@ -144,8 +144,8 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "passthrough_route" => passthrough_route_root_schema(),
         "mcp_auth_settings" => mcp_auth_settings_root_schema(),
         "pricing" => pricing_root_schema(),
-        "team" => team_root_schema(),
-        "user" => user_root_schema(),
+        "team" => team_root_schema(strict),
+        "user" => user_root_schema(strict),
         other => panic!("unknown resource {other:?}"),
     };
     if strict {
@@ -1139,6 +1139,7 @@ fn split_semantic_modes(node: &mut serde_json::Map<String, Value>) {
 pub fn apikey_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::ApiKey>(true);
     if strict {
+        super::tags::constrain_tags_property(&mut schema);
         require_mcp_tool_ref(&mut schema);
         let access = schema
             .pointer_mut("/definitions/McpAccess")
@@ -2248,14 +2249,22 @@ pub fn pricing_root_schema() -> Value {
 
 /// Canonical JSON Schema for the `team` resource, derived from the
 /// [`Team`](crate::models::Team) struct.
-pub fn team_root_schema() -> Value {
-    struct_root_schema::<crate::models::Team>(false)
+pub fn team_root_schema(strict: bool) -> Value {
+    let mut schema = struct_root_schema::<crate::models::Team>(false);
+    if strict {
+        super::tags::constrain_tags_property(&mut schema);
+    }
+    schema
 }
 
 /// Canonical JSON Schema for the `user` resource, derived from the
 /// [`User`](crate::models::User) struct.
-pub fn user_root_schema() -> Value {
-    struct_root_schema::<crate::models::User>(false)
+pub fn user_root_schema(strict: bool) -> Value {
+    let mut schema = struct_root_schema::<crate::models::User>(false);
+    if strict {
+        super::tags::constrain_tags_property(&mut schema);
+    }
+    schema
 }
 
 /// Canonical JSON Schema for the `observability_exporter` resource, derived

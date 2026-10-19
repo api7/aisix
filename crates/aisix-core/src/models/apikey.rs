@@ -80,6 +80,24 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_name: Option<String>,
 
+    /// Cost-attribution tags, as tag key to tag value — for example
+    /// `{"department": "rnd", "subsidiary": "emea"}`. Every request this key
+    /// authenticates is attributed to one value per tag key, resolved when
+    /// the request is made with the nearest setting winning: this key's own
+    /// value, else the value in the `tags` of the team `team_id` names, else
+    /// the value in the `tags` of the member `user_id` names. Different keys
+    /// combine, so a request can carry tags from all three. Tags are never
+    /// read from the request itself. Keys match `^[a-z][a-z0-9_]{0,62}$`,
+    /// values are 1 to 128 characters, and at most 32 entries are allowed.
+    /// Omitted or empty means the key adds no tags of its own.
+    #[serde(
+        default,
+        deserialize_with = "crate::models::tags::null_as_empty",
+        skip_serializing_if = "crate::models::Tags::is_empty"
+    )]
+    #[schemars(schema_with = "crate::models::tags::tags_schema")]
+    pub tags: crate::models::Tags,
+
     /// External identity bound to this key for JWT authentication.
     /// When a request presents a valid JWT issued by the
     /// `oidc_providers` entry named in `jwt_provider`, the value of
@@ -438,6 +456,7 @@ mod tests {
             team_id: None,
             user_id: None,
             user_name: None,
+            tags: Default::default(),
             jwt_subject: None,
             jwt_provider: None,
             mcp_access: None,

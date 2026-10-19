@@ -179,6 +179,18 @@ impl KeyOwnerNames {
             None => key.user_name.as_deref(),
         }
     }
+
+    /// The request's effective cost-attribution tags: per tag key, the
+    /// key's own value, else the team's, else the member's
+    /// ([`crate::models::effective_tags`]). Only the key's own `team_id` /
+    /// `user_id` count.
+    pub fn effective_tags(&self, key: &ApiKey) -> crate::models::Tags {
+        crate::models::effective_tags(
+            &key.tags,
+            self.team.as_ref().map(|e| &e.value.tags),
+            self.user.as_ref().map(|e| &e.value.tags),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -204,6 +216,7 @@ mod tests {
         let key = |json: &str| serde_json::from_str::<ApiKey>(json).unwrap();
         let named = |name: &str| Team {
             name: name.into(),
+            tags: Default::default(),
             runtime_id: String::new(),
         };
         snap.teams
@@ -214,6 +227,7 @@ mod tests {
             "u-1",
             User {
                 name: "Alice".into(),
+                tags: Default::default(),
                 runtime_id: String::new(),
             },
             1,
@@ -222,6 +236,7 @@ mod tests {
             "u-empty",
             User {
                 name: String::new(),
+                tags: Default::default(),
                 runtime_id: String::new(),
             },
             1,

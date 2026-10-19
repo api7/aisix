@@ -43,7 +43,17 @@ pub struct AuthenticatedKey {
     /// [`AuthenticatedKey::user_name`], never off the key directly — the
     /// key's own `user_name` is only the fallback.
     pub owner: aisix_core::KeyOwnerNames,
+    /// The request's effective cost-attribution tags, resolved from the key
+    /// and its `owner` rows ([`aisix_core::KeyOwnerNames::effective_tags`]).
+    /// Read by the `tag:` rate-limit policy dimensions and stamped on every
+    /// usage event through [`AuthenticatedKey::caller`].
+    pub tags: Arc<aisix_core::Tags>,
 }
+
+/// The principal's effective tags, published beside its owner names so
+/// `ClientContext` reuses them instead of resolving them again.
+#[derive(Clone)]
+pub(crate) struct EffectiveTags(pub(crate) Arc<aisix_core::Tags>);
 
 /// The verified JWT identity a request authenticated as.
 pub struct JwtIdentity {
@@ -126,8 +136,10 @@ impl AuthenticatedKey {
         jwt: Option<Arc<JwtIdentity>>,
         anonymous: bool,
     ) -> Self {
+        let owner = aisix_core::KeyOwnerNames::resolve(snapshot, &entry.value);
         Self {
-            owner: aisix_core::KeyOwnerNames::resolve(snapshot, &entry.value),
+            tags: Arc::new(owner.effective_tags(&entry.value)),
+            owner,
             entry,
             jwt,
             anonymous,
@@ -139,10 +151,13 @@ impl AuthenticatedKey {
     }
 
     /// Publish the principal to the request's extensions, where
-    /// `ClientContext` reads the key and its resolved owner names.
+    /// `ClientContext` reads the key, its resolved owner names and tags.
     pub(crate) fn publish(&self, parts: &mut Parts) {
         parts.extensions.insert(self.entry.clone());
         parts.extensions.insert(self.owner.clone());
+        parts
+            .extensions
+            .insert(EffectiveTags(Arc::clone(&self.tags)));
     }
 
     /// The key's display name, for the `api_key_name` metric label.
@@ -158,6 +173,12 @@ impl AuthenticatedKey {
     /// See [`aisix_core::KeyOwnerNames::user_name`].
     pub(crate) fn user_name(&self) -> Option<&str> {
         self.owner.user_name(self.key())
+    }
+
+    /// The caller identity a usage event is attributed to, resolved from
+    /// the same owner rows as [`Self::user_name`].
+    pub(crate) fn caller(&self) -> aisix_gateway::CallerIdentity {
+        aisix_gateway::CallerIdentity::from_entry(&self.entry, &self.owner, Arc::clone(&self.tags))
     }
 }
 

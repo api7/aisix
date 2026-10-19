@@ -66,7 +66,7 @@ pub use models::{
     McpTransport, Model, ObservabilityExporter, ParamConstraints, PassthroughAuthMode,
     PassthroughCredentialMode, PassthroughRoute, PolicyScope, PolicyWindow, ProviderApis,
     ProviderKey, RateLimit, RateLimitPolicy, RequestOverrides, ResponseOverrides, Routing,
-    RoutingStrategy, RoutingTarget, SchemaError, StreamDoneMarker, Team, TelemetryKind,
+    RoutingStrategy, RoutingTarget, SchemaError, StreamDoneMarker, Tags, Team, TelemetryKind,
     TelemetryTags, User, WhenAllUnavailablePolicy, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};

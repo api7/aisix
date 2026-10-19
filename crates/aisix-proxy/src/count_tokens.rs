@@ -1007,13 +1007,7 @@ fn emit_usage_event(
         event.attempt_model = w.target_model.clone();
     }
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
-    crate::usage_attr::apply_caller_identity(
-        &mut event,
-        client.jwt.as_ref(),
-        client.caller.api_key_name.as_deref(),
-        client.caller.user_id.as_deref(),
-        client.caller.user_name.as_deref(),
-    );
+    crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
     crate::usage_attr::emit_usage(

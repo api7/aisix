@@ -51,7 +51,7 @@ impl PolicyIndex {
                 PolicyDimension::ModelName => input.routing_parent_model_name,
                 _ => None,
             };
-            for value in [input.get(*dimension), parent].into_iter().flatten() {
+            for value in [input.get(dimension), parent].into_iter().flatten() {
                 if let Some(matches) = by_value.get(value) {
                     positions.extend_from_slice(matches);
                 }
@@ -85,10 +85,10 @@ fn required_match(nodes: &[ConditionNode]) -> Option<(PolicyDimension, Vec<Strin
     nodes.iter().find_map(|node| match node {
         ConditionNode::Leaf(leaf) if !leaf.negate => match (&leaf.operator, &leaf.value) {
             (ConditionOperator::Eq, ConditionValue::One(value)) => {
-                Some((leaf.dimension, vec![value.clone()]))
+                Some((leaf.dimension.clone(), vec![value.clone()]))
             }
             (ConditionOperator::In, ConditionValue::Many(values)) => {
-                Some((leaf.dimension, values.clone()))
+                Some((leaf.dimension.clone(), values.clone()))
             }
             _ => None,
         },

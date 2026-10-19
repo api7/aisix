@@ -4890,6 +4890,7 @@ data: [DONE]\n\n"
             )),
             jwt: None,
             owner: Default::default(),
+            tags: Default::default(),
         };
 
         // Suspended: max_requests=1 would deny the second reservation

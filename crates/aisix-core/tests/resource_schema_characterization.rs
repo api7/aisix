@@ -1022,6 +1022,11 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
             "/definitions/McpToolRef/properties/tool/default",
             "/definitions/McpToolRef/properties/tool/minLength",
             "/definitions/McpToolRef/required",
+            "/properties/tags/additionalProperties/maxLength",
+            "/properties/tags/additionalProperties/minLength",
+            "/properties/tags/maxProperties",
+            "/properties/tags/propertyNames",
+            "/properties/tags/type",
         ],
     ),
     (
@@ -1096,6 +1101,26 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
             "/oneOf/3/not/anyOf",
             "/properties/effort_mapping/additionalProperties/minLength",
             "/properties/effort_mapping/properties//minLength",
+        ],
+    ),
+    (
+        "team",
+        &[
+            "/properties/tags/additionalProperties/maxLength",
+            "/properties/tags/additionalProperties/minLength",
+            "/properties/tags/maxProperties",
+            "/properties/tags/propertyNames",
+            "/properties/tags/type",
+        ],
+    ),
+    (
+        "user",
+        &[
+            "/properties/tags/additionalProperties/maxLength",
+            "/properties/tags/additionalProperties/minLength",
+            "/properties/tags/maxProperties",
+            "/properties/tags/propertyNames",
+            "/properties/tags/type",
         ],
     ),
 ];

@@ -76,15 +76,24 @@
       "description": "A leaf's comparison value: `in` (and the reserved list operators) carry a string list, every scalar operator a single string."
     },
     "GroupByDimension": {
-      "description": "Dimension a policy's counters split on (`group_by`). The subset of [`PolicyDimension`] with a stable per-request value to key a bucket segment on — `model_name` is excluded (it duplicates `model` as a bucket identity, less precisely).",
-      "enum": [
-        "team",
-        "member",
-        "api_key",
-        "model",
-        "provider"
-      ],
-      "type": "string"
+      "description": "Dimension a policy's counters split on (`group_by`). The subset of the condition dimensions with a stable per-request value to key a counter on — `model_name` is excluded (it duplicates `model` as a counter identity, less precisely).",
+      "oneOf": [
+        {
+          "enum": [
+            "team",
+            "member",
+            "api_key",
+            "model",
+            "provider"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`tag:<key>` — one counter per effective value of the cost-attribution tag `<key>` (the API key's own value, else its team's, else its member's). A matched request with no value for the key is not subject to the policy, exactly like `team` on a key that belongs to no team.",
+          "pattern": "^tag:[a-z][a-z0-9_]{0,62}$",
+          "type": "string"
+        }
+      ]
     },
     "PolicyAction": {
       "description": "What the policy does past its limits. v1 has the single `reject` (429); the enum reserves the field for `fallback`/`queue`/`alert`.",
@@ -160,6 +169,11 @@
           "enum": [
             "provider"
           ],
+          "type": "string"
+        },
+        {
+          "description": "`tag:<key>` — the request's effective value of the cost-attribution tag `<key>`: the API key's own `tags[<key>]`, else that of the team its `team_id` names, else that of the member its `user_id` names. A string dimension: it admits `==`, `~=`, `in`, `~~` and `~*`. A request with no value for the key matches neither the condition nor its negation, exactly like `team` on a key that belongs to no team.",
+          "pattern": "^tag:[a-z][a-z0-9_]{0,62}$",
           "type": "string"
         }
       ]
@@ -399,7 +413,7 @@
       "type": "array"
     },
     "group_by": {
-      "description": "Dimensions the counters split on; `[]`/absent = one shared bucket for every matched request. A matched request missing a `group_by` dimension is not subject to the policy (mirrors `team_member` only applying to keys that carry a `user_id`).",
+      "description": "Dimensions the counters split on; `[]`/absent = one shared bucket for every matched request. A matched request missing a `group_by` dimension — a `team` or `member` its key does not carry, or a `tag:<key>` it has no value for — is not subject to the policy (mirrors `team_member` only applying to keys that carry a `user_id`).",
       "items": {
         "$ref": "#/definitions/GroupByDimension"
       },

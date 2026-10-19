@@ -179,6 +179,24 @@ pub struct UsageEvent {
     #[serde(skip)]
     pub user_name: String,
 
+    /// UUID of the team the authenticating ApiKey belongs to
+    /// (`ApiKey.team_id`), snapshotted at request time like `user_id`.
+    /// Omitted when the key belongs to no team, or when auth failed before
+    /// resolution.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub team_id: String,
+
+    /// The request's effective cost-attribution tags, tag key to tag value:
+    /// per key, the ApiKey's own value, else that of the team its `team_id`
+    /// names, else that of the member its `user_id` names. Resolved once,
+    /// from the snapshot the request authenticated on, so every event of a
+    /// request — every attempt, the terminal row, a cancel row — carries
+    /// the same set; a batch attribution row resolves it from the key that
+    /// observed the batch complete. Never taken from the request. Omitted
+    /// when empty.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tags: std::collections::BTreeMap<String, String>,
+
     /// The model alias exactly as the client sent it in the request
     /// body (`model` field) — a Model-Group name for routed requests,
     /// a direct model's display name otherwise. `model_id` records the

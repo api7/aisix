@@ -1545,13 +1545,7 @@ fn emit_tool_call_usage(
             .unwrap_or_default(),
         ..Default::default()
     };
-    crate::usage_attr::apply_caller_identity(
-        &mut event,
-        auth.jwt.as_ref(),
-        auth.api_key_name(),
-        auth.key().user_id.as_deref(),
-        auth.user_name(),
-    );
+    crate::usage_attr::apply_caller_identity(&mut event, auth.jwt.as_ref(), &auth.caller());
     crate::usage_attr::apply_auth_type(&mut event, auth);
     // A tool call resolves neither a model nor a ProviderKey, so the
     // attribution labels are the placeholder — present so this family has

@@ -291,9 +291,15 @@ where
             caller: api_key
                 .map(|e| {
                     let owner = parts.extensions.get::<aisix_core::KeyOwnerNames>();
+                    let tags = parts
+                        .extensions
+                        .get::<crate::auth::EffectiveTags>()
+                        .map(|t| std::sync::Arc::clone(&t.0))
+                        .unwrap_or_default();
                     aisix_gateway::CallerIdentity::from_entry(
                         e,
                         owner.unwrap_or(&Default::default()),
+                        tags,
                     )
                 })
                 .unwrap_or_default(),
