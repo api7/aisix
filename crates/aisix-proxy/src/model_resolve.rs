@@ -31,12 +31,12 @@ pub(crate) fn resolve_model(
     // terminal emitters that run after the handler is gone read it back off
     // the request's attribution cell (see `attribution`).
     if let Some(exact) = snapshot.models.get_by_name(requested) {
-        crate::attribution::note_requested_model(requested);
+        crate::attribution::note_requested_model(requested, &exact.id);
         note_dispatchable_entry(&exact);
         return Some(exact);
     }
     let (entry, upstream) = best_wildcard_row(snapshot, requested)?;
-    crate::attribution::note_requested_model(requested);
+    crate::attribution::note_requested_model(requested, &entry.id);
     // A wildcard row is a direct model, and attribution stays on the ROW
     // (see the module docs), so the synthetic clone below inherits its id.
     note_dispatchable_entry(&entry);
@@ -47,16 +47,6 @@ pub(crate) fn resolve_model(
         model,
         entry.revision,
     )))
-}
-
-/// The id of the entry [`resolve_model`] resolves `requested` to — for a
-/// wildcard alias the row's own id, which is what the synthetic clone keeps
-/// — without noting anything on the request's attribution cell.
-pub(crate) fn resolved_entry_id(snapshot: &AisixSnapshot, requested: &str) -> Option<String> {
-    if let Some(exact) = snapshot.models.get_by_name(requested) {
-        return Some(exact.id.clone());
-    }
-    best_wildcard_row(snapshot, requested).map(|(entry, _)| entry.id.clone())
 }
 
 /// Record the resolved entry's uuid for the terminal emitters that run
@@ -229,29 +219,6 @@ mod tests {
             models: table,
             ..Default::default()
         }
-    }
-
-    /// `UsageEvent::requested_model_id` is looked up at emission rather than
-    /// carried from the handler, so the lookup must land on exactly the
-    /// entry dispatch resolved: the exact row first, else the wildcard ROW.
-    #[test]
-    fn resolved_entry_id_names_the_entry_resolve_model_returns() {
-        let snap = snapshot_with(vec![
-            ("m-star", direct_model("openai/*", Some("*"))),
-            ("m-exact", direct_model("openai/gpt-4o", Some("gpt-4o"))),
-        ]);
-        for name in ["openai/gpt-4o", "openai/gpt-4.1", "nope"] {
-            assert_eq!(
-                resolved_entry_id(&snap, name),
-                resolve_model(&snap, name).map(|e| e.id.clone()),
-                "{name}"
-            );
-        }
-        assert_eq!(
-            resolved_entry_id(&snap, "openai/gpt-4.1").as_deref(),
-            Some("m-star")
-        );
-        assert_eq!(resolved_entry_id(&snap, "nope"), None);
     }
 
     #[test]

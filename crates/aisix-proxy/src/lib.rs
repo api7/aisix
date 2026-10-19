@@ -12252,6 +12252,13 @@ data: [DONE]\n\n";
         );
         assert_eq!(judge_events[0].prompt_tokens, 30);
         assert_eq!(judge_events[0].completion_tokens, 7);
+        // Members and judge each name their own target, and every one of
+        // them names the ensemble the caller addressed.
+        assert!(
+            events.iter().all(|e| e.requested_model_id == "m-council"),
+            "every sub-call event carries the ensemble's id"
+        );
+        assert!(panel_events.iter().all(|e| e.model_id != "m-council"));
         assert_attempt_indices_increase(&events);
         assert_ensemble_terminal_row_names_no_kind(&events);
     }

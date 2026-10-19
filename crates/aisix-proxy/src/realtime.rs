@@ -848,10 +848,7 @@ async fn run_session(
                 502,
                 started.elapsed(),
             );
-            crate::usage_attr::emit_error_usage_event(
-                &state,
-                &snap,
-                crate::operation::REALTIME,
+            let mut event = crate::usage_attr::build_error_usage_event(
                 "realtime",
                 &request_id,
                 &requested_model,
@@ -867,6 +864,20 @@ async fn run_session(
                 crate::usage_attr::enforced_hits(&audit),
                 crate::usage_attr::guardrail_scores(&audit),
                 crate::usage_attr::bypass_reason(&audit),
+            );
+            // Same reason as the session-end event: no attribution cell here.
+            event.requested_model_id = model_entry.id.clone();
+            let model = crate::usage_attr::usage_event_model_label(&snap, &requested_model);
+            crate::usage_attr::emit_prepared_usage_event(
+                &state,
+                &snap,
+                crate::operation::REALTIME,
+                event,
+                crate::usage_attr::usage_event_labels(
+                    &model,
+                    &crate::usage_attr::ResolvedPk::unresolved(),
+                ),
+                client.trace.as_ref(),
             );
             return;
         }
@@ -1086,6 +1097,10 @@ async fn run_session(
         model_id: model_entry.id.clone(),
         api_key_id: auth.entry.id.clone(),
         requested_model: requested_model.clone(),
+        // The session runs outside the request scope, so the emit
+        // chokepoint cannot read it off the attribution cell; realtime
+        // serves direct models only, which address themselves.
+        requested_model_id: model_entry.id.clone(),
         prompt_tokens: usage.input_tokens.min(u32::MAX as u64) as u32,
         completion_tokens: usage.output_tokens.min(u32::MAX as u64) as u32,
         cached_prompt_tokens: usage.cached_tokens.min(u32::MAX as u64) as u32,
@@ -1621,6 +1636,7 @@ mod tests {
         assert_eq!(ev.completion_tokens, 3);
         assert_eq!(ev.cached_prompt_tokens, 1);
         assert_eq!(ev.requested_model, "rt-model");
+        assert_eq!(ev.requested_model_id, "m-rt");
         assert_eq!(ev.api_key_id, "k-1");
     }
 
