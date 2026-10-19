@@ -732,9 +732,10 @@ pub async fn chat_completions(
 struct Success {
     response: Response,
     provider: String,
-    /// UUID of the v3 Model row this request resolved to (the virtual
-    /// model the caller asked for, before any routing fan-out). Empty
-    /// in the unlikely case the resolver was bypassed.
+    /// The `model_id` the event reports when no winning attempt names a
+    /// target (a cache hit, an ensemble): the addressed entry's own id when
+    /// it dispatches itself or is an ensemble, empty for a routing /
+    /// semantic group.
     model_id: String,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
@@ -1542,8 +1543,8 @@ async fn dispatch(
         })?;
     let model_id = virtual_entry.id.clone();
 
-    // Every error from here on attaches the `model_id` its failure event
-    // reports when no attempt answers for it: the entry's own id when the
+    // Every error from here on — and a response-cache hit — carries the
+    // `model_id` its event reports when no attempt answers for it: the entry's own id when the
     // caller addressed a direct model, empty for a group — before a target
     // is selected nothing dispatchable was involved, and once one is, the
     // attempt rows name it.
@@ -1551,8 +1552,10 @@ async fn dispatch(
     // they fire before any provider billing happens. The output-filter
     // path below is the only site that builds a `Some(UpstreamCharge)`
     // (manually, not via this helper).
-    let failure_model_id = crate::model_resolve::dispatchable_entry_id(&virtual_entry).to_string();
-    let with_model = |e: ProxyError| DispatchFailure::new(Some(failure_model_id.clone()), None, e);
+    let unattempted_model_id =
+        crate::model_resolve::dispatchable_entry_id(&virtual_entry).to_string();
+    let with_model =
+        |e: ProxyError| DispatchFailure::new(Some(unattempted_model_id.clone()), None, e);
 
     if !auth.key().can_access(snapshot, &req.model) {
         return Err(with_model(ProxyError::ModelForbidden(req.model.clone())));
@@ -2995,7 +2998,9 @@ async fn dispatch(
                 return Ok(Success {
                     response,
                     provider: provider_label,
-                    model_id: model_id.clone(),
+                    // No target served this request: a group's own id is
+                    // not a model that served, so a group hit names none.
+                    model_id: unattempted_model_id.clone(),
                     prompt_tokens: Some(prompt),
                     completion_tokens: Some(completion),
                     total_tokens: Some(total),

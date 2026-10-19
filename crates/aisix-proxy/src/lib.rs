@@ -5720,6 +5720,8 @@ data: [DONE]\n\n";
             .expect("hit event was never emitted")
             .expect("sender dropped");
         assert_eq!(hit.cache_status, "hit");
+        // A direct model's hit still names the model.
+        assert_eq!(hit.model_id, "model-id-1");
         // Same producer as the row for the original call — not the Model
         // row's own `model_name`, and not empty.
         assert_eq!(hit.provider_model_version, miss.provider_model_version);
@@ -5727,6 +5729,70 @@ data: [DONE]\n\n";
             hit.provider_request_id, "",
             "a hit must not replay the provider's response id",
         );
+    }
+
+    /// A routing group answered from the response cache selected no
+    /// target, so its hit names no `model_id` — the group's own id prices
+    /// nothing and stays in `requested_model_id` — while the miss that
+    /// filled the cache names the target that served it.
+    #[tokio::test]
+    async fn a_group_cache_hit_names_no_model_id() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-producer",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "cached"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 11, "total_tokens": 18}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_routing_group("smart", &[("m-primary", "primary", &upstream.uri())]);
+        seed_cache_policy(&snap, "group-cache");
+        let state = build_state_with_cache(snap, hub).with_usage_sink(UsageSink::new(tx));
+
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let _ = run(build_router(state.clone()), make_req()).await;
+        let miss = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("miss event was never emitted")
+            .expect("sender dropped");
+        assert_eq!(miss.cache_status, "miss");
+        assert_eq!(miss.model_id, "m-primary");
+
+        let _ = run(build_router(state), make_req()).await;
+        let hit = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("hit event was never emitted")
+            .expect("sender dropped");
+        assert_eq!(hit.cache_status, "hit");
+        assert_eq!(hit.model_id, "", "{hit:?}");
+        assert_eq!(hit.requested_model_id, "router-smart");
     }
 
     #[tokio::test]
