@@ -1089,7 +1089,7 @@ impl VertexBridge {
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-
+        retain_vertex_betas(&mut headers)?;
         let client = self.client_for(ctx);
         let started = Instant::now();
 
