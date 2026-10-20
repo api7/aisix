@@ -203,6 +203,8 @@ flate2 = "1"
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-credential-types = "1"
+# STS for AssumeRole and GetCallerIdentity on Bedrock credentials.
+aws-sdk-sts = { version = "1", default-features = false, features = ["rt-tokio"] }
 # Signs the Bedrock requests the SDK has no operation for (the runtime's
 # OpenAI-compatible Chat Completions endpoint).
 aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }

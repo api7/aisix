@@ -34,13 +34,25 @@ webpki-roots.workspace = true
 # that excludes Bedrock does not pull the AWS crates in through here.
 aws-smithy-http-client = { workspace = true, optional = true }
 aws-smithy-runtime-api = { workspace = true, optional = true }
+# Bedrock authentication (`aws_auth`): the default credential chain and STS.
+aws-config = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+aws-sdk-sts = { workspace = true, optional = true }
+aws-smithy-types = { workspace = true, optional = true }
 
 [features]
 default = []
 # Enables `upstream_tls::aws_http_client`, so Bedrock clients share the
 # deployment's outbound trust roots. Turned on by the crates that build
 # AWS SDK clients (aisix-provider-bedrock, aisix-guardrails/bedrock).
-aws = ["dep:aws-smithy-http-client", "dep:aws-smithy-runtime-api"]
+aws = [
+    "dep:aws-smithy-http-client",
+    "dep:aws-smithy-runtime-api",
+    "dep:aws-config",
+    "dep:aws-credential-types",
+    "dep:aws-sdk-sts",
+    "dep:aws-smithy-types",
+]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

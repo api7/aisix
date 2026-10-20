@@ -118,7 +118,7 @@ pub struct KeywordConfig {
 
 /// AWS credentials for a Bedrock guardrail.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BedrockAWSCredentials {
     Static {
         /// AWS access key ID for static Bedrock guardrail credentials.
@@ -128,6 +128,57 @@ pub enum BedrockAWSCredentials {
         /// Bedrock. The gateway does not log the plaintext value.
         #[schemars(length(min = 1))]
         secret_access_key: String,
+        /// AWS session token that accompanies temporary access keys. The
+        /// gateway does not log the plaintext value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        session_token: Option<String>,
+        /// ARN of an IAM role to assume with these credentials through
+        /// `sts:AssumeRole`. The temporary credentials are refreshed before
+        /// they expire. When the credentials already belong to this role,
+        /// they are used as they are.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        role_arn: Option<String>,
+        /// External ID the role's trust policy requires. Requires `role_arn`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        external_id: Option<String>,
+        /// Session name for the assumed role. Requires `role_arn`. When
+        /// omitted, the gateway generates one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        role_session_name: Option<String>,
+    },
+    /// A Bedrock API key, sent as a bearer token instead of a SigV4
+    /// signature.
+    ApiKey {
+        /// Amazon Bedrock API key. The gateway does not log the plaintext
+        /// value.
+        #[schemars(length(min = 1))]
+        api_key: String,
+    },
+    /// Credentials from the gateway's own AWS environment: environment
+    /// variables, web identity (for example IRSA on EKS), the ECS
+    /// container credentials endpoint, or the EC2 instance profile.
+    /// Temporary credentials are refreshed before they expire.
+    DefaultChain {
+        /// ARN of an IAM role to assume with these credentials through
+        /// `sts:AssumeRole`. The temporary credentials are refreshed before
+        /// they expire. When the credentials already belong to this role,
+        /// they are used as they are.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        role_arn: Option<String>,
+        /// External ID the role's trust policy requires. Requires `role_arn`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        external_id: Option<String>,
+        /// Session name for the assumed role. Requires `role_arn`. When
+        /// omitted, the gateway generates one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        role_session_name: Option<String>,
     },
 }
 
@@ -1749,10 +1800,14 @@ mod tests {
                     BedrockAWSCredentials::Static {
                         access_key_id,
                         secret_access_key,
+                        session_token: None,
+                        role_arn: None,
+                        ..
                     } => {
                         assert_eq!(access_key_id, "AKIAEXAMPLE");
                         assert_eq!(secret_access_key, "PLAINTEXT_FOR_TEST");
                     }
+                    other => panic!("expected static credentials, got {other:?}"),
                 }
             }
             _ => panic!("expected Bedrock variant"),
