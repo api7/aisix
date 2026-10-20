@@ -7,9 +7,10 @@
 //! what to send instead — never dropped, because a dropped image is a
 //! request the model answers blind while the caller sees a 200.
 //!
-//! The gateway never fetches a caller-supplied URL. A URL either reaches
-//! the upstream as a reference its own API resolves, or the request is
-//! refused.
+//! A URL reaches the upstream as a reference when its API resolves that
+//! kind of URL itself. Otherwise the bridge has the gateway download it
+//! first ([`crate::media_fetch`]) and sends the bytes inline, or refuses
+//! the part when the URL cannot be downloaded.
 
 use serde_json::Value;
 
@@ -48,10 +49,11 @@ pub enum MediaSource<'a> {
     Inline { mime_type: String, data: &'a str },
     /// A reference the upstream would have to resolve. `mime_type` is the
     /// caller's explicit `format` / `mime_type` / `content_type`, else the
-    /// one the path's extension names, else `None`.
+    /// one the path's extension names, else `None`; `explicit` says which.
     Uri {
         uri: &'a str,
         mime_type: Option<String>,
+        explicit: bool,
     },
 }
 
@@ -97,7 +99,7 @@ fn explicit_mime_type(obj: &Value) -> Option<String> {
 
 /// Media types compare case-insensitively, and `image/jpg` is a common
 /// misspelling of `image/jpeg` that no upstream accepts.
-fn normalize_mime_type(mime_type: &str) -> String {
+pub(crate) fn normalize_mime_type(mime_type: &str) -> String {
     match mime_type.trim().to_ascii_lowercase() {
         m if m == "image/jpg" => "image/jpeg".to_string(),
         m => m,
@@ -196,10 +198,12 @@ fn source_from_url(url: &str, explicit: Option<String>) -> Result<MediaSource<'_
         .filter(|scheme| scheme.eq_ignore_ascii_case("data:"))
         .map(|_| &url[5..]);
     let Some(rest) = rest else {
+        let is_explicit = explicit.is_some();
         let mime_type = explicit.or_else(|| mime_type_from_path(url).map(str::to_string));
         return Ok(MediaSource::Uri {
             uri: url,
             mime_type,
+            explicit: is_explicit,
         });
     };
     let (header, data) = rest
@@ -291,10 +295,17 @@ pub fn translate_user_parts<T>(
     Ok(out)
 }
 
-/// A caller's URL quoted in an error message, cut short: a client that
-/// puts bare base64 where a URL belongs would otherwise get it all back.
+/// A caller's URL quoted in an error message, without its query or
+/// fragment (a signed URL carries its credential there) and cut short: a
+/// client that puts bare base64 where a URL belongs would otherwise get it
+/// all back.
 pub fn display_uri(uri: &str) -> String {
     const MAX: usize = 64;
+    let uri = if uri.contains("://") {
+        uri.split(['?', '#']).next().unwrap_or(uri)
+    } else {
+        uri
+    };
     match uri.char_indices().nth(MAX) {
         Some((cut, _)) => format!("{:?}…", &uri[..cut]),
         None => format!("{uri:?}"),
@@ -370,21 +381,24 @@ mod tests {
             uri(&typed),
             MediaSource::Uri {
                 uri: "gs://b/cat",
-                mime_type: Some("image/webp".into())
+                mime_type: Some("image/webp".into()),
+                explicit: true,
             }
         );
         assert_eq!(
             uri(&by_ext),
             MediaSource::Uri {
                 uri: "https://x.example/a/cat.JPG?sig=1",
-                mime_type: Some("image/jpeg".into())
+                mime_type: Some("image/jpeg".into()),
+                explicit: false,
             }
         );
         assert_eq!(
             uri(&untyped),
             MediaSource::Uri {
                 uri: "https://x.example/cat",
-                mime_type: None
+                mime_type: None,
+                explicit: false,
             }
         );
     }
@@ -439,6 +453,10 @@ mod tests {
             .contains("uploaded-file id"));
         let long = "A".repeat(10_000);
         assert!(display_uri(&long).len() < 80);
+        assert_eq!(
+            display_uri("https://x.example/a.png?X-Amz-Signature=s#f"),
+            "\"https://x.example/a.png\""
+        );
         assert_eq!(
             parse_part(&json!({"type":"video_url","video_url":{"url":"x"}})).unwrap(),
             ContentPart::Unsupported("video_url")

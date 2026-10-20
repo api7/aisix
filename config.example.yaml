@@ -522,6 +522,31 @@ upstream:
   #   # client certificate either), and Redis in sentinel mode.
   #   # verify: true
 
+  # Media URLs in chat requests. When an image, audio or file part is a
+  # URL the target upstream cannot read itself — Amazon Bedrock, Claude
+  # on Vertex AI, or an http:// URL toward Anthropic or Gemini — the
+  # gateway downloads it and sends the bytes inline. An upstream that
+  # reads the URL itself still gets the URL.
+  #
+  # The download only reaches publicly routable addresses: loopback,
+  # private (RFC 1918), CGNAT, link-local (including the 169.254.169.254
+  # metadata endpoint), IPv6 unique-local / link-local, multicast and
+  # reserved ranges are refused with a 400, for every address a name
+  # resolves to and for every redirect hop (at most 10). It follows the
+  # request's own upstream timeout, retries a timeout or connection
+  # failure up to 3 attempts in all, and never forwards the caller's
+  # headers.
+  # media_fetch:
+  #   # false refuses such parts with a 400 instead of downloading them.
+  #   enabled: true
+  #   # Hosts that may be reached although they resolve to a non-public
+  #   # address, as host (any port) or host:port; IPv6 with a port as
+  #   # [addr]:port. There is no switch that turns the address check off.
+  #   allowed_hosts: []
+  #   # e.g. ["media.internal", "10.0.0.5:9000"]
+  #   # Largest download accepted per URL, in bytes (default 50 MiB).
+  #   max_bytes: 52428800
+
 # Connection-layer settings for the inbound side — the clients, or the
 # gateway in front of this one, talking to the listeners above. The
 # mirror image of `upstream:`.

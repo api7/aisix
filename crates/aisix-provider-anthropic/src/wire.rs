@@ -28,6 +28,7 @@ use aisix_gateway::content_part::{
     check_tool_result_parts, display_uri, parse_part, part_error, ContentPart, Media, MediaKind,
     MediaSource,
 };
+use aisix_gateway::media_fetch::FetchedMedia;
 use aisix_gateway::structured_output::{
     apply_schema_limits, json_schema_from_response_format, seal_object_schemas,
     ANTHROPIC_SCHEMA_LIMITS, JSON_TOOL_DESCRIPTION, JSON_TOOL_NAME,
@@ -263,8 +264,8 @@ fn anthropic_text_block(block: &serde_json::Value) -> Option<serde_json::Value> 
 
 /// Whether the upstream reads an image or document from a URL itself
 /// (Anthropic's `url` source). Claude on Vertex AI and on Amazon Bedrock
-/// does not, and the gateway never fetches a caller's URL, so there a URL
-/// part is refused.
+/// does not, so there the bridge has the gateway download the URL first
+/// ([`aisix_gateway::media_fetch`]); a URL it did not download is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaUrls {
     Accepted,
@@ -280,6 +281,7 @@ fn anthropic_user_blocks(
     blocks: &[serde_json::Value],
     message_index: usize,
     urls: MediaUrls,
+    fetched: &FetchedMedia,
 ) -> Result<Vec<serde_json::Value>, TranslateError> {
     let mut out = Vec::with_capacity(blocks.len());
     for (part_index, block) in blocks.iter().enumerate() {
@@ -290,7 +292,7 @@ fn anthropic_user_blocks(
             ContentPart::Text(_) => out.extend(anthropic_text_block(block)),
             ContentPart::Media(media) => {
                 let mut translated =
-                    anthropic_media_block(&media, urls).map_err(|r| invalid(&r))?;
+                    anthropic_media_block(&media, urls, fetched).map_err(|r| invalid(&r))?;
                 if let Some(marker) = block.get("cache_control") {
                     translated["cache_control"] = marker.clone();
                 }
@@ -320,8 +322,35 @@ pub fn claude_media_kind(mime_type: &str) -> Result<&'static str, String> {
     }
 }
 
+/// Whether a media part needs the gateway to download its URL before it
+/// can reach an upstream whose URL handling is `urls`: always where the
+/// upstream reads no URL, and for `http://` where it reads only
+/// `https://`.
+pub fn anthropic_needs_fetch(media: &Media<'_>, urls: MediaUrls) -> bool {
+    matches!(media.source, MediaSource::Uri { .. })
+        && (matches!(urls, MediaUrls::Refused(_))
+            || media.source.scheme().as_deref() == Some("http"))
+}
+
 /// One media part as an Anthropic `image` or `document` block.
-fn anthropic_media_block(media: &Media<'_>, urls: MediaUrls) -> Result<serde_json::Value, String> {
+fn anthropic_media_block(
+    media: &Media<'_>,
+    urls: MediaUrls,
+    fetched: &FetchedMedia,
+) -> Result<serde_json::Value, String> {
+    if let MediaSource::Uri { uri, .. } = &media.source {
+        if let Some(download) = fetched.take(uri) {
+            let kind = claude_media_kind(&download.mime_type)?;
+            return Ok(serde_json::json!({
+                "type": kind,
+                "source": {
+                    "type": "base64",
+                    "media_type": download.mime_type,
+                    "data": download.data.into_base64(),
+                },
+            }));
+        }
+    }
     match &media.source {
         MediaSource::Inline { mime_type, data } => {
             let kind = claude_media_kind(mime_type)?;
@@ -330,18 +359,18 @@ fn anthropic_media_block(media: &Media<'_>, urls: MediaUrls) -> Result<serde_jso
                 "source": {"type": "base64", "media_type": mime_type, "data": data},
             }))
         }
-        MediaSource::Uri { uri, mime_type } => {
+        MediaSource::Uri { uri, mime_type, .. } => {
             if let MediaUrls::Refused(upstream) = urls {
                 return Err(format!(
-                    "{upstream} does not read media from a URL, and the gateway does not \
-                     fetch {} itself; send the content inline as a base64 data: URL",
+                    "{upstream} does not read media from a URL, and the gateway did not \
+                     download {}; send the content inline as a base64 data: URL",
                     display_uri(uri)
                 ));
             }
             if media.source.scheme().as_deref() != Some("https") {
                 return Err(format!(
-                    "Claude models read only https:// URLs, and the gateway does not fetch \
-                     {} itself; send the content inline as a base64 data: URL",
+                    "Claude models read only https:// URLs, and the gateway did not download \
+                     {}; send the content inline as a base64 data: URL",
                     display_uri(uri)
                 ));
             }
@@ -448,14 +477,15 @@ pub enum TranslateError {
 pub fn split_system<'a>(
     req: &'a ChatFormat,
 ) -> Result<(Option<AnthropicSystem>, Vec<AnthropicMessage<'a>>), TranslateError> {
-    split_system_with(req, MediaUrls::Accepted)
+    split_system_with(req, MediaUrls::Accepted, &FetchedMedia::default())
 }
 
 /// [`split_system`] for an upstream whose handling of media URLs is
-/// `urls`.
+/// `urls`, with the media URLs the gateway already downloaded for it.
 pub fn split_system_with<'a>(
     req: &'a ChatFormat,
     urls: MediaUrls,
+    fetched: &FetchedMedia,
 ) -> Result<(Option<AnthropicSystem>, Vec<AnthropicMessage<'a>>), TranslateError> {
     let mut system_msgs: Vec<&'a ChatMessage> = Vec::new();
     let mut messages: Vec<AnthropicMessage<'a>> = Vec::new();
@@ -475,7 +505,7 @@ pub fn split_system_with<'a>(
                     // System messages interleaved with user/assistant
                     // turns don't map cleanly; append as a user turn to
                     // preserve semantics without silently dropping them.
-                    messages.push(user_turn(m, index, urls)?);
+                    messages.push(user_turn(m, index, urls, fetched)?);
                 } else {
                     system_msgs.push(m);
                 }
@@ -489,7 +519,7 @@ pub fn split_system_with<'a>(
             }
             Role::User => {
                 seen_non_system = true;
-                messages.push(user_turn(m, index, urls)?);
+                messages.push(user_turn(m, index, urls, fetched)?);
             }
             Role::Assistant => {
                 seen_non_system = true;
@@ -528,15 +558,17 @@ pub fn split_system_with<'a>(
 /// A user-role turn: the caller's typed content blocks translated by
 /// [`anthropic_user_blocks`] (preserving `cache_control` markers), else
 /// the single-text-block shape from the flattened text.
-fn user_turn(
-    m: &ChatMessage,
+fn user_turn<'a>(
+    m: &'a ChatMessage,
     index: usize,
     urls: MediaUrls,
-) -> Result<AnthropicMessage<'_>, TranslateError> {
+    fetched: &FetchedMedia,
+) -> Result<AnthropicMessage<'a>, TranslateError> {
     Ok(match m.content_blocks.as_deref() {
-        Some(blocks) => {
-            AnthropicMessage::from_blocks("user", anthropic_user_blocks(blocks, index, urls)?)
-        }
+        Some(blocks) => AnthropicMessage::from_blocks(
+            "user",
+            anthropic_user_blocks(blocks, index, urls, fetched)?,
+        ),
         // No blocks: the text is the stored string.
         None => AnthropicMessage::text("user", m.content.as_deref().unwrap_or("")),
     })
@@ -4243,7 +4275,9 @@ mod tests {
                     serde_json::json!([{"type": "text", "text": "hi"}, part]),
                 )],
             );
-            let err = split_system_with(&req, urls).unwrap_err().to_string();
+            let err = split_system_with(&req, urls, &FetchedMedia::default())
+                .unwrap_err()
+                .to_string();
             assert!(err.starts_with("messages[0].content[1]: "), "{err}");
             assert!(err.contains(expected), "{expected} not in {err}");
         }

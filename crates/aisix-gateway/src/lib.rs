@@ -33,6 +33,7 @@ pub mod content_part;
 pub mod credential;
 pub mod dns_cache;
 pub mod hub;
+pub mod media_fetch;
 pub mod response_tap;
 pub mod sse;
 pub mod structured_output;

@@ -270,6 +270,8 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
         // pools are constructed once and can't be reconfigured afterwards.
         aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream)?)
             .map_err(|e| anyhow::anyhow!("upstream TLS init failed: {e}"))?;
+        aisix_gateway::media_fetch::init(&cfg.upstream.media_fetch)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         run(cfg).await
     }
     .await;

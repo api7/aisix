@@ -47,6 +47,7 @@ use std::time::{Duration, Instant};
 use aisix_gateway::content_part::{
     check_tool_result_parts, display_uri, translate_user_parts, Media, MediaSource,
 };
+use aisix_gateway::media_fetch::{fetch_media_urls, Encoding, FetchedMedia};
 use aisix_gateway::tool_calls::reject_legacy_function_calling;
 
 use crate::gemini_tools::{
@@ -64,9 +65,9 @@ use crate::wire;
 // Anthropic SSE, decoded by the shared `AnthropicStreamEvent` +
 // `StreamState` (the same decoder the direct Anthropic bridge uses).
 use aisix_provider_anthropic::wire::{
-    build_request as build_anthropic_request, response_into_chat_response, split_system_with,
-    structured_output_for, AnthropicResponse, AnthropicStreamEvent, MediaUrls, StreamState,
-    StructuredOutput,
+    anthropic_needs_fetch, build_request as build_anthropic_request, response_into_chat_response,
+    split_system_with, structured_output_for, AnthropicResponse, AnthropicStreamEvent, MediaUrls,
+    StreamState, StructuredOutput,
 };
 
 // Llama + the OpenAI-compatible MaaS family on Vertex use the OpenAI
@@ -917,8 +918,10 @@ impl VertexBridge {
             },
         )?;
 
+        let fetched =
+            fetch_media_urls(&req, ctx.deadline, Encoding::Base64, gemini_needs_fetch).await?;
         let body = {
-            let typed = build_gemini_request(&req, upstream_id)?;
+            let typed = build_gemini_request_with(&req, upstream_id, &fetched)?;
             // Serialize to JSON, then apply the per-ProviderKey override
             // pipeline (#339). The Gemini `contents` shape does not match the
             // OpenAI-style top-level keys the request transforms target, so
@@ -1028,10 +1031,14 @@ impl VertexBridge {
             structured_output_for(&req, upstream_id),
             StructuredOutput::Tool(_)
         );
+        let urls = MediaUrls::Refused("Claude on Vertex AI");
+        let fetched = fetch_media_urls(&req, ctx.deadline, Encoding::Base64, |m| {
+            anthropic_needs_fetch(m, urls)
+        })
+        .await?;
         let body_value = {
-            let (system, messages) =
-                split_system_with(&req, MediaUrls::Refused("Claude on Vertex AI"))
-                    .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
+            let (system, messages) = split_system_with(&req, urls, &fetched)
+                .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
             let anthropic_req = build_anthropic_request(&req, upstream_id, system, messages, false);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -1138,10 +1145,14 @@ impl VertexBridge {
         // with stream=true and — unlike `:rawPredict` — `stream` is KEPT
         // in the body (only `model` is stripped into the URL). Add the
         // Vertex `anthropic_version`.
+        let urls = MediaUrls::Refused("Claude on Vertex AI");
+        let fetched = fetch_media_urls(&req, ctx.deadline, Encoding::Base64, |m| {
+            anthropic_needs_fetch(m, urls)
+        })
+        .await?;
         let body_value = {
-            let (system, messages) =
-                split_system_with(&req, MediaUrls::Refused("Claude on Vertex AI"))
-                    .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
+            let (system, messages) = split_system_with(&req, urls, &fetched)
+                .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
             let anthropic_req = build_anthropic_request(&req, upstream_id, system, messages, true);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -1729,8 +1740,10 @@ impl VertexBridge {
             },
         )?;
 
+        let fetched =
+            fetch_media_urls(&req, ctx.deadline, Encoding::Base64, gemini_needs_fetch).await?;
         let body = {
-            let typed = build_gemini_request(&req, upstream_id)?;
+            let typed = build_gemini_request_with(&req, upstream_id, &fetched)?;
             // Serialize + apply the per-ProviderKey override pipeline (#339)
             // before sending (see the non-stream path for the rail caveat).
             let mut body = serde_json::to_value(&typed)
@@ -2243,34 +2256,65 @@ fn rewrite_gemini_openapi_schema(schema: &mut serde_json::Value) {
 }
 
 /// A user turn's `parts[]`, in the caller's order: text, then media as
-/// `inlineData` (base64 in the request) or `fileData` (a `gs://` or
-/// `https://` reference Gemini resolves itself).
-fn gemini_user_parts(m: &ChatMessage, index: usize) -> Result<Vec<GeminiPart>, BridgeError> {
+/// `inlineData` (base64 in the request, or downloaded by the gateway) or
+/// `fileData` (a `gs://` or `https://` reference Gemini resolves itself).
+fn gemini_user_parts(
+    m: &ChatMessage,
+    index: usize,
+    fetched: &FetchedMedia,
+) -> Result<Vec<GeminiPart>, BridgeError> {
     let Some(blocks) = m.content_blocks.as_deref() else {
         return Ok(vec![GeminiPart::text(m.content_str())]);
     };
     translate_user_parts(blocks, index, "Gemini", GeminiPart::text, |media, _| {
-        gemini_media_part(media).map(GeminiPart::Raw)
+        gemini_media_part(media, fetched).map(GeminiPart::Raw)
     })
     .map_err(BridgeError::InvalidRequest)
 }
 
-/// One media part on the Gemini wire. The gateway does not fetch URLs: a
-/// `gs://` or `https://` URL goes up as `fileData` for Gemini to read, and
-/// `fileData` needs the media type, which is the caller's `format` or the
+/// Gemini reads `gs://` and `https://` URLs itself, but only with a media
+/// type; an `http://` URL, or an `https://` one whose type neither the
+/// caller nor the extension gives, is downloaded by the gateway.
+fn gemini_needs_fetch(media: &Media<'_>) -> bool {
+    match &media.source {
+        MediaSource::Inline { .. } => false,
+        MediaSource::Uri { mime_type, .. } => match media.source.scheme().as_deref() {
+            Some("http") => true,
+            Some("https") => mime_type.is_none(),
+            _ => false,
+        },
+    }
+}
+
+/// One media part on the Gemini wire: a URL the gateway downloaded goes up
+/// as `inlineData`; a `gs://` or `https://` URL as `fileData` for Gemini
+/// to read, which needs the media type — the caller's `format` or the
 /// URL's extension.
-fn gemini_media_part(media: &Media<'_>) -> Result<serde_json::Value, String> {
+fn gemini_media_part(
+    media: &Media<'_>,
+    fetched: &FetchedMedia,
+) -> Result<serde_json::Value, String> {
+    if let MediaSource::Uri { uri, .. } = &media.source {
+        if let Some(download) = fetched.take(uri) {
+            return Ok(serde_json::json!({
+                "inlineData": {
+                    "mimeType": download.mime_type,
+                    "data": download.data.into_base64(),
+                }
+            }));
+        }
+    }
     match &media.source {
         MediaSource::Inline { mime_type, data } => Ok(serde_json::json!({
             "inlineData": {"mimeType": mime_type, "data": data}
         })),
-        MediaSource::Uri { uri, mime_type } => {
+        MediaSource::Uri { uri, mime_type, .. } => {
             match media.source.scheme().as_deref() {
                 Some("gs" | "https") => {}
                 _ => {
                     return Err(format!(
-                        "Gemini models read only gs:// and https:// URLs, and the gateway does \
-                         not fetch {} itself; send the content inline as a base64 data: URL",
+                        "Gemini models read only gs:// and https:// URLs, and the gateway did \
+                         not download {}; send the content inline as a base64 data: URL",
                         display_uri(uri)
                     ));
                 }
@@ -2287,6 +2331,14 @@ fn gemini_media_part(media: &Media<'_>) -> Result<serde_json::Value, String> {
             }))
         }
     }
+}
+
+#[cfg(test)]
+fn build_gemini_request(
+    req: &ChatFormat,
+    upstream_model: &str,
+) -> Result<GeminiGenerateContentRequest, BridgeError> {
+    build_gemini_request_with(req, upstream_model, &FetchedMedia::default())
 }
 
 /// Translate the gateway's [`ChatFormat`] into Gemini's
@@ -2316,9 +2368,12 @@ fn gemini_media_part(media: &Media<'_>) -> Result<serde_json::Value, String> {
 /// dropping it: the legacy `functions` / `function_call` fields, a
 /// non-function tool, an unsupported `tool_choice`, a tool result with no
 /// call to answer, or call arguments that are not JSON.
-fn build_gemini_request(
+///
+/// `fetched` holds the media URLs the gateway downloaded for Gemini.
+fn build_gemini_request_with(
     req: &ChatFormat,
     upstream_model: &str,
+    fetched: &FetchedMedia,
 ) -> Result<GeminiGenerateContentRequest, BridgeError> {
     reject_legacy_function_calling(req)?;
     let mut system_parts: Vec<String> = Vec::new();
@@ -2341,7 +2396,7 @@ fn build_gemini_request(
             Role::System | Role::Developer => system_parts.push(m.content_str().to_string()),
             Role::User => contents.push(GeminiContent {
                 role: "user",
-                parts: gemini_user_parts(m, index)?,
+                parts: gemini_user_parts(m, index, fetched)?,
             }),
             Role::Tool => {
                 check_tool_result_parts(m, index).map_err(BridgeError::InvalidRequest)?;

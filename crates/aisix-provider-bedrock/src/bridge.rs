@@ -51,14 +51,15 @@ use base64::Engine as _;
 use aisix_gateway::content_part::{
     check_tool_result_parts, display_uri, translate_user_parts, Media, MediaSource,
 };
+use aisix_gateway::media_fetch::{fetch_media_urls, Encoding, FetchedMedia};
 use aws_smithy_runtime_api::client::result::ServiceError;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use serde::Deserialize;
 use std::time::{Duration, Instant};
 
 use aisix_provider_anthropic::wire::{
-    build_request, claude_media_kind, response_into_chat_response, split_system_with,
-    structured_output_for, tool_choice_states_a_preference,
+    anthropic_needs_fetch, build_request, claude_media_kind, response_into_chat_response,
+    split_system_with, structured_output_for, tool_choice_states_a_preference,
     translate_reasoning_effort_to_anthropic, AnthropicResponse, MediaUrls, StructuredOutput,
 };
 
@@ -1010,10 +1011,14 @@ impl BedrockBridge {
         );
         // Every intermediate stays inside this block, so only the wire
         // bytes are alive while the upstream is awaited.
+        let urls = MediaUrls::Refused("Claude on Amazon Bedrock");
+        let fetched = fetch_media_urls(&req, ctx.deadline, Encoding::Base64, |m| {
+            anthropic_needs_fetch(m, urls)
+        })
+        .await?;
         let body_bytes = {
-            let (system, messages) =
-                split_system_with(&req, MediaUrls::Refused("Claude on Amazon Bedrock"))
-                    .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
+            let (system, messages) = split_system_with(&req, urls, &fetched)
+                .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
             let anthropic_req = build_request(&req, anthropic_model, system, messages, false);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -1108,8 +1113,9 @@ impl BedrockBridge {
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
         let client = self.build_client_from_ctx(ctx)?;
+        let fetched = fetch_media_urls(&req, ctx.deadline, Encoding::Bytes, |_| true).await?;
         let (system_blocks, message_blocks) =
-            build_converse_inputs(&req, BedrockPublisher::from_model_id(upstream_id))?;
+            build_converse_inputs(&req, BedrockPublisher::from_model_id(upstream_id), &fetched)?;
 
         let started = Instant::now();
         let deadline = ctx.deadline;
@@ -1210,8 +1216,9 @@ impl BedrockBridge {
         upstream_id: &str,
     ) -> Result<ChatChunkStream, BridgeError> {
         let client = self.build_client_from_ctx(ctx)?;
+        let fetched = fetch_media_urls(&req, ctx.deadline, Encoding::Bytes, |_| true).await?;
         let (system_blocks, message_blocks) =
-            build_converse_inputs(&req, BedrockPublisher::from_model_id(upstream_id))?;
+            build_converse_inputs(&req, BedrockPublisher::from_model_id(upstream_id), &fetched)?;
 
         let started = Instant::now();
         let deadline = ctx.deadline;
@@ -1294,6 +1301,7 @@ impl BedrockBridge {
 fn build_converse_inputs(
     req: &ChatFormat,
     publisher: Option<BedrockPublisher>,
+    fetched: &FetchedMedia,
 ) -> Result<(Vec<SystemContentBlock>, Vec<BedrockMessage>), BridgeError> {
     let claude = publisher == Some(BedrockPublisher::Anthropic);
     let mut systems: Vec<SystemContentBlock> = Vec::new();
@@ -1329,7 +1337,7 @@ fn build_converse_inputs(
             Role::User => {
                 messages.push(build_message(
                     ConversationRole::User,
-                    user_content_blocks(msg, index, claude)?,
+                    user_content_blocks(msg, index, claude, fetched)?,
                 )?);
             }
             Role::Assistant => {
@@ -1380,6 +1388,7 @@ fn user_content_blocks(
     msg: &ChatMessage,
     index: usize,
     claude: bool,
+    fetched: &FetchedMedia,
 ) -> Result<Vec<ContentBlock>, BridgeError> {
     let Some(parts) = msg.content_blocks.as_deref() else {
         return Ok(vec![ContentBlock::Text(msg.content_str().to_string())]);
@@ -1391,17 +1400,12 @@ fn user_content_blocks(
         family,
         ContentBlock::Text,
         |media, part_index| {
-            if claude {
-                if let MediaSource::Inline { mime_type, .. } = &media.source {
-                    claude_media_kind(mime_type)?;
-                }
-            }
-            let upstream = if claude {
-                "Claude on Amazon Bedrock"
-            } else {
-                "Amazon Bedrock"
-            };
-            converse_media_block(media, upstream, &format!("document-{index}-{part_index}"))
+            converse_media_block(
+                media,
+                claude,
+                fetched,
+                &format!("document-{index}-{part_index}"),
+            )
         },
     )
     .map_err(BridgeError::InvalidRequest)?;
@@ -1424,30 +1428,55 @@ const LENIENT_BASE64: base64::engine::GeneralPurpose = base64::engine::GeneralPu
         .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
 );
 
-/// One inline media part as a Converse `image` / `document` / `audio` /
-/// `video` block, chosen by its media type.
+/// One media part — inline, or a URL the gateway downloaded — as a
+/// Converse `image` / `document` / `audio` / `video` block, chosen by its
+/// media type. A Claude model takes only what it takes through
+/// InvokeModel: images and PDFs.
 fn converse_media_block(
     media: &Media<'_>,
-    upstream: &str,
+    claude: bool,
+    fetched: &FetchedMedia,
     document_name: &str,
 ) -> Result<ContentBlock, String> {
-    let (mime_type, data) = match &media.source {
-        MediaSource::Inline { mime_type, data } => (mime_type.as_str(), *data),
-        MediaSource::Uri { uri, .. } => {
-            return Err(format!(
-                "{upstream} does not read media from a URL, and the gateway does not \
-                 fetch {} itself; send the content inline as a base64 data: URL",
-                display_uri(uri)
-            ));
-        }
+    enum Payload<'a> {
+        Base64(&'a str),
+        Bytes(Vec<u8>),
+    }
+    let (mime_type, payload) = match &media.source {
+        MediaSource::Inline { mime_type, data } => (mime_type.clone(), Payload::Base64(data)),
+        MediaSource::Uri { uri, .. } => match fetched.take(uri) {
+            Some(download) => (
+                download.mime_type,
+                Payload::Bytes(download.data.into_bytes()),
+            ),
+            None => {
+                let upstream = if claude {
+                    "Claude on Amazon Bedrock"
+                } else {
+                    "Amazon Bedrock"
+                };
+                return Err(format!(
+                    "{upstream} does not read media from a URL, and the gateway did not \
+                     download {}; send the content inline as a base64 data: URL",
+                    display_uri(uri)
+                ));
+            }
+        },
     };
+    let mime_type = mime_type.as_str();
+    if claude {
+        claude_media_kind(mime_type)?;
+    }
     let unsupported = || format!("Amazon Bedrock does not accept media of type {mime_type:?}");
-    let bytes = || {
-        let compact: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-        LENIENT_BASE64
-            .decode(compact)
-            .map(Blob::new)
-            .map_err(|_| "the media data is not valid base64".to_string())
+    let bytes = move || match payload {
+        Payload::Bytes(bytes) => Ok(Blob::new(bytes)),
+        Payload::Base64(data) => {
+            let compact: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+            LENIENT_BASE64
+                .decode(compact)
+                .map(Blob::new)
+                .map_err(|_| "the media data is not valid base64".to_string())
+        }
     };
     let built = |e: aws_smithy_types::error::operation::BuildError| {
         format!("bedrock converse: build media block: {e}")
@@ -5147,7 +5176,8 @@ mod tests {
             ]
         }))
         .unwrap();
-        let (_systems, messages) = build_converse_inputs(&req, None).unwrap();
+        let (_systems, messages) =
+            build_converse_inputs(&req, None, &FetchedMedia::default()).unwrap();
         let roles: Vec<ConversationRole> = messages.iter().map(|m| m.role().clone()).collect();
         assert_eq!(
             roles,
@@ -5174,7 +5204,8 @@ mod tests {
             ],
         );
 
-        let (systems, messages) = build_converse_inputs(&req, None).unwrap();
+        let (systems, messages) =
+            build_converse_inputs(&req, None, &FetchedMedia::default()).unwrap();
         assert_eq!(systems.len(), 1);
         assert_eq!(
             systems[0],
@@ -5205,7 +5236,8 @@ mod tests {
         }))
         .unwrap();
 
-        let (systems, messages) = build_converse_inputs(&req, None).unwrap();
+        let (systems, messages) =
+            build_converse_inputs(&req, None, &FetchedMedia::default()).unwrap();
         assert!(systems.is_empty());
         // user → assistant(2× toolUse) → user(2× toolResult, coalesced)
         assert_eq!(
