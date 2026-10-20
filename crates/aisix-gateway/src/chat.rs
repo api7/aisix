@@ -63,12 +63,10 @@ impl Role {
 ///     [`Self::text`] / [`Self::content_str`] and emitted as `content` on
 ///     serialization, so a request carrying megabytes of text blocks does
 ///     not hold them twice. Read text through those accessors, never the
-///     field. Bridges that don't speak content blocks
-///     (Anthropic / Gemini cross-provider translation today) read this
-///     and silently skip non-text blocks (images/audio): a cross-provider
-///     request keeps only the text. Documented for users under
-///     "Cross-Provider Content Limitations" in the provider-compatibility
-///     reference.
+///     field. A bridge that builds its own request shape (Anthropic,
+///     Gemini, Bedrock) translates the blocks through
+///     [`crate::content_part`] instead of reading this text, so a non-text
+///     part is converted or refused, never silently dropped.
 ///   * [`Self::content_blocks`] holds the **raw array** verbatim when
 ///     the caller sent the typed-block form. Bridges that DO support
 ///     content blocks (the OpenAI-compat bridge) forward this verbatim

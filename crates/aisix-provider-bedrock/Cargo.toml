@@ -25,6 +25,7 @@ aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
 # adapter applies the same wire transforms cp-api configures (#302 §5 / #340).
 aisix-provider-openai = { path = "../aisix-provider-openai" }
 async-stream = "0.3"
+base64.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
