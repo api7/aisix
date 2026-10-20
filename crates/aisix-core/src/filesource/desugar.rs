@@ -212,7 +212,7 @@ pub(crate) fn desugar_passthrough_route(
         };
         let Some(name) = name_value.as_str() else {
             return Err(format!(
-                "`{name_field}` must be a string (a {noun} display_name)"
+                "`{name_field}` must be a string (the {noun}'s display_name)"
             ));
         };
         if obj.contains_key(id_field) {
@@ -575,6 +575,19 @@ mod tests {
         assert!(err.contains("\"nope\""), "unexpected: {err}");
         assert!(err.contains("a-key"), "unexpected: {err}");
         assert!(err.contains("b-key"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn passthrough_route_non_string_name_reads_correctly_for_each_noun() {
+        let maps = IdentityMaps::new();
+        for (field, expected) in [
+            ("provider_key", "(the provider key's display_name)"),
+            ("anonymous_key", "(the api key's display_name)"),
+        ] {
+            let mut doc = json!({ field: 1 });
+            let err = desugar_passthrough_route(&mut doc, &maps).unwrap_err();
+            assert!(err.contains(expected), "unexpected: {err}");
+        }
     }
 
     #[test]
