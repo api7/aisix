@@ -1779,6 +1779,27 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                 }
             }
         }
+        // The AssumeRole options mean nothing without the role. Write path
+        // only: a stored row that carries one anyway still loads, and the
+        // option is simply unused.
+        if strict {
+            if let Some(Value::Array(branches)) = defs
+                .get_mut("BedrockAWSCredentials")
+                .and_then(|d| d.get_mut("oneOf"))
+            {
+                for branch in branches.iter_mut().filter_map(Value::as_object_mut) {
+                    if matches!(branch_kind(branch), Some("static" | "default_chain")) {
+                        branch.insert(
+                            "dependencies".to_string(),
+                            json!({
+                                "external_id": ["role_arn"],
+                                "role_session_name": ["role_arn"]
+                            }),
+                        );
+                    }
+                }
+            }
+        }
 
         set_definition_property_enum(
             defs,
@@ -1815,6 +1836,20 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
             "static",
             "kind",
             "Credential mode for explicitly configured AWS access keys.",
+        );
+        set_definition_variant_property_description(
+            defs,
+            "BedrockAWSCredentials",
+            "api_key",
+            "kind",
+            "Credential mode for an Amazon Bedrock API key.",
+        );
+        set_definition_variant_property_description(
+            defs,
+            "BedrockAWSCredentials",
+            "default_chain",
+            "kind",
+            "Credential mode that uses the gateway's own AWS environment.",
         );
         set_definition_variant_property_description(
             defs,
@@ -4161,8 +4196,31 @@ mod tests {
             "aws_credentials": { "kind": "role_arn", "access_key_id": "AKIA" },
             "latency_mode": { "kind": "serial" }
         });
-        // Phase 4 will add role_arn; today it's rejected.
         assert!(validate_guardrail(&v).is_err());
+    }
+
+    /// The AssumeRole options require `role_arn` on the write path only:
+    /// a stored row carrying one without the role still loads, so the
+    /// guardrail keeps enforcing.
+    #[test]
+    fn guardrail_bedrock_role_options_need_role_arn_only_on_write() {
+        let v = json!({
+            "name": "g",
+            "kind": "bedrock",
+            "guardrail_id": "id",
+            "guardrail_version": "1",
+            "region": "us-east-1",
+            "aws_credentials": {
+                "kind": "static", "access_key_id": "a", "secret_access_key": "s",
+                "external_id": "x"
+            },
+            "latency_mode": { "kind": "serial" }
+        });
+        assert!(validate_guardrail(&v).is_err());
+        validate_guardrail_lenient(&v).expect("a stored row still loads");
+        let mut with_role = v.clone();
+        with_role["aws_credentials"]["role_arn"] = json!("arn:aws:iam::1:role/r");
+        validate_guardrail(&with_role).expect("role_arn satisfies the dependency");
     }
 
     #[test]

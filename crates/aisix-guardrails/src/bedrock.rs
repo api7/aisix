@@ -35,10 +35,9 @@ use std::time::Duration;
 use aisix_core::models::{
     BedrockAWSCredentials, BedrockConfig, BedrockLatencyMode, GuardrailHookPoint,
 };
+use aisix_gateway::aws_auth::{AssumeRole, AwsAuth, AwsAuthMode, AwsAuthSpec};
 use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
-use aws_credential_types::provider::SharedCredentialsProvider;
-use aws_credential_types::Credentials;
 use aws_sdk_bedrockruntime::config::timeout::TimeoutConfig;
 use aws_sdk_bedrockruntime::config::{BehaviorVersion, Region};
 use aws_sdk_bedrockruntime::operation::apply_guardrail::{
@@ -112,6 +111,52 @@ fn sdk_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
     aisix_gateway::upstream_tls::build_aws_http_client()
 }
 
+/// How a guardrail's `aws_credentials` authenticate, in its region.
+/// AssumeRole options without a `role_arn` have no role to apply to and
+/// are not used.
+fn auth_spec(cfg: &BedrockConfig) -> AwsAuthSpec {
+    let assume = |role_arn: &Option<String>,
+                  external_id: &Option<String>,
+                  role_session_name: &Option<String>| {
+        role_arn.as_ref().map(|role_arn| AssumeRole {
+            role_arn: role_arn.clone(),
+            external_id: external_id.clone(),
+            role_session_name: role_session_name.clone(),
+        })
+    };
+    let (mode, assume_role) = match &cfg.aws_credentials {
+        BedrockAWSCredentials::Static {
+            access_key_id,
+            secret_access_key,
+            session_token,
+            role_arn,
+            external_id,
+            role_session_name,
+        } => (
+            AwsAuthMode::AccessKey {
+                access_key_id: access_key_id.clone(),
+                secret_access_key: secret_access_key.clone(),
+                session_token: session_token.clone(),
+            },
+            assume(role_arn, external_id, role_session_name),
+        ),
+        BedrockAWSCredentials::ApiKey { api_key } => (AwsAuthMode::ApiKey(api_key.clone()), None),
+        BedrockAWSCredentials::DefaultChain {
+            role_arn,
+            external_id,
+            role_session_name,
+        } => (
+            AwsAuthMode::DefaultChain,
+            assume(role_arn, external_id, role_session_name),
+        ),
+    };
+    AwsAuthSpec {
+        mode,
+        assume_role,
+        region: cfg.region.clone(),
+    }
+}
+
 impl BedrockGuardrail {
     /// Build the dispatcher from a parsed [`BedrockConfig`]. Caller
     /// owns the row's `name`, `hook_point`, and `fail_open` (they
@@ -128,8 +173,9 @@ impl BedrockGuardrail {
     /// blocking call from inside the etcd-watch supervisor's
     /// `arc_swap::store`), and `aws_config::defaults().load().await`
     /// is only async because of credential-source discovery (env,
-    /// IMDS, file). With static credentials we have nothing to
-    /// discover, so we compose `SdkConfig` directly via the builder.
+    /// IMDS, file). Discovery is left to the credentials provider,
+    /// which runs it on the first call and refreshes it after, so the
+    /// `SdkConfig` is composed directly via the builder.
     pub fn new(
         row_name: impl Into<String>,
         cfg: &BedrockConfig,
@@ -164,20 +210,7 @@ impl BedrockGuardrail {
         fail_open: bool,
         endpoint_url: Option<String>,
     ) -> Self {
-        let BedrockAWSCredentials::Static {
-            access_key_id,
-            secret_access_key,
-        } = &cfg.aws_credentials;
-        // Static credentials provider — no STS, no role assume.
-        // Phase 4 will add a kind=role_arn variant.
-        let creds = Credentials::new(
-            access_key_id.clone(),
-            secret_access_key.clone(),
-            // No session token (static keys are long-lived).
-            None,
-            None,
-            "aisix-guardrails-bedrock",
-        );
+        let auth = aisix_gateway::aws_auth::resolve(&auth_spec(cfg));
         // The dial budget the operator configured, exactly as the
         // provider bridge applies it. Without a `TimeoutConfig` the SDK's
         // default plugins substitute their own 3.1s and
@@ -192,7 +225,6 @@ impl BedrockGuardrail {
         let mut builder = aws_config::SdkConfig::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(cfg.region.clone()))
-            .credentials_provider(SharedCredentialsProvider::new(creds))
             .timeout_config(timeouts.build())
             // Same HTTP stack as the Bedrock provider bridge, so
             // `upstream.tls.ca_file` covers the guardrail call too and
@@ -204,11 +236,22 @@ impl BedrockGuardrail {
             .sleep_impl(aws_smithy_async::rt::sleep::SharedAsyncSleep::new(
                 aws_smithy_async::rt::sleep::TokioSleep::new(),
             ));
+        if let AwsAuth::SigV4(provider) = &auth {
+            builder = builder.credentials_provider(provider.clone());
+        }
         if let Some(url) = endpoint_url {
             builder = builder.endpoint_url(url);
         }
         let sdk_cfg = builder.build();
-        let client = Client::new(&sdk_cfg);
+        let mut conf = aws_sdk_bedrockruntime::config::Builder::from(&sdk_cfg);
+        if let AwsAuth::Bearer(token) = auth {
+            conf = conf
+                .bearer_token(aws_sdk_bedrockruntime::config::Token::new(token, None))
+                .auth_scheme_preference([
+                    aws_smithy_runtime_api::client::auth::http::HTTP_BEARER_AUTH_SCHEME_ID,
+                ]);
+        }
+        let client = Client::from_conf(conf.build());
         Self {
             row_name: row_name.into(),
             guardrail_id: cfg.guardrail_id.clone(),
@@ -1163,6 +1206,10 @@ mod tests {
             aws_credentials: BedrockAWSCredentials::Static {
                 access_key_id: "AKIAEXAMPLE".into(),
                 secret_access_key: "TEST".into(),
+                session_token: None,
+                role_arn: None,
+                external_id: None,
+                role_session_name: None,
             },
             latency_mode: BedrockLatencyMode::Serial,
             // Default fail-closed output (cp-api omits the field when unset).

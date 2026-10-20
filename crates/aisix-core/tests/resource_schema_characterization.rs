@@ -728,6 +728,46 @@ fn guardrail_corpus() {
                 json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "static", "access_key_id": "AKIA", "secret_access_key": "s"}, "latency_mode": {"kind": "timed", "timeout_ms": 500}}),
             ),
             (
+                "bedrock api_key credentials",
+                true,
+                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "api_key", "api_key": "ABSK"}, "latency_mode": {"kind": "serial"}}),
+            ),
+            (
+                "bedrock default_chain credentials",
+                true,
+                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "default_chain"}, "latency_mode": {"kind": "serial"}}),
+            ),
+            (
+                "bedrock default_chain assuming a role",
+                true,
+                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "default_chain", "role_arn": "arn:aws:iam::1:role/r", "external_id": "x", "role_session_name": "s"}, "latency_mode": {"kind": "serial"}}),
+            ),
+            (
+                "bedrock static with session token and role",
+                true,
+                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "static", "access_key_id": "a", "secret_access_key": "s", "session_token": "t", "role_arn": "arn:aws:iam::1:role/r"}, "latency_mode": {"kind": "serial"}}),
+            ),
+            (
+                "bedrock api_key with role_arn",
+                false,
+                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "api_key", "api_key": "ABSK", "role_arn": "arn:aws:iam::1:role/r"}, "latency_mode": {"kind": "serial"}}),
+            ),
+            (
+                "bedrock api_key without api_key",
+                false,
+                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "api_key"}, "latency_mode": {"kind": "serial"}}),
+            ),
+            (
+                "bedrock default_chain with access keys",
+                false,
+                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "default_chain", "access_key_id": "a", "secret_access_key": "s"}, "latency_mode": {"kind": "serial"}}),
+            ),
+            (
+                "bedrock external_id without role_arn",
+                false,
+                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "default_chain", "external_id": "x"}, "latency_mode": {"kind": "serial"}}),
+            ),
+            (
                 "bedrock missing guardrail_id",
                 false,
                 json!({"name": "b", "kind": "bedrock", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "static", "access_key_id": "a", "secret_access_key": "s"}, "latency_mode": {"kind": "serial"}}),
@@ -1032,6 +1072,8 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
     (
         "guardrail",
         &[
+            "/definitions/BedrockAWSCredentials/oneOf/0/dependencies",
+            "/definitions/BedrockAWSCredentials/oneOf/2/dependencies",
             "/oneOf/10/allOf",
             "/oneOf/10/properties/allow_threshold/default",
             "/oneOf/10/properties/deny_threshold/default",

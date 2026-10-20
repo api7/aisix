@@ -69,7 +69,7 @@ impl BedrockBridge {
         );
         drop(body);
 
-        let client = self.build_client_from_ctx(ctx)?;
+        let client = self.build_client_from_ctx(ctx).await?;
         let started = Instant::now();
         let deadline = ctx.deadline;
         if !stream {
@@ -159,7 +159,7 @@ impl BedrockBridge {
                 .build()
                 .map_err(|e| BridgeError::Config(e.to_string()))?,
         );
-        let client = self.build_client_from_ctx(ctx)?;
+        let client = self.build_client_from_ctx(ctx).await?;
         let started = Instant::now();
         let runtime = client
             .count_tokens()
@@ -212,8 +212,9 @@ fn mantle_count_tokens_url(region: &str) -> String {
 
 /// Count on Bedrock Mantle's Anthropic `count_tokens`: the base model id,
 /// the request's messages, `system` and `tools`, and the options counting
-/// reads (`thinking`, `tool_choice`, `output_config`), signed with SigV4
-/// (service `bedrock`) from the provider key's credentials.
+/// reads (`thinking`, `tool_choice`, `output_config`), authenticated like
+/// every other Bedrock call on the provider key: its bearer API key, or
+/// SigV4 (service `bedrock`).
 async fn mantle_count_tokens(
     body: &Value,
     model_id: &str,
@@ -242,39 +243,14 @@ async fn mantle_count_tokens(
         aisix_gateway::json_body(&Value::Object(count))
             .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?,
     );
-    let url = mantle_count_tokens_url(&creds.region);
+    let url = mantle_count_tokens_url(creds.region());
 
-    let identity = aws_credential_types::Credentials::new(
-        creds.access_key_id.clone(),
-        creds.secret_access_key.clone(),
-        creds.session_token.clone(),
-        None,
-        "aisix-provider-bedrock",
-    )
-    .into();
-    let params = aws_sigv4::sign::v4::SigningParams::builder()
-        .identity(&identity)
-        .region(&creds.region)
-        .name("bedrock")
-        .time(std::time::SystemTime::now())
-        .settings(aws_sigv4::http_request::SigningSettings::default())
-        .build()
-        .map_err(|e| BridgeError::Config(format!("sign bedrock-mantle request: {e}")))?
-        .into();
     let unsigned = [
-        ("content-type", "application/json"),
-        ("anthropic-version", "2023-06-01"),
+        ("content-type".to_string(), "application/json".to_string()),
+        ("anthropic-version".to_string(), "2023-06-01".to_string()),
     ];
-    let signable = aws_sigv4::http_request::SignableRequest::new(
-        "POST",
-        &url,
-        unsigned.iter().copied(),
-        aws_sigv4::http_request::SignableBody::Bytes(&bytes),
-    )
-    .map_err(|e| BridgeError::Config(format!("sign bedrock-mantle request: {e}")))?;
-    let (instructions, _) = aws_sigv4::http_request::sign(signable, &params)
-        .map_err(|e| BridgeError::Config(format!("sign bedrock-mantle request: {e}")))?
-        .into_parts();
+    let auth = creds.request_auth(ctx.deadline).await?;
+    let signed = crate::bridge::auth_headers(&auth, creds.region(), &url, &unsigned, &bytes)?;
 
     let client = aisix_gateway::upstream_tls::raw_client_for_provider_key(
         ctx.provider_key.upstream_connection().as_ref(),
@@ -286,7 +262,7 @@ async fn mantle_count_tokens(
         || Ok::<_, BridgeError>(url.clone()),
     )?;
     let mut req = endpoint.post_on(&client).body(bytes);
-    for (name, value) in unsigned.iter().copied().chain(instructions.headers()) {
+    for (name, value) in unsigned.iter().chain(signed.iter()) {
         req = req.header(name, value);
     }
     if let Some(d) = ctx.deadline {

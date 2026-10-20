@@ -27,6 +27,8 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+#[cfg(feature = "aws")]
+pub mod aws_auth;
 pub mod bridge;
 pub mod chat;
 pub mod content_part;

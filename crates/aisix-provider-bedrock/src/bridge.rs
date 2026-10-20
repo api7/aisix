@@ -10,12 +10,15 @@
 //! referencing D7.x follow-ups — see crate-level docs.
 //!
 //! Credentials: `ProviderKey.api_key` is a JSON-encoded
-//! `{access_key_id, secret_access_key, session_token?, region}`
-//! struct. The bridge parses it per request (cheap — strings only)
-//! and constructs a per-call SDK client. `ProviderKey.api_base` (if
+//! [`BedrockSecret`] whose `auth_type` selects access keys, a Bedrock
+//! API key, or the default credential chain, optionally exchanged for a
+//! role. The bridge parses it per request (cheap — strings only),
+//! resolves the credentials through a cache shared by every request on
+//! the same configuration, and constructs a per-call SDK client. `ProviderKey.api_base` (if
 //! set) is forwarded as the SDK's `endpoint_url` so operators can
 //! point at a private deployment / VPC endpoint.
 
+use aisix_gateway::aws_auth::{AssumeRole, AwsAuth, AwsAuthMode, AwsAuthSpec};
 use aisix_gateway::structured_output::{
     response_into_fake_stream_chunks, unwrap_json_tool_call, JSON_TOOL_DESCRIPTION, JSON_TOOL_NAME,
 };
@@ -340,52 +343,168 @@ pub(crate) fn strip_region_prefix(model_id: &str) -> &str {
 
 /// Schema for `ProviderKey.api_key` on a Bedrock provider key.
 ///
-/// Convention: AWS credentials are JSON-encoded into the `secret`
-/// field. The cp-api side delivers them already-decrypted (mTLS-only
-/// etcd channel; see ProviderKey doc).
+/// The secret is a JSON object. `auth_type` selects how requests
+/// authenticate, and decides which other fields belong:
+///
+/// - `access_key` (the default when absent): `access_key_id` and
+///   `secret_access_key`, optionally `session_token`.
+/// - `api_key`: `api_key`, a Bedrock API key sent as a bearer token.
+/// - `default_chain`: no credential fields — the gateway's own AWS
+///   environment supplies them (environment variables, web identity,
+///   the ECS container endpoint, the instance profile).
+///
+/// `role_arn` (with optional `external_id` and `role_session_name`)
+/// exchanges the `access_key` or `default_chain` credentials for that
+/// role through `sts:AssumeRole`. `region` is required in every mode.
+/// A field that belongs to another mode is a configuration error, so a
+/// mode is never chosen by which fields happen to be present.
 ///
 /// `endpoint_url` is intentionally NOT in here — that goes in
 /// `ProviderKey.api_base` so the cp-api validator can apply normal
-/// URL-shape rules. Region is in here because Bedrock keys dispatch
-/// off region (`bedrock-runtime.<region>.amazonaws.com`).
-#[derive(Debug, Clone, Deserialize)]
+/// URL-shape rules.
+#[derive(Debug, Clone)]
 pub(crate) struct BedrockSecret {
-    pub(crate) access_key_id: String,
-    pub(crate) secret_access_key: String,
-    /// AWS STS session token. Optional — long-lived static keys
-    /// don't have one; assume-role credentials do.
+    pub(crate) auth: AwsAuthSpec,
+}
+
+#[derive(Deserialize)]
+struct RawBedrockSecret {
     #[serde(default)]
-    pub(crate) session_token: Option<String>,
-    /// AWS region the Bedrock dispatch targets (e.g. `us-west-2`).
-    /// Required — Bedrock's URL is region-keyed and the SDK won't
-    /// dispatch without it.
-    pub(crate) region: String,
+    auth_type: Option<String>,
+    #[serde(default)]
+    access_key_id: Option<String>,
+    #[serde(default)]
+    secret_access_key: Option<String>,
+    #[serde(default)]
+    session_token: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    role_arn: Option<String>,
+    #[serde(default)]
+    external_id: Option<String>,
+    #[serde(default)]
+    role_session_name: Option<String>,
+    region: String,
+}
+
+const SECRET_SHAPE: &str = "{auth_type?, access_key_id, secret_access_key, session_token?, \
+     api_key, role_arn?, external_id?, role_session_name?, region}";
+
+fn secret_error(detail: &str) -> BridgeError {
+    BridgeError::InvalidUpstreamCredentials(format!("bedrock provider_key.api_key {detail}"))
 }
 
 impl BedrockSecret {
-    /// Parse the JSON-encoded credential blob. Audit M1: error
-    /// messages here MUST NOT echo the raw secret content — only
-    /// generic shape errors.
+    /// Parse and validate the JSON-encoded credential blob. Audit M1:
+    /// error messages here MUST NOT echo the raw secret content — only
+    /// field names and generic shape errors.
     pub(crate) fn parse(secret: &str) -> Result<Self, BridgeError> {
         if secret.trim().is_empty() {
-            return Err(BridgeError::InvalidUpstreamCredentials(
-                "bedrock provider_key.api_key is empty — \
-                 expected JSON {access_key_id, secret_access_key, region, session_token?}"
-                    .into(),
-            ));
+            return Err(secret_error(&format!(
+                "is empty — expected JSON {SECRET_SHAPE}"
+            )));
         }
-        serde_json::from_str::<BedrockSecret>(secret).map_err(|_e| {
-            // Intentionally do NOT include the underlying serde error
-            // message — it can leak partial secret contents (e.g.
-            // "invalid character 'X' at position N" reveals what's
-            // in the JSON). Generic shape hint is enough for the
-            // operator who controls the registration.
-            BridgeError::InvalidUpstreamCredentials(
-                "bedrock provider_key.api_key must be valid JSON: \
-                 {access_key_id, secret_access_key, region, session_token?}"
-                    .into(),
-            )
+        // Intentionally do NOT include the underlying serde error
+        // message — it can leak partial secret contents (e.g.
+        // "invalid character 'X' at position N" reveals what's
+        // in the JSON).
+        let raw = serde_json::from_str::<RawBedrockSecret>(secret)
+            .map_err(|_e| secret_error(&format!("must be valid JSON: {SECRET_SHAPE}")))?;
+        let reject = |present: bool, field: &str, mode: &str| {
+            if present {
+                Err(secret_error(&format!(
+                    "carries `{field}`, which does not apply to auth_type \"{mode}\""
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        let auth_type = raw.auth_type.as_deref().unwrap_or("access_key");
+        let mode = match auth_type {
+            "access_key" => {
+                reject(raw.api_key.is_some(), "api_key", auth_type)?;
+                let (Some(access_key_id), Some(secret_access_key)) =
+                    (raw.access_key_id, raw.secret_access_key)
+                else {
+                    return Err(secret_error(
+                        "auth_type \"access_key\" requires `access_key_id` and `secret_access_key`",
+                    ));
+                };
+                AwsAuthMode::AccessKey {
+                    access_key_id,
+                    secret_access_key,
+                    session_token: raw.session_token,
+                }
+            }
+            "api_key" => {
+                for (present, field) in [
+                    (raw.access_key_id.is_some(), "access_key_id"),
+                    (raw.secret_access_key.is_some(), "secret_access_key"),
+                    (raw.session_token.is_some(), "session_token"),
+                    (raw.role_arn.is_some(), "role_arn"),
+                    (raw.external_id.is_some(), "external_id"),
+                    (raw.role_session_name.is_some(), "role_session_name"),
+                ] {
+                    reject(present, field, auth_type)?;
+                }
+                match raw.api_key {
+                    Some(key) if !key.trim().is_empty() => AwsAuthMode::ApiKey(key),
+                    _ => {
+                        return Err(secret_error(
+                            "auth_type \"api_key\" requires a non-empty `api_key`",
+                        ))
+                    }
+                }
+            }
+            "default_chain" => {
+                for (present, field) in [
+                    (raw.access_key_id.is_some(), "access_key_id"),
+                    (raw.secret_access_key.is_some(), "secret_access_key"),
+                    (raw.session_token.is_some(), "session_token"),
+                    (raw.api_key.is_some(), "api_key"),
+                ] {
+                    reject(present, field, auth_type)?;
+                }
+                AwsAuthMode::DefaultChain
+            }
+            _ => {
+                return Err(secret_error(
+                    "has an unknown `auth_type` — expected \"access_key\", \"api_key\" or \
+                     \"default_chain\"",
+                ))
+            }
+        };
+        let assume_role = match raw.role_arn {
+            Some(role_arn) if !role_arn.trim().is_empty() => Some(AssumeRole {
+                role_arn,
+                external_id: raw.external_id,
+                role_session_name: raw.role_session_name,
+            }),
+            Some(_) => return Err(secret_error("has an empty `role_arn`")),
+            None => {
+                for (present, field) in [
+                    (raw.external_id.is_some(), "external_id"),
+                    (raw.role_session_name.is_some(), "role_session_name"),
+                ] {
+                    if present {
+                        return Err(secret_error(&format!("sets `{field}` without `role_arn`")));
+                    }
+                }
+                None
+            }
+        };
+        Ok(Self {
+            auth: AwsAuthSpec {
+                mode,
+                assume_role,
+                region: raw.region,
+            },
         })
+    }
+
+    pub(crate) fn region(&self) -> &str {
+        &self.auth.region
     }
 }
 
@@ -409,28 +528,129 @@ fn sdk_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
     aisix_gateway::upstream_tls::build_aws_http_client()
 }
 
-/// Build a Bedrock SDK Client from the parsed credentials plus the
+/// What one request authenticates with, resolved before it is built.
+pub(crate) enum RequestAuth {
+    /// A Bedrock API key: `Authorization: Bearer`, no SigV4.
+    Bearer(String),
+    /// SigV4 with these credentials.
+    SigV4(Credentials),
+}
+
+impl BedrockSecret {
+    /// The credentials this request signs with, or the bearer token it
+    /// carries. Fetched credentials (default chain, AssumeRole) come from a
+    /// cache shared by every request on the same configuration, so this
+    /// reaches AWS only when they are missing or about to expire.
+    pub(crate) async fn request_auth(
+        &self,
+        deadline: Option<std::time::Duration>,
+    ) -> Result<RequestAuth, BridgeError> {
+        use aws_credential_types::provider::error::CredentialsError;
+        use aws_credential_types::provider::ProvideCredentials as _;
+        if self.region().trim().is_empty() {
+            return Err(BridgeError::InvalidUpstreamConfig(
+                "bedrock provider_key.api_key.region is empty — \
+                 AWS Bedrock dispatch is region-keyed and requires e.g. \"us-west-2\""
+                    .into(),
+            ));
+        }
+        let provider = match aisix_gateway::aws_auth::resolve(&self.auth) {
+            AwsAuth::Bearer(token) => return Ok(RequestAuth::Bearer(token)),
+            AwsAuth::SigV4(provider) => provider,
+        };
+        let started = Instant::now();
+        let timed_out = |cause: &str| BridgeError::Timeout {
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            cause: cause.to_string(),
+        };
+        let fetched = match deadline {
+            Some(d) => tokio::time::timeout(d, provider.provide_credentials())
+                .await
+                .map_err(|_| timed_out(""))?,
+            None => provider.provide_credentials().await,
+        };
+        // The cause is in the gateway log, not in the caller's error: an
+        // STS refusal names the gateway's own account and role.
+        fetched.map(RequestAuth::SigV4).map_err(|e| {
+            let msg = format!(
+                "bedrock: could not obtain AWS credentials for auth_type \"{}\"{} — \
+                 the gateway log has the cause",
+                self.auth.mode_name(),
+                if self.auth.assume_role.is_some() {
+                    " with role_arn"
+                } else {
+                    ""
+                },
+            );
+            match e {
+                // Missing or refused credentials: the configuration's to fix.
+                CredentialsError::CredentialsNotLoaded(_)
+                | CredentialsError::InvalidConfiguration(_) => {
+                    BridgeError::InvalidUpstreamCredentials(msg)
+                }
+                CredentialsError::ProviderTimedOut(_) => timed_out("obtaining AWS credentials"),
+                // A credential service that failed (STS 5xx, IMDS
+                // unreachable) may answer the next attempt.
+                _ => BridgeError::Transport(msg),
+            }
+        })
+    }
+}
+
+/// The headers that authenticate a request the SDK has no operation for:
+/// the bearer token, or the SigV4 signature over `method`, `url`, `headers`
+/// and `body` (service `bedrock`).
+pub(crate) fn auth_headers(
+    auth: &RequestAuth,
+    region: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<Vec<(String, String)>, BridgeError> {
+    let creds = match auth {
+        RequestAuth::Bearer(token) => {
+            return Ok(vec![(
+                "authorization".to_string(),
+                format!("Bearer {token}"),
+            )])
+        }
+        RequestAuth::SigV4(creds) => creds,
+    };
+    let identity = creds.clone().into();
+    let params = aws_sigv4::sign::v4::SigningParams::builder()
+        .identity(&identity)
+        .region(region)
+        .name("bedrock")
+        .time(std::time::SystemTime::now())
+        .settings(aws_sigv4::http_request::SigningSettings::default())
+        .build()
+        .map_err(|e| BridgeError::Config(format!("bedrock: build signing params: {e}")))?
+        .into();
+    let signable = aws_sigv4::http_request::SignableRequest::new(
+        "POST",
+        url,
+        headers.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        aws_sigv4::http_request::SignableBody::Bytes(body),
+    )
+    .map_err(|e| BridgeError::InvalidUpstreamConfig(format!("bedrock endpoint {url:?}: {e}")))?;
+    let (instructions, _) = aws_sigv4::http_request::sign(signable, &params)
+        .map_err(|e| BridgeError::Config(format!("bedrock: sign request: {e}")))?
+        .into_parts();
+    Ok(instructions
+        .headers()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect())
+}
+
+/// Build a Bedrock SDK Client from the resolved authentication plus the
 /// optional endpoint override.
 fn build_client(
-    creds: &BedrockSecret,
+    auth: &RequestAuth,
+    region: &str,
     endpoint_url: Option<&str>,
     hdr: &UpstreamHeaderContext<'_>,
     deadline: Option<std::time::Duration>,
 ) -> Result<BedrockClient, BridgeError> {
-    if creds.region.trim().is_empty() {
-        return Err(BridgeError::InvalidUpstreamConfig(
-            "bedrock provider_key.api_key.region is empty — \
-             AWS Bedrock dispatch is region-keyed and requires e.g. \"us-west-2\""
-                .into(),
-        ));
-    }
-    let aws_creds = Credentials::new(
-        creds.access_key_id.clone(),
-        creds.secret_access_key.clone(),
-        creds.session_token.clone(),
-        None,
-        "aisix-provider-bedrock",
-    );
     // The SDK enforces the deadlines the other bridges get from
     // `tokio::time::timeout` wrappers: the shared `upstream.connect_timeout`
     // bounds the dial (explicitly disabled when the operator set `0`, or
@@ -454,8 +674,7 @@ fn build_client(
     }
     let mut builder = aws_config::SdkConfig::builder()
         .behavior_version(BehaviorVersion::latest())
-        .region(Region::new(creds.region.clone()))
-        .credentials_provider(SharedCredentialsProvider::new(aws_creds))
+        .region(Region::new(region.to_string()))
         .timeout_config(timeouts.build())
         // The HTTP stack carrying `upstream.tls.ca_file`, so a
         // Bedrock-compatible endpoint behind a private CA is reachable
@@ -472,6 +691,9 @@ fn build_client(
         .sleep_impl(aws_smithy_async::rt::sleep::SharedAsyncSleep::new(
             aws_smithy_async::rt::sleep::TokioSleep::new(),
         ));
+    if let RequestAuth::SigV4(creds) = auth {
+        builder = builder.credentials_provider(SharedCredentialsProvider::new(creds.clone()));
+    }
     if let Some(url) = endpoint_url {
         builder = builder.endpoint_url(url);
     }
@@ -483,6 +705,16 @@ fn build_client(
     // `modify_before_signing`, so the headers are covered by the SigV4
     // signature (#340).
     let mut conf = aws_sdk_bedrockruntime::config::Builder::from(&sdk_cfg);
+    if let RequestAuth::Bearer(token) = auth {
+        conf = conf
+            .bearer_token(aws_sdk_bedrockruntime::config::Token::new(
+                token.clone(),
+                None,
+            ))
+            .auth_scheme_preference([
+                aws_smithy_runtime_api::client::auth::http::HTTP_BEARER_AUTH_SCHEME_ID,
+            ]);
+    }
     let headers = filtered_extra_headers(hdr);
     if !headers.is_empty() {
         conf = conf.interceptor(DefaultHeadersInterceptor { headers });
@@ -812,7 +1044,7 @@ impl Bridge for BedrockBridge {
     ) -> Result<EmbeddingResponse, BridgeError> {
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
-        let client = self.build_client_from_ctx(ctx)?;
+        let client = self.build_client_from_ctx(ctx).await?;
         let started = Instant::now();
         let deadline = ctx.deadline;
 
@@ -1046,7 +1278,7 @@ impl BedrockBridge {
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
-        let client = self.build_client_from_ctx(ctx)?;
+        let client = self.build_client_from_ctx(ctx).await?;
 
         // The Anthropic request builder reads the Claude family version
         // off the model name to pick a structured-output shape, and
@@ -1163,11 +1395,6 @@ impl BedrockBridge {
         ctx: &BridgeContext,
     ) -> Result<crate::openai_compat::Endpoint, BridgeError> {
         let creds = BedrockSecret::parse(&ctx.provider_key.api_key)?;
-        if creds.region.trim().is_empty() {
-            return Err(BridgeError::InvalidUpstreamConfig(
-                "bedrock provider_key.api_key.region is empty".into(),
-            ));
-        }
         #[cfg(test)]
         let base = self
             .endpoint_url_override
@@ -1189,7 +1416,7 @@ impl BedrockBridge {
     /// Resolve credentials + build an SDK client. Pulled out of
     /// `chat_converse` / `chat_converse_stream` because both methods
     /// need it and the body is identical.
-    pub(crate) fn build_client_from_ctx(
+    pub(crate) async fn build_client_from_ctx(
         &self,
         ctx: &BridgeContext,
     ) -> Result<BedrockClient, BridgeError> {
@@ -1211,7 +1438,14 @@ impl BedrockBridge {
         };
         // Converse paths carry no JSON body, but default_headers still apply
         // (header-level, publisher-agnostic) via the signing interceptor.
-        build_client(&creds, endpoint_url, &ctx.header_ctx(), ctx.deadline)
+        let auth = creds.request_auth(ctx.deadline).await?;
+        build_client(
+            &auth,
+            creds.region(),
+            endpoint_url,
+            &ctx.header_ctx(),
+            ctx.deadline,
+        )
     }
 
     /// Dispatch Bedrock chat via the unified Converse API.
@@ -1228,7 +1462,7 @@ impl BedrockBridge {
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
-        let client = self.build_client_from_ctx(ctx)?;
+        let client = self.build_client_from_ctx(ctx).await?;
         let fetched =
             fetch_media_urls_including_tool_results(&req, ctx, Encoding::Bytes, |_| true).await?;
         let charged = fetched.charge(ctx);
@@ -1323,7 +1557,7 @@ impl BedrockBridge {
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatChunkStream, BridgeError> {
-        let client = self.build_client_from_ctx(ctx)?;
+        let client = self.build_client_from_ctx(ctx).await?;
         let fetched =
             fetch_media_urls_including_tool_results(&req, ctx, Encoding::Bytes, |_| true).await?;
         let charged = fetched.charge(ctx);
@@ -3261,17 +3495,115 @@ mod tests {
         let json =
             r#"{"access_key_id":"AKIA-test","secret_access_key":"sk-test","region":"us-west-2"}"#;
         let s = BedrockSecret::parse(json).unwrap();
-        assert_eq!(s.access_key_id, "AKIA-test");
-        assert_eq!(s.secret_access_key, "sk-test");
-        assert_eq!(s.region, "us-west-2");
-        assert!(s.session_token.is_none());
+        assert_eq!(s.region(), "us-west-2");
+        assert!(s.auth.assume_role.is_none());
+        match &s.auth.mode {
+            AwsAuthMode::AccessKey {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => {
+                assert_eq!(access_key_id, "AKIA-test");
+                assert_eq!(secret_access_key, "sk-test");
+                assert!(session_token.is_none());
+            }
+            _ => panic!("an absent auth_type is access_key"),
+        }
     }
 
     #[test]
     fn bedrock_secret_parses_with_session_token() {
         let json = r#"{"access_key_id":"AKIA","secret_access_key":"sk","region":"us-west-2","session_token":"AQo..."}"#;
         let s = BedrockSecret::parse(json).unwrap();
-        assert_eq!(s.session_token.as_deref(), Some("AQo..."));
+        assert!(matches!(
+            &s.auth.mode,
+            AwsAuthMode::AccessKey { session_token: Some(t), .. } if t == "AQo..."
+        ));
+    }
+
+    #[test]
+    fn bedrock_secret_parses_each_auth_type() {
+        let s = BedrockSecret::parse(
+            r#"{"auth_type":"api_key","api_key":"ABSK-test","region":"us-east-1"}"#,
+        )
+        .unwrap();
+        assert!(matches!(&s.auth.mode, AwsAuthMode::ApiKey(k) if k == "ABSK-test"));
+
+        let s = BedrockSecret::parse(
+            r#"{"auth_type":"default_chain","region":"us-east-1",
+                "role_arn":"arn:aws:iam::123456789012:role/B","external_id":"x",
+                "role_session_name":"gw"}"#,
+        )
+        .unwrap();
+        assert!(matches!(s.auth.mode, AwsAuthMode::DefaultChain));
+        let role = s.auth.assume_role.expect("role_arn assumes a role");
+        assert_eq!(role.role_arn, "arn:aws:iam::123456789012:role/B");
+        assert_eq!(role.external_id.as_deref(), Some("x"));
+        assert_eq!(role.role_session_name.as_deref(), Some("gw"));
+
+        let s = BedrockSecret::parse(
+            r#"{"auth_type":"access_key","access_key_id":"a","secret_access_key":"b",
+                "region":"us-east-1","role_arn":"arn:aws:iam::123456789012:role/B"}"#,
+        )
+        .unwrap();
+        assert!(s.auth.assume_role.is_some());
+    }
+
+    /// A secret whose fields do not match its `auth_type` is refused with
+    /// a 401 that names the offending field and never the secret value.
+    #[test]
+    fn bedrock_secret_rejects_fields_of_another_mode() {
+        let cases = [
+            (r#"{"auth_type":"api_key","region":"r"}"#, "api_key"),
+            (
+                r#"{"auth_type":"api_key","api_key":"  ","region":"r"}"#,
+                "api_key",
+            ),
+            (
+                r#"{"auth_type":"api_key","api_key":"SECRET-MARKER","role_arn":"arn:aws:iam::1:role/x","region":"r"}"#,
+                "role_arn",
+            ),
+            (
+                r#"{"auth_type":"api_key","api_key":"SECRET-MARKER","access_key_id":"a","region":"r"}"#,
+                "access_key_id",
+            ),
+            (
+                r#"{"auth_type":"default_chain","access_key_id":"a","secret_access_key":"SECRET-MARKER","region":"r"}"#,
+                "access_key_id",
+            ),
+            (
+                r#"{"auth_type":"default_chain","api_key":"SECRET-MARKER","region":"r"}"#,
+                "api_key",
+            ),
+            (
+                r#"{"access_key_id":"a","secret_access_key":"b","api_key":"SECRET-MARKER","region":"r"}"#,
+                "api_key",
+            ),
+            (
+                r#"{"auth_type":"access_key","access_key_id":"a","region":"r"}"#,
+                "secret_access_key",
+            ),
+            (
+                r#"{"access_key_id":"a","secret_access_key":"SECRET-MARKER","external_id":"e","region":"r"}"#,
+                "external_id",
+            ),
+            (
+                r#"{"auth_type":"default_chain","role_session_name":"s","region":"r"}"#,
+                "role_session_name",
+            ),
+            (
+                r#"{"auth_type":"default_chain","role_arn":"","region":"r"}"#,
+                "role_arn",
+            ),
+            (r#"{"auth_type":"iam","region":"r"}"#, "auth_type"),
+        ];
+        for (json, field) in cases {
+            let err = BedrockSecret::parse(json).unwrap_err();
+            assert_eq!(err.http_status(), 401, "{json}");
+            let msg = err.to_string();
+            assert!(msg.contains(field), "{json}: {msg}");
+            assert!(!msg.contains("SECRET-MARKER"), "{json}: {msg}");
+        }
     }
 
     #[test]
