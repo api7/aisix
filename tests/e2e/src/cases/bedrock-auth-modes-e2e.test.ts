@@ -612,18 +612,18 @@ describe("Bedrock guardrail authentication modes", () => {
       return;
     }
     // Every guardrail is attached to the environment, so one request runs
-    // all four; wait until each one has been called.
-    await waitConfigPropagation(async () => {
-      const r = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${CALLER}`, "content-type": "application/json" },
-        body: JSON.stringify({ model: "gr-auth-model", messages: [{ role: "user", content: "hello" }] }),
-      });
-      await r.text();
-      const seen = new Set(guardrails!.received.map(guardOf));
-      return r.status === 200 && Object.values(GUARDS).every((id) => seen.has(id));
+    // all four; the beforeAll gate already implies they are loaded.
+    const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "gr-auth-model", messages: [{ role: "user", content: "hello" }] }),
     });
+    const text = await res.text();
+    expect(res.status, text).toBe(200);
     const calls = (id: string) => guardrails!.received.filter((r) => guardOf(r) === id);
+    for (const [mode, id] of Object.entries(GUARDS)) {
+      expect(calls(id).length, `${mode} guardrail was called`).toBeGreaterThan(0);
+    }
 
     for (const c of calls(GUARDS.session)) {
       expect(signer(c)).toBe("ASIAGUARDSESSION001");
