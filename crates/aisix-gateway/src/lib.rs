@@ -61,7 +61,7 @@ pub use credential::credential_fingerprint;
 pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};
 pub use response_tap::{
     capture_header_values, note_upstream_response, provider_request_id, ResponseHeaderTap,
-    UpstreamResponseCapture,
+    UpstreamResponseCapture, PROVIDER_REQUEST_ID_HEADERS,
 };
 pub use sse::{SseDecoder, SseEvent, SseFrameTooLarge};
 pub use structured_output::{

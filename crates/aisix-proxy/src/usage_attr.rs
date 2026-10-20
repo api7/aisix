@@ -1026,11 +1026,14 @@ pub(crate) fn emit_usage(
         if event.upstream_response_headers.is_empty() {
             event.upstream_response_headers = response.headers;
         }
-        // A failed attempt has no response object to take an id from, and
-        // count_tokens' answer carries none; the provider's request-id
-        // header is what its support traces the call by.
+        // A failed attempt has no response object to take an id from — nor
+        // does an upstream error a route relays as its own answer (the jobs
+        // and passthrough families) — and count_tokens' answer carries none;
+        // the provider's request-id header is what its support traces the
+        // call by.
         if event.provider_request_id.is_empty()
             && (!event.error_class.is_empty()
+                || event.status_code >= 400
                 || surface.operation == crate::operation::COUNT_TOKENS.operation)
         {
             event.provider_request_id = sanitize_provider_response_id(&response.request_id);

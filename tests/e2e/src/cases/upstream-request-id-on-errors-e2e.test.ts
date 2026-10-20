@@ -37,6 +37,7 @@ const LOGSTORE = "upstream-request-id-store";
 
 const OPENAI = "urid-openai";
 const OPENAI_RETRIED = "urid-openai-retried";
+const OPENAI_OK = "urid-openai-ok";
 const ANTHROPIC = "urid-anthropic";
 const AZURE = "urid-azure";
 const BEDROCK = "urid-bedrock-nova";
@@ -117,6 +118,19 @@ async function startUpstream(): Promise<{ server: Server; baseUrl: string }> {
     if (path.startsWith("/dec/")) {
       return fail(400, { "x-request-id": "dec-systemone" }, { detail: "rejected by the mock" });
     }
+    // OpenAI, answering: an embedding carries no id of its own.
+    if (path.startsWith("/oai-ok/")) {
+      res.writeHead(200, { "content-type": "application/json", "x-request-id": "oai-ok-embeddings" });
+      res.end(
+        JSON.stringify({
+          object: "list",
+          data: [{ object: "embedding", index: 0, embedding: [0.1, 0.2] }],
+          model: "text-embedding-3-small",
+          usage: { prompt_tokens: 1, total_tokens: 1 },
+        }),
+      );
+      return;
+    }
     // OpenAI, retried: every attempt answers with an id of its own.
     if (path.startsWith("/oai-retried/")) {
       retriedCalls += 1;
@@ -128,6 +142,10 @@ async function startUpstream(): Promise<{ server: Server; baseUrl: string }> {
     }
     fail(404, {}, { message: `no route ${path}` });
   });
+  // Never close an idle pooled connection first: a request sent as Node's 5s
+  // keep-alive close lands would fail an extra attempt.
+  server.keepAliveTimeout = 120_000;
+  server.headersTimeout = 125_000;
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const addr = server.address();
   if (addr === null || typeof addr === "string") throw new Error("no port");
@@ -216,6 +234,7 @@ describe("the provider's request id on failed attempts and token counts", () => 
       seed.createProviderKey({ display_name, secret: "sk-mock", ...extra });
     const openai = await pk("urid-openai-pk", { api_base: `${up.baseUrl}/oai/v1` });
     const retried = await pk("urid-openai-retried-pk", { api_base: `${up.baseUrl}/oai-retried/v1` });
+    const answering = await pk("urid-openai-ok-pk", { api_base: `${up.baseUrl}/oai-ok/v1` });
     const anthropic = await pk("urid-anthropic-pk", {
       provider: "anthropic",
       adapter: "anthropic",
@@ -242,6 +261,7 @@ describe("the provider's request id on failed attempts and token counts", () => 
     for (const [display_name, key, provider, model_name, retries] of [
       [OPENAI, openai, "openai", "gpt-4o-mini", 0],
       [OPENAI_RETRIED, retried, "openai", "gpt-4o-mini", 1],
+      [OPENAI_OK, answering, "openai", "text-embedding-3-small", 0],
       [ANTHROPIC, anthropic, "anthropic", "claude-sonnet-4-5", 0],
       [AZURE, azure, "azure-openai", "gpt-4o-mini", 0],
       [BEDROCK, bedrock, "bedrock", "amazon.nova-lite-v1:0", 0],
@@ -302,6 +322,31 @@ describe("the provider's request id on failed attempts and token counts", () => 
       expect(field(line, "provider_request_id"), line).toBe(upstreamId);
     });
   }
+
+  test("an upstream error the jobs surface relays carries the provider's request id", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const res = await json("/v1/batches", {
+      model: OPENAI,
+      input_file_id: "file-urid",
+      endpoint: "/v1/chat/completions",
+      completion_window: "24h",
+    });
+    expect(res.status, res.text).toBe(400);
+    const [row] = await rowsFor(res.requestId, 1);
+    expect(row.get("provider_request_id"), JSON.stringify(Object.fromEntries(row))).toBe("oai-batches");
+    const line = await accessLine(res.requestId);
+    expect(field(line, "provider_request_id"), line).toBe("oai-batches");
+  });
+
+  test("a success whose response has no id of its own records none", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const res = await json("/v1/embeddings", { model: OPENAI_OK, input: "hi" });
+    expect(res.status, res.text).toBe(200);
+    const [row] = await rowsFor(res.requestId, 1);
+    expect(row.has("provider_request_id"), JSON.stringify(Object.fromEntries(row))).toBe(false);
+    const line = await accessLine(res.requestId);
+    expect(field(line, "provider_request_id"), line).toBeUndefined();
+  });
 
   test("each retried attempt carries the id of its own response", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();

@@ -449,14 +449,24 @@ impl AccessLogRecord {
         if error_kind.is_empty() {
             return;
         }
-        if self.provider_request_id.is_none() && !provider_request_id.is_empty() {
-            self.provider_request_id = Some(provider_request_id.to_string());
-        }
+        self.fill_provider_request_id_if_absent(provider_request_id);
         if self.error_kind.is_some() || self.error.is_some() || self.status != status {
             return;
         }
         self.error_kind = Some(error_kind.to_string());
         self.error = (!error.is_empty()).then(|| error.to_string());
+    }
+
+    /// Set `provider_request_id` on a line that has none.
+    pub fn fill_provider_request_id_if_absent(&mut self, provider_request_id: &str) {
+        if self.provider_request_id.is_none() && !provider_request_id.is_empty() {
+            self.provider_request_id = Some(provider_request_id.to_string());
+        }
+    }
+
+    /// Whether the line reports a 4xx or 5xx.
+    pub fn is_error_status(&self) -> bool {
+        self.status >= 400
     }
 
     pub fn emit(&self) {

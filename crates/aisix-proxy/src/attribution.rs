@@ -538,6 +538,10 @@ impl Cell {
                 message,
                 &self.terminal_provider_request_id,
             );
+        } else if record.is_error_status() {
+            // An upstream error relayed as the route's own answer names no
+            // error class, and is still a failed call.
+            record.fill_provider_request_id_if_absent(&self.terminal_provider_request_id);
         }
     }
 

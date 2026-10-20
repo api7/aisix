@@ -444,16 +444,19 @@ pub struct UsageEvent {
     pub status_code: u16,
 
     /// Provider response `id` — OpenAI's `chat.completion.id`, Anthropic's
-    /// message `id`, a Responses-API `resp_…`.
+    /// message `id`, a Responses-API `resp_…`. A failed attempt (one with an
+    /// `error_class`, or a 4xx/5xx the route relayed) and a `count_tokens`
+    /// call have no response object, so they record the provider's own
+    /// request-id header instead (`aisix_gateway::PROVIDER_REQUEST_ID_HEADERS`).
     ///
     /// Empty does NOT mean the request never reached an upstream. It means
     /// no id was recorded, which happens on all of:
     ///
     /// - the request never reached an upstream (guardrail block,
     ///   pre-dispatch error), or was served from cache;
-    /// - the attempt failed, so there was no response body to read one from;
-    /// - the endpoint's provider response carries no id at all — embeddings,
-    ///   audio, images, `count_tokens` — or the id it returns is a resource
+    /// - the attempt failed and the provider sent no request-id header;
+    /// - the endpoint's successful provider response carries no id at all —
+    ///   embeddings, audio, images — or the id it returns is a resource
     ///   handle rather than a per-call response id (video jobs,
     ///   files/batches/fine-tuning, the passthrough tunnel), which is
     ///   deliberately not recorded here (AISIX-Cloud#1289);
