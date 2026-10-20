@@ -61,6 +61,7 @@ const CONVERSE_REPLY = {
 const PNG = Buffer.from(PNG_B64, "base64");
 const PDF = Buffer.from(PDF_B64, "base64");
 const MAX_BYTES = 1024;
+const PAD_BYTES = 1500;
 
 interface MediaServer {
   port: number;
@@ -87,6 +88,9 @@ async function startMediaServer(): Promise<MediaServer> {
         return send(200, "application/octet-stream", PNG);
       case "/doc.pdf":
         return send(200, "application/pdf", PDF);
+      case "/pad-a.png":
+      case "/pad-b.png":
+        return send(200, "image/png", Buffer.concat([PNG, Buffer.alloc(PAD_BYTES - PNG.length, 7)]));
       case "/big.png":
         return send(200, "image/png", Buffer.alloc(MAX_BYTES * 2, 1));
       case "/to-private.png":
@@ -717,5 +721,113 @@ describe("chat media URLs with upstream.media_fetch.enabled: false", () => {
     expect(res.status, body).toBe(400);
     expect(JSON.parse(body).error.message).toContain("Amazon Bedrock does not read media from a URL");
     expect(media.hits.get("/cat.png") ?? 0).toBe(0);
+  });
+});
+
+describe("chat media downloads count against proxy.request_body_limit_bytes", () => {
+  // One download (1500 bytes) plus the small inbound body fits; a second
+  // one takes the request past the limit.
+  const LIMIT = 2500;
+  let app: SpawnedApp | undefined;
+  let upstream: RecordingUpstream | undefined;
+  let media: MediaServer | undefined;
+  let etcdReachable = false;
+  const CALLER = "sk-chat-media-fetch-total";
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+    upstream = await startUpstream();
+    media = await startMediaServer();
+    app = await spawnApp({
+      requestBodyLimitBytes: LIMIT,
+      extra: { upstream: { media_fetch: { allowed_hosts: [`localhost:${media.port}`] } } },
+    });
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    const pk = await seed.createProviderKey({
+      display_name: "media-total-bedrock-pk",
+      provider: "bedrock",
+      adapter: "bedrock",
+      secret: JSON.stringify({
+        access_key_id: "AKIA-media-e2e",
+        secret_access_key: "sk-media-e2e",
+        region: "us-west-2",
+      }),
+      api_base: upstream.baseUrl,
+    });
+    await seed.createModel({
+      display_name: "media-total-nova",
+      provider: "bedrock",
+      model_name: "amazon.nova-pro-v1:0",
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update(CALLER).digest("hex"),
+      allowed_models: ["media-total-nova"],
+    });
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER}` },
+      });
+      await res.text();
+      return res.status === 200;
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+    await media?.close();
+  });
+
+  async function send(path: string, body: unknown) {
+    const res = await fetch(`${app!.proxyUrl}${path}`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, text: await res.text() };
+  }
+
+  const url = (path: string) => `http://localhost:${media!.port}${path}`;
+
+  test("under the limit the request goes through; past it, the same 413 an oversized body gets", async (ctx) => {
+    if (!etcdReachable || !app || !upstream || !media) return ctx.skip();
+    const one = await send("/v1/chat/completions", {
+      model: "media-total-nova",
+      messages: [{ role: "user", content: [text("hi"), image(url("/pad-a.png"))] }],
+    });
+    expect(one.status, one.text).toBe(200);
+
+    const before = upstream.received.length;
+    const two = await send("/v1/chat/completions", {
+      model: "media-total-nova",
+      messages: [
+        { role: "user", content: [text("hi"), image(url("/pad-a.png")), image(url("/pad-b.png"))] },
+      ],
+    });
+    expect(two.status, two.text).toBe(413);
+    const error = JSON.parse(two.text).error;
+    expect(error.type).toBe("invalid_request_error");
+    expect(error.message).toContain(`${LIMIT}-byte limit`);
+    expect(upstream.received.length).toBe(before);
+
+    const viaMessages = await send("/v1/messages", {
+      model: "media-total-nova",
+      max_tokens: 16,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "hi" },
+            { type: "image", source: { type: "url", url: url("/pad-a.png") } },
+            { type: "image", source: { type: "url", url: url("/pad-b.png") } },
+          ],
+        },
+      ],
+    });
+    expect(viaMessages.status, viaMessages.text).toBe(413);
+    expect(JSON.parse(viaMessages.text).error.type).toBe("request_too_large");
   });
 });

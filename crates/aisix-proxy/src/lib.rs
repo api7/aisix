@@ -1228,8 +1228,9 @@ async fn enforce_request_body_limit(
             );
         }
     }
-    let (parts, body) = request.into_parts();
-    let (body, _account) = request_body_account::counted(body);
+    let (mut parts, body) = request.into_parts();
+    let (body, account) = request_body_account::counted(body);
+    parts.extensions.insert(account);
     next.run(Request::from_parts(parts, body)).await
 }
 

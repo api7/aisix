@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -45,6 +46,9 @@ pub struct MediaFetchSettings {
     enabled: bool,
     allowed_hosts: Vec<AllowedHost>,
     max_bytes: u64,
+    /// `proxy.request_body_limit_bytes`: the inbound body and everything
+    /// downloaded for the request share it. `0` is no limit.
+    request_body_limit_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +75,7 @@ impl MediaFetchSettings {
             enabled: cfg.enabled,
             allowed_hosts,
             max_bytes: cfg.max_bytes,
+            request_body_limit_bytes: 0,
         })
     }
 
@@ -112,11 +117,54 @@ fn parse_allowed_host(entry: &str) -> Option<AllowedHost> {
 
 static SETTINGS: OnceLock<MediaFetchSettings> = OnceLock::new();
 
-/// Install `upstream.media_fetch`. Called once during boot; fails on an
+/// Install `upstream.media_fetch`, with `proxy.request_body_limit_bytes`
+/// as the per-request total. Called once during boot; fails on an
 /// `allowed_hosts` entry that does not parse.
-pub fn init(cfg: &aisix_core::config::MediaFetchConfig) -> Result<(), String> {
-    let _ = SETTINGS.set(MediaFetchSettings::from_config(cfg)?);
+pub fn init(
+    cfg: &aisix_core::config::MediaFetchConfig,
+    request_body_limit_bytes: usize,
+) -> Result<(), String> {
+    let mut settings = MediaFetchSettings::from_config(cfg)?;
+    settings.request_body_limit_bytes = request_body_limit_bytes;
+    let _ = SETTINGS.set(settings);
     Ok(())
+}
+
+/// What one request may still hold: its inbound body plus every byte
+/// downloaded for it, against `proxy.request_body_limit_bytes`.
+struct RequestBudget {
+    used: AtomicUsize,
+    limit: usize,
+}
+
+impl RequestBudget {
+    fn new(inbound: usize, limit: usize) -> Self {
+        Self {
+            used: AtomicUsize::new(inbound),
+            limit,
+        }
+    }
+
+    #[cfg(test)]
+    fn unlimited() -> Self {
+        Self::new(0, 0)
+    }
+
+    fn would_exceed(&self, more: u64) -> bool {
+        self.limit > 0 && self.used.load(Ordering::Relaxed) as u64 + more > self.limit as u64
+    }
+
+    fn claim(&self, n: usize) -> Result<(), Failure> {
+        let used = self.used.fetch_add(n, Ordering::Relaxed) + n;
+        if self.limit > 0 && used > self.limit {
+            return Err(Failure::OverRequestLimit);
+        }
+        Ok(())
+    }
+
+    fn release(&self, n: usize) {
+        self.used.fetch_sub(n, Ordering::Relaxed);
+    }
 }
 
 fn settings() -> &'static MediaFetchSettings {
@@ -285,8 +333,10 @@ pub async fn fetch_media_urls(
 
     let started = Instant::now();
     let deadline = budget.map(|b| started + b);
+    let held = RequestBudget::new(ctx.inbound_body_bytes, settings.request_body_limit_bytes);
+    let held = &held;
     let mut downloads = futures::stream::iter(wanted.into_iter().map(|w| async move {
-        let download = fetch_one(&w, settings, encoding);
+        let download = fetch_one(&w, settings, encoding, held);
         let result = match deadline {
             Some(at) => tokio::time::timeout_at(at, download)
                 .await
@@ -301,6 +351,11 @@ pub async fn fetch_media_urls(
         match result {
             Ok(media) => {
                 slots.insert(w.uri, (media, w.uses));
+            }
+            Err(Failure::OverRequestLimit) => {
+                return Err(BridgeError::RequestTooLarge {
+                    limit_bytes: settings.request_body_limit_bytes,
+                });
             }
             Err(failure) => {
                 tracing::warn!(
@@ -327,11 +382,12 @@ async fn fetch_one(
     w: &Wanted,
     settings: &MediaFetchSettings,
     encoding: Encoding,
+    held: &RequestBudget,
 ) -> Result<Fetched, Failure> {
     let url = Url::parse(&w.uri).map_err(|_| Failure::BadUrl)?;
     let mut attempt = 1;
     let (bytes, content_type, final_url) = loop {
-        match download(&url, settings).await {
+        match download(&url, settings, held).await {
             Err(f) if f.retryable() && attempt < MAX_ATTEMPTS => {
                 tokio::time::sleep(RETRY_BACKOFF * attempt).await;
                 attempt += 1;
@@ -362,6 +418,7 @@ async fn fetch_one(
 async fn download(
     url: &Url,
     settings: &MediaFetchSettings,
+    held: &RequestBudget,
 ) -> Result<(Vec<u8>, Option<String>, Url), Failure> {
     let mut current = url.clone();
     for hop in 0..=MAX_REDIRECTS {
@@ -400,26 +457,48 @@ async fn download(
             .filter(|m| {
                 !m.is_empty() && m != "application/octet-stream" && !m.starts_with("binary/")
             });
-        let body = read_capped(resp, settings.max_bytes).await?;
+        let body = read_capped(resp, settings.max_bytes, held).await?;
         return Ok((body, content_type, current));
     }
     Err(Failure::TooManyRedirects)
 }
 
-/// Read the body into one buffer, refusing it once it passes `max`.
-async fn read_capped(mut resp: reqwest::Response, max: u64) -> Result<Vec<u8>, Failure> {
+/// Read the body into one buffer, refusing it once it passes `max` or
+/// takes the request past its total. A body that is not kept gives its
+/// bytes back to the request's total.
+async fn read_capped(
+    mut resp: reqwest::Response,
+    max: u64,
+    held: &RequestBudget,
+) -> Result<Vec<u8>, Failure> {
     let declared = resp.content_length();
     if declared.is_some_and(|len| len > max) {
         return Err(Failure::TooLarge);
     }
-    let mut body = Vec::with_capacity(declared.unwrap_or(0) as usize);
-    while let Some(chunk) = resp.chunk().await.map_err(classify)? {
-        if body.len() as u64 + chunk.len() as u64 > max {
-            return Err(Failure::TooLarge);
-        }
-        body.extend_from_slice(&chunk);
+    if declared.is_some_and(|len| held.would_exceed(len)) {
+        return Err(Failure::OverRequestLimit);
     }
-    Ok(body)
+    let mut body = Vec::with_capacity(declared.unwrap_or(0) as usize);
+    let mut claimed = 0;
+    let read = async {
+        while let Some(chunk) = resp.chunk().await.map_err(classify)? {
+            if body.len() as u64 + chunk.len() as u64 > max {
+                return Err(Failure::TooLarge);
+            }
+            claimed += chunk.len();
+            held.claim(chunk.len())?;
+            body.extend_from_slice(&chunk);
+        }
+        Ok(())
+    }
+    .await;
+    match read {
+        Ok(()) => Ok(body),
+        Err(failure) => {
+            held.release(claimed);
+            Err(failure)
+        }
+    }
 }
 
 /// Whether `url` may be requested, and through which client: `true` for
@@ -519,6 +598,9 @@ enum Failure {
     Timeout,
     Status(u16),
     TooLarge,
+    /// The request's inbound body plus its downloads passed
+    /// `proxy.request_body_limit_bytes`.
+    OverRequestLimit,
     TooManyRedirects,
     BadRedirect,
     UnknownType,
@@ -553,6 +635,10 @@ impl Failure {
             Self::TooLarge => format!(
                 "it is larger than the {}-byte limit (upstream.media_fetch.max_bytes)",
                 settings.max_bytes
+            ),
+            Self::OverRequestLimit => format!(
+                "the request would exceed its {}-byte limit",
+                settings.request_body_limit_bytes
             ),
             Self::TooManyRedirects => format!("it redirects more than {MAX_REDIRECTS} times"),
             Self::BadRedirect => {
@@ -687,6 +773,32 @@ fn sniff(b: &[u8]) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    async fn dl(
+        url: &Url,
+        settings: &MediaFetchSettings,
+    ) -> Result<(Vec<u8>, Option<String>, Url), Failure> {
+        download(url, settings, &RequestBudget::unlimited()).await
+    }
+
+    #[tokio::test]
+    async fn downloads_count_against_the_request_total_and_give_back_what_they_drop() {
+        let port = serve(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n0123456789").await;
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/a")).unwrap();
+        let settings = with_allowed(&["127.0.0.1"]);
+        // 5 inbound + 10 downloaded > 12.
+        let held = RequestBudget::new(5, 12);
+        let got = download(&url, &settings, &held).await;
+        assert_eq!(got.map(|_| ()), Err(Failure::OverRequestLimit));
+        assert_eq!(
+            held.used.load(Ordering::Relaxed),
+            5,
+            "the dropped body is given back"
+        );
+        let roomy = RequestBudget::new(5, 15);
+        assert!(download(&url, &settings, &roomy).await.is_ok());
+        assert_eq!(roomy.used.load(Ordering::Relaxed), 15);
+    }
+
     #[test]
     fn only_globally_routable_addresses_are_public() {
         for blocked in [
@@ -788,11 +900,11 @@ mod tests {
             format!("http://127.0.0.1:{port}/a.png"),
             format!("http://[::ffff:127.0.0.1]:{port}/a.png"),
         ] {
-            let got = download(&Url::parse(&url).unwrap(), &closed).await;
+            let got = dl(&Url::parse(&url).unwrap(), &closed).await;
             assert!(matches!(got, Err(Failure::Blocked(_))), "{url}: {got:?}");
         }
         let open = with_allowed(&[&format!("localhost:{port}")]);
-        let (body, ..) = download(
+        let (body, ..) = dl(
             &Url::parse(&format!("http://localhost:{port}/a.png")).unwrap(),
             &open,
         )
@@ -800,7 +912,7 @@ mod tests {
         .unwrap();
         assert_eq!(body, b"PNG!");
         let other_port = with_allowed(&["localhost:1"]);
-        let got = download(
+        let got = dl(
             &Url::parse(&format!("http://localhost:{port}/a.png")).unwrap(),
             &other_port,
         )
@@ -816,7 +928,7 @@ mod tests {
         .await;
         let chunked = serve(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n01234567890123456").await;
         for port in [declared, chunked] {
-            let got = download(
+            let got = dl(
                 &Url::parse(&format!("http://127.0.0.1:{port}/a")).unwrap(),
                 &with_allowed(&["127.0.0.1"]),
             )
@@ -838,9 +950,9 @@ mod tests {
         let redirector = serve(location.as_bytes()).await;
         let url = Url::parse(&format!("http://localhost:{redirector}/a.png")).unwrap();
         // The first hop is allowed; the second is a loopback literal that is not.
-        let got = download(&url, &with_allowed(&[&format!("localhost:{redirector}")])).await;
+        let got = dl(&url, &with_allowed(&[&format!("localhost:{redirector}")])).await;
         assert!(matches!(got, Err(Failure::Blocked(_))), "{got:?}");
-        let (body, _, answered) = download(
+        let (body, _, answered) = dl(
             &url,
             &with_allowed(&[&format!("localhost:{redirector}"), "127.0.0.1"]),
         )
@@ -855,7 +967,7 @@ mod tests {
         let port =
             serve(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
                 .await;
-        let got = download(
+        let got = dl(
             &Url::parse(&format!("http://127.0.0.1:{port}/a")).unwrap(),
             &with_allowed(&["127.0.0.1"]),
         )
@@ -883,10 +995,13 @@ mod tests {
     /// charged to the end-to-end budget only.
     #[tokio::test]
     async fn every_part_naming_a_downloaded_url_gets_it_and_the_time_is_charged() {
-        init(&aisix_core::config::MediaFetchConfig {
-            allowed_hosts: vec!["127.0.0.1".into()],
-            ..Default::default()
-        })
+        init(
+            &aisix_core::config::MediaFetchConfig {
+                allowed_hosts: vec!["127.0.0.1".into()],
+                ..Default::default()
+            },
+            0,
+        )
         .unwrap();
         let port = serve(b"HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: 4\r\nconnection: close\r\n\r\nPNG!").await;
         let url = format!("http://127.0.0.1:{port}/img");

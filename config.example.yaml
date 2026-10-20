@@ -75,7 +75,10 @@ proxy:
   # requests than any fixed gateway default (Anthropic takes 32 MB), so
   # a gateway-side cap rejects requests the upstream would have served.
   # Set a value to bound per-request memory; over-limit requests get a
-  # 413 in the caller's error envelope.
+  # 413 in the caller's error envelope. Media the gateway downloads for a
+  # request (upstream.media_fetch) counts against the same limit together
+  # with the inbound body, so a request whose body plus downloads pass it
+  # gets that 413 too.
   # request_body_limit_bytes: 0
   # tls:
   #   cert_file: "/etc/aisix/tls/proxy.crt"
@@ -545,6 +548,8 @@ upstream:
   #   allowed_hosts: []
   #   # e.g. ["media.internal", "10.0.0.5:9000"]
   #   # Largest download accepted per URL, in bytes (default 50 MiB).
+  #   # All downloads of one request also count, with its inbound body,
+  #   # against proxy.request_body_limit_bytes when that is set (413 past it).
   #   max_bytes: 52428800
 
 # Connection-layer settings for the inbound side — the clients, or the
