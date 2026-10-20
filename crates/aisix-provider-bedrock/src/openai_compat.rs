@@ -192,14 +192,18 @@ fn shape_body(body: &mut Value, model_id: &str) {
 
 /// A user turn's remote image URLs, inlined as `data:` URLs from what the
 /// gateway downloaded for them.
+///
+/// The second value is the request's deadline less the time the downloads
+/// took, which is what the upstream call has left.
 async fn inline_remote_images<'a>(
     req: Cow<'a, ChatFormat>,
     ctx: &BridgeContext,
-) -> Result<Cow<'a, ChatFormat>, BridgeError> {
+) -> Result<(Cow<'a, ChatFormat>, Option<Duration>), BridgeError> {
     let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, |m| {
         m.kind == aisix_gateway::content_part::MediaKind::Image
     })
     .await?;
+    let deadline = fetched.charge(ctx).deadline;
     let mut req = req;
     let rewrites: Vec<(usize, usize, String)> = req
         .messages
@@ -245,7 +249,7 @@ async fn inline_remote_images<'a>(
             }
         }
     }
-    Ok(req)
+    Ok((req, deadline))
 }
 
 /// The endpoint URL: the provider key's `api_base` when set, else the
@@ -326,8 +330,15 @@ fn mint_tool_call_id() -> String {
     format!("call_{}", uuid::Uuid::new_v4().simple())
 }
 
-fn mint_positional_ids(tool_calls: &mut [Value], minted: &mut Vec<(u64, String)>) {
-    for call in tool_calls {
+/// A streamed delta names its call by `index`, so one call keeps one minted
+/// id across its deltas; a whole response's calls carry no `index` and are
+/// told apart by position.
+fn mint_positional_ids(
+    tool_calls: &mut [Value],
+    minted: &mut Vec<(u64, String)>,
+    by_position: bool,
+) {
+    for (position, call) in tool_calls.iter_mut().enumerate() {
         let Some(obj) = call.as_object_mut() else {
             continue;
         };
@@ -337,7 +348,11 @@ fn mint_positional_ids(tool_calls: &mut [Value], minted: &mut Vec<(u64, String)>
         if !is_positional_tool_call_id(id) {
             continue;
         }
-        let index = obj.get("index").and_then(Value::as_u64).unwrap_or(0);
+        let index = if by_position {
+            position as u64
+        } else {
+            obj.get("index").and_then(Value::as_u64).unwrap_or(0)
+        };
         let id = match minted.iter().find(|(i, _)| *i == index) {
             Some((_, id)) => id.clone(),
             None => {
@@ -385,9 +400,9 @@ async fn http_error(resp: reqwest::Response, started: Instant) -> BridgeError {
         })
         .or_else(|| parsed.as_ref().and_then(|v| field(v, "error")))
         .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
-    let kind =
-        errortype.or_else(|| error_obj.and_then(|e| field(e, "type").or_else(|| field(e, "code"))));
-    crate::errors::upstream_error(status, kind, message, retry_after, started)
+    let code = error_obj.and_then(|e| field(e, "code"));
+    let kind = errortype.or_else(|| error_obj.and_then(|e| field(e, "type")).or(code.clone()));
+    crate::errors::upstream_error(status, kind, code, message, retry_after, started)
 }
 
 async fn with_deadline<T, F>(
@@ -423,8 +438,8 @@ async fn send(
     ctx: &BridgeContext,
     model_id: &str,
     stream: bool,
-) -> Result<(reqwest::Response, Instant), BridgeError> {
-    let req = inline_remote_images(req, ctx).await?;
+) -> Result<(reqwest::Response, Instant, Option<Duration>), BridgeError> {
+    let (req, deadline) = inline_remote_images(req, ctx).await?;
     let body = {
         let messages = messages_from(&req, DeveloperRoleMode::MapToSystem);
         let mut body = serde_json::to_value(build_request(
@@ -475,7 +490,7 @@ async fn send(
     let headers = signed_headers(&endpoint.creds, &url_text, headers, &body)?;
     let started = Instant::now();
     let client = endpoint.client.clone();
-    let resp = with_deadline(ctx.deadline, started, async move {
+    let resp = with_deadline(deadline, started, async move {
         url.post_on(&client)
             .headers(headers)
             .body(body)
@@ -488,7 +503,7 @@ async fn send(
     if !resp.status().is_success() {
         return Err(http_error(resp, started).await);
     }
-    Ok((resp, started))
+    Ok((resp, started, deadline))
 }
 
 pub(crate) async fn chat(
@@ -497,9 +512,11 @@ pub(crate) async fn chat(
     ctx: &BridgeContext,
     model_id: &str,
 ) -> Result<ChatResponse, BridgeError> {
-    let (resp, started) = send(&endpoint, req, ctx, model_id, false).await?;
+    let (resp, started, deadline) = send(&endpoint, req, ctx, model_id, false).await?;
     let request_id = request_id_header(resp.headers());
-    let parsed: OpenAiResponse = with_deadline(ctx.deadline, started, async {
+    // The body read gets what is left of the one budget, not a fresh one.
+    let left = deadline.map(|d| d.saturating_sub(started.elapsed()));
+    let parsed: OpenAiResponse = with_deadline(left, started, async {
         resp.json()
             .await
             .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
@@ -510,7 +527,7 @@ pub(crate) async fn chat(
         chat.id = request_id;
     }
     if let Some(Value::Array(calls)) = chat.message.extra.get_mut("tool_calls") {
-        mint_positional_ids(calls, &mut Vec::new());
+        mint_positional_ids(calls, &mut Vec::new(), true);
     }
     Ok(chat)
 }
@@ -521,7 +538,7 @@ pub(crate) async fn chat_stream(
     ctx: &BridgeContext,
     model_id: &str,
 ) -> Result<ChatChunkStream, BridgeError> {
-    let (resp, _) = send(&endpoint, req, ctx, model_id, true).await?;
+    let (resp, _, _) = send(&endpoint, req, ctx, model_id, true).await?;
     let request_id = request_id_header(resp.headers());
     let byte_stream = resp.bytes_stream();
     let stream = async_stream::try_stream! {
@@ -562,7 +579,7 @@ fn chunk_from(
         chunk.id = request_id.to_string();
     }
     if let Some(calls) = chunk.delta.tool_calls.as_mut() {
-        mint_positional_ids(calls, minted);
+        mint_positional_ids(calls, minted, false);
     }
     Ok(chunk)
 }

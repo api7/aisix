@@ -63,6 +63,7 @@ const CHAT_COMPLETION = {
         content: null,
         tool_calls: [
           { id: "call_0", type: "function", function: { name: "get_weather", arguments: "{}" } },
+          { id: "call_1", type: "function", function: { name: "get_weather", arguments: "{\"day\":2}" } },
         ],
       },
       finish_reason: "tool_calls",
@@ -292,11 +293,31 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
     expect(sent[0].body.stop).toBeUndefined();
     expect(sent[0].body.n).toBeUndefined();
     expect(sent[0].body.tools).toHaveLength(1);
-    // The positional `call_0` is replaced by a unique id.
+    // The positional `call_0` / `call_1` are replaced by unique ids, one per call.
     const body = JSON.parse(result.text);
-    const id = body.choices[0].message.tool_calls[0].id;
-    expect(id).not.toBe("call_0");
-    expect(id).toMatch(/^call_[0-9a-f]{32}$/);
+    const ids = body.choices[0].message.tool_calls.map((c: any) => c.id);
+    expect(ids).toHaveLength(2);
+    for (const id of ids) expect(id).toMatch(/^call_[0-9a-f]{32}$/);
+    expect(ids[0]).not.toBe(ids[1]);
+  });
+
+  test("a Chat Completions error keeps the endpoint's own message and code", async (ctx) => {
+    if (skip(ctx)) return;
+    respond = () => ({
+      status: 400,
+      body: {
+        error: {
+          type: "invalid_request_error",
+          code: "context_length_exceeded",
+          message: "This model's maximum context length is 400000 tokens.",
+        },
+      },
+    });
+    const res = await chat({ model: "cc-gpt", messages: [{ role: "user", content: "hi" }] });
+    expect(res.status).toBe(400);
+    const body = JSON.parse(res.text);
+    expect(body.error.message).toBe("This model's maximum context length is 400000 tokens.");
+    expect(body.error.code).toBe("context_length_exceeded");
   });
 
   test("a GPT model while it reasons drops the sampling parameters AWS refuses", async (ctx) => {
@@ -417,6 +438,35 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
     const last = sent[0].body.messages[2].content;
     expect(last[0].toolResult.toolUseId).toBe("tooluse_1");
     expect(last.at(-1)).toEqual({ text: "and tomorrow?" });
+  });
+
+  test("a Claude thinking budget fits under max_completion_tokens", async (ctx) => {
+    if (skip(ctx)) return;
+    const { result, sent } = await capture(() =>
+      chat({
+        model: "cc-claude",
+        stream: true,
+        messages: [{ role: "user", content: "think" }],
+        max_completion_tokens: 3000,
+        reasoning_effort: "high",
+      }),
+    );
+    expect(result.status, result.text).toBe(200);
+    const body = sent[0].body;
+    expect(body.inferenceConfig.maxTokens).toBe(3000);
+    const budget = body.additionalModelRequestFields?.thinking?.budget_tokens;
+    expect(budget).toBeGreaterThan(0);
+    expect(budget).toBeLessThan(3000);
+  });
+
+  test("a non-streamed Claude request with requestMetadata is served by Converse", async (ctx) => {
+    if (skip(ctx)) return;
+    const { result, sent } = await capture(() =>
+      chat({ model: "cc-claude", messages: [{ role: "user", content: "hi" }], requestMetadata: { team: "e2e" } }),
+    );
+    expect(result.status, result.text).toBe(200);
+    expect(sent[0].path).toMatch(/\/converse$/);
+    expect(sent[0].body.requestMetadata).toEqual({ team: "e2e" });
   });
 
   test("stop and max_completion_tokens reach inferenceConfig", async (ctx) => {

@@ -715,8 +715,16 @@ impl Bridge for BedrockBridge {
         // Claude answers a non-streamed request through InvokeModel, in
         // Anthropic Messages shape; every other publisher, and every
         // streamed request, through Converse.
+        // InvokeModel has no place for `requestMetadata` or a Bedrock
+        // `outputConfig`, so a Claude request carrying either is served by
+        // Converse, as it is when streamed.
+        let needs_converse = ["requestMetadata", "outputConfig"]
+            .iter()
+            .any(|k| req.extra.get(*k).is_some_and(|v| !v.is_null()));
         match publisher {
-            Some(BedrockPublisher::Anthropic) => self.chat_anthropic(req, ctx, upstream_id).await,
+            Some(BedrockPublisher::Anthropic) if !needs_converse => {
+                self.chat_anthropic(req, ctx, upstream_id).await
+            }
             _ => self.chat_converse(req, ctx, upstream_id).await,
         }
     }
@@ -853,7 +861,8 @@ impl Bridge for BedrockBridge {
                     // The caller's purpose; `search_document` when it gave none.
                     input_type: req.input_type.as_deref().unwrap_or("search_document"),
                     embedding_types,
-                    output_dimension: req.dimensions,
+                    // Embed v4 takes a vector length; v3 has a fixed one.
+                    output_dimension: req.dimensions.filter(|_| base_id.contains("embed-v4")),
                 })
                 .map_err(|e| BridgeError::Config(format!("serialize Cohere embed body: {e}")))?,
             );
@@ -978,11 +987,8 @@ fn shape_invoke_body(
         obj.insert("stop_sequences".into(), stops.into());
     }
     obj.remove("stop");
-    if let Some(cap) = obj.remove("max_completion_tokens") {
-        if req.max_tokens.is_none() {
-            obj.insert("max_tokens".into(), cap);
-        }
-    }
+    // Already carried as `max_tokens` (see `chat_anthropic`).
+    obj.remove("max_completion_tokens");
     for key in [
         "guardrailConfig",
         "performanceConfig",
@@ -1025,6 +1031,15 @@ impl BedrockBridge {
         // `anthropic.claude-…` is not a name it can read. Hand it the
         // Claude name the Bedrock id carries; the `model` field it lands
         // in is stripped below, since /invoke keys the model off the URL.
+        // The Anthropic builder sizes a thinking budget against
+        // `max_tokens`, so the caller's cap has to be there under either
+        // name before it runs.
+        let mut req = req;
+        if req.max_tokens.is_none() {
+            if let Some(cap) = crate::converse_req::max_tokens(&req, upstream_id) {
+                req.to_mut().max_tokens = Some(cap);
+            }
+        }
         let anthropic_model = bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id);
         let synthetic_json_tool = matches!(
             structured_output_for(&req, anthropic_model),
@@ -2633,7 +2648,7 @@ fn build_converse_additional_model_request_fields(
         thinking_max_tokens = translate_reasoning_effort_to_anthropic(
             &mut extras,
             bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id),
-            req.max_tokens,
+            crate::converse_req::max_tokens(req, upstream_id),
         );
         for name in ["thinking", "output_config", "anthropic_beta"] {
             if let Some(value) = extras.remove(name) {
@@ -2644,7 +2659,15 @@ fn build_converse_additional_model_request_fields(
         fields.insert(name.to_string(), value);
     }
     if let Some((name, value)) = crate::converse_req::top_k_field(req, upstream_id) {
-        fields.insert(name.to_string(), value);
+        // Nova's `inferenceConfig` may already hold the caller's own knobs.
+        match (fields.get_mut(name), value) {
+            (Some(serde_json::Value::Object(existing)), serde_json::Value::Object(add)) => {
+                existing.extend(add)
+            }
+            (_, value) => {
+                fields.insert(name.to_string(), value);
+            }
+        }
     }
     // Claude 4.5 and later take the switch beside `toolConfig`; Converse
     // rejects a `type` there once `toolConfig.toolChoice` names one.

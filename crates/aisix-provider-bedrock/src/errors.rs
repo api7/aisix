@@ -46,9 +46,13 @@ pub(crate) fn exception_name(raw: &str) -> &str {
 }
 
 /// An upstream HTTP error, classified by its AWS exception name.
+/// `code` is a code the upstream named itself (the Chat Completions
+/// endpoint's OpenAI-shaped `error.code`); a context-window overflow the
+/// message describes is classified here when it named none.
 pub(crate) fn upstream_error(
     status: u16,
     kind: Option<String>,
+    code: Option<String>,
     message: String,
     retry_after: Option<Duration>,
     started: Instant,
@@ -68,7 +72,7 @@ pub(crate) fn upstream_error(
     } else {
         status
     };
-    let code = context_window_code(&message);
+    let code = code.or_else(|| context_window_code(&message));
     BridgeError::UpstreamStatus {
         status,
         parsed: Some(Box::new(UpstreamErrorView {
@@ -172,7 +176,7 @@ where
         }
     }
     let retry_after = aisix_gateway::parse_retry_after(&hdrs);
-    upstream_error(status, kind, message, retry_after, started)
+    upstream_error(status, kind, None, message, retry_after, started)
 }
 
 #[cfg(test)]
@@ -184,6 +188,7 @@ mod tests {
         let e = upstream_error(
             424,
             Some("ModelErrorException".into()),
+            None,
             "the model failed".into(),
             None,
             Instant::now(),
@@ -199,6 +204,7 @@ mod tests {
         let e = upstream_error(
             408,
             Some("ModelTimeoutException:http://internal".into()),
+            None,
             "took too long".into(),
             None,
             Instant::now(),
@@ -211,6 +217,7 @@ mod tests {
         let e = upstream_error(
             400,
             Some("ValidationException".into()),
+            None,
             "Input is too long for requested model.".into(),
             None,
             Instant::now(),

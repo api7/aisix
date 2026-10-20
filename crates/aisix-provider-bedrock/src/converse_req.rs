@@ -324,6 +324,7 @@ pub(crate) fn stop_sequences(req: &ChatFormat, model_id: &str) -> Option<Vec<Str
             let seqs: Vec<String> = items
                 .iter()
                 .filter_map(Value::as_str)
+                .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect();
             (!seqs.is_empty()).then_some(seqs)
@@ -332,8 +333,8 @@ pub(crate) fn stop_sequences(req: &ChatFormat, model_id: &str) -> Option<Vec<Str
     }
 }
 
-/// The output-token cap: `max_completion_tokens`, else `max_tokens`. The
-/// OpenAI-family models on Bedrock (and Kimi K3) reject a cap below 16,
+/// The output-token cap: `max_completion_tokens`, else `max_tokens`. On
+/// Converse the OpenAI-family models (and Kimi K3) reject a cap below 16,
 /// so a smaller one is raised to it.
 pub(crate) fn max_tokens(req: &ChatFormat, model_id: &str) -> Option<u32> {
     let cap = req
