@@ -285,6 +285,27 @@ pub async fn fetch_media_urls(
     encoding: Encoding,
     needs_fetch: impl Fn(&Media<'_>) -> bool,
 ) -> Result<FetchedMedia, BridgeError> {
+    fetch_media_urls_in(req, ctx, encoding, needs_fetch, false).await
+}
+
+/// [`fetch_media_urls`] for an upstream that also takes media inside a
+/// tool result (`role:"tool"` content parts).
+pub async fn fetch_media_urls_including_tool_results(
+    req: &ChatFormat,
+    ctx: &BridgeContext,
+    encoding: Encoding,
+    needs_fetch: impl Fn(&Media<'_>) -> bool,
+) -> Result<FetchedMedia, BridgeError> {
+    fetch_media_urls_in(req, ctx, encoding, needs_fetch, true).await
+}
+
+async fn fetch_media_urls_in(
+    req: &ChatFormat,
+    ctx: &BridgeContext,
+    encoding: Encoding,
+    needs_fetch: impl Fn(&Media<'_>) -> bool,
+    tool_results: bool,
+) -> Result<FetchedMedia, BridgeError> {
     if !settings().enabled {
         return Ok(FetchedMedia::default());
     }
@@ -295,7 +316,9 @@ pub async fn fetch_media_urls(
     // System turns are included: the Anthropic translation carries a
     // system turn that follows the conversation as a user turn.
     for (message, m) in req.messages.iter().enumerate() {
-        if !matches!(m.role, Role::User | Role::System | Role::Developer) {
+        let scanned = matches!(m.role, Role::User | Role::System | Role::Developer)
+            || (tool_results && m.role == Role::Tool);
+        if !scanned {
             continue;
         }
         for (part, block) in m.content_blocks.iter().flatten().enumerate() {

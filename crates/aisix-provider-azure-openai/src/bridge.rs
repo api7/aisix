@@ -500,19 +500,11 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
         .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
-/// Map an Azure HTTP error response to a customer-visible
-/// [`BridgeError::UpstreamStatus`].
+/// Map an Azure HTTP error response to a [`BridgeError::UpstreamStatus`]
+/// carrying Azure's own error message.
 ///
-/// **Audit M1 — sensitive-info redaction:** Azure error envelopes
-/// (`{"error": {"code": "...", "message": "..."}}`) often include the
-/// operator-defined deployment id (e.g. "The API deployment for this
-/// resource does not exist.") or the resource hostname. The
-/// customer-visible `message` stays a canned phrase. We do read
-/// `error.code` into [`UpstreamErrorView::kind`] — these are a small
-/// closed set of Azure-defined tokens (`DeploymentNotFound`,
-/// `content_filter`, …), stable taxonomy rather than operator data —
-/// so the envelope-translation layer can derive an OpenAI `code`.
-/// [`UpstreamErrorView::message`] stays `None`.
+/// `error.code` is read into [`UpstreamErrorView::kind`] so the
+/// envelope-translation layer can derive an OpenAI `code`.
 ///
 /// Azure-specific quirk: content-policy violations nest under
 /// `error.inner_error.code` *or* `error.innererror.code` (Azure emits
@@ -529,15 +521,7 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
     // load-balancer / front door). Same guard as
     // `capture_upstream_error_http`.
     let kind = is_json.then(|| parse_azure_error_code(&body)).flatten();
-    let message = match status.as_u16() {
-        401 | 403 => "upstream authentication failed".to_string(),
-        404 => "upstream deployment or model not found".to_string(),
-        408 => "upstream request timeout".to_string(),
-        409 => "upstream conflict".to_string(),
-        413 => "upstream request entity too large".to_string(),
-        429 => "upstream rate limited".to_string(),
-        _ => format!("upstream returned {}", status.as_u16()),
-    };
+    let message = aisix_gateway::upstream_error_message(&body);
     // Azure's envelope only has a single `error.code` field (no
     // separate `type`). Downstream OpenAI clients expect both
     // `error.type` AND `error.code` — populate both `kind` and `code`
@@ -548,7 +532,7 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
     let parsed = kind.as_ref().map(|k| {
         Box::new(aisix_gateway::UpstreamErrorView {
             kind: Some(k.clone()),
-            message: None,
+            message: (!message.is_empty()).then(|| message.clone()),
             code: Some(k.clone()),
             param: None,
         })
@@ -1967,11 +1951,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_maps_upstream_400_to_canned_message_not_body_echo() {
-        // Audit M1: the upstream error body may contain operator-
-        // internal identifiers (deployment name, resource hostname).
-        // The bridge must map to a canned status-keyed phrase and NOT
-        // echo the upstream body verbatim.
+    async fn chat_maps_upstream_400_to_the_upstream_message() {
+        // The caller receives Azure's own error text.
         let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
@@ -1991,9 +1972,9 @@ mod tests {
                 status, message, ..
             } => {
                 assert_eq!(status, 400);
-                assert!(
-                    !message.contains("gpt4o-prod") && !message.contains("acme-west"),
-                    "upstream body must not echo into the customer-visible error; got message={message:?}"
+                assert_eq!(
+                    message,
+                    "The API deployment for 'gpt4o-prod' does not exist on resource 'acme-west'"
                 );
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
@@ -2001,7 +1982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_maps_404_to_deployment_not_found_canned_message() {
+    async fn chat_maps_404_to_the_upstream_message() {
         let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
@@ -2019,21 +2000,14 @@ mod tests {
                 status, message, ..
             } => {
                 assert_eq!(status, 404);
-                assert!(
-                    message.contains("deployment or model not found"),
-                    "404 must surface as deployment-not-found canned message; got {message:?}"
-                );
-                assert!(
-                    !message.contains("foo-bar"),
-                    "upstream body must not leak; got {message:?}"
-                );
+                assert_eq!(message, "operator-internal: foo-bar");
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn chat_maps_429_with_retry_after_and_canned_message() {
+    async fn chat_maps_429_with_retry_after_and_the_upstream_message() {
         let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
@@ -2059,9 +2033,9 @@ mod tests {
             } => {
                 assert_eq!(status, 429);
                 assert_eq!(retry_after, Some(std::time::Duration::from_secs(30)));
-                assert!(
-                    !message.contains("gpt4o-prod"),
-                    "upstream body must not leak; got {message:?}"
+                assert_eq!(
+                    message,
+                    "rate limited — quota for deployment gpt4o-prod exceeded"
                 );
             }
             other => panic!("expected UpstreamStatus with retry_after, got {other:?}"),
@@ -2199,7 +2173,7 @@ mod tests {
                 assert_eq!(wire, aisix_gateway::UpstreamWire::AzureOpenAI);
                 let parsed = parsed.expect("inner_error parsed");
                 assert_eq!(parsed.kind.as_deref(), Some("ResponsibleAIPolicyViolation"));
-                assert!(parsed.message.is_none());
+                assert_eq!(parsed.message.as_deref(), Some("blocked"));
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
         }

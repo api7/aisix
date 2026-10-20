@@ -531,17 +531,11 @@ where
     }
 }
 
-/// Map an upstream HTTP error to a customer-visible error.
-///
-/// **Audit-aware:** Vertex error envelopes (`{"error": {"code":
-/// 403, "message": "Permission denied for project foo-bar-prod"}}`)
-/// leak operator project ids. The customer-visible `message` is a
-/// canned status-keyed phrase. We *do* read the upstream's
-/// `error.status` (a gRPC canonical code such as `"RESOURCE_EXHAUSTED"`)
-/// into [`UpstreamErrorView::kind`] so the envelope-translation layer
-/// can derive an OpenAI `code` — that token is a stable taxonomy
-/// label, not operator-internal data. [`UpstreamErrorView::message`]
-/// is intentionally left `None`.
+/// Map an upstream HTTP error to a [`BridgeError::UpstreamStatus`]
+/// carrying Vertex's own error message. The upstream's `error.status` (a
+/// gRPC canonical code such as `"RESOURCE_EXHAUSTED"`) is read into
+/// [`UpstreamErrorView::kind`] so the envelope-translation layer can derive
+/// an OpenAI `code`.
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     let retry_after = aisix_gateway::parse_retry_after(resp.headers());
     let is_json = aisix_gateway::response_is_json(&resp);
@@ -551,17 +545,11 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
     // from a fronting WAF or load balancer). Same guard as
     // `capture_upstream_error_http`.
     let kind = is_json.then(|| parse_vertex_error_status(&body)).flatten();
-    let message = match status.as_u16() {
-        401 | 403 => "upstream authentication failed".to_string(),
-        404 => "upstream model or endpoint not found".to_string(),
-        408 => "upstream request timeout".to_string(),
-        429 => "upstream rate limited".to_string(),
-        _ => format!("upstream returned {}", status.as_u16()),
-    };
+    let message = aisix_gateway::upstream_error_message(&body);
     let parsed = kind.as_ref().map(|_| {
         Box::new(aisix_gateway::UpstreamErrorView {
             kind: kind.clone(),
-            message: None,
+            message: (!message.is_empty()).then(|| message.clone()),
             code: None,
             param: None,
         })
@@ -579,8 +567,7 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
 /// a Vertex error body. The body shape is
 /// `{"error": {"code": int, "message": "...", "status": "...", "details": [...]}}`
 /// per <https://cloud.google.com/apis/design/errors>. Returns `None`
-/// when the body is not JSON of that shape — we intentionally do not
-/// surface `error.message` (it embeds operator project ids).
+/// when the body is not JSON of that shape.
 fn parse_vertex_error_status(body: &[u8]) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct Outer {
@@ -5213,9 +5200,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_gemini_maps_4xx_to_canned_message_not_body_echo() {
-        // Audit-aware: Vertex 4xx error envelopes leak operator project
-        // ids. Must redact to canned phrase.
+    async fn chat_gemini_maps_4xx_to_the_upstream_message() {
+        // The caller receives Vertex's own error message.
         let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
@@ -5244,24 +5230,13 @@ mod tests {
                 ..
             } => {
                 assert_eq!(status, 403);
-                assert!(
-                    !message.contains("my-proj-prod-123")
-                        && !message.contains("Permission denied on project"),
-                    "upstream body must not leak project id; got message={message:?}"
+                assert_eq!(
+                    message,
+                    "Permission denied on project my-proj-prod-123 for resource gemini-1.5-pro"
                 );
-                // Audit fix (PR #323 MEDIUM-2): pin the wire tag so a
-                // refactor that breaks the cross-wire translation
-                // pipeline fails this test loudly. parsed.message
-                // must stay None for operator-taxonomy redaction.
                 assert_eq!(wire, aisix_gateway::UpstreamWire::Vertex);
-                if let Some(view) = parsed {
-                    assert!(
-                        view.message.is_none(),
-                        "vertex must NOT surface upstream message (project ids leak); \
-                         got {:?}",
-                        view.message
-                    );
-                }
+                // No gRPC `status` in this body, so there is no view.
+                assert!(parsed.is_none());
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
         }
@@ -5338,13 +5313,10 @@ mod tests {
             } => {
                 assert_eq!(status, 429);
                 assert_eq!(wire, aisix_gateway::UpstreamWire::Vertex);
-                assert!(
-                    !message.contains("my-secret-proj"),
-                    "must not leak project id; got {message:?}"
-                );
+                assert_eq!(message, "Quota exceeded for project my-secret-proj");
                 let parsed = parsed.expect("status field parsed into view");
                 assert_eq!(parsed.kind.as_deref(), Some("RESOURCE_EXHAUSTED"));
-                assert!(parsed.message.is_none());
+                assert_eq!(parsed.message.as_deref(), Some(message.as_str()));
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
         }
@@ -6588,6 +6560,8 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             input_was_single: false,
             encoding_format: None,
             dimensions: None,
+            input_type: None,
+            embedding_types: None,
         };
         let resp = bridge.embed(&req, &ctx).await.expect("embed dispatch");
         assert_eq!(resp.object, "list");
@@ -6654,6 +6628,8 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             input_was_single: true,
             encoding_format: None,
             dimensions: None,
+            input_type: None,
+            embedding_types: None,
         };
 
         let resp = bridge.embed(&req, &ctx).await.expect("embed dispatch");
@@ -6690,6 +6666,8 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             input_was_single: true,
             encoding_format: None,
             dimensions: Some(256),
+            input_type: None,
+            embedding_types: None,
         };
         bridge.embed(&req, &ctx).await.expect("embed dispatch");
         let received = server.received_requests().await.unwrap();

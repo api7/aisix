@@ -203,6 +203,9 @@ flate2 = "1"
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-credential-types = "1"
+# Signs the Bedrock requests the SDK has no operation for (the runtime's
+# OpenAI-compatible Chat Completions endpoint).
+aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
 aws-smithy-async = { version = "1", features = ["rt-tokio"] }
 aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"

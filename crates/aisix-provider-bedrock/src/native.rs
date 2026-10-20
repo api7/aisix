@@ -22,8 +22,8 @@ use aws_sdk_bedrockruntime::types::{
 use serde_json::Value;
 
 use crate::bridge::{
-    map_aws_sdk_error_generic, strip_region_prefix, upstream_model, validate_model_id_chars,
-    BedrockBridge, BedrockPublisher, BedrockSecret,
+    strip_region_prefix, upstream_model, validate_model_id_chars, BedrockBridge, BedrockPublisher,
+    BedrockSecret,
 };
 
 /// Whether `/v1/messages` for `upstream_id` takes Bedrock's own Anthropic
@@ -85,7 +85,7 @@ impl BedrockBridge {
                 .body(Blob::new(bytes))
                 .send()
                 .await
-                .map_err(|e| map_aws_sdk_error_generic(e, started, deadline))?;
+                .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
             let json: Value = serde_json::from_slice(resp.body().as_ref())
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
             return Ok(NativeMessages::Json(json));
@@ -99,7 +99,7 @@ impl BedrockBridge {
             .body(Blob::new(bytes))
             .send()
             .await
-            .map_err(|e| map_aws_sdk_error_generic(e, started, deadline))?;
+            .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
 
         // The first event is awaited here, before the response is committed,
         // so an exception Bedrock raises before any content (a throttle is
@@ -175,7 +175,7 @@ impl BedrockBridge {
             .input(input)
             .send()
             .await
-            .map_err(|e| map_aws_sdk_error_generic(e, started, ctx.deadline));
+            .map_err(|e| crate::errors::sdk_error(e, started, ctx.deadline));
         match runtime {
             Ok(resp) => Ok(serde_json::json!({"input_tokens": resp.input_tokens()})),
             // bedrock-runtime's CountTokens does not count every Claude model
@@ -296,18 +296,28 @@ async fn mantle_count_tokens(
     if let Some(d) = ctx.deadline {
         req = req.timeout(d);
     }
+    let started = Instant::now();
     let resp = req.send().await.map_err(aisix_gateway::send_error)?;
     aisix_gateway::note_upstream_response(resp.headers());
     let status = resp.status();
     if !status.is_success() {
         let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-        return Err(BridgeError::UpstreamStatus {
-            status: status.as_u16(),
-            message: format!("upstream returned {}", status.as_u16()),
-            parsed: None,
-            wire: aisix_gateway::UpstreamWire::Bedrock,
+        let kind = resp
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body =
+            aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)
+                .await;
+        return Err(crate::errors::upstream_error(
+            status.as_u16(),
+            kind,
+            None,
+            aisix_gateway::upstream_error_message(&body),
             retry_after,
-        });
+            started,
+        ));
     }
     let json: Value = resp
         .json()
@@ -462,15 +472,16 @@ fn stream_error(
         }
         _ => ("api_error", None),
     };
-    // Canned text keyed on the status, like every other Bedrock error the
-    // gateway relays: the AWS message embeds account ids and ARNs.
-    let message = match status {
-        Some(429) => "upstream rate limited".to_string(),
-        Some(529) => "upstream overloaded".to_string(),
-        Some(400) => "upstream rejected the streaming request".to_string(),
-        Some(s) => format!("upstream reported stream error {s}"),
-        None => "upstream reported a stream error".to_string(),
-    };
+    // The upstream's own text; a status-keyed phrase only when it sent none.
+    let message = svc
+        .meta()
+        .message()
+        .filter(|m| !m.is_empty())
+        .map(|m| aisix_gateway::truncate_lossy(m, aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES))
+        .unwrap_or_else(|| match status {
+            Some(s) => format!("upstream reported stream error {s}"),
+            None => "upstream reported a stream error".to_string(),
+        });
     StreamException {
         kind,
         status,

@@ -20,6 +20,11 @@
 //! - [x] D7.4 — Mistral / Amazon Titan / Amazon Nova / Cohere / AI21
 //!   dispatch via Converse (same unified path; AWS handles
 //!   publisher-specific body shaping inside Bedrock).
+//! - [x] Grok and OpenAI GPT 5.6+ addressed through a cross-region
+//!   inference profile answer through bedrock-runtime's OpenAI-compatible
+//!   Chat Completions endpoint (`/openai/v1/chat/completions`, SigV4), and
+//!   fall back to Converse when the request needs a Converse-only feature
+//!   (see `openai_compat`).
 //!
 //! `/v1/messages` and `/v1/messages/count_tokens` for Claude go to
 //! `InvokeModel` / `InvokeModelWithResponseStream` / `CountTokens` with the
@@ -91,8 +96,11 @@
 #![deny(rust_2018_idioms)]
 
 mod bridge;
+mod converse_req;
 mod convert;
+mod errors;
 mod native;
+mod openai_compat;
 mod wire;
 
 pub use bridge::{BedrockBridge, BedrockPublisher};

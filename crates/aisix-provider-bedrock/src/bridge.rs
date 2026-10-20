@@ -30,9 +30,6 @@ use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_credential_types::Credentials;
 use aws_sdk_bedrockruntime::config::{BehaviorVersion, Region};
 use aws_sdk_bedrockruntime::error::SdkError;
-use aws_sdk_bedrockruntime::operation::converse::ConverseError;
-use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
-use aws_sdk_bedrockruntime::operation::invoke_model::InvokeModelError;
 use aws_sdk_bedrockruntime::primitives::Blob;
 use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
 use aws_sdk_bedrockruntime::types::{
@@ -47,15 +44,14 @@ use aws_sdk_bedrockruntime::types::{
 };
 use aws_sdk_bedrockruntime::Client as BedrockClient;
 use base64::Engine as _;
+use reqwest::Client as HttpClient;
 
-use aisix_gateway::content_part::{
-    check_tool_result_parts, display_uri, translate_user_parts_with, Media, MediaSource,
+use aisix_gateway::content_part::{display_uri, translate_user_parts_with, Media, MediaSource};
+use aisix_gateway::media_fetch::{
+    fetch_media_urls, fetch_media_urls_including_tool_results, Encoding, FetchedMedia,
 };
-use aisix_gateway::media_fetch::{fetch_media_urls, Encoding, FetchedMedia};
-use aws_smithy_runtime_api::client::result::ServiceError;
-use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use serde::Deserialize;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use aisix_provider_anthropic::wire::{
     anthropic_needs_fetch, apply_auto_prompt_caching, auto_prompt_caching_ttl, build_request,
@@ -98,6 +94,9 @@ pub struct BedrockBridge {
     /// metrics dashboards keep their existing `provider="bedrock"`
     /// filters working.
     name: &'static str,
+    /// HTTP client for the operation the SDK has no call for — the
+    /// runtime's OpenAI-compatible Chat Completions endpoint.
+    http: HttpClient,
     /// Test-only endpoint URL override. When set, the SDK config's
     /// `endpoint_url` is pinned to this value so wiremock can stand
     /// in for `bedrock-runtime.<region>.amazonaws.com`. Credentials,
@@ -112,6 +111,9 @@ impl BedrockBridge {
     pub fn new() -> Self {
         Self {
             name: "bedrock",
+            http: aisix_gateway::client_builder()
+                .build()
+                .unwrap_or_else(|_| HttpClient::new()),
             #[cfg(test)]
             endpoint_url_override: None,
         }
@@ -220,6 +222,7 @@ const KNOWN_PUBLISHER_TAGS: &[&str] = &[
     "zai",
     "twelvelabs",
     "openai",
+    "xai",
 ];
 
 impl BedrockPublisher {
@@ -228,7 +231,7 @@ impl BedrockPublisher {
     /// `global.`, `us-gov.`, `au.`, `ca.`, `jp.`, …) — see
     /// [`strip_region_prefix`] for the exact rule.
     pub fn from_model_id(model_id: &str) -> Option<Self> {
-        let stripped = strip_region_prefix(model_id);
+        let stripped = strip_region_prefix(capability_id(model_id));
         let (publisher_tag, _rest) = stripped.split_once('.')?;
         let tag_lower = publisher_tag.to_ascii_lowercase();
         let body_lower = stripped.to_ascii_lowercase();
@@ -244,7 +247,7 @@ impl BedrockPublisher {
             "ai21" => Self::Ai21,
             "deepseek" | "writer" | "stability" | "google" | "nvidia" | "qwen" | "moonshotai"
             | "moonshot" | "minimaxai" | "minimax" | "zai-org" | "zai" | "twelvelabs"
-            | "openai" => Self::Other,
+            | "openai" | "xai" => Self::Other,
             _ => return None,
         })
     }
@@ -265,6 +268,40 @@ impl BedrockPublisher {
             Self::Ai21 => "ai21",
             Self::Other => "<unspecified>",
         }
+    }
+}
+
+/// The model id a Bedrock ARN carries in its last path segment — an
+/// inference-profile ARN ends in the profile id (`us.anthropic.claude-…`).
+/// An application inference profile or provisioned throughput ARN ends in
+/// an opaque id, which names no publisher. A bare model id is unchanged.
+pub(crate) fn capability_id(model_id: &str) -> &str {
+    if is_arn(model_id) {
+        model_id.rsplit('/').next().unwrap_or(model_id)
+    } else {
+        model_id
+    }
+}
+
+pub(crate) fn is_arn(model_id: &str) -> bool {
+    model_id.starts_with("arn:")
+}
+
+/// Resolve the publisher of the model a request dispatches to. An ARN whose
+/// last segment names no publisher (an application inference profile, a
+/// provisioned throughput) is still a Bedrock model, and is served by
+/// Converse, which needs no publisher; any other unrecognised id is a
+/// misconfigured model and is refused without spending a retry.
+fn resolve_publisher(upstream_id: &str) -> Result<Option<BedrockPublisher>, BridgeError> {
+    match BedrockPublisher::from_model_id(upstream_id) {
+        Some(p) => Ok(Some(p)),
+        None if is_arn(upstream_id) => Ok(None),
+        None => Err(BridgeError::InvalidUpstreamConfig(format!(
+            "bedrock publisher unknown for model id {upstream_id:?}; \
+             expected a Bedrock model id such as anthropic.claude-* / meta.llama* / \
+             amazon.nova-* / openai.* / xai.* (optionally prefixed with a cross-region \
+             inference profile like us. / eu. / global.), or a Bedrock ARN"
+        ))),
     }
 }
 
@@ -311,7 +348,7 @@ pub(crate) fn strip_region_prefix(model_id: &str) -> &str {
 /// `ProviderKey.api_base` so the cp-api validator can apply normal
 /// URL-shape rules. Region is in here because Bedrock keys dispatch
 /// off region (`bedrock-runtime.<region>.amazonaws.com`).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct BedrockSecret {
     pub(crate) access_key_id: String,
     pub(crate) secret_access_key: String,
@@ -610,103 +647,6 @@ pub(crate) fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
         .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
-/// Translate an SDK error into the canonical `BridgeError`.
-///
-/// **Audit M1 — sensitive-info redaction:** Bedrock error envelopes
-/// frequently include the operator's model id, region, account
-/// numbers (in ARNs), and IAM role names. Surfacing these to a
-/// downstream customer leaks operator-internal taxonomy. We map to
-/// canned status-keyed phrases.
-///
-/// **Audit H3** — `deadline` is threaded through so a SDK-side timeout
-/// reports the actual elapsed budget instead of `0ms` (which formats
-/// as "timed out after 0ms" in customer logs).
-fn map_sdk_error(
-    err: SdkError<InvokeModelError>,
-    started: Instant,
-    deadline: Option<Duration>,
-) -> BridgeError {
-    match err {
-        SdkError::TimeoutError(_) => {
-            // Prefer the actual elapsed budget; fall back to the
-            // deadline if elapsed somehow rounds to 0 (clock skew).
-            let elapsed_ms = started.elapsed().as_millis() as u64;
-            let reported = if elapsed_ms > 0 {
-                elapsed_ms
-            } else {
-                deadline.map(|d| d.as_millis() as u64).unwrap_or(0)
-            };
-            BridgeError::Timeout {
-                elapsed_ms: reported,
-                cause: String::new(),
-            }
-        }
-        SdkError::DispatchFailure(_) => BridgeError::Transport("upstream dispatch failed".into()),
-        SdkError::ConstructionFailure(_) => {
-            BridgeError::Config("upstream request construction failed".into())
-        }
-        SdkError::ResponseError(_) => {
-            BridgeError::UpstreamDecode("upstream response could not be parsed".into())
-        }
-        SdkError::ServiceError(svc) => map_service_error(svc),
-        _ => BridgeError::Transport("upstream dispatch failed".into()),
-    }
-}
-
-/// Audit H1 — propagate `Retry-After` from the upstream's HTTP
-/// response so the gateway's cooldown layer gets the actual upstream
-/// hint instead of falling back to its configured default. Bedrock
-/// returns `Retry-After` on 429 throttle responses; collapsing it to
-/// `None` silently degrades multi-region / burst behavior.
-fn map_service_error(
-    svc: ServiceError<InvokeModelError, aws_smithy_runtime_api::http::Response>,
-) -> BridgeError {
-    // SECURITY: AWS error messages embed operator-internal taxonomy
-    // (ARNs, region, account id, IAM role names). The canned status-
-    // keyed phrase reaches the customer; the parsed view surfaces only
-    // the AWS error CODE (e.g. "ThrottlingException") for the
-    // error_translate layer to translate to OpenAI / Anthropic shape.
-    // `parsed.message` is intentionally left `None`.
-    let kind = svc.err().meta().code().map(str::to_string);
-    let raw = svc.raw();
-    let status = raw.status().as_u16();
-    // Convert smithy HeaderMap → http::HeaderMap so we can reuse the
-    // gateway-level `parse_retry_after` helper. Headers with invalid
-    // bytes are dropped (defensive — SDK should not produce them).
-    let mut hdrs = http::HeaderMap::new();
-    for (k, v) in raw.headers() {
-        if let (Ok(name), Ok(val)) = (
-            http::HeaderName::from_bytes(k.as_bytes()),
-            http::HeaderValue::from_str(v),
-        ) {
-            hdrs.insert(name, val);
-        }
-    }
-    let retry_after = aisix_gateway::parse_retry_after(&hdrs);
-    let message = match status {
-        401 | 403 => "upstream authentication failed".to_string(),
-        404 => "upstream model not found".to_string(),
-        408 => "upstream request timeout".to_string(),
-        429 => "upstream rate limited".to_string(),
-        _ => format!("upstream returned {status}"),
-    };
-    let parsed = kind.as_ref().map(|k| {
-        Box::new(aisix_gateway::UpstreamErrorView {
-            kind: Some(k.clone()),
-            message: None,
-            code: None,
-            param: None,
-        })
-    });
-    BridgeError::UpstreamStatus {
-        status,
-        message,
-        parsed,
-        wire: aisix_gateway::UpstreamWire::Bedrock,
-        retry_after,
-    }
-}
-
 /// **Audit M2** — defense-in-depth check on the upstream model id
 /// before it's URL-encoded into the Bedrock `/model/<id>/invoke`
 /// path. The SDK encodes reserved characters, but pinning the
@@ -721,7 +661,7 @@ pub(crate) fn validate_model_id_chars(model_id: &str) -> Result<(), BridgeError>
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_' | '/'))
     {
-        return Err(BridgeError::Config(format!(
+        return Err(BridgeError::InvalidUpstreamConfig(format!(
             "bedrock model id {model_id:?} contains unexpected characters — \
              only [A-Za-z0-9._:/-] are allowed"
         )));
@@ -786,35 +726,25 @@ impl Bridge for BedrockBridge {
         let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
-        let publisher = BedrockPublisher::from_model_id(upstream_id).ok_or_else(|| {
-            BridgeError::Config(format!(
-                "bedrock publisher unknown for model id {upstream_id:?}; \
-                 expected one of anthropic.claude-* / meta.llama* / mistral.* / \
-                 amazon.titan-* / amazon.nova-* / cohere.command* / ai21.jamba-* \
-                 (optionally prefixed with a cross-region inference profile like us. / eu. / apac.)"
-            ))
-        })?;
-        // Keep wire module reachable from the public surface so the
-        // streaming follow-up can wire SigV4-reserved-header checks
-        // for any operator default_headers override.
-        let _ = wire::reserved_sigv4_headers();
+        let publisher = resolve_publisher(upstream_id)?;
         reject_system_only(&req)?;
-
-        // Phase G productionization (#302 Step 3): unified Converse
-        // wire for non-Anthropic publishers (Meta / Mistral / Cohere /
-        // Amazon Titan / Amazon Nova / AI21). Anthropic stays on the
-        // legacy /invoke path (chat_anthropic, wired via #320) for
-        // backward compat with existing operator deployments — the
-        // Anthropic Messages JSON envelope is what cp-api / dashboard
-        // tests already pin. Moving Anthropic to Converse is a clean
-        // follow-up since the SDK-decoded Converse response shape is
-        // equivalent for the customer-visible ChatResponse.
-        //
-        // chat_stream (below) dispatches ALL publishers through
-        // Converse because the legacy /invoke path never had a
-        // streaming variant (D7.2.b was the gap).
+        if crate::openai_compat::serves(&req, upstream_id) {
+            let endpoint = self.chat_completions_endpoint(ctx)?;
+            return crate::openai_compat::chat(endpoint, req, ctx, upstream_id).await;
+        }
+        // Claude answers a non-streamed request through InvokeModel, in
+        // Anthropic Messages shape; every other publisher, and every
+        // streamed request, through Converse.
+        // InvokeModel has no place for `requestMetadata` or a Bedrock
+        // `outputConfig`, so a Claude request carrying either is served by
+        // Converse, as it is when streamed.
+        let needs_converse = ["requestMetadata", "outputConfig"]
+            .iter()
+            .any(|k| req.extra.get(*k).is_some_and(|v| !v.is_null()));
         match publisher {
-            BedrockPublisher::Anthropic => self.chat_anthropic(req, ctx, upstream_id).await,
+            Some(BedrockPublisher::Anthropic) if !needs_converse => {
+                self.chat_anthropic(req, ctx, upstream_id).await
+            }
             _ => self.chat_converse(req, ctx, upstream_id).await,
         }
     }
@@ -838,15 +768,12 @@ impl Bridge for BedrockBridge {
         let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
-        let publisher = BedrockPublisher::from_model_id(upstream_id).ok_or_else(|| {
-            BridgeError::Config(format!(
-                "bedrock publisher unknown for model id {upstream_id:?}; \
-                 expected one of anthropic.claude-* / meta.llama* / mistral.* / \
-                 amazon.titan-* / amazon.nova-* / cohere.command* / ai21.jamba-* \
-                 (optionally prefixed with a cross-region inference profile like us. / eu. / apac.)"
-            ))
-        })?;
+        resolve_publisher(upstream_id)?;
         reject_system_only(&req)?;
+        if crate::openai_compat::serves(&req, upstream_id) {
+            let endpoint = self.chat_completions_endpoint(ctx)?;
+            return crate::openai_compat::chat_stream(endpoint, req, ctx, upstream_id).await;
+        }
         // The tool route's JSON only exists once the synthetic tool call
         // has been assembled, so it cannot be streamed as it arrives.
         // Run the request non-streaming — through `chat`, so each
@@ -870,11 +797,6 @@ impl Bridge for BedrockBridge {
                 }
             }));
         }
-        // Phase G productionization (#302 Step 3): unified Converse
-        // stream path for all publishers — same SDK call (.converse_stream)
-        // owns the AWS event-stream binary frame decoding internally,
-        // so the bridge layer doesn't ship its own decoder.
-        let _ = publisher;
         self.chat_converse_stream(req, ctx, upstream_id).await
     }
 
@@ -919,7 +841,7 @@ impl Bridge for BedrockBridge {
                     .body(Blob::new(body_bytes))
                     .send()
                     .await
-                    .map_err(|e| map_sdk_error(e, started, deadline))?;
+                    .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
                 let parsed: TitanEmbedResponse = serde_json::from_slice(resp.body().as_ref())
                     .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
                 if let Some(token_count) = parsed.input_text_token_count {
@@ -940,12 +862,27 @@ impl Bridge for BedrockBridge {
             struct CohereEmbedRequest<'a> {
                 texts: &'a [String],
                 input_type: &'a str,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                embedding_types: Option<serde_json::Value>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                output_dimension: Option<u32>,
             }
+            // `encoding_format` names the embedding type when the caller
+            // gave no `embedding_types`; base64 is served from floats.
+            let embedding_types = req.embedding_types.clone().or_else(|| {
+                req.encoding_format.as_deref().map(|f| {
+                    let f = if f == "base64" { "float" } else { f };
+                    serde_json::json!([f])
+                })
+            });
             let body_bytes = Vec::from(
                 aisix_gateway::json_body(&CohereEmbedRequest {
                     texts: &req.input,
-                    // LiteLLM's default when the caller gives no input_type.
-                    input_type: "search_document",
+                    // The caller's purpose; `search_document` when it gave none.
+                    input_type: req.input_type.as_deref().unwrap_or("search_document"),
+                    embedding_types,
+                    // Embed v4 takes a vector length; v3 has a fixed one.
+                    output_dimension: req.dimensions.filter(|_| base_id.contains("embed-v4")),
                 })
                 .map_err(|e| BridgeError::Config(format!("serialize Cohere embed body: {e}")))?,
             );
@@ -957,19 +894,27 @@ impl Bridge for BedrockBridge {
                 .body(Blob::new(body_bytes))
                 .send()
                 .await
-                .map_err(|e| map_sdk_error(e, started, deadline))?;
+                .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
             let parsed: CohereEmbedResponse = serde_json::from_slice(resp.body().as_ref())
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            for (i, values) in parsed.embeddings.into_iter().enumerate() {
+            for (i, values) in parsed.embeddings.into_vectors().into_iter().enumerate() {
                 data.push(EmbeddingObject {
                     index: i as u32,
                     object: "embedding".to_string(),
                     embedding: EmbeddingVector::Float(values),
                 });
             }
-            // Cohere-on-Bedrock returns no token statistics; record the
-            // source as unavailable rather than presenting this zero as a
-            // provider-reported count.
+            // Cohere reports billed tokens under `meta.billed_units` when it
+            // reports any; without them the count is unavailable, never a
+            // zero presented as reported.
+            if let Some(tokens) = parsed
+                .meta
+                .and_then(|m| m.billed_units)
+                .and_then(|b| b.input_tokens)
+            {
+                prompt_tokens = tokens;
+                usage_reported = true;
+            }
         } else {
             return Err(BridgeError::Config(format!(
                 "bedrock embeddings support amazon.titan-embed-* and cohere.embed-* \
@@ -1005,10 +950,81 @@ struct TitanEmbedResponse {
     input_text_token_count: Option<u64>,
 }
 
-/// Cohere-on-Bedrock embed response (`embeddings` = one vector per text).
+/// Cohere-on-Bedrock embed response: `embeddings` is one vector per text
+/// (`embeddings_floats`), or an object keyed by embedding type
+/// (`embeddings_by_type`, the Embed v4 shape when types are requested).
 #[derive(Debug, Deserialize)]
 struct CohereEmbedResponse {
-    embeddings: Vec<Vec<f32>>,
+    embeddings: CohereEmbeddings,
+    #[serde(default)]
+    meta: Option<CohereMeta>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CohereEmbeddings {
+    Floats(Vec<Vec<f32>>),
+    ByType(std::collections::BTreeMap<String, Vec<Vec<f32>>>),
+}
+
+impl CohereEmbeddings {
+    /// The vectors of the response, `float` first when several types came
+    /// back.
+    fn into_vectors(self) -> Vec<Vec<f32>> {
+        match self {
+            Self::Floats(v) => v,
+            Self::ByType(mut by_type) => by_type
+                .remove("float")
+                .or_else(|| by_type.into_values().next())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CohereMeta {
+    #[serde(default)]
+    billed_units: Option<CohereBilledUnits>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CohereBilledUnits {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+}
+
+/// Fit the Anthropic Messages body InvokeModel sends to what Bedrock's
+/// Claude takes: OpenAI's `stop` as `stop_sequences` and
+/// `max_completion_tokens` as `max_tokens`; the Bedrock-native blocks come
+/// off the body (they travel as request headers), and the caller's
+/// `additionalModelRequestFields` join it, as Converse does for Claude.
+fn shape_invoke_body(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    req: &ChatFormat,
+    upstream_id: &str,
+) {
+    if let Some(stops) = crate::converse_req::stop_sequences(req, upstream_id) {
+        obj.insert("stop_sequences".into(), stops.into());
+    }
+    obj.remove("stop");
+    // Already carried as `max_tokens` (see `chat_anthropic`).
+    obj.remove("max_completion_tokens");
+    for key in [
+        "guardrailConfig",
+        "performanceConfig",
+        "serviceTier",
+        "service_tier",
+        "requestMetadata",
+        "outputConfig",
+        "additionalModelRequestFields",
+    ] {
+        obj.remove(key);
+    }
+    if let Some(serde_json::Value::Object(fields)) = req.extra.get("additionalModelRequestFields") {
+        for (k, v) in fields {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
 }
 
 impl BedrockBridge {
@@ -1035,6 +1051,15 @@ impl BedrockBridge {
         // `anthropic.claude-…` is not a name it can read. Hand it the
         // Claude name the Bedrock id carries; the `model` field it lands
         // in is stripped below, since /invoke keys the model off the URL.
+        // The Anthropic builder sizes a thinking budget against
+        // `max_tokens`, so the caller's cap has to be there under either
+        // name before it runs.
+        let mut req = req;
+        if req.max_tokens.is_none() {
+            if let Some(cap) = crate::converse_req::max_tokens(&req, upstream_id) {
+                req.to_mut().max_tokens = Some(cap);
+            }
+        }
         let anthropic_model = bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id);
         let synthetic_json_tool = matches!(
             structured_output_for(&req, anthropic_model),
@@ -1066,6 +1091,7 @@ impl BedrockBridge {
             // URL-borne `model` into the /invoke body.
             apply_body_overrides(&mut body_value, ctx);
             if let Some(obj) = body_value.as_object_mut() {
+                shape_invoke_body(obj, &req, upstream_id);
                 obj.remove("model");
                 obj.remove("stream");
                 obj.insert(
@@ -1078,27 +1104,84 @@ impl BedrockBridge {
             })?)
         };
 
+        let native = crate::converse_req::NativeBlocks::from_request(&req)?;
         // The owned request is not needed past its wire bytes.
         drop(req);
         let started = Instant::now();
         let deadline = ctx.deadline;
-        let resp = client
+        let mut call = client
             .invoke_model()
             .model_id(upstream_id)
             .content_type("application/json")
             .accept("application/json")
-            .body(Blob::new(body_bytes))
+            .body(Blob::new(body_bytes));
+        // InvokeModel takes the Bedrock-native blocks as request headers.
+        if let Some(g) = native.guardrail.as_ref() {
+            let field = |k: &str| g.get(k).and_then(|v| v.as_str()).map(str::to_string);
+            call = call
+                .set_guardrail_identifier(field("guardrailIdentifier"))
+                .set_guardrail_version(field("guardrailVersion"));
+            if let Some(trace) = field("trace") {
+                call = call.trace(aws_sdk_bedrockruntime::types::Trace::from(
+                    trace.to_ascii_uppercase().as_str(),
+                ));
+            }
+        }
+        if let Some(p) = native.performance.as_ref() {
+            call = call.performance_config_latency(p.latency().clone());
+        }
+        if let Some(tier) = native.service_tier.as_ref() {
+            call = call.service_tier(tier.r#type().clone());
+        }
+        let resp = call
             .send()
             .await
-            .map_err(|e| map_sdk_error(e, started, deadline))?;
+            .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
+        let request_id = aws_sdk_bedrockruntime::operation::RequestId::request_id(&resp)
+            .unwrap_or_default()
+            .to_string();
 
         let parsed: AnthropicResponse = serde_json::from_slice(resp.body().as_ref())
             .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
         let mut chat = response_into_chat_response(parsed);
+        if chat.id.is_empty() {
+            chat.id = request_id;
+        }
         if synthetic_json_tool {
             unwrap_json_tool_call(&mut chat);
         }
         Ok(chat)
+    }
+
+    /// The Chat Completions endpoint for this provider key: its parsed
+    /// credentials, its `api_base` (or the region's host), and the extra
+    /// headers the SigV4 signature covers.
+    fn chat_completions_endpoint(
+        &self,
+        ctx: &BridgeContext,
+    ) -> Result<crate::openai_compat::Endpoint, BridgeError> {
+        let creds = BedrockSecret::parse(&ctx.provider_key.api_key)?;
+        if creds.region.trim().is_empty() {
+            return Err(BridgeError::InvalidUpstreamConfig(
+                "bedrock provider_key.api_key.region is empty".into(),
+            ));
+        }
+        #[cfg(test)]
+        let base = self
+            .endpoint_url_override
+            .clone()
+            .or_else(|| ctx.provider_key.api_base.clone());
+        #[cfg(not(test))]
+        let base = ctx.provider_key.api_base.clone();
+        Ok(crate::openai_compat::Endpoint {
+            client: aisix_gateway::upstream_tls::client_for_provider_key(
+                &self.http,
+                ctx.provider_key.upstream_connection().as_ref(),
+            ),
+            creds,
+            base,
+            extra_headers: filtered_extra_headers(&ctx.header_ctx()),
+        })
     }
 
     /// Resolve credentials + build an SDK client. Pulled out of
@@ -1132,17 +1215,9 @@ impl BedrockBridge {
     /// Dispatch Bedrock chat via the unified Converse API.
     ///
     /// Request: `POST /model/<modelId>/converse`. The SDK builds the
-    /// Converse JSON envelope (`messages[]`, `system[]`,
-    /// `inferenceConfig`) from typed builders, signs SigV4, and POSTs
-    /// to the resolved endpoint. Response: typed `ConverseOutput` with
-    /// `output.message.content[]` text blocks, `stop_reason`, `usage`
-    /// (input/output/total tokens), and `metrics.latency_ms`.
-    ///
-    /// Unlike the per-publisher `/invoke` legacy path, Converse uses
-    /// ONE wire shape for every Bedrock publisher (Anthropic, Meta,
-    /// Mistral, Cohere, Amazon Titan/Nova, AI21). Adding a new
-    /// publisher to AWS's supported list requires zero gateway-side
-    /// code change — the SDK upgrade picks it up.
+    /// Converse JSON envelope from typed builders, signs SigV4, and POSTs
+    /// to the resolved endpoint. Converse uses ONE wire shape for every
+    /// Bedrock publisher.
     ///
     /// Reference: <https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html>
     async fn chat_converse(
@@ -1152,68 +1227,66 @@ impl BedrockBridge {
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
         let client = self.build_client_from_ctx(ctx)?;
-        let fetched = fetch_media_urls(&req, ctx, Encoding::Bytes, |_| true).await?;
+        let fetched =
+            fetch_media_urls_including_tool_results(&req, ctx, Encoding::Bytes, |_| true).await?;
         let charged = fetched.charge(ctx);
         let ctx = &*charged;
-        let (system_blocks, message_blocks) = build_converse_inputs(
+        let publisher = BedrockPublisher::from_model_id(upstream_id);
+        let native = crate::converse_req::NativeBlocks::from_request(&req)?;
+        // A caller's `response_format` becomes one of two request shapes
+        // here, picked by whether the model constrains its own decoding.
+        let structured = bedrock_structured_output(&req, upstream_id);
+        let json_tool_schema = match &structured {
+            StructuredOutput::Tool(schema) => Some(schema),
+            _ => None,
+        };
+        let tool_config = build_tool_config(&req, json_tool_schema, publisher, upstream_id);
+        let parts = ConverseParts::build(
             &req,
-            BedrockPublisher::from_model_id(upstream_id),
+            upstream_id,
             &fetched,
             auto_prompt_caching_ttl(&ctx.model),
+            tool_config.as_ref(),
+            native.guardrail.is_some(),
+            pk_param_constraints(ctx),
         )?;
 
         let started = Instant::now();
         let deadline = ctx.deadline;
         let mut call = client.converse().model_id(upstream_id);
-        for sb in system_blocks {
+        for sb in parts.systems {
             call = call.system(sb);
         }
-        for mb in message_blocks {
+        for mb in parts.messages {
             call = call.messages(mb);
         }
-        // Audit MEDIUM-2 (PR #389): wire ChatFormat's
-        // temperature/max_tokens/top_p through to Converse's
-        // InferenceConfiguration. The legacy chat_anthropic path
-        // forwards these via build_request → AnthropicRequest;
-        // dropping them on the Converse path is a silent
-        // behavioural regression for every non-Anthropic customer.
-        // #463: re-apply the PK's param_constraints temperature clamp here —
-        // only the /invoke body path runs apply_param_constraints otherwise,
-        // so without this a Bedrock-wide temperature ceiling silently no-ops
-        // for every Converse (non-Anthropic) publisher.
-        let (reasoning_fields, thinking_max_tokens) =
-            build_converse_additional_model_request_fields(&req, upstream_id);
-        if let Some(cfg) =
-            build_inference_config(&req, thinking_max_tokens, pk_param_constraints(ctx))
-        {
+        if let Some(cfg) = parts.inference {
             call = call.inference_config(cfg);
         }
-        if let Some(fields) = reasoning_fields {
+        if let Some(fields) = parts.additional {
             call = call.additional_model_request_fields(fields);
         }
-        // A caller's `response_format` becomes one of two request shapes
-        // here, picked by whether the model constrains its own decoding.
-        let structured = bedrock_structured_output(&req, upstream_id);
-        let mut json_tool_schema = None;
-        match &structured {
-            StructuredOutput::None => {}
-            StructuredOutput::Native(schema) => {
-                if let Some(cfg) = build_output_config(&req, schema) {
-                    call = call.output_config(cfg);
-                }
-            }
-            StructuredOutput::Tool(schema) => json_tool_schema = Some(schema),
+        let output_config = match &structured {
+            StructuredOutput::Native(schema) => build_output_config(&req, schema),
+            _ => None,
+        };
+        if let Some(cfg) = output_config.or(native.output_config.clone()) {
+            call = call.output_config(cfg);
         }
-        // #560: forward OpenAI `tools` / `tool_choice` into Converse's
-        // `toolConfig`. Without this every Converse publisher silently
-        // drops tool calling and improvises the call as prose
-        // (finish_reason=stop, tool_calls=[]).
-        if let Some(tc) = build_tool_config(
-            &req,
-            json_tool_schema,
-            BedrockPublisher::from_model_id(upstream_id),
-        ) {
+        if let Some(tc) = tool_config {
             call = call.tool_config(tc);
+        }
+        if let Some(g) = native.converse_guardrail() {
+            call = call.guardrail_config(g);
+        }
+        if let Some(p) = native.performance {
+            call = call.performance_config(p);
+        }
+        if let Some(t) = native.service_tier {
+            call = call.service_tier(t);
+        }
+        for (k, v) in native.request_metadata {
+            call = call.request_metadata(k, v);
         }
 
         // The owned request is not needed past its wire bytes.
@@ -1221,8 +1294,12 @@ impl BedrockBridge {
         let resp = call
             .send()
             .await
-            .map_err(|e| map_converse_sdk_error(e, started, deadline))?;
+            .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
+        let request_id = aws_sdk_bedrockruntime::operation::RequestId::request_id(&resp)
+            .unwrap_or_default()
+            .to_string();
         let mut chat = converse_output_into_chat_response(resp, upstream_id);
+        chat.id = request_id;
         if json_tool_schema.is_some() {
             unwrap_json_tool_call(&mut chat);
         }
@@ -1234,24 +1311,8 @@ impl BedrockBridge {
     /// Request: `POST /model/<modelId>/converse-stream`. The SDK
     /// reads the binary `vnd.amazon.eventstream` body internally and
     /// yields typed [`ConverseStreamOutput`] events through the
-    /// returned stream — no per-byte frame decoder lives in the
-    /// bridge layer.
-    ///
-    /// Event sequence per AWS docs:
-    ///
-    /// ```text
-    /// MessageStart      → {role: "assistant"}
-    /// ContentBlockStart → {start: {text: ""}, contentBlockIndex: 0}
-    /// ContentBlockDelta → {delta: {text: "..."}, contentBlockIndex: 0}
-    /// ContentBlockStop  → {contentBlockIndex: 0}
-    /// MessageStop       → {stopReason: "end_turn"}
-    /// Metadata          → {usage: {...}, metrics: {latencyMs: ...}}
-    /// ```
-    ///
-    /// Each event maps to zero, one, or two [`ChatChunk`]s — see
-    /// [`emit_converse_chunk`]. Stream closes cleanly when AWS sends
-    /// the final Metadata event and the underlying eventstream
-    /// connection terminates.
+    /// returned stream; each maps to zero, one, or two [`ChatChunk`]s —
+    /// see [`emit_converse_chunk`].
     ///
     /// Reference: <https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html>
     async fn chat_converse_stream(
@@ -1261,51 +1322,62 @@ impl BedrockBridge {
         upstream_id: &str,
     ) -> Result<ChatChunkStream, BridgeError> {
         let client = self.build_client_from_ctx(ctx)?;
-        let fetched = fetch_media_urls(&req, ctx, Encoding::Bytes, |_| true).await?;
+        let fetched =
+            fetch_media_urls_including_tool_results(&req, ctx, Encoding::Bytes, |_| true).await?;
         let charged = fetched.charge(ctx);
         let ctx = &*charged;
-        let (system_blocks, message_blocks) = build_converse_inputs(
+        let publisher = BedrockPublisher::from_model_id(upstream_id);
+        let native = crate::converse_req::NativeBlocks::from_request(&req)?;
+        // Only the native structured-output shape reaches this path —
+        // `chat_stream` diverts the tool route before it gets here,
+        // because a tool call cannot be streamed before it is complete.
+        let tool_config = build_tool_config(&req, None, publisher, upstream_id);
+        let parts = ConverseParts::build(
             &req,
-            BedrockPublisher::from_model_id(upstream_id),
+            upstream_id,
             &fetched,
             auto_prompt_caching_ttl(&ctx.model),
+            tool_config.as_ref(),
+            native.guardrail.is_some(),
+            pk_param_constraints(ctx),
         )?;
 
         let started = Instant::now();
         let deadline = ctx.deadline;
         let mut call = client.converse_stream().model_id(upstream_id);
-        for sb in system_blocks {
+        for sb in parts.systems {
             call = call.system(sb);
         }
-        for mb in message_blocks {
+        for mb in parts.messages {
             call = call.messages(mb);
         }
-        // Mirror chat_converse on the stream path — same audit fix +
-        // the #463 param_constraints temperature clamp.
-        let (reasoning_fields, thinking_max_tokens) =
-            build_converse_additional_model_request_fields(&req, upstream_id);
-        if let Some(cfg) =
-            build_inference_config(&req, thinking_max_tokens, pk_param_constraints(ctx))
-        {
+        if let Some(cfg) = parts.inference {
             call = call.inference_config(cfg);
         }
-        if let Some(fields) = reasoning_fields {
+        if let Some(fields) = parts.additional {
             call = call.additional_model_request_fields(fields);
         }
-        // Only the native structured-output shape reaches this path —
-        // `chat_stream` diverts the tool route before it gets here,
-        // because a tool call cannot be streamed before it is complete.
-        if let StructuredOutput::Native(schema) = bedrock_structured_output(&req, upstream_id) {
-            if let Some(cfg) = build_output_config(&req, &schema) {
-                call = call.output_config(cfg);
-            }
+        let output_config = match bedrock_structured_output(&req, upstream_id) {
+            StructuredOutput::Native(schema) => build_output_config(&req, &schema),
+            _ => None,
+        };
+        if let Some(cfg) = output_config.or(native.output_config.clone()) {
+            call = call.output_config(cfg);
         }
-        // #560: forward tools on the stream path too (all publishers,
-        // incl. Anthropic, stream through Converse).
-        if let Some(tc) =
-            build_tool_config(&req, None, BedrockPublisher::from_model_id(upstream_id))
-        {
+        if let Some(tc) = tool_config {
             call = call.tool_config(tc);
+        }
+        if let Some(g) = native.stream_guardrail() {
+            call = call.guardrail_config(g);
+        }
+        if let Some(p) = native.performance {
+            call = call.performance_config(p);
+        }
+        if let Some(t) = native.service_tier {
+            call = call.service_tier(t);
+        }
+        for (k, v) in native.request_metadata {
+            call = call.request_metadata(k, v);
         }
 
         // The owned request is not needed past its wire bytes.
@@ -1313,7 +1385,10 @@ impl BedrockBridge {
         let mut resp = call
             .send()
             .await
-            .map_err(|e| map_converse_stream_sdk_error(e, started, deadline))?;
+            .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
+        let request_id = aws_sdk_bedrockruntime::operation::RequestId::request_id(&resp)
+            .unwrap_or_default()
+            .to_string();
 
         let upstream_id_owned = upstream_id.to_string();
         let stream = async_stream::try_stream! {
@@ -1321,7 +1396,8 @@ impl BedrockBridge {
             loop {
                 match resp.stream.recv().await {
                     Ok(Some(event)) => {
-                        for chunk in emit_converse_chunk(event, &upstream_id_owned, &mut state) {
+                        for mut chunk in emit_converse_chunk(event, &upstream_id_owned, &mut state) {
+                            chunk.id = request_id.clone();
                             yield chunk;
                         }
                     }
@@ -1333,6 +1409,53 @@ impl BedrockBridge {
             }
         };
         Ok(Box::pin(stream))
+    }
+}
+
+/// The parts of a Converse request built from the chat request, shared by
+/// Converse and ConverseStream so the two cannot drift.
+struct ConverseParts {
+    systems: Vec<SystemContentBlock>,
+    messages: Vec<BedrockMessage>,
+    inference: Option<InferenceConfiguration>,
+    additional: Option<aws_smithy_types::Document>,
+}
+
+impl ConverseParts {
+    fn build(
+        req: &ChatFormat,
+        upstream_id: &str,
+        fetched: &FetchedMedia,
+        auto_cache_ttl: Option<&str>,
+        tool_config: Option<&ToolConfiguration>,
+        guarded: bool,
+        constraints: Option<&ParamConstraints>,
+    ) -> Result<Self, BridgeError> {
+        let publisher = BedrockPublisher::from_model_id(upstream_id);
+        // Converse rejects tool blocks in a request without a
+        // `toolConfig`, so with no tools to send the history is rewritten.
+        let neutralized = tool_config
+            .is_none()
+            .then(|| crate::converse_req::neutralize_tool_history(req))
+            .flatten();
+        let history = neutralized.as_ref().unwrap_or(req);
+        let (systems, messages) = build_converse_inputs(
+            history,
+            publisher,
+            upstream_id,
+            fetched,
+            auto_cache_ttl,
+            guarded,
+        )?;
+        let (additional, thinking_max_tokens) =
+            build_converse_additional_model_request_fields(req, upstream_id, tool_config)?;
+        let inference = build_inference_config(req, upstream_id, thinking_max_tokens, constraints);
+        Ok(Self {
+            systems,
+            messages,
+            inference,
+            additional,
+        })
     }
 }
 
@@ -1352,8 +1475,10 @@ impl BedrockBridge {
 fn build_converse_inputs(
     req: &ChatFormat,
     publisher: Option<BedrockPublisher>,
+    upstream_id: &str,
     fetched: &FetchedMedia,
     auto_cache_ttl: Option<&str>,
+    guarded: bool,
 ) -> Result<(Vec<SystemContentBlock>, Vec<BedrockMessage>), BridgeError> {
     let claude = publisher == Some(BedrockPublisher::Anthropic);
     let cache = CachePoints::for_publisher(publisher);
@@ -1422,25 +1547,23 @@ fn build_converse_inputs(
                 messages.push(build_message(ConversationRole::Assistant, blocks)?);
             }
             Role::Tool => {
-                check_tool_result_parts(msg, index).map_err(BridgeError::InvalidRequest)?;
                 // #560: `role:"tool"` → Converse `toolResult` block. The
-                // correlation id rides `tool_call_id`, the result text
-                // rides `content`. A result that names no call still goes
+                // correlation id rides `tool_call_id`, the result rides
+                // `content`. A result that names no call still goes
                 // upstream under a generated id, and Bedrock decides what
                 // to make of it rather than the turn vanishing here.
                 let id = msg
                     .tool_call_id
                     .clone()
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                pending_tool_results.push(ContentBlock::ToolResult(
-                    ToolResultBlock::builder()
-                        .tool_use_id(id)
-                        .content(ToolResultContentBlock::Text(msg.content_str().to_string()))
-                        .build()
-                        .map_err(|e| {
-                            BridgeError::Config(format!("bedrock converse: build tool_result: {e}"))
-                        })?,
-                ));
+                pending_tool_results.extend(tool_result_blocks(
+                    msg,
+                    index,
+                    id,
+                    claude,
+                    fetched,
+                    tool_result_images_inline(upstream_id),
+                )?);
                 if let Some(point) = cache.point(tool_message_cache_control(msg)) {
                     pending_tool_results.push(ContentBlock::CachePoint(point));
                 }
@@ -1450,6 +1573,13 @@ fn build_converse_inputs(
     // Flush any trailing tool results (a conversation ending on a result).
     if !pending_tool_results.is_empty() {
         messages.push(build_message(ConversationRole::User, pending_tool_results)?);
+    }
+    // Converse requires the roles to alternate, so consecutive turns of
+    // one role — tool results followed by a user message, two user or two
+    // assistant messages in a row — are merged into one turn.
+    let mut messages = merge_consecutive_roles(messages)?;
+    if guarded {
+        guard_trailing_user_text(&mut messages)?;
     }
     // `auto_prompt_caching` is a Claude setting; Nova honours only the
     // caller's own markers.
@@ -1801,6 +1931,146 @@ fn converse_media_block(
         .build()
         .map_err(built)?;
     Ok(ContentBlock::Document(block))
+}
+
+/// Whether this model takes an image inside `toolResult.content`. Claude
+/// does; OpenAI's GPT models on Bedrock reject it there, so their tool
+/// result's images travel beside it in the same turn.
+fn tool_result_images_inline(upstream_id: &str) -> bool {
+    !crate::openai_compat::is_openai_gpt(capability_id(upstream_id))
+}
+
+/// The text a tool result keeps when its only content was images moved
+/// beside it.
+const TOOL_RESULT_IMAGE_PLACEHOLDER: &str =
+    "[Tool returned an image - see the following user message]";
+
+/// One `role:"tool"` message as a Converse `toolResult` block — its text,
+/// images and documents — followed by any images the model only takes
+/// beside the result.
+fn tool_result_blocks(
+    msg: &ChatMessage,
+    index: usize,
+    id: String,
+    claude: bool,
+    fetched: &FetchedMedia,
+    images_inline: bool,
+) -> Result<Vec<ContentBlock>, BridgeError> {
+    let parts: Vec<ContentBlock> = match msg.content_blocks.as_deref() {
+        None => vec![ContentBlock::Text(msg.content_str().to_string())],
+        Some(blocks) => {
+            let family = if claude { "Claude" } else { "Amazon Bedrock" };
+            translate_user_parts_with(
+                blocks,
+                index,
+                family,
+                ContentBlock::Text,
+                |media, part_index| {
+                    converse_media_block(
+                        media,
+                        claude,
+                        fetched,
+                        &format!("document-{index}-{part_index}"),
+                    )
+                },
+                |_| None,
+            )
+            .map_err(BridgeError::InvalidRequest)?
+        }
+    };
+    let mut content: Vec<ToolResultContentBlock> = Vec::new();
+    let mut siblings: Vec<ContentBlock> = Vec::new();
+    for part in parts {
+        match part {
+            ContentBlock::Text(t) => content.push(ToolResultContentBlock::Text(t)),
+            ContentBlock::Image(img) if images_inline => {
+                content.push(ToolResultContentBlock::Image(img))
+            }
+            ContentBlock::Image(img) => siblings.push(ContentBlock::Image(img)),
+            ContentBlock::Document(doc) => content.push(ToolResultContentBlock::Document(doc)),
+            ContentBlock::Video(video) => content.push(ToolResultContentBlock::Video(video)),
+            _ => {
+                return Err(BridgeError::InvalidRequest(format!(
+                    "messages[{index}]: a tool result on Amazon Bedrock can carry text, \
+                     images, documents and video only; send the media in a user message instead"
+                )))
+            }
+        }
+    }
+    if content.is_empty() {
+        content.push(ToolResultContentBlock::Text(if siblings.is_empty() {
+            String::new()
+        } else {
+            TOOL_RESULT_IMAGE_PLACEHOLDER.to_string()
+        }));
+    }
+    let block = ToolResultBlock::builder()
+        .tool_use_id(id)
+        .set_content(Some(content))
+        .build()
+        .map_err(|e| BridgeError::Config(format!("bedrock converse: build tool_result: {e}")))?;
+    let mut out = vec![ContentBlock::ToolResult(block)];
+    out.extend(siblings);
+    Ok(out)
+}
+
+/// Merge adjacent Converse messages of the same role, keeping their blocks
+/// in order.
+fn merge_consecutive_roles(
+    messages: Vec<BedrockMessage>,
+) -> Result<Vec<BedrockMessage>, BridgeError> {
+    let mut out: Vec<BedrockMessage> = Vec::with_capacity(messages.len());
+    for message in messages {
+        match out.last_mut() {
+            Some(last) if last.role() == message.role() => {
+                let mut content = last.content().to_vec();
+                content.extend(message.content().iter().cloned());
+                *last = build_message(last.role().clone(), content)?;
+            }
+            _ => out.push(message),
+        }
+    }
+    Ok(out)
+}
+
+/// With a guardrail configured, the trailing user turn's text is sent as
+/// `guardContent`, so the guardrail evaluates the newest input rather than
+/// the whole history.
+fn guard_trailing_user_text(messages: &mut [BedrockMessage]) -> Result<(), BridgeError> {
+    use aws_sdk_bedrockruntime::types::{
+        GuardrailConverseContentBlock, GuardrailConverseTextBlock,
+    };
+    let Some(last) = messages.last_mut() else {
+        return Ok(());
+    };
+    if last.role() != &ConversationRole::User
+        || last
+            .content()
+            .iter()
+            .any(|b| matches!(b, ContentBlock::GuardContent(_)))
+    {
+        return Ok(());
+    }
+    let mut content = Vec::with_capacity(last.content().len());
+    for block in last.content() {
+        match block {
+            ContentBlock::Text(t) => content.push(ContentBlock::GuardContent(
+                GuardrailConverseContentBlock::Text(
+                    GuardrailConverseTextBlock::builder()
+                        .text(t.clone())
+                        .build()
+                        .map_err(|e| {
+                            BridgeError::Config(format!(
+                                "bedrock converse: build guardContent: {e}"
+                            ))
+                        })?,
+                ),
+            )),
+            other => content.push(other.clone()),
+        }
+    }
+    *last = build_message(ConversationRole::User, content)?;
+    Ok(())
 }
 
 /// Bedrock rejects an empty `messages[]`, which is what a request holding
@@ -2265,42 +2535,18 @@ fn tool_call_chunk(
     }
 }
 
-/// Map the SDK's `ConverseError` SdkError variant to BridgeError.
-/// Delegates to the generic helper so both Converse and ConverseStream
-/// share the wire-shape + Retry-After preservation logic.
-fn map_converse_sdk_error(
-    e: SdkError<ConverseError, aws_smithy_runtime_api::http::Response>,
-    started: Instant,
-    deadline: Option<Duration>,
-) -> BridgeError {
-    map_aws_sdk_error_generic(e, started, deadline)
-}
-
-fn map_converse_stream_sdk_error(
-    e: SdkError<ConverseStreamError, aws_smithy_runtime_api::http::Response>,
-    started: Instant,
-    deadline: Option<Duration>,
-) -> BridgeError {
-    map_aws_sdk_error_generic(e, started, deadline)
-}
-
 /// Map a mid-stream `ConverseStream` receiver failure. The AWS event
 /// stream carries modeled exceptions *inside* the committed 200
 /// response — throttling, internal failures, and model stream errors
 /// arrive as event-stream messages, not HTTP statuses — so surface
 /// them as [`BridgeError::UpstreamInBand`] with the AWS exception code
-/// in the view for `error_translate` (AISIX-Cloud#1222 scenario 3).
-/// Same redaction rule as [`map_service_error`]: canned message keyed
-/// on the derived status, code-only view, no raw AWS text (which
-/// embeds ARNs / account ids). Non-service failures (transport,
-/// event-stream decode) keep the previous Transport mapping.
+/// and the upstream's own message (AISIX-Cloud#1222 scenario 3).
+/// Non-service failures (transport, event-stream decode) keep the
+/// Transport mapping.
 fn map_converse_stream_event_error(
     e: SdkError<ConverseStreamOutputError, aws_smithy_types::event_stream::RawMessage>,
 ) -> BridgeError {
     let Some(svc) = e.as_service_error() else {
-        // SDK already maps eventstream-decode and transport failures
-        // into its error type. Surface as Transport to flow through
-        // the existing customer-visible error envelope.
         return BridgeError::Transport(format!("bedrock converse-stream: {e}"));
     };
     let status: Option<u16> = match svc {
@@ -2316,132 +2562,11 @@ fn map_converse_stream_event_error(
         ConverseStreamOutputError::ServiceUnavailableException(_) => Some(503),
         _ => None,
     };
-    let message = match status {
-        Some(429) => "upstream rate limited".to_string(),
-        Some(400) => "upstream rejected the streaming request".to_string(),
-        Some(s) => format!("upstream reported stream error {s}"),
-        None => "upstream reported a stream error".to_string(),
-    };
-    let parsed = svc.meta().code().map(|k| {
-        Box::new(aisix_gateway::UpstreamErrorView {
-            kind: Some(k.to_string()),
-            message: None,
-            code: None,
-            param: None,
-        })
-    });
-    BridgeError::UpstreamInBand {
+    crate::errors::in_band_error(
         status,
-        message,
-        parsed,
-        wire: aisix_gateway::UpstreamWire::Bedrock,
-    }
-}
-
-/// Common AWS SDK error classifier. Routes through the same
-/// UpstreamStatus / Transport / Timeout taxonomy the legacy
-/// `map_service_error` uses for `/invoke`, preserving:
-///
-/// - `wire: UpstreamWire::Bedrock` — so `error_translate` renders
-///   Bedrock-shape errors back to OpenAI/Anthropic-shape clients
-/// - `retry_after: Some(...)` — parsed from the upstream's
-///   `Retry-After` header so the cooldown layer honours the AWS
-///   throttle hint instead of falling back to its default
-/// - `parsed.kind: Some(<AWS error code>)` — so a 429 from
-///   `ThrottlingException` is distinguishable from a 429 from a
-///   different throttle source
-///
-/// The `E: ProvideErrorMetadata` bound lets the helper extract
-/// `.meta().code()` regardless of which operation the error came
-/// from (Converse vs. ConverseStream variants of the same shape).
-///
-/// Audit MEDIUM / HIGH on PR #389 — the prior implementation
-/// collapsed to `BridgeError::upstream_status(status, msg)` which
-/// sets `wire: Unknown` and `retry_after: None`, silently regressing
-/// the legacy /invoke path's hardening (PR #323 MEDIUM-2).
-pub(crate) fn map_aws_sdk_error_generic<E>(
-    err: SdkError<E, aws_smithy_runtime_api::http::Response>,
-    started: Instant,
-    deadline: Option<Duration>,
-) -> BridgeError
-where
-    E: std::fmt::Debug + ProvideErrorMetadata,
-{
-    // Deadline-elapsed wins over upstream classification — surfacing
-    // an UpstreamStatus on a timed-out request would hide the
-    // operator's configured deadline.
-    if let Some(d) = deadline {
-        if started.elapsed() >= d {
-            return BridgeError::Timeout {
-                elapsed_ms: started.elapsed().as_millis() as u64,
-                cause: String::new(),
-            };
-        }
-    }
-    match err {
-        SdkError::ServiceError(svc) => bedrock_service_error_to_upstream_status(svc),
-        SdkError::TimeoutError(_) => BridgeError::Timeout {
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            cause: String::new(),
-        },
-        other => BridgeError::Transport(format!("{other}")),
-    }
-}
-
-/// Translate an AWS SDK `ServiceError` into a fully-shaped
-/// `BridgeError::UpstreamStatus` — same fields as the legacy
-/// `map_service_error` would emit for `/invoke`. Generic over the
-/// operation error type so the same logic covers Converse +
-/// ConverseStream + any future Bedrock op.
-fn bedrock_service_error_to_upstream_status<E>(
-    svc: ServiceError<E, aws_smithy_runtime_api::http::Response>,
-) -> BridgeError
-where
-    E: ProvideErrorMetadata,
-{
-    let kind = svc.err().meta().code().map(str::to_string);
-    let raw = svc.raw();
-    let status = raw.status().as_u16();
-    // Convert smithy HeaderMap → http::HeaderMap so we can reuse the
-    // gateway-level `parse_retry_after` helper. Headers with invalid
-    // bytes are dropped (defensive — SDK should not produce them).
-    let mut hdrs = http::HeaderMap::new();
-    for (k, v) in raw.headers() {
-        if let (Ok(name), Ok(val)) = (
-            http::HeaderName::from_bytes(k.as_bytes()),
-            http::HeaderValue::from_str(v),
-        ) {
-            hdrs.insert(name, val);
-        }
-    }
-    let retry_after = aisix_gateway::parse_retry_after(&hdrs);
-    let message = match status {
-        401 | 403 => "upstream authentication failed".to_string(),
-        404 => "upstream model not found".to_string(),
-        408 => "upstream request timeout".to_string(),
-        429 => "upstream rate limited".to_string(),
-        _ => format!("upstream returned {status}"),
-    };
-    // SECURITY: the AWS error message embeds operator-internal
-    // taxonomy (ARNs, region, account id, IAM role names). We surface
-    // only the AWS error CODE (e.g. "ThrottlingException") for the
-    // error_translate layer; the customer-visible `message` is the
-    // canned status-keyed phrase above.
-    let parsed = kind.as_ref().map(|k| {
-        Box::new(aisix_gateway::UpstreamErrorView {
-            kind: Some(k.clone()),
-            message: None,
-            code: None,
-            param: None,
-        })
-    });
-    BridgeError::UpstreamStatus {
-        status,
-        message,
-        parsed,
-        wire: aisix_gateway::UpstreamWire::Bedrock,
-        retry_after,
-    }
+        svc.meta().code(),
+        svc.meta().message().unwrap_or_default().to_string(),
+    )
 }
 
 /// Pull the PK's `request.param_constraints` off the context — the single
@@ -2476,11 +2601,17 @@ fn pk_param_constraints(ctx: &BridgeContext) -> Option<&ParamConstraints> {
 /// [`translate_reasoning_effort_to_anthropic`].
 fn build_inference_config(
     req: &ChatFormat,
+    upstream_id: &str,
     thinking_max_tokens: Option<u32>,
     constraints: Option<&ParamConstraints>,
 ) -> Option<InferenceConfiguration> {
-    let max_tokens = req.max_tokens.or(thinking_max_tokens);
-    if req.temperature.is_none() && max_tokens.is_none() && req.top_p.is_none() {
+    let max_tokens = crate::converse_req::max_tokens(req, upstream_id).or(thinking_max_tokens);
+    let stop_sequences = crate::converse_req::stop_sequences(req, upstream_id);
+    if req.temperature.is_none()
+        && max_tokens.is_none()
+        && req.top_p.is_none()
+        && stop_sequences.is_none()
+    {
         return None;
     }
     let mut b = InferenceConfiguration::builder();
@@ -2511,40 +2642,76 @@ fn build_inference_config(
     if let Some(p) = req.top_p {
         b = b.top_p(p);
     }
+    if let Some(stops) = stop_sequences {
+        b = b.set_stop_sequences(Some(stops));
+    }
     Some(b.build())
 }
 
-/// Carry Anthropic-specific reasoning controls through Bedrock Converse.
-/// Anthropic non-streaming requests use the native `/invoke` envelope, where
-/// `build_request` already translates `reasoning_effort`; streaming has to use
-/// Converse and therefore places the same provider fields under
-/// `additionalModelRequestFields`. Other Bedrock publishers must not receive
-/// Anthropic parameters they may reject.
+/// `additionalModelRequestFields` for a Converse request: the caller's own
+/// model-specific fields (see
+/// [`crate::converse_req::caller_additional_fields`]), then what the
+/// gateway translates into it — Claude's thinking controls, another
+/// publisher's `reasoning_effort` shape, `top_k`, and Claude's
+/// disable-parallel-tool-use switch. The gateway's translation wins over a
+/// caller field of the same name.
 ///
-/// The second value is the `max_tokens` a translated thinking budget needs
-/// when the caller sent none.
+/// The second value is the `max_tokens` a translated Claude thinking budget
+/// needs when the caller sent none.
 fn build_converse_additional_model_request_fields(
     req: &ChatFormat,
     upstream_id: &str,
-) -> (Option<aws_smithy_types::Document>, Option<u32>) {
-    if BedrockPublisher::from_model_id(upstream_id) != Some(BedrockPublisher::Anthropic) {
-        return (None, None);
+    tool_config: Option<&ToolConfiguration>,
+) -> Result<(Option<aws_smithy_types::Document>, Option<u32>), BridgeError> {
+    let mut fields = crate::converse_req::caller_additional_fields(req);
+    let mut thinking_max_tokens = None;
+    let claude = BedrockPublisher::from_model_id(upstream_id) == Some(BedrockPublisher::Anthropic);
+    if claude {
+        let mut extras = req.extra.clone();
+        thinking_max_tokens = translate_reasoning_effort_to_anthropic(
+            &mut extras,
+            bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id),
+            crate::converse_req::max_tokens(req, upstream_id),
+        );
+        for name in ["thinking", "output_config", "anthropic_beta"] {
+            if let Some(value) = extras.remove(name) {
+                fields.insert(name.to_string(), value);
+            }
+        }
+    } else if let Some((name, value)) = crate::converse_req::reasoning_field(req, upstream_id)? {
+        fields.insert(name.to_string(), value);
     }
-
-    let mut extras = req.extra.clone();
-    let thinking_max_tokens = translate_reasoning_effort_to_anthropic(
-        &mut extras,
-        bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id),
-        req.max_tokens,
-    );
-    let mut fields = serde_json::Map::new();
-    for name in ["thinking", "output_config", "anthropic_beta"] {
-        if let Some(value) = extras.remove(name) {
-            fields.insert(name.to_string(), value);
+    if let Some((name, value)) = crate::converse_req::top_k_field(req, upstream_id) {
+        // Nova's `inferenceConfig` may already hold the caller's own knobs.
+        match (fields.get_mut(name), value) {
+            (Some(serde_json::Value::Object(existing)), serde_json::Value::Object(add)) => {
+                existing.extend(add)
+            }
+            (_, value) => {
+                fields.insert(name.to_string(), value);
+            }
         }
     }
+    // Claude 4.5 and later take the switch beside `toolConfig`; Converse
+    // rejects a `type` there once `toolConfig.toolChoice` names one.
+    if let (true, Some(tc), Some(parallel)) = (
+        claude
+            && bedrock_claude_model_name(upstream_id)
+                .is_some_and(aisix_provider_anthropic::wire::supports_native_structured_output),
+        tool_config,
+        req.extra
+            .get("parallel_tool_calls")
+            .and_then(|v| v.as_bool()),
+    ) {
+        let mut choice = serde_json::Map::new();
+        if tc.tool_choice().is_none() {
+            choice.insert("type".into(), "auto".into());
+        }
+        choice.insert("disable_parallel_tool_use".into(), (!parallel).into());
+        fields.insert("tool_choice".into(), serde_json::Value::Object(choice));
+    }
     let fields = (!fields.is_empty()).then(|| json_to_document(&serde_json::Value::Object(fields)));
-    (fields, thinking_max_tokens)
+    Ok((fields, thinking_max_tokens))
 }
 
 /// Decide what a request's OpenAI `response_format` becomes on Bedrock.
@@ -2552,49 +2719,14 @@ fn build_converse_additional_model_request_fields(
 /// The decision is the Anthropic crate's — same gate, same schema
 /// sealing — asked with the Claude model name Bedrock's id *carries*
 /// rather than the id itself, which that gate cannot read. Every model
-/// that is not a Claude one keeps [`StructuredOutput::Tool`], which
-/// needs no capability beyond tool calling; AWS's native structured
+/// that is not a Claude one — every publisher, and an ARN naming no
+/// model — takes [`StructuredOutput::Tool`]; AWS's native structured
 /// output on Converse covers the same Claude families Anthropic's own
 /// API does.
 fn bedrock_structured_output(req: &ChatFormat, upstream_id: &str) -> StructuredOutput {
-    let decided = structured_output_for(
+    structured_output_for(
         req,
         bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id),
-    );
-    // The tool route only exists where the model can call a tool at
-    // all. Attaching a `toolConfig` to a publisher whose Converse
-    // implementation has none fails the whole request — and it would
-    // fail a request carrying no tools of its own, purely because the
-    // caller asked for JSON. Leaving the field unhonoured is the lesser
-    // outcome, and is what these models did before.
-    if matches!(decided, StructuredOutput::Tool(_))
-        && !converse_supports_tool_use(BedrockPublisher::from_model_id(upstream_id))
-    {
-        tracing::debug!(
-            model = %upstream_id,
-            "dropping response_format: this Bedrock publisher supports neither native structured output nor tool use"
-        );
-        return StructuredOutput::None;
-    }
-    decided
-}
-
-/// Whether this publisher's Converse implementation supports tool use at
-/// all, per AWS's supported-model table. Titan Text has none, and
-/// `Other` is the set this bridge has not classified — several of which
-/// (DeepSeek R1 among them) also reject `toolConfig`.
-///
-/// Only the *synthetic* tool is gated on this. A caller who sent their
-/// own `tools` still gets them forwarded: an explicit unsupported tool
-/// request is theirs to see rejected, which is what #560 shipped.
-fn converse_supports_tool_use(publisher: Option<BedrockPublisher>) -> bool {
-    matches!(
-        publisher,
-        Some(BedrockPublisher::Anthropic)
-            | Some(BedrockPublisher::AmazonNova)
-            | Some(BedrockPublisher::Meta)
-            | Some(BedrockPublisher::Mistral)
-            | Some(BedrockPublisher::Cohere)
     )
 }
 
@@ -2653,22 +2785,6 @@ fn build_output_config(req: &ChatFormat, schema: &serde_json::Value) -> Option<O
 /// required on the wire even though the SDK models it as optional.
 const DEFAULT_JSON_SCHEMA_NAME: &str = "structured_output";
 
-/// Whether Converse honours an explicit `toolChoice` for this
-/// publisher. Per AWS, forcing a specific tool is Anthropic Claude and
-/// Amazon Nova only; every other publisher rejects the field, so the
-/// synthetic tool is merely offered there and the model is trusted to
-/// take the only tool on the table.
-///
-/// This gates only the forcing the *gateway* adds. A `tool_choice` the
-/// caller set themselves still goes through unchanged — an explicit
-/// unsupported force is theirs to see rejected.
-fn converse_honours_forced_tool_choice(publisher: Option<BedrockPublisher>) -> bool {
-    matches!(
-        publisher,
-        Some(BedrockPublisher::Anthropic) | Some(BedrockPublisher::AmazonNova)
-    )
-}
-
 /// Build a Converse [`ToolConfiguration`] from the OpenAI `tools` /
 /// `tool_choice` the caller sent — they arrive in [`ChatFormat::extra`]
 /// (the gateway captures unknown top-level request fields there). Returns
@@ -2703,6 +2819,7 @@ fn build_tool_config(
     req: &ChatFormat,
     json_tool_schema: Option<&serde_json::Value>,
     publisher: Option<BedrockPublisher>,
+    upstream_id: &str,
 ) -> Option<ToolConfiguration> {
     // OpenAI `tool_choice:"none"` means "don't call any tool this turn".
     // Converse has no `none`, so send no toolConfig — the model answers
@@ -2798,7 +2915,7 @@ fn build_tool_config(
     let force_json_tool = json_tool_schema.is_some()
         && !client_set_tool_choice
         && !thinking_enabled
-        && converse_honours_forced_tool_choice(publisher);
+        && crate::converse_req::forces_json_tool(upstream_id);
     if force_json_tool {
         if let Ok(choice) = SpecificToolChoice::builder().name(JSON_TOOL_NAME).build() {
             config = config.tool_choice(ToolChoice::Tool(choice));
@@ -2839,6 +2956,7 @@ fn map_tool_choice(choice: &serde_json::Value) -> Option<ToolChoice> {
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use std::time::Duration;
 
     async fn consume_invalid_mock_stream(result: Result<ChatChunkStream, BridgeError>) {
         match result {
@@ -3245,11 +3363,11 @@ mod tests {
         let req = ChatFormat::new("customer-facing-name", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(msg.contains("bedrock publisher unknown"));
                 assert!(msg.contains("totally-bogus-model-id"));
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -3344,7 +3462,7 @@ mod tests {
         );
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(
                     msg.contains("publisher unknown"),
                     "must hit publisher-resolution error (proving model_name was used); got {msg}"
@@ -3354,7 +3472,7 @@ mod tests {
                     "must echo the ctx.model.model_name value (NOT req.model); got {msg}"
                 );
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -3732,15 +3850,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_maps_upstream_4xx_to_canned_message_not_body_echo() {
-        // Audit M1: Bedrock error envelopes can contain account
-        // numbers (in ARNs), model IDs, IAM role names — must not
-        // leak into customer-visible error.
-        //
-        // Audit M5 follow-up: assert the canned message EXACTLY,
-        // not just absence-of-leak. A future refactor that re-renders
-        // SDK metadata into the message would pass an absence check
-        // but fail the exact-match assertion.
+    async fn chat_maps_upstream_4xx_to_the_upstream_message() {
+        // The caller receives the upstream's own error message, even
+        // where the SDK cannot model the exception.
         let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
@@ -3766,16 +3878,9 @@ mod tests {
                 status, message, ..
             } => {
                 assert_eq!(status, 400);
-                assert!(
-                    !message.contains("123456789012") && !message.contains("internal-leaky-role"),
-                    "upstream body must not leak account / role info into customer error; got {message:?}"
-                );
-                // Positive pin (audit M5): exact-match the canned
-                // status-keyed phrase. Bedrock returns 400 → bucket
-                // is "upstream returned 400" per `map_service_error`.
                 assert_eq!(
-                    message, "upstream returned 400",
-                    "must emit canned 4xx phrasing only; got {message:?}"
+                    message,
+                    "Operation cannot be performed by IAM role arn:aws:iam::123456789012:role/internal-leaky-role"
                 );
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
@@ -3783,7 +3888,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_maps_upstream_429_with_retry_after_and_canned_rate_limited() {
+    async fn chat_maps_upstream_429_with_retry_after_and_upstream_message() {
         // Audit H1: Bedrock's `Retry-After` header on 429 must reach
         // the cooldown layer. Collapsing it to `None` silently
         // degrades multi-region / burst behavior.
@@ -3818,11 +3923,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(status, 429);
-                assert_eq!(message, "upstream rate limited");
-                assert!(
-                    !message.contains("123456789012"),
-                    "must not leak account id; got {message:?}"
-                );
+                assert_eq!(message, "Too many requests for account 123456789012");
                 // Audit H1 pin: the SDK / smithy headers must round-trip
                 // Retry-After into the BridgeError so the cooldown
                 // layer sees the upstream's hint instead of falling
@@ -3836,16 +3937,13 @@ mod tests {
                 // refactor that breaks cross-wire translation fails
                 // here. `parsed.kind` should carry the AWS exception
                 // name (the SDK derives this from `__type` /
-                // X-Amzn-ErrorType). `parsed.message` stays None for
-                // operator-taxonomy redaction (ARNs, account ids).
+                // X-Amzn-ErrorType). `parsed.message` carries the
+                // upstream's own text.
                 assert_eq!(wire, aisix_gateway::UpstreamWire::Bedrock);
-                if let Some(view) = parsed {
-                    assert!(
-                        view.message.is_none(),
-                        "bedrock must NOT surface upstream message; got {:?}",
-                        view.message
-                    );
-                }
+                assert_eq!(
+                    parsed.and_then(|v| v.message).as_deref(),
+                    Some("Too many requests for account 123456789012")
+                );
             }
             other => panic!("expected UpstreamStatus with retry_after, got {other:?}"),
         }
@@ -3972,13 +4070,13 @@ mod tests {
         let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(
                     msg.contains("unexpected characters"),
                     "must reject invalid model id chars; got {msg}"
                 );
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -4223,7 +4321,7 @@ mod tests {
                 parsed,
             } => {
                 assert_eq!(status, 429);
-                assert_eq!(message, "upstream rate limited");
+                assert_eq!(message, "Rate exceeded", "the upstream's own message");
                 assert_eq!(
                     wire,
                     aisix_gateway::UpstreamWire::Bedrock,
@@ -4245,11 +4343,10 @@ mod tests {
         }
     }
 
-    /// Audit HIGH-1 (PR #389): Converse 4xx that isn't 429 must
-    /// still get the canned status-keyed message + Bedrock wire,
-    /// matching the legacy /invoke path.
+    /// A Converse 4xx that isn't 429 carries the upstream's own message
+    /// and the Bedrock wire, matching the /invoke path.
     #[tokio::test]
-    async fn chat_converse_maps_upstream_4xx_to_canned_message_with_bedrock_wire() {
+    async fn chat_converse_maps_upstream_4xx_to_upstream_message_with_bedrock_wire() {
         let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/meta\..+/converse$"))
@@ -4281,15 +4378,8 @@ mod tests {
                 ..
             } => {
                 assert_eq!(status, 403);
-                assert_eq!(
-                    message, "upstream authentication failed",
-                    "must use canned phrase (NOT echo upstream ARN)"
-                );
+                assert_eq!(message, "User: arn:aws:iam::123:user/x is not authorized");
                 assert_eq!(wire, aisix_gateway::UpstreamWire::Bedrock);
-                assert!(
-                    !message.contains("arn:aws:iam"),
-                    "canned phrase must not leak the operator-internal ARN; got {message}"
-                );
                 let parsed = parsed.expect("must expose AWS error kind");
                 assert_eq!(parsed.kind.as_deref(), Some("AccessDeniedException"));
             }
@@ -4681,11 +4771,18 @@ mod tests {
             "anthropic.claude-sonnet-4-20250514-v1:0",
             "us.anthropic.claude-3-5-sonnet-20240620-v1:0",
             "anthropic.claude-3-haiku-20240307-v1:0",
-            // Other publishers whose Converse supports tool use.
+            // Every other publisher, and an ARN naming no model, takes the
+            // synthetic tool too.
             "amazon.nova-pro-v1:0",
             "meta.llama3-3-70b-instruct-v1:0",
             "mistral.mistral-large-2407-v1:0",
             "cohere.command-r-plus-v1:0",
+            "amazon.titan-text-express-v1",
+            "deepseek.r1-v1:0",
+            "ai21.jamba-1-5-large-v1:0",
+            "openai.gpt-oss-120b-1:0",
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abcd1234",
+            "arn:aws:bedrock:us-east-1:123456789012:provisioned-model/xyz",
         ] {
             assert!(
                 matches!(
@@ -4693,24 +4790,6 @@ mod tests {
                     StructuredOutput::Tool(_)
                 ),
                 "{id} should take the tool path"
-            );
-        }
-        for id in [
-            // No native structured output AND no Converse tool use, so
-            // there is no shape to translate into. Dropping the field
-            // keeps these models answering as they did before rather
-            // than failing the request on a `toolConfig` they reject.
-            "amazon.titan-text-express-v1",
-            "deepseek.r1-v1:0",
-            "ai21.jamba-1-5-large-v1:0",
-            // A profile ARN whose last segment is an opaque id naming no
-            // model this gateway can identify.
-            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abcd1234",
-            "arn:aws:bedrock:us-east-1:123456789012:provisioned-model/xyz",
-        ] {
-            assert!(
-                matches!(bedrock_structured_output(&req, id), StructuredOutput::None),
-                "{id} has no structured-output shape and must drop the field"
             );
         }
     }
@@ -4971,18 +5050,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_publisher_without_tool_use_gets_no_tool_config_from_response_format() {
-        // Titan Text has no Converse tool support; a `toolConfig` it
-        // never asked for would fail the whole request.
-        let body = capture_bedrock_body(
-            "amazon.titan-text-express-v1",
-            "converse",
-            &structured_request(person_schema()),
-            false,
-        )
-        .await;
-        assert!(body.get("toolConfig").is_none(), "body={body}");
-        assert!(body.get("outputConfig").is_none(), "body={body}");
+    async fn every_publisher_is_offered_the_json_tool_and_only_tool_choice_models_are_forced() {
+        // The synthetic tool goes to every publisher; the forced choice
+        // only to models that take a forced tool choice.
+        for (model, forced) in [
+            ("amazon.titan-text-express-v1", false),
+            ("meta.llama3-3-70b-instruct-v1:0", false),
+            ("openai.gpt-oss-120b-1:0", true),
+            ("qwen.qwen3-32b-v1:0", true),
+        ] {
+            let body = capture_bedrock_body(
+                model,
+                "converse",
+                &structured_request(person_schema()),
+                false,
+            )
+            .await;
+            assert_eq!(
+                body["toolConfig"]["tools"][0]["toolSpec"]["name"], JSON_TOOL_NAME,
+                "{model}: body={body}"
+            );
+            assert_eq!(
+                body["toolConfig"].get("toolChoice").is_some(),
+                forced,
+                "{model}: body={body}"
+            );
+            assert!(body.get("outputConfig").is_none(), "body={body}");
+        }
     }
 
     #[tokio::test]
@@ -5450,8 +5544,15 @@ mod tests {
             ]
         }))
         .unwrap();
-        let (_systems, messages) =
-            build_converse_inputs(&req, None, &FetchedMedia::default(), None).unwrap();
+        let (_systems, messages) = build_converse_inputs(
+            &req,
+            None,
+            "meta.llama3-3-70b-instruct-v1:0",
+            &FetchedMedia::default(),
+            None,
+            false,
+        )
+        .unwrap();
         let roles: Vec<ConversationRole> = messages.iter().map(|m| m.role().clone()).collect();
         assert_eq!(
             roles,
@@ -5478,8 +5579,15 @@ mod tests {
             ],
         );
 
-        let (systems, messages) =
-            build_converse_inputs(&req, None, &FetchedMedia::default(), None).unwrap();
+        let (systems, messages) = build_converse_inputs(
+            &req,
+            None,
+            "meta.llama3-3-70b-instruct-v1:0",
+            &FetchedMedia::default(),
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(systems.len(), 1);
         assert_eq!(
             systems[0],
@@ -5510,8 +5618,15 @@ mod tests {
         }))
         .unwrap();
 
-        let (systems, messages) =
-            build_converse_inputs(&req, None, &FetchedMedia::default(), None).unwrap();
+        let (systems, messages) = build_converse_inputs(
+            &req,
+            None,
+            "meta.llama3-3-70b-instruct-v1:0",
+            &FetchedMedia::default(),
+            None,
+            false,
+        )
+        .unwrap();
         assert!(systems.is_empty());
         // user → assistant(2× toolUse) → user(2× toolResult, coalesced)
         assert_eq!(
@@ -6398,6 +6513,8 @@ mod tests {
             input_was_single: false,
             encoding_format: None,
             dimensions: None,
+            input_type: None,
+            embedding_types: None,
         };
         let resp = bridge.embed(&req, &ctx).await.expect("titan embed");
         assert_eq!(resp.data.len(), 2);
@@ -6446,6 +6563,8 @@ mod tests {
             input_was_single: true,
             encoding_format: None,
             dimensions: None,
+            input_type: None,
+            embedding_types: None,
         };
 
         let resp = bridge.embed(&req, &ctx).await.expect("titan embed");
@@ -6480,6 +6599,8 @@ mod tests {
             input_was_single: true,
             encoding_format: None,
             dimensions: Some(512),
+            input_type: None,
+            embedding_types: None,
         };
 
         // V2: dimensions forwards.
@@ -6531,6 +6652,8 @@ mod tests {
             input_was_single: false,
             encoding_format: None,
             dimensions: None,
+            input_type: None,
+            embedding_types: None,
         };
         let resp = bridge.embed(&req, &ctx).await.expect("cohere embed");
         assert_eq!(resp.data.len(), 2);
@@ -6559,6 +6682,8 @@ mod tests {
             input_was_single: true,
             encoding_format: None,
             dimensions: None,
+            input_type: None,
+            embedding_types: None,
         };
         let err = bridge.embed(&req, &ctx).await.unwrap_err();
         match err {
@@ -6694,6 +6819,8 @@ mod tests {
                 assistant[1],
                 serde_json::json!({"cachePoint": {"type": "default"}})
             );
+            // The tool results and the user message after them are one
+            // Converse turn: the roles must alternate.
             let results = &messages[2]["content"];
             assert!(results[0].get("toolResult").is_some(), "{results}");
             assert_eq!(
@@ -6701,13 +6828,16 @@ mod tests {
                 serde_json::json!({"cachePoint": {"type": "default"}})
             );
             assert_eq!(
-                messages[3]["content"],
+                results.as_array().unwrap()[2..],
                 serde_json::json!([
                     {"text": "firstsecond"},
                     {"cachePoint": {"type": "default", "ttl": "5m"}},
                     {"text": "third"},
                 ])
+                .as_array()
+                .unwrap()[..]
             );
+            assert_eq!(messages.len(), 3, "{messages:?}");
             let tools = body["toolConfig"]["tools"].as_array().unwrap();
             assert!(tools[0].get("toolSpec").is_some());
             assert_eq!(
@@ -6799,8 +6929,15 @@ mod tests {
         ]);
         let req = ChatFormat::new("m", vec![user]);
         let claude = Some(BedrockPublisher::Anthropic);
-        let (_, messages) =
-            build_converse_inputs(&req, claude, &FetchedMedia::default(), None).unwrap();
+        let (_, messages) = build_converse_inputs(
+            &req,
+            claude,
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            &FetchedMedia::default(),
+            None,
+            false,
+        )
+        .unwrap();
         let points = messages[0]
             .content()
             .iter()
@@ -6815,8 +6952,15 @@ mod tests {
         first.content_blocks = Some(vec![serde_json::json!({"type": "text", "text": "",
             "cache_control": ec})]);
         let req = ChatFormat::new("m", vec![first, ChatMessage::user("q".to_string())]);
-        let (_, messages) =
-            build_converse_inputs(&req, claude, &FetchedMedia::default(), Some("5m")).unwrap();
+        let (_, messages) = build_converse_inputs(
+            &req,
+            claude,
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            &FetchedMedia::default(),
+            Some("5m"),
+            false,
+        )
+        .unwrap();
         assert!(matches!(
             messages.last().unwrap().content().last(),
             Some(ContentBlock::CachePoint(_))
@@ -6834,8 +6978,10 @@ mod tests {
         let (systems, messages) = build_converse_inputs(
             &req,
             Some(BedrockPublisher::Anthropic),
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
             &FetchedMedia::default(),
             None,
+            false,
         )
         .unwrap();
         assert!(

@@ -855,6 +855,8 @@ async fn embed_texts_inner(
         input_was_single: texts.len() == 1,
         encoding_format: Some("float".to_string()),
         dimensions,
+        input_type: None,
+        embedding_types: None,
     };
     let ctx = {
         let base = crate::dispatch::bridge_ctx(

@@ -42,6 +42,10 @@ pub struct EmbeddingRequestBody {
     pub encoding_format: Option<String>,
     #[serde(default)]
     pub dimensions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_types: Option<serde_json::Value>,
 }
 
 /// The client-facing request body as content capture records it: the text
@@ -61,6 +65,10 @@ fn captured_embeddings_prompt(req: &EmbeddingRequest) -> String {
         input: Input<'a>,
         encoding_format: &'a Option<String>,
         dimensions: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_type: &'a Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        embedding_types: &'a Option<serde_json::Value>,
     }
     let input = match req.input.as_slice() {
         [single] if req.input_was_single => Input::Single(single),
@@ -71,6 +79,8 @@ fn captured_embeddings_prompt(req: &EmbeddingRequest) -> String {
         input,
         encoding_format: &req.encoding_format,
         dimensions: req.dimensions,
+        input_type: &req.input_type,
+        embedding_types: &req.embedding_types,
     })
     .unwrap_or_default()
 }
@@ -526,6 +536,8 @@ async fn dispatch(
         input_was_single,
         encoding_format: body.encoding_format,
         dimensions: body.dimensions,
+        input_type: body.input_type,
+        embedding_types: body.embedding_types,
     };
 
     // A Model Group walks its targets (AISIX-Cloud#1111); every per-target
@@ -943,6 +955,8 @@ mod tests {
                 input: body.input.into_vec(),
                 encoding_format: body.encoding_format,
                 dimensions: body.dimensions,
+                input_type: body.input_type,
+                embedding_types: body.embedding_types,
             };
             assert_eq!(super::captured_embeddings_prompt(&req), expected, "{raw}");
         }
