@@ -84,9 +84,10 @@ pub(crate) fn render_openai_envelope(
         code: match wire {
             UpstreamWire::OpenAI => view.code.clone(),
             UpstreamWire::AzureOpenAI => derived_code.or_else(|| view.code.clone()),
-            // The Bedrock bridge sets `code` only for a classification it
-            // made itself (a context-window overflow), never from the
-            // upstream body, so it outranks the exception-name table.
+            // The Bedrock bridge sets `code` from the Chat Completions
+            // endpoint's own `error.code`, or for a context-window overflow
+            // it classified; either is more specific than the
+            // exception-name table.
             UpstreamWire::Bedrock => view.code.clone().or(derived_code),
             _ => derived_code,
         },
