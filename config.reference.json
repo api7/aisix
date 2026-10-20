@@ -106,6 +106,9 @@
       "min_drain_secs": 30
     },
     "upstream": {
+      "bedrock": {
+        "mantle_endpoint": null
+      },
       "connect_timeout_ms": 5000,
       "media_fetch": {
         "allowed_hosts": [],

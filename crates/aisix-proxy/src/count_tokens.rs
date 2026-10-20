@@ -522,7 +522,7 @@ async fn dispatch(
         // count_tokens has no upstream equivalent outside the Anthropic
         // protocol; skip foreign targets in a mixed group rather than
         // dispatching to an upstream that would 404.
-        if !crate::dispatch::speaks_anthropic(snapshot, &target.model) {
+        if !counts_anthropic_tokens(state, snapshot, &target.model) {
             continue;
         }
         any_anthropic = true;
@@ -597,7 +597,7 @@ async fn dispatch(
         // target that can actually serve the request.
         let has_usable_fallback = attempt_models[target_idx + 1..]
             .iter()
-            .any(|t| crate::dispatch::speaks_anthropic(snapshot, &t.model));
+            .any(|t| counts_anthropic_tokens(state, snapshot, &t.model));
         let budget = crate::routing::effective_retries(
             &target.model,
             crate::routing::group_retries_of(&model_entry.value),
@@ -687,6 +687,21 @@ async fn dispatch(
                         _ => true,
                     };
                     last_err = Some(e);
+                    // A platform's token-counting API serves fewer models and
+                    // regions than its Messages route, so a refusal there moves
+                    // on to the group's next target rather than ending the
+                    // request a target behind it could have answered.
+                    if !retryable
+                        && has_usable_fallback
+                        && crate::dispatch::anthropic_platform_bridge(
+                            &state.hub,
+                            snapshot,
+                            &target.model,
+                        )
+                        .is_some()
+                    {
+                        break;
+                    }
                     if !retryable {
                         return Err(last_err.unwrap_or(ProxyError::ProviderUnavailable));
                     }
@@ -705,10 +720,22 @@ async fn dispatch(
         return Err(ProxyError::InvalidRequest(format!(
             "model `{model_name}` is not backed by an Anthropic-protocol upstream; \
              /v1/messages/count_tokens requires a provider key that either uses \
-             the anthropic adapter or declares `apis.messages`"
+             the anthropic adapter or declares `apis.messages`, or a Claude model \
+             on Amazon Bedrock or Vertex AI"
         )));
     }
     Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))
+}
+
+/// Whether a target answers this route: an Anthropic-protocol upstream, or
+/// Claude on a platform with a token-counting API of its own.
+fn counts_anthropic_tokens(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    model: &aisix_core::Model,
+) -> bool {
+    crate::dispatch::speaks_anthropic(snapshot, model)
+        || crate::dispatch::anthropic_platform_bridge(&state.hub, snapshot, model).is_some()
 }
 
 /// Dispatch one concrete target's count_tokens passthrough. The route is
@@ -731,8 +758,24 @@ async fn count_tokens_to_target(
 ) -> Result<CountTokensSuccess, ProxyError> {
     let attempt_started = Instant::now();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-    let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+    if let Some(bridge) = crate::dispatch::anthropic_platform_bridge(&state.hub, snapshot, model) {
+        return platform_count_tokens(
+            state,
+            bridge,
+            body,
+            model,
+            model_id,
+            timeouts,
+            &pk_entry,
+            upstream_model,
+            request_id,
+            client,
+            attempt_started,
+        )
+        .await;
+    }
+    let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
     // Only the outbound wire bytes outlive this block — see
     // `crate::util::outbound_json`.
     let body = {
@@ -936,6 +979,75 @@ async fn count_tokens_to_target(
         // never of the vendor: a `byo` + `adapter: anthropic` key already
         // reported `byo` on /v1/chat/completions, and a Provider Key that
         // declares `apis.messages` brings any vendor down this path.
+        provider: model
+            .provider
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_ascii_lowercase(),
+        upstream_model,
+        provider_key_id: pk_entry.id.to_string(),
+        model_id: model_id.to_string(),
+        upstream_elapsed: attempt_started.elapsed(),
+    })
+}
+
+/// count_tokens for Claude on a platform, on the platform's own
+/// token-counting API, with the same body rewrites `/v1/messages` gives
+/// that target.
+#[allow(clippy::too_many_arguments)]
+async fn platform_count_tokens(
+    state: &ProxyState,
+    bridge: std::sync::Arc<dyn aisix_gateway::Bridge>,
+    body: &Value,
+    model: &aisix_core::Model,
+    model_id: &str,
+    timeouts: crate::routing::TimeoutBudget,
+    pk_entry: &aisix_core::resource::ResourceEntry<aisix_core::ProviderKey>,
+    upstream_model: String,
+    request_id: &str,
+    client: &ClientContext,
+    attempt_started: Instant,
+) -> Result<CountTokensSuccess, ProxyError> {
+    let stripped = aisix_provider_anthropic::strip_billing_header_attribution(body);
+    let stripped =
+        aisix_provider_anthropic::strip_unsigned_thinking_blocks(stripped.as_ref()).into_owned();
+    let (mapped, _) = crate::effort_mapping::anthropic_native_request(&stripped, model, false);
+    let mut outbound = mapped.into_owned();
+    if let Some(messages) = outbound.get_mut("messages") {
+        aisix_gateway::tool_calls::strip_thought_signatures_in_body(messages);
+    }
+    let mut ctx = crate::dispatch::bridge_ctx(
+        request_id,
+        model_id,
+        std::sync::Arc::new(model.clone()),
+        &pk_entry.id,
+        std::sync::Arc::new(pk_entry.value.clone()),
+        Some(client),
+    );
+    if let Some(d) = timeouts.request {
+        ctx = ctx.with_deadline(d);
+    }
+    let counted = bridge
+        .anthropic_count_tokens(outbound, &ctx)
+        .await
+        .map_err(|be| {
+            crate::cooldown::note_failure(
+                &state.runtime_status,
+                model_id,
+                model.cooldown.as_ref(),
+                be,
+            )
+        })
+        .map_err(ProxyError::Bridge)?;
+    state.health.record_success(&model.display_name);
+    state.runtime_status.mark_healthy(model_id);
+    let mut resp = axum::response::IntoResponse::into_response(axum::Json(counted));
+    if let Ok(hv) = HeaderValue::from_str(request_id) {
+        resp.headers_mut()
+            .insert(HeaderName::from_static("x-aisix-request-id"), hv);
+    }
+    Ok(CountTokensSuccess {
+        response: resp,
         provider: model
             .provider
             .as_deref()

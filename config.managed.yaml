@@ -290,6 +290,11 @@ upstream:
   #   enabled: true
   #   allowed_hosts: []
   #   max_bytes: 52428800
+  # Bedrock Mantle, where count_tokens for a Claude model bedrock-runtime
+  # cannot count is retried. null derives https://bedrock-mantle.{region}.api.aws
+  # from the provider key's region. See config.example.yaml.
+  # bedrock:
+  #   mantle_endpoint: null
 
 # Connection-layer settings for the inbound side. `idle_timeout_secs: 0`
 # (the default) never closes an idle client connection, leaving that to

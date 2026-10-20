@@ -26,6 +26,11 @@
 //!   fall back to Converse when the request needs a Converse-only feature
 //!   (see `openai_compat`).
 //!
+//! `/v1/messages` and `/v1/messages/count_tokens` for Claude go to
+//! `InvokeModel` / `InvokeModelWithResponseStream` / `CountTokens` with the
+//! caller's Anthropic body (`native.rs`); everything below is the chat
+//! translation the other endpoints use.
+//!
 //! Anthropic non-streaming keeps the legacy `/invoke` path
 //! (`chat_anthropic`) for backward compat with existing operator
 //! deployments + e2e test fixtures. Anthropic streaming, and all
@@ -94,7 +99,9 @@ mod bridge;
 mod converse_req;
 mod convert;
 mod errors;
+mod native;
 mod openai_compat;
 mod wire;
 
 pub use bridge::{BedrockBridge, BedrockPublisher};
+pub use native::init_mantle_endpoint;

@@ -1841,6 +1841,26 @@ pub struct UpstreamConfig {
     /// Downloading a chat request's media URL for an upstream that cannot
     /// read one itself — see [`MediaFetchConfig`].
     pub media_fetch: MediaFetchConfig,
+    /// Amazon Bedrock endpoints the provider key does not name — see
+    /// [`BedrockUpstreamConfig`].
+    pub bedrock: BedrockUpstreamConfig,
+}
+
+/// Amazon Bedrock endpoints beyond the `bedrock-runtime` one a provider key
+/// names with `api_base`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields, default)]
+pub struct BedrockUpstreamConfig {
+    /// Base URL of Bedrock Mantle, where `/v1/messages/count_tokens` for a
+    /// Claude model is counted when `bedrock-runtime`'s CountTokens refuses
+    /// that model (`POST {mantle_endpoint}/anthropic/v1/messages/count_tokens`,
+    /// signed with the provider key's credentials). `null` (the default)
+    /// derives the public regional host from the provider key's region,
+    /// `https://bedrock-mantle.{region}.api.aws`; set it for a private
+    /// (VPC endpoint) or GovCloud deployment. One value serves every
+    /// Bedrock provider key.
+    pub mantle_endpoint: Option<String>,
 }
 
 /// When a chat request carries an image, audio or file part as a URL and
@@ -1894,6 +1914,7 @@ impl Default for UpstreamConfig {
             retries: DEFAULT_UPSTREAM_RETRIES,
             tls: OutboundTlsConfig::default(),
             media_fetch: MediaFetchConfig::default(),
+            bedrock: BedrockUpstreamConfig::default(),
         }
     }
 }
