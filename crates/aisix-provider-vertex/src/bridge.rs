@@ -1088,7 +1088,8 @@ impl VertexBridge {
         drop(req);
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        retain_vertex_betas(&mut headers)?;
         let client = self.client_for(ctx);
         let started = Instant::now();
 
@@ -1209,7 +1210,8 @@ impl VertexBridge {
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        retain_vertex_betas(&mut headers)?;
         let client = self.client_for(ctx);
         let started = Instant::now();
 
@@ -1993,6 +1995,30 @@ fn gemini_chunk_into_chat_chunks(
     }
 
     chunks
+}
+
+/// Keep only the `anthropic-beta` values Vertex AI takes in a Claude chat
+/// request's headers — the provider key's `default_headers` or a forwarded
+/// client header — under Vertex AI's names; an unknown one is a 400 there.
+fn retain_vertex_betas(headers: &mut http::HeaderMap) -> Result<(), BridgeError> {
+    use aisix_provider_anthropic::platform::{header_betas, platform_beta, Platform};
+    let beta_header = HeaderName::from_static("anthropic-beta");
+    let wanted = header_betas(Some(headers));
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let kept: std::collections::BTreeSet<&str> = wanted
+        .iter()
+        .filter_map(|b| platform_beta(Platform::Vertex, b))
+        .collect();
+    headers.remove(&beta_header);
+    if !kept.is_empty() {
+        let joined = kept.into_iter().collect::<Vec<_>>().join(",");
+        let value = HeaderValue::from_str(&joined)
+            .map_err(|e| BridgeError::Config(format!("anthropic-beta header: {e}")))?;
+        headers.insert(beta_header, value);
+    }
+    Ok(())
 }
 
 /// Build the outbound headers: `Authorization: Bearer <access_token>`,
