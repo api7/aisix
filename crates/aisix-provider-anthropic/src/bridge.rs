@@ -28,7 +28,7 @@ use aisix_gateway::media_fetch::{fetch_media_urls, Encoding};
 use aisix_gateway::structured_output::{response_into_fake_stream_chunks, unwrap_json_tool_call};
 
 use crate::wire::{
-    anthropic_needs_fetch, build_request, inject_cache_breakpoints, response_into_chat_response,
+    anthropic_needs_fetch, apply_auto_prompt_caching, build_request, response_into_chat_response,
     split_system_with, structured_output_for, AnthropicResponse, AnthropicStreamEvent, MediaUrls,
     StreamState, StructuredOutput,
 };
@@ -220,25 +220,6 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
         .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
-/// Apply the Model's `auto_prompt_caching` setting to the outbound
-/// request. A no-op unless the operator enabled it; the wire-level
-/// stand-down (a caller who set their own markers wins) lives in
-/// [`inject_cache_breakpoints`]. Shared by the streaming and
-/// non-streaming paths so they can't drift.
-fn maybe_inject_cache_breakpoints(
-    body: &mut crate::wire::AnthropicRequest<'_>,
-    ctx: &BridgeContext,
-) {
-    if let Some(apc) = ctx
-        .model
-        .auto_prompt_caching
-        .as_ref()
-        .filter(|apc| apc.enabled)
-    {
-        inject_cache_breakpoints(body, apc.ttl_or_default().as_wire_str());
-    }
-}
-
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     aisix_gateway::capture_upstream_error_http(
         status,
@@ -369,6 +350,10 @@ impl Bridge for AnthropicBridge {
         aisix_core::Adapter::Anthropic.wire_protocol()
     }
 
+    fn reads_cache_markers(&self, _ctx: &BridgeContext) -> bool {
+        true
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,
@@ -396,7 +381,7 @@ impl Bridge for AnthropicBridge {
             let (system, messages) = split_system_with(&req, MediaUrls::Accepted, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
             let mut body = build_request(&req, upstream, system, messages, false);
-            maybe_inject_cache_breakpoints(&mut body, ctx);
+            apply_auto_prompt_caching(&mut body, &ctx.model);
             outbound_bytes(&body)?
         };
         let synthetic_json_tool = matches!(
@@ -496,7 +481,7 @@ impl Bridge for AnthropicBridge {
             let (system, messages) = split_system_with(&req, MediaUrls::Accepted, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
             let mut body = build_request(&req, upstream, system, messages, true);
-            maybe_inject_cache_breakpoints(&mut body, ctx);
+            apply_auto_prompt_caching(&mut body, &ctx.model);
             outbound_bytes(&body)?
         };
         // The owned request is not needed past its wire bytes.

@@ -65,9 +65,10 @@ use crate::wire;
 // Anthropic SSE, decoded by the shared `AnthropicStreamEvent` +
 // `StreamState` (the same decoder the direct Anthropic bridge uses).
 use aisix_provider_anthropic::wire::{
-    anthropic_needs_fetch, build_request as build_anthropic_request, response_into_chat_response,
-    split_system_with, structured_output_for, AnthropicResponse, AnthropicStreamEvent, MediaUrls,
-    StreamState, StructuredOutput,
+    anthropic_needs_fetch, apply_auto_prompt_caching, build_request as build_anthropic_request,
+    response_into_chat_response, retain_cache_control_fields, split_system_with,
+    structured_output_for, AnthropicResponse, AnthropicStreamEvent, MediaUrls, StreamState,
+    StructuredOutput,
 };
 
 // Llama + the OpenAI-compatible MaaS family on Vertex use the OpenAI
@@ -637,6 +638,12 @@ impl Bridge for VertexBridge {
         aisix_core::Adapter::Vertex.wire_protocol()
     }
 
+    fn reads_cache_markers(&self, ctx: &BridgeContext) -> bool {
+        upstream_model(ctx).is_ok_and(|id| {
+            VertexPublisher::from_upstream_id(id) == Some(VertexPublisher::Anthropic)
+        })
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,
@@ -1042,11 +1049,16 @@ impl VertexBridge {
         let body_value = {
             let (system, messages) = split_system_with(&req, urls, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
-            let anthropic_req = build_anthropic_request(&req, upstream_id, system, messages, false);
+            let mut anthropic_req =
+                build_anthropic_request(&req, upstream_id, system, messages, false);
+            apply_auto_prompt_caching(&mut anthropic_req, &ctx.model);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
             })?;
             drop(anthropic_req);
+            // Vertex AI refuses the `scope` a marker may carry on the
+            // Anthropic API.
+            retain_cache_control_fields(&mut body_value, |k| k != "scope");
             // Apply the per-ProviderKey override pipeline (#339) before the
             // Vertex-specific shaping below, so the `model`/`stream` strip keeps
             // the final say and an override can never reintroduce a URL-borne
@@ -1158,11 +1170,16 @@ impl VertexBridge {
         let body_value = {
             let (system, messages) = split_system_with(&req, urls, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
-            let anthropic_req = build_anthropic_request(&req, upstream_id, system, messages, true);
+            let mut anthropic_req =
+                build_anthropic_request(&req, upstream_id, system, messages, true);
+            apply_auto_prompt_caching(&mut anthropic_req, &ctx.model);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
             })?;
             drop(anthropic_req);
+            // Vertex AI refuses the `scope` a marker may carry on the
+            // Anthropic API.
+            retain_cache_control_fields(&mut body_value, |k| k != "scope");
             // Apply the per-ProviderKey override pipeline (#339) before the
             // Vertex-specific shaping below (see the non-stream path). Here
             // `stream` is intentionally KEPT in the body.
