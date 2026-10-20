@@ -3101,21 +3101,32 @@ async fn serve_connection<I, S>(
         Downstream::Http1 => {
             // `with_upgrades` keeps the WebSocket surfaces (`/v1/realtime`)
             // working: hyper cannot upgrade a connection it does not own.
+            // hyper retires an h1 connection that has not read a request
+            // yet by closing it on the spot, and on a TLS connection — or
+            // a plaintext one whose request is still arriving — nothing
+            // has been read at the moment the drain ends. That client is
+            // owed an answer like any other (AISIX-Cloud#1394), so a
+            // connection is retired only once it has dispatched a request:
+            // the one that arrives is served with `Connection: close`, and
+            // a connection that never sends one is bounded by
+            // `downstream.idle_timeout_secs` exactly as the version sniff
+            // bounds a plaintext one. A pooled connection that has served
+            // a request is retired when the drain ends, as before.
+            let (dispatched_tx, mut dispatched) = watch::channel(false);
+            let service = hyper::service::service_fn(move |req| {
+                dispatched_tx.send_replace(true);
+                hyper::service::Service::call(&service, req)
+            });
             let conn = http1.serve_connection(io, service).with_upgrades();
             tokio::pin!(conn);
             let mut retired = false;
             loop {
                 tokio::select! {
-                    // The connection is polled first so it has read the
-                    // bytes the version sniff already saw before it can be
-                    // retired. hyper closes a connection that has read
-                    // nothing yet on the spot, so a request that arrives
-                    // after the drain ends — on a connection accepted
-                    // before it — would otherwise lose a coin flip
-                    // against an already-fired cancel and go unanswered.
-                    biased;
                     served = conn.as_mut() => break served.map_err(|e| e.to_string()),
-                    _ = shutdown.cancelled(), if !retired => {
+                    _ = async {
+                        shutdown.cancelled().await;
+                        let _ = dispatched.wait_for(|d| *d).await;
+                    }, if !retired => {
                         conn.as_mut().graceful_shutdown();
                         retired = true;
                     }
