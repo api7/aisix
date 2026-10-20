@@ -1025,6 +1025,7 @@ fn shape_invoke_body(
             obj.insert(k.clone(), v.clone());
         }
     }
+    aisix_provider_anthropic::platform::retain_bedrock_thinking_display(obj);
 }
 
 impl BedrockBridge {
@@ -2678,6 +2679,7 @@ fn build_converse_additional_model_request_fields(
                 fields.insert(name.to_string(), value);
             }
         }
+        aisix_provider_anthropic::platform::retain_bedrock_thinking_display(&mut fields);
     } else if let Some((name, value)) = crate::converse_req::reasoning_field(req, upstream_id)? {
         fields.insert(name.to_string(), value);
     }
@@ -5095,6 +5097,35 @@ mod tests {
             body["toolConfig"].get("toolChoice").is_none(),
             "body={body}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_thinking_display_bedrock_refuses_is_dropped_on_both_chat_paths() {
+        let claude = "anthropic.claude-sonnet-4-5-20250929-v1:0";
+        for (display, kept) in [("updates", false), ("summarized", true)] {
+            let mut req = ChatFormat::new("my-model", vec![ChatMessage::user("hi")]);
+            req.max_tokens = Some(4096);
+            req.extra.insert(
+                "thinking".into(),
+                serde_json::json!({"type": "enabled", "budget_tokens": 2048, "display": display}),
+            );
+            let invoke = capture_bedrock_body(claude, "invoke", &req, false).await;
+            let converse = capture_bedrock_body(claude, "converse-stream", &req, true).await;
+            for thinking in [
+                &invoke["thinking"],
+                &converse["additionalModelRequestFields"]["thinking"],
+            ] {
+                assert_eq!(
+                    thinking["budget_tokens"], 2048,
+                    "{display}: {invoke} {converse}"
+                );
+                assert_eq!(
+                    thinking.get("display").is_some(),
+                    kept,
+                    "{display}: {invoke} {converse}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

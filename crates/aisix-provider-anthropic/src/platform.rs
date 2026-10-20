@@ -105,12 +105,14 @@ pub fn allowed_fields(platform: Platform) -> &'static [&'static str] {
 }
 
 /// `anthropic-beta` values Bedrock accepts, keyed by the Anthropic name.
-/// A value not listed is dropped: Bedrock answers an unknown one with 400.
+/// A value not listed is dropped: Bedrock answers an unknown one with 400
+/// ("invalid beta flag"). Measured against Claude Sonnet 4.5 `InvokeModel`.
 const BEDROCK_BETAS: &[(&str, &str)] = &[
     (
         "advanced-tool-use-2025-11-20",
         "tool-search-tool-2025-10-19",
     ),
+    ("claude-code-20250219", "claude-code-20250219"),
     ("compact-2026-01-12", "compact-2026-01-12"),
     ("computer-use-2025-01-24", "computer-use-2025-01-24"),
     ("computer-use-2025-11-24", "computer-use-2025-11-24"),
@@ -119,32 +121,38 @@ const BEDROCK_BETAS: &[(&str, &str)] = &[
         "context-management-2025-06-27",
         "context-management-2025-06-27",
     ),
-    (
-        "dangerous-tool-use-2026-09-03",
-        "dangerous-tool-use-2026-09-03",
-    ),
     ("effort-2025-11-24", "effort-2025-11-24"),
     (
         "fine-grained-tool-streaming-2025-05-14",
         "fine-grained-tool-streaming-2025-05-14",
     ),
     (
-        "thinking-binding-controls-2026-08-01",
-        "thinking-binding-controls-2026-08-01",
+        "interleaved-thinking-2025-05-14",
+        "interleaved-thinking-2025-05-14",
     ),
+    (
+        "mid-conversation-output-config-2026-07-01",
+        "mid-conversation-output-config-2026-07-01",
+    ),
+    (
+        "mid-conversation-tool-changes-2026-07-01",
+        "mid-conversation-tool-changes-2026-07-01",
+    ),
+    ("output-128k-2025-02-19", "output-128k-2025-02-19"),
+    (
+        "structured-outputs-2025-11-13",
+        "structured-outputs-2025-11-13",
+    ),
+    (
+        "thinking-token-count-2026-05-13",
+        "thinking-token-count-2026-05-13",
+    ),
+    (
+        "token-efficient-tools-2025-02-19",
+        "token-efficient-tools-2025-02-19",
+    ),
+    ("tool-examples-2025-10-29", "tool-examples-2025-10-29"),
     ("tool-search-tool-2025-10-19", "tool-search-tool-2025-10-19"),
-    (
-        "mid-conversation-output-config-2026-07-01",
-        "mid-conversation-output-config-2026-07-01",
-    ),
-    (
-        "thinking-display-updates-2026-08-18",
-        "thinking-display-updates-2026-08-18",
-    ),
-    (
-        "mid-conversation-tool-changes-2026-07-01",
-        "mid-conversation-tool-changes-2026-07-01",
-    ),
 ];
 
 /// `anthropic-beta` values Vertex AI accepts, keyed by the Anthropic name.
@@ -276,6 +284,7 @@ pub fn shape_request(
                 wanted.insert(TOOL_SEARCH_BETA.to_string());
             }
             filter_bedrock_context_management(obj, &mut wanted);
+            retain_bedrock_thinking_display(obj);
         }
         Platform::Vertex => {
             if let Some(edits) = obj
@@ -602,6 +611,24 @@ fn fold_output_format(obj: &mut Map<String, Value>) {
     }
 }
 
+/// The `thinking.display` values Bedrock takes for Claude; any other
+/// (`updates`) is refused with a 400.
+const BEDROCK_THINKING_DISPLAYS: &[&str] = &["summarized", "omitted"];
+
+/// Drop a `thinking.display` Bedrock refuses from a body bound for it,
+/// leaving the model's default display.
+pub fn retain_bedrock_thinking_display(obj: &mut Map<String, Value>) {
+    let Some(thinking) = obj.get_mut("thinking").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if thinking.get("display").is_some_and(|d| {
+        !d.as_str()
+            .is_some_and(|d| BEDROCK_THINKING_DISPLAYS.contains(&d))
+    }) {
+        thinking.remove("display");
+    }
+}
+
 /// Keep the `context_management.edits` Bedrock runs and add the beta each
 /// needs; drop the field when none is left.
 fn filter_bedrock_context_management(obj: &mut Map<String, Value>, betas: &mut BTreeSet<String>) {
@@ -669,7 +696,8 @@ mod tests {
             [
                 "context-1m-2025-08-07",
                 "context-management-2025-06-27",
-                "effort-2025-11-24"
+                "effort-2025-11-24",
+                "interleaved-thinking-2025-05-14"
             ]
         );
         assert_eq!(body["anthropic_beta"], json!(betas));

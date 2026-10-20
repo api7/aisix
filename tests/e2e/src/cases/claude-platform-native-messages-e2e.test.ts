@@ -446,10 +446,12 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
     // Only the Bedrock-known betas, with the ones the body's own features
     // need; the effort beta because Claude 4.5 takes `effort` as a beta.
     expect(body.anthropic_beta).toEqual([
+      "claude-code-20250219",
       "context-1m-2025-08-07",
       "context-management-2025-06-27",
       "effort-2025-11-24",
       "fine-grained-tool-streaming-2025-05-14",
+      "interleaved-thinking-2025-05-14",
     ]);
     // Bedrock runs only some context-management edits.
     expect(body.context_management).toEqual({ edits: [{ type: "clear_tool_uses_20250919" }] });
@@ -486,6 +488,14 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
     expect(sent.upstream.path).toBe(`/model/${BEDROCK_ID}/invoke-with-response-stream`);
     const body = JSON.parse(sent.upstream.body);
     expect(body).not.toHaveProperty("stream");
+    expect(body.anthropic_beta).toEqual([
+      "claude-code-20250219",
+      "context-1m-2025-08-07",
+      "context-management-2025-06-27",
+      "effort-2025-11-24",
+      "fine-grained-tool-streaming-2025-05-14",
+      "interleaved-thinking-2025-05-14",
+    ]);
     expect(body.messages[1].content[0].signature).toBe("sig-history");
     expect(body.messages[2].content[0].content[1]).toEqual(BASE64_IMAGE);
 
@@ -511,6 +521,59 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
     expect(row.get("cache_read_tokens")).toBe(String(CACHE_READ));
     expect(row.get("cache_creation_tokens")).toBe(String(CACHE_WRITE));
     expect(row.get("provider_request_id")).toBe("msg_bdrk_stream");
+  });
+
+  test("Bedrock receives the betas it runs and none it refuses", async (ctx) => {
+    if (skip(ctx)) return;
+    const runs = [
+      "interleaved-thinking-2025-05-14",
+      "output-128k-2025-02-19",
+      "structured-outputs-2025-11-13",
+      "thinking-token-count-2026-05-13",
+      "token-efficient-tools-2025-02-19",
+      "tool-examples-2025-10-29",
+    ];
+    const refused = [
+      "dangerous-tool-use-2026-09-03",
+      "extended-cache-ttl-2025-04-11",
+      "files-api-2025-04-14",
+      "prompt-caching-2024-07-31",
+      "prompt-caching-scope-2026-01-05",
+      "thinking-binding-controls-2026-08-01",
+      "thinking-display-updates-2026-08-18",
+      "token-counting-2024-11-01",
+    ];
+    for (const stream of [false, true]) {
+      const sent = await send(
+        "/v1/messages",
+        {
+          model: BEDROCK,
+          max_tokens: 2000,
+          stream,
+          thinking: { type: "enabled", budget_tokens: 1024, display: "updates" },
+          messages: [{ role: "user", content: "What is 17*23?" }],
+        },
+        [...refused, ...runs].join(","),
+      );
+      expect(sent.status, sent.text).toBe(200);
+      const body = JSON.parse(sent.upstream.body);
+      expect(body.anthropic_beta, `stream=${stream}`).toEqual(runs);
+      // Bedrock refuses `display: "updates"`; the default display applies.
+      expect(body.thinking, `stream=${stream}`).toEqual({ type: "enabled", budget_tokens: 1024 });
+    }
+
+    const summarized = await send("/v1/messages", {
+      model: BEDROCK,
+      max_tokens: 2000,
+      thinking: { type: "enabled", budget_tokens: 1024, display: "summarized" },
+      messages: [{ role: "user", content: "What is 17*23?" }],
+    });
+    expect(summarized.status, summarized.text).toBe(200);
+    expect(JSON.parse(summarized.upstream.body).thinking).toEqual({
+      type: "enabled",
+      budget_tokens: 1024,
+      display: "summarized",
+    });
   });
 
   test("an image URL inside a tool result is downloaded for Bedrock and Vertex AI", async (ctx) => {
