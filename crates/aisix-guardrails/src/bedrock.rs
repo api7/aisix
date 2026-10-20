@@ -519,7 +519,7 @@ impl SplitOutcome {
         guardrail_id: &str,
         row_name: &str,
     ) -> Self {
-        match classify_response(resp, guardrail_id) {
+        match classify_response(resp, guardrail_id, row_name) {
             BedrockOutcome::Allow => Self::Allow {
                 masked: texts.to_vec(),
                 counts: Default::default(),
@@ -639,7 +639,11 @@ enum BedrockOutcome {
 /// Classify an `ApplyGuardrail` response into allow / block / mask.
 /// Secure by default: an intervention that is neither a recognizable
 /// block nor accompanied by masked output is treated as a block.
-fn classify_response(resp: &ApplyGuardrailOutput, guardrail_id: &str) -> BedrockOutcome {
+fn classify_response(
+    resp: &ApplyGuardrailOutput,
+    guardrail_id: &str,
+    row_name: &str,
+) -> BedrockOutcome {
     match resp.action() {
         GuardrailAction::None => BedrockOutcome::Allow,
         GuardrailAction::GuardrailIntervened => {
@@ -665,6 +669,7 @@ fn classify_response(resp: &ApplyGuardrailOutput, guardrail_id: &str) -> Bedrock
             // upgrade. `intervened` is the active signal, so an unknown
             // action is treated as no-intervention (Allow).
             tracing::warn!(
+                guardrail_name = %row_name,
                 guardrail_id = %guardrail_id,
                 action = ?other,
                 "unknown ApplyGuardrail action; treating as Allow",
@@ -1016,7 +1021,7 @@ mod tests {
         #[test]
         fn action_none_is_allow() {
             let r = resp(GuardrailAction::None, vec![], vec![]);
-            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Allow);
+            assert_eq!(classify_response(&r, "gid", "row"), BedrockOutcome::Allow);
         }
 
         #[test]
@@ -1027,7 +1032,7 @@ mod tests {
                 vec![pii(PiiAction::Anonymized)],
             );
             assert_eq!(
-                classify_response(&r, "gid"),
+                classify_response(&r, "gid", "row"),
                 BedrockOutcome::Mask(vec!["contact {EMAIL} about the order".to_owned()])
             );
         }
@@ -1039,7 +1044,7 @@ mod tests {
                 vec!["irrelevant"],
                 vec![pii(PiiAction::Blocked)],
             );
-            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Block);
+            assert_eq!(classify_response(&r, "gid", "row"), BedrockOutcome::Block);
         }
 
         #[test]
@@ -1050,7 +1055,7 @@ mod tests {
                 vec!["masked text"],
                 vec![topic()],
             );
-            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Block);
+            assert_eq!(classify_response(&r, "gid", "row"), BedrockOutcome::Block);
         }
 
         #[test]
@@ -1060,14 +1065,14 @@ mod tests {
                 vec!["masked"],
                 vec![pii(PiiAction::Anonymized), pii(PiiAction::Blocked)],
             );
-            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Block);
+            assert_eq!(classify_response(&r, "gid", "row"), BedrockOutcome::Block);
         }
 
         #[test]
         fn intervened_without_hard_block_or_masked_output_is_block() {
             // Secure default: an intervention we can't read as a mask blocks.
             let r = resp(GuardrailAction::GuardrailIntervened, vec![], vec![]);
-            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Block);
+            assert_eq!(classify_response(&r, "gid", "row"), BedrockOutcome::Block);
         }
 
         #[test]
@@ -1096,7 +1101,7 @@ mod tests {
                 ],
             );
             assert_eq!(
-                classify_response(&r, "gid"),
+                classify_response(&r, "gid", "row"),
                 BedrockOutcome::Mask(vec!["contact {EMAIL}".to_owned()])
             );
         }
@@ -1112,7 +1117,7 @@ mod tests {
                 vec![pii(PiiAction::Anonymized)],
             );
             assert_eq!(
-                classify_response(&r, "gid"),
+                classify_response(&r, "gid", "row"),
                 BedrockOutcome::Mask(vec![String::new(), "masked tail".to_owned()])
             );
         }
