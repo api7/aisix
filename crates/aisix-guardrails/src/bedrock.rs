@@ -144,7 +144,7 @@ impl BedrockGuardrail {
             // the snapshot, which is rare (snapshot rebuild only).
             tracing::info!(
                 endpoint = %url,
-                guardrail_id = %cfg.guardrail_id,
+                bedrock_guardrail_id = %cfg.guardrail_id,
                 "BedrockGuardrail using endpoint URL override (Config.bedrock_endpoint_url)",
             );
         }
@@ -304,7 +304,7 @@ impl BedrockGuardrail {
                 if batches.len() > 1 {
                     tracing::warn!(
                         guardrail_name = %self.row_name,
-                        guardrail_id = %self.guardrail_id,
+                        bedrock_guardrail_id = %self.guardrail_id,
                         slots = texts.len(),
                         batches = batches.len(),
                         budget = BEDROCK_REFUSAL_BATCH_CHARS,
@@ -335,7 +335,7 @@ impl BedrockGuardrail {
                     let (left, right) = texts.split_at(texts.len() / 2);
                     tracing::warn!(
                         guardrail_name = %self.row_name,
-                        guardrail_id = %self.guardrail_id,
+                        bedrock_guardrail_id = %self.guardrail_id,
                         slots = texts.len(),
                         detail = %detail,
                         "bedrock refused a payload already inside the batch budget; \
@@ -366,7 +366,7 @@ impl BedrockGuardrail {
                 }
                 tracing::warn!(
                     guardrail_name = %self.row_name,
-                    guardrail_id = %self.guardrail_id,
+                    bedrock_guardrail_id = %self.guardrail_id,
                     pieces = pieces.len(),
                     budget = BEDROCK_REFUSAL_BATCH_CHARS,
                     detail = %detail,
@@ -475,7 +475,7 @@ impl BedrockGuardrail {
         let (reason, error_detail, error_source) = failure.log_fields();
         tracing::warn!(
             guardrail_name = %self.row_name,
-            guardrail_id = %self.guardrail_id,
+            bedrock_guardrail_id = %self.guardrail_id,
             failure_tag = reason,
             error = error_detail,
             source = error_source,
@@ -537,7 +537,7 @@ impl SplitOutcome {
                     // applied to the wrong slot.
                     tracing::warn!(
                         guardrail_name = %row_name,
-                        guardrail_id = %guardrail_id,
+                        bedrock_guardrail_id = %guardrail_id,
                         expected = texts.len(),
                         got = outputs.len(),
                         "bedrock masked outputs don't align with input \
@@ -670,7 +670,7 @@ fn classify_response(
             // action is treated as no-intervention (Allow).
             tracing::warn!(
                 guardrail_name = %row_name,
-                guardrail_id = %guardrail_id,
+                bedrock_guardrail_id = %guardrail_id,
                 action = ?other,
                 "unknown ApplyGuardrail action; treating as Allow",
             );
