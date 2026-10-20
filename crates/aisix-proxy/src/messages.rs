@@ -1696,6 +1696,7 @@ async fn anthropic_passthrough_dispatch(
                     cached_prompt_tokens: 0,
                     cache_write_tokens: None,
                     modality: Default::default(),
+                    cache_creation_ttl: usage.cache_creation_ttl,
                     cache_creation_tokens: usage.cache_creation_tokens,
                     cache_read_tokens: usage.cache_read_tokens,
                     reasoning_tokens: 0,
@@ -2226,6 +2227,9 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
         cached_prompt_tokens: 0,
         cache_write_tokens: None,
         modality: Default::default(),
+        cache_creation_ttl: aisix_gateway::CacheCreationTtl::from_anthropic(
+            usage.and_then(|u| u.get("cache_creation")),
+        ),
         reasoning_tokens: 0,
         upstream_total_tokens: 0,
         reasoning_folded_into_completion: 0,
@@ -2559,6 +2563,7 @@ async fn cross_provider_dispatch(
                     cached_prompt_tokens: comp.cached_prompt_tokens,
                     cache_write_tokens: comp.cache_write_tokens,
                     modality: comp.modality,
+                    cache_creation_ttl: comp.cache_creation_ttl,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
                     reasoning_tokens: comp.reasoning_tokens,
@@ -2760,6 +2765,7 @@ async fn cross_provider_dispatch(
         cached_prompt_tokens: resp.usage.cached_prompt_tokens,
         cache_write_tokens: resp.usage.cache_write_tokens,
         modality: resp.usage.modality,
+        cache_creation_ttl: resp.usage.cache_creation_ttl,
         cache_creation_tokens: resp.usage.cache_creation_tokens,
         cache_read_tokens: resp.usage.cache_read_tokens,
         reasoning_tokens: resp.usage.reasoning_tokens,
@@ -2939,6 +2945,7 @@ fn build_anthropic_sse_stream(
                         comp.completion_tokens = comp.completion_tokens.max(u.completion_tokens);
                         comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);
                         comp.modality = comp.modality.max_fieldwise(&u.modality);
+                        comp.cache_creation_ttl = comp.cache_creation_ttl.max_fieldwise(&u.cache_creation_ttl);
                         comp.cached_prompt_tokens =
                             comp.cached_prompt_tokens.max(u.cached_prompt_tokens);
                         comp.cache_creation_tokens =
@@ -3323,6 +3330,7 @@ struct AnthropicStreamCompletion {
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
     modality: aisix_gateway::ModalityTokens,
+    cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
     reasoning_tokens: u32,
@@ -3506,6 +3514,7 @@ struct AnthropicUsageMetrics {
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
     modality: aisix_gateway::ModalityTokens,
+    cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
     /// Recorded exactly as `/v1/chat/completions` records them, so one
@@ -3622,6 +3631,7 @@ fn emit_anthropic_usage_event(
         cached_prompt_tokens: metrics.cached_prompt_tokens,
         cache_write_tokens: metrics.cache_write_tokens,
         modality_tokens: metrics.modality,
+        cache_creation_ttl: metrics.cache_creation_ttl,
         cache_creation_tokens: metrics.cache_creation_tokens,
         cache_read_tokens: metrics.cache_read_tokens,
         usage_estimated: metrics.usage_estimated,
@@ -3792,6 +3802,7 @@ struct AnthropicStreamUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
     cache_creation_tokens: u32,
+    cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     cache_read_tokens: u32,
     /// True once a `message_delta` carried a numeric `output_tokens`.
     /// Without it, `completion_tokens` holds only the `message_start`
@@ -3906,6 +3917,8 @@ fn update_anthropic_usage(
                 {
                     acc.cache_creation_tokens = t as u32;
                 }
+                acc.cache_creation_ttl =
+                    aisix_gateway::CacheCreationTtl::from_anthropic(usage.get("cache_creation"));
                 if let Some(t) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
                     acc.cache_read_tokens = t as u32;
                 }
@@ -4010,6 +4023,9 @@ fn update_anthropic_usage(
                 {
                     acc.cache_creation_tokens = acc.cache_creation_tokens.max(t as u32);
                 }
+                acc.cache_creation_ttl = acc.cache_creation_ttl.max_fieldwise(
+                    &aisix_gateway::CacheCreationTtl::from_anthropic(usage.get("cache_creation")),
+                );
                 if let Some(t) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
                     acc.cache_read_tokens = acc.cache_read_tokens.max(t as u32);
                 }
@@ -4032,12 +4048,15 @@ fn update_anthropic_usage(
 pub(crate) fn anthropic_usage_stats(body: &Value) -> Option<aisix_gateway::UsageStats> {
     body.get("usage")?;
     let m = anthropic_metrics_from_response_json(body);
-    Some(aisix_gateway::UsageStats::with_cache(
-        m.prompt_tokens,
-        m.completion_tokens,
-        m.cache_creation_tokens,
-        m.cache_read_tokens,
-    ))
+    Some(aisix_gateway::UsageStats {
+        cache_creation_ttl: m.cache_creation_ttl,
+        ..aisix_gateway::UsageStats::with_cache(
+            m.prompt_tokens,
+            m.completion_tokens,
+            m.cache_creation_tokens,
+            m.cache_read_tokens,
+        )
+    })
 }
 
 /// The usage one streamed Anthropic event reports, read by this endpoint's
@@ -4053,12 +4072,15 @@ pub(crate) fn anthropic_stream_usage_stats(event: &Value) -> Option<aisix_gatewa
     usage.filter(|u| u.is_object())?;
     let mut acc = AnthropicStreamUsage::default();
     update_anthropic_usage(&mut acc, event, Instant::now(), &mut true);
-    Some(aisix_gateway::UsageStats::with_cache(
-        acc.prompt_tokens,
-        acc.completion_tokens,
-        acc.cache_creation_tokens,
-        acc.cache_read_tokens,
-    ))
+    Some(aisix_gateway::UsageStats {
+        cache_creation_ttl: acc.cache_creation_ttl,
+        ..aisix_gateway::UsageStats::with_cache(
+            acc.prompt_tokens,
+            acc.completion_tokens,
+            acc.cache_creation_tokens,
+            acc.cache_read_tokens,
+        )
+    })
 }
 
 /// Drain every complete SSE frame from `buf`, updating `acc` and
@@ -4141,6 +4163,7 @@ impl<F: FnOnce(AnthropicStreamUsage)> Drop for AnthropicStreamGuard<F> {
                 // industry contract (#419 parity).
                 usage.completion_tokens = 0;
                 usage.cache_creation_tokens = 0;
+                usage.cache_creation_ttl = aisix_gateway::CacheCreationTtl::NONE;
                 usage.cache_read_tokens = 0;
             }
             // Token-estimation fallback (AISIX-Cloud#1074), after the #419

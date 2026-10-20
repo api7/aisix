@@ -422,6 +422,7 @@ pub fn into_usage(u: OpenAiUsage) -> UsageStats {
         // creation/read counters; leave at 0 (cp-api falls back to
         // prompt rate for unset cache counters).
         cache_creation_tokens: 0,
+        cache_creation_ttl: aisix_gateway::CacheCreationTtl::NONE,
         cache_read_tokens: 0,
         // Preserve DeepSeek's native counters verbatim for passthrough
         // (#542) so a client reading the native field names still works,
