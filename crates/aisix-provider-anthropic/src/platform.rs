@@ -612,6 +612,35 @@ fn fold_output_format(obj: &mut Map<String, Value>) {
     }
 }
 
+/// Keep only the `anthropic_beta` values Bedrock takes in a body bound for
+/// it, under Bedrock's names, and drop the field when none is left.
+pub fn retain_bedrock_betas(obj: &mut Map<String, Value>) {
+    let Some(Value::Array(betas)) = obj.get("anthropic_beta") else {
+        return;
+    };
+    let kept: BTreeSet<&str> = betas
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(|b| platform_beta(Platform::Bedrock, b))
+        .collect();
+    if kept.len() != betas.len() {
+        tracing::debug!(
+            sent = ?betas,
+            kept = ?kept,
+            "anthropic_beta values Bedrock does not take were not sent"
+        );
+    }
+    if kept.is_empty() {
+        obj.remove("anthropic_beta");
+    } else {
+        let kept = kept
+            .into_iter()
+            .map(|b| Value::String(b.to_string()))
+            .collect();
+        obj.insert("anthropic_beta".to_string(), Value::Array(kept));
+    }
+}
+
 /// Drop a `thinking.display` Bedrock refuses from a body bound for it,
 /// leaving the model's default display. Bedrock takes `summarized` and
 /// `omitted` and answers any other value (`updates`) with a 400.

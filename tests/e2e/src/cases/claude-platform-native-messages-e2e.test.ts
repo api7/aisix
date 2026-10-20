@@ -174,6 +174,13 @@ async function startUpstream(): Promise<Upstream> {
       if (path === "/v1/messages/count_tokens") return json({ input_tokens: 99 });
       if (path.endsWith("/models/count-tokens:rawPredict")) return json({ input_tokens: 17 });
       if (path.endsWith("/invoke")) return json(reply("msg_bdrk_nonstream"));
+      if (path.endsWith("/converse"))
+        return json({
+          output: { message: { role: "assistant", content: [{ text: "ok" }] } },
+          stopReason: "end_turn",
+          usage: { inputTokens: UNCACHED_IN, outputTokens: 2, totalTokens: UNCACHED_IN + 2 },
+          metrics: { latencyMs: 1 },
+        });
       if (path.endsWith(":rawPredict")) return json(reply("msg_vrtx_nonstream"));
       if (path.endsWith(":streamRawPredict")) {
         res.writeHead(200, { "content-type": "text/event-stream" });
@@ -576,6 +583,39 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
     });
   });
 
+  test("chat to Claude on Bedrock sends only the body betas Bedrock runs", async (ctx) => {
+    if (skip(ctx)) return;
+    const chat = {
+      model: BEDROCK,
+      max_tokens: 2000,
+      messages: [{ role: "user", content: "What is 17*23?" }],
+      thinking: { type: "enabled", budget_tokens: 1024, display: "updates" },
+      anthropic_beta: [
+        "interleaved-thinking-2025-05-14",
+        "thinking-display-updates-2026-08-18",
+        "advanced-tool-use-2025-11-20",
+        "files-api-2025-04-14",
+      ],
+    };
+    const expected = ["interleaved-thinking-2025-05-14", "tool-search-tool-2025-10-19"];
+
+    const invoke = await send("/v1/chat/completions", chat);
+    expect(invoke.status, invoke.text).toBe(200);
+    expect(invoke.upstream.path).toBe(`/model/${BEDROCK_ID}/invoke`);
+    const invokeBody = JSON.parse(invoke.upstream.body);
+    expect(invokeBody.anthropic_beta).toEqual(expected);
+    expect(invokeBody.thinking).toEqual({ type: "enabled", budget_tokens: 1024 });
+
+    // `requestMetadata` has no place in InvokeModel, so this one is served
+    // by Converse.
+    const converse = await send("/v1/chat/completions", { ...chat, requestMetadata: { team: "a" } });
+    expect(converse.status, converse.text).toBe(200);
+    expect(converse.upstream.path).toBe(`/model/${BEDROCK_ID}/converse`);
+    const fields = JSON.parse(converse.upstream.body).additionalModelRequestFields;
+    expect(fields.anthropic_beta).toEqual(expected);
+    expect(fields.thinking).toEqual({ type: "enabled", budget_tokens: 1024 });
+  });
+
   test("an image URL inside a tool result is downloaded for Bedrock and Vertex AI", async (ctx) => {
     if (skip(ctx)) return;
     const image = { type: "image", source: { type: "url", url: `http://localhost:${upstream!.port}/img.png` } };
@@ -676,7 +716,7 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
       body: JSON.stringify({
         model: BEDROCK_MANTLE_ONLY,
         system: "Be brief.",
-        thinking: { type: "enabled", budget_tokens: 2048 },
+        thinking: { type: "enabled", budget_tokens: 2048, display: "updates" },
         messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
       }),
     });

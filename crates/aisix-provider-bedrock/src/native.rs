@@ -234,6 +234,10 @@ async fn mantle_count_tokens(
             count.insert(key.to_string(), v.clone());
         }
     }
+    // A display cannot change the count, and Bedrock refuses some values.
+    if let Some(thinking) = count.get_mut("thinking").and_then(Value::as_object_mut) {
+        thinking.remove("display");
+    }
     let bytes = Vec::from(
         aisix_gateway::json_body(&Value::Object(count))
             .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?,

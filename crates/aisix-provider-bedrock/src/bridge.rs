@@ -1026,6 +1026,7 @@ fn shape_invoke_body(
         }
     }
     aisix_provider_anthropic::platform::retain_bedrock_thinking_display(obj);
+    aisix_provider_anthropic::platform::retain_bedrock_betas(obj);
 }
 
 impl BedrockBridge {
@@ -2680,6 +2681,7 @@ fn build_converse_additional_model_request_fields(
             }
         }
         aisix_provider_anthropic::platform::retain_bedrock_thinking_display(&mut fields);
+        aisix_provider_anthropic::platform::retain_bedrock_betas(&mut fields);
     } else if let Some((name, value)) = crate::converse_req::reasoning_field(req, upstream_id)? {
         fields.insert(name.to_string(), value);
     }
