@@ -20,7 +20,6 @@
 //! - [x] D7.4 — Mistral / Amazon Titan / Amazon Nova / Cohere / AI21
 //!   dispatch via Converse (same unified path; AWS handles
 //!   publisher-specific body shaping inside Bedrock).
-//!
 //! - [x] Grok and OpenAI GPT 5.6+ addressed through a cross-region
 //!   inference profile answer through bedrock-runtime's OpenAI-compatible
 //!   Chat Completions endpoint (`/openai/v1/chat/completions`, SigV4), and
