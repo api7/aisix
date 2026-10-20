@@ -25,7 +25,8 @@ use std::borrow::Cow;
 
 use aisix_core::MappedEffort;
 use aisix_gateway::content_part::{
-    check_tool_result_parts, parse_part, part_error, ContentPart, Media, MediaKind, MediaSource,
+    check_tool_result_parts, display_uri, parse_part, part_error, ContentPart, Media, MediaKind,
+    MediaSource,
 };
 use aisix_gateway::structured_output::{
     apply_schema_limits, json_schema_from_response_format, seal_object_schemas,
@@ -305,22 +306,25 @@ fn anthropic_user_blocks(
     Ok(out)
 }
 
+/// Which Claude content block a media type travels as: `image` or
+/// `document` (PDF). Anything else is the 400 sentence. Shared with the
+/// Bedrock Converse rail, which serves the same Claude models.
+pub fn claude_media_kind(mime_type: &str) -> Result<&'static str, String> {
+    match mime_type {
+        m if m.starts_with("image/") => Ok("image"),
+        "application/pdf" => Ok("document"),
+        m if m.starts_with("audio/") => Err("Claude models do not accept audio input".into()),
+        m => Err(format!(
+            "Claude models accept images and PDF documents, not {m:?}"
+        )),
+    }
+}
+
 /// One media part as an Anthropic `image` or `document` block.
 fn anthropic_media_block(media: &Media<'_>, urls: MediaUrls) -> Result<serde_json::Value, String> {
     match &media.source {
         MediaSource::Inline { mime_type, data } => {
-            let kind = match mime_type.as_str() {
-                m if m.starts_with("image/") => "image",
-                "application/pdf" => "document",
-                m if m.starts_with("audio/") => {
-                    return Err("Claude models do not accept audio input".into());
-                }
-                m => {
-                    return Err(format!(
-                        "Claude models accept images and PDF documents, not {m:?}"
-                    ));
-                }
-            };
+            let kind = claude_media_kind(mime_type)?;
             Ok(serde_json::json!({
                 "type": kind,
                 "source": {"type": "base64", "media_type": mime_type, "data": data},
@@ -330,13 +334,15 @@ fn anthropic_media_block(media: &Media<'_>, urls: MediaUrls) -> Result<serde_jso
             if let MediaUrls::Refused(upstream) = urls {
                 return Err(format!(
                     "{upstream} does not read media from a URL, and the gateway does not \
-                     fetch {uri:?} itself; send the content inline as a base64 data: URL"
+                     fetch {} itself; send the content inline as a base64 data: URL",
+                    display_uri(uri)
                 ));
             }
             if media.source.scheme().as_deref() != Some("https") {
                 return Err(format!(
                     "Claude models read only https:// URLs, and the gateway does not fetch \
-                     {uri:?} itself; send the content inline as a base64 data: URL"
+                     {} itself; send the content inline as a base64 data: URL",
+                    display_uri(uri)
                 ));
             }
             let kind = match (mime_type.as_deref(), media.kind) {

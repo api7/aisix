@@ -49,7 +49,7 @@ use aws_sdk_bedrockruntime::Client as BedrockClient;
 use base64::Engine as _;
 
 use aisix_gateway::content_part::{
-    check_tool_result_parts, parse_part, part_error, ContentPart, Media, MediaSource,
+    check_tool_result_parts, display_uri, translate_user_parts, Media, MediaSource,
 };
 use aws_smithy_runtime_api::client::result::ServiceError;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
@@ -57,9 +57,9 @@ use serde::Deserialize;
 use std::time::{Duration, Instant};
 
 use aisix_provider_anthropic::wire::{
-    build_request, response_into_chat_response, split_system_with, structured_output_for,
-    tool_choice_states_a_preference, translate_reasoning_effort_to_anthropic, AnthropicResponse,
-    MediaUrls, StructuredOutput,
+    build_request, claude_media_kind, response_into_chat_response, split_system_with,
+    structured_output_for, tool_choice_states_a_preference,
+    translate_reasoning_effort_to_anthropic, AnthropicResponse, MediaUrls, StructuredOutput,
 };
 
 // Per-`ProviderKey` request override pipeline (#302 §5 / #340). The JSON-body
@@ -1106,7 +1106,8 @@ impl BedrockBridge {
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
         let client = self.build_client_from_ctx(ctx)?;
-        let (system_blocks, message_blocks) = build_converse_inputs(&req)?;
+        let (system_blocks, message_blocks) =
+            build_converse_inputs(&req, BedrockPublisher::from_model_id(upstream_id))?;
         if message_blocks.is_empty() {
             return Err(system_only_request());
         }
@@ -1210,7 +1211,8 @@ impl BedrockBridge {
         upstream_id: &str,
     ) -> Result<ChatChunkStream, BridgeError> {
         let client = self.build_client_from_ctx(ctx)?;
-        let (system_blocks, message_blocks) = build_converse_inputs(&req)?;
+        let (system_blocks, message_blocks) =
+            build_converse_inputs(&req, BedrockPublisher::from_model_id(upstream_id))?;
         if message_blocks.is_empty() {
             return Err(system_only_request());
         }
@@ -1295,7 +1297,9 @@ impl BedrockBridge {
 /// `Vec` length.
 fn build_converse_inputs(
     req: &ChatFormat,
+    publisher: Option<BedrockPublisher>,
 ) -> Result<(Vec<SystemContentBlock>, Vec<BedrockMessage>), BridgeError> {
+    let claude = publisher == Some(BedrockPublisher::Anthropic);
     let mut systems: Vec<SystemContentBlock> = Vec::new();
     let mut messages: Vec<BedrockMessage> = Vec::new();
     // #560: buffer for coalescing consecutive `role:"tool"` results
@@ -1329,7 +1333,7 @@ fn build_converse_inputs(
             Role::User => {
                 messages.push(build_message(
                     ConversationRole::User,
-                    user_content_blocks(msg, index)?,
+                    user_content_blocks(msg, index, claude)?,
                 )?);
             }
             Role::Assistant => {
@@ -1369,57 +1373,83 @@ fn build_converse_inputs(
 }
 
 /// A user turn's content parts as Converse blocks, in the caller's order.
-/// Adjacent text parts join into one, so a text-only message keeps the
-/// single text block it has always had. Converse takes media only as bytes
-/// in the request, and the gateway does not fetch a caller's URL, so a URL
-/// part is refused.
-fn user_content_blocks(msg: &ChatMessage, index: usize) -> Result<Vec<ContentBlock>, BridgeError> {
+/// Converse takes media only as bytes in the request, and the gateway does
+/// not fetch a caller's URL, so a URL part is refused. A Claude model on
+/// this rail takes what it takes through InvokeModel — images and PDFs —
+/// so the two rails refuse the same parts.
+///
+/// Converse rejects a user message that carries a document but no text,
+/// so such a message gets a one-character text block after its media.
+fn user_content_blocks(
+    msg: &ChatMessage,
+    index: usize,
+    claude: bool,
+) -> Result<Vec<ContentBlock>, BridgeError> {
     let Some(parts) = msg.content_blocks.as_deref() else {
         return Ok(vec![ContentBlock::Text(msg.content_str().to_string())]);
     };
-    let mut blocks = Vec::new();
-    let mut text = String::new();
-    for (part_index, part) in parts.iter().enumerate() {
-        let invalid =
-            |reason: &str| BridgeError::InvalidRequest(part_error(index, part_index, reason));
-        match parse_part(part).map_err(|r| invalid(&r))? {
-            ContentPart::Text(t) => text.push_str(t),
-            ContentPart::Media(media) => {
-                if !text.is_empty() {
-                    blocks.push(ContentBlock::Text(std::mem::take(&mut text)));
+    let family = if claude { "Claude" } else { "Amazon Bedrock" };
+    let mut blocks = translate_user_parts(
+        parts,
+        index,
+        family,
+        ContentBlock::Text,
+        |media, part_index| {
+            if claude {
+                if let MediaSource::Inline { mime_type, .. } = &media.source {
+                    claude_media_kind(mime_type)?;
                 }
-                let name = format!("document-{index}-{part_index}");
-                blocks.push(converse_media_block(&media, &name).map_err(|r| invalid(&r))?);
             }
-            ContentPart::Unsupported(ty) => {
-                return Err(invalid(&format!(
-                    "content part type {ty:?} is not supported for Amazon Bedrock models"
-                )));
-            }
-        }
-    }
-    if !text.is_empty() || blocks.is_empty() {
-        blocks.push(ContentBlock::Text(text));
+            let upstream = if claude {
+                "Claude on Amazon Bedrock"
+            } else {
+                "Amazon Bedrock"
+            };
+            converse_media_block(media, upstream, &format!("document-{index}-{part_index}"))
+        },
+    )
+    .map_err(BridgeError::InvalidRequest)?;
+    let has_document = blocks
+        .iter()
+        .any(|b| matches!(b, ContentBlock::Document(_)));
+    let has_text = blocks.iter().any(|b| matches!(b, ContentBlock::Text(_)));
+    if has_document && !has_text {
+        blocks.push(ContentBlock::Text(".".to_string()));
     }
     Ok(blocks)
 }
 
+/// Line-wrapped or unpadded base64 is common in callers' payloads; the
+/// upstreams that take base64 text accept it, so the bytes decoded for
+/// Converse must too.
+const LENIENT_BASE64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    base64::engine::GeneralPurposeConfig::new()
+        .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+);
+
 /// One inline media part as a Converse `image` / `document` / `audio` /
 /// `video` block, chosen by its media type.
-fn converse_media_block(media: &Media<'_>, document_name: &str) -> Result<ContentBlock, String> {
+fn converse_media_block(
+    media: &Media<'_>,
+    upstream: &str,
+    document_name: &str,
+) -> Result<ContentBlock, String> {
     let (mime_type, data) = match &media.source {
         MediaSource::Inline { mime_type, data } => (mime_type.as_str(), *data),
         MediaSource::Uri { uri, .. } => {
             return Err(format!(
-                "Amazon Bedrock does not read media from a URL, and the gateway does not \
-                 fetch {uri:?} itself; send the content inline as a base64 data: URL"
+                "{upstream} does not read media from a URL, and the gateway does not \
+                 fetch {} itself; send the content inline as a base64 data: URL",
+                display_uri(uri)
             ));
         }
     };
     let unsupported = || format!("Amazon Bedrock does not accept media of type {mime_type:?}");
     let bytes = || {
-        base64::engine::general_purpose::STANDARD
-            .decode(data)
+        let compact: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        LENIENT_BASE64
+            .decode(compact)
             .map(Blob::new)
             .map_err(|_| "the media data is not valid base64".to_string())
     };
@@ -5111,7 +5141,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let (_systems, messages) = build_converse_inputs(&req).unwrap();
+        let (_systems, messages) = build_converse_inputs(&req, None).unwrap();
         let roles: Vec<ConversationRole> = messages.iter().map(|m| m.role().clone()).collect();
         assert_eq!(
             roles,
@@ -5138,7 +5168,7 @@ mod tests {
             ],
         );
 
-        let (systems, messages) = build_converse_inputs(&req).unwrap();
+        let (systems, messages) = build_converse_inputs(&req, None).unwrap();
         assert_eq!(systems.len(), 1);
         assert_eq!(
             systems[0],
@@ -5169,7 +5199,7 @@ mod tests {
         }))
         .unwrap();
 
-        let (systems, messages) = build_converse_inputs(&req).unwrap();
+        let (systems, messages) = build_converse_inputs(&req, None).unwrap();
         assert!(systems.is_empty());
         // user → assistant(2× toolUse) → user(2× toolResult, coalesced)
         assert_eq!(

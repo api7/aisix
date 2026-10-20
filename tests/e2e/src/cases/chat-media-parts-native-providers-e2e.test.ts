@@ -233,9 +233,9 @@ describe("chat media content parts → native provider media shapes", () => {
 
   /** Sends a request that must be refused before it reaches the upstream,
    * and returns the error message. */
-  async function refused(model: string, messages: unknown[]): Promise<string> {
+  async function refused(model: string, messages: unknown[], stream = false): Promise<string> {
     const before = upstream!.received.length;
-    const res = await post("/v1/chat/completions", { model, messages });
+    const res = await post("/v1/chat/completions", { model, messages, stream });
     expect(res.status, res.text).toBe(400);
     expect(upstream!.received.length - before).toBe(0);
     return JSON.parse(res.text).error.message as string;
@@ -320,6 +320,9 @@ describe("chat media content parts → native provider media shapes", () => {
     expect(
       await refused("media-gemini", user({ type: "video_url", video_url: { url: "x" } })),
     ).toMatch(/"video_url" is not supported/);
+    // Bare base64 where a URL belongs is quoted back cut short, not whole.
+    const echoed = await refused("media-gemini", user(image("A".repeat(100_000))));
+    expect(echoed.length).toBeLessThan(400);
     expect(
       await refused("media-gemini", [
         { role: "user", content: "look" },
@@ -373,6 +376,13 @@ describe("chat media content parts → native provider media shapes", () => {
     });
   }
 
+  test("Claude on Amazon Bedrock refuses audio on the streaming (Converse) rail too", async (ctx) => {
+    if (!ready(ctx)) return;
+    expect(
+      await refused("media-bedrock-claude", [{ role: "user", content: [text("hi"), audio] }], true),
+    ).toMatch(/do not accept audio/);
+  });
+
   test("bedrock converse: inline media become bytes blocks, URLs are refused", async (ctx) => {
     if (!ready(ctx)) return;
     const body = await chat("media-nova", [
@@ -390,5 +400,14 @@ describe("chat media content parts → native provider media shapes", () => {
         { role: "user", content: [text("hi"), image("https://img.example/cat.png")] },
       ]),
     ).toContain("Amazon Bedrock does not read media from a URL");
+  });
+
+  test("bedrock converse: a document-only turn gets the text block Converse requires", async (ctx) => {
+    if (!ready(ctx)) return;
+    const body = await chat("media-nova", [pdf]);
+    expect(body.messages[0].content).toEqual([
+      { document: { format: "pdf", name: "document-0-0", source: { bytes: PDF_B64 } } },
+      { text: "." },
+    ]);
   });
 });

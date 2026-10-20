@@ -404,8 +404,8 @@ fn attach_replayed_reasoning(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
 /// `blocks` stays `None` for a text-only slot so the common case keeps the
 /// bare-string wire shape it has always had; when it is `Some`, the
 /// OpenAI-compatible bridge forwards the array verbatim and the bridges that
-/// don't speak blocks (Anthropic / Gemini / Bedrock) fall back to `text` —
-/// the documented cross-provider content limitation.
+/// build their own request shape (Anthropic / Gemini / Bedrock) translate
+/// it through `aisix_gateway::content_part`.
 struct ChatContent {
     text: String,
     blocks: Option<Vec<Value>>,

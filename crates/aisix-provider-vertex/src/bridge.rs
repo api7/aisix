@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aisix_gateway::content_part::{
-    check_tool_result_parts, parse_part, part_error, ContentPart, Media, MediaSource,
+    check_tool_result_parts, display_uri, translate_user_parts, Media, MediaSource,
 };
 use aisix_gateway::tool_calls::reject_legacy_function_calling;
 
@@ -2242,40 +2242,17 @@ fn rewrite_gemini_openapi_schema(schema: &mut serde_json::Value) {
     }
 }
 
-/// A user turn's `parts[]`, in the caller's order. Adjacent text parts
-/// join into one, so a text-only message keeps the single text part it
-/// has always had; media becomes `inlineData` (base64 in the request) or
-/// `fileData` (a `gs://` or `https://` reference Gemini resolves itself).
+/// A user turn's `parts[]`, in the caller's order: text, then media as
+/// `inlineData` (base64 in the request) or `fileData` (a `gs://` or
+/// `https://` reference Gemini resolves itself).
 fn gemini_user_parts(m: &ChatMessage, index: usize) -> Result<Vec<GeminiPart>, BridgeError> {
     let Some(blocks) = m.content_blocks.as_deref() else {
         return Ok(vec![GeminiPart::text(m.content_str())]);
     };
-    let mut parts = Vec::new();
-    let mut text = String::new();
-    for (part_index, block) in blocks.iter().enumerate() {
-        let invalid =
-            |reason: &str| BridgeError::InvalidRequest(part_error(index, part_index, reason));
-        match parse_part(block).map_err(|r| invalid(&r))? {
-            ContentPart::Text(t) => text.push_str(t),
-            ContentPart::Media(media) => {
-                if !text.is_empty() {
-                    parts.push(GeminiPart::text(std::mem::take(&mut text)));
-                }
-                parts.push(GeminiPart::Raw(
-                    gemini_media_part(&media).map_err(|r| invalid(&r))?,
-                ));
-            }
-            ContentPart::Unsupported(ty) => {
-                return Err(invalid(&format!(
-                    "content part type {ty:?} is not supported for Gemini models"
-                )));
-            }
-        }
-    }
-    if !text.is_empty() || parts.is_empty() {
-        parts.push(GeminiPart::text(text));
-    }
-    Ok(parts)
+    translate_user_parts(blocks, index, "Gemini", GeminiPart::text, |media, _| {
+        gemini_media_part(media).map(GeminiPart::Raw)
+    })
+    .map_err(BridgeError::InvalidRequest)
 }
 
 /// One media part on the Gemini wire. The gateway does not fetch URLs: a
@@ -2293,14 +2270,16 @@ fn gemini_media_part(media: &Media<'_>) -> Result<serde_json::Value, String> {
                 _ => {
                     return Err(format!(
                         "Gemini models read only gs:// and https:// URLs, and the gateway does \
-                         not fetch {uri:?} itself; send the content inline as a base64 data: URL"
+                         not fetch {} itself; send the content inline as a base64 data: URL",
+                        display_uri(uri)
                     ));
                 }
             }
             let mime_type = mime_type.as_deref().ok_or_else(|| {
                 format!(
-                    "the media type of {uri:?} cannot be told from its extension; \
-                     set it in image_url.format (or file.format), for example \"image/png\""
+                    "the media type of {} cannot be told from its extension; \
+                     set it in image_url.format (or file.format), for example \"image/png\"",
+                    display_uri(uri)
                 )
             })?;
             Ok(serde_json::json!({

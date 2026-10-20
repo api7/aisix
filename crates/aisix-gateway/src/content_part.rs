@@ -92,7 +92,16 @@ fn explicit_mime_type(obj: &Value) -> Option<String> {
         .iter()
         .find_map(|k| obj.get(*k).and_then(Value::as_str))
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        .map(normalize_mime_type)
+}
+
+/// Media types compare case-insensitively, and `image/jpg` is a common
+/// misspelling of `image/jpeg` that no upstream accepts.
+fn normalize_mime_type(mime_type: &str) -> String {
+    match mime_type.trim().to_ascii_lowercase() {
+        m if m == "image/jpg" => "image/jpeg".to_string(),
+        m => m,
+    }
 }
 
 fn parse_image_url(block: &Value) -> Result<Media<'_>, String> {
@@ -125,9 +134,9 @@ fn parse_input_audio(block: &Value) -> Result<Media<'_>, String> {
         );
     };
     let mime_type = if format.contains('/') {
-        format.to_string()
+        normalize_mime_type(format)
     } else {
-        format!("audio/{format}")
+        normalize_mime_type(&format!("audio/{format}"))
     };
     Ok(Media {
         kind: MediaKind::Audio,
@@ -163,6 +172,13 @@ fn parse_file(block: &Value) -> Result<Media<'_>, String> {
         .and_then(Value::as_str)
         .filter(|d| !d.is_empty())
     {
+        if !id.contains("://") {
+            return Err(format!(
+                "file.file_id {} is an uploaded-file id, which this gateway cannot \
+                 resolve; send the content as file.file_data",
+                display_uri(id)
+            ));
+        }
         source_from_url(id, explicit)?
     } else {
         return Err("a file part must carry file.file_data or file.file_id".into());
@@ -175,7 +191,11 @@ fn parse_file(block: &Value) -> Result<Media<'_>, String> {
 
 /// A `data:` URL becomes inline bytes; anything else is a reference.
 fn source_from_url(url: &str, explicit: Option<String>) -> Result<MediaSource<'_>, String> {
-    let Some(rest) = url.strip_prefix("data:") else {
+    let rest = url
+        .get(..5)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("data:"))
+        .map(|_| &url[5..]);
+    let Some(rest) = rest else {
         let mime_type = explicit.or_else(|| mime_type_from_path(url).map(str::to_string));
         return Ok(MediaSource::Uri {
             uri: url,
@@ -191,7 +211,7 @@ fn source_from_url(url: &str, explicit: Option<String>) -> Result<MediaSource<'_
         return Err("a data: URL must be base64-encoded (data:<media type>;base64,<data>)".into());
     }
     let mime_type = explicit
-        .or_else(|| (!declared.is_empty()).then(|| declared.to_string()))
+        .or_else(|| (!declared.is_empty()).then(|| normalize_mime_type(declared)))
         .ok_or("a data: URL must name its media type (data:<media type>;base64,<data>)")?;
     Ok(MediaSource::Inline { mime_type, data })
 }
@@ -230,6 +250,55 @@ pub fn mime_type_from_path(url: &str) -> Option<&'static str> {
         "3gp" => "video/3gpp",
         _ => return None,
     })
+}
+
+/// A user turn's parts in the caller's order, for a bridge whose wire has
+/// one text item per run of text: adjacent text parts join into one item,
+/// so a text-only message keeps the single text item it has always had.
+/// `media` builds the item for one media part (it gets the part's index)
+/// or returns the reason the upstream cannot take it; `family` names the
+/// models in the error for an unsupported part type. A turn with nothing
+/// in it yields one empty text item.
+pub fn translate_user_parts<T>(
+    blocks: &[Value],
+    message_index: usize,
+    family: &str,
+    text: impl Fn(String) -> T,
+    media: impl Fn(&Media<'_>, usize) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
+    let mut out = Vec::new();
+    let mut run = String::new();
+    for (part_index, block) in blocks.iter().enumerate() {
+        let invalid = |reason: &str| part_error(message_index, part_index, reason);
+        match parse_part(block).map_err(|r| invalid(&r))? {
+            ContentPart::Text(t) => run.push_str(t),
+            ContentPart::Media(m) => {
+                if !run.is_empty() {
+                    out.push(text(std::mem::take(&mut run)));
+                }
+                out.push(media(&m, part_index).map_err(|r| invalid(&r))?);
+            }
+            ContentPart::Unsupported(ty) => {
+                return Err(invalid(&format!(
+                    "content part type {ty:?} is not supported for {family} models"
+                )));
+            }
+        }
+    }
+    if !run.is_empty() || out.is_empty() {
+        out.push(text(run));
+    }
+    Ok(out)
+}
+
+/// A caller's URL quoted in an error message, cut short: a client that
+/// puts bare base64 where a URL belongs would otherwise get it all back.
+pub fn display_uri(uri: &str) -> String {
+    const MAX: usize = 64;
+    match uri.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("{:?}…", &uri[..cut]),
+        None => format!("{uri:?}"),
+    }
 }
 
 /// The 400 sentence for a part an upstream cannot take: which message and
@@ -321,6 +390,18 @@ mod tests {
     }
 
     #[test]
+    fn media_types_are_case_insensitive_and_jpg_means_jpeg() {
+        let block = json!({"type":"image_url","image_url":{"url":"DATA:IMAGE/JPG;base64,/9j/"}});
+        match parse_part(&block).unwrap() {
+            ContentPart::Media(Media {
+                source: MediaSource::Inline { mime_type, .. },
+                ..
+            }) => assert_eq!(mime_type, "image/jpeg"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn input_audio_and_file_data_are_inline() {
         let audio = json!({"type":"input_audio","input_audio":{"data":"UklG","format":"wav"}});
         let file = json!({"type":"file","file":{"file_data":"data:application/pdf;base64,JVBE","filename":"a.pdf"}});
@@ -352,6 +433,12 @@ mod tests {
         ] {
             assert!(parse_part(&bad).is_err(), "{bad}");
         }
+        let file_id = json!({"type":"file","file":{"file_id":"file-abc123"}});
+        assert!(parse_part(&file_id)
+            .unwrap_err()
+            .contains("uploaded-file id"));
+        let long = "A".repeat(10_000);
+        assert!(display_uri(&long).len() < 80);
         assert_eq!(
             parse_part(&json!({"type":"video_url","video_url":{"url":"x"}})).unwrap(),
             ContentPart::Unsupported("video_url")
