@@ -510,10 +510,13 @@ describe("semantic guardrail kind e2e", () => {
     expect(res.content).toBe("upstream-answered");
   });
 
-  test.each(UNUSABLE)(
+  test.for(UNUSABLE)(
     "an unusable 200 (%s) fails closed as an upstream failure",
-    async (shape) => {
-      if (!etcdReachable || !app) return;
+    async (shape, ctx) => {
+      if (!etcdReachable || !app) {
+        ctx.skip();
+        return;
+      }
       const res = await chat(`${shape}-closed-chat`, [
         { role: "user", content: "what is the weather" },
       ]);

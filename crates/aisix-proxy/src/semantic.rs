@@ -931,9 +931,7 @@ async fn embed_texts_inner(
             }
             EmbeddingVector::Base64(_) => {
                 return Err(EmbedTextsError::UnusableResponse(
-                    "embedding endpoint returned base64 vectors; semantic routing needs \
-                     encoding_format=float support"
-                        .into(),
+                    "embedding endpoint returned base64 vectors; float vectors are required".into(),
                 ));
             }
         }
