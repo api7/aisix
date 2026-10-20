@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   SeedClient,
+  eventStream,
   eventStreamException,
   invokeChunk,
   spawnApp,
@@ -178,6 +179,19 @@ async function startUpstream(): Promise<Upstream> {
       if (path === "/v1/messages/count_tokens") return json({ input_tokens: 99 });
       if (path.endsWith("/models/count-tokens:rawPredict")) return json({ input_tokens: 17 });
       if (path.endsWith("/invoke")) return json(reply("msg_bdrk_nonstream"));
+      if (path.endsWith("/converse-stream")) {
+        res.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" });
+        res.end(
+          eventStream([
+            ["messageStart", { role: "assistant" }],
+            ["contentBlockDelta", { contentBlockIndex: 0, delta: { text: "ok" } }],
+            ["contentBlockStop", { contentBlockIndex: 0 }],
+            ["messageStop", { stopReason: "end_turn" }],
+            ["metadata", { usage: { inputTokens: 3, outputTokens: 1, totalTokens: 4 }, metrics: { latencyMs: 1 } }],
+          ]),
+        );
+        return;
+      }
       if (path.endsWith("/converse"))
         return json({
           output: { message: { role: "assistant", content: [{ text: "ok" }] } },
@@ -705,6 +719,26 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
       expect(JSON.parse(converse.upstream.body).additionalModelRequestFields.anthropic_beta, model).toEqual(
         expected,
       );
+
+      const streamed = await send("/v1/chat/completions", { ...chat, model, stream: true }, callerBetas);
+      expect(streamed.status, streamed.text).toBe(200);
+      expect(streamed.upstream.path).toBe(`/model/${BEDROCK_ID}/converse-stream`);
+      expect(streamed.upstream.headers["anthropic-beta"], model).toBeUndefined();
+      expect(JSON.parse(streamed.upstream.body).additionalModelRequestFields.anthropic_beta, model).toEqual(
+        expected,
+      );
+    }
+
+    // `/v1/responses` reaches Claude through the same chat dispatch.
+    for (const [model, expected] of [
+      [BEDROCK_OPERATOR_BETAS, ["context-1m-2025-08-07"]],
+      [BEDROCK_FORWARDED_BETAS, ["interleaved-thinking-2025-05-14"]],
+    ] as const) {
+      const sent = await send("/v1/responses", { model, input: "What is 17*23?", max_output_tokens: 64 }, callerBetas);
+      expect(sent.status, sent.text).toBe(200);
+      expect(sent.upstream.path).toBe(`/model/${BEDROCK_ID}/invoke`);
+      expect(sent.upstream.headers["anthropic-beta"], model).toBeUndefined();
+      expect(JSON.parse(sent.upstream.body).anthropic_beta, model).toEqual(expected);
     }
   });
 
