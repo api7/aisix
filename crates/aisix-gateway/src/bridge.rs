@@ -825,6 +825,17 @@ pub trait Bridge: Send + Sync + 'static {
         crate::hub::UPSTREAM_PROTOCOL_UNKNOWN
     }
 
+    /// Whether the upstream `ctx` dispatches to reads `cache_control`
+    /// prompt-cache markers carried in the [`ChatFormat`] — on content
+    /// parts, on a `role:"tool"` message, on `tool_calls[]` entries and on
+    /// tool definitions. A translation from a protocol whose markers the
+    /// chat form does not carry by default (Anthropic Messages) keeps them
+    /// only when this is true; everywhere else they would reach an upstream
+    /// that rejects or ignores them. The default is `false`.
+    fn reads_cache_markers(&self, _ctx: &BridgeContext) -> bool {
+        false
+    }
+
     /// Non-streaming call: one request, one response.
     async fn chat(
         &self,

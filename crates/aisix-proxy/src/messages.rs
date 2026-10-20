@@ -2154,8 +2154,8 @@ async fn cross_provider_dispatch(
 ) -> Result<DispatchOutcome, ProxyError> {
     use aisix_gateway::Bridge;
     use aisix_provider_anthropic::{
-        chat_response_into_anthropic_json, parse_inbound_request, translate_extras_to_openai_shape,
-        AnthropicSseEncoder,
+        chat_response_into_anthropic_json, wire::parse_inbound_request_with,
+        wire::translate_extras_to_openai_shape_with, wire::CacheMarkers, AnthropicSseEncoder,
     };
     use std::sync::Arc;
 
@@ -2169,25 +2169,7 @@ async fn cross_provider_dispatch(
     let bridge: Arc<dyn Bridge> = crate::dispatch::resolve_bridge(&state.hub, provider_key)
         .ok_or(ProxyError::ProviderUnavailable)?;
 
-    // Parse the Anthropic-shape body into the gateway's normalised
-    // ChatFormat. Errors here are 400 — the request is malformed
-    // before it even hits the bridge.
-    let mut chat = parse_inbound_request(body)
-        .map_err(|e| ProxyError::InvalidRequest(format!("invalid Anthropic body: {e}")))?;
-    // Force the bridge dispatch to use the operator's display name
-    // (`model_name`) so the bridge can re-resolve the upstream id
-    // through `ctx.model.upstream_model()` exactly like chat.rs does.
-    chat.model = model_name.to_string();
-
-    // Rewrite Anthropic-shaped extras into the OpenAI chat shape the
-    // non-Anthropic bridges expect: tools/tool_choice (#236),
-    // stop_sequences/metadata/thinking are translated; Anthropic-only
-    // fields (context_management, top_k, mcp_servers, …) are dropped —
-    // flattened onto an OpenAI-compatible upstream they 400 as unknown
-    // parameters (AISIX-Cloud#953).
-    translate_extras_to_openai_shape(&mut chat.extra, mapped_effort);
-
-    let is_stream = chat.is_streaming();
+    let is_stream = body.get("stream").and_then(Value::as_bool) == Some(true);
 
     // #554: bound the upstream connect with the appropriate deadline —
     // the streaming read budget for stream calls, the E2E request timeout
@@ -2196,7 +2178,16 @@ async fn cross_provider_dispatch(
     let mut ctx = crate::dispatch::bridge_ctx(
         request_id,
         model_id,
-        Arc::new(model.clone()),
+        Arc::new({
+            // `auto_prompt_caching` covers chat completions and responses
+            // requests. A `/v1/messages` caller writes its own markers, and
+            // on the Anthropic API — where this route is forwarded as it is
+            // — nothing is injected either; a translated rail must not
+            // differ from it.
+            let mut model = model.clone();
+            model.auto_prompt_caching = None;
+            model
+        }),
         provider_key_id,
         Arc::new(provider_key.clone()),
         Some(client),
@@ -2215,6 +2206,31 @@ async fn cross_provider_dispatch(
     if is_stream {
         ctx = ctx.with_non_streaming_deadline(timeouts.request);
     }
+
+    // Parse the Anthropic-shape body into the gateway's normalised
+    // ChatFormat. Errors here are 400 — the request is malformed
+    // before it even hits the bridge. The caller's prompt-cache markers
+    // survive only to an upstream that reads them (Claude or Nova behind a
+    // platform adapter); anywhere else the chat form is what it always was.
+    let markers = if bridge.reads_cache_markers(&ctx) {
+        CacheMarkers::Keep
+    } else {
+        CacheMarkers::Drop
+    };
+    let mut chat = parse_inbound_request_with(body, markers)
+        .map_err(|e| ProxyError::InvalidRequest(format!("invalid Anthropic body: {e}")))?;
+    // Force the bridge dispatch to use the operator's display name
+    // (`model_name`) so the bridge can re-resolve the upstream id
+    // through `ctx.model.upstream_model()` exactly like chat.rs does.
+    chat.model = model_name.to_string();
+
+    // Rewrite Anthropic-shaped extras into the OpenAI chat shape the
+    // non-Anthropic bridges expect: tools/tool_choice (#236),
+    // stop_sequences/metadata/thinking are translated; Anthropic-only
+    // fields (context_management, top_k, mcp_servers, …) are dropped —
+    // flattened onto an OpenAI-compatible upstream they 400 as unknown
+    // parameters (AISIX-Cloud#953).
+    translate_extras_to_openai_shape_with(&mut chat.extra, mapped_effort, markers);
     let provider_label = provider.to_ascii_lowercase();
     let provider_key_id = model.provider_key_id.as_deref().unwrap_or("unknown");
     let upstream_model = model.upstream_model().unwrap_or("unknown").to_string();
