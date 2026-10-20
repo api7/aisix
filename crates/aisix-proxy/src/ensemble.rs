@@ -79,6 +79,24 @@ pub struct ModelCallOutcome {
     pub usage_estimated: bool,
 }
 
+/// A failed sub-call: the bridge error the caller is answered with, and
+/// whether the gateway refused the call on the model's own rate limit before
+/// dispatching it.
+#[derive(Debug)]
+pub struct CallError {
+    pub source: BridgeError,
+    pub rate_limited: bool,
+}
+
+impl From<BridgeError> for CallError {
+    fn from(source: BridgeError) -> Self {
+        Self {
+            source,
+            rate_limited: false,
+        }
+    }
+}
+
 #[async_trait]
 pub trait ModelCaller: Send + Sync {
     /// `req` builds the sub-call's request. It is called once per upstream
@@ -89,7 +107,7 @@ pub trait ModelCaller: Send + Sync {
         &self,
         target: &str,
         req: &RequestBuilder<'_>,
-    ) -> Result<ModelCallOutcome, BridgeError>;
+    ) -> Result<ModelCallOutcome, CallError>;
 }
 
 /// Builds one sub-call's request on demand; see [`ModelCaller::call`].
@@ -122,7 +140,7 @@ impl ModelCaller for ProxyModelCaller<'_> {
         &self,
         target: &str,
         req: &RequestBuilder<'_>,
-    ) -> Result<ModelCallOutcome, BridgeError> {
+    ) -> Result<ModelCallOutcome, CallError> {
         // Members run concurrently, outside the attempt windows the
         // upstream clock and the response-header tap key on; say so rather
         // than report their time as the gateway's.
@@ -197,7 +215,13 @@ impl ModelCaller for ProxyModelCaller<'_> {
             // logs so an operator can attribute the throttled
             // member.
             tracing::warn!(member = %target, error = %e, "ensemble sub-call rate limited");
-            BridgeError::upstream_status(429, "rate limit exceeded for an ensemble sub-call")
+            CallError {
+                source: BridgeError::upstream_status(
+                    429,
+                    "rate limit exceeded for an ensemble sub-call",
+                ),
+                rate_limited: true,
+            }
         })?;
 
         // On a bridge error the reservation drops here → concurrency slots
@@ -280,16 +304,20 @@ pub struct SubcallFailure {
     pub error_class: &'static str,
     pub error_message: String,
     pub latency_ms: u32,
-    /// Whether the call reached the upstream (`BridgeError::reached_upstream`).
+    /// Whether the call reached the upstream.
     pub dispatched: bool,
 }
 
 impl SubcallFailure {
+    /// `rate_limited` marks a call the gateway refused on the model's own
+    /// rate limit: classed and flagged as a routing attempt refused the same
+    /// way is, not as an answer from the upstream.
     pub(crate) fn new(
         index: u32,
         kind: &'static str,
         model: &str,
         err: &BridgeError,
+        rate_limited: bool,
         started: Instant,
     ) -> Self {
         Self {
@@ -297,10 +325,14 @@ impl SubcallFailure {
             kind,
             model: model.to_string(),
             status: err.http_status(),
-            error_class: crate::attempt::routing_error_class(err),
+            error_class: if rate_limited {
+                "rate_limit_exceeded"
+            } else {
+                crate::attempt::routing_error_class(err)
+            },
             error_message: crate::attempt::attempt_error_message(err),
             latency_ms: crate::attempt::ms_since(started),
-            dispatched: err.reached_upstream(),
+            dispatched: !rate_limited && err.reached_upstream(),
         }
     }
 }
@@ -470,8 +502,15 @@ pub(crate) async fn run_ensemble_panel(
             let result =
                 call_with_optional_timeout(caller, &model, &member_req, per_call_timeout).await;
             let result = result.map_err(|err| {
-                tracing::warn!(panel_model = %model, error = %err, "ensemble panel member failed");
-                SubcallFailure::new(slot, "panel", &model, &err, started)
+                tracing::warn!(panel_model = %model, error = %err.source, "ensemble panel member failed");
+                SubcallFailure::new(
+                    slot,
+                    "panel",
+                    &model,
+                    &err.source,
+                    err.rate_limited,
+                    started,
+                )
             });
             progress.record_panel(match &result {
                 Ok(outcome) => Ok(PanelOutcome::of(slot, &model, outcome)),
@@ -556,16 +595,17 @@ pub async fn run_ensemble(
         Ok(r) => r,
         // Carry the (already-billed) panel survivors out on the judge
         // failure so the dispatch layer commits + emits them too.
-        Err(source) => {
+        Err(err) => {
             let judge = SubcallFailure::new(
                 judge_index,
                 "judge",
                 &config.judge.model,
-                &source,
+                &err.source,
+                err.rate_limited,
                 judge_started,
             );
             return Err(EnsembleError::Judge {
-                source,
+                source: err.source,
                 panel,
                 failed,
                 judge,
@@ -682,14 +722,15 @@ async fn call_with_optional_timeout(
     target: &str,
     req: &RequestBuilder<'_>,
     timeout: Option<Duration>,
-) -> Result<ModelCallOutcome, BridgeError> {
+) -> Result<ModelCallOutcome, CallError> {
     match timeout {
         Some(d) => match tokio::time::timeout(d, caller.call(target, req)).await {
             Ok(result) => result,
             Err(_) => Err(BridgeError::Timeout {
                 elapsed_ms: d.as_millis() as u64,
                 cause: String::new(),
-            }),
+            }
+            .into()),
         },
         None => caller.call(target, req).await,
     }
@@ -747,7 +788,7 @@ mod tests {
             &self,
             target: &str,
             req: &RequestBuilder<'_>,
-        ) -> Result<ModelCallOutcome, BridgeError> {
+        ) -> Result<ModelCallOutcome, CallError> {
             self.calls.lock().unwrap().push((target.to_string(), req()));
             let mut scripted = self.scripted.lock().unwrap();
             let queue = scripted

@@ -10910,7 +10910,9 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             "judge-m",
         ));
         snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
-        let app = build_router(build_state(snap, hub));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app =
+            build_router(build_state(snap, hub).with_usage_sink(aisix_obs::UsageSink::new(tx)));
 
         let body = serde_json::json!({
             "model": "council",
@@ -10927,6 +10929,19 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         // Only one copy acquires the concurrency:1 slot; the other is dropped,
         // leaving one panel response < min_responses(2) → insufficient panel.
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        // The refused copy's row says the gateway's own limit refused it
+        // before any upstream call, as a refused routing attempt's does.
+        let events = collect_events(&mut rx).await;
+        let refused: Vec<_> = events
+            .iter()
+            .filter(|e| e.attempt_kind == "panel" && e.status_code != 200)
+            .collect();
+        assert_eq!(refused.len(), 1, "{events:?}");
+        assert_eq!(refused[0].status_code, 429);
+        assert_eq!(refused[0].error_class, "rate_limit_exceeded");
+        assert_eq!(refused[0].model_id, "m-capped");
+        assert_attempt_indices_increase(&events);
     }
 
     /// #620: the per-member reservation must RELEASE on success (commit), not

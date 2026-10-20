@@ -3922,12 +3922,13 @@ async fn dispatch_ensemble(
         // The judge's row on a streaming exit that fails it before its
         // stream exists, the same row the buffered judge's failure gets.
         let judge_index = ensemble_cfg.panel.len() as u32;
-        let judge_failure = |err: &BridgeError, started: Instant| {
+        let judge_failure = |err: &BridgeError, rate_limited: bool, started: Instant| {
             crate::ensemble::SubcallFailure::new(
                 judge_index,
                 "judge",
                 &ensemble_cfg.judge.model,
                 err,
+                rate_limited,
                 started,
             )
         };
@@ -3999,7 +4000,7 @@ async fn dispatch_ensemble(
             let failure = emit_panel_then_fail(
                 &panel,
                 &failed,
-                Some(&judge_failure(&err, Instant::now())),
+                Some(&judge_failure(&err, false, Instant::now())),
                 ProxyError::Bridge(err),
             );
             reservation.commit_tokens(panel_total).await;
@@ -4029,7 +4030,7 @@ async fn dispatch_ensemble(
                 let failure = emit_panel_then_fail(
                     &panel,
                     &failed,
-                    Some(&judge_failure(&err, Instant::now())),
+                    Some(&judge_failure(&err, false, Instant::now())),
                     ProxyError::Bridge(err),
                 );
                 reservation.commit_tokens(panel_total).await;
@@ -4043,7 +4044,7 @@ async fn dispatch_ensemble(
             let failure = emit_panel_then_fail(
                 &panel,
                 &failed,
-                Some(&judge_failure(&err, Instant::now())),
+                Some(&judge_failure(&err, false, Instant::now())),
                 ProxyError::Bridge(err),
             );
             reservation.commit_tokens(panel_total).await;
@@ -4093,7 +4094,7 @@ async fn dispatch_ensemble(
                 let failure = emit_panel_then_fail(
                     &panel,
                     &failed,
-                    Some(&judge_failure(&err, Instant::now())),
+                    Some(&judge_failure(&err, true, Instant::now())),
                     ProxyError::Bridge(err),
                 );
                 reservation.commit_tokens(panel_total).await;
@@ -4118,7 +4119,7 @@ async fn dispatch_ensemble(
                 let failure = emit_panel_then_fail(
                     &panel,
                     &failed,
-                    Some(&judge_failure(&be, judge_started)),
+                    Some(&judge_failure(&be, false, judge_started)),
                     ProxyError::Bridge(be),
                 );
                 reservation.commit_tokens(panel_total).await;
@@ -4388,9 +4389,9 @@ async fn dispatch_ensemble(
                 // "successful panel members are always billed" invariant must
                 // hold on the failure exits too (same class as the output-block
                 // path). Extract the survivors + the client-facing ProxyError,
-                // then commit + emit them BEFORE returning. No judge usage event:
-                // the judge either never ran (InsufficientPanel) or produced no
-                // response (Judge). `charge: None` — the per-member events
+                // then commit + emit them BEFORE returning, beside a row for
+                // each member that failed and, on a judge failure, the judge's
+                // own failed row. `charge: None` — the per-member events
                 // already carry the bill, so passing a charge would double-count.
                 //
                 // `EnsembleError::http_status` is the single source of truth for
