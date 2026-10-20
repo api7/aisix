@@ -142,15 +142,13 @@ pub fn client_builder() -> reqwest::ClientBuilder {
 
 /// [`client_builder`] for a peer the caller, not the operator, chose (a
 /// media URL): the same connection settings and trust roots, but never
-/// the upstream mTLS client identity, which only upstreams may be shown.
+/// the upstream mTLS client identity, which only upstreams may be shown,
+/// and never `upstream.tls.verify: false`, which an operator sets for the
+/// upstreams they configured, not for any host a caller names.
 pub fn caller_chosen_peer_client_builder() -> reqwest::ClientBuilder {
     let mut b = base_client_builder();
-    let tls = &config().tls;
     for root in &crate::upstream_tls::reqwest_material().roots {
         b = b.add_root_certificate(root.clone());
-    }
-    if !tls.verify {
-        b = b.danger_accept_invalid_certs(true);
     }
     b
 }

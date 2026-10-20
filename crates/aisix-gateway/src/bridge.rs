@@ -204,7 +204,9 @@ impl BridgeContext {
     /// under, whichever kind of dispatch this context came from.
     pub fn non_streaming_ctx(&self) -> Self {
         let mut ctx = self.clone();
-        if let Some(deadline) = self.non_streaming_deadline {
+        // The result is a non-streaming context, which carries its budget
+        // in `deadline` alone.
+        if let Some(deadline) = ctx.non_streaming_deadline.take() {
             ctx.deadline = Some(deadline);
         }
         ctx

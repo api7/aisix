@@ -921,6 +921,9 @@ mod tests {
         let charged = fetched.charge(&streaming);
         assert_eq!(charged.deadline, Some(Duration::from_secs(10)));
         assert!(charged.non_streaming_deadline.unwrap() < Duration::from_secs(60));
+        // A streaming dispatch's non-streaming leg is charged on its own budget.
+        let leg = streaming.non_streaming_ctx();
+        assert!(fetched.charge(&leg).deadline.unwrap() < Duration::from_secs(60));
         let plain = ctx().with_deadline(Duration::from_secs(60));
         assert!(fetched.charge(&plain).deadline.unwrap() < Duration::from_secs(60));
         assert!(matches!(
