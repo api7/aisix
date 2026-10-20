@@ -29,7 +29,6 @@
 
 pub mod bridge;
 pub mod chat;
-pub mod content_part;
 pub mod credential;
 pub mod dns_cache;
 pub mod hub;
