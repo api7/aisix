@@ -141,16 +141,6 @@ pub async fn count_tokens(
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
-            emit_access_log(
-                &model_name,
-                &success.provider,
-                &api_key_id,
-                status,
-                elapsed,
-                &request_id,
-                None,
-                &routing,
-            );
             // One ProviderKey lookup per completion (#941).
             let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
             crate::request_metrics::record(
@@ -202,18 +192,35 @@ pub async fn count_tokens(
                 &screening,
                 routing.winner(),
             );
+            // After the event: the count's id comes off the provider's
+            // response head, which the event took.
+            let provider_request_id = crate::attribution::terminal_provider_request_id();
+            emit_access_log(
+                &model_name,
+                &success.provider,
+                &api_key_id,
+                status,
+                elapsed,
+                &request_id,
+                Some(&provider_request_id),
+                None,
+                &routing,
+            );
             success.response
         }
         Err(err) => {
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             emit_access_log(
                 &model_name,
-                "unknown",
+                last_target.provider(),
                 &api_key_id,
                 status,
                 elapsed,
                 &request_id,
+                None,
                 Some(&err),
                 &routing,
             );
@@ -222,8 +229,6 @@ pub async fn count_tokens(
             // branch used to emit `Upstream::default()`, so a 502 from a
             // real provider landed on `provider="unknown"` while the same
             // key's successes landed on the real one.
-            let attributed = crate::attribution::current().unwrap_or_default();
-            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             crate::request_metrics::record(
                 &state,
                 "/v1/messages/count_tokens",
@@ -1147,6 +1152,7 @@ fn emit_access_log(
     status: u16,
     elapsed: Duration,
     request_id: &str,
+    provider_request_id: Option<&str>,
     error: Option<&ProxyError>,
     routing: &crate::attempt::RoutingTelemetry,
 ) {
@@ -1174,9 +1180,7 @@ fn emit_access_log(
         completion_tokens: None,
         total_tokens: None,
         request_id,
-        // No provider response id: count_tokens returns only the token
-        // estimate, and no upstream response object (AISIX-Cloud#1289).
-        provider_request_id: None,
+        provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
         served_by_model: summary.served_by_model,
         routing_attempt_count: summary.attempt_count,
         routing_fallback_count: summary.fallback_count,

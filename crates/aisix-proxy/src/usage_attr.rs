@@ -1019,6 +1019,21 @@ pub(crate) fn emit_usage(
         &mut event.error_class,
         &mut event.error_message,
     );
+    if dispatched {
+        let response = crate::attribution::take_attempt_upstream_response(event.attempt_index);
+        // A surface that runs detached from the request scope (`/v1/realtime`)
+        // read its own off the upgrade response.
+        if event.upstream_response_headers.is_empty() {
+            event.upstream_response_headers = response.headers;
+        }
+        // The response object's id when it had one; otherwise — a failed
+        // attempt, a token count, an embedding, an image, a Bedrock answer —
+        // the provider's request-id header, which is what its support traces
+        // the call by.
+        if event.provider_request_id.is_empty() {
+            event.provider_request_id = sanitize_provider_response_id(&response.request_id);
+        }
+    }
     // The request's access-log line, for the families that deferred it to
     // their stream (AISIX-Cloud#1571). Here, and after the stamping above,
     // so the line and the event cannot disagree about the outcome: one
@@ -1030,6 +1045,13 @@ pub(crate) fn emit_usage(
             event.status_code,
             &event.error_class,
             &event.error_message,
+            // Only an upstream's own id: a cache hit's stored one is not this
+            // request's call.
+            if dispatched {
+                &event.provider_request_id
+            } else {
+                ""
+            },
         );
         crate::attribution::emit_deferred_access_log(&event);
     }
@@ -1066,12 +1088,6 @@ pub(crate) fn emit_usage(
         if let Some(finish) = crate::attribution::take_responses_finish() {
             event.finish_reason = finish.to_string();
         }
-    }
-    // A surface that runs detached from the request scope (`/v1/realtime`)
-    // read its own off the upgrade response.
-    if dispatched && event.upstream_response_headers.is_empty() {
-        event.upstream_response_headers =
-            crate::attribution::take_attempt_response_headers(event.attempt_index);
     }
     let emission = trace.map(|bundle| {
         event.trace_id = bundle.trace_id_hex();

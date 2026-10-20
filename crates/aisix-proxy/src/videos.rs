@@ -1505,6 +1505,19 @@ impl Telemetry<'_> {
             }
             None => (None, None),
         };
+        // AISIX-Cloud#1325: this tail never took `upstream_model` or the
+        // ProviderKey pair, and its error sites pass `provider: "unknown"`.
+        // All three come off the request's attribution cell, which the
+        // dispatch filled when it selected the target — so a failed video
+        // job is attributable to the same key its successes are.
+        let snap = self.state.snapshot.load();
+        let attributed = crate::attribution::current().unwrap_or_default();
+        let last_target = crate::request_metrics::LastTarget::new(&snap, &attributed);
+        let provider = if provider == "unknown" {
+            last_target.provider()
+        } else {
+            provider
+        };
         let log_target = crate::attribution::AccessLogTarget::current();
         let summary = routing.access_log_summary();
         let line = AccessLog {
@@ -1543,19 +1556,6 @@ impl Telemetry<'_> {
         } else {
             crate::attribution::emit_access_log(line);
         }
-        // AISIX-Cloud#1325: this tail never took `upstream_model` or the
-        // ProviderKey pair, and its error sites pass `provider: "unknown"`.
-        // All three come off the request's attribution cell, which the
-        // dispatch filled when it selected the target — so a failed video
-        // job is attributable to the same key its successes are.
-        let snap = self.state.snapshot.load();
-        let attributed = crate::attribution::current().unwrap_or_default();
-        let last_target = crate::request_metrics::LastTarget::new(&snap, &attributed);
-        let provider = if provider == "unknown" {
-            last_target.provider()
-        } else {
-            provider
-        };
         crate::request_metrics::record(
             self.state,
             self.endpoint,
