@@ -204,6 +204,23 @@ pub fn spawn(
     (sink, handle)
 }
 
+/// Run `serving` to completion, then flip `stop`, the signal the worker
+/// was [`spawn`]ed with, so it drains what is queued and exits.
+///
+/// The worker must not stop on the drain's `cancel`: a connection accepted
+/// before the drain ended is still served after it, and that request's
+/// UsageEvent is owed like any other. Stopping only once the proxy has
+/// stopped serving is what keeps those events from landing in a queue
+/// nobody reads.
+pub async fn stop_after<T>(
+    serving: impl std::future::Future<Output = T>,
+    stop: &watch::Sender<bool>,
+) -> T {
+    let served = serving.await;
+    let _ = stop.send(true);
+    served
+}
+
 async fn run(
     cfg: TelemetryConfig,
     metrics: Metrics,
@@ -1578,6 +1595,48 @@ mod tests {
         }
         drop(sink);
         worker.await.unwrap();
+
+        assert_recorded_events(&batches, &expected);
+    }
+
+    /// A request served after the drain's `cancel` emits its event after
+    /// `cancel` has flipped. The worker stops only once serving is over, so
+    /// that event is still posted.
+    #[tokio::test]
+    async fn an_event_emitted_after_the_drain_ended_is_delivered() {
+        let (server, batches) = recording_server(200).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TelemetryConfig::new(
+            format!("{}/dp/telemetry", server.uri()),
+            write_test_bundle(dir.path()),
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (sink, worker) = spawn(cfg, Metrics::new(false), stop_rx);
+
+        let expected = ordered_events(2);
+        sink.try_emit(
+            "test",
+            expected[0].clone(),
+            aisix_obs::UsageEventLabels::default(),
+        );
+        stop_after(
+            async {
+                // Long enough for a worker that had already been told to stop
+                // to drain and exit before the late request completes.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                sink.try_emit(
+                    "test",
+                    expected[1].clone(),
+                    aisix_obs::UsageEventLabels::default(),
+                );
+            },
+            &stop_tx,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), worker)
+            .await
+            .expect("the worker exits once serving is over")
+            .unwrap();
 
         assert_recorded_events(&batches, &expected);
     }

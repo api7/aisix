@@ -993,9 +993,13 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // needs `Metrics`: a usage batch it gives up on is counted against
     // `aisix_usage_event_drops_total`, the same counter the queue's own
     // drops land on.
+    //
+    // It stops on its own signal rather than `cancel`, flipped once the
+    // proxy has finished serving: see `telemetry::stop_after`.
+    let (usage_stop_tx, usage_stop_rx) = watch::channel(false);
     let (usage_sink, telemetry_task) = match telemetry_cfg {
         Some(cfg) => {
-            let (sink, handle) = telemetry::spawn(cfg, (*metrics).clone(), cancel_rx.clone());
+            let (sink, handle) = telemetry::spawn(cfg, (*metrics).clone(), usage_stop_rx);
             (sink, Some(handle))
         }
         None => (aisix_obs::UsageSink::disabled(), None),
@@ -1694,7 +1698,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         Duration::from_secs(cfg.shutdown.min_drain_secs),
     ));
 
-    proxy_serve
+    telemetry::stop_after(proxy_serve, &usage_stop_tx)
         .await
         .map_err(|e| anyhow::anyhow!("proxy serve error: {e}"))?;
     if let Some(handle) = admin_serve_handle {
