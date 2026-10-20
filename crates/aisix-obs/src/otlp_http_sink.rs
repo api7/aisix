@@ -1506,6 +1506,21 @@ fn push_usage(attributes: &mut Vec<Value>, event: &UsageEvent, operation: Option
             i64::from(creation),
         ));
     }
+    // The conventions define no per-lifetime split of cache writes.
+    for (key, value) in [
+        (
+            "aisix.cache_creation_5m_tokens",
+            event.cache_creation_ttl.cache_creation_5m_tokens,
+        ),
+        (
+            "aisix.cache_creation_1h_tokens",
+            event.cache_creation_ttl.cache_creation_1h_tokens,
+        ),
+    ] {
+        if let Some(v) = value {
+            attributes.push(attr_int(key, i64::from(v)));
+        }
+    }
     // Modality breakdowns, as the upstream reported them (each a subset of
     // its side's total). Named after the GenAI conventions' development
     // registry, which defines them beyond the v1.41 release.
@@ -2169,9 +2184,21 @@ mod tests {
             prompt_tokens: 10,
             cache_read_tokens: 300,
             cache_creation_tokens: 40,
+            cache_creation_ttl: aisix_gateway::CacheCreationTtl {
+                cache_creation_5m_tokens: Some(0),
+                cache_creation_1h_tokens: Some(40),
+            },
             completion_tokens: 5,
             ..sample_event()
         });
+        assert_eq!(
+            attr(&anthropic, "aisix.cache_creation_5m_tokens").unwrap()["intValue"],
+            "0"
+        );
+        assert_eq!(
+            attr(&anthropic, "aisix.cache_creation_1h_tokens").unwrap()["intValue"],
+            "40"
+        );
         assert_eq!(
             attr(&anthropic, "gen_ai.usage.input_tokens").unwrap()["intValue"],
             "350"
@@ -2213,6 +2240,8 @@ mod tests {
         let plain = usage(sample_event());
         assert!(attr(&plain, "gen_ai.usage.cache_read.input_tokens").is_none());
         assert!(attr(&plain, "gen_ai.usage.cache_creation.input_tokens").is_none());
+        assert!(attr(&plain, "aisix.cache_creation_5m_tokens").is_none());
+        assert!(attr(&plain, "aisix.cache_creation_1h_tokens").is_none());
     }
 
     /// A complete chat capture becomes the conventions' structured content;

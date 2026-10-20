@@ -150,6 +150,7 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
     output_tokens: 7,
     cache_creation_input_tokens: 300,
     cache_read_input_tokens: 1200,
+    cache_creation: { ephemeral_5m_input_tokens: 100, ephemeral_1h_input_tokens: 200 },
   };
   const ANTHROPIC_TOTAL_INPUT =
     ANTHROPIC_USAGE.input_tokens +
@@ -655,6 +656,9 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
       expect(row["aisix.cache_read_tokens"], route).toBe(
         ANTHROPIC_USAGE.cache_read_input_tokens,
       );
+      // The write's split by cache lifetime, as the upstream reported it.
+      expect(row["aisix.cache_creation_5m_tokens"], route).toBe(100);
+      expect(row["aisix.cache_creation_1h_tokens"], route).toBe(200);
       expect(row["aisix.cached_prompt_tokens"] ?? 0, route).toBe(0);
       // Anthropic reports no total of its own, and the event records only an
       // upstream-stated one — exactly as `/v1/messages` records it.

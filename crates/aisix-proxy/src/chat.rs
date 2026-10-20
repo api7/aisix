@@ -291,6 +291,7 @@ pub async fn chat_completions(
                         cached_prompt_tokens: success.cached_prompt_tokens,
                         cache_write_tokens: success.cache_write_tokens,
                         modality: success.modality,
+                        cache_creation_ttl: success.cache_creation_ttl,
                         reasoning_tokens: success.reasoning_tokens,
                         upstream_total_tokens: success.upstream_total_tokens,
                         reasoning_folded_into_completion: success.reasoning_folded_into_completion,
@@ -615,6 +616,7 @@ pub async fn chat_completions(
                             cached_prompt_tokens: c.cached_prompt_tokens,
                             cache_write_tokens: c.cache_write_tokens,
                             modality: c.modality,
+                            cache_creation_ttl: c.cache_creation_ttl,
                             reasoning_tokens: c.reasoning_tokens,
                             upstream_total_tokens: c.upstream_total_tokens,
                             reasoning_folded_into_completion: c.reasoning_folded_into_completion,
@@ -753,6 +755,7 @@ struct Success {
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
     modality: aisix_gateway::ModalityTokens,
+    cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
@@ -1464,6 +1467,7 @@ struct UpstreamCharge {
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
     modality: aisix_gateway::ModalityTokens,
+    cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
@@ -2377,6 +2381,7 @@ async fn dispatch(
                         cached_prompt_tokens: comp.cached_prompt_tokens,
                         cache_write_tokens: comp.cache_write_tokens,
                         modality: comp.modality,
+                        cache_creation_ttl: comp.cache_creation_ttl,
                         reasoning_tokens: comp.reasoning_tokens,
                         upstream_total_tokens: comp.upstream_total_tokens.unwrap_or(0),
                         reasoning_folded_into_completion: comp.reasoning_folded_into_completion,
@@ -2569,6 +2574,7 @@ async fn dispatch(
             cached_prompt_tokens: 0,
             cache_write_tokens: None,
             modality: Default::default(),
+            cache_creation_ttl: Default::default(),
             reasoning_tokens: 0,
             upstream_total_tokens: 0,
             reasoning_folded_into_completion: 0,
@@ -2870,6 +2876,7 @@ async fn dispatch(
                 let cached_prompt_tokens = cached.usage.cached_prompt_tokens;
                 let cache_write_tokens = cached.usage.cache_write_tokens;
                 let modality = cached.usage.modality;
+                let cache_creation_ttl = cached.usage.cache_creation_ttl;
                 let reasoning_tokens = cached.usage.reasoning_tokens;
                 let upstream_total_tokens = cached.usage.upstream_total_tokens;
                 let reasoning_folded_into_completion =
@@ -3019,6 +3026,7 @@ async fn dispatch(
                     cached_prompt_tokens,
                     cache_write_tokens,
                     modality,
+                    cache_creation_ttl,
                     reasoning_tokens,
                     upstream_total_tokens,
                     reasoning_folded_into_completion,
@@ -3429,6 +3437,7 @@ async fn dispatch(
     let cached_prompt_tokens = upstream.usage.cached_prompt_tokens;
     let cache_write_tokens = upstream.usage.cache_write_tokens;
     let modality = upstream.usage.modality;
+    let cache_creation_ttl = upstream.usage.cache_creation_ttl;
     let reasoning_tokens = upstream.usage.reasoning_tokens;
     let upstream_total_tokens = upstream.usage.upstream_total_tokens;
     let reasoning_folded_into_completion = upstream.usage.reasoning_folded_into_completion;
@@ -3495,6 +3504,7 @@ async fn dispatch(
                 cached_prompt_tokens,
                 cache_write_tokens,
                 modality,
+                cache_creation_ttl,
                 reasoning_tokens,
                 upstream_total_tokens,
                 reasoning_folded_into_completion,
@@ -3694,6 +3704,7 @@ async fn dispatch(
         cached_prompt_tokens,
         cache_write_tokens,
         modality,
+        cache_creation_ttl,
         reasoning_tokens,
         upstream_total_tokens,
         reasoning_folded_into_completion,
@@ -4277,6 +4288,7 @@ async fn dispatch_ensemble(
                         cached_prompt_tokens: comp.cached_prompt_tokens,
                         cache_write_tokens: comp.cache_write_tokens,
                         modality: comp.modality,
+                        cache_creation_ttl: comp.cache_creation_ttl,
                         reasoning_tokens: comp.reasoning_tokens,
                         upstream_total_tokens: comp.upstream_total_tokens.unwrap_or(0),
                         reasoning_folded_into_completion: comp.reasoning_folded_into_completion,
@@ -4354,6 +4366,7 @@ async fn dispatch_ensemble(
             cached_prompt_tokens: 0,
             cache_write_tokens: None,
             modality: Default::default(),
+            cache_creation_ttl: Default::default(),
             reasoning_tokens: 0,
             upstream_total_tokens: 0,
             reasoning_folded_into_completion: 0,
@@ -4500,6 +4513,7 @@ async fn dispatch_ensemble(
                 cached_prompt_tokens: effective_judge.usage.cached_prompt_tokens,
                 cache_write_tokens: effective_judge.usage.cache_write_tokens,
                 modality: effective_judge.usage.modality,
+                cache_creation_ttl: effective_judge.usage.cache_creation_ttl,
                 reasoning_tokens: effective_judge.usage.reasoning_tokens,
                 upstream_total_tokens: effective_judge.usage.upstream_total_tokens,
                 reasoning_folded_into_completion: effective_judge
@@ -4660,6 +4674,7 @@ async fn dispatch_ensemble(
         cached_prompt_tokens: metric_usage.cached_prompt_tokens,
         cache_write_tokens: metric_usage.cache_write_tokens,
         modality: metric_usage.modality,
+        cache_creation_ttl: metric_usage.cache_creation_ttl,
         reasoning_tokens: metric_usage.reasoning_tokens,
         // Request-level aggregate for Prometheus; the per-sub-call
         // UsageEvents above carry each upstream's own totals.
@@ -4892,6 +4907,7 @@ fn emit_usage_event(
         cached_prompt_tokens: extras.cached_prompt_tokens,
         cache_write_tokens: extras.cache_write_tokens,
         modality_tokens: extras.modality,
+        cache_creation_ttl: extras.cache_creation_ttl,
         reasoning_tokens: extras.reasoning_tokens,
         cache_creation_tokens: extras.cache_creation_tokens,
         cache_read_tokens: extras.cache_read_tokens,
@@ -5036,6 +5052,7 @@ struct UsageExtras {
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
     modality: aisix_gateway::ModalityTokens,
+    cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     reasoning_tokens: u32,
     /// `UsageStats::upstream_total_tokens` — the event's `total_tokens`.
     upstream_total_tokens: u32,
@@ -5307,6 +5324,7 @@ struct StreamCompletion {
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
     modality: aisix_gateway::ModalityTokens,
+    cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
@@ -5585,6 +5603,7 @@ impl EnsembleSubcall {
             cached_prompt_tokens: self.usage.cached_prompt_tokens,
             cache_write_tokens: self.usage.cache_write_tokens,
             modality: self.usage.modality,
+            cache_creation_ttl: self.usage.cache_creation_ttl,
             reasoning_tokens: self.usage.reasoning_tokens,
             upstream_total_tokens: self.usage.upstream_total_tokens,
             reasoning_folded_into_completion: self.usage.reasoning_folded_into_completion,
@@ -6009,6 +6028,7 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
                 // recorded.
                 c.upstream_total_tokens = None;
                 c.cache_creation_tokens = 0;
+                c.cache_creation_ttl = aisix_gateway::CacheCreationTtl::NONE;
                 c.cache_read_tokens = 0;
                 c.total_tokens = c.prompt_tokens as u64;
             }
@@ -6361,6 +6381,7 @@ where
                         comp.total_tokens = acc.total_tokens as u64;
                         comp.cache_write_tokens = acc.cache_write_tokens;
                         comp.modality = acc.modality;
+                        comp.cache_creation_ttl = acc.cache_creation_ttl;
                         comp.cached_prompt_tokens = acc.cached_prompt_tokens;
                         comp.reasoning_tokens = acc.reasoning_tokens;
                         comp.cache_creation_tokens = acc.cache_creation_tokens;

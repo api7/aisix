@@ -51,9 +51,9 @@ pub use bridge::{
     MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
 };
 pub use chat::{
-    ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest,
-    EmbeddingResponse, EmbeddingUsage, EmbeddingUsageSource, EmbeddingVector, FinishReason,
-    ModalityTokens, Role, ServiceTier, UsageStats,
+    CacheCreationTtl, ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject,
+    EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingUsageSource, EmbeddingVector,
+    FinishReason, ModalityTokens, Role, ServiceTier, UsageStats,
 };
 pub use credential::credential_fingerprint;
 pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};

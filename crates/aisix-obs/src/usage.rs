@@ -294,6 +294,16 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cache_creation_tokens: u32,
 
+    /// `cache_creation_5m_tokens`, `cache_creation_1h_tokens`: the part of
+    /// `cache_creation_tokens` written with a five-minute and a one-hour
+    /// cache lifetime, exactly as the upstream reported them (Anthropic
+    /// `usage.cache_creation`, Bedrock Converse `usage.cacheDetails`). A
+    /// one-hour write bills above a five-minute one. Both are absent when
+    /// the upstream reported no split; `cache_creation_tokens` stays the
+    /// total either way.
+    #[serde(flatten)]
+    pub cache_creation_ttl: aisix_gateway::CacheCreationTtl,
+
     /// Anthropic cache_read_input_tokens. Separate counter on top of
     /// input_tokens; bills at ~0.10× prompt rate.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
@@ -2202,6 +2212,30 @@ mod tests {
         assert!(!json.contains("provider_featured"));
         assert!(!json.contains("branded_provider"));
         assert!(!json.contains("pk_label"));
+    }
+
+    #[test]
+    fn cache_creation_ttl_split_rides_the_wire_only_when_reported() {
+        let split = UsageEvent {
+            cache_creation_tokens: 300,
+            cache_creation_ttl: aisix_gateway::CacheCreationTtl {
+                cache_creation_5m_tokens: Some(0),
+                cache_creation_1h_tokens: Some(300),
+            },
+            ..Default::default()
+        };
+        let json: serde_json::Value = serde_json::to_value(&split).unwrap();
+        assert_eq!(json["cache_creation_tokens"], 300);
+        assert_eq!(json["cache_creation_5m_tokens"], 0);
+        assert_eq!(json["cache_creation_1h_tokens"], 300);
+
+        let total_only = UsageEvent {
+            cache_creation_tokens: 300,
+            ..Default::default()
+        };
+        let json: serde_json::Value = serde_json::to_value(&total_only).unwrap();
+        assert!(json.get("cache_creation_5m_tokens").is_none(), "{json}");
+        assert!(json.get("cache_creation_1h_tokens").is_none(), "{json}");
     }
 
     #[test]

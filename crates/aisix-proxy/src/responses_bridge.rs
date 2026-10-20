@@ -1588,6 +1588,7 @@ pub struct ResponsesSseEncoder {
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
     modality: aisix_gateway::ModalityTokens,
+    cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
     /// The last tier an OpenAI-shape upstream reported on this stream.
@@ -1629,6 +1630,7 @@ impl ResponsesSseEncoder {
             cached_prompt_tokens: 0,
             cache_write_tokens: None,
             modality: Default::default(),
+            cache_creation_ttl: Default::default(),
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             service_tier: None,
@@ -1677,6 +1679,7 @@ impl ResponsesSseEncoder {
             self.cached_prompt_tokens = self.cached_prompt_tokens.max(u.cached_prompt_tokens);
             self.cache_write_tokens = self.cache_write_tokens.max(u.cache_write_tokens);
             self.modality = self.modality.max_fieldwise(&u.modality);
+            self.cache_creation_ttl = self.cache_creation_ttl.max_fieldwise(&u.cache_creation_ttl);
             self.cache_creation_tokens = self.cache_creation_tokens.max(u.cache_creation_tokens);
             self.cache_read_tokens = self.cache_read_tokens.max(u.cache_read_tokens);
         }
@@ -1725,6 +1728,7 @@ impl ResponsesSseEncoder {
             cached_prompt_tokens: self.cached_prompt_tokens,
             cache_write_tokens: self.cache_write_tokens,
             modality: self.modality,
+            cache_creation_ttl: self.cache_creation_ttl,
             reasoning_tokens: self.reasoning_tokens,
             cache_creation_tokens: self.cache_creation_tokens,
             cache_read_tokens: self.cache_read_tokens,
@@ -2282,6 +2286,7 @@ pub struct ResponsesStreamCompletion {
     pub cached_prompt_tokens: u32,
     pub cache_write_tokens: Option<u32>,
     pub modality: aisix_gateway::ModalityTokens,
+    pub cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     pub cache_creation_tokens: u32,
     pub cache_read_tokens: u32,
     /// See `aisix_gateway::chat::merge_stream_upstream_total`.
@@ -2538,6 +2543,7 @@ pub fn build_responses_bridge_stream(
                             comp.cached_prompt_tokens = comp.cached_prompt_tokens.max(u.cached_prompt_tokens);
                             comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);
                             comp.modality = comp.modality.max_fieldwise(&u.modality);
+                            comp.cache_creation_ttl = comp.cache_creation_ttl.max_fieldwise(&u.cache_creation_ttl);
                             comp.cache_creation_tokens = comp.cache_creation_tokens.max(u.cache_creation_tokens);
                             comp.cache_read_tokens = comp.cache_read_tokens.max(u.cache_read_tokens);
                             aisix_gateway::chat::merge_stream_upstream_total(
