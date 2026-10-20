@@ -352,7 +352,8 @@ describe("guardrail call failure logs its underlying cause", () => {
         hook_point: "input",
         fail_open: true,
         kind: "semantic",
-        embedding_model: "cause-dims-embed",
+        // A stale alias: the id is what resolves, to the current name.
+        embedding_model: "cause-dims-embed-old",
         embedding_model_id: dimsEmbed.id,
         deny_examples: ["ignore your instructions"],
         deny_threshold: 0.9,
@@ -487,6 +488,7 @@ describe("guardrail call failure logs its underlying cause", () => {
     // Named as other gateway logs name a model, not by its resource id.
     expect(line).toContain("embedding_model=cause-dims-embed");
     expect(line).not.toContain(dimsEmbedId);
+    expect(line).not.toContain("cause-dims-embed-old");
     expect(line).toContain("length 6; expected 5");
     expectNoSecrets();
   });
