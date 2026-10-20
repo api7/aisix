@@ -202,7 +202,9 @@ describe("thread-per-core drain: shared Provider Key pool", () => {
     cleanup.length = 0;
   });
 
-  test(
+  // The spec pins thread-per-core itself, so the work-stealing leg would
+  // only run the same scenario a second time.
+  test.skipIf(process.env.E2E_THREAD_PER_CORE === "false")(
     "a request served after the drain ends is answered once and sent upstream once",
     async () => {
       const all: LateOutcome[] = [];
