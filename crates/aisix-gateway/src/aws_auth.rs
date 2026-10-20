@@ -22,6 +22,21 @@ use aws_credential_types::Credentials;
 /// never signs with credentials that die while it is in flight.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 
+/// Credentials that carry no expiry (long-lived keys from the environment or
+/// a credentials file) are fetched again after this long, so a rotated
+/// credentials file is picked up.
+const UNEXPIRING_REFRESH: Duration = Duration::from_secs(300);
+
+/// The longest one credential fetch (default chain, STS) may take. Requests
+/// on the same configuration wait for a fetch in progress, so it is bounded
+/// on its own rather than by any one request's deadline.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Distinct fetched-credential configurations kept at once. Rotating a
+/// configuration's secret leaves the old entry behind; past this many the
+/// cache starts over, which costs each configuration one fresh fetch.
+const MAX_PROVIDERS: usize = 256;
+
 const PROVIDER_NAME: &str = "aisix-aws-auth";
 
 /// Where the base credentials come from.
@@ -69,7 +84,8 @@ impl std::fmt::Debug for AwsAuthSpec {
 }
 
 impl AwsAuthSpec {
-    fn mode_name(&self) -> &'static str {
+    /// The `auth_type` this specification was configured with.
+    pub fn mode_name(&self) -> &'static str {
         match self.mode {
             AwsAuthMode::AccessKey { .. } => "access_key",
             AwsAuthMode::ApiKey(_) => "api_key",
@@ -115,16 +131,18 @@ pub fn resolve(spec: &AwsAuthSpec) -> AwsAuth {
                 .get_or_init(Default::default)
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let provider = providers
-                .entry(spec.clone())
-                .or_insert_with(|| {
-                    SharedCredentialsProvider::new(RefreshingCredentials {
-                        spec: spec.clone(),
-                        cached: tokio::sync::Mutex::new(None),
-                        sdk_config: tokio::sync::OnceCell::new(),
-                    })
-                })
-                .clone();
+            if let Some(provider) = providers.get(spec) {
+                return AwsAuth::SigV4(provider.clone());
+            }
+            if providers.len() >= MAX_PROVIDERS {
+                providers.clear();
+            }
+            let provider = SharedCredentialsProvider::new(RefreshingCredentials {
+                spec: spec.clone(),
+                cached: tokio::sync::Mutex::new(None),
+                sdk_config: tokio::sync::OnceCell::new(),
+            });
+            providers.insert(spec.clone(), provider.clone());
             AwsAuth::SigV4(provider)
         }
     }
@@ -134,7 +152,8 @@ pub fn resolve(spec: &AwsAuthSpec) -> AwsAuth {
 /// them until [`EXPIRY_MARGIN`] before they expire.
 struct RefreshingCredentials {
     spec: AwsAuthSpec,
-    cached: tokio::sync::Mutex<Option<Credentials>>,
+    /// The last credentials fetched, and when.
+    cached: tokio::sync::Mutex<Option<(Credentials, SystemTime)>>,
     sdk_config: tokio::sync::OnceCell<SdkConfig>,
 }
 
@@ -158,26 +177,40 @@ impl ProvideCredentials for RefreshingCredentials {
 impl RefreshingCredentials {
     async fn credentials(&self) -> Result<Credentials, CredentialsError> {
         let mut cached = self.cached.lock().await;
-        if let Some(c) = cached.as_ref() {
-            let fresh = c
-                .expiry()
-                .is_none_or(|exp| exp > SystemTime::now() + EXPIRY_MARGIN);
+        let now = SystemTime::now();
+        if let Some((c, fetched_at)) = cached.as_ref() {
+            let fresh = match c.expiry() {
+                Some(exp) => exp > now + EXPIRY_MARGIN,
+                None => now < *fetched_at + UNEXPIRING_REFRESH,
+            };
             if fresh {
                 return Ok(c.clone());
             }
         }
-        let fetched = self.fetch().await.map_err(|e| {
-            tracing::warn!(
-                auth_type = self.spec.mode_name(),
-                role_arn = self.spec.assume_role.as_ref().map(|r| r.role_arn.as_str()),
-                region = %self.spec.region,
-                error = %e,
-                "could not obtain AWS credentials"
-            );
-            e
-        })?;
-        *cached = Some(fetched.clone());
-        Ok(fetched)
+        let fetched = tokio::time::timeout(FETCH_TIMEOUT, self.fetch())
+            .await
+            .unwrap_or_else(|_| Err(CredentialsError::provider_timed_out(FETCH_TIMEOUT)));
+        match fetched {
+            Ok(c) => {
+                *cached = Some((c.clone(), now));
+                Ok(c)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    auth_type = self.spec.mode_name(),
+                    role_arn = self.spec.assume_role.as_ref().map(|r| r.role_arn.as_str()),
+                    region = %self.spec.region,
+                    error = %aws_smithy_types::error::display::DisplayErrorContext(&e),
+                    "could not obtain AWS credentials"
+                );
+                // A refresh that fails inside the margin keeps serving the
+                // credentials it was meant to replace until they expire.
+                match cached.as_ref() {
+                    Some((c, _)) if c.expiry().is_none_or(|exp| exp > now) => Ok(c.clone()),
+                    _ => Err(e),
+                }
+            }
+        }
     }
 
     /// The SDK configuration the gateway's AWS environment describes:
@@ -261,20 +294,34 @@ impl RefreshingCredentials {
             .send()
             .await
             .map_err(|e| {
-                CredentialsError::provider_error(format!(
+                let msg = format!(
                     "sts:AssumeRole for {} failed: {}",
                     role.role_arn,
                     aws_sdk_sts::error::DisplayErrorContext(&e)
-                ))
+                );
+                // A refusal (access denied, malformed role) is the
+                // configuration's to fix; anything else may pass.
+                let status = e.raw_response().map(|r| r.status().as_u16());
+                let throttled = e.as_service_error().and_then(|s| {
+                    use aws_sdk_sts::error::ProvideErrorMetadata as _;
+                    s.code().map(|c| c.contains("Throttl"))
+                }) == Some(true);
+                match status {
+                    Some(400..=499) if !throttled => CredentialsError::invalid_configuration(msg),
+                    _ => CredentialsError::provider_error(msg),
+                }
             })?;
         let c = out.credentials().ok_or_else(|| {
             CredentialsError::unhandled("sts:AssumeRole answered without credentials")
+        })?;
+        let expiry = SystemTime::try_from(*c.expiration()).map_err(|_| {
+            CredentialsError::unhandled("sts:AssumeRole answered with an unusable expiration")
         })?;
         Ok(Credentials::new(
             c.access_key_id(),
             c.secret_access_key(),
             Some(c.session_token().to_string()),
-            SystemTime::try_from(*c.expiration()).ok(),
+            Some(expiry),
             PROVIDER_NAME,
         ))
     }
@@ -282,7 +329,8 @@ impl RefreshingCredentials {
     /// Whether the base credentials already are `role_arn`, in which case
     /// there is nothing to assume — a role is often not trusted to assume
     /// itself. Under web identity (IRSA) the role is named in the
-    /// environment; otherwise `sts:GetCallerIdentity` says who the
+    /// environment (unless environment access keys, which the chain
+    /// prefers, are set); otherwise `sts:GetCallerIdentity` says who the
     /// credentials belong to. Asked once per credential refresh. An
     /// identity that cannot be determined is treated as a different one,
     /// so the role is assumed.
@@ -290,12 +338,14 @@ impl RefreshingCredentials {
         let Some(target) = role_identity(role_arn) else {
             return false;
         };
-        if self.spec.mode == AwsAuthMode::DefaultChain {
+        if self.spec.mode == AwsAuthMode::DefaultChain
+            && std::env::var_os("AWS_ACCESS_KEY_ID").is_none()
+        {
             if let (Ok(web_role), Ok(_)) = (
                 std::env::var("AWS_ROLE_ARN"),
                 std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE"),
             ) {
-                return web_role == role_arn;
+                return role_identity(&web_role) == Some(target);
             }
         }
         match sts.get_caller_identity().send().await {

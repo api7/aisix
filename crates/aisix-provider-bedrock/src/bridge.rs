@@ -541,7 +541,12 @@ impl BedrockSecret {
     /// carries. Fetched credentials (default chain, AssumeRole) come from a
     /// cache shared by every request on the same configuration, so this
     /// reaches AWS only when they are missing or about to expire.
-    pub(crate) async fn request_auth(&self) -> Result<RequestAuth, BridgeError> {
+    pub(crate) async fn request_auth(
+        &self,
+        deadline: Option<std::time::Duration>,
+    ) -> Result<RequestAuth, BridgeError> {
+        use aws_credential_types::provider::error::CredentialsError;
+        use aws_credential_types::provider::ProvideCredentials as _;
         if self.region().trim().is_empty() {
             return Err(BridgeError::InvalidUpstreamConfig(
                 "bedrock provider_key.api_key.region is empty — \
@@ -549,22 +554,46 @@ impl BedrockSecret {
                     .into(),
             ));
         }
-        match aisix_gateway::aws_auth::resolve(&self.auth) {
-            AwsAuth::Bearer(token) => Ok(RequestAuth::Bearer(token)),
-            AwsAuth::SigV4(provider) => {
-                use aws_credential_types::provider::ProvideCredentials as _;
-                provider
-                    .provide_credentials()
-                    .await
-                    .map(RequestAuth::SigV4)
-                    .map_err(|e| {
-                        BridgeError::InvalidUpstreamCredentials(format!(
-                            "bedrock: could not obtain AWS credentials: {}",
-                            aws_smithy_types::error::display::DisplayErrorContext(&e)
-                        ))
-                    })
+        let provider = match aisix_gateway::aws_auth::resolve(&self.auth) {
+            AwsAuth::Bearer(token) => return Ok(RequestAuth::Bearer(token)),
+            AwsAuth::SigV4(provider) => provider,
+        };
+        let started = Instant::now();
+        let timed_out = |cause: &str| BridgeError::Timeout {
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            cause: cause.to_string(),
+        };
+        let fetched = match deadline {
+            Some(d) => tokio::time::timeout(d, provider.provide_credentials())
+                .await
+                .map_err(|_| timed_out(""))?,
+            None => provider.provide_credentials().await,
+        };
+        // The cause is in the gateway log, not in the caller's error: an
+        // STS refusal names the gateway's own account and role.
+        fetched.map(RequestAuth::SigV4).map_err(|e| {
+            let msg = format!(
+                "bedrock: could not obtain AWS credentials for auth_type \"{}\"{} — \
+                 the gateway log has the cause",
+                self.auth.mode_name(),
+                if self.auth.assume_role.is_some() {
+                    " with role_arn"
+                } else {
+                    ""
+                },
+            );
+            match e {
+                // Missing or refused credentials: the configuration's to fix.
+                CredentialsError::CredentialsNotLoaded(_)
+                | CredentialsError::InvalidConfiguration(_) => {
+                    BridgeError::InvalidUpstreamCredentials(msg)
+                }
+                CredentialsError::ProviderTimedOut(_) => timed_out("obtaining AWS credentials"),
+                // A credential service that failed (STS 5xx, IMDS
+                // unreachable) may answer the next attempt.
+                _ => BridgeError::Transport(msg),
             }
-        }
+        })
     }
 }
 
@@ -1407,7 +1436,7 @@ impl BedrockBridge {
         };
         // Converse paths carry no JSON body, but default_headers still apply
         // (header-level, publisher-agnostic) via the signing interceptor.
-        let auth = creds.request_auth().await?;
+        let auth = creds.request_auth(ctx.deadline).await?;
         build_client(
             &auth,
             creds.region(),

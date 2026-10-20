@@ -461,7 +461,7 @@ async fn send(
         ),
     ];
     headers.extend(endpoint.extra_headers.iter().cloned());
-    let auth = endpoint.creds.request_auth().await?;
+    let auth = endpoint.creds.request_auth(ctx.deadline).await?;
     let headers = authenticated_headers(&auth, endpoint.creds.region(), &url_text, headers, &body)?;
     let started = Instant::now();
     let client = endpoint.client.clone();

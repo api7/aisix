@@ -253,7 +253,7 @@ async fn mantle_count_tokens(
         ("content-type".to_string(), "application/json".to_string()),
         ("anthropic-version".to_string(), "2023-06-01".to_string()),
     ];
-    let auth = creds.request_auth().await?;
+    let auth = creds.request_auth(ctx.deadline).await?;
     let signed = crate::bridge::auth_headers(&auth, creds.region(), &url, &unsigned, &bytes)?;
 
     let client = aisix_gateway::upstream_tls::raw_client_for_provider_key(

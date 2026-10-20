@@ -1,4 +1,7 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
@@ -123,12 +126,41 @@ async function startSts() {
           `<UserId>AIDA0000</UserId><Account>${ACCOUNT}</Account></GetCallerIdentityResult>${meta}</GetCallerIdentityResponse>`,
       );
     }
+    if (call.action === "AssumeRoleWithWebIdentity") {
+      const n = (issued.get("web") ?? 0) + 1;
+      issued.set("web", n);
+      return xml(
+        `<AssumeRoleWithWebIdentityResponse ${ns}><AssumeRoleWithWebIdentityResult><Credentials>` +
+          `<AccessKeyId>ASIA-web-${n}</AccessKeyId><SecretAccessKey>secret-web-${n}</SecretAccessKey>` +
+          `<SessionToken>token-web-${n}</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials>` +
+          `<AssumedRoleUser><Arn>arn:aws:sts::${ACCOUNT}:assumed-role/WebRole/s</Arn><AssumedRoleId>AROA:s</AssumedRoleId></AssumedRoleUser>` +
+          `<SubjectFromWebIdentityToken>system:serviceaccount:aisix:gw</SubjectFromWebIdentityToken>` +
+          `</AssumeRoleWithWebIdentityResult>${meta}</AssumeRoleWithWebIdentityResponse>`,
+      );
+    }
     if (call.action === "AssumeRole") {
       const role = (call.roleArn ?? "").split("/").pop() ?? "";
+      // `Flaky` issues one set inside the refresh margin, then fails.
+      const failing = role === "Flaky" && (issued.get(role) ?? 0) >= 1;
+      if (role === "Denied" || role === "Broken" || failing) {
+        const [status, code] = role === "Denied" ? [403, "AccessDenied"] : [500, "InternalFailure"];
+        return {
+          status,
+          headers: { "content-type": "text/xml" },
+          body:
+            `<ErrorResponse ${ns}><Error><Type>Sender</Type><Code>${code}</Code>` +
+            `<Message>refused by the mock</Message></Error><RequestId>req-sts</RequestId></ErrorResponse>`,
+        };
+      }
       const n = (issued.get(role) ?? 0) + 1;
       issued.set(role, n);
       // `ShortLived` credentials are already inside the refresh margin.
-      const expiration = role === "ShortLived" ? new Date(Date.now() + 30_000).toISOString() : "2099-01-01T00:00:00Z";
+      const expiration =
+        role === "ShortLived"
+          ? new Date(Date.now() + 30_000).toISOString()
+          : role === "Flaky"
+            ? new Date(Date.now() + 45_000).toISOString()
+            : "2099-01-01T00:00:00Z";
       return xml(
         `<AssumeRoleResponse ${ns}><AssumeRoleResult><Credentials>` +
           `<AccessKeyId>ASIA-${role}-${n}</AccessKeyId><SecretAccessKey>secret-${role}-${n}</SecretAccessKey>` +
@@ -238,6 +270,9 @@ const PROVIDER_KEYS: Record<string, Record<string, unknown>> = {
     role_arn: `arn:aws:iam::${ACCOUNT}:role/ShortLived`,
     region: "us-east-1",
   },
+  denied: { auth_type: "default_chain", role_arn: `arn:aws:iam::${ACCOUNT}:role/Denied`, region: "us-east-1" },
+  flaky: { auth_type: "default_chain", role_arn: `arn:aws:iam::${ACCOUNT}:role/Flaky`, region: "us-east-1" },
+  broken: { auth_type: "default_chain", role_arn: `arn:aws:iam::${ACCOUNT}:role/Broken`, region: "us-east-1" },
   plain: { access_key_id: PLAIN_STATIC_KEY, secret_access_key: "plain-secret", region: "us-east-1" },
   badapikey: { auth_type: "api_key", region: "us-east-1" },
   badchain: {
@@ -413,11 +448,26 @@ describe("Bedrock provider key authentication modes", () => {
 
   test("a role the ambient identity already is is used without AssumeRole", async (ctx) => {
     if (skip(ctx)) return;
+    const stsBefore = sts!.calls.length;
     const r = await chat("chainself-llama");
     expect(r.status, r.text).toBe(200);
     expect(signer(r.sent[0])).toBe(AMBIENT_KEY);
-    expect(sts!.calls.filter((c) => c.roleArn?.endsWith("/AmbientRole"))).toEqual([]);
-    expect(sts!.calls.some((c) => c.action === "GetCallerIdentity" && c.signer === AMBIENT_KEY)).toBe(true);
+    expect(sts!.calls.slice(stsBefore)).toEqual([
+      expect.objectContaining({ action: "GetCallerIdentity", signer: AMBIENT_KEY }),
+    ]);
+  });
+
+  test("a failed refresh keeps serving credentials that have not expired yet", async (ctx) => {
+    if (skip(ctx)) return;
+    // The first set is already inside the refresh margin, so the second
+    // request refreshes; STS fails that refresh.
+    for (let i = 0; i < 2; i++) {
+      const r = await chat("flaky-llama");
+      expect(r.status, r.text).toBe(200);
+      expect(signer(r.sent[0])).toBe("ASIA-Flaky-1");
+    }
+    const assumes = sts!.calls.filter((c) => c.action === "AssumeRole" && c.roleArn?.endsWith("/Flaky"));
+    expect(assumes.length).toBeGreaterThanOrEqual(2);
   });
 
   test("assumed credentials close to expiry are refreshed before the next request signs", async (ctx) => {
@@ -455,6 +505,23 @@ describe("Bedrock provider key authentication modes", () => {
       expect(r.text).not.toContain(LEAK_MARKER);
     }
     expect(sts!.calls.length).toBe(stsBefore);
+  });
+
+  test("a refused AssumeRole is a credential error; a failing STS is not", async (ctx) => {
+    if (skip(ctx)) return;
+    const denied = await chat("denied-llama");
+    expect(denied.status, denied.text).toBe(401);
+    expect(denied.sent).toEqual([]);
+    // The caller learns which setting failed, not what STS said: a real
+    // refusal names the gateway's own account and role.
+    const message = JSON.parse(denied.text).error.message;
+    expect(message).toContain("role_arn");
+    expect(message).not.toContain("refused by the mock");
+    expect(denied.text).not.toContain(ACCOUNT);
+
+    const broken = await chat("broken-llama");
+    expect(broken.sent).toEqual([]);
+    expect(broken.status, broken.text).toBeGreaterThanOrEqual(500);
   });
 });
 
@@ -578,5 +645,79 @@ describe("Bedrock guardrail authentication modes", () => {
       roleArn: `arn:aws:iam::${ACCOUNT}:role/GuardRole`,
       externalId: "guard-ext",
     });
+  });
+});
+
+describe("Bedrock default chain on web identity (IRSA)", () => {
+  let app: SpawnedApp | undefined;
+  let bedrock: Awaited<ReturnType<typeof listen>> | undefined;
+  let sts: Awaited<ReturnType<typeof startSts>> | undefined;
+  let etcdReachable = false;
+  const tokenFile = join(tmpdir(), `aisix-e2e-web-identity-${randomUUID()}`);
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+    writeFileSync(tokenFile, "header.payload.signature");
+    bedrock = await listen(bedrockReply);
+    sts = await startSts();
+    const env = awsEnv(sts.url);
+    delete env.AWS_ACCESS_KEY_ID;
+    delete env.AWS_SECRET_ACCESS_KEY;
+    app = await spawnApp({
+      extraEnv: {
+        ...env,
+        AWS_ROLE_ARN: `arn:aws:iam::${ACCOUNT}:role/WebRole`,
+        AWS_WEB_IDENTITY_TOKEN_FILE: tokenFile,
+      },
+    });
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    const pk = await seed.createProviderKey({
+      display_name: "auth-web-pk",
+      provider: "bedrock",
+      adapter: "bedrock",
+      secret: JSON.stringify({
+        auth_type: "default_chain",
+        role_arn: `arn:aws:iam::${ACCOUNT}:role/WebRole`,
+        region: "us-east-1",
+      }),
+      api_base: bedrock.url,
+    });
+    await seed.createModel({
+      display_name: "web-llama",
+      provider: "bedrock",
+      model_name: MODELS.llama,
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["web-llama"] });
+    await waitConfigPropagation(async () => {
+      const r = await fetch(`${app!.proxyUrl}/v1/models`, { headers: { authorization: `Bearer ${CALLER}` } });
+      await r.text();
+      return r.status === 200;
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await close(bedrock?.server);
+    await close(sts?.server);
+    rmSync(tokenFile, { force: true });
+  });
+
+  test("the web-identity role is used as it is, without asking STS who it is", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "web-llama", messages: [{ role: "user", content: "hello" }] }),
+    });
+    const text = await res.text();
+    expect(res.status, text).toBe(200);
+    expect(signer(bedrock!.received[bedrock!.received.length - 1])).toBe("ASIA-web-1");
+    expect(sts!.calls.map((c) => c.action)).toEqual(["AssumeRoleWithWebIdentity"]);
   });
 });
