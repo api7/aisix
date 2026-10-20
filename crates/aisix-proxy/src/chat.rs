@@ -5881,6 +5881,9 @@ pub(crate) fn emit_abandoned_ensemble(
     if panel.is_empty() && judge.is_none() {
         return first_index;
     }
+    // Failed members cost nothing; with no answered sub-call there is no
+    // charge to settle, exactly as when nothing had returned.
+    let charged = judge.is_some() || panel.iter().any(Result::is_ok);
     let mut index = first_index;
     let mut usage = aisix_gateway::chat::UsageStats::default();
     for member in panel {
@@ -5916,6 +5919,9 @@ pub(crate) fn emit_abandoned_ensemble(
         };
         sub.emit_extras(state, snap, &pending.ctx, extras, /* blocked */ false);
         index += 1;
+    }
+    if !charged {
+        return index;
     }
     let charge = EnsembleCharge::new(state, snap, pending.entry_keys, usage, &pending.ctx);
     if pending.stream {
