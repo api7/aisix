@@ -848,7 +848,7 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
         expect(res.status, `${path} ${model}`).toBe(400);
         expect(res.body.error.type).toBe("invalid_request_error");
         expect(res.body.error.message).toBe(
-          `model \`${model}\` is ${kind} model; ${path} serves direct and routing models only`,
+          `request payload is invalid: model \`${model}\` is ${kind} model; ${path} serves direct and routing models only`,
         );
       }
     }
