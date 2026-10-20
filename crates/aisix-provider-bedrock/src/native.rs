@@ -61,7 +61,8 @@ impl BedrockBridge {
         platform::inline_media(&mut body, Platform::Bedrock, &fetched)
             .map_err(BridgeError::InvalidRequest)?;
         drop(fetched);
-        let betas = platform::header_betas(ctx.client_headers.as_deref());
+        let mut betas = platform::header_betas(ctx.client_headers.as_deref());
+        betas.extend(crate::bridge::header_betas(ctx));
         platform::shape_request(&mut body, Platform::Bedrock, upstream_id, betas);
         let bytes = Vec::from(
             aisix_gateway::json_body(&body)

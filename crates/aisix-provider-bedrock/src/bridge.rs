@@ -649,6 +649,7 @@ fn build_client(
     region: &str,
     endpoint_url: Option<&str>,
     hdr: &UpstreamHeaderContext<'_>,
+    claude: bool,
     deadline: Option<std::time::Duration>,
 ) -> Result<BedrockClient, BridgeError> {
     // The SDK enforces the deadlines the other bridges get from
@@ -715,7 +716,7 @@ fn build_client(
                 aws_smithy_runtime_api::client::auth::http::HTTP_BEARER_AUTH_SCHEME_ID,
             ]);
     }
-    let headers = filtered_extra_headers(hdr);
+    let headers = filtered_extra_headers(hdr, claude);
     if !headers.is_empty() {
         conf = conf.interceptor(DefaultHeadersInterceptor { headers });
     }
@@ -737,7 +738,11 @@ fn build_client(
 /// is FIRST-WINS (see `intercept` below), the opposite of every other
 /// delivery site, so the value would vanish with no failure to look at.
 /// It is dropped here instead, with a warning, so the operator can see it.
-fn filtered_extra_headers(hdr: &UpstreamHeaderContext<'_>) -> Vec<(String, String)> {
+///
+/// For Claude, `anthropic-beta` is dropped too: Bedrock reads Claude's
+/// betas from the body, and its paths carry these values there (see
+/// [`header_betas`]).
+fn filtered_extra_headers(hdr: &UpstreamHeaderContext<'_>, claude: bool) -> Vec<(String, String)> {
     let reserved = wire::reserved_sigv4_headers();
     // An operator's `default_headers` entry is a standing misconfiguration
     // and warns. A forwarded CLIENT header is not — the caller chooses
@@ -746,6 +751,7 @@ fn filtered_extra_headers(hdr: &UpstreamHeaderContext<'_>) -> Vec<(String, Strin
     let forwarded = aisix_gateway::ForwardedClientHeaders::resolve(hdr);
     aisix_gateway::resolve_extra_headers(hdr)
         .into_iter()
+        .filter(|(name, _)| !(claude && name.as_str() == ANTHROPIC_BETA))
         .filter(|(name, _)| {
             if reserved.contains(&name.as_str()) {
                 let dropped = "header not sent to a Bedrock upstream: AWS SigV4 derives \
@@ -768,6 +774,40 @@ fn filtered_extra_headers(hdr: &UpstreamHeaderContext<'_>) -> Vec<(String, Strin
             )
         })
         .collect()
+}
+
+const ANTHROPIC_BETA: &str = "anthropic-beta";
+
+/// The `anthropic-beta` values the ProviderKey's headers carry — its
+/// `default_headers` and a client header `forward_client_headers` admits.
+/// No `anthropic-beta` header is sent to Claude on Bedrock, which reads
+/// betas from the body, so a Claude request carries these in
+/// `anthropic_beta`, filtered to the ones Bedrock takes like the caller's
+/// own.
+pub(crate) fn header_betas(ctx: &BridgeContext) -> Vec<String> {
+    let mut headers = http::HeaderMap::new();
+    for (name, value) in aisix_gateway::resolve_extra_headers(&ctx.header_ctx()) {
+        if name.as_str() == ANTHROPIC_BETA {
+            headers.append(name, value);
+        }
+    }
+    aisix_provider_anthropic::platform::header_betas(Some(&headers))
+}
+
+/// Add `betas` to a Claude body's `anthropic_beta`, ahead of
+/// [`aisix_provider_anthropic::platform::retain_bedrock_betas`]. A single
+/// string there is read as a one-value list.
+fn fold_betas(obj: &mut serde_json::Map<String, serde_json::Value>, betas: Vec<String>) {
+    if betas.is_empty() {
+        return;
+    }
+    let mut list = match obj.remove("anthropic_beta") {
+        Some(serde_json::Value::Array(list)) => list,
+        Some(serde_json::Value::String(one)) => vec![serde_json::Value::String(one)],
+        _ => Vec::new(),
+    };
+    list.extend(betas.into_iter().map(serde_json::Value::String));
+    obj.insert("anthropic_beta".to_string(), serde_json::Value::Array(list));
 }
 
 /// Apply the per-`ProviderKey` request/response **body** override pipeline to
@@ -1234,6 +1274,7 @@ fn shape_invoke_body(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     req: &ChatFormat,
     upstream_id: &str,
+    header_betas: Vec<String>,
 ) {
     if let Some(stops) = crate::converse_req::stop_sequences(req, upstream_id) {
         obj.insert("stop_sequences".into(), stops.into());
@@ -1258,6 +1299,7 @@ fn shape_invoke_body(
         }
     }
     aisix_provider_anthropic::platform::retain_bedrock_thinking_display(obj);
+    fold_betas(obj, header_betas);
     aisix_provider_anthropic::platform::retain_bedrock_betas(obj);
 }
 
@@ -1325,7 +1367,7 @@ impl BedrockBridge {
             // URL-borne `model` into the /invoke body.
             apply_body_overrides(&mut body_value, ctx);
             if let Some(obj) = body_value.as_object_mut() {
-                shape_invoke_body(obj, &req, upstream_id);
+                shape_invoke_body(obj, &req, upstream_id, header_betas(ctx));
                 obj.remove("model");
                 obj.remove("stream");
                 obj.insert(
@@ -1409,7 +1451,7 @@ impl BedrockBridge {
             ),
             creds,
             base,
-            extra_headers: filtered_extra_headers(&ctx.header_ctx()),
+            extra_headers: filtered_extra_headers(&ctx.header_ctx(), false),
         })
     }
 
@@ -1439,11 +1481,15 @@ impl BedrockBridge {
         // Converse paths carry no JSON body, but default_headers still apply
         // (header-level, publisher-agnostic) via the signing interceptor.
         let auth = creds.request_auth(ctx.deadline).await?;
+        let claude = upstream_model(ctx).is_ok_and(|id| {
+            BedrockPublisher::from_model_id(id) == Some(BedrockPublisher::Anthropic)
+        });
         build_client(
             &auth,
             creds.region(),
             endpoint_url,
             &ctx.header_ctx(),
+            claude,
             ctx.deadline,
         )
     }
@@ -1481,10 +1527,9 @@ impl BedrockBridge {
             &req,
             upstream_id,
             &fetched,
-            auto_prompt_caching_ttl(&ctx.model),
             tool_config.as_ref(),
             native.guardrail.is_some(),
-            pk_param_constraints(ctx),
+            ctx,
         )?;
 
         let started = Instant::now();
@@ -1572,10 +1617,9 @@ impl BedrockBridge {
             &req,
             upstream_id,
             &fetched,
-            auto_prompt_caching_ttl(&ctx.model),
             tool_config.as_ref(),
             native.guardrail.is_some(),
-            pk_param_constraints(ctx),
+            ctx,
         )?;
 
         let started = Instant::now();
@@ -1662,11 +1706,11 @@ impl ConverseParts {
         req: &ChatFormat,
         upstream_id: &str,
         fetched: &FetchedMedia,
-        auto_cache_ttl: Option<&str>,
         tool_config: Option<&ToolConfiguration>,
         guarded: bool,
-        constraints: Option<&ParamConstraints>,
+        ctx: &BridgeContext,
     ) -> Result<Self, BridgeError> {
+        let auto_cache_ttl = auto_prompt_caching_ttl(&ctx.model);
         let publisher = BedrockPublisher::from_model_id(upstream_id);
         // Converse rejects tool blocks in a request without a
         // `toolConfig`, so with no tools to send the history is rewritten.
@@ -1684,8 +1728,13 @@ impl ConverseParts {
             guarded,
         )?;
         let (additional, thinking_max_tokens) =
-            build_converse_additional_model_request_fields(req, upstream_id, tool_config)?;
-        let inference = build_inference_config(req, upstream_id, thinking_max_tokens, constraints);
+            build_converse_additional_model_request_fields(req, upstream_id, tool_config, ctx)?;
+        let inference = build_inference_config(
+            req,
+            upstream_id,
+            thinking_max_tokens,
+            pk_param_constraints(ctx),
+        );
         Ok(Self {
             systems,
             messages,
@@ -2917,6 +2966,7 @@ fn build_converse_additional_model_request_fields(
     req: &ChatFormat,
     upstream_id: &str,
     tool_config: Option<&ToolConfiguration>,
+    ctx: &BridgeContext,
 ) -> Result<(Option<aws_smithy_types::Document>, Option<u32>), BridgeError> {
     let mut fields = crate::converse_req::caller_additional_fields(req);
     let mut thinking_max_tokens = None;
@@ -2934,6 +2984,7 @@ fn build_converse_additional_model_request_fields(
             }
         }
         aisix_provider_anthropic::platform::retain_bedrock_thinking_display(&mut fields);
+        fold_betas(&mut fields, header_betas(ctx));
         aisix_provider_anthropic::platform::retain_bedrock_betas(&mut fields);
     } else if let Some((name, value)) = crate::converse_req::reasoning_field(req, upstream_id)? {
         fields.insert(name.to_string(), value);
@@ -7494,7 +7545,7 @@ mod forwarded_header_tests {
         let inbound = header_map(&[("x-user-jwt", "callers-own")]);
         let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
         assert_eq!(
-            filtered_extra_headers(&ctx),
+            filtered_extra_headers(&ctx, false),
             vec![("x-user-jwt".to_string(), "callers-own".to_string())]
         );
     }
@@ -7508,7 +7559,7 @@ mod forwarded_header_tests {
         let inbound = header_map(&[("x-user-jwt", "callers-own")]);
         let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
         assert_eq!(
-            filtered_extra_headers(&ctx),
+            filtered_extra_headers(&ctx, false),
             vec![("x-user-jwt".to_string(), "static".to_string())]
         );
     }
@@ -7524,7 +7575,7 @@ mod forwarded_header_tests {
             let inbound = header_map(&[(slot, "callers-own")]);
             let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
             assert_eq!(
-                filtered_extra_headers(&ctx),
+                filtered_extra_headers(&ctx, false),
                 vec![(slot.to_string(), "callers-own".to_string())],
                 "{slot}"
             );
@@ -7541,7 +7592,27 @@ mod forwarded_header_tests {
             let r = overrides(&[(slot, "static")], &[slot]);
             let inbound = header_map(&[(slot, "callers-own")]);
             let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
-            assert!(filtered_extra_headers(&ctx).is_empty(), "{slot}");
+            assert!(filtered_extra_headers(&ctx, false).is_empty(), "{slot}");
         }
+    }
+
+    /// Claude's betas travel in the body, so the header is not sent to it
+    /// from either source; another publisher's request keeps it.
+    #[test]
+    fn anthropic_beta_is_not_a_header_for_claude() {
+        let r = overrides(
+            &[("anthropic-beta", "context-1m-2025-08-07")],
+            &["anthropic-beta"],
+        );
+        let inbound = header_map(&[("anthropic-beta", "files-api-2025-04-14")]);
+        let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+        assert!(filtered_extra_headers(&ctx, true).is_empty());
+        assert_eq!(
+            filtered_extra_headers(&ctx, false),
+            vec![(
+                "anthropic-beta".to_string(),
+                "context-1m-2025-08-07".to_string()
+            )]
+        );
     }
 }
