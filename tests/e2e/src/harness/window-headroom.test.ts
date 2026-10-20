@@ -62,4 +62,37 @@ describe("awaitWindowHeadroom", () => {
     await pending;
     expect(settled).toBe(true);
   });
+
+  test("measures the headroom against the window it is given", async () => {
+    vi.useFakeTimers();
+    // 80s before UTC midnight is 20s before a minute ends: short for a
+    // minute counter, ample for the day counter asked about.
+    vi.setSystemTime(new Date("2026-01-01T23:58:40.000Z"));
+
+    let settled = false;
+    const pending = awaitWindowHeadroom(30, 86_400).then(() => {
+      settled = true;
+    });
+    await pending;
+    expect(settled).toBe(true);
+  });
+
+  test("waits past UTC midnight for a day window", async () => {
+    vi.useFakeTimers();
+    // 90s before midnight, asking for more headroom than a minute holds:
+    // only the day window can satisfy it, and only after midnight.
+    vi.setSystemTime(new Date("2026-01-01T23:58:30.000Z"));
+
+    let settled = false;
+    const pending = awaitWindowHeadroom(120, 86_400).then(() => {
+      settled = true;
+    });
+
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(59_200);
+    await pending;
+    expect(settled).toBe(true);
+  });
 });

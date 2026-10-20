@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  awaitWindowHeadroom,
   EtcdClient,
   SeedClient,
   spawnApp,
@@ -46,14 +47,6 @@ const CHAT_BODY = {
   ],
   usage: { prompt_tokens: 8, completion_tokens: 8, total_tokens: 16 },
 };
-
-/** Day buckets roll at UTC midnight; a burst that starts seconds before
- * it would split across two buckets and the 429 assertions would flap. */
-async function awaitDayWindowHeadroom(headroomSecs = 15): Promise<void> {
-  const secsLeft = 86_400 - (Math.floor(Date.now() / 1000) % 86_400);
-  if (secsLeft >= headroomSecs) return;
-  await new Promise((r) => setTimeout(r, secsLeft * 1000 + 100));
-}
 
 describe("rate limit e2e: day window (#771)", () => {
   let app: SpawnedApp | undefined;
@@ -162,7 +155,7 @@ describe("rate limit e2e: day window (#771)", () => {
       return;
     }
     // Propagation is gated in beforeAll on the last-seeded sentinel key.
-    await awaitDayWindowHeadroom();
+    await awaitWindowHeadroom(15, 86_400);
 
     // Key A succeeds and commits 16 tokens against the team's 10/day.
     const first = await chat(KEY_A_PLAINTEXT);
@@ -180,7 +173,7 @@ describe("rate limit e2e: day window (#771)", () => {
       ctx.skip();
       return;
     }
-    await awaitDayWindowHeadroom();
+    await awaitWindowHeadroom(15, 86_400);
 
     const first = await chat(KEY_C_PLAINTEXT);
     expect(first.status).toBe(200);

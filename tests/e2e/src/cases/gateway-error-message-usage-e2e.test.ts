@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { WebSocket as WsClient, WebSocketServer, type WebSocket as WsSocket } from "ws";
 import {
+  awaitWindowHeadroom,
   EtcdClient,
   SeedClient,
   spawnApp,
@@ -517,6 +518,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
 
     await expectNamed(await chat("gem-ghost-chat"), "unknown model", notFound("gem-ghost-chat"));
 
+    await awaitWindowHeadroom();
     expect((await chat("gem-chat", "hello", LIMITED)).status).toBe(200);
     const limited = await chat("gem-chat", "hello", LIMITED);
     expect(limited.status).toBe(429);
@@ -705,6 +707,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
     expect(a2aBlockEvent.get("error_message")).toBe(
       "request blocked by content policy (guardrail 'gem-input-block')",
     );
+    await awaitWindowHeadroom();
     await a2a("hello", LIMITED_A2A);
     const a2aLimited = await a2a("hello", LIMITED_A2A);
     expect(a2aLimited.status).toBe(429);
@@ -731,6 +734,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
     expect(mcpBlockEvent.get("error_message")).toBe(
       "tool call blocked by content policy (guardrail 'gem-input-block')",
     );
+    await awaitWindowHeadroom();
     await tool("hello", LIMITED_MCP);
     const mcpLimited = await tool("hello", LIMITED_MCP);
     expect(mcpLimited.status).toBe(429);

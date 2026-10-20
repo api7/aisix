@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  EtcdClient, ProxyClient, SeedClient, spawnApp, startOpenAiUpstream,
+  awaitWindowHeadroom, EtcdClient, ProxyClient, SeedClient, spawnApp, startOpenAiUpstream,
   waitConfigPropagation, type OpenAiUpstream, type SpawnedApp,
 } from "../harness/index.js";
 import { metricDelta, scrapeMetrics } from "../harness/metrics.js";
@@ -140,6 +140,7 @@ describe("metric name labels resolve from the named documents", () => {
   test("a rejection names its policy, and a layer with no policy leaves both labels empty alike", async (ctx) => {
     if (!reachable) return ctx.skip();
     const before = await scrapeMetrics(app!.metricsUrl);
+    await awaitWindowHeadroom();
     expect((await chat(app!, POLICY_KEY)).status).toBe(200);
     expect((await chat(app!, POLICY_KEY)).status).toBe(429);
     const after = await scrapeMetrics(app!.metricsUrl);
@@ -231,6 +232,7 @@ describe("name labels are opt-in", () => {
 
   test("with no label selection no family renders a name label, and the defaults keep their sets", async (ctx) => {
     if (!reachable) return ctx.skip();
+    await awaitWindowHeadroom();
     expect((await chat(app!, NAMED_KEY)).status).toBe(200);
     expect((await chat(app!, NAMED_KEY)).status).toBe(429);
     const scrape = await scrapeText(app!);

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  awaitWindowHeadroom,
   EtcdClient,
   ProxyClient,
   SeedClient,
@@ -609,6 +610,7 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
         return;
       }
 
+      await awaitWindowHeadroom(10, 86_400);
       const first = await ensembleRequest(model, caller, stream);
       await first.text();
       expect(first.status).toBe(502);
@@ -625,6 +627,7 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
       return;
     }
 
+    await awaitWindowHeadroom(10, 86_400);
     const first = await ensembleRequest(PANEL_MEMBER_QUOTA_MODEL, CALLER, false);
     await first.text();
     expect(first.status).toBe(200);
@@ -640,6 +643,7 @@ describe("ensemble Prometheus token and TTFT coverage", () => {
       return;
     }
 
+    await awaitWindowHeadroom(10, 86_400);
     const first = await ensembleRequest(JUDGE_MEMBER_QUOTA_MODEL, CALLER, false);
     await first.text();
     expect(first.status).toBe(200);

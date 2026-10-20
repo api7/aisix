@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  awaitWindowHeadroom,
   EtcdClient,
   ProxyClient,
   SeedClient,
@@ -866,6 +867,7 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
     if (!ready(ctx)) return;
     // 381 + 62 = 443 tokens against a 400-token minute: the first call is
     // admitted, and only a committed count can refuse the second.
+    await awaitWindowHeadroom();
     const first = await post("/v1/systemone", systemOneBody("dec-typesafe"), TPM_CALLER);
     expect(first.status).toBe(200);
     const second = await post("/v1/systemone", systemOneBody("dec-typesafe"), TPM_CALLER);
