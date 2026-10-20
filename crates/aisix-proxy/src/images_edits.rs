@@ -213,10 +213,14 @@ pub async fn image_edits(
             let snapshot = snapshot.unwrap_or_else(|| state.snapshot.load());
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             crate::images::emit_access_log(
                 ENDPOINT,
-                "unknown",
-                "unknown",
+                Some(attributed.requested_model.as_str())
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or("unknown"),
+                last_target.provider(),
                 &api_key_id,
                 status,
                 elapsed,
@@ -227,10 +231,8 @@ pub async fn image_edits(
             // AISIX-Cloud#1325: the form is parsed inside the dispatch that
             // failed, so this branch never sees the model — the request's
             // attribution cell recorded the target it selected.
-            let attributed = crate::attribution::current().unwrap_or_default();
             let metric_model =
                 crate::request_metrics::LastTarget::requested_model(&snapshot, &attributed);
-            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             crate::request_metrics::record(
                 &state,
                 ENDPOINT,

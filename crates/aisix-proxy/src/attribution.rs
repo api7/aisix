@@ -441,9 +441,10 @@ struct Cell {
     terminal_upstream: Option<Duration>,
     /// See [`note_semantic_decision`].
     semantic: Option<aisix_obs::SemanticAccessLog>,
-    /// See [`note_terminal_error`]: `(status, error_class, error_message)`
-    /// of the terminal event, `None` when it named no failure.
-    terminal_error: Option<(u16, String, String)>,
+    /// See [`note_terminal_error`]: `(status, error_class, error_message,
+    /// provider_request_id)` of the terminal event, `None` when it named no
+    /// failure.
+    terminal_error: Option<(u16, String, String, String)>,
     /// The `upstream` end-to-end observation has been recorded.
     e2e_upstream_recorded: bool,
     /// See [`UpstreamClock`].
@@ -464,10 +465,9 @@ struct Cell {
     /// its headers under its index; from then on the "latest response"
     /// fallback belongs to nobody.
     attempts_settled: bool,
-    /// Each settled attempt's upstream response headers, by attempt index,
-    /// until that attempt's usage event takes them.
-    attempt_response_headers:
-        std::collections::BTreeMap<u32, std::collections::BTreeMap<String, String>>,
+    /// What each settled attempt's upstream response left, by attempt
+    /// index, until that attempt's usage event takes it.
+    attempt_responses: std::collections::BTreeMap<u32, aisix_gateway::UpstreamResponseCapture>,
 }
 
 /// How long this request has spent waiting on an upstream, measured from
@@ -530,8 +530,8 @@ impl Cell {
     /// the terminal event, so the event is known by then even where the
     /// line was built first.
     fn name_failure(&self, record: &mut aisix_obs::AccessLogRecord) {
-        if let Some((status, class, message)) = &self.terminal_error {
-            record.fill_error_if_absent(*status, class, message);
+        if let Some((status, class, message, provider_request_id)) = &self.terminal_error {
+            record.fill_failure_if_absent(*status, class, message, provider_request_id);
         }
     }
 
@@ -1317,12 +1317,12 @@ pub(crate) fn note_attempt_started(attempt: InFlightAttempt) {
 /// is kept whole (`won`).
 pub(crate) fn note_attempt_settled(rec: &AttemptRecord) {
     let _ = CURRENT.try_with(|a| {
-        let headers = a.response_tap.take();
+        let response = a.response_tap.take();
         let mut cell = a.lock();
         cell.attempts_settled = true;
         cell.upstream_clock.settle(Instant::now(), rec.success);
-        if !headers.is_empty() {
-            cell.attempt_response_headers.insert(rec.index, headers);
+        if !response.is_empty() {
+            cell.attempt_responses.insert(rec.index, response);
         }
     });
     with_cancel(|c| {
@@ -1436,9 +1436,20 @@ pub(crate) fn note_e2e_downstream(
 /// Note the failure the request's terminal usage event names, so the
 /// access-log line carries it too ([`Cell::name_failure`]). Called from the
 /// emission chokepoint, so every family records it the same way.
-pub(crate) fn note_terminal_error(status: u16, error_class: &str, error_message: &str) {
-    let failure = (!error_class.is_empty())
-        .then(|| (status, error_class.to_string(), error_message.to_string()));
+pub(crate) fn note_terminal_error(
+    status: u16,
+    error_class: &str,
+    error_message: &str,
+    provider_request_id: &str,
+) {
+    let failure = (!error_class.is_empty()).then(|| {
+        (
+            status,
+            error_class.to_string(),
+            error_message.to_string(),
+            provider_request_id.to_string(),
+        )
+    });
     let _ = CURRENT.try_with(|a| a.lock().terminal_error = failure);
 }
 
@@ -1524,17 +1535,17 @@ pub(crate) fn note_upstream_wait_unmeasured() {
     let _ = CURRENT.try_with(|a| a.lock().upstream_unmeasured = true);
 }
 
-/// The upstream response headers recorded for the attempt `attempt_index`
-/// names, moved out so each attempt's are reported once. An attempt the
-/// routing telemetry never settled (a surface without it) takes the latest
-/// response the tap saw.
-pub(crate) fn take_attempt_response_headers(
+/// What the upstream response of the attempt `attempt_index` names left —
+/// the exporters' headers and the provider's request id — moved out so each
+/// attempt's are reported once. An attempt the routing telemetry never
+/// settled (a surface without it) takes the latest response the tap saw.
+pub(crate) fn take_attempt_upstream_response(
     attempt_index: u32,
-) -> std::collections::BTreeMap<String, String> {
+) -> aisix_gateway::UpstreamResponseCapture {
     CURRENT
         .try_with(|a| {
             let mut cell = a.lock();
-            if let Some(stored) = cell.attempt_response_headers.remove(&attempt_index) {
+            if let Some(stored) = cell.attempt_responses.remove(&attempt_index) {
                 return stored;
             }
             if cell.attempts_settled || cell.upstream_unmeasured {

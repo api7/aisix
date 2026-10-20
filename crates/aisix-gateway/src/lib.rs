@@ -59,7 +59,10 @@ pub use chat::{
 };
 pub use credential::credential_fingerprint;
 pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};
-pub use response_tap::{capture_header_values, note_upstream_response, ResponseHeaderTap};
+pub use response_tap::{
+    capture_header_values, note_upstream_response, provider_request_id, ResponseHeaderTap,
+    UpstreamResponseCapture,
+};
 pub use sse::{SseDecoder, SseEvent, SseFrameTooLarge};
 pub use structured_output::{
     apply_schema_limits, close_object_schemas, json_schema_from_response_format,

@@ -434,12 +434,24 @@ impl AccessLogRecord {
     /// that already names an error keeps it, and a line reporting a
     /// different status than the event describes another outcome — a
     /// caller that left after the line was written — so it is left alone.
-    pub fn fill_error_if_absent(&mut self, status: u16, error_kind: &str, error: &str) {
-        if self.error_kind.is_some()
-            || self.error.is_some()
-            || error_kind.is_empty()
-            || self.status != status
-        {
+    ///
+    /// The event's `provider_request_id` fills a line that has none, whether
+    /// or not it already names the error: the line of a failed request is
+    /// written by a handler that never saw the upstream's response head.
+    pub fn fill_failure_if_absent(
+        &mut self,
+        status: u16,
+        error_kind: &str,
+        error: &str,
+        provider_request_id: &str,
+    ) {
+        if error_kind.is_empty() || self.status != status {
+            return;
+        }
+        if self.provider_request_id.is_none() && !provider_request_id.is_empty() {
+            self.provider_request_id = Some(provider_request_id.to_string());
+        }
+        if self.error_kind.is_some() || self.error.is_some() {
             return;
         }
         self.error_kind = Some(error_kind.to_string());

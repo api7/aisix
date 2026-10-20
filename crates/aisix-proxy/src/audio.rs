@@ -255,11 +255,15 @@ pub async fn transcriptions(
             let snapshot = snapshot.unwrap_or_else(|| state.snapshot.load());
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             emit_access_log(
                 "POST",
                 "/v1/audio/transcriptions",
-                "unknown",
-                "unknown",
+                Some(attributed.requested_model.as_str())
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or("unknown"),
+                last_target.provider(),
                 &api_key_id,
                 status,
                 elapsed,
@@ -273,10 +277,8 @@ pub async fn transcriptions(
             // target it selected, so an upstream failure here is attributed
             // exactly like on the JSON endpoints instead of landing wholly
             // on `unknown`.
-            let attributed = crate::attribution::current().unwrap_or_default();
             let metric_model =
                 crate::request_metrics::LastTarget::requested_model(&snapshot, &attributed);
-            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             crate::request_metrics::record(
                 &state,
                 "/v1/audio/transcriptions",
@@ -488,11 +490,15 @@ pub async fn translations(
             let snapshot = snapshot.unwrap_or_else(|| state.snapshot.load());
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             emit_access_log(
                 "POST",
                 "/v1/audio/translations",
-                "unknown",
-                "unknown",
+                Some(attributed.requested_model.as_str())
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or("unknown"),
+                last_target.provider(),
                 &api_key_id,
                 status,
                 elapsed,
@@ -506,10 +512,8 @@ pub async fn translations(
             // target it selected, so an upstream failure here is attributed
             // exactly like on the JSON endpoints instead of landing wholly
             // on `unknown`.
-            let attributed = crate::attribution::current().unwrap_or_default();
             let metric_model =
                 crate::request_metrics::LastTarget::requested_model(&snapshot, &attributed);
-            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             crate::request_metrics::record(
                 &state,
                 "/v1/audio/translations",
@@ -754,11 +758,13 @@ pub async fn speech(
         Err(err) => {
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             emit_access_log(
                 "POST",
                 "/v1/audio/speech",
                 &model_name,
-                "unknown",
+                last_target.provider(),
                 &api_key_id,
                 status,
                 elapsed,
@@ -771,8 +777,6 @@ pub async fn speech(
             // branch used to emit `Upstream::default()`, so a 502 from a
             // real provider landed on `provider="unknown"` while the same
             // key's successes landed on the real one.
-            let attributed = crate::attribution::current().unwrap_or_default();
-            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             crate::request_metrics::record(
                 &state,
                 "/v1/audio/speech",

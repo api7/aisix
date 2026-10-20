@@ -199,6 +199,12 @@ async function startUpstream(): Promise<{ server: Server; baseUrl: string }> {
       res.end(JSON.stringify({ message: `no route ${path}` }));
     });
   });
+  // Node closes an idle keep-alive connection after 5s, which is about how
+  // long the gateway's pooled connection to this upstream sits idle between
+  // the cases that use it; a request sent as the close lands fails that
+  // attempt and is retried. Never closing first takes the race away.
+  server.keepAliveTimeout = 120_000;
+  server.headersTimeout = 125_000;
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const addr = server.address();
   if (addr === null || typeof addr === "string") throw new Error("no port");
@@ -312,7 +318,15 @@ describe("UsageEvent: prompt-cache writes split by cache lifetime", () => {
     expect(res.status, text).toBe(200);
     const requestId = res.headers.get("x-aisix-request-id") ?? "";
     expect(requestId, "x-aisix-request-id").not.toBe("");
-    return waitForSlsLog(sls!, LOGSTORE, (l) => l.get("request_id") === requestId, `usage row for ${requestId}`, 15_000);
+    // The attempt that answered: a retried request also has a row for the
+    // attempt that failed first, with the same request id and no usage.
+    return waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (l) => l.get("request_id") === requestId && l.get("status_code") === "200",
+      `usage row for ${requestId}`,
+      15_000,
+    );
   }
 
   const split: Array<[string, Protocol, string, boolean]> = [];

@@ -493,7 +493,7 @@ pub async fn chat_completions(
                 path,
                 status,
                 elapsed,
-                None,
+                Some(last_target.provider()).filter(|p| *p != crate::request_metrics::UNKNOWN),
                 Some(&model_name),
                 Some(&api_key_id),
                 al_prompt,
