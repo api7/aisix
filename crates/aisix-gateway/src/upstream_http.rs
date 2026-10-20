@@ -478,6 +478,18 @@ mod tests {
                  `upstream_http::config()`",
             ),
             (
+                // The STS / default-chain loader behind Bedrock credentials.
+                "aws_config::defaults(",
+                "upstream_tls::aws_http_client()",
+                "AWS SDK configuration must be built on `upstream_tls::aws_http_client()`",
+            ),
+            (
+                "aws_config::defaults(",
+                "timeout_config",
+                "AWS SDK configuration must carry a `TimeoutConfig` built from \
+                 `upstream_http::config()`",
+            ),
+            (
                 // `object_store`'s own `ClientOptions` defaults carry
                 // neither the deployment's trust roots nor its pool and
                 // dial budgets — it leaves `pool_idle_timeout` unset,

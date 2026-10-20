@@ -6,9 +6,22 @@
       "oneOf": [
         {
           "additionalProperties": false,
+          "dependencies": {
+            "external_id": [
+              "role_arn"
+            ],
+            "role_session_name": [
+              "role_arn"
+            ]
+          },
           "properties": {
             "access_key_id": {
               "description": "AWS access key ID for static Bedrock guardrail credentials.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "external_id": {
+              "description": "External ID the role's trust policy requires. Requires `role_arn`.",
               "minLength": 1,
               "type": "string"
             },
@@ -19,8 +32,23 @@
               ],
               "type": "string"
             },
+            "role_arn": {
+              "description": "ARN of an IAM role to assume with these credentials through `sts:AssumeRole`. The temporary credentials are refreshed before they expire. When the credentials already belong to this role, they are used as they are.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "role_session_name": {
+              "description": "Session name for the assumed role. Requires `role_arn`. When omitted, the gateway generates one.",
+              "minLength": 1,
+              "type": "string"
+            },
             "secret_access_key": {
               "description": "AWS secret access key used to authenticate requests to Amazon Bedrock. The gateway does not log the plaintext value.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "session_token": {
+              "description": "AWS session token that accompanies temporary access keys. The gateway does not log the plaintext value.",
               "minLength": 1,
               "type": "string"
             }
@@ -29,6 +57,69 @@
             "access_key_id",
             "kind",
             "secret_access_key"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A Bedrock API key, sent as a bearer token instead of a SigV4 signature.",
+          "properties": {
+            "api_key": {
+              "description": "Amazon Bedrock API key. The gateway does not log the plaintext value.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "description": "Credential mode for an Amazon Bedrock API key.",
+              "enum": [
+                "api_key"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "api_key",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "dependencies": {
+            "external_id": [
+              "role_arn"
+            ],
+            "role_session_name": [
+              "role_arn"
+            ]
+          },
+          "description": "Credentials from the gateway's own AWS environment: environment variables, web identity (for example IRSA on EKS), the ECS container credentials endpoint, or the EC2 instance profile. Temporary credentials are refreshed before they expire.",
+          "properties": {
+            "external_id": {
+              "description": "External ID the role's trust policy requires. Requires `role_arn`.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "description": "Credential mode that uses the gateway's own AWS environment.",
+              "enum": [
+                "default_chain"
+              ],
+              "type": "string"
+            },
+            "role_arn": {
+              "description": "ARN of an IAM role to assume with these credentials through `sts:AssumeRole`. The temporary credentials are refreshed before they expire. When the credentials already belong to this role, they are used as they are.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "role_session_name": {
+              "description": "Session name for the assumed role. Requires `role_arn`. When omitted, the gateway generates one.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
           ],
           "type": "object"
         }

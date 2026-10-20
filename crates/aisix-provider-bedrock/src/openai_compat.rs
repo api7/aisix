@@ -11,7 +11,7 @@
 //! signed with SigV4 for the `bedrock` service.
 
 use std::borrow::Cow;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use aisix_gateway::content_part::{parse_part, ContentPart, MediaSource};
 use aisix_gateway::media_fetch::{fetch_media_urls, Encoding};
@@ -23,12 +23,12 @@ use aisix_provider_openai::wire::{
     build_request, messages_from, response_into_chat_response, stream_chunk_into_chat_chunk,
     DeveloperRoleMode, OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
 };
-use aws_credential_types::Credentials;
-use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
 use futures::StreamExt;
 use serde_json::Value;
 
-use crate::bridge::{capability_id, is_arn, strip_region_prefix, BedrockSecret};
+use crate::bridge::{
+    auth_headers, capability_id, is_arn, strip_region_prefix, BedrockSecret, RequestAuth,
+};
 
 const CHAT_COMPLETIONS_PATH: &str = "/openai/v1/chat/completions";
 
@@ -269,42 +269,16 @@ fn endpoint_url(base: Option<&str>, region: &str) -> String {
     }
 }
 
-fn signed_headers(
-    creds: &BedrockSecret,
+/// The request headers plus the ones that authenticate them.
+fn authenticated_headers(
+    auth: &RequestAuth,
+    region: &str,
     url: &str,
     mut headers: Vec<(String, String)>,
     body: &[u8],
 ) -> Result<http::HeaderMap, BridgeError> {
-    let identity = Credentials::new(
-        creds.access_key_id.clone(),
-        creds.secret_access_key.clone(),
-        creds.session_token.clone(),
-        None,
-        "aisix-provider-bedrock",
-    )
-    .into();
-    let params = aws_sigv4::sign::v4::SigningParams::builder()
-        .identity(&identity)
-        .region(&creds.region)
-        .name("bedrock")
-        .time(SystemTime::now())
-        .settings(SigningSettings::default())
-        .build()
-        .map_err(|e| BridgeError::Config(format!("bedrock: build signing params: {e}")))?
-        .into();
-    let signable = SignableRequest::new(
-        "POST",
-        url,
-        headers.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-        SignableBody::Bytes(body),
-    )
-    .map_err(|e| BridgeError::InvalidUpstreamConfig(format!("bedrock endpoint {url:?}: {e}")))?;
-    let (instructions, _) = sign(signable, &params)
-        .map_err(|e| BridgeError::Config(format!("bedrock: sign request: {e}")))?
-        .into_parts();
-    for (name, value) in instructions.headers() {
-        headers.push((name.to_string(), value.to_string()));
-    }
+    let auth = auth_headers(auth, region, url, &headers, body)?;
+    headers.extend(auth);
     let mut map = http::HeaderMap::new();
     for (name, value) in headers {
         if let (Ok(n), Ok(v)) = (
@@ -461,12 +435,12 @@ async fn send(
         "bedrock/chat_completions",
         &[
             endpoint.base.as_deref().unwrap_or(""),
-            &endpoint.creds.region,
+            endpoint.creds.region(),
         ],
         || {
             Ok(endpoint_url(
                 endpoint.base.as_deref(),
-                &endpoint.creds.region,
+                endpoint.creds.region(),
             ))
         },
     )?;
@@ -487,7 +461,8 @@ async fn send(
         ),
     ];
     headers.extend(endpoint.extra_headers.iter().cloned());
-    let headers = signed_headers(&endpoint.creds, &url_text, headers, &body)?;
+    let auth = endpoint.creds.request_auth().await?;
+    let headers = authenticated_headers(&auth, endpoint.creds.region(), &url_text, headers, &body)?;
     let started = Instant::now();
     let client = endpoint.client.clone();
     let resp = with_deadline(deadline, started, async move {

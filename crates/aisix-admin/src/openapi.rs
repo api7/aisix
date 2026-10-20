@@ -2199,7 +2199,11 @@ fn add_variant_titles(doc: &mut Value) {
     let variant_titles: &[(&str, &[&str])] = &[
         (
             "/components/schemas/BedrockAWSCredentials/oneOf",
-            &["Static credentials"],
+            &[
+                "Static credentials",
+                "Bedrock API key",
+                "Default credential chain",
+            ],
         ),
         (
             "/components/schemas/BedrockLatencyMode/oneOf",

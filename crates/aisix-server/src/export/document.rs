@@ -39,7 +39,12 @@ use super::secrets::{
 
 /// Guardrail credential field names, at any nesting depth, that are
 /// always secrets in the guardrail schema.
-const GUARDRAIL_SECRET_KEYS: &[&str] = &["api_key", "access_key_secret", "secret_access_key"];
+const GUARDRAIL_SECRET_KEYS: &[&str] = &[
+    "api_key",
+    "access_key_secret",
+    "secret_access_key",
+    "session_token",
+];
 
 /// Issues surfaced during a build, split by whether they leave the
 /// exported file loadable. `blocking` issues mean the file cannot be
