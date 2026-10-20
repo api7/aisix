@@ -2929,7 +2929,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_anthropic_dispatches_via_invoke_model_url() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         // Bedrock's InvokeModel URL: `/model/<urlencoded_id>/invoke`.
         // The `:` in `anthropic.claude-3-5-sonnet-20241022-v2:0` gets
@@ -2963,7 +2963,7 @@ mod tests {
     /// `map_sdk_error`, which never ran on success.
     #[tokio::test]
     async fn chat_deadline_cancels_a_silent_upstream() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
             .respond_with(
@@ -3003,7 +3003,7 @@ mod tests {
     /// telemetry and stacked under the gateway's own retry budget.
     #[tokio::test]
     async fn sdk_does_not_retry_on_its_own() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
             .respond_with(
@@ -3035,7 +3035,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_anthropic_body_contains_bedrock_anthropic_version_and_no_model_field() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
@@ -3084,7 +3084,7 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_effort_reaches_both_invoke_and_converse_stream_wires() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let invoke = CapturingResponder::default();
         let stream = CapturingResponder::default();
         Mock::given(method("POST"))
@@ -3141,7 +3141,7 @@ mod tests {
         // This is a wire-level pin that the SDK actually signed (vs.
         // sending unauthenticated). If a future bug accidentally
         // bypassed the SDK, the canned auth header would change.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
@@ -3186,7 +3186,7 @@ mod tests {
         // tool-call responses. The bridge's reused
         // `response_into_chat_response` must translate them to
         // OpenAI's `tool_calls` shape so downstream agents work.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3263,7 +3263,7 @@ mod tests {
         // not just absence-of-leak. A future refactor that re-renders
         // SDK metadata into the message would pass an absence check
         // but fail the exact-match assertion.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
             .respond_with(
@@ -3309,7 +3309,7 @@ mod tests {
         // Audit H1: Bedrock's `Retry-After` header on 429 must reach
         // the cooldown layer. Collapsing it to `None` silently
         // degrades multi-region / burst behavior.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
             .respond_with(
@@ -3380,7 +3380,7 @@ mod tests {
         // regardless. Critical: the URL path must include the FULL
         // model id with the region prefix; only the publisher resolver
         // strips it.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(
                 r"^/model/us\.anthropic\.claude-3-5-sonnet-20241022-v2(:0|%3A0)/invoke$",
@@ -3414,7 +3414,7 @@ mod tests {
     /// the unit-test layer.
     #[tokio::test]
     async fn chat_with_us_gov_cross_region_prefix_dispatches_with_full_model_id() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(
                 r"^/model/us-gov\.anthropic\.claude-3-5-sonnet-20241022-v2(:0|%3A0)/invoke$",
@@ -3442,7 +3442,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_global_cross_region_prefix_dispatches_with_full_model_id() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(
                 r"^/model/global\.anthropic\.claude-3-5-sonnet-20241022-v2(:0|%3A0)/invoke$",
@@ -3518,7 +3518,7 @@ mod tests {
         // `split_system` helper from aisix-provider-anthropic must
         // pull system turns out of the messages array into the
         // top-level `system` field.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
@@ -3589,7 +3589,7 @@ mod tests {
         // Asserts URL path is `/model/<id>/converse` (NOT /invoke) and
         // the SDK's typed response decodes into the gateway's
         // ChatResponse correctly.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(
                 r"^/model/meta\.llama3-3-70b-instruct-v1(:0|%3A0)/converse$",
@@ -3621,7 +3621,7 @@ mod tests {
         // dispatch is genuinely uniform across publishers (regression
         // guard against a future change that hard-codes per-publisher
         // routing inside chat_converse itself).
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(
                 r"^/model/amazon\.nova-pro-v1(:0|%3A0)/converse$",
@@ -3650,7 +3650,7 @@ mod tests {
         // the request — full event-stream binary frame decode is
         // exercised at the SDK level, beyond the scope of unit
         // tests; this guard just verifies the URL routing.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(
                 r"^/model/anthropic\.claude-3-5-sonnet-20241022-v2(:0|%3A0)/converse-stream$",
@@ -3684,7 +3684,7 @@ mod tests {
         // Same as the Anthropic-stream test but for a non-Anthropic
         // publisher — pins that chat_stream wiring is uniform across
         // publishers.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(
                 r"^/model/meta\.llama3-3-70b-instruct-v1(:0|%3A0)/converse-stream$",
@@ -3713,7 +3713,7 @@ mod tests {
     /// Retry-After hint (breaks cooldown auto-tuning).
     #[tokio::test]
     async fn chat_converse_maps_upstream_429_with_retry_after_and_bedrock_wire() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/meta\..+/converse$"))
             .respond_with(
@@ -3772,7 +3772,7 @@ mod tests {
     /// matching the legacy /invoke path.
     #[tokio::test]
     async fn chat_converse_maps_upstream_4xx_to_canned_message_with_bedrock_wire() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/meta\..+/converse$"))
             .respond_with(
@@ -3826,7 +3826,7 @@ mod tests {
     /// customer who was setting these knobs via the gateway.
     #[tokio::test]
     async fn chat_converse_wires_temperature_max_tokens_top_p_into_inference_config() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/converse$"))
@@ -3878,7 +3878,7 @@ mod tests {
     /// an empty `{}` causes some Bedrock publishers to 400.
     #[tokio::test]
     async fn chat_converse_omits_inference_config_when_no_knobs_set() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/converse$"))
@@ -3913,7 +3913,7 @@ mod tests {
         // would 400 upstream. We use Meta here so the test routes
         // through chat_converse (the Anthropic publisher would route
         // through legacy /invoke and skip the Converse body shape).
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/converse$"))
@@ -4002,7 +4002,7 @@ mod tests {
 
     /// Capture the outbound Converse body for a tools-bearing request.
     async fn capture_converse_body(req: &ChatFormat) -> serde_json::Value {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/converse$"))
@@ -4153,7 +4153,7 @@ mod tests {
         req: &ChatFormat,
         streaming: bool,
     ) -> serde_json::Value {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(format!(r"^/model/.+/{route}$")))
@@ -4554,7 +4554,7 @@ mod tests {
         // which bounds a chunk gap rather than a whole completion. The
         // tool route's upstream leg is not streaming, so it runs under
         // the end-to-end budget the context carries alongside it.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
             .respond_with(
@@ -4611,7 +4611,7 @@ mod tests {
         // The reverse translation: the model's call to the synthetic
         // tool is the answer, so the client sees plain JSON content and
         // no tool call it never asked for.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/converse$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4649,7 +4649,7 @@ mod tests {
         // The /invoke half of the reverse translation: Claude families
         // that cannot constrain their own decoding answer by calling the
         // synthetic tool, and that call is the answer.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4687,7 +4687,7 @@ mod tests {
         // The JSON only exists once the tool call is complete, so the
         // stream request never reaches Converse: it runs over the
         // publisher's own non-streaming wire and is rendered as chunks.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4734,7 +4734,7 @@ mod tests {
         // The other half of #560: a Converse `toolUse` content block must
         // surface as an OpenAI `tool_calls` entry with `arguments` as a
         // JSON-encoded STRING, and `content: null` when there's no prose.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/converse$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4810,7 +4810,7 @@ mod tests {
     /// as a permanent zero.
     #[tokio::test]
     async fn chat_converse_maps_prompt_cache_tokens_beside_the_input_count() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/converse$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4875,7 +4875,7 @@ mod tests {
     /// envelope rather than being dropped on the way through.
     #[tokio::test]
     async fn chat_invoke_anthropic_carries_prompt_cache_tokens() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4923,7 +4923,7 @@ mod tests {
     /// must read as zero rather than as an inferred value.
     #[tokio::test]
     async fn chat_converse_without_cache_fields_reports_no_cache_tokens() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/converse$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5298,7 +5298,7 @@ mod tests {
         // When a Converse response carries BOTH a text block and a toolUse
         // block, the assistant `content` must be preserved (non-null)
         // alongside tool_calls — the OpenAI prose-plus-tool_calls shape.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/converse$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5426,7 +5426,7 @@ mod tests {
 
     #[tokio::test]
     async fn bedrock_applies_param_renames() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
@@ -5461,7 +5461,7 @@ mod tests {
 
     #[tokio::test]
     async fn bedrock_clamps_temperature_via_param_constraints() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
@@ -5492,7 +5492,7 @@ mod tests {
 
     #[tokio::test]
     async fn bedrock_fills_default_body_fields_when_caller_omits() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
@@ -5522,7 +5522,7 @@ mod tests {
 
     #[tokio::test]
     async fn bedrock_injects_default_headers() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
@@ -5575,7 +5575,7 @@ mod tests {
         // SigV4 timestamp guard: an operator default_headers entry naming the
         // reserved `x-amz-date` must be dropped, leaving the SDK's own signed
         // timestamp intact. A non-reserved companion header still applies.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
@@ -5615,7 +5615,7 @@ mod tests {
     async fn bedrock_default_headers_apply_on_converse_path() {
         // The interceptor is registered on the client config, so default
         // headers reach the Converse path (non-Anthropic publishers) too.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingConverseResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/converse$"))
@@ -5655,7 +5655,7 @@ mod tests {
         // The body pipeline runs BEFORE the Bedrock model/stream strip, so a
         // default_body_fields block can never reintroduce a URL-borne model
         // into the /invoke body — while a genuine extra field still lands.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
@@ -5697,7 +5697,7 @@ mod tests {
     async fn bedrock_response_content_list_to_string_flattens_outbound_body() {
         // The `content_list_to_string` branch is gated on the response
         // override block and flattens array content to a string on the body.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
@@ -5742,7 +5742,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_converse_clamps_temperature_via_param_constraints() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/converse$"))
@@ -5776,7 +5776,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_converse_clamps_temperature_min_via_param_constraints() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/converse$"))
@@ -5815,7 +5815,7 @@ mod tests {
         // The two-`if` clamp applies max then min, so min wins — matching the
         // /invoke path's `apply_param_constraints`. The test merely completing
         // (no panic) is the core assertion; the value pins the max-then-min order.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/converse$"))
@@ -5856,7 +5856,7 @@ mod tests {
         // eventstream decode fails on the non-eventstream response, so the
         // ignored `chat_stream` result is fine — same pattern as the
         // non-stream clamp tests.)
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/converse-stream$"))
@@ -5895,7 +5895,7 @@ mod tests {
         use wiremock::matchers::{method as wm_method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(wm_path("/model/amazon.titan-embed-text-v1/invoke"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5944,7 +5944,7 @@ mod tests {
         use wiremock::matchers::{method as wm_method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(wm_path("/model/amazon.titan-embed-text-v1/invoke"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5983,7 +5983,7 @@ mod tests {
         use wiremock::matchers::method as wm_method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "embedding": [0.1],
@@ -6029,7 +6029,7 @@ mod tests {
         use wiremock::matchers::{method as wm_method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(wm_path("/model/cohere.embed-english-v3/invoke"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

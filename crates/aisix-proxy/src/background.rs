@@ -240,7 +240,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_check_marks_unhealthy_on_failure() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(503).set_body_string("down"))
@@ -271,7 +271,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_check_ignores_configured_transient_status() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))

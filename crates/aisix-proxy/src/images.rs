@@ -928,7 +928,7 @@ mod tests {
     /// — a blocked `prompt` returns 422 content_filter, upstream never hit.
     #[tokio::test]
     async fn input_guardrail_blocks_prompt_returns_422() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/images/generations"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
@@ -961,7 +961,7 @@ mod tests {
     /// (`expect(1)`) and returns 200.
     #[tokio::test]
     async fn input_guardrail_allows_benign_prompt_forwards_200() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/images/generations"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
@@ -1019,7 +1019,7 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_returns_image_url() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/images/generations"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
@@ -1095,7 +1095,7 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_error_propagates_as_502() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/images/generations"))
             .respond_with(ResponseTemplate::new(500).set_body_string("server error"))
@@ -1134,7 +1134,7 @@ mod tests {
     /// "openai".
     #[tokio::test]
     async fn emits_usage_event_with_tokens_when_upstream_returns_usage() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let body = serde_json::json!({
             "created": 1_700_000_000i64,
             "data": [{"b64_json": "aGVsbG8="}],
@@ -1180,7 +1180,7 @@ mod tests {
     /// attributed (precise per-image cost is a cross-repo follow-up).
     #[tokio::test]
     async fn emits_zero_token_event_when_upstream_omits_usage() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/images/generations"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
@@ -1321,7 +1321,7 @@ mod tests {
     /// image-generation spend showed up unattributed in cp-api analytics.
     #[tokio::test]
     async fn emits_provider_telemetry_tags_issue_867() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/images/generations"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
@@ -1369,7 +1369,7 @@ mod tests {
     /// (200), and the event records the guardrail that governed the request.
     #[tokio::test]
     async fn applied_guardrails_recorded_on_usage_event() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/images/generations"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
@@ -1415,7 +1415,7 @@ mod tests {
     /// Mirrors `completions.rs::upstream_5xx_emits_zero_token_error_event`.
     #[tokio::test]
     async fn upstream_5xx_emits_zero_token_error_event() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/images/generations"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal"))
@@ -1480,7 +1480,7 @@ mod tests {
     /// pins the counts on the emitted UsageEvent.
     #[tokio::test]
     async fn pii_mask_rewrites_prompt_before_upstream_issue_696() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/images/generations"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1530,7 +1530,7 @@ mod tests {
     /// — /v1/images/generations previously never touched it.
     #[tokio::test]
     async fn upstream_5xx_marks_cooldown_issue_701() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/images/generations"))
             .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
@@ -1577,7 +1577,7 @@ mod tests {
     async fn blocked_request_names_the_policy_on_the_usage_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("my-image"));
         snap.apikeys.insert(apikey_entry(&["*"]));
@@ -1636,7 +1636,7 @@ mod tests {
     async fn masked_request_names_the_policy_on_the_usage_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/images/generations"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))

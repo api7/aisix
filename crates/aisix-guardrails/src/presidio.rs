@@ -635,7 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_input_allows_without_anonymizer_call() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/analyze"))
             .and(body_partial_json(json!({
@@ -655,7 +655,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_entity_blocks() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/analyze"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([
@@ -678,7 +678,7 @@ mod tests {
     async fn maskable_blob_path_blocks() {
         // The blob path has no write-back channel, so a maskable outcome
         // maps to Block there (kind=bedrock ANONYMIZE contract).
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/analyze"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([
@@ -697,8 +697,8 @@ mod tests {
 
     #[tokio::test]
     async fn segment_path_masks_via_anonymizer() {
-        let analyzer = MockServer::start().await;
-        let anonymizer = MockServer::start().await;
+        let analyzer = MockServer::builder().start().await;
+        let anonymizer = MockServer::builder().start().await;
         // Slot 0 is clean, slot 1 carries the email.
         Mock::given(method("POST"))
             .and(path("/analyze"))
@@ -743,7 +743,7 @@ mod tests {
 
     #[tokio::test]
     async fn segment_path_block_entity_short_circuits() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/analyze"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([
@@ -759,8 +759,8 @@ mod tests {
 
     #[tokio::test]
     async fn anonymizer_failure_does_not_release_unmasked_content() {
-        let analyzer = MockServer::start().await;
-        let anonymizer = MockServer::start().await;
+        let analyzer = MockServer::builder().start().await;
+        let anonymizer = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/analyze"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([
@@ -784,7 +784,7 @@ mod tests {
     async fn empty_text_skips_analyzer() {
         // No /analyze mock mounted — a call would 404 → ConfigError → Block,
         // so Allow proves empty slots never reach the analyzer.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let g = build(&server.uri(), &server.uri(), false);
         let out = g
             .moderate_input_segments(&[String::new(), "   ".to_owned()])
@@ -794,7 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn five_xx_fail_open_bypasses_fail_closed_blocks() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/analyze"))
             .respond_with(ResponseTemplate::new(503))
@@ -813,7 +813,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_error_4xx_tagged_separately() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/analyze"))
             .respond_with(ResponseTemplate::new(400))
@@ -843,7 +843,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_only_hook_skips_output() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let c = cfg(&server.uri(), &server.uri());
         let g = PresidioGuardrail::new(
             "t",

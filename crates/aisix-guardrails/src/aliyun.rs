@@ -957,7 +957,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_input_returns_allow_and_signs_request() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/"))
             // proves the signed form body carries Action + Service + Signature
@@ -981,7 +981,7 @@ mod tests {
     /// `none` for the benign history and the request was released clean.
     #[tokio::test]
     async fn risk_past_the_cap_in_the_newest_message_still_blocks() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // The benign history: every call whose content lacks the marker
         // comes back clean.
         Mock::given(method("POST"))
@@ -1011,7 +1011,7 @@ mod tests {
     /// The output side of the same clip (`check_output` shares `moderate`).
     #[tokio::test]
     async fn risk_past_the_cap_in_the_output_tail_still_blocks() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("RISKMARKER"))
             .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("high")))
@@ -1035,7 +1035,7 @@ mod tests {
     /// one call per chunk rather than silently dropping the remainder.
     #[tokio::test]
     async fn content_within_the_cap_is_still_a_single_call() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("none")))
             .expect(1)
@@ -1050,7 +1050,7 @@ mod tests {
 
     #[tokio::test]
     async fn content_over_the_cap_costs_one_call_per_chunk() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("none")))
             // 3 chunks' worth of whitespace-free text → 3 calls, and the
@@ -1065,7 +1065,7 @@ mod tests {
 
     #[tokio::test]
     async fn high_risk_input_blocks_at_high_threshold() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("high")))
             .mount(&server)
@@ -1076,7 +1076,7 @@ mod tests {
 
     #[tokio::test]
     async fn medium_risk_allowed_at_high_threshold_blocked_at_medium() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("medium")))
             .mount(&server)
@@ -1091,7 +1091,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_sends_session_id() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("Service=llm_response_moderation"))
             // sessionId is JSON-encoded inside ServiceParameters, percent-encoded
@@ -1114,7 +1114,7 @@ mod tests {
             (581, "aliyun_timeout"),
             (500, "aliyun_5xx"),
         ] {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(200)
@@ -1132,7 +1132,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_5xx_fail_open_true_returns_bypass() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
@@ -1146,7 +1146,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_5xx_fails_closed_by_default() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
@@ -1161,7 +1161,7 @@ mod tests {
 
     #[tokio::test]
     async fn app_level_403_code_is_config_error_block_when_fail_closed() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -1262,7 +1262,7 @@ mod tests {
         //    with a body naming the cause. Without the code the operator only
         //    sees a bare status (AISIX-Cloud#1030 follow-up).
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(404).set_body_json(json!({
                     "Code": "InvalidAccessKeyId.NotFound",
@@ -1289,7 +1289,7 @@ mod tests {
         //    the caller's prompt — plus the AccessKey id. Body copied from a
         //    live green-cip response. Only `Code` may survive into a log (#153).
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             let string_to_sign = "POST&%2F&AccessKeyId%3DLTAI_LEAKED_KEY_ID%26Action%3D\
                  TextModerationPlus%26ServiceParameters%3D%257B%2522content%2522%253A\
                  %2520%2522CANARY_CALLER_PROMPT%2522%257D%26Version%3D2022-03-02";
@@ -1335,7 +1335,7 @@ mod tests {
         //     parse nothing, and report no code for the single most common
         //     misconfiguration.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             // Mirrors the live shape: RequestId, then the huge Message, then Code.
             let echo = "%2522%E4%25BD%25A0".repeat(2_000);
             Mock::given(method("POST"))
@@ -1369,7 +1369,7 @@ mod tests {
         // 2b. An unparseable 4xx body yields no code rather than a raw echo: an
         //     unrecognized body is exactly the one we can't vouch for.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             let filler = "X".repeat(crate::MAX_ERROR_BODY_LOG_BYTES + 4_000);
             Mock::given(method("POST"))
                 .respond_with(
@@ -1396,7 +1396,7 @@ mod tests {
         // 3. HTTP 200 but an app-level error Code — the Message carries the
         //    reason (e.g. an access key lacking llm_response_moderation).
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "Code": 403,
@@ -1430,7 +1430,7 @@ mod tests {
         //    RiskWords/RiskPositions must not reach the log even though the
         //    provider sent them.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(200)
@@ -1476,7 +1476,7 @@ mod tests {
         //    retrievable for a request nobody blocked, without spending a
         //    default-level line on every request.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(200)
@@ -1503,7 +1503,7 @@ mod tests {
         //    "we forgot to log it", an empty one as "Aliyun never answered" —
         //    and the failure bucket must survive.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(200)
@@ -1530,7 +1530,7 @@ mod tests {
         //    there rather than from the body — and the failure type must say
         //    "malformed", not "5xx".
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(200)
@@ -1563,7 +1563,7 @@ mod tests {
         // 5. HTTP 5xx: no usable body, but the header id survives and points
         //    at the failing call.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(500).insert_header("x-acs-request-id", "SERVER-ERR-1"),
@@ -1586,7 +1586,7 @@ mod tests {
         // 6. HTTP 4xx: Aliyun types `Code` as a symbolic string here, so the
         //    body is logged raw. The id must come from the header regardless.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(404)
@@ -1616,7 +1616,7 @@ mod tests {
         //    is present in the body here even without the header, so a server
         //    that omits the header still yields one.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "Code": 400,

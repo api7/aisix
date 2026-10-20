@@ -3515,7 +3515,7 @@ mod tests {
 
     #[tokio::test]
     async fn otlp_sink_posts_one_request_with_all_spans() {
-        let server = wiremock::MockServer::start().await;
+        let server = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/traces"))
             .respond_with(wiremock::ResponseTemplate::new(200))
@@ -3549,7 +3549,7 @@ mod tests {
 
     #[tokio::test]
     async fn otlp_sink_classifies_5xx_as_transient() {
-        let server = wiremock::MockServer::start().await;
+        let server = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(503))
             .mount(&server)
@@ -3564,7 +3564,7 @@ mod tests {
 
     #[tokio::test]
     async fn otlp_sink_classifies_4xx_as_permanent() {
-        let server = wiremock::MockServer::start().await;
+        let server = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(400))
             .mount(&server)
@@ -3634,7 +3634,7 @@ mod tests {
             "the endpoint is reported as configured: {unreachable}"
         );
 
-        let server = wiremock::MockServer::start().await;
+        let server = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(
                 wiremock::ResponseTemplate::new(401)
@@ -3739,8 +3739,8 @@ mod tests {
         // `control` with the rate absent (= 1.0). One event must reach the
         // control's receiver while the rate-0 exporter enqueues nothing —
         // its pipeline is never even created.
-        let zero_srv = wiremock::MockServer::start().await;
-        let ctrl_srv = wiremock::MockServer::start().await;
+        let zero_srv = wiremock::MockServer::builder().start().await;
+        let ctrl_srv = wiremock::MockServer::builder().start().await;
         for srv in [&zero_srv, &ctrl_srv] {
             wiremock::Mock::given(wiremock::matchers::method("POST"))
                 .respond_with(wiremock::ResponseTemplate::new(200))
@@ -3792,7 +3792,7 @@ mod tests {
     async fn fan_out_delivers_a_span_to_a_real_receiver() {
         // The new fan-out enqueues into a per-exporter pipeline (1s flush);
         // a single request's span lands at the receiver after the flush.
-        let server = wiremock::MockServer::start().await;
+        let server = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/traces"))
             .respond_with(wiremock::ResponseTemplate::new(200))
@@ -3832,7 +3832,7 @@ mod tests {
     /// pipeline.
     #[tokio::test]
     async fn config_publish_reaps_deleted_and_disabled_exporters() {
-        let receiver = wiremock::MockServer::start().await;
+        let receiver = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(200))
             .mount(&receiver)

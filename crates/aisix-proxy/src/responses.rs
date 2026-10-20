@@ -4711,7 +4711,7 @@ mod tests {
     /// echoed back — and the upstream must never be contacted (`expect(0)`).
     #[tokio::test]
     async fn input_guardrail_blocks_string_input_returns_422_content_filter() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4776,7 +4776,7 @@ mod tests {
 
         for model in ["gpt-4o-resp", "resp-group"] {
             for stream in [false, true] {
-                let upstream = MockServer::start().await;
+                let upstream = MockServer::builder().start().await;
                 Mock::given(method("POST"))
                     .and(path("/v1/responses"))
                     .respond_with(ResponseTemplate::new(200))
@@ -4841,7 +4841,7 @@ mod tests {
     async fn streamed_unterminated_terminal_frame_is_still_parsed_for_usage() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // Note the absent trailing blank line on the last frame.
         let sse = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_eof\",\"model\":\"gpt-4o-2024-11-20\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_eof\",\"model\":\"gpt-4o-2024-11-20\",\"usage\":{\"input_tokens\":31,\"output_tokens\":17,\"total_tokens\":48}}}";
         Mock::given(method("POST"))
@@ -4903,7 +4903,7 @@ mod tests {
     /// the upstream really sent.
     #[tokio::test]
     async fn streamed_terminal_frame_with_a_half_terminator_keeps_its_own_bytes() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_half\",\"model\":\"gpt-4o-2024-11-20\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_half\",\"model\":\"gpt-4o-2024-11-20\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n";
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
@@ -4954,7 +4954,7 @@ mod tests {
     /// `input_text` part blocks the call.
     #[tokio::test]
     async fn input_guardrail_blocks_array_message_items() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(
@@ -4992,7 +4992,7 @@ mod tests {
     /// guardrail must not block clean traffic.
     #[tokio::test]
     async fn input_guardrail_allows_benign_input_forwards_200() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5031,7 +5031,7 @@ mod tests {
     /// literal in `output` must 422 with the upstream never contacted.
     #[tokio::test]
     async fn input_guardrail_blocks_function_call_output_text() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(
@@ -5072,7 +5072,7 @@ mod tests {
     /// semantics.)
     #[tokio::test]
     async fn input_guardrail_blocks_instructions_field() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(
@@ -5110,7 +5110,7 @@ mod tests {
     /// skipped. A blocked literal in `reason` must 422.
     #[tokio::test]
     async fn input_guardrail_blocks_mcp_approval_response_reason() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(
@@ -5161,7 +5161,7 @@ mod tests {
     /// returned response, unlike the input check which short-circuits first.
     #[tokio::test]
     async fn output_guardrail_blocks_non_streaming_response() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5203,7 +5203,7 @@ mod tests {
     /// guardrails on the non-streaming route.
     #[tokio::test]
     async fn output_guardrail_blocks_non_streaming_refusal_response() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5245,7 +5245,7 @@ mod tests {
     /// guardrail configured passes through unchanged → 200 with body.
     #[tokio::test]
     async fn output_guardrail_allows_clean_non_streaming_response() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5281,7 +5281,7 @@ mod tests {
     /// held back (BufferFull): the client gets 422 and never the tokens.
     #[tokio::test]
     async fn output_guardrail_blocks_streaming_response_holds_back() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = "event: response.output_text.delta\n\
                    data: {\"type\":\"response.output_text.delta\",\"delta\":\"sure: BLOCKME\"}\n\n\
                    event: response.completed\n\
@@ -5325,7 +5325,7 @@ mod tests {
     /// held-back stream must block before any refusal text reaches the wire.
     #[tokio::test]
     async fn output_guardrail_blocks_streaming_refusal_response_holds_back() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = "event: response.refusal.delta\n\
                    data: {\"type\":\"response.refusal.delta\",\"item_id\":\"msg_refusal\",\"output_index\":0,\"content_index\":0,\"delta\":\"sure: BLOCKME\"}\n\n\
                    event: response.refusal.done\n\
@@ -5371,7 +5371,7 @@ mod tests {
     /// must still hold and block it before it reaches the client.
     #[tokio::test]
     async fn output_guardrail_blocks_done_only_streaming_refusal() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = "event: response.refusal.done\n\
                    data: {\"type\":\"response.refusal.done\",\"item_id\":\"msg_refusal\",\"output_index\":0,\"content_index\":0,\"refusal\":\"sure: BLOCKME\"}\n\n\
                    data: [DONE]\n\n";
@@ -5412,7 +5412,7 @@ mod tests {
     /// is scanned then released in full → 200 + the SSE body.
     #[tokio::test]
     async fn output_guardrail_allows_clean_streaming_response() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = "event: response.output_text.delta\n\
                    data: {\"type\":\"response.output_text.delta\",\"delta\":\"a clean answer\"}\n\n\
                    data: [DONE]\n\n";
@@ -5478,7 +5478,7 @@ mod tests {
     /// the blocked literal reaches the client.
     #[tokio::test]
     async fn output_guardrail_blocks_streaming_cross_provider_response() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(
@@ -5524,7 +5524,7 @@ mod tests {
     /// guardrail is scanned then released in full.
     #[tokio::test]
     async fn output_guardrail_allows_clean_streaming_cross_provider_response() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(
@@ -5565,7 +5565,7 @@ mod tests {
     async fn streaming_cross_provider_block_emits_guardrail_blocked_usage_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(
@@ -5622,7 +5622,7 @@ mod tests {
     /// being released unscanned — even when its content is otherwise clean.
     #[tokio::test]
     async fn output_guardrail_streaming_oversized_response_fails_closed() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // One delta larger than the 256 KiB default BufferFull cap.
         let big = "x".repeat(300_000);
         let sse =
@@ -5679,7 +5679,7 @@ mod tests {
     /// `content_filter` — a monitor rule "blocking", which it must never do.
     #[tokio::test]
     async fn monitor_output_guardrail_oversized_stream_released() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let big = "x".repeat(300_000);
         let sse =
             format!("data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{big}\"}}\n\ndata: [DONE]\n\n");
@@ -5727,7 +5727,7 @@ mod tests {
     #[tokio::test]
     async fn monitor_output_guardrail_streams_live_and_records_would_block() {
         use aisix_obs::UsageSink;
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = "event: response.output_text.delta\n\
                    data: {\"type\":\"response.output_text.delta\",\"delta\":\"sure: BLOCKME\"}\n\n\
                    event: response.completed\n\
@@ -5797,7 +5797,7 @@ mod tests {
     async fn monitor_scan_disconnect_still_emits_usage_event() {
         use aisix_obs::UsageSink;
         use futures::StreamExt;
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = "event: response.output_text.delta\n\
                    data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello there\"}\n\n\
                    event: response.completed\n\
@@ -5816,7 +5816,7 @@ mod tests {
 
         // Remote moderation backend that never answers within the test —
         // parks the end-of-stream scan so the disconnect lands mid-await.
-        let acs = MockServer::start().await;
+        let acs = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:analyze"))
             .respond_with(
@@ -5898,7 +5898,7 @@ mod tests {
     #[tokio::test]
     async fn monitor_output_guardrail_oversized_cross_provider_stream_released() {
         use aisix_obs::UsageSink;
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let big = serde_json::to_string(&"y".repeat(300_000)).unwrap();
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
@@ -5957,7 +5957,7 @@ mod tests {
     /// output is an output-guardrail bypass.
     #[tokio::test]
     async fn output_guardrail_blocks_tool_call_arguments_non_streaming() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5997,7 +5997,7 @@ mod tests {
     /// the client.
     #[tokio::test]
     async fn output_guardrail_blocks_tool_call_arguments_streaming() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let completed = serde_json::json!({
             "type": "response.completed",
             "response": {"output": [{
@@ -6046,7 +6046,7 @@ mod tests {
     /// `response.completed`. Same for `response.failed`.
     #[tokio::test]
     async fn output_guardrail_blocks_tool_call_on_incomplete_terminal() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let incomplete = serde_json::json!({
             "type": "response.incomplete",
             "response": {"output": [{
@@ -6096,7 +6096,7 @@ mod tests {
     /// that they reassemble without a separator.
     #[tokio::test]
     async fn output_guardrail_blocks_tool_call_delta_without_terminal() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let d1 = serde_json::json!({"type":"response.function_call_arguments.delta","delta":"{\"q\":\"BLOCK"});
         let d2 =
             serde_json::json!({"type":"response.function_call_arguments.delta","delta":"ME\"}"});
@@ -6142,7 +6142,7 @@ mod tests {
     /// carrying a blocked literal must still be scanned and held back.
     #[tokio::test]
     async fn output_guardrail_blocks_mcp_tool_call_delta_without_terminal() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let d = serde_json::json!({"type":"response.mcp_call_arguments.delta","delta":"{\"q\":\"BLOCKME\"}"});
         let sse =
             format!("event: response.mcp_call_arguments.delta\ndata: {d}\n\ndata: [DONE]\n\n");
@@ -6183,7 +6183,7 @@ mod tests {
     /// block reserved+burned the slot, so the benign request got 429.
     #[tokio::test]
     async fn blocked_request_does_not_consume_rate_limit_slot() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -6267,7 +6267,7 @@ mod tests {
     /// Responses-API shape. This is the codex-against-Anthropic path.
     #[tokio::test]
     async fn non_openai_model_bridges_to_responses_shape() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(header("x-api-key", "sk-ant-test"))
@@ -6328,7 +6328,7 @@ mod tests {
             "event: message_stop\n",
             "data: {\"type\":\"message_stop\"}\n\n",
         );
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(
@@ -6366,7 +6366,7 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_forwards_to_upstream() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .and(header("authorization", "Bearer sk-test"))
@@ -6399,7 +6399,7 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_error_returns_502() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
@@ -6434,7 +6434,7 @@ mod tests {
     async fn emits_usage_event_on_200_non_streaming_issue_404() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // Responses-API wire shape. Pin specific token counts so a
         // regression that swapped semantics (input vs output) or
         // dropped reasoning_tokens would fail here. Mirrors the
@@ -6524,7 +6524,7 @@ mod tests {
     async fn records_the_provider_response_id_non_streaming_1289() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -6577,7 +6577,7 @@ mod tests {
     async fn records_the_provider_response_id_when_usage_is_estimated_1289() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -6676,7 +6676,7 @@ data: [DONE]\n\n";
     async fn streaming_records_the_provider_response_id_from_response_created_1289() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse_body = "\
 data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1289_stream\"}}\n\n\
 data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
@@ -6736,7 +6736,7 @@ data: [DONE]\n\n";
     /// 404 → non-200.
     #[tokio::test]
     async fn responses_verbatim_applies_pk_request_overrides_issue_867() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .and(body_partial_json(serde_json::json!({"safe_flag": true})))
@@ -6777,7 +6777,7 @@ data: [DONE]\n\n";
     async fn output_block_records_billed_tokens_issue_543() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let upstream_body = serde_json::json!({
             "id": "resp-blk",
             "object": "response",
@@ -6841,7 +6841,7 @@ data: [DONE]\n\n";
     async fn estimates_usage_event_when_upstream_omits_usage_block() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // 200 OK but no `usage` field — should NOT emit.
         let upstream_body = serde_json::json!({
             "id": "resp-abc",
@@ -6903,7 +6903,7 @@ data: [DONE]\n\n";
     async fn streaming_path_emits_usage_event_from_terminal_event_issue_808() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // Real Responses-API streaming: deltas then a terminal
         // `response.completed` carrying the authoritative `usage` block
         // (nested under `response`, with reasoning + cached sub-counts).
@@ -6983,7 +6983,7 @@ data: [DONE]\n\n";
     async fn streaming_path_emits_provider_telemetry_tags_issue_867() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse_body = "\
 data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n\
 data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
@@ -7054,7 +7054,7 @@ data: [DONE]\n\n";
     async fn non_streaming_emits_provider_telemetry_tags_issue_867() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let upstream_body = serde_json::json!({
             "id": "resp-abc",
             "object": "response",
@@ -7109,7 +7109,7 @@ data: [DONE]\n\n";
     async fn upstream_5xx_emits_zero_token_failed_attempt_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal"))
@@ -7191,7 +7191,7 @@ data: [DONE]\n\n";
     async fn estimates_usage_event_when_usage_block_is_empty() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let upstream_body = serde_json::json!({
             "id": "resp-abc",
             "object": "response",
@@ -7249,7 +7249,7 @@ data: [DONE]\n\n";
     async fn emits_with_zero_output_when_output_tokens_missing() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let upstream_body = serde_json::json!({
             "id": "resp-abc",
             "object": "response",
@@ -7449,7 +7449,7 @@ data: [DONE]\n\n";
     async fn responses_usage_event_carries_the_enforced_mask() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -7504,7 +7504,7 @@ data: [DONE]\n\n";
     async fn streaming_responses_usage_event_carries_the_enforced_mask() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = "event: response.output_text.delta\n\
                    data: {\"type\":\"response.output_text.delta\",\"delta\":\"the version: 9.9.9 build\"}\n\n\
                    event: response.completed\n\

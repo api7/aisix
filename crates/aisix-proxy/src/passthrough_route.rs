@@ -7512,7 +7512,7 @@ mod tests {
 
     #[tokio::test]
     async fn inject_route_replaces_caller_auth_with_provider_key() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("GET"))
             .and(wm_path("/v1/models"))
             .and(wiremock::matchers::header(
@@ -7551,7 +7551,7 @@ mod tests {
 
     #[tokio::test]
     async fn key_without_route_grant_is_403() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let snap = AisixSnapshot::new();
         snap.provider_keys
             .insert(provider_key_entry("http://unused"));
@@ -7575,7 +7575,7 @@ mod tests {
 
     #[tokio::test]
     async fn unauthenticated_route_request_is_401() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let snap = AisixSnapshot::new();
         snap.provider_keys
             .insert(provider_key_entry("http://unused"));
@@ -7597,7 +7597,7 @@ mod tests {
     /// passthrough route, not the typed handler.
     #[tokio::test]
     async fn host_match_wins_over_typed_route_on_colliding_path() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(wm_path("/v1/chat/completions"))
             .respond_with(
@@ -7650,7 +7650,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_route_does_not_match() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let snap = AisixSnapshot::new();
         snap.provider_keys
             .insert(provider_key_entry("http://unused"));
@@ -7679,7 +7679,7 @@ mod tests {
 
     #[tokio::test]
     async fn anonymous_route_fails_closed_when_source_ip_is_unresolvable() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let snap = AisixSnapshot::new();
         snap.apikeys.insert(apikey_entry("sk-anon", Some(&["*"])));
         snap.passthrough_routes.insert(route_entry(
@@ -7879,7 +7879,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsafe_remainder_is_rejected_before_contacting_the_upstream() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let snap = AisixSnapshot::new();
         snap.provider_keys
             .insert(provider_key_entry("http://unused"));
@@ -10630,7 +10630,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         // legacy tunnel documented that as "forward the caller's
         // credential beside the injected one"; routes never double-send —
         // forward_client is the explicit BYO mode.
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("GET"))
             .and(wm_path("/v1/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
@@ -10864,7 +10864,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
     /// [`slot_request`] carries an ordinary `x-other`, so each test above
     /// can tell "the rule fired" from "the pattern never matched".
     async fn slot_route_fixture(overrides: serde_json::Value) -> (MockServer, AisixSnapshot) {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("GET"))
             .and(wm_path("/v1/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
@@ -10982,7 +10982,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
     async fn blocked_request_names_the_policy_on_the_usage_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(wm_path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
@@ -11356,7 +11356,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
     /// Relay `sse` through a passthrough route governed by `guardrail`, and
     /// return the `data:` payload of the refusal frame that ends it.
     async fn relayed_refusal_frame(sse: &str, guardrail: &str) -> serde_json::Value {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(wm_path("/v1/chat/completions"))
             .respond_with(

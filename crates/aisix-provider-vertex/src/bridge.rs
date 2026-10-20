@@ -3926,7 +3926,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_gemini_dispatches_to_generate_content_url() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -3977,7 +3977,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_anthropic_dispatches_to_raw_predict_url_with_messages_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingAnthropicResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -4046,7 +4046,7 @@ mod tests {
         // caller's `response_format` becomes whatever the shared
         // serializer makes of it — the native control here, since the
         // Vertex model id IS the Claude name (`@date`, not `-date`).
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingAnthropicResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/v1/projects/.+:rawPredict$"))
@@ -4079,7 +4079,7 @@ mod tests {
         // which bounds a chunk gap rather than a whole completion. The
         // Claude tool route's upstream leg is not streaming, so it runs
         // under the end-to-end budget carried beside it.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/v1/projects/.+:rawPredict$"))
             .respond_with(
@@ -4133,7 +4133,7 @@ mod tests {
         // An older Claude family takes the tool route, and the call it
         // makes is the answer — the client must not be handed a tool
         // call it never offered.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/v1/projects/.+:rawPredict$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4231,7 +4231,7 @@ mod tests {
     /// and surface a terminal finish_reason.
     #[tokio::test]
     async fn chat_anthropic_stream_dispatches_to_stream_raw_predict_keeping_stream_in_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingAnthropicStreamResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -4336,7 +4336,7 @@ mod tests {
     /// stripped — opposite of the Gemini/Anthropic publisher paths).
     #[tokio::test]
     async fn chat_openai_shim_dispatches_to_openapi_endpoint_with_model_in_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -4451,7 +4451,7 @@ mod tests {
     /// matches the upstream stream and surface a terminal finish_reason.
     #[tokio::test]
     async fn chat_openai_shim_stream_dispatches_to_openapi_endpoint_with_stream_in_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiStreamResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -4534,7 +4534,7 @@ mod tests {
     /// Bearer, and that the model is ALSO kept in the body.
     #[tokio::test]
     async fn chat_mistral_dispatches_to_rawpredict_with_model_in_url_and_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -4587,7 +4587,7 @@ mod tests {
     /// segment from Mistral) with the same OpenAI-shape body.
     #[tokio::test]
     async fn chat_ai21_dispatches_to_rawpredict_under_ai21_publisher_segment() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -4629,7 +4629,7 @@ mod tests {
     /// only in the publisher URL segment pinned by the non-stream tests).
     #[tokio::test]
     async fn chat_mistral_stream_dispatches_to_streamrawpredict_with_stream_in_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiStreamResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -4691,7 +4691,7 @@ mod tests {
     /// (not only transitively via the `url_segment()` unit test).
     #[tokio::test]
     async fn chat_ai21_stream_dispatches_to_streamrawpredict_under_ai21_segment() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiStreamResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -4763,7 +4763,7 @@ mod tests {
     /// surface the bug.
     #[tokio::test]
     async fn chat_gemini_honors_provider_key_api_base_in_production_path() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -4798,7 +4798,7 @@ mod tests {
     /// land on its own path every time.
     #[tokio::test]
     async fn url_cache_holds_a_row_per_upstream_model() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         for model in ["gemini-1.5-pro", "gemini-2.0-flash"] {
             Mock::given(method("POST"))
                 .and(path(format!(
@@ -4841,8 +4841,8 @@ mod tests {
                 .mount(server)
                 .await;
         }
-        let first = MockServer::start().await;
-        let second = MockServer::start().await;
+        let first = MockServer::builder().start().await;
+        let second = MockServer::builder().start().await;
         mount(&first).await;
         mount(&second).await;
 
@@ -4866,7 +4866,7 @@ mod tests {
     /// still produce a single-slash URL after concatenation.
     #[tokio::test]
     async fn chat_gemini_trims_trailing_slash_on_provider_key_api_base() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -4894,7 +4894,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_gemini_body_uses_gemini_wire_shape() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .respond_with(responder.clone())
@@ -4936,7 +4936,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_gemini_lifts_system_to_top_level_system_instruction() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .respond_with(responder.clone())
@@ -4982,7 +4982,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_gemini_uses_model_role_for_assistant_turns() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .respond_with(responder.clone())
@@ -5028,7 +5028,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_gemini_authorization_header_carries_pre_minted_bearer() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .respond_with(responder.clone())
@@ -5060,7 +5060,7 @@ mod tests {
     async fn chat_gemini_maps_4xx_to_canned_message_not_body_echo() {
         // Audit-aware: Vertex 4xx error envelopes leak operator project
         // ids. Must redact to canned phrase.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
                 "error": {
@@ -5117,7 +5117,7 @@ mod tests {
     /// `capture_upstream_error_http`.
     #[tokio::test]
     async fn chat_gemini_non_json_body_skips_envelope_parse() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(403).set_body_raw(
                 b"<html><body>403 Forbidden</body></html>".as_slice(),
@@ -5152,7 +5152,7 @@ mod tests {
     /// (operator project ids leak otherwise).
     #[tokio::test]
     async fn chat_gemini_429_populates_parsed_kind_from_grpc_status() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
                 "error": {
@@ -5199,7 +5199,7 @@ mod tests {
         // A malicious secret that injects `/` into the project field
         // must be rejected before URL stitching — otherwise the
         // attacker could redirect to a different path.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let bridge = VertexBridge::new().with_api_base_override(server.uri());
         let evil_secret =
             r#"{"access_token":"ya29","project":"my-proj/../admin","region":"us-central1"}"#;
@@ -5296,7 +5296,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_gemini_response_with_max_tokens_finish_reason_maps_to_length() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "candidates": [{
@@ -5375,7 +5375,7 @@ mod tests {
         // trips. A regression that dropped `?alt=sse` would land here
         // — Vertex would return chunked JSON array instead of SSE,
         // breaking the decoder.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(
                 "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:streamGenerateContent",
@@ -5414,7 +5414,7 @@ mod tests {
     /// without the test-only `with_api_base_override` seam.
     #[tokio::test]
     async fn chat_gemini_stream_honors_provider_key_api_base_in_production_path() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(
                 "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:streamGenerateContent",
@@ -5450,7 +5450,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_gemini_stream_first_chunk_is_role_then_content() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -5511,7 +5511,7 @@ mod tests {
         // Sanity: body has multiple chunks separated by \n\n.
         assert!(body.matches("\n\n").count() >= 3);
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -5563,7 +5563,7 @@ mod tests {
             .unwrap()
         );
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -5597,7 +5597,7 @@ mod tests {
         // returns Err from chat_stream rather than yielding an Err
         // chunk). This matches the non-stream path and is what
         // DP-side error handling expects.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
                 "error": {
@@ -5631,7 +5631,7 @@ mod tests {
         // decode the `data:` payload as a different shape) should
         // surface as UpstreamDecode, not panic or skip the chunk.
         let body = "data: this is not valid JSON\n\n".to_string();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -5672,7 +5672,7 @@ mod tests {
         let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hel\"}]}}]}\n\n\
 data: {\"error\":{\"code\":503,\"message\":\"The service is currently unavailable.\",\"status\":\"UNAVAILABLE\"}}\n\n"
             .to_string();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -5723,7 +5723,7 @@ data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_d
 event: error\n\
 data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"
             .to_string();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -5769,7 +5769,7 @@ data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_d
 event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}"
             .to_string();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -5829,7 +5829,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         // the request URI included `?alt=sse`. Without that query,
         // Vertex emits a chunked JSON array, not SSE — which would
         // make every downstream stream consumer fail to decode.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let captured: std::sync::Arc<std::sync::Mutex<Option<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured_for_responder = captured.clone();
@@ -5901,8 +5901,8 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
     async fn chat_gemini_sa_path_mints_token_and_forwards_as_bearer() {
         // Two wiremock servers: one for GCP OAuth token endpoint,
         // one for Vertex AI Gemini chat.
-        let oauth_server = MockServer::start().await;
-        let vertex_server = MockServer::start().await;
+        let oauth_server = MockServer::builder().start().await;
+        let vertex_server = MockServer::builder().start().await;
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5987,7 +5987,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
 
     #[tokio::test]
     async fn gemini_request_applies_default_body_fields() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -6029,7 +6029,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
 
     #[tokio::test]
     async fn gemini_request_applies_default_headers() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -6070,7 +6070,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         // names `authorization` must NEVER clobber the minted Vertex OAuth
         // Bearer. A non-reserved companion header still applies, proving the
         // block was processed rather than skipped wholesale.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -6115,7 +6115,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
 
     #[tokio::test]
     async fn openai_shim_request_applies_param_renames() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -6157,7 +6157,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
 
     #[tokio::test]
     async fn openai_shim_request_applies_param_constraints() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -6199,7 +6199,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         // `default_body_fields` block can never reintroduce a URL-borne
         // `model` into the `:rawPredict` body — while a genuine extra field
         // still lands.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingAnthropicResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -6263,7 +6263,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         // Regression guard for the STREAMING body-build path: it serializes
         // the body separately from the non-stream path, so it needs its own
         // proof that the override pipeline reaches the wire.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiStreamResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -6310,7 +6310,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
     async fn mistral_request_applies_default_body_fields_and_keeps_model_in_body() {
         // Regression guard for the partner `:rawPredict` URL builder rail,
         // which is a distinct code path from the openapi shim.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -6357,7 +6357,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         // The `content_list_to_string` branch is gated on the *response*
         // override block, so it needs a PK with a `response` section and a
         // multi-block message to observe the array -> string flatten.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -6406,7 +6406,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         use wiremock::matchers::{method as wm_method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(wm_path(
                 "/v1/projects/my-proj/locations/us-central1/publishers/google/models/text-embedding-005:predict",
@@ -6475,7 +6475,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         use wiremock::matchers::{method as wm_method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(wm_path(
                 "/v1/projects/my-proj/locations/us-central1/publishers/google/models/text-embedding-005:predict",
@@ -6512,7 +6512,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         use wiremock::matchers::method as wm_method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "predictions": [

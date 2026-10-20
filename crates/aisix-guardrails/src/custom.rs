@@ -1637,7 +1637,7 @@ mod tests {
     async fn a_hung_call_is_cut_by_the_wall_clock_budget() {
         // The mirror case: the script is parked on a pending response, so
         // the interrupt handler never runs and only the outer timeout fires.
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/scan"))
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
@@ -1667,7 +1667,7 @@ mod tests {
     async fn the_script_reaches_a_real_service_and_uses_its_answer() {
         // The whole point of the kind: an adapter written inside the
         // gateway, talking to a service with its own protocol.
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/scan"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1699,7 +1699,7 @@ mod tests {
 
     #[tokio::test]
     async fn secrets_reach_the_script_and_the_wire() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/whoami"))
             .and(wiremock::matchers::header("x-api-key", "sk-live-42"))
@@ -1939,7 +1939,7 @@ mod tests {
     async fn an_oversize_body_is_reported_not_silently_truncated() {
         // A truncated body makes resp.json() throw a parse error that
         // reads like a bug in the script, when the cause is the cap.
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/big"))
             .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(2 * 1024 * 1024)))

@@ -704,7 +704,7 @@ mod tests {
         // which bounds a chunk gap rather than a whole completion. The
         // tool route's upstream leg is not streaming, so it runs under
         // the end-to-end budget carried beside it.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/messages"))
             .respond_with(
@@ -771,7 +771,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_streaming_injects_breakpoints_when_enabled() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         mount_ok_nonstream(&server).await;
         let ctx = caching_ctx(
             &server.uri(),
@@ -803,7 +803,7 @@ mod tests {
     async fn non_streaming_does_not_inject_when_disabled() {
         // Field present but enabled:false must inject nothing — distinct
         // from the field-absent case sample_ctx covers.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         mount_ok_nonstream(&server).await;
         let ctx = caching_ctx(&server.uri(), serde_json::json!({"enabled": false}));
         AnthropicBridge::new().chat(&req(), &ctx).await.unwrap();
@@ -821,7 +821,7 @@ mod tests {
         // The streaming path must inject identically to the
         // non-streaming path (handler-families lockstep). Capture the
         // outbound body, not just the streamed chunks.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse = "\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude-sonnet-4-5\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1}}}\n\n\
@@ -874,7 +874,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn non_streaming_happy_path() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(header("x-api-key", "sk-ant-test"))
@@ -906,7 +906,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn non_streaming_400_bad_request_surfaces_message() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(400).set_body_raw(
@@ -946,7 +946,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// the shared-fn change on the Anthropic side.
     #[tokio::test]
     async fn non_streaming_400_non_json_content_type_still_surfaces_message() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(400).set_body_raw(
@@ -977,7 +977,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn non_streaming_decode_error_on_malformed_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
@@ -992,7 +992,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn deadline_elapses_to_timeout_error() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(
@@ -1056,7 +1056,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // when paired with a tool_call_id. Without one, there's no
         // way to pair the result with its originating tool_use, so
         // the request is refused.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let bridge = AnthropicBridge::new();
         let ctx = sample_ctx(&server.uri());
         let req = ChatFormat::new(
@@ -1076,7 +1076,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn streaming_happy_path_emits_text_deltas_then_finish() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse = "\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"model\":\"claude-sonnet-4-5\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1}}}\n\n\
@@ -1125,7 +1125,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// (pre-fix the final usage carried prompt_tokens=0).
     #[tokio::test]
     async fn streaming_harvests_input_tokens_from_message_delta() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse = "\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"gen_952\",\"model\":\"claude-sonnet-4-5\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null}}\n\n\
@@ -1168,7 +1168,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn streaming_upstream_error_surfaces_before_stream_start() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(500).set_body_string("oops"))
@@ -1191,7 +1191,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// then looked like a clean completion.
     #[tokio::test]
     async fn streaming_in_band_error_event_surfaces_as_typed_error() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse = "\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"model\":\"claude-sonnet-4-5\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1}}}\n\n\

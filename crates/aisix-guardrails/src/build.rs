@@ -2682,7 +2682,7 @@ mod tests {
     #[tokio::test]
     async fn monitor_downgrades_provider_failure_block() {
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
@@ -2706,7 +2706,7 @@ mod tests {
     #[tokio::test]
     async fn downgraded_unavailability_block_still_emits_would_block() {
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
@@ -2733,7 +2733,7 @@ mod tests {
     #[tokio::test]
     async fn monitor_never_blocks_on_provider_failure() {
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)

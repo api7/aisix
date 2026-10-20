@@ -1501,7 +1501,7 @@ mod tests {
     /// `AzureUpstreamRef::resolve`'s verbatim-override branch.
     #[tokio::test]
     async fn url_cache_holds_a_row_per_deployment() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         for deployment in ["gpt4o-prod", "gpt4o-mini"] {
             Mock::given(method("POST"))
                 .and(path(format!(
@@ -1544,8 +1544,8 @@ mod tests {
                 .mount(server)
                 .await;
         }
-        let first = MockServer::start().await;
-        let second = MockServer::start().await;
+        let first = MockServer::builder().start().await;
+        let second = MockServer::builder().start().await;
         mount(&first).await;
         mount(&second).await;
 
@@ -1782,7 +1782,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_dispatch_sends_api_key_header_and_deployment_url() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // Mock asserts: POST + path with deployment + api-version
         // query + api-key header carrying the literal secret.
         let responder = CapturingResponder::default().with_response(
@@ -1833,7 +1833,7 @@ mod tests {
         // Audit M4: assert the full body shape, not just the `model`
         // field — `messages` array present, `stream: false` for
         // non-streaming, content matches the request.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
@@ -1892,7 +1892,7 @@ mod tests {
         // and `content_filter_results` blocks. The reused OpenAi
         // wire parsers must not blow up on these extension fields —
         // they don't set `deny_unknown_fields`, so serde discards.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1934,7 +1934,7 @@ mod tests {
     async fn chat_applies_param_renames_to_outbound_body() {
         // Audit M2: assert the renamed key carries the original VALUE,
         // not just that the key swap happened.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
@@ -1972,7 +1972,7 @@ mod tests {
         // internal identifiers (deployment name, resource hostname).
         // The bridge must map to a canned status-keyed phrase and NOT
         // echo the upstream body verbatim.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_string(
@@ -2002,7 +2002,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_maps_404_to_deployment_not_found_canned_message() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(ResponseTemplate::new(404).set_body_string("operator-internal: foo-bar"))
@@ -2034,7 +2034,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_maps_429_with_retry_after_and_canned_message() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(
@@ -2077,7 +2077,7 @@ mod tests {
     /// is exactly the SDK-retry-logic break that issue #322 calls out.
     #[tokio::test]
     async fn chat_429_preserves_openai_compatible_code_for_sdk_retry() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(ResponseTemplate::new(429).set_body_raw(
@@ -2112,7 +2112,7 @@ mod tests {
     /// `capture_upstream_error_http`.
     #[tokio::test]
     async fn chat_400_non_json_body_skips_envelope_parse() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_raw(
@@ -2143,7 +2143,7 @@ mod tests {
     /// recognised by the parser.
     #[tokio::test]
     async fn chat_400_with_innererror_smushed_casing_also_lifts_kind() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_raw(
@@ -2174,7 +2174,7 @@ mod tests {
     /// `parsed.message` stays `None` (deployment id leak).
     #[tokio::test]
     async fn chat_400_with_inner_error_responsible_ai_lifts_kind() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_raw(
@@ -2240,7 +2240,7 @@ mod tests {
     /// Azure every time.
     #[tokio::test]
     async fn chat_ignores_req_model_and_uses_ctx_model_name() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2271,7 +2271,7 @@ mod tests {
         // (top-level) and `content_filter_results` (per-choice) — the
         // reused OpenAiStreamChunk parsers must tolerate both without
         // breaking deserialization.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse_body = concat!(
             // chunk 1 — top-level prompt_filter_results + empty choices (Azure prelude)
             "data: {\"id\":\"x\",\"model\":\"gpt4o-prod\",\"prompt_filter_results\":[{\"prompt_index\":0,\"content_filter_results\":{\"hate\":{\"filtered\":false,\"severity\":\"safe\"}}}],\"choices\":[]}\n\n",
@@ -2345,7 +2345,7 @@ mod tests {
         // Audit H2: a slow / hanging stream body must not wedge after
         // headers arrive. The bridge enforces the deadline on each
         // per-chunk wait, not just on the initial POST.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // 1s delay before the SSE body is emitted. With a 200ms
         // deadline, the bridge should surface a Timeout from the
         // per-chunk wait — the headers arrive instantly (mock
@@ -2626,7 +2626,7 @@ mod tests {
         // End-to-end pin: AAD JSON secret → token mint via wiremock
         // AAD endpoint → chat POST to Azure OpenAI endpoint carrying
         // Authorization: Bearer <minted-token> (NOT api-key:).
-        let aad_server = MockServer::start().await;
+        let aad_server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/oauth2/v2.0/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2638,7 +2638,7 @@ mod tests {
             .mount(&aad_server)
             .await;
 
-        let azure_server = MockServer::start().await;
+        let azure_server = MockServer::builder().start().await;
         let captured_headers: std::sync::Arc<std::sync::Mutex<Option<http::HeaderMap>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured_for_responder = captured_headers.clone();
@@ -2693,7 +2693,7 @@ mod tests {
     async fn chat_with_aad_secret_caches_minted_token_across_calls() {
         // Three back-to-back chats with the same AAD secret must
         // share the cache slot — only one token-mint trip.
-        let aad_server = MockServer::start().await;
+        let aad_server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/oauth2/v2.0/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2705,7 +2705,7 @@ mod tests {
             .mount(&aad_server)
             .await;
 
-        let azure_server = MockServer::start().await;
+        let azure_server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "x", "object": "chat.completion", "created": 1700000000_i64,
@@ -2736,7 +2736,7 @@ mod tests {
     async fn chat_with_aad_secret_aad_4xx_surfaces_before_azure_call() {
         // AAD 401 bubbles out as Config (operator-actionable) without
         // ever calling the Azure OpenAI endpoint.
-        let aad_server = MockServer::start().await;
+        let aad_server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(401).set_body_string(
                 r#"{"error":"invalid_client","error_description":"AADSTS7000215"}"#,
@@ -2744,7 +2744,7 @@ mod tests {
             .mount(&aad_server)
             .await;
 
-        let azure_server = MockServer::start().await;
+        let azure_server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0) // must NOT be called
@@ -2777,7 +2777,7 @@ mod tests {
     /// audit-aigw-387 on the Vertex SA OAuth side.
     #[tokio::test]
     async fn chat_stream_with_aad_secret_sets_authorization_bearer_header() {
-        let aad_server = MockServer::start().await;
+        let aad_server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/oauth2/v2.0/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2789,7 +2789,7 @@ mod tests {
             .mount(&aad_server)
             .await;
 
-        let azure_server = MockServer::start().await;
+        let azure_server = MockServer::builder().start().await;
         let captured_headers: std::sync::Arc<std::sync::Mutex<Option<http::HeaderMap>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured_for_responder = captured_headers.clone();

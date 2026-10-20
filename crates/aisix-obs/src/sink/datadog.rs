@@ -502,7 +502,7 @@ mod tests {
     /// ride along under their `aisix.` keys.
     #[tokio::test]
     async fn output_tokens_include_reasoning_counted_beside_the_completion() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sink = sink_for(&server, &[]);
         let log = |event: UsageEvent| sink.to_log(&SinkRecord::metadata_only(event));
 
@@ -531,7 +531,7 @@ mod tests {
     /// shape; the raw cache counters keep their `aisix.` keys.
     #[tokio::test]
     async fn input_tokens_include_cache_in_either_accounting_shape() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sink = sink_for(&server, &[]);
         let log = |event: UsageEvent| sink.to_log(&SinkRecord::metadata_only(event));
 
@@ -555,7 +555,7 @@ mod tests {
 
     #[tokio::test]
     async fn appends_batch_posts_gzipped_json_with_api_key_header() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(202))
@@ -649,7 +649,7 @@ mod tests {
     /// structured messages, nested, with no flat prompt/completion.
     #[tokio::test]
     async fn selected_headers_ride_the_log_and_content_is_structured() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(202))
@@ -736,7 +736,7 @@ mod tests {
     /// other side is still structured.
     #[tokio::test]
     async fn truncated_side_falls_back_to_flat_text() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(202))
@@ -785,7 +785,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_error_is_transient() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(
@@ -808,7 +808,7 @@ mod tests {
     async fn rate_limited_429_is_transient() {
         // Datadog signals back-pressure with 429; a log sink must back off and
         // retry, not drop the batch.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(
@@ -829,7 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_error_403_is_permanent() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(403).set_body_string(r#"{"errors":["Forbidden"]}"#))
@@ -850,7 +850,7 @@ mod tests {
     async fn request_timeout_408_is_retried() {
         // The intake timing out on its side says nothing about the batch —
         // retry it, as every other HTTP sink does.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(408))

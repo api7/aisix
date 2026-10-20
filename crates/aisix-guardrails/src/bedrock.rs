@@ -1446,7 +1446,7 @@ mod tests {
     /// segment must appear in something the mock accepted.
     #[tokio::test]
     async fn over_limit_payload_is_resent_in_batches_until_all_scanned() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let refused = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Mock::given(method("POST"))
@@ -1492,7 +1492,7 @@ mod tests {
     /// failing.
     #[tokio::test]
     async fn single_over_limit_slot_has_its_text_split() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let refused = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Mock::given(method("POST"))
@@ -1531,7 +1531,7 @@ mod tests {
     /// a later clean piece overwrite an earlier refusal.
     #[tokio::test]
     async fn a_block_in_any_piece_blocks_the_request() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         struct BlockOnMarker;
         impl wiremock::Respond for BlockOnMarker {
             fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
@@ -1589,7 +1589,7 @@ mod tests {
     /// never had a size problem.
     #[tokio::test]
     async fn accepted_payload_is_still_a_single_call() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(clean_body()))
@@ -1609,7 +1609,7 @@ mod tests {
     /// what actually to change.
     #[tokio::test]
     async fn unsplittable_refusal_reports_too_large() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(
@@ -1647,7 +1647,7 @@ mod tests {
     /// exactly one POST under `/guardrail/.../apply`.
     #[tokio::test]
     async fn apply_returns_allow_on_action_none() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1677,7 +1677,7 @@ mod tests {
     /// should never reach the upstream LLM.
     #[tokio::test]
     async fn apply_returns_block_on_action_intervened() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1717,7 +1717,7 @@ mod tests {
     /// the SDK gives up and we map the failure.
     #[tokio::test]
     async fn apply_5xx_with_fail_open_true_returns_bypass() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(ResponseTemplate::new(500).set_body_json(json!({
@@ -1741,7 +1741,7 @@ mod tests {
     /// block on Bedrock outage (correctness over availability).
     #[tokio::test]
     async fn apply_5xx_with_fail_open_false_returns_block() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(ResponseTemplate::new(500).set_body_json(json!({
@@ -1763,7 +1763,7 @@ mod tests {
     /// differently from Bedrock service outages.
     #[tokio::test]
     async fn apply_429_throttling_with_fail_open_tags_throttled() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(ResponseTemplate::new(429).set_body_json(json!({
@@ -1798,7 +1798,7 @@ mod tests {
     /// server hang past our 100ms timeout.
     #[tokio::test]
     async fn apply_timed_mode_aborts_at_timeout_and_tags_timeout() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(
@@ -1869,7 +1869,7 @@ mod tests {
     /// texts + entity-type counts.
     #[tokio::test]
     async fn apply_segments_sends_one_block_per_text_and_masks_positionally() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(
@@ -1918,7 +1918,7 @@ mod tests {
     /// — originals stand, the request continues.
     #[tokio::test]
     async fn apply_segments_misaligned_outputs_keep_originals_and_allow() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(
@@ -1941,7 +1941,7 @@ mod tests {
     /// blocks — masking never bypasses a blocking disposition.
     #[tokio::test]
     async fn apply_segments_hard_block_still_blocks() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1980,7 +1980,7 @@ mod tests {
     /// un-masked content there would defeat the operator's policy.
     #[tokio::test]
     async fn blob_apply_still_blocks_on_anonymize() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(
@@ -2005,7 +2005,7 @@ mod tests {
     /// with `fail_open=false` blocks, with `fail_open=true` bypasses.
     #[tokio::test]
     async fn apply_segments_5xx_honors_fail_open() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(ResponseTemplate::new(500).set_body_json(json!({
