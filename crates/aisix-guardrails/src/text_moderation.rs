@@ -189,7 +189,7 @@ impl TextModerationGuardrail {
                 return Err(clock.fail(AcsFailure::Timeout));
             };
             tracing::error!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 http_status = status.as_u16(),
                 response_body = %response_body,
                 "azure content safety text:analyze returned 4xx — check endpoint and api_key configuration",
@@ -236,7 +236,7 @@ impl TextModerationGuardrail {
         let tag = failure.failure.bypass_tag();
         if !matches!(failure.failure, AcsFailure::ConfigError) {
             tracing::warn!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 failure = ?failure.failure,
                 http_status = failure.http_status,
                 fail_open,

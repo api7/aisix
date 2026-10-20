@@ -106,3 +106,27 @@ impl EosOutputScan {
         hits
     }
 }
+
+/// Release held-back output unscanned because it outgrew the chain's
+/// `max_buffer_bytes` under `on_buffer_exceeded: fail_open`: records the
+/// bypass and logs which row's cap was exceeded. Every relay's fail-open
+/// branch goes through here; a fail-closed branch logs
+/// [`output_buffer_owner`] itself.
+pub(crate) fn release_output_buffer_unscanned(chain: &dyn aisix_guardrails::Guardrail) {
+    tracing::warn!(
+        guardrail_name = output_buffer_owner(chain),
+        guardrail_hook = "output",
+        max_buffer_bytes = chain.stream_output_policy().hold_cap().map(|(cap, _)| cap),
+        fail_open = true,
+        "streamed output exceeded the guardrail buffer cap; releasing it without an output scan",
+    );
+    chain.record_output_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+}
+
+/// The row whose `max_buffer_bytes` held-back output outgrew, as a log
+/// field value.
+pub(crate) fn output_buffer_owner(
+    chain: &dyn aisix_guardrails::Guardrail,
+) -> Option<tracing::field::DisplayValue<&str>> {
+    chain.output_buffer_owner().map(tracing::field::display)
+}

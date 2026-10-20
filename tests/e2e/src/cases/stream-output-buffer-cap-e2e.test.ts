@@ -7,6 +7,7 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLines,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -262,6 +263,26 @@ describe("streamed output hold-back cap measures held content (#513)", () => {
     post("/v1/messages", { model, max_tokens: 256, messages: [{ role: "user", content: "go" }] });
   const responses = (model: string) => post("/v1/responses", { model, input: "go" });
 
+  // Every relay logs which row's cap the stream outgrew. Lines accumulate
+  // across tests, so each one waits for a line beyond those already there.
+  const isCapLine = (failOpen: boolean) => (l: string) =>
+    failOpen
+      ? l.includes("releasing it without an output scan")
+      : l.includes("failing closed") && l.includes("max_buffer_bytes");
+  const capLines = (failOpen: boolean) =>
+    app!.output().split("\n").filter(isCapLine(failOpen)).length;
+  const expectCapLine = async (failOpen: boolean, before: number) => {
+    const row = failOpen ? "cap-fail-open" : "cap-fail-closed";
+    const lines = await waitForLogLines(
+      app!,
+      isCapLine(failOpen),
+      before + 1,
+      `the ${row} buffer-cap line`,
+    );
+    expect(lines[before]).toContain(`guardrail_name=${row}`);
+    expect(lines[before]).toContain(`max_buffer_bytes=${CAP}`);
+  };
+
   const ready = (ctx: { skip: () => void }) => {
     if (!etcdReachable || !app) {
       ctx.skip();
@@ -272,20 +293,24 @@ describe("streamed output hold-back cap measures held content (#513)", () => {
 
   test("chat: a stream of tool-call arguments over the cap fails closed", async (ctx) => {
     if (!ready(ctx)) return;
+    const before = capLines(false);
     const res = await chat("cap-chat-tools");
     expect(res.status).toBe(200);
     const body = await res.text();
     expect(body).toContain("output_buffer_exceeded");
+    await expectCapLine(false, before);
     // Nothing held was released: not even the first argument piece.
     expect(body).not.toContain(PIECES[0]);
   });
 
   test("chat: a stream of reasoning over the cap fails closed", async (ctx) => {
     if (!ready(ctx)) return;
+    const before = capLines(false);
     const res = await chat("cap-chat-reasoning");
     expect(res.status).toBe(200);
     const body = await res.text();
     expect(body).toContain("output_buffer_exceeded");
+    await expectCapLine(false, before);
     expect(body).not.toContain(PIECES[0]);
     expect(body).not.toContain(EMAIL);
   });
@@ -308,9 +333,11 @@ describe("streamed output hold-back cap measures held content (#513)", () => {
 
   test("messages (native): fail_open releases a thinking-heavy stream unscanned", async (ctx) => {
     if (!ready(ctx)) return;
+    const before = capLines(true);
     const res = await messages("cap-msg-native");
     expect(res.status).toBe(200);
     const body = await res.text();
+    await expectCapLine(true, before);
     expect(body).not.toContain("event: error");
     expect(body).toContain(PIECES[29]);
     expect(body, "released unscanned, so the mask never ran").toContain(EMAIL);
@@ -329,9 +356,11 @@ describe("streamed output hold-back cap measures held content (#513)", () => {
 
   test("messages (bridged): fail_open releases a reasoning-heavy stream unscanned", async (ctx) => {
     if (!ready(ctx)) return;
+    const before = capLines(true);
     const res = await messages("cap-msg-bridge");
     expect(res.status).toBe(200);
     const body = await res.text();
+    await expectCapLine(true, before);
     expect(body).not.toContain("event: error");
     expect(body, "released unscanned, so the mask never ran").toContain(EMAIL);
     expect(body).toContain("message_stop");
@@ -339,9 +368,11 @@ describe("streamed output hold-back cap measures held content (#513)", () => {
 
   test("responses (native): fail_open releases a reasoning-heavy stream unscanned", async (ctx) => {
     if (!ready(ctx)) return;
+    const before = capLines(true);
     const res = await responses("cap-resp-native");
     expect(res.status).toBe(200);
     const body = await res.text();
+    await expectCapLine(true, before);
     expect(body).not.toContain("output_buffer_exceeded");
     expect(body).toContain(PIECES[29]);
     expect(body, "released unscanned, so the mask never ran").toContain(EMAIL);
@@ -350,9 +381,11 @@ describe("streamed output hold-back cap measures held content (#513)", () => {
 
   test("responses (bridged): fail_open releases a reasoning-heavy stream unscanned", async (ctx) => {
     if (!ready(ctx)) return;
+    const before = capLines(true);
     const res = await responses("cap-resp-bridge");
     expect(res.status).toBe(200);
     const body = await res.text();
+    await expectCapLine(true, before);
     expect(body).not.toContain("output_buffer_exceeded");
     expect(body).toContain(PIECES[29]);
     expect(body, "released unscanned, so the mask never ran").toContain(EMAIL);

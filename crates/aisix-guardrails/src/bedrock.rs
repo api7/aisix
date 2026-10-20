@@ -303,7 +303,7 @@ impl BedrockGuardrail {
                 let batches = batch_by_chars(texts, BEDROCK_REFUSAL_BATCH_CHARS);
                 if batches.len() > 1 {
                     tracing::warn!(
-                        row = %self.row_name,
+                        guardrail_name = %self.row_name,
                         guardrail_id = %self.guardrail_id,
                         slots = texts.len(),
                         batches = batches.len(),
@@ -334,7 +334,7 @@ impl BedrockGuardrail {
                     // is divided by its own text below.
                     let (left, right) = texts.split_at(texts.len() / 2);
                     tracing::warn!(
-                        row = %self.row_name,
+                        guardrail_name = %self.row_name,
                         guardrail_id = %self.guardrail_id,
                         slots = texts.len(),
                         detail = %detail,
@@ -365,7 +365,7 @@ impl BedrockGuardrail {
                     return Err(BedrockFailure::TooLarge { detail });
                 }
                 tracing::warn!(
-                    row = %self.row_name,
+                    guardrail_name = %self.row_name,
                     guardrail_id = %self.guardrail_id,
                     pieces = pieces.len(),
                     budget = BEDROCK_REFUSAL_BATCH_CHARS,
@@ -474,7 +474,7 @@ impl BedrockGuardrail {
     fn handle_failure(&self, failure: BedrockFailure, fail_open: bool) -> GuardrailVerdict {
         let (reason, error_detail, error_source) = failure.log_fields();
         tracing::warn!(
-            row = %self.row_name,
+            guardrail_name = %self.row_name,
             guardrail_id = %self.guardrail_id,
             failure_tag = reason,
             error = error_detail,
@@ -536,7 +536,7 @@ impl SplitOutcome {
                     // unattributable rewrite is dropped rather than
                     // applied to the wrong slot.
                     tracing::warn!(
-                        row = %row_name,
+                        guardrail_name = %row_name,
                         guardrail_id = %guardrail_id,
                         expected = texts.len(),
                         got = outputs.len(),

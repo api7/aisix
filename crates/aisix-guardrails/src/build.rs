@@ -245,7 +245,7 @@ impl GuardrailInstances {
             Err(err) => {
                 tracing::warn!(
                     guardrail_id = %entry.id,
-                    name = %entry.value.name,
+                    guardrail_name = %entry.value.name,
                     error = %err,
                     "skipping guardrail with invalid config",
                 );

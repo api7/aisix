@@ -86,15 +86,19 @@ impl GuardrailEmbedder for ProxyGuardrailEmbedder {
         // embedding model takes effect on the next screened request
         // without the guardrail row being rewritten or its chain rebuilt.
         let alias = aisix_core::models::resolve_model_ref(&snapshot, model_alias, model_id);
+        let unresolved = || EmbedError {
+            model: Some(alias.to_string()),
+            ..EmbedFailure::Unresolved.into()
+        };
         let Some(entry) = snapshot.models.get_by_name(&alias) else {
-            return Err(EmbedFailure::Unresolved.into());
+            return Err(unresolved());
         };
         // The alias must name an EMBEDDING model. A chat model would
         // answer the dispatch with a completion, not a vector, and the
         // resulting error would read as a provider outage rather than
         // the configuration mistake it is.
         let Some(dimensions) = embedding_dimensions(&entry.value) else {
-            return Err(EmbedFailure::Unresolved.into());
+            return Err(unresolved());
         };
 
         // Cache lookup first, so a fully warm example set costs no call.
@@ -130,9 +134,15 @@ impl GuardrailEmbedder for ProxyGuardrailEmbedder {
             &misses,
         )
         .await
-        .map_err(classify)?;
+        .map_err(|e| EmbedError {
+            model: Some(entry.value.display_name.clone()),
+            ..classify(e)
+        })?;
         if fetched.len() != misses.len() {
-            return Err(EmbedFailure::Upstream.into());
+            return Err(EmbedError {
+                model: Some(entry.value.display_name.clone()),
+                ..EmbedFailure::Upstream.into()
+            });
         }
 
         if cacheable {
@@ -194,5 +204,6 @@ fn classify(err: EmbedTextsError) -> EmbedError {
     EmbedError {
         failure,
         error: Some(crate::semantic::embed_failure_text(&err)),
+        model: None,
     }
 }

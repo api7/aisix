@@ -210,7 +210,7 @@ impl AliyunAiGuardrail {
                 // pass stays at debug.
                 if blocked {
                     tracing::info!(
-                        row = %self.row_name,
+                        guardrail_name = %self.row_name,
                         service,
                         aliyun_request_id = %diag.request_id,
                         aliyun_code = %diag.code,
@@ -221,7 +221,7 @@ impl AliyunAiGuardrail {
                     );
                 } else {
                     tracing::debug!(
-                        row = %self.row_name,
+                        guardrail_name = %self.row_name,
                         service,
                         aliyun_request_id = %diag.request_id,
                         aliyun_code = %diag.code,
@@ -300,7 +300,7 @@ impl AliyunAiGuardrail {
             match reply.suggestion.as_str() {
                 "block" => {
                     tracing::info!(
-                        row = %self.row_name,
+                        guardrail_name = %self.row_name,
                         service,
                         aliyun_request_id = %diag.request_id,
                         aliyun_suggestion = %diag.suggestion,
@@ -315,7 +315,7 @@ impl AliyunAiGuardrail {
                 }
                 "mask" => {
                     tracing::info!(
-                        row = %self.row_name,
+                        guardrail_name = %self.row_name,
                         service,
                         aliyun_request_id = %diag.request_id,
                         aliyun_dimensions = %diag.dimensions_field(),
@@ -326,7 +326,7 @@ impl AliyunAiGuardrail {
                 }
                 _ => {
                     tracing::debug!(
-                        row = %self.row_name,
+                        guardrail_name = %self.row_name,
                         service,
                         aliyun_request_id = %diag.request_id,
                         aliyun_suggestion = %diag.suggestion,
@@ -443,7 +443,7 @@ impl AliyunAiGuardrail {
     /// the policy — fail closed.
     fn mask_without_replacement(&self, diag: &AigDiagnostics) -> SegmentsOutcome {
         tracing::warn!(
-            row = %self.row_name,
+            guardrail_name = %self.row_name,
             aliyun_request_id = %diag.request_id,
             aliyun_labels = %diag.labels_field(),
             "aliyun AI guardrail suggested mask but returned no desensitized text; \
@@ -588,7 +588,7 @@ impl AliyunAiGuardrail {
             };
             diag.code = extract_error_code(&response_body);
             tracing::error!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 aliyun_request_id = %diag.request_id,
                 http_status = status.as_u16(),
                 aliyun_code = %diag.code,
@@ -630,7 +630,7 @@ impl AliyunAiGuardrail {
             // first-run error for this kind, so name the fix.
             408 => {
                 tracing::error!(
-                    row = %self.row_name,
+                    guardrail_name = %self.row_name,
                     aliyun_request_id = %diag.request_id,
                     aliyun_code = %diag.code,
                     aliyun_message = %diag.message_field(),
@@ -642,7 +642,7 @@ impl AliyunAiGuardrail {
             }
             401 | 403 | 400 => {
                 tracing::error!(
-                    row = %self.row_name,
+                    guardrail_name = %self.row_name,
                     aliyun_request_id = %diag.request_id,
                     aliyun_code = %diag.code,
                     aliyun_message = %diag.message_field(),
@@ -654,7 +654,7 @@ impl AliyunAiGuardrail {
             code => {
                 let (failure, meaning) = classify_body_error_code(code);
                 tracing::warn!(
-                    row = %self.row_name,
+                    guardrail_name = %self.row_name,
                     aliyun_request_id = %diag.request_id,
                     aliyun_code = %diag.code,
                     aliyun_message = %diag.message_field(),
@@ -675,7 +675,7 @@ impl AliyunAiGuardrail {
         let tag = failure.failure.bypass_tag();
         if !matches!(failure.failure, AliyunFailure::ConfigError) {
             tracing::warn!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 aliyun_request_id = %diag.request_id,
                 failure = ?failure.failure,
                 http_status = failure.http_status,

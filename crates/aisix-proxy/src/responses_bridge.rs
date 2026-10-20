@@ -2571,7 +2571,7 @@ pub fn build_responses_bridge_stream(
                         buffering = false;
                         released = true;
                         if let Some(chain) = output_guardrail.as_ref() {
-                            chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                            crate::guardrail_stream::release_output_buffer_unscanned(chain.as_ref());
                         }
                         for b in held.drain(..) {
                             downstream_mark!();
@@ -2683,7 +2683,7 @@ pub fn build_responses_bridge_stream(
                 if on_exceeded_fail_open {
                     released = true;
                     if let Some(chain) = output_guardrail.as_ref() {
-                        chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                        crate::guardrail_stream::release_output_buffer_unscanned(chain.as_ref());
                     }
                     for b in held.drain(..) {
                         downstream_mark!();
@@ -2713,6 +2713,7 @@ pub fn build_responses_bridge_stream(
         // closed (#719).
         if overflowed {
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::output_buffer_owner(chain.as_ref()),
                 guardrail_hook = "output",
                 model = %model_label,
                 max_buffer_bytes,

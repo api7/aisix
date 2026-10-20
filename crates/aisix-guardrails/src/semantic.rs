@@ -220,7 +220,7 @@ impl SemanticGuardrail {
             .await
         {
             Ok(v) if v.vectors.len() == prototypes.len() => v.vectors,
-            Ok(_) => return self.on_failure(EmbedFailure::Upstream.into(), started, fail_open),
+            Ok(v) => return self.on_failure(miscounted(v.model), started, fail_open),
             Err(failure) => return self.on_failure(failure, started, fail_open),
         };
 
@@ -238,7 +238,7 @@ impl SemanticGuardrail {
             .await
         {
             Ok(v) if v.vectors.len() == texts.len() => v,
-            Ok(_) => return self.on_failure(EmbedFailure::Upstream.into(), started, fail_open),
+            Ok(v) => return self.on_failure(miscounted(v.model), started, fail_open),
             Err(failure) => return self.on_failure(failure, started, fail_open),
         };
         // The model that actually produced these numbers, by its current
@@ -363,8 +363,11 @@ impl SemanticGuardrail {
     ) -> GuardrailVerdict {
         let tag = failure.failure.as_str();
         tracing::warn!(
-            guardrail = "semantic",
-            embedding_model = %self.cfg.embedding_model_identity,
+            guardrail_name = %self.cfg.row_name,
+            embedding_model = %failure
+                .model
+                .as_deref()
+                .unwrap_or(&self.cfg.embedding_model_identity),
             failure = tag,
             fail_open,
             error = failure.error.as_deref(),
@@ -379,6 +382,14 @@ impl SemanticGuardrail {
                 tag,
             )
         }
+    }
+}
+
+/// An embedding answer carrying the wrong number of vectors.
+fn miscounted(model: String) -> EmbedError {
+    EmbedError {
+        model: Some(model),
+        ..EmbedFailure::Upstream.into()
     }
 }
 

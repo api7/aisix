@@ -185,7 +185,7 @@ impl PromptShieldGuardrail {
                 return Err(clock.fail(AcsFailure::Timeout));
             };
             tracing::error!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 http_status = status.as_u16(),
                 response_body = %response_body,
                 "azure content safety returned 4xx — check endpoint and api_key configuration",
@@ -213,7 +213,7 @@ impl PromptShieldGuardrail {
         // event and alert rules don't fire twice for the same failure.
         if !matches!(failure.failure, AcsFailure::ConfigError) {
             tracing::warn!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 failure = ?failure.failure,
                 http_status = failure.http_status,
                 fail_open = fail_open,

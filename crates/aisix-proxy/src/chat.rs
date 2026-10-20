@@ -6431,11 +6431,12 @@ where
                     if comp.bypass_reason.is_empty() {
                         comp.bypass_reason = crate::error::TAG_OUTPUT_BUFFER_EXCEEDED.to_owned();
                     }
-                    ctx.chain.record_output_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                    crate::guardrail_stream::release_output_buffer_unscanned(ctx.chain.as_ref());
                     // Recorded once; the remainder is released by window unscanned.
                     window_tool_calls_cap = None;
                 } else {
                     tracing::warn!(
+                        guardrail_name = crate::guardrail_stream::output_buffer_owner(ctx.chain.as_ref()),
                         guardrail_hook = "output",
                         max_buffer_bytes,
                         "streamed tool-call arguments exceeded max_buffer_bytes; failing closed",
@@ -6590,8 +6591,8 @@ where
                                     }
                                 }
                                 if let Some(ctx) = output_guardrail.as_ref() {
-                                    ctx.chain.record_output_bypass(
-                                        crate::error::TAG_OUTPUT_BUFFER_EXCEEDED,
+                                    crate::guardrail_stream::release_output_buffer_unscanned(
+                                        ctx.chain.as_ref(),
                                     );
                                 }
                                 for chunk in pending.drain(..) {
@@ -6601,6 +6602,7 @@ where
                                 pending_bytes.clear();
                             } else {
                                 tracing::warn!(
+                                    guardrail_name = output_guardrail.as_ref().and_then(|ctx| crate::guardrail_stream::output_buffer_owner(ctx.chain.as_ref())),
                                     guardrail_hook = "output",
                                     max_buffer_bytes = *max_buffer_bytes,
                                     "streaming response exceeded max_buffer_bytes; failing closed",
