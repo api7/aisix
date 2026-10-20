@@ -570,16 +570,10 @@ impl ProxyError {
     pub fn envelope(&self) -> ErrorEnvelope {
         // Bridge-surface upstream errors get special handling: the
         // bridge has best-effort-parsed the upstream envelope into a
-        // structured [`UpstreamErrorView`], and for same-wire 4xx
-        // (OpenAI upstream + OpenAI client) we forward the parsed
-        // fields directly instead of wrapping them inside the
-        // gateway's generic `upstream_error` envelope.
-        //
-        // 5xx and non-JSON bodies fall back to the generic envelope —
-        // upstream internal-server-error detail (engine names, queue
-        // depth, etc.) is operator-internal and must not bleed through.
-        // Cross-wire translation (Anthropic / Bedrock / Vertex / Azure
-        // → OpenAI shape) ships in a follow-up via `error_translate`.
+        // structured [`UpstreamErrorView`], and for a 4xx we translate
+        // its fields into the client's envelope. 5xx and non-JSON bodies
+        // take the generic envelope; every one carries the upstream's own
+        // message.
         if let ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamStatus {
             status,
             message,
@@ -682,15 +676,8 @@ impl ProxyError {
 /// tables so the OpenAI-shape `error.type` and `error.code` carry the
 /// retry semantics SDKs depend on.
 ///
-/// **5xx**: emit a canned `upstream returned {status}` message under
-/// `type: upstream_error`. Upstream 5xx bodies routinely embed
-/// operator-internal detail (engine names, shard ids, queue depth,
-/// ARNs in raw AWS messages) — surfacing them to the customer leaks
-/// internal taxonomy. The full upstream body remains in operator
-/// logs via tracing.
-///
-/// **`UpstreamWire::Unknown`** (cooldown fixtures / synthesised
-/// errors): legacy generic envelope.
+/// **5xx and synthesised errors** (`UpstreamWire::Unknown`): the generic
+/// `upstream_error` envelope carrying the upstream's own message.
 ///
 /// An upstream that answers with no usable message (an empty body, or an
 /// envelope whose `message` is blank) is named by its status and reason
@@ -716,15 +703,7 @@ fn render_bridge_upstream_envelope(
             error: crate::error_translate::render_openai_envelope(parsed, wire, message),
         };
     }
-    let safe_message = if (500..600).contains(&status) {
-        // Suppress upstream `error.message` on 5xx — engine names /
-        // shard ids / ARNs commonly appear here and are not customer
-        // information.
-        format!("upstream returned {status}")
-    } else {
-        message.to_string()
-    };
-    ErrorEnvelope::new(safe_message, "upstream_error")
+    ErrorEnvelope::new(message.to_string(), "upstream_error")
 }
 
 fn upstream_status_message(status: u16) -> String {
@@ -974,7 +953,7 @@ impl ProxyError {
     /// follows ecosystem convention.
     ///
     /// Reuses [`Self::envelope`] for the 4xx/5xx message-classification
-    /// and upstream-message redaction logic so the two envelope
+    /// and upstream-message logic so the two envelope
     /// renderers can't drift on those rules.
     pub fn into_anthropic_response(self) -> Response {
         let status = self.status();
@@ -988,7 +967,7 @@ impl ProxyError {
             _ => None,
         };
         // Reuse OpenAI envelope only for the SAFE-MESSAGE logic
-        // (5xx body redaction, 4xx upstream-message pass-through).
+        // (the upstream message, translated on a 4xx).
         // The inner type is overwritten to the Anthropic-canonical
         // string above.
         let openai_env = self.envelope();
@@ -1593,24 +1572,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anthropic_envelope_bridge_5xx_maps_to_api_error_with_message_redacted() {
-        // 5xx collapse contract from ai-gateway#322/#327 — upstream
-        // body redacted, customer sees a generic 502 wrapped in the
-        // Anthropic-shape envelope with `error.type = "api_error"`
-        // (Anthropic's catch-all for upstream/server failure).
+    async fn anthropic_envelope_bridge_5xx_maps_to_api_error_with_the_upstream_message() {
+        // 5xx collapse contract from ai-gateway#322/#327: the customer
+        // sees a 502 wrapped in the Anthropic-shape envelope with
+        // `error.type = "api_error"` (Anthropic's catch-all for
+        // upstream/server failure), carrying the upstream's own message.
         let bridge_err = BridgeError::upstream_status(503, "engine internal panic");
         let err = ProxyError::Bridge(bridge_err);
         let resp = err.into_anthropic_response();
         let json = assert_anthropic_envelope(resp, StatusCode::BAD_GATEWAY, "api_error").await;
-        let msg = json["error"]["message"].as_str().unwrap_or("");
-        assert!(
-            !msg.contains("engine internal panic"),
-            "upstream 5xx body must be redacted from the Anthropic envelope, got: {msg}",
-        );
-        assert!(
-            msg.contains("503"),
-            "redacted message must still surface the upstream status, got: {msg}",
-        );
+        assert_eq!(json["error"]["message"], "engine internal panic");
     }
 
     /// The four headers a gateway-produced 429 owes the caller, on the
