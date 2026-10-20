@@ -5,6 +5,7 @@ import {
   EtcdClient,
   SeedClient,
   eventStream,
+  invokeChunk,
   spawnApp,
   startMockSls,
   waitConfigPropagation,
@@ -14,8 +15,9 @@ import {
 } from "../harness/index.js";
 
 // Prompt caching for Claude behind the two platform adapters: Amazon
-// Bedrock (InvokeModel when not streaming, ConverseStream when streaming)
-// and Vertex AI (rawPredict).
+// Bedrock (InvokeModel when not streaming, ConverseStream when a chat
+// completions request streams, InvokeModelWithResponseStream when a
+// `/v1/messages` one does) and Vertex AI (rawPredict).
 //
 // A caller's `cache_control` markers reach the upstream where the caller
 // put them — as `cache_control` on the Anthropic body InvokeModel and
@@ -106,6 +108,32 @@ const CONVERSE_STREAM = eventStream([
   ],
 ]);
 
+const INVOKE_STREAM = Buffer.concat(
+  [
+    {
+      type: "message_start",
+      message: {
+        id: "msg_cache_stream",
+        type: "message",
+        role: "assistant",
+        model: "claude",
+        content: [],
+        usage: {
+          input_tokens: UNCACHED_IN,
+          output_tokens: 1,
+          cache_read_input_tokens: CACHE_READ,
+          cache_creation_input_tokens: CACHE_WRITE,
+        },
+      },
+    },
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+    { type: "content_block_stop", index: 0 },
+    { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: OUT } },
+    { type: "message_stop" },
+  ].map(invokeChunk),
+);
+
 interface RecordingUpstream {
   baseUrl: string;
   received: Array<{ path: string; body: string }>;
@@ -121,6 +149,11 @@ async function startUpstream(): Promise<RecordingUpstream> {
     req.on("end", () => {
       const path = (req.url ?? "/").split("?")[0];
       received.push({ path, body: Buffer.concat(chunks).toString("utf8") });
+      if (path.endsWith("/invoke-with-response-stream")) {
+        res.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" });
+        res.end(INVOKE_STREAM);
+        return;
+      }
       if (path.endsWith("/converse-stream")) {
         res.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" });
         res.end(CONVERSE_STREAM);
@@ -435,25 +468,24 @@ describe("prompt caching for Claude on Amazon Bedrock and Vertex AI", () => {
     await expectCacheCountersOnUsageEvent(sent.requestId);
   });
 
-  test("streamed /v1/messages to Claude on Bedrock (ConverseStream) sends cache points", async (ctx) => {
+  test("streamed /v1/messages to Claude on Bedrock (InvokeModelWithResponseStream) keeps every marker in place", async (ctx) => {
     if (skip(ctx)) return;
     const sent = await send("/v1/messages", markedMessages(BEDROCK_CLAUDE, true));
-    expect(sent.upstream.path).toMatch(/\/converse-stream$/);
+    expect(sent.upstream.path).toMatch(/\/invoke-with-response-stream$/);
     const body = sent.upstream.body;
     expect(body.system).toEqual([
-      { text: "You are a careful assistant." },
-      { text: "Long reference material." },
-      { cachePoint: { type: "default", ttl: "1h" } },
+      { type: "text", text: "You are a careful assistant." },
+      { type: "text", text: "Long reference material.", cache_control: HOUR },
     ]);
-    expect(body.toolConfig.tools[1]).toEqual({ cachePoint: { type: "default" } });
-    const first = body.messages[0].content;
-    expect(first[0].image).toBeDefined();
-    expect(first[1]).toEqual({ cachePoint: { type: "default" } });
-    const results = body.messages[2].content;
-    expect(results[0].toolResult.toolUseId).toBe("toolu_1");
-    expect(results[1]).toEqual({ cachePoint: { type: "default" } });
+    expect(body.tools[0].cache_control).toEqual(EPHEMERAL);
+    expect(body.messages[0].content[0].cache_control).toEqual(EPHEMERAL);
+    expect(body.messages[2].content[0]).toMatchObject({
+      type: "tool_result",
+      tool_use_id: "toolu_1",
+      cache_control: EPHEMERAL,
+    });
 
-    const usage = lastUsage(sent.text, (f) => f.usage ?? f.message?.usage);
+    const usage = lastUsage(sent.text, (f) => f.message?.usage);
     expect(usage.input_tokens).toBe(UNCACHED_IN);
     expect(usage.cache_read_input_tokens).toBe(CACHE_READ);
     expect(usage.cache_creation_input_tokens).toBe(CACHE_WRITE);

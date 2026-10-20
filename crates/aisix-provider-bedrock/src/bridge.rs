@@ -279,7 +279,7 @@ impl BedrockPublisher {
 /// gate means a token that isn't a real prefix (no known publisher
 /// after it) is left untouched, so a plain `anthropic.claude-…` id is
 /// never mangled.
-fn strip_region_prefix(model_id: &str) -> &str {
+pub(crate) fn strip_region_prefix(model_id: &str) -> &str {
     let Some((maybe_region, rest)) = model_id.split_once('.') else {
         return model_id;
     };
@@ -514,7 +514,7 @@ fn filtered_extra_headers(hdr: &UpstreamHeaderContext<'_>) -> Vec<(String, Strin
 /// on. (`param_constraints`'s temperature clamp IS still re-applied on the
 /// Converse path via `build_inference_config` — see #463 — but `param_renames`
 /// / `default_body_fields` / `content_list_to_string` have no Converse target.)
-fn apply_body_overrides(body: &mut serde_json::Value, ctx: &BridgeContext) {
+pub(crate) fn apply_body_overrides(body: &mut serde_json::Value, ctx: &BridgeContext) {
     if let Some(r) = ctx.provider_key.request.as_ref() {
         apply_param_renames(body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
@@ -603,7 +603,7 @@ impl Intercept for ResponseHeadersInterceptor {
 }
 
 /// Pull the upstream model id off the BridgeContext.
-fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
+pub(crate) fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
     ctx.model
         .model_name
         .as_deref()
@@ -716,7 +716,7 @@ fn map_service_error(
 ///
 /// Bedrock model ids are documented as
 /// `<publisher>.<family>-<version>:<revision>` with all-ASCII tokens.
-fn validate_model_id_chars(model_id: &str) -> Result<(), BridgeError> {
+pub(crate) fn validate_model_id_chars(model_id: &str) -> Result<(), BridgeError> {
     if !model_id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_' | '/'))
@@ -754,6 +754,26 @@ impl Bridge for BedrockBridge {
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
         self.chat_cow(std::borrow::Cow::Borrowed(req), ctx).await
+    }
+
+    fn serves_anthropic_messages(&self, upstream_model: &str) -> bool {
+        crate::native::serves_anthropic_messages(upstream_model)
+    }
+
+    async fn anthropic_messages(
+        &self,
+        body: serde_json::Value,
+        ctx: &BridgeContext,
+    ) -> Result<aisix_gateway::NativeMessages, BridgeError> {
+        self.native_messages(body, ctx).await
+    }
+
+    async fn anthropic_count_tokens(
+        &self,
+        body: serde_json::Value,
+        ctx: &BridgeContext,
+    ) -> Result<serde_json::Value, BridgeError> {
+        self.native_count_tokens(body, ctx).await
     }
 
     async fn chat_cow(
@@ -1084,7 +1104,10 @@ impl BedrockBridge {
     /// Resolve credentials + build an SDK client. Pulled out of
     /// `chat_converse` / `chat_converse_stream` because both methods
     /// need it and the body is identical.
-    fn build_client_from_ctx(&self, ctx: &BridgeContext) -> Result<BedrockClient, BridgeError> {
+    pub(crate) fn build_client_from_ctx(
+        &self,
+        ctx: &BridgeContext,
+    ) -> Result<BedrockClient, BridgeError> {
         // Parse credentials per-request to keep the bridge stateless —
         // credential rotation lands as soon as the PK snapshot
         // refreshes, no client cache invalidation needed.
@@ -2336,7 +2359,7 @@ fn map_converse_stream_event_error(
 /// collapsed to `BridgeError::upstream_status(status, msg)` which
 /// sets `wire: Unknown` and `retry_after: None`, silently regressing
 /// the legacy /invoke path's hardening (PR #323 MEDIUM-2).
-fn map_aws_sdk_error_generic<E>(
+pub(crate) fn map_aws_sdk_error_generic<E>(
     err: SdkError<E, aws_smithy_runtime_api::http::Response>,
     started: Instant,
     deadline: Option<Duration>,

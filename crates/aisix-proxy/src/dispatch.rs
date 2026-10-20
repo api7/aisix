@@ -167,6 +167,33 @@ pub(crate) fn speaks_anthropic(snapshot: &AisixSnapshot, model: &Model) -> bool 
     serves_natively(snapshot, model, ApiSurface::Messages)
 }
 
+/// The platform bridge that serves `/v1/messages` (and its
+/// `count_tokens` sub-route) for this target on the platform's own Claude
+/// Messages routes — Claude on Amazon Bedrock or on Vertex AI. The caller's
+/// Anthropic body is then forwarded nearly as it is and answered in the
+/// same wire, rather than translated through the chat form; the other
+/// endpoints keep translating, since the platform routes speak only the
+/// Anthropic Messages wire. `None` for every other target.
+pub(crate) fn anthropic_platform_bridge(
+    hub: &Hub,
+    snapshot: &AisixSnapshot,
+    model: &Model,
+) -> Option<Arc<dyn Bridge>> {
+    let pk = snapshot
+        .provider_keys
+        .get_by_id(model.provider_key_id.as_deref()?)?;
+    if !matches!(
+        pk.value.adapter,
+        Some(aisix_core::Adapter::Bedrock) | Some(aisix_core::Adapter::Vertex)
+    ) {
+        return None;
+    }
+    let bridge = resolve_bridge(hub, &pk.value)?;
+    bridge
+        .serves_anthropic_messages(model.model_name.as_deref()?)
+        .then_some(bridge)
+}
+
 /// Whether this Model's upstream is Anthropic's **own** API, as opposed
 /// to any of the other upstreams that merely speak the same wire
 /// protocol.

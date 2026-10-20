@@ -907,6 +907,13 @@ pub fn supports_native_structured_output(model: &str) -> bool {
     claude_family_version(model).is_some_and(|version| version >= (4, 5))
 }
 
+/// The `(major, minor)` family version a Claude model name carries
+/// (`claude-sonnet-4-5-20250929` is `(4, 5)`), `None` for a name that is
+/// not one.
+pub fn claude_family(model: &str) -> Option<(u32, u32)> {
+    claude_family_version(model)
+}
+
 fn claude_family_version(model: &str) -> Option<(u32, u32)> {
     let lowered = model.trim().to_ascii_lowercase();
     let segments: Vec<&str> = lowered.split(['-', '@']).collect();

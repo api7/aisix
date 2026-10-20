@@ -21,6 +21,11 @@
 //!   dispatch via Converse (same unified path; AWS handles
 //!   publisher-specific body shaping inside Bedrock).
 //!
+//! `/v1/messages` and `/v1/messages/count_tokens` for Claude go to
+//! `InvokeModel` / `InvokeModelWithResponseStream` / `CountTokens` with the
+//! caller's Anthropic body (`native.rs`); everything below is the chat
+//! translation the other endpoints use.
+//!
 //! Anthropic non-streaming keeps the legacy `/invoke` path
 //! (`chat_anthropic`) for backward compat with existing operator
 //! deployments + e2e test fixtures. Anthropic streaming, and all
@@ -87,6 +92,7 @@
 
 mod bridge;
 mod convert;
+mod native;
 mod wire;
 
 pub use bridge::{BedrockBridge, BedrockPublisher};

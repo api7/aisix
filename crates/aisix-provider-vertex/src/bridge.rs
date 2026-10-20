@@ -57,6 +57,9 @@ use crate::gemini_tools::{
 use crate::token_mint::{ServiceAccountKey, TokenMinter};
 use crate::wire;
 
+#[path = "native.rs"]
+mod native;
+
 // Claude on Vertex reuses the shared Anthropic Messages serializer +
 // response decoder (the same `wire` items the Bedrock `/invoke` path
 // reuses). The Vertex `:rawPredict` body is Anthropic Messages JSON
@@ -650,6 +653,26 @@ impl Bridge for VertexBridge {
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
         self.chat_cow(std::borrow::Cow::Borrowed(req), ctx).await
+    }
+
+    fn serves_anthropic_messages(&self, upstream_model: &str) -> bool {
+        native::serves_anthropic_messages(upstream_model)
+    }
+
+    async fn anthropic_messages(
+        &self,
+        body: serde_json::Value,
+        ctx: &BridgeContext,
+    ) -> Result<aisix_gateway::NativeMessages, BridgeError> {
+        self.native_messages(body, ctx).await
+    }
+
+    async fn anthropic_count_tokens(
+        &self,
+        body: serde_json::Value,
+        ctx: &BridgeContext,
+    ) -> Result<serde_json::Value, BridgeError> {
+        self.native_count_tokens(body, ctx).await
     }
 
     async fn chat_cow(

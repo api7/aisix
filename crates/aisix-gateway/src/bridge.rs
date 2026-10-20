@@ -298,6 +298,9 @@ pub enum BridgeCapability {
     TextCompletions,
     /// [`Bridge::generate_image`] — `/v1/images/generations`.
     ImageGeneration,
+    /// [`Bridge::anthropic_messages`] and [`Bridge::anthropic_count_tokens`]
+    /// — `/v1/messages` served on the platform's own Claude routes.
+    AnthropicMessages,
 }
 
 impl BridgeCapability {
@@ -307,6 +310,7 @@ impl BridgeCapability {
             Self::Embeddings => "embeddings",
             Self::TextCompletions => "text completions",
             Self::ImageGeneration => "image generation",
+            Self::AnthropicMessages => "Anthropic messages",
         }
     }
 }
@@ -800,6 +804,18 @@ impl BridgeError {
 /// (the Hub holds `Arc<dyn Bridge>` values).
 pub type ChatChunkStream = BoxStream<'static, Result<ChatChunk, BridgeError>>;
 
+/// What a platform answered an Anthropic Messages request with, in the
+/// Anthropic Messages wire itself.
+pub enum NativeMessages {
+    /// The Messages response object.
+    Json(serde_json::Value),
+    /// Anthropic SSE frames (`event:` + `data:` + blank line), each item
+    /// one or more whole frames. A failure inside the committed stream
+    /// arrives as an Anthropic `error` frame; an `Err` item is a transport
+    /// failure the bridge could not express as one.
+    Stream(BoxStream<'static, Result<bytes::Bytes, BridgeError>>),
+}
+
 /// The provider-agnostic chat operation. Implementors live in the
 /// individual `aisix-provider-*` crates.
 #[async_trait]
@@ -925,6 +941,40 @@ pub trait Bridge: Send + Sync + 'static {
     ) -> Result<serde_json::Value, BridgeError> {
         Err(BridgeError::UnsupportedCapability(
             BridgeCapability::ImageGeneration,
+        ))
+    }
+
+    /// Whether `upstream_model` is a Claude model this platform serves on
+    /// its own Anthropic Messages routes, so `/v1/messages` reaches it
+    /// through [`Bridge::anthropic_messages`] rather than the chat
+    /// translation.
+    fn serves_anthropic_messages(&self, _upstream_model: &str) -> bool {
+        false
+    }
+
+    /// An Anthropic Messages body sent to the platform's own Claude route
+    /// and answered in the same wire. `body` is the caller's request with
+    /// the gateway's own rewrites applied; the bridge adapts it to what the
+    /// platform accepts. `body.stream` picks the streaming route.
+    async fn anthropic_messages(
+        &self,
+        _body: serde_json::Value,
+        _ctx: &BridgeContext,
+    ) -> Result<NativeMessages, BridgeError> {
+        Err(BridgeError::UnsupportedCapability(
+            BridgeCapability::AnthropicMessages,
+        ))
+    }
+
+    /// `/v1/messages/count_tokens` on the platform's own token-counting
+    /// API, answered as Anthropic's `{"input_tokens": N}`.
+    async fn anthropic_count_tokens(
+        &self,
+        _body: serde_json::Value,
+        _ctx: &BridgeContext,
+    ) -> Result<serde_json::Value, BridgeError> {
+        Err(BridgeError::UnsupportedCapability(
+            BridgeCapability::AnthropicMessages,
         ))
     }
 }

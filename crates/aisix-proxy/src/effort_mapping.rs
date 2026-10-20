@@ -130,6 +130,9 @@ pub(crate) fn anthropic_native_request<'a>(
         || !model
             .model_name
             .as_deref()
+            // A platform model id (`us.anthropic.claude-haiku-4-5-…`) names
+            // its Claude family inside it.
+            .map(aisix_provider_anthropic::platform::claude_name)
             .is_some_and(rejects_effort_parameter)
     {
         return anthropic_request(body, model);
