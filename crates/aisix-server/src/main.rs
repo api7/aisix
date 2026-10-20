@@ -3260,10 +3260,11 @@ async fn serve_http_tpc(
     // while a sibling may hold an in-flight stream for minutes. A done
     // worker waits for the slowest before it drops its runtime (see
     // `run_tpc_worker`), and this waits for every worker, so the fastest
-    // drain cannot end the process under the slowest. Everything else stays immediately fatal: an accept
-    // loop failing, a panic unwinding, or a worker stopping without a
-    // shutdown signal has to bring the process down rather than leave it
-    // serving on fewer listeners than it reported binding.
+    // drain cannot end the process under the slowest. Everything else
+    // stays immediately fatal: an accept loop failing, a panic unwinding,
+    // or a worker stopping without a shutdown signal has to bring the
+    // process down rather than leave it serving on fewer listeners than
+    // it reported binding.
     let shutdown_seen = shutdown.cancel;
     tokio::task::spawn_blocking(move || {
         for _ in 0..workers {
@@ -3306,7 +3307,10 @@ impl Drop for WorkerExit {
 }
 
 /// One thread-per-core worker: its own current-thread runtime, its own
-/// listener, its own upstream connection pool.
+/// listener, its own upstream connection pool for Provider Keys without
+/// a connection override. Every other client pool is process-wide, so an
+/// upstream connection this runtime drives may be serving a sibling's
+/// request — which is why the runtime outlives its own drain.
 #[allow(clippy::too_many_arguments)]
 fn run_tpc_worker(
     listeners: Vec<WorkerListener>,
