@@ -441,10 +441,11 @@ struct Cell {
     terminal_upstream: Option<Duration>,
     /// See [`note_semantic_decision`].
     semantic: Option<aisix_obs::SemanticAccessLog>,
-    /// See [`note_terminal_error`]: `(status, error_class, error_message,
-    /// provider_request_id)` of the terminal event, `None` when it named no
-    /// failure.
-    terminal_error: Option<(u16, String, String, String)>,
+    /// See [`note_terminal_error`]: `(status, error_class, error_message)`
+    /// of the terminal event, `None` when it named no failure.
+    terminal_error: Option<(u16, String, String)>,
+    /// The terminal event's `provider_request_id`; see [`note_terminal_error`].
+    terminal_provider_request_id: String,
     /// The `upstream` end-to-end observation has been recorded.
     e2e_upstream_recorded: bool,
     /// See [`UpstreamClock`].
@@ -530,8 +531,13 @@ impl Cell {
     /// the terminal event, so the event is known by then even where the
     /// line was built first.
     fn name_failure(&self, record: &mut aisix_obs::AccessLogRecord) {
-        if let Some((status, class, message, provider_request_id)) = &self.terminal_error {
-            record.fill_failure_if_absent(*status, class, message, provider_request_id);
+        if let Some((status, class, message)) = &self.terminal_error {
+            record.fill_failure_if_absent(
+                *status,
+                class,
+                message,
+                &self.terminal_provider_request_id,
+            );
         }
     }
 
@@ -1442,15 +1448,22 @@ pub(crate) fn note_terminal_error(
     error_message: &str,
     provider_request_id: &str,
 ) {
-    let failure = (!error_class.is_empty()).then(|| {
-        (
-            status,
-            error_class.to_string(),
-            error_message.to_string(),
-            provider_request_id.to_string(),
-        )
+    let failure = (!error_class.is_empty())
+        .then(|| (status, error_class.to_string(), error_message.to_string()));
+    let _ = CURRENT.try_with(|a| {
+        let mut cell = a.lock();
+        cell.terminal_error = failure;
+        cell.terminal_provider_request_id = provider_request_id.to_string();
     });
-    let _ = CURRENT.try_with(|a| a.lock().terminal_error = failure);
+}
+
+/// The `provider_request_id` of the request's terminal usage event, for a
+/// line written after it on a success that has no response object of its own
+/// to read one from (`/v1/messages/count_tokens`).
+pub(crate) fn terminal_provider_request_id() -> String {
+    CURRENT
+        .try_with(|a| a.lock().terminal_provider_request_id.clone())
+        .unwrap_or_default()
 }
 
 /// Note the upstream duration of the attempt behind the request's terminal

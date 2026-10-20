@@ -427,7 +427,8 @@ just absent or off, which reads like a quiet upstream:
   success or failure — goes through `aisix_gateway::note_upstream_response`
   as soon as its head is in hand (`stream_timeout::send_with_deadline` and the
   provider bridges already do; Bedrock through an SDK interceptor). That is
-  the only source of an exporter's `upstream_response_headers`.
+  the only source of an exporter's `upstream_response_headers` and of the
+  `provider_request_id` a failed attempt or a token count records.
 - **Upstream wait.** `gateway_overhead_ms` subtracts the time the request
   spent inside attempt windows. `RoutingTelemetry::begin_attempt` / `record`
   open and close them; a surface that dispatches without it calls

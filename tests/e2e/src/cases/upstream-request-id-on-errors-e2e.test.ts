@@ -329,6 +329,8 @@ describe("the provider's request id on failed attempts and token counts", () => 
       expect(res.status, res.text).toBe(200);
       const [row] = await rowsFor(res.requestId, 1);
       expect(row.get("provider_request_id"), JSON.stringify(Object.fromEntries(row))).toBe(upstreamId);
+      const line = await accessLine(res.requestId);
+      expect(field(line, "provider_request_id"), line).toBe(upstreamId);
     });
   }
 
