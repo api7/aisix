@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  awaitWindowHeadroom,
   agentClaims,
   EtcdClient,
   metricDelta,
@@ -303,6 +304,7 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
     // rpm=1: the first request consumes the budget, the second is refused
     // by the gateway itself — no upstream is contacted, so this event comes
     // from the zero-attempt path rather than from a failed attempt.
+    await awaitWindowHeadroom();
     expect((await chat(GATEWAY_LIMITED_PLAINTEXT, "uma-gw429-first")).status).toBe(200);
     expect((await chat(GATEWAY_LIMITED_PLAINTEXT, "uma-gw429-refused")).status).toBe(429);
     const after: MetricSample[] = await scrapeMetrics(app.metricsUrl);

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  awaitWindowHeadroom,
   EtcdClient,
   SeedClient,
   ProxyClient,
@@ -112,6 +113,7 @@ describe("completions TPM boundary: usage exactly on the cap (#950)", () => {
         body: JSON.stringify({ model: "tpm-exact", prompt: "hi" }),
       });
 
+    await awaitWindowHeadroom();
     const first = await post();
     expect(first.status).toBe(200);
     await first.body?.cancel();
@@ -196,6 +198,7 @@ describe("completions TPM commit (#911 [21])", () => {
     });
 
     // First call succeeds and commits 16 tokens against the TPM=10 counter.
+    await awaitWindowHeadroom();
     const first = await postCompletion();
     expect(first.status).toBe(200);
 

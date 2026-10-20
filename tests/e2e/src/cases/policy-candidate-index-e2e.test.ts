@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { expect, test } from "vitest";
 import {
+  awaitWindowHeadroom,
   EtcdClient,
   ProxyClient,
   spawnApp,
@@ -61,6 +62,8 @@ test("policy candidates follow creation, identity edits, fallback conditions and
       });
       expect(response.status, JSON.stringify(response.body)).toBe(status);
     };
+    // Every step below reads counters of one UTC day.
+    await awaitWindowHeadroom(60, 86_400);
     await synced();
     await request(0, 200);
     await request(1, 200);

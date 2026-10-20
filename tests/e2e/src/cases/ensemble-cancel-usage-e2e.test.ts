@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  awaitWindowHeadroom,
   EtcdClient,
   ProxyClient,
   SeedClient,
@@ -147,6 +148,9 @@ describe("an ensemble abandoned after its panel answered", () => {
           return;
         }
         const caller = stream ? STREAM_CALLER : NONSTREAM_CALLER;
+        // The abandoned request's charge and the admission that must refuse
+        // the next one have to land in the same per-minute TPM window.
+        await awaitWindowHeadroom();
         const judgeCallsBefore = judge.receivedRequests.length;
         const slsFrom = sls.requests.length;
         const controller = new AbortController();
