@@ -2853,8 +2853,17 @@ fn tool_message_from_tool_result(block: &serde_json::Value, markers: CacheMarker
         _ => (Some(String::new()), None),
     };
 
+    // The result travels as one block, so a marker on the block or on any
+    // item of its `content` sets the breakpoint after it.
+    let marker = block.get("cache_control").or_else(|| {
+        block
+            .get("content")?
+            .as_array()?
+            .iter()
+            .find_map(|item| item.get("cache_control"))
+    });
     let mut extra = serde_json::Map::new();
-    if let (CacheMarkers::Keep, Some(marker)) = (markers, block.get("cache_control")) {
+    if let (CacheMarkers::Keep, Some(marker)) = (markers, marker) {
         extra.insert("cache_control".into(), marker.clone());
     }
     ChatMessage {
@@ -7630,6 +7639,13 @@ mod tests {
                     {"type": "tool_result", "tool_use_id": "toolu_1", "content": "42", "cache_control": ec},
                     {"type": "text", "text": "and?"},
                 ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_2", "name": "lookup", "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_2",
+                     "content": [{"type": "text", "text": "43", "cache_control": ec}]},
+                ]},
             ],
         })
     }
@@ -7668,9 +7684,11 @@ mod tests {
         assert_eq!(m[2]["content"][0]["type"], "tool_result");
         assert_eq!(m[2]["content"][0]["cache_control"], ec);
         assert!(m[2]["content"][1].get("cache_control").is_none());
+        assert_eq!(m[4]["content"][0]["type"], "tool_result");
+        assert_eq!(m[4]["content"][0]["cache_control"], ec);
         assert_eq!(
             wire.to_string().matches("cache_control").count(),
-            7,
+            8,
             "{wire}"
         );
     }
@@ -7682,7 +7700,10 @@ mod tests {
         let dropped = parse_inbound_request_with(&body, CacheMarkers::Drop).unwrap();
         let plain = serde_json::to_value(&plain).unwrap();
         assert_eq!(plain, serde_json::to_value(&dropped).unwrap());
-        assert!(!plain["messages"].to_string().contains("cache_control"), "{plain}");
+        assert!(
+            !plain["messages"].to_string().contains("cache_control"),
+            "{plain}"
+        );
         assert_eq!(plain["messages"][0]["content"], "rules\ncontext");
         let mut extra = dropped.extra.clone();
         translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);

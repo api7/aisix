@@ -1362,7 +1362,7 @@ fn build_converse_inputs(
                             systems.push(SystemContentBlock::Text(text.to_string()));
                         }
                         if let Some(point) = cache.point(part.get("cache_control")) {
-                            if !systems.is_empty() {
+                            if matches!(systems.last(), Some(SystemContentBlock::Text(_))) {
                                 systems.push(SystemContentBlock::CachePoint(point));
                             }
                         }
@@ -1419,8 +1419,8 @@ fn build_converse_inputs(
     }
     // `auto_prompt_caching` is a Claude setting; Nova honours only the
     // caller's own markers.
-    if let Some(ttl) =
-        auto_cache_ttl.filter(|_| cache == CachePoints::Claude && !chat_has_cache_markers(req))
+    if let Some(ttl) = auto_cache_ttl
+        .filter(|_| cache == CachePoints::Claude && !carries_cache_points(&systems, &messages, req))
     {
         inject_cache_points(&mut systems, &mut messages, cache, ttl)?;
     }
@@ -1450,9 +1450,9 @@ impl CachePoints {
         }
     }
 
-    /// The checkpoint a `cache_control` marker becomes, carrying its `ttl`
-    /// (`5m` or `1h`) for Claude only: Nova takes the five-minute default
-    /// alone and rejects the field.
+    /// The checkpoint a `cache_control` marker becomes, carrying a `1h`
+    /// `ttl` for Claude only: Nova takes the five-minute default alone and
+    /// rejects the field.
     fn point(self, marker: Option<&serde_json::Value>) -> Option<CachePointBlock> {
         let marker = marker?;
         let ttl = marker.get("ttl").and_then(|t| t.as_str());
@@ -1464,12 +1464,11 @@ impl CachePoints {
             Self::Off => return None,
             Self::Nova | Self::Claude => CachePointBlock::builder().r#type(CachePointType::Default),
         };
-        if self == Self::Claude {
-            match ttl {
-                Some("5m") => builder = builder.ttl(CacheTtl::FiveMinutes),
-                Some("1h") => builder = builder.ttl(CacheTtl::OneHour),
-                _ => {}
-            }
+        // `5m` is the default every model takes, and a model that offers
+        // only that rejects an explicit `ttl`, so only `1h` is written out
+        // — the same rule the Anthropic rails follow for the marker.
+        if self == Self::Claude && ttl == Some("1h") {
+            builder = builder.ttl(CacheTtl::OneHour);
         }
         builder.build().ok()
     }
@@ -1504,30 +1503,35 @@ fn part_text(part: &serde_json::Value) -> Option<&str> {
         .filter(|t| !t.trim().is_empty())
 }
 
-/// Whether the caller put any `cache_control` marker in the request — on a
-/// content part, a tool message, a tool call or a tool definition. The
-/// gateway's `auto_prompt_caching` stands down for such a request, as it
-/// does on every Claude rail.
-fn chat_has_cache_markers(req: &ChatFormat) -> bool {
+/// Whether the caller's own markers put a checkpoint in the request — in
+/// the system prompt, a message, or (marked tool definitions always become
+/// one for Claude) the tools. The gateway's `auto_prompt_caching` stands down
+/// for such a request, as it does on every Claude rail; a marker that placed
+/// no checkpoint does not count, matching the rails that look at the body
+/// they send.
+fn carries_cache_points(
+    systems: &[SystemContentBlock],
+    messages: &[BedrockMessage],
+    req: &ChatFormat,
+) -> bool {
     let marked = |v: &serde_json::Value| v.get("cache_control").is_some();
-    req.messages.iter().any(|m| {
-        m.extra.contains_key("cache_control")
-            || m.content_blocks
-                .as_deref()
-                .is_some_and(|b| b.iter().any(marked))
-            || m.extra
-                .get("tool_calls")
-                .and_then(|v| v.as_array())
-                .is_some_and(|calls| calls.iter().any(marked))
-    }) || req
-        .extra
-        .get("tools")
-        .and_then(|v| v.as_array())
-        .is_some_and(|tools| {
-            tools
+    systems
+        .iter()
+        .any(|b| matches!(b, SystemContentBlock::CachePoint(_)))
+        || messages.iter().any(|m| {
+            m.content()
                 .iter()
-                .any(|t| marked(t) || t.get("function").is_some_and(marked))
+                .any(|b| matches!(b, ContentBlock::CachePoint(_)))
         })
+        || req
+            .extra
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|t| marked(t) || t.get("function").is_some_and(marked))
+            })
 }
 
 /// `auto_prompt_caching` on Converse for Claude: the two breakpoints the Anthropic
@@ -1804,7 +1808,7 @@ fn assistant_content_blocks(
                     blocks.push(ContentBlock::Text(text.to_string()));
                 }
                 if let Some(point) = cache.point(part.get("cache_control")) {
-                    if !blocks.is_empty() {
+                    if matches!(blocks.last(), Some(ContentBlock::Text(_))) {
                         blocks.push(ContentBlock::CachePoint(point));
                     }
                 }
@@ -6647,7 +6651,7 @@ mod tests {
                 messages[3]["content"],
                 serde_json::json!([
                     {"text": "firstsecond"},
-                    {"cachePoint": {"type": "default", "ttl": "5m"}},
+                    {"cachePoint": {"type": "default"}},
                     {"text": "third"},
                 ])
             );
@@ -6729,6 +6733,41 @@ mod tests {
         )
         .await;
         assert_eq!(body.to_string().matches("cachePoint").count(), 5, "{body}");
+    }
+
+    #[test]
+    fn adjacent_markers_place_one_cache_point_and_a_markerless_point_does_not_stand_down() {
+        let ec = serde_json::json!({"type": "ephemeral"});
+        let mut user = ChatMessage::user(String::new());
+        user.content = None;
+        user.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "a", "cache_control": ec}),
+            serde_json::json!({"type": "text", "text": "", "cache_control": ec}),
+        ]);
+        let req = ChatFormat::new("m", vec![user]);
+        let claude = Some(BedrockPublisher::Anthropic);
+        let (_, messages) =
+            build_converse_inputs(&req, claude, &FetchedMedia::default(), None).unwrap();
+        let points = messages[0]
+            .content()
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::CachePoint(_)))
+            .count();
+        assert_eq!(points, 1, "{:?}", messages[0].content());
+
+        // A marker with nothing before it places no checkpoint, so it does
+        // not stand `auto_prompt_caching` down.
+        let mut first = ChatMessage::user(String::new());
+        first.content = None;
+        first.content_blocks = Some(vec![serde_json::json!({"type": "text", "text": "",
+            "cache_control": ec})]);
+        let req = ChatFormat::new("m", vec![first, ChatMessage::user("q".to_string())]);
+        let (_, messages) =
+            build_converse_inputs(&req, claude, &FetchedMedia::default(), Some("5m")).unwrap();
+        assert!(matches!(
+            messages.last().unwrap().content().last(),
+            Some(ContentBlock::CachePoint(_))
+        ));
     }
 
     #[tokio::test]

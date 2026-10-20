@@ -288,6 +288,9 @@ pub fn translate_user_parts_with<T>(
 ) -> Result<Vec<T>, String> {
     let mut out = Vec::new();
     let mut run = String::new();
+    // Whether the last item out is one `after` placed: a second right
+    // behind it would mark nothing new.
+    let mut placed = false;
     for (part_index, block) in blocks.iter().enumerate() {
         let invalid = |reason: &str| part_error(message_index, part_index, reason);
         match parse_part(block).map_err(|r| invalid(&r))? {
@@ -304,12 +307,16 @@ pub fn translate_user_parts_with<T>(
                 )));
             }
         }
+        if !run.is_empty() || matches!(parse_part(block), Ok(ContentPart::Media(_))) {
+            placed = false;
+        }
         if let Some(item) = after(block) {
             if !run.is_empty() {
                 out.push(text(std::mem::take(&mut run)));
             }
-            if !out.is_empty() {
+            if !out.is_empty() && !placed {
                 out.push(item);
+                placed = true;
             }
         }
     }
