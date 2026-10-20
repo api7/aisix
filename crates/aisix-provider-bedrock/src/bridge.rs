@@ -6559,7 +6559,7 @@ mod tests {
         } else {
             "converse"
         };
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(format!(r"^/model/.+/{route}$")))
@@ -6826,7 +6826,7 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_injects_auto_prompt_caching_markers_for_claude() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
