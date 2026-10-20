@@ -3506,6 +3506,7 @@ struct PassthroughUsage {
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
     modality: aisix_gateway::ModalityTokens,
+    cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
@@ -3524,6 +3525,7 @@ impl PassthroughUsage {
             cached_prompt_tokens: u.cached_prompt_tokens,
             cache_write_tokens: u.cache_write_tokens,
             modality: u.modality,
+            cache_creation_ttl: u.cache_creation_ttl,
             reasoning_tokens: u.reasoning_tokens,
             cache_creation_tokens: u.cache_creation_tokens,
             cache_read_tokens: u.cache_read_tokens,
@@ -3545,6 +3547,9 @@ impl PassthroughUsage {
         self.cached_prompt_tokens = self.cached_prompt_tokens.max(other.cached_prompt_tokens);
         self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
         self.modality = self.modality.max_fieldwise(&other.modality);
+        self.cache_creation_ttl = self
+            .cache_creation_ttl
+            .max_fieldwise(&other.cache_creation_ttl);
         self.reasoning_tokens = self.reasoning_tokens.max(other.reasoning_tokens);
         self.cache_creation_tokens = self.cache_creation_tokens.max(other.cache_creation_tokens);
         self.cache_read_tokens = self.cache_read_tokens.max(other.cache_read_tokens);
@@ -7123,6 +7128,7 @@ impl RouteTelemetry {
             cached_prompt_tokens: usage.cached_prompt_tokens,
             cache_write_tokens: usage.cache_write_tokens,
             modality_tokens: usage.modality,
+            cache_creation_ttl: usage.cache_creation_ttl,
             reasoning_tokens: usage.reasoning_tokens,
             total_tokens: usage.upstream_total_tokens.unwrap_or(0),
             cache_creation_tokens: usage.cache_creation_tokens,

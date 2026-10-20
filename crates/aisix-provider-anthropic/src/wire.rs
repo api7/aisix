@@ -34,8 +34,8 @@ use aisix_gateway::structured_output::{
     ANTHROPIC_SCHEMA_LIMITS, JSON_TOOL_DESCRIPTION, JSON_TOOL_NAME,
 };
 use aisix_gateway::{
-    BridgeError, ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, FinishReason, Role,
-    ServiceTier, UsageStats,
+    BridgeError, CacheCreationTtl, ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse,
+    FinishReason, Role, ServiceTier, UsageStats,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1740,6 +1740,9 @@ pub struct AnthropicUsage {
     /// Tokens served from the prompt cache (0.10× input rate).
     #[serde(default)]
     pub cache_read_input_tokens: u32,
+    /// `cache_creation_input_tokens` split by cache lifetime.
+    #[serde(default)]
+    pub cache_creation: Option<serde_json::Value>,
     #[serde(default)]
     pub speed: Option<serde_json::Value>,
     #[serde(default)]
@@ -1843,12 +1846,15 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
             // in — `input + output` alone under-counts (#906). Cache
             // counters stay separate; Anthropic doesn't use OpenAI's
             // cached-prompt / reasoning taxonomy (those default to 0).
-            UsageStats::with_cache(
-                u.input_tokens,
-                u.output_tokens,
-                u.cache_creation_input_tokens,
-                u.cache_read_input_tokens,
-            )
+            UsageStats {
+                cache_creation_ttl: CacheCreationTtl::from_anthropic(u.cache_creation.as_ref()),
+                ..UsageStats::with_cache(
+                    u.input_tokens,
+                    u.output_tokens,
+                    u.cache_creation_input_tokens,
+                    u.cache_read_input_tokens,
+                )
+            }
         })
         .unwrap_or_default();
 
@@ -2041,6 +2047,8 @@ pub struct AnthropicStreamStartUsage {
     #[serde(default)]
     pub cache_read_input_tokens: Option<u32>,
     #[serde(default)]
+    pub cache_creation: Option<serde_json::Value>,
+    #[serde(default)]
     pub speed: Option<serde_json::Value>,
     #[serde(default)]
     pub service_tier: Option<serde_json::Value>,
@@ -2088,6 +2096,8 @@ pub struct AnthropicStreamUsage {
     #[serde(default)]
     pub cache_read_input_tokens: Option<u32>,
     #[serde(default)]
+    pub cache_creation: Option<serde_json::Value>,
+    #[serde(default)]
     pub speed: Option<serde_json::Value>,
     #[serde(default)]
     pub service_tier: Option<serde_json::Value>,
@@ -2108,6 +2118,7 @@ pub struct StreamState {
     /// onto the terminal usage so the bridge doesn't drop them (#906).
     pub cache_creation_tokens: u32,
     pub cache_read_tokens: u32,
+    pub cache_creation_ttl: CacheCreationTtl,
     /// The tier the last `message_start` / `message_delta` usage reported,
     /// stamped on every chunk after it.
     pub service_tier: Option<ServiceTier>,
@@ -2153,6 +2164,12 @@ impl StreamState {
                     .as_ref()
                     .and_then(|u| u.cache_read_input_tokens)
                     .unwrap_or(0);
+                self.cache_creation_ttl = CacheCreationTtl::from_anthropic(
+                    message
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.cache_creation.as_ref()),
+                );
                 if let Some(tier) = message
                     .usage
                     .as_ref()
@@ -2214,6 +2231,11 @@ impl StreamState {
                 if let Some(t) = usage.cache_read_input_tokens {
                     self.cache_read_tokens = self.cache_read_tokens.max(t);
                 }
+                self.cache_creation_ttl =
+                    self.cache_creation_ttl
+                        .max_fieldwise(&CacheCreationTtl::from_anthropic(
+                            usage.cache_creation.as_ref(),
+                        ));
                 if let Some(tier) = usage_service_tier(&usage.speed, &usage.service_tier) {
                     self.service_tier = Some(tier);
                 }
@@ -2311,8 +2333,9 @@ impl StreamState {
                     .as_deref()
                     .map(|r| map_stop_reason(Some(r)));
                 let usage = usage.as_ref().and_then(|u| {
-                    u.output_tokens.map(|n| {
-                        UsageStats::with_cache(
+                    u.output_tokens.map(|n| UsageStats {
+                        cache_creation_ttl: self.cache_creation_ttl,
+                        ..UsageStats::with_cache(
                             self.input_tokens,
                             n,
                             self.cache_creation_tokens,

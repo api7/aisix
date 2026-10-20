@@ -1257,6 +1257,8 @@ fn shape_invoke_body(
             obj.insert(k.clone(), v.clone());
         }
     }
+    aisix_provider_anthropic::platform::retain_bedrock_thinking_display(obj);
+    aisix_provider_anthropic::platform::retain_bedrock_betas(obj);
 }
 
 impl BedrockBridge {
@@ -2479,6 +2481,10 @@ fn converse_output_into_chat_response(
             upstream_total_tokens: u.total_tokens().max(0) as u32,
             cache_read_tokens: u.cache_read_input_tokens().unwrap_or(0).max(0) as u32,
             cache_creation_tokens: u.cache_write_input_tokens().unwrap_or(0).max(0) as u32,
+            cache_creation_ttl: converse_cache_creation_ttl(
+                u.cache_details(),
+                u.cache_write_input_tokens(),
+            ),
             ..Default::default()
         })
         .unwrap_or_default();
@@ -2490,6 +2496,17 @@ fn converse_output_into_chat_response(
         usage,
         service_tier: converse_service_tier(resp.service_tier()),
     }
+}
+
+/// Converse `usage.cacheDetails`, the cache writes by lifetime.
+fn converse_cache_creation_ttl(
+    details: &[aws_sdk_bedrockruntime::types::CacheDetail],
+    cache_write_input_tokens: Option<i32>,
+) -> aisix_gateway::CacheCreationTtl {
+    aisix_gateway::CacheCreationTtl::from_converse_details(
+        details.iter().map(|d| (d.ttl().as_str(), d.input_tokens())),
+        cache_write_input_tokens.unwrap_or(0).max(0) as u32,
+    )
 }
 
 /// Converse `serviceTier.type`, verbatim (an SDK-unknown value keeps its
@@ -2708,6 +2725,10 @@ fn emit_converse_chunk(
                         cache_read_tokens: u.cache_read_input_tokens.unwrap_or(0).max(0) as u32,
                         cache_creation_tokens: u.cache_write_input_tokens.unwrap_or(0).max(0)
                             as u32,
+                        cache_creation_ttl: converse_cache_creation_ttl(
+                            u.cache_details(),
+                            u.cache_write_input_tokens,
+                        ),
                         ..Default::default()
                     }),
                     service_tier,
@@ -2912,6 +2933,8 @@ fn build_converse_additional_model_request_fields(
                 fields.insert(name.to_string(), value);
             }
         }
+        aisix_provider_anthropic::platform::retain_bedrock_thinking_display(&mut fields);
+        aisix_provider_anthropic::platform::retain_bedrock_betas(&mut fields);
     } else if let Some((name, value)) = crate::converse_req::reasoning_field(req, upstream_id)? {
         fields.insert(name.to_string(), value);
     }
@@ -5430,6 +5453,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_thinking_display_bedrock_refuses_is_dropped_on_both_chat_paths() {
+        let claude = "anthropic.claude-sonnet-4-5-20250929-v1:0";
+        for (display, kept) in [("updates", false), ("summarized", true)] {
+            let mut req = ChatFormat::new("my-model", vec![ChatMessage::user("hi")]);
+            req.max_tokens = Some(4096);
+            req.extra.insert(
+                "thinking".into(),
+                serde_json::json!({"type": "enabled", "budget_tokens": 2048, "display": display}),
+            );
+            let invoke = capture_bedrock_body(claude, "invoke", &req, false).await;
+            let converse = capture_bedrock_body(claude, "converse-stream", &req, true).await;
+            for thinking in [
+                &invoke["thinking"],
+                &converse["additionalModelRequestFields"]["thinking"],
+            ] {
+                assert_eq!(
+                    thinking["budget_tokens"], 2048,
+                    "{display}: {invoke} {converse}"
+                );
+                assert_eq!(
+                    thinking.get("display").is_some(),
+                    kept,
+                    "{display}: {invoke} {converse}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn json_object_without_a_schema_emits_nothing_on_either_bedrock_path() {
         let mut req = ChatFormat::new("my-model", vec![ChatMessage::user("hi")]);
         req.extra.insert(
@@ -5725,7 +5777,11 @@ mod tests {
                     "outputTokens": 11,
                     "totalTokens": 51,
                     "cacheReadInputTokens": 800,
-                    "cacheWriteInputTokens": 200
+                    "cacheWriteInputTokens": 200,
+                    "cacheDetails": [
+                        {"ttl": "5m", "inputTokens": 50},
+                        {"ttl": "1h", "inputTokens": 150}
+                    ]
                 },
                 "serviceTier": {"type": "priority"},
                 "metrics": {"latencyMs": 1}
@@ -5748,6 +5804,13 @@ mod tests {
 
         assert_eq!(chat.usage.cache_read_tokens, 800);
         assert_eq!(chat.usage.cache_creation_tokens, 200);
+        assert_eq!(
+            chat.usage.cache_creation_ttl,
+            aisix_gateway::CacheCreationTtl {
+                cache_creation_5m_tokens: Some(50),
+                cache_creation_1h_tokens: Some(150),
+            }
+        );
         assert_eq!(
             chat.service_tier,
             Some(ServiceTier::Native("priority".into()))
@@ -5793,7 +5856,11 @@ mod tests {
                     "input_tokens": 40,
                     "output_tokens": 11,
                     "cache_read_input_tokens": 800,
-                    "cache_creation_input_tokens": 200
+                    "cache_creation_input_tokens": 200,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 0,
+                        "ephemeral_1h_input_tokens": 200
+                    }
                 }
             })))
             .expect(1)
@@ -5816,6 +5883,13 @@ mod tests {
 
         assert_eq!(chat.usage.cache_read_tokens, 800);
         assert_eq!(chat.usage.cache_creation_tokens, 200);
+        assert_eq!(
+            chat.usage.cache_creation_ttl,
+            aisix_gateway::CacheCreationTtl {
+                cache_creation_5m_tokens: Some(0),
+                cache_creation_1h_tokens: Some(200),
+            }
+        );
         assert_eq!(chat.usage.prompt_tokens, 40);
         // The cache-inclusive total folds them in (#906), and the
         // OpenAI-shape subset stays empty.
@@ -5855,6 +5929,7 @@ mod tests {
             .unwrap();
         assert_eq!(chat.usage.cache_read_tokens, 0);
         assert_eq!(chat.usage.cache_creation_tokens, 0);
+        assert!(chat.usage.cache_creation_ttl.is_empty());
     }
 
     /// A replayed turn that holds only `reasoning_content` is skipped

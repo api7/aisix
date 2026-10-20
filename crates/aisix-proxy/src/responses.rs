@@ -151,6 +151,7 @@ struct ResponseUsage {
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
     modality: aisix_gateway::ModalityTokens,
+    cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     /// Anthropic `cache_creation_input_tokens` (cache write). Always 0 on
     /// the verbatim OpenAI path; carried for the cross-provider bridge
     /// path (#825) so an Anthropic-backed /v1/responses call bills cache
@@ -2626,6 +2627,7 @@ async fn responses_cross_provider_to_target(
                     cached_prompt_tokens: comp.cached_prompt_tokens,
                     cache_write_tokens: comp.cache_write_tokens,
                     modality: comp.modality,
+                    cache_creation_ttl: comp.cache_creation_ttl,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
                     upstream_total_tokens: comp.upstream_total_tokens.unwrap_or(0),
@@ -2787,6 +2789,7 @@ async fn responses_cross_provider_to_target(
             cached_prompt_tokens: resp.usage.cached_prompt_tokens,
             cache_write_tokens: resp.usage.cache_write_tokens,
             modality: resp.usage.modality,
+            cache_creation_ttl: resp.usage.cache_creation_ttl,
             cache_creation_tokens: resp.usage.cache_creation_tokens,
             cache_read_tokens: resp.usage.cache_read_tokens,
             upstream_total_tokens: resp.usage.upstream_total_tokens,
@@ -3009,6 +3012,7 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
             usage.get("input_tokens_details"),
             usage.get("output_tokens_details"),
         ),
+        cache_creation_ttl: aisix_gateway::CacheCreationTtl::NONE,
         // OpenAI verbatim path: no Anthropic-style cache counters.
         cache_creation_tokens: 0,
         cache_read_tokens: 0,
@@ -3075,6 +3079,7 @@ impl ResponseUsage {
             cached_prompt_tokens: self.cached_prompt_tokens,
             cache_write_tokens: self.cache_write_tokens,
             modality: self.modality,
+            cache_creation_ttl: self.cache_creation_ttl,
             reasoning_tokens: self.reasoning_tokens,
             cache_creation_tokens: self.cache_creation_tokens,
             cache_read_tokens: self.cache_read_tokens,
@@ -4026,6 +4031,7 @@ fn emit_usage_event(
         cached_prompt_tokens: usage.cached_prompt_tokens,
         cache_write_tokens: usage.cache_write_tokens,
         modality_tokens: usage.modality,
+        cache_creation_ttl: usage.cache_creation_ttl,
         reasoning_tokens: usage.reasoning_tokens,
         // Anthropic cache counters (#825 cross-provider path); 0 on the
         // verbatim OpenAI path.

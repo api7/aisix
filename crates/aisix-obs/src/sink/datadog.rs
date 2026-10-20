@@ -539,11 +539,17 @@ mod tests {
             prompt_tokens: 10,
             cache_read_tokens: 300,
             cache_creation_tokens: 40,
+            cache_creation_ttl: aisix_gateway::CacheCreationTtl {
+                cache_creation_5m_tokens: Some(10),
+                cache_creation_1h_tokens: Some(30),
+            },
             ..UsageEvent::default()
         });
         assert_eq!(anthropic["gen_ai.usage.input_tokens"], 350);
         assert_eq!(anthropic["aisix.cache_read_tokens"], 300);
         assert_eq!(anthropic["aisix.cache_creation_tokens"], 40);
+        assert_eq!(anthropic["aisix.cache_creation_5m_tokens"], 10);
+        assert_eq!(anthropic["aisix.cache_creation_1h_tokens"], 30);
 
         let openai = log(UsageEvent {
             prompt_tokens: 120,
@@ -551,6 +557,8 @@ mod tests {
             ..UsageEvent::default()
         });
         assert_eq!(openai["gen_ai.usage.input_tokens"], 120);
+        assert!(openai.get("aisix.cache_creation_5m_tokens").is_none());
+        assert!(openai.get("aisix.cache_creation_1h_tokens").is_none());
     }
 
     #[tokio::test]

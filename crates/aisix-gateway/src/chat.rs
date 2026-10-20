@@ -481,6 +481,136 @@ pub struct UsageStats {
     /// upgrade, a rollback) unreadable. A cache hit reports none.
     #[serde(skip)]
     pub modality: ModalityTokens,
+    /// The split of `cache_creation_tokens` by cache lifetime, when the
+    /// upstream reported one. Not serialized, for the same reason as
+    /// `modality`.
+    #[serde(skip)]
+    pub cache_creation_ttl: CacheCreationTtl,
+}
+
+/// Prompt-cache writes by cache lifetime, as the upstream reported them:
+/// Anthropic `usage.cache_creation.ephemeral_5m_input_tokens` /
+/// `ephemeral_1h_input_tokens`, Bedrock Converse `usage.cacheDetails[]` by
+/// `ttl`. Each is a part of `cache_creation_tokens`, and `None` when the
+/// upstream reported no split — distinct from a reported `0`. A one-hour
+/// write is priced above a five-minute one, so only the split tells them
+/// apart. Serialized under the usage event's own field names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheCreationTtl {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_5m_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h_tokens: Option<u32>,
+}
+
+impl CacheCreationTtl {
+    /// Nothing reported.
+    pub const NONE: Self = Self {
+        cache_creation_5m_tokens: None,
+        cache_creation_1h_tokens: None,
+    };
+
+    /// Read an Anthropic-shape `usage.cache_creation` object; anything but
+    /// an object reports no split.
+    pub fn from_anthropic(cache_creation: Option<&serde_json::Value>) -> Self {
+        let Some(split) = cache_creation.filter(|v| v.is_object()) else {
+            return Self::NONE;
+        };
+        let count = |key: &str| {
+            Some(
+                split
+                    .get(key)
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or(0, |n| n.min(u64::from(u32::MAX)) as u32),
+            )
+        };
+        Self {
+            cache_creation_5m_tokens: count("ephemeral_5m_input_tokens"),
+            cache_creation_1h_tokens: count("ephemeral_1h_input_tokens"),
+        }
+    }
+
+    /// Bedrock Converse `cacheDetails[]`, given as `(ttl, inputTokens)`
+    /// pairs. Taken only when the recognised lifetimes account for the
+    /// whole `cacheWriteInputTokens`: a partial breakdown, or one with a
+    /// lifetime this gateway does not know, would understate the write.
+    pub fn from_converse_details<'a>(
+        details: impl IntoIterator<Item = (&'a str, i32)>,
+        cache_write_tokens: u32,
+    ) -> Self {
+        let (mut five_m, mut one_h, mut any) = (0u32, 0u32, false);
+        for (ttl, tokens) in details {
+            any = true;
+            let tokens = tokens.max(0) as u32;
+            match ttl {
+                "5m" => five_m = five_m.saturating_add(tokens),
+                "1h" => one_h = one_h.saturating_add(tokens),
+                _ => {}
+            }
+        }
+        if !any || five_m.saturating_add(one_h) != cache_write_tokens {
+            return Self::NONE;
+        }
+        Self {
+            cache_creation_5m_tokens: Some(five_m),
+            cache_creation_1h_tokens: Some(one_h),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::NONE
+    }
+
+    /// The split as a record of a `total`-token write: kept, with an
+    /// unreported part as `0`, only when its parts add up to a non-zero
+    /// total. A split that misses the total — a partial upstream report, a
+    /// lifetime this gateway does not read, frames or members merged
+    /// unevenly — would misstate what was written at which lifetime, so it
+    /// is no split at all, as is any split of a write that did not happen.
+    pub fn accounting_for(self, total: u32) -> Self {
+        let five_m = self.cache_creation_5m_tokens.unwrap_or(0);
+        let one_h = self.cache_creation_1h_tokens.unwrap_or(0);
+        if self.is_empty() || total == 0 || five_m.saturating_add(one_h) != total {
+            return Self::NONE;
+        }
+        Self {
+            cache_creation_5m_tokens: Some(five_m),
+            cache_creation_1h_tokens: Some(one_h),
+        }
+    }
+
+    /// Field-wise sum, `None` only where neither side reported.
+    pub fn saturating_add(&self, other: &Self) -> Self {
+        fn add(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+            match (a, b) {
+                (None, None) => None,
+                _ => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+            }
+        }
+        Self {
+            cache_creation_5m_tokens: add(
+                self.cache_creation_5m_tokens,
+                other.cache_creation_5m_tokens,
+            ),
+            cache_creation_1h_tokens: add(
+                self.cache_creation_1h_tokens,
+                other.cache_creation_1h_tokens,
+            ),
+        }
+    }
+
+    /// Field-wise maximum, for a stream that reports usage on more than
+    /// one frame.
+    pub fn max_fieldwise(&self, other: &Self) -> Self {
+        Self {
+            cache_creation_5m_tokens: self
+                .cache_creation_5m_tokens
+                .max(other.cache_creation_5m_tokens),
+            cache_creation_1h_tokens: self
+                .cache_creation_1h_tokens
+                .max(other.cache_creation_1h_tokens),
+        }
+    }
 }
 
 /// The per-modality token counts an upstream reports inside its usage
@@ -746,6 +876,9 @@ impl UsageStats {
                 .reasoning_folded_into_completion
                 .saturating_add(other.reasoning_folded_into_completion),
             modality: self.modality.saturating_add(&other.modality),
+            cache_creation_ttl: self
+                .cache_creation_ttl
+                .saturating_add(&other.cache_creation_ttl),
         }
     }
 
@@ -782,6 +915,9 @@ impl UsageStats {
             // frame's value stands.
             reasoning_folded_into_completion: other.reasoning_folded_into_completion,
             modality: self.modality.max_fieldwise(&other.modality),
+            cache_creation_ttl: self
+                .cache_creation_ttl
+                .max_fieldwise(&other.cache_creation_ttl),
         }
     }
 
@@ -1604,6 +1740,54 @@ mod tests {
     }
 
     #[test]
+    fn cache_creation_ttl_reads_only_a_reported_split() {
+        let split =
+            serde_json::json!({"ephemeral_5m_input_tokens": 20, "ephemeral_1h_input_tokens": 300});
+        assert_eq!(
+            CacheCreationTtl::from_anthropic(Some(&split)),
+            CacheCreationTtl {
+                cache_creation_5m_tokens: Some(20),
+                cache_creation_1h_tokens: Some(300),
+            }
+        );
+        assert!(CacheCreationTtl::from_anthropic(None).is_empty());
+        assert!(CacheCreationTtl::from_anthropic(Some(&serde_json::Value::Null)).is_empty());
+
+        assert_eq!(
+            CacheCreationTtl::from_converse_details([("5m", 20), ("1h", 300)], 320),
+            CacheCreationTtl {
+                cache_creation_5m_tokens: Some(20),
+                cache_creation_1h_tokens: Some(300),
+            }
+        );
+        // A breakdown that does not account for the whole write, or carries
+        // a lifetime this gateway does not know, is no split at all.
+        assert!(CacheCreationTtl::from_converse_details([("1h", 300)], 320).is_empty());
+        assert!(
+            CacheCreationTtl::from_converse_details([("1h", 300), ("24h", 20)], 320).is_empty()
+        );
+        assert!(CacheCreationTtl::from_converse_details([], 320).is_empty());
+
+        let one_hour = CacheCreationTtl {
+            cache_creation_5m_tokens: None,
+            cache_creation_1h_tokens: Some(300),
+        };
+        assert_eq!(
+            one_hour.accounting_for(300),
+            CacheCreationTtl {
+                cache_creation_5m_tokens: Some(0),
+                cache_creation_1h_tokens: Some(300),
+            }
+        );
+        assert!(one_hour.accounting_for(320).is_empty());
+        let zeros = CacheCreationTtl {
+            cache_creation_5m_tokens: Some(0),
+            cache_creation_1h_tokens: Some(0),
+        };
+        assert!(zeros.accounting_for(0).is_empty());
+    }
+
+    #[test]
     fn usage_stats_saturating_add_sums_every_field() {
         let a = UsageStats {
             prompt_tokens: 10,
@@ -1621,6 +1805,10 @@ mod tests {
             modality: ModalityTokens {
                 prompt_audio_tokens: Some(4),
                 ..ModalityTokens::NONE
+            },
+            cache_creation_ttl: CacheCreationTtl {
+                cache_creation_5m_tokens: Some(0),
+                cache_creation_1h_tokens: Some(1),
             },
         };
         let b = UsageStats {
@@ -1641,8 +1829,10 @@ mod tests {
                 completion_image_tokens: Some(1),
                 ..ModalityTokens::NONE
             },
+            cache_creation_ttl: CacheCreationTtl::NONE,
         };
         let sum = a.saturating_add(&b);
+        assert_eq!(sum.cache_creation_ttl, a.cache_creation_ttl);
         assert_eq!(
             sum.modality,
             ModalityTokens {

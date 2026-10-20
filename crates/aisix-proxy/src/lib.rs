@@ -5647,6 +5647,85 @@ data: [DONE]\n\n";
         assert_eq!(hit_event.completion_tokens, 11);
     }
 
+    /// A response-cache hit reports the cached write's total but no
+    /// split by cache lifetime: not every cache backend keeps the split, so
+    /// a hit reports none whichever backend served it.
+    #[tokio::test]
+    async fn cache_hit_reports_no_cache_write_split() {
+        use aisix_obs::UsageSink;
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_cached",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "cached"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 7,
+                    "output_tokens": 11,
+                    "cache_creation_input_tokens": 300,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 0,
+                        "ephemeral_1h_input_tokens": 300
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-claude"]));
+        seed_cache_policy(&snap, "ttl-cache");
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = build_state_with_cache(snap, hub).with_usage_sink(UsageSink::new(tx));
+
+        let body = serde_json::json!({
+            "model": "my-claude",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let _ = run(build_router(state.clone()), make_req()).await;
+        let miss = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("event was never emitted")
+            .expect("sender dropped");
+        assert_eq!(miss.cache_status, "miss");
+        assert_eq!(miss.cache_creation_ttl.cache_creation_1h_tokens, Some(300));
+
+        let _ = run(build_router(state), make_req()).await;
+        let hit = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("event was never emitted")
+            .expect("sender dropped");
+        assert_eq!(hit.cache_status, "hit");
+        assert_eq!(hit.cache_creation_tokens, 300);
+        assert!(
+            hit.cache_creation_ttl.is_empty(),
+            "{:?}",
+            hit.cache_creation_ttl
+        );
+    }
+
     /// AISIX-Cloud#1571: a cache hit answers "which model produced the body
     /// you were served". That is the only thing on a hit row that names the
     /// producer at all — a Model Group's hit reports no target, because
