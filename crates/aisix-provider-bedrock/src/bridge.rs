@@ -1517,11 +1517,9 @@ impl BedrockBridge {
             &req,
             upstream_id,
             &fetched,
-            auto_prompt_caching_ttl(&ctx.model),
             tool_config.as_ref(),
             native.guardrail.is_some(),
-            pk_param_constraints(ctx),
-            header_betas(ctx),
+            ctx,
         )?;
 
         let started = Instant::now();
@@ -1609,11 +1607,9 @@ impl BedrockBridge {
             &req,
             upstream_id,
             &fetched,
-            auto_prompt_caching_ttl(&ctx.model),
             tool_config.as_ref(),
             native.guardrail.is_some(),
-            pk_param_constraints(ctx),
-            header_betas(ctx),
+            ctx,
         )?;
 
         let started = Instant::now();
@@ -1700,12 +1696,11 @@ impl ConverseParts {
         req: &ChatFormat,
         upstream_id: &str,
         fetched: &FetchedMedia,
-        auto_cache_ttl: Option<&str>,
         tool_config: Option<&ToolConfiguration>,
         guarded: bool,
-        constraints: Option<&ParamConstraints>,
-        header_betas: Vec<String>,
+        ctx: &BridgeContext,
     ) -> Result<Self, BridgeError> {
+        let auto_cache_ttl = auto_prompt_caching_ttl(&ctx.model);
         let publisher = BedrockPublisher::from_model_id(upstream_id);
         // Converse rejects tool blocks in a request without a
         // `toolConfig`, so with no tools to send the history is rewritten.
@@ -1726,9 +1721,14 @@ impl ConverseParts {
             req,
             upstream_id,
             tool_config,
-            header_betas,
+            header_betas(ctx),
         )?;
-        let inference = build_inference_config(req, upstream_id, thinking_max_tokens, constraints);
+        let inference = build_inference_config(
+            req,
+            upstream_id,
+            thinking_max_tokens,
+            pk_param_constraints(ctx),
+        );
         Ok(Self {
             systems,
             messages,
