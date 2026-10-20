@@ -218,20 +218,40 @@ describe("a refused request shape is described as a request error", () => {
   });
 
   // A request with nothing but instructions gives the model no turn to
-  // answer. Bedrock Converse cannot carry one, and it is the request that
-  // has to change.
-  test.for<[string, boolean[]]>([
-    ["refusal-nova", [false, true]],
-    ["refusal-bedrock-claude", [true]],
-  ])("chat: a system-only request on %s", async ([model, streams], ctx) => {
+  // answer, and Bedrock rejects it on every rail. It is the request that has
+  // to change, so the gateway refuses it the same way whichever rail serves
+  // it: Converse for Nova, `/invoke` for a non-streaming Claude call, and
+  // ConverseStream for a streaming one. Each entry point reaches the same
+  // bridge.
+  const SYSTEM_ONLY: Record<string, (model: string, stream: boolean) => unknown> = {
+    "/v1/chat/completions": (model, stream) => ({
+      model,
+      stream,
+      messages: [{ role: "system", content: "You are terse." }],
+    }),
+    "/v1/messages": (model, stream) => ({
+      model,
+      stream,
+      max_tokens: 64,
+      system: "You are terse.",
+      messages: [],
+    }),
+    "/v1/responses": (model, stream) => ({
+      model,
+      stream,
+      instructions: "You are terse.",
+      input: [],
+    }),
+  };
+  test.for<[string, string]>(
+    ["refusal-nova", "refusal-bedrock-claude"].flatMap((model) =>
+      Object.keys(SYSTEM_ONLY).map((path): [string, string] => [path, model]),
+    ),
+  )("%s: a system-only request on %s", async ([path, model], ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
-    for (const stream of streams) {
+    for (const stream of [false, true]) {
       const before = upstreamHits;
-      const res = await post(app, "/v1/chat/completions", {
-        model,
-        stream,
-        messages: [{ role: "system", content: "You are terse." }],
-      });
+      const res = await post(app, path, SYSTEM_ONLY[path]!(model, stream));
       await expectRequestRefusal(res, /at least one user or assistant turn/);
       expect(upstreamHits, `stream=${stream}`).toBe(before);
     }

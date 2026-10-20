@@ -1004,6 +1004,9 @@ impl BedrockBridge {
         let body_bytes = {
             let (system, messages) =
                 split_system(&req).map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
+            if messages.is_empty() {
+                return Err(system_only_request());
+            }
             let anthropic_req = build_request(&req, anthropic_model, system, messages, false);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -1359,9 +1362,11 @@ fn build_converse_inputs(
     Ok((systems, messages))
 }
 
-/// Converse rejects an empty `messages[]`, which is what a request holding
+/// Bedrock rejects an empty `messages[]`, which is what a request holding
 /// only system / developer turns leaves behind. That is the caller's
-/// request to fix, so it is refused as one rather than as a gateway fault.
+/// request to fix, so it is refused as one rather than as a gateway fault,
+/// on every rail (Converse, ConverseStream and the Claude `/invoke` path),
+/// so one request gets one answer whether or not it streams.
 fn system_only_request() -> BridgeError {
     BridgeError::InvalidRequest(
         "messages must include at least one user or assistant turn; \
