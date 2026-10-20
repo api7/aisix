@@ -550,6 +550,23 @@ pub async fn capture_upstream_error_http(
     }
 }
 
+/// The human-readable message of an upstream error body: `error.message`
+/// (the OpenAI / Google / Azure envelope), a top-level `message` (AWS), a
+/// bare-string `error`, or else the body text itself — truncated at
+/// [`MAX_UPSTREAM_ERROR_MESSAGE_BYTES`]. The caller receives it as the
+/// upstream wrote it.
+pub fn upstream_error_message(body: &[u8]) -> String {
+    let parsed: Option<serde_json::Value> = serde_json::from_slice(body).ok();
+    let text = |v: Option<&serde_json::Value>| v.and_then(|m| m.as_str()).map(str::to_string);
+    let message = parsed.as_ref().and_then(|v| {
+        text(v.get("error").and_then(|e| e.get("message")))
+            .or_else(|| text(v.get("message")))
+            .or_else(|| text(v.get("error")))
+    });
+    let message = message.unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
+    truncate_lossy(&message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES)
+}
+
 /// Probe one SSE `data:` payload for a provider in-band error envelope
 /// (`{"error": {...}}` or `{"error": "..."}`) and capture it as a
 /// [`BridgeError::UpstreamInBand`]. Returns `None` when the payload is
@@ -999,6 +1016,8 @@ mod tests {
             input_was_single: true,
             encoding_format: None,
             dimensions: None,
+            input_type: None,
+            embedding_types: None,
         };
 
         let cases: Vec<(BridgeError, BridgeCapability, &str)> = vec![
