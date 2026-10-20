@@ -434,16 +434,34 @@ impl AccessLogRecord {
     /// that already names an error keeps it, and a line reporting a
     /// different status than the event describes another outcome — a
     /// caller that left after the line was written — so it is left alone.
-    pub fn fill_error_if_absent(&mut self, status: u16, error_kind: &str, error: &str) {
-        if self.error_kind.is_some()
-            || self.error.is_some()
-            || error_kind.is_empty()
-            || self.status != status
-        {
+    ///
+    /// The event's `provider_request_id` fills a failed request's line that
+    /// has none, whatever status either reports: the line is written by a
+    /// handler that never saw the upstream's response head, and the id names
+    /// that upstream response whichever status the caller was given.
+    pub fn fill_failure_if_absent(
+        &mut self,
+        status: u16,
+        error_kind: &str,
+        error: &str,
+        provider_request_id: &str,
+    ) {
+        if error_kind.is_empty() {
+            return;
+        }
+        self.fill_provider_request_id_if_absent(provider_request_id);
+        if self.error_kind.is_some() || self.error.is_some() || self.status != status {
             return;
         }
         self.error_kind = Some(error_kind.to_string());
         self.error = (!error.is_empty()).then(|| error.to_string());
+    }
+
+    /// Set `provider_request_id` on a line that has none.
+    pub fn fill_provider_request_id_if_absent(&mut self, provider_request_id: &str) {
+        if self.provider_request_id.is_none() && !provider_request_id.is_empty() {
+            self.provider_request_id = Some(provider_request_id.to_string());
+        }
     }
 
     pub fn emit(&self) {

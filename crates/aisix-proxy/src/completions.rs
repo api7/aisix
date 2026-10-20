@@ -281,9 +281,11 @@ pub async fn completions(
         Err(err) => {
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             emit_access_log(
                 &model_name,
-                "unknown",
+                last_target.provider(),
                 &api_key_id,
                 status,
                 elapsed,
@@ -297,8 +299,6 @@ pub async fn completions(
             // branch used to emit `Upstream::default()`, so a 502 from a
             // real provider landed on `provider="unknown"` while the same
             // key's successes landed on the real one.
-            let attributed = crate::attribution::current().unwrap_or_default();
-            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             crate::request_metrics::record(
                 &state,
                 "/v1/completions",
