@@ -10,7 +10,7 @@ import type { SpawnedApp } from "./app.js";
  * log line ends in a newline, so anything after the last one is a
  * fragment and is dropped until the rest of it arrives.
  */
-function completeLines(app: SpawnedApp): string[] {
+export function completeLines(app: SpawnedApp): string[] {
   const lines = app.output().split("\n");
   lines.pop();
   return lines;

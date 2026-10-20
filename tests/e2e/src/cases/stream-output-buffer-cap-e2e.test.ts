@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  completeLines,
   ProxyClient,
   SeedClient,
   spawnApp,
@@ -270,7 +271,7 @@ describe("streamed output hold-back cap measures held content (#513)", () => {
       ? l.includes("releasing it without an output scan")
       : l.includes("failing closed") && l.includes("max_buffer_bytes");
   const capLines = (failOpen: boolean) =>
-    app!.output().split("\n").filter(isCapLine(failOpen)).length;
+    completeLines(app!).filter(isCapLine(failOpen)).length;
   const expectCapLine = async (failOpen: boolean, before: number) => {
     const row = failOpen ? "cap-fail-open" : "cap-fail-closed";
     const lines = await waitForLogLines(
