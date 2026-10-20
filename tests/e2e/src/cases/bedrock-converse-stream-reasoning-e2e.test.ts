@@ -5,6 +5,7 @@ import {
   EtcdClient,
   SeedClient,
   eventStream,
+  invokeChunk,
   spawnApp,
   waitConfigPropagation,
   type SpawnedApp,
@@ -21,6 +22,11 @@ import {
 // a signature-only delta. The text is shortened and the signature replaced
 // with a marker; a redacted-reasoning block is added so the spec can show
 // that ciphertext stays out of the reply, as it does when not streamed.
+//
+// `/v1/messages` is the exception: it reaches Claude on Bedrock through
+// InvokeModelWithResponseStream, in the Anthropic wire, so the signature
+// and the redacted block come back to the caller as Claude sent them — an
+// Anthropic client replays both on its next turn.
 
 const CALLER_PLAINTEXT = "sk-bedrock-stream-reasoning";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -55,6 +61,43 @@ const CONVERSE_STREAM = eventStream([
     { usage: { inputTokens: 46, outputTokens: 119, totalTokens: 165 }, metrics: { latencyMs: 1045 } },
   ],
 ]);
+
+// The same reply as InvokeModelWithResponseStream streams it.
+const INVOKE_STREAM = Buffer.concat(
+  [
+    {
+      type: "message_start",
+      message: {
+        id: "msg_bdrk_reasoning",
+        type: "message",
+        role: "assistant",
+        model: "claude-haiku-4-5-20251001",
+        content: [],
+        stop_reason: null,
+        usage: { input_tokens: 46, output_tokens: 1 },
+      },
+    },
+    { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } },
+    ...REASONING_DELTAS.map((thinking) => ({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "thinking_delta", thinking },
+    })),
+    { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: SIGNATURE } },
+    { type: "content_block_stop", index: 0 },
+    { type: "content_block_start", index: 1, content_block: { type: "redacted_thinking", data: REDACTED } },
+    { type: "content_block_stop", index: 1 },
+    { type: "content_block_start", index: 2, content_block: { type: "text", text: "" } },
+    ...ANSWER_DELTAS.map((text) => ({
+      type: "content_block_delta",
+      index: 2,
+      delta: { type: "text_delta", text },
+    })),
+    { type: "content_block_stop", index: 2 },
+    { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 119 } },
+    { type: "message_stop" },
+  ].map(invokeChunk),
+);
 
 // The same reply as Bedrock `/invoke` returns it when not streamed.
 const INVOKE_REPLY = {
@@ -105,7 +148,10 @@ describe("Bedrock: streamed reasoning matches the non-streamed reply", () => {
     upstream = createServer((req, res) => {
       req.resume();
       req.on("end", () => {
-        if (req.url?.endsWith("/converse-stream")) {
+        if (req.url?.endsWith("/invoke-with-response-stream")) {
+          res.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" });
+          res.end(INVOKE_STREAM);
+        } else if (req.url?.endsWith("/converse-stream")) {
           res.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" });
           res.end(CONVERSE_STREAM);
         } else if (req.url?.endsWith("/converse")) {
@@ -212,7 +258,7 @@ describe("Bedrock: streamed reasoning matches the non-streamed reply", () => {
     expectNoOpaqueReasoning(raw);
   });
 
-  test("/v1/messages streams a thinking block", async (ctx) => {
+  test("/v1/messages streams the thinking block with its signature", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const request = {
       model: MODEL,
@@ -246,8 +292,16 @@ describe("Bedrock: streamed reasoning matches the non-streamed reply", () => {
       .map((e) => e.delta.text)
       .join("");
     expect(text).toBe(ANSWER);
-    expect(events.some((e) => e.delta?.type === "signature_delta")).toBe(false);
-    expectNoOpaqueReasoning(raw);
+    expect(events).toContainEqual({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "signature_delta", signature: SIGNATURE },
+    });
+    expect(events).toContainEqual({
+      type: "content_block_start",
+      index: 1,
+      content_block: { type: "redacted_thinking", data: REDACTED },
+    });
   });
 
   test("/v1/responses streams a reasoning item", async (ctx) => {

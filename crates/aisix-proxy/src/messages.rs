@@ -1133,12 +1133,30 @@ async fn dispatch_to_target(
     // another upstream's reasoning: it rejects any signature that does not
     // verify. Per target, so a fail-over between the two kinds of upstream
     // sends each the history it accepts.
+    //
+    // Claude on Bedrock or Vertex AI is both: it is not Anthropic's API, and
+    // it verifies thinking signatures exactly as Anthropic's API does.
+    //
+    // A structured-output request to a Claude family without native
+    // structured output keeps the chat translation, whose synthetic-tool
+    // route is what makes it work there.
+    let platform = crate::dispatch::anthropic_platform_bridge(&state.hub, snapshot, model)
+        .filter(|_| !needs_synthetic_structured_output(body, model));
     let body = if crate::dispatch::is_first_party_anthropic(snapshot, model) {
         aisix_provider_anthropic::strip_unsigned_thinking_blocks(body)
+    } else if platform.is_some() {
+        match aisix_provider_anthropic::strip_billing_header_attribution(body) {
+            std::borrow::Cow::Borrowed(b) => {
+                aisix_provider_anthropic::strip_unsigned_thinking_blocks(b)
+            }
+            std::borrow::Cow::Owned(b) => std::borrow::Cow::Owned(
+                aisix_provider_anthropic::strip_unsigned_thinking_blocks(&b).into_owned(),
+            ),
+        }
     } else {
         aisix_provider_anthropic::strip_billing_header_attribution(body)
     };
-    let speaks_anthropic = crate::dispatch::speaks_anthropic(snapshot, model);
+    let speaks_anthropic = platform.is_some() || crate::dispatch::speaks_anthropic(snapshot, model);
     let (mapped, mapped_effort) = if speaks_anthropic {
         crate::effort_mapping::anthropic_native_request(body.as_ref(), model, true)
     } else {
@@ -1185,6 +1203,7 @@ async fn dispatch_to_target(
         state,
         snapshot,
         body,
+        platform,
         model,
         &target.id,
         timeouts,
@@ -1217,6 +1236,11 @@ async fn anthropic_passthrough_dispatch(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     body: std::borrow::Cow<'_, Value>,
+    // Set for Claude on a platform's own Messages routes
+    // ([`crate::dispatch::anthropic_platform_bridge`]): the bridge sends the
+    // body there and answers in the Anthropic wire, and everything after the
+    // upstream answer is shared with Anthropic's own API.
+    platform: Option<std::sync::Arc<dyn aisix_gateway::Bridge>>,
     model: &aisix_core::Model,
     model_id: &str,
     timeouts: crate::routing::TimeoutBudget,
@@ -1242,8 +1266,6 @@ async fn anthropic_passthrough_dispatch(
     input_redactions: crate::redact::RedactionCounts,
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, ProxyError> {
-    let api_key = crate::dispatch::require_api_key(pk_value, model)?;
-
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
     // The outbound body exists only as its wire bytes past this block: they
@@ -1251,7 +1273,7 @@ async fn anthropic_passthrough_dispatch(
     // body the handler keeps for fail-over, so an owned `Value` copy alive
     // across the await would be a third copy of the whole request. Later
     // readers (content capture, token estimation) work from the bytes.
-    let (body_bytes, is_stream) = {
+    let (body_bytes, is_stream, platform_body) = {
         let mut body = body.into_owned();
 
         // Rewrite the `model` field to the upstream value.
@@ -1289,76 +1311,16 @@ async fn anthropic_passthrough_dispatch(
             .get("stream")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        (crate::util::outbound_json(&body)?, is_stream)
+        let bytes = crate::util::outbound_json(&body)?;
+        // A platform bridge adapts the body itself, so it takes the value
+        // rather than parsing the bytes back.
+        (bytes, is_stream, platform.is_some().then_some(body))
     };
 
-    // Build the target URL. build_anthropic_url tolerates the rare case
-    // where the customer mistakenly puts `/v1` in the Anthropic
-    // api_base (the dashboard placeholder uses the OpenAI form, so
-    // this is a copy-paste hazard).
-    let url = aisix_gateway::url_cache::cached_endpoint_url(
-        pk_id,
-        "proxy/messages",
-        // Every resolve_base_url_for input (#1017) via the shared constructor.
-        &crate::dispatch::pk_surface_url_fingerprint(pk_value, aisix_core::ApiSurface::Messages),
-        || {
-            let base =
-                crate::dispatch::resolve_base_url_for(pk_value, aisix_core::ApiSurface::Messages)?;
-            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_anthropic_url(
-                &base,
-                "/messages",
-            ))
-        },
-    )?;
-
-    // Build the outbound HeaderMap explicitly so the PK's
-    // `request.default_headers` / `request.forward_client_headers` can
-    // inject operator-supplied and forwarded client headers via the
-    // shared apply pipeline. The bridge-owned headers (x-api-key,
-    // anthropic-version, content-type, x-aisix-request-id) are inserted
-    // FIRST, which is what stops a `default_headers` entry clobbering
-    // auth here (ai-gateway#337) — that merge is skip-if-present. Only a
-    // header the operator explicitly forwards takes the credential slot.
-    let mut headers = axum::http::HeaderMap::new();
-    let api_key_hv = HeaderValue::from_str(api_key).map_err(|e| {
-        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-            "api key contains invalid header chars: {e}"
-        )))
-    })?;
-    headers.insert(HeaderName::from_static("x-api-key"), api_key_hv);
-    headers.insert(
-        HeaderName::from_static("anthropic-version"),
-        HeaderValue::from_static(ANTHROPIC_VERSION),
-    );
-    headers.insert(
-        axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    let rid_hv = HeaderValue::from_str(request_id).map_err(|e| {
-        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-            "request_id contains invalid header chars: {e}"
-        )))
-    })?;
-    headers.insert(HeaderName::from_static("x-aisix-request-id"), rid_hv);
-    aisix_gateway::apply_request_headers(
-        &mut headers,
-        &crate::dispatch::upstream_header_ctx(pk_value, pk_id, model, model_id, client_ctx),
-    );
-
-    let client = crate::http_client::client_for(pk_value.upstream_connection().as_ref());
-    let mut req_builder = url
-        .post_on(&client)
-        .headers(headers)
-        .body(body_bytes.clone());
-    // #554: non-streaming gets the E2E request timeout via reqwest's
-    // request-level timeout. Streaming must NOT use it (it would cap the
-    // whole stream); the streaming branch below enforces the per-chunk
-    // read timeout instead.
-    if !is_stream {
-        if let Some(d) = timeouts.request {
-            req_builder = req_builder.timeout(d);
-        }
-    }
+    let wire_protocol = match &platform {
+        Some(bridge) => bridge.wire_protocol(),
+        None => aisix_core::Adapter::Anthropic.wire_protocol(),
+    };
     let send_started = Instant::now();
     // least_busy: count this target as in-flight for the upstream call
     // (mirrors chat.rs). Non-streaming / error paths drop the guard at
@@ -1370,8 +1332,86 @@ async fn anthropic_passthrough_dispatch(
     // request-level timeout can't be used — it would cap the whole stream);
     // non-streaming relies on the request-level timeout set above.
     let connect_deadline = if is_stream { timeouts.stream } else { None };
-    let upstream_resp =
-        crate::stream_timeout::send_with_deadline(req_builder, connect_deadline, send_started)
+    let answer = match &platform {
+        None => {
+            let api_key = crate::dispatch::require_api_key(pk_value, model)?;
+            // Build the target URL. build_anthropic_url tolerates the rare case
+            // where the customer mistakenly puts `/v1` in the Anthropic
+            // api_base (the dashboard placeholder uses the OpenAI form, so
+            // this is a copy-paste hazard).
+            let url = aisix_gateway::url_cache::cached_endpoint_url(
+                pk_id,
+                "proxy/messages",
+                // Every resolve_base_url_for input (#1017) via the shared constructor.
+                &crate::dispatch::pk_surface_url_fingerprint(
+                    pk_value,
+                    aisix_core::ApiSurface::Messages,
+                ),
+                || {
+                    let base = crate::dispatch::resolve_base_url_for(
+                        pk_value,
+                        aisix_core::ApiSurface::Messages,
+                    )?;
+                    Ok::<_, crate::error::ProxyError>(crate::dispatch::build_anthropic_url(
+                        &base,
+                        "/messages",
+                    ))
+                },
+            )?;
+
+            // Build the outbound HeaderMap explicitly so the PK's
+            // `request.default_headers` / `request.forward_client_headers` can
+            // inject operator-supplied and forwarded client headers via the
+            // shared apply pipeline. The bridge-owned headers (x-api-key,
+            // anthropic-version, content-type, x-aisix-request-id) are inserted
+            // FIRST, which is what stops a `default_headers` entry clobbering
+            // auth here (ai-gateway#337) — that merge is skip-if-present. Only a
+            // header the operator explicitly forwards takes the credential slot.
+            let mut headers = axum::http::HeaderMap::new();
+            let api_key_hv = HeaderValue::from_str(api_key).map_err(|e| {
+                ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                    "api key contains invalid header chars: {e}"
+                )))
+            })?;
+            headers.insert(HeaderName::from_static("x-api-key"), api_key_hv);
+            headers.insert(
+                HeaderName::from_static("anthropic-version"),
+                HeaderValue::from_static(ANTHROPIC_VERSION),
+            );
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            let rid_hv = HeaderValue::from_str(request_id).map_err(|e| {
+                ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                    "request_id contains invalid header chars: {e}"
+                )))
+            })?;
+            headers.insert(HeaderName::from_static("x-aisix-request-id"), rid_hv);
+            aisix_gateway::apply_request_headers(
+                &mut headers,
+                &crate::dispatch::upstream_header_ctx(pk_value, pk_id, model, model_id, client_ctx),
+            );
+
+            let client = crate::http_client::client_for(pk_value.upstream_connection().as_ref());
+            let mut req_builder = url
+                .post_on(&client)
+                .headers(headers)
+                .body(body_bytes.clone());
+            // #554: non-streaming gets the E2E request timeout via reqwest's
+            // request-level timeout. Streaming must NOT use it (it would cap the
+            // whole stream); the streaming branch below enforces the per-chunk
+            // read timeout instead.
+            if !is_stream {
+                if let Some(d) = timeouts.request {
+                    req_builder = req_builder.timeout(d);
+                }
+            }
+            let upstream_resp = crate::stream_timeout::send_with_deadline(
+                req_builder,
+                connect_deadline,
+                send_started,
+            )
             .await
             .map_err(|be| {
                 crate::cooldown::note_failure(
@@ -1383,29 +1423,68 @@ async fn anthropic_passthrough_dispatch(
             })
             .map_err(ProxyError::Bridge)?;
 
-    let status = upstream_resp.status();
+            let status = upstream_resp.status();
 
-    if !status.is_success() {
-        let status_u16 = status.as_u16();
-        let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
-        let message = upstream_resp.text().await.unwrap_or_default();
-        let truncated = crate::util::truncate_on_char_boundary(&message, 1024);
-        let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
-            status_u16,
-            truncated,
-            retry_after,
-        );
-        // Apply the cross-request cooldown contract to the
-        // Anthropic-passthrough path too — without this, a 401 / 429 /
-        // 5xx via /v1/messages would never mark the direct model and
-        // subsequent requests would keep hitting the same broken
-        // upstream. See `crate::cooldown` for the shared decision.
-        if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-        {
-            state.runtime_status.mark_cooldown(model_id, ttl, reason);
+            if !status.is_success() {
+                let status_u16 = status.as_u16();
+                let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
+                let message = upstream_resp.text().await.unwrap_or_default();
+                let truncated = crate::util::truncate_on_char_boundary(&message, 1024);
+                let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
+                    status_u16,
+                    truncated,
+                    retry_after,
+                );
+                // Apply the cross-request cooldown contract to the
+                // Anthropic-passthrough path too — without this, a 401 / 429 /
+                // 5xx via /v1/messages would never mark the direct model and
+                // subsequent requests would keep hitting the same broken
+                // upstream. See `crate::cooldown` for the shared decision.
+                if let Some((ttl, reason)) =
+                    crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                {
+                    state.runtime_status.mark_cooldown(model_id, ttl, reason);
+                }
+                return Err(ProxyError::Bridge(err));
+            }
+            Upstream::Http(upstream_resp)
         }
-        return Err(ProxyError::Bridge(err));
-    }
+        Some(bridge) => {
+            let mut ctx = crate::dispatch::bridge_ctx(
+                request_id,
+                model_id,
+                std::sync::Arc::new(model.clone()),
+                pk_id,
+                std::sync::Arc::new(pk_value.clone()),
+                Some(client_ctx),
+            );
+            if let Some(d) = if is_stream {
+                timeouts.stream
+            } else {
+                timeouts.request
+            } {
+                ctx = ctx.with_deadline(d);
+            }
+            // Media downloads are bounded by the end-to-end budget, not the
+            // chunk gap a streaming deadline is.
+            if is_stream {
+                ctx = ctx.with_non_streaming_deadline(timeouts.request);
+            }
+            let native = bridge
+                .anthropic_messages(platform_body.unwrap_or_default(), &ctx)
+                .await
+                .map_err(|be| {
+                    crate::cooldown::note_failure(
+                        &state.runtime_status,
+                        model_id,
+                        model.cooldown.as_ref(),
+                        be,
+                    )
+                })
+                .map_err(ProxyError::Bridge)?;
+            Upstream::Native(native)
+        }
+    };
 
     // Update health trackers on success — both the display-name-keyed
     // observational signal AND the id-keyed runtime status that
@@ -1437,12 +1516,15 @@ async fn anthropic_passthrough_dispatch(
     // read timeout lives on the SSE branch this response no longer takes,
     // so without one a stalled JSON body would be held with no bound at all.
     let buffered_body_deadline = if is_stream { timeouts.stream } else { None };
-    let is_stream = is_stream && crate::dispatch::upstream_body_is_sse(upstream_resp.headers());
+    let is_stream = match &answer {
+        Upstream::Http(resp) => is_stream && crate::dispatch::upstream_body_is_sse(resp.headers()),
+        Upstream::Native(native) => matches!(native, aisix_gateway::NativeMessages::Stream(_)),
+    };
 
     if is_stream {
         // For SSE streaming: pass through the response body as a streaming
         // `text/event-stream` response.
-        let headers = upstream_resp.headers().clone();
+        let (content_type, upstream_bytes) = answer.into_sse();
         // #554: enforce the per-chunk read timeout on the forwarded bytes.
         // When a `stream_timeout` is configured, peek the first byte so a
         // slow/erroring first token fails over (the caller loops to the next
@@ -1453,7 +1535,7 @@ async fn anthropic_passthrough_dispatch(
         let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
         let wrapped: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
             Box::pin(crate::stream_timeout::with_read_timeout_bytes_signalled(
-                upstream_resp.bytes_stream(),
+                upstream_bytes,
                 stream_budget,
                 read_timeout.clone(),
             ));
@@ -1658,7 +1740,7 @@ async fn anthropic_passthrough_dispatch(
                     &state_c,
                     &snap_c,
                     &pk_c,
-                    aisix_core::Adapter::Anthropic.wire_protocol(),
+                    wire_protocol,
                     &request_id_c,
                     &model_id_c,
                     &api_key_id_c,
@@ -1734,13 +1816,9 @@ async fn anthropic_passthrough_dispatch(
         ));
 
         // Copy content-type from upstream (should be text/event-stream).
-        if let Some(ct) = headers.get("content-type") {
-            if let Ok(hv) = HeaderValue::from_bytes(ct.as_bytes()) {
-                response
-                    .headers_mut()
-                    .insert(axum::http::header::CONTENT_TYPE, hv);
-            }
-        }
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, content_type);
         // Set cache-control to no-cache for SSE.
         response.headers_mut().insert(
             axum::http::header::CACHE_CONTROL,
@@ -1761,7 +1839,7 @@ async fn anthropic_passthrough_dispatch(
         Ok(DispatchOutcome {
             response,
             provider_label,
-            upstream_protocol: aisix_core::Adapter::Anthropic.wire_protocol(),
+            upstream_protocol: wire_protocol,
             provider_key_id: pk_id.to_string(),
             upstream_model: upstream_model.clone(),
             metrics: AnthropicUsageMetrics::default(),
@@ -1778,18 +1856,18 @@ async fn anthropic_passthrough_dispatch(
         // failures cool down the target — a body the bridge can't
         // parse is a real upstream problem worth taking out of
         // rotation, not a caller bug.
-        let mut json_body: Value =
-            crate::dispatch::json_body_within(upstream_resp, buffered_body_deadline)
-                .await
-                .map_err(|be| {
-                    crate::cooldown::note_failure(
-                        &state.runtime_status,
-                        model_id,
-                        model.cooldown.as_ref(),
-                        be,
-                    )
-                })
-                .map_err(ProxyError::Bridge)?;
+        let mut json_body: Value = answer
+            .into_json(buffered_body_deadline)
+            .await
+            .map_err(|be| {
+                crate::cooldown::note_failure(
+                    &state.runtime_status,
+                    model_id,
+                    model.cooldown.as_ref(),
+                    be,
+                )
+            })
+            .map_err(ProxyError::Bridge)?;
 
         let mut metrics = anthropic_metrics_from_response_json(&json_body);
         // Token-estimation fallback (AISIX-Cloud#1074): an
@@ -1933,7 +2011,7 @@ async fn anthropic_passthrough_dispatch(
         Ok(DispatchOutcome {
             response: Json(json_body).into_response(),
             provider_label,
-            upstream_protocol: aisix_core::Adapter::Anthropic.wire_protocol(),
+            upstream_protocol: wire_protocol,
             provider_key_id: pk_id.to_string(),
             upstream_model,
             metrics,
@@ -1943,6 +2021,85 @@ async fn anthropic_passthrough_dispatch(
             output_redactions,
             output_monitor_hits,
         })
+    }
+}
+
+fn needs_synthetic_structured_output(body: &Value, model: &aisix_core::Model) -> bool {
+    let asks = body.get("output_format").is_some_and(|v| !v.is_null())
+        || body
+            .get("output_config")
+            .and_then(|c| c.get("format"))
+            .is_some_and(|v| !v.is_null());
+    asks && !model
+        .model_name
+        .as_deref()
+        .map(aisix_provider_anthropic::platform::claude_name)
+        .is_some_and(aisix_provider_anthropic::wire::supports_native_structured_output)
+}
+
+/// What the upstream of an Anthropic-wire `/v1/messages` passthrough
+/// answered: Anthropic's own API (or any endpoint speaking its wire) over
+/// HTTP, or a platform bridge's native answer.
+enum Upstream {
+    Http(reqwest::Response),
+    Native(aisix_gateway::NativeMessages),
+}
+
+impl Upstream {
+    /// The SSE body and the content type to answer it under. A platform
+    /// stream's transport failure becomes an Anthropic `error` frame — the
+    /// stream it interrupts is already committed.
+    fn into_sse(
+        self,
+    ) -> (
+        HeaderValue,
+        std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
+    ) {
+        let sse = HeaderValue::from_static("text/event-stream");
+        match self {
+            Self::Http(resp) => {
+                let ct = resp
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| HeaderValue::from_bytes(v.as_bytes()).ok())
+                    .unwrap_or(sse);
+                (ct, Box::pin(resp.bytes_stream()))
+            }
+            Self::Native(aisix_gateway::NativeMessages::Stream(frames)) => {
+                let frames = async_stream::stream! {
+                    futures::pin_mut!(frames);
+                    while let Some(item) = frames.next().await {
+                        match item {
+                            Ok(bytes) => yield Ok(bytes),
+                            Err(e) => {
+                                yield Ok(aisix_provider_anthropic::platform::error_frame(
+                                    "api_error",
+                                    &e.to_string(),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                };
+                (sse, Box::pin(frames))
+            }
+            Self::Native(aisix_gateway::NativeMessages::Json(_)) => {
+                unreachable!("a JSON answer takes the buffered branch")
+            }
+        }
+    }
+
+    async fn into_json(
+        self,
+        deadline: Option<std::time::Duration>,
+    ) -> Result<Value, aisix_gateway::BridgeError> {
+        match self {
+            Self::Http(resp) => crate::dispatch::json_body_within(resp, deadline).await,
+            Self::Native(aisix_gateway::NativeMessages::Json(v)) => Ok(v),
+            Self::Native(aisix_gateway::NativeMessages::Stream(_)) => {
+                unreachable!("a stream takes the SSE branch")
+            }
+        }
     }
 }
 

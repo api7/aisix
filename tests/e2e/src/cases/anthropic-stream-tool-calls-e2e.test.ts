@@ -340,7 +340,10 @@ describe("Claude streaming tool calls reach OpenAI-protocol clients", () => {
       ["toolu_time", "get_time"],
     ]);
     expect(JSON.parse(calls[0]!.json)).toEqual({ city: "Paris", unit: "celsius" });
-    expect(JSON.parse(calls[1]!.json)).toEqual({});
+    // The stream is Vertex AI's own, relayed as it is: a call with no
+    // arguments streams an empty `partial_json`, which an Anthropic client
+    // reads as `{}`.
+    expect(JSON.parse(calls[1]!.json || "{}")).toEqual({});
     const stop = events.find((e) => e.type === "message_delta");
     expect(stop?.delta?.stop_reason).toBe("tool_use");
   });

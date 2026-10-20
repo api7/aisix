@@ -28,8 +28,8 @@ use tokio::time::Instant;
 use crate::bridge::{BridgeContext, BridgeError};
 use crate::chat::{ChatFormat, Role};
 use crate::content_part::{
-    display_uri, mime_type_from_path, normalize_mime_type, parse_part, part_error, ContentPart,
-    Media, MediaSource,
+    display_uri, mime_type_from_path, normalize_mime_type, parse_part, ContentPart, Media,
+    MediaSource,
 };
 
 /// Attempts per URL on a timeout or transport failure. An HTTP error
@@ -255,9 +255,19 @@ impl FetchedMedia {
 struct Wanted {
     uri: String,
     explicit_mime_type: Option<String>,
-    message: usize,
-    part: usize,
+    location: String,
     uses: usize,
+}
+
+/// A media URL a request names, for a wire the chat form does not carry
+/// (an Anthropic Messages body forwarded as it is).
+pub struct MediaUrl {
+    pub uri: String,
+    /// The media type the request states for it, if any.
+    pub mime_type: Option<String>,
+    /// Where the request names it (`messages[2].content[0].content[1]`),
+    /// prefixed to the error a failed download returns.
+    pub location: String,
 }
 
 /// Download every `http(s)` media URL in the request's user turns that
@@ -296,13 +306,10 @@ async fn fetch_media_urls_in(
     needs_fetch: impl Fn(&Media<'_>) -> bool,
     tool_results: bool,
 ) -> Result<FetchedMedia, BridgeError> {
-    let settings = settings();
-    if !settings.enabled {
+    if !settings().enabled {
         return Ok(FetchedMedia::default());
     }
-    let budget = ctx.non_streaming_deadline.or(ctx.deadline);
-    let mut wanted: Vec<Wanted> = Vec::new();
-    let mut seen: HashMap<&str, usize> = HashMap::new();
+    let mut urls: Vec<MediaUrl> = Vec::new();
     // Every part naming a URL takes the download from the result, whether
     // or not that part alone would have needed it, so all are counted.
     let mut occurrences: HashMap<&str, usize> = HashMap::new();
@@ -332,28 +339,74 @@ async fn fetch_media_urls_in(
             {
                 continue;
             }
-            match seen.entry(uri) {
-                Entry::Occupied(_) => {}
-                Entry::Vacant(at) => {
-                    at.insert(wanted.len());
-                    wanted.push(Wanted {
-                        uri: uri.to_string(),
-                        explicit_mime_type: mime_type.clone().filter(|_| *explicit),
-                        message,
-                        part,
-                        uses: 0,
-                    });
-                }
-            }
+            urls.push(MediaUrl {
+                uri: uri.to_string(),
+                mime_type: mime_type.clone().filter(|_| *explicit),
+                location: format!("messages[{message}].content[{part}]"),
+            });
         }
     }
+    let uses = |uri: &str| occurrences.get(uri).copied().unwrap_or(1);
+    fetch_wanted(dedupe(urls, uses), ctx, encoding).await
+}
+
+/// Download `urls` as `encoding` — the [`fetch_media_urls`] rules for a
+/// request whose media the caller has already located. Each URL is
+/// downloaded once however often it is named, and every naming takes it
+/// from the result.
+pub async fn fetch_urls(
+    urls: Vec<MediaUrl>,
+    ctx: &BridgeContext,
+    encoding: Encoding,
+) -> Result<FetchedMedia, BridgeError> {
+    if !settings().enabled {
+        return Ok(FetchedMedia::default());
+    }
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for u in &urls {
+        *counts.entry(u.uri.clone()).or_default() += 1;
+    }
+    let urls: Vec<MediaUrl> = urls
+        .into_iter()
+        .filter(|u| Url::parse(&u.uri).is_ok_and(|p| matches!(p.scheme(), "http" | "https")))
+        .collect();
+    let uses = |uri: &str| counts.get(uri).copied().unwrap_or(1);
+    fetch_wanted(dedupe(urls, uses), ctx, encoding).await
+}
+
+/// Whether `upstream.media_fetch` is on, i.e. whether a URL the upstream
+/// cannot read is downloaded rather than refused.
+pub fn enabled() -> bool {
+    settings().enabled
+}
+
+fn dedupe(urls: Vec<MediaUrl>, uses: impl Fn(&str) -> usize) -> Vec<Wanted> {
+    let mut wanted: Vec<Wanted> = Vec::new();
+    let mut seen: HashMap<String, ()> = HashMap::new();
+    for u in urls {
+        if let Entry::Vacant(at) = seen.entry(u.uri.clone()) {
+            at.insert(());
+            wanted.push(Wanted {
+                uses: uses(&u.uri),
+                uri: u.uri,
+                explicit_mime_type: u.mime_type,
+                location: u.location,
+            });
+        }
+    }
+    wanted
+}
+
+async fn fetch_wanted(
+    wanted: Vec<Wanted>,
+    ctx: &BridgeContext,
+    encoding: Encoding,
+) -> Result<FetchedMedia, BridgeError> {
+    let settings = settings();
     if wanted.is_empty() {
         return Ok(FetchedMedia::default());
     }
-    for w in &mut wanted {
-        w.uses = occurrences.get(w.uri.as_str()).copied().unwrap_or(1);
-    }
-
+    let budget = ctx.non_streaming_deadline.or(ctx.deadline);
     let started = Instant::now();
     let deadline = budget.map(|b| started + b);
     let held = RequestBudget::new(ctx.inbound_body_bytes, settings.request_body_limit_bytes);
@@ -387,10 +440,10 @@ async fn fetch_media_urls_in(
                     failure = ?failure,
                     "media URL not downloaded"
                 );
-                return Err(BridgeError::InvalidRequest(part_error(
-                    w.message,
-                    w.part,
-                    &failure.describe(&w.uri, settings),
+                return Err(BridgeError::InvalidRequest(format!(
+                    "{}: {}",
+                    w.location,
+                    failure.describe(&w.uri, settings),
                 )));
             }
         }

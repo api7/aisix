@@ -59,3 +59,32 @@ export function eventStreamFrame(eventType: string, payload: unknown): Buffer {
 export function eventStream(events: Array<[string, unknown]>): Buffer {
   return Buffer.concat(events.map(([type, payload]) => eventStreamFrame(type, payload)));
 }
+
+/** One `:message-type: exception` frame, the way Bedrock raises an error
+ * inside a committed event stream (`throttlingException`, …). */
+export function eventStreamException(exceptionType: string, payload: unknown): Buffer {
+  const headers = Buffer.concat([
+    stringHeader(":exception-type", exceptionType),
+    stringHeader(":content-type", "application/json"),
+    stringHeader(":message-type", "exception"),
+  ]);
+  const body = Buffer.from(JSON.stringify(payload), "utf8");
+  const total = 12 + headers.length + body.length + 4;
+  const prelude = Buffer.alloc(8);
+  prelude.writeUInt32BE(total, 0);
+  prelude.writeUInt32BE(headers.length, 4);
+  const preludeCrc = Buffer.alloc(4);
+  preludeCrc.writeUInt32BE(crc32(prelude), 0);
+  const withoutCrc = Buffer.concat([prelude, preludeCrc, headers, body]);
+  const messageCrc = Buffer.alloc(4);
+  messageCrc.writeUInt32BE(crc32(withoutCrc), 0);
+  return Buffer.concat([withoutCrc, messageCrc]);
+}
+
+/** An `InvokeModelWithResponseStream` `chunk` frame carrying one Anthropic
+ * Messages stream event. */
+export function invokeChunk(event: unknown): Buffer {
+  return eventStreamFrame("chunk", {
+    bytes: Buffer.from(JSON.stringify(event), "utf8").toString("base64"),
+  });
+}
