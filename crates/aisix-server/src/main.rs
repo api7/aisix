@@ -3043,8 +3043,10 @@ async fn accept_loop(
     drop(listener);
 
     // The drain has already run every in-flight request to completion, so
-    // what is left here is idle pooled connections; each one's task ends
-    // as soon as `serve_connection` hands it the cancel signal.
+    // what is left here is idle pooled connections, which end as soon as
+    // `serve_connection` hands them the cancel signal, and connections that
+    // have not sent a request yet, which are served first and so are held
+    // for up to `downstream.idle_timeout_secs` (unbounded when it is 0).
     drop(alive);
     let _ = all_connections_ended.recv().await;
     Ok(())
@@ -3122,6 +3124,9 @@ async fn serve_connection<I, S>(
             let mut retired = false;
             loop {
                 tokio::select! {
+                    // A pooled connection whose next request is already
+                    // buffered reads it before it can be retired.
+                    biased;
                     served = conn.as_mut() => break served.map_err(|e| e.to_string()),
                     _ = async {
                         shutdown.cancelled().await;
