@@ -137,12 +137,14 @@ impl BedrockGuardrail {
         fail_open: bool,
         endpoint_url: Option<String>,
     ) -> Self {
+        let row_name = row_name.into();
         if let Some(url) = endpoint_url.as_ref() {
             // Visible at INFO so an operator inspecting DP logs sees
             // "Bedrock isn't talking to AWS" without having to grep
             // env. Prints once per BedrockGuardrail materialised from
             // the snapshot, which is rare (snapshot rebuild only).
             tracing::info!(
+                guardrail_name = %row_name,
                 endpoint = %url,
                 bedrock_guardrail_id = %cfg.guardrail_id,
                 "BedrockGuardrail using endpoint URL override (Config.bedrock_endpoint_url)",
