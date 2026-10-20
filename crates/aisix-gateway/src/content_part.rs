@@ -270,6 +270,22 @@ pub fn translate_user_parts<T>(
     text: impl Fn(String) -> T,
     media: impl Fn(&Media<'_>, usize) -> Result<T, String>,
 ) -> Result<Vec<T>, String> {
+    translate_user_parts_with(blocks, message_index, family, text, media, |_| None)
+}
+
+/// [`translate_user_parts`] where `after` may return an item to place right
+/// after a part — a prompt-cache checkpoint for a part that carries a
+/// `cache_control` marker. The text run is closed before it, so the item
+/// follows exactly the text it marks. An item for a part with nothing
+/// before it is dropped: there is no prefix for it to mark.
+pub fn translate_user_parts_with<T>(
+    blocks: &[Value],
+    message_index: usize,
+    family: &str,
+    text: impl Fn(String) -> T,
+    media: impl Fn(&Media<'_>, usize) -> Result<T, String>,
+    after: impl Fn(&Value) -> Option<T>,
+) -> Result<Vec<T>, String> {
     let mut out = Vec::new();
     let mut run = String::new();
     for (part_index, block) in blocks.iter().enumerate() {
@@ -286,6 +302,14 @@ pub fn translate_user_parts<T>(
                 return Err(invalid(&format!(
                     "content part type {ty:?} is not supported for {family} models"
                 )));
+            }
+        }
+        if let Some(item) = after(block) {
+            if !run.is_empty() {
+                out.push(text(std::mem::take(&mut run)));
+            }
+            if !out.is_empty() {
+                out.push(item);
             }
         }
     }

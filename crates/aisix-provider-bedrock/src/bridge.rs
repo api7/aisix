@@ -36,20 +36,20 @@ use aws_sdk_bedrockruntime::operation::invoke_model::InvokeModelError;
 use aws_sdk_bedrockruntime::primitives::Blob;
 use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
 use aws_sdk_bedrockruntime::types::{
-    AnyToolChoice, AudioBlock, AudioFormat, AudioSource, ContentBlock, ContentBlockDelta,
-    ContentBlockStart, ConversationRole, ConverseStreamOutput, DocumentBlock, DocumentFormat,
-    DocumentSource, ImageBlock, ImageFormat, ImageSource, InferenceConfiguration,
-    JsonSchemaDefinition, Message as BedrockMessage, OutputConfig, OutputFormat,
-    OutputFormatStructure, OutputFormatType, ReasoningContentBlock, ReasoningContentBlockDelta,
-    SpecificToolChoice, StopReason as SdkStopReason, SystemContentBlock, Tool, ToolChoice,
-    ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolSpecification,
-    ToolUseBlock, VideoBlock, VideoFormat, VideoSource,
+    AnyToolChoice, AudioBlock, AudioFormat, AudioSource, CachePointBlock, CachePointType, CacheTtl,
+    ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole, ConverseStreamOutput,
+    DocumentBlock, DocumentFormat, DocumentSource, ImageBlock, ImageFormat, ImageSource,
+    InferenceConfiguration, JsonSchemaDefinition, Message as BedrockMessage, OutputConfig,
+    OutputFormat, OutputFormatStructure, OutputFormatType, ReasoningContentBlock,
+    ReasoningContentBlockDelta, SpecificToolChoice, StopReason as SdkStopReason,
+    SystemContentBlock, Tool, ToolChoice, ToolConfiguration, ToolInputSchema, ToolResultBlock,
+    ToolResultContentBlock, ToolSpecification, ToolUseBlock, VideoBlock, VideoFormat, VideoSource,
 };
 use aws_sdk_bedrockruntime::Client as BedrockClient;
 use base64::Engine as _;
 
 use aisix_gateway::content_part::{
-    check_tool_result_parts, display_uri, translate_user_parts, Media, MediaSource,
+    check_tool_result_parts, display_uri, translate_user_parts_with, Media, MediaSource,
 };
 use aisix_gateway::media_fetch::{fetch_media_urls, Encoding, FetchedMedia};
 use aws_smithy_runtime_api::client::result::ServiceError;
@@ -58,8 +58,9 @@ use serde::Deserialize;
 use std::time::{Duration, Instant};
 
 use aisix_provider_anthropic::wire::{
-    anthropic_needs_fetch, build_request, claude_media_kind, response_into_chat_response,
-    split_system_with, structured_output_for, tool_choice_states_a_preference,
+    anthropic_needs_fetch, apply_auto_prompt_caching, auto_prompt_caching_ttl, build_request,
+    claude_media_kind, response_into_chat_response, split_system_with, structured_output_for,
+    tool_choice_states_a_preference, tool_message_cache_control,
     translate_reasoning_effort_to_anthropic, AnthropicResponse, MediaUrls, StructuredOutput,
 };
 
@@ -737,6 +738,15 @@ impl Bridge for BedrockBridge {
         aisix_core::Adapter::Bedrock.wire_protocol()
     }
 
+    fn reads_cache_markers(&self, ctx: &BridgeContext) -> bool {
+        upstream_model(ctx).is_ok_and(|id| {
+            !matches!(
+                CachePoints::for_publisher(BedrockPublisher::from_model_id(id)),
+                CachePoints::Off
+            )
+        })
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,
@@ -1021,7 +1031,8 @@ impl BedrockBridge {
         let body_bytes = {
             let (system, messages) = split_system_with(&req, urls, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
-            let anthropic_req = build_request(&req, anthropic_model, system, messages, false);
+            let mut anthropic_req = build_request(&req, anthropic_model, system, messages, false);
+            apply_auto_prompt_caching(&mut anthropic_req, &ctx.model);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
             })?;
@@ -1118,8 +1129,12 @@ impl BedrockBridge {
         let fetched = fetch_media_urls(&req, ctx, Encoding::Bytes, |_| true).await?;
         let charged = fetched.charge(ctx);
         let ctx = &*charged;
-        let (system_blocks, message_blocks) =
-            build_converse_inputs(&req, BedrockPublisher::from_model_id(upstream_id), &fetched)?;
+        let (system_blocks, message_blocks) = build_converse_inputs(
+            &req,
+            BedrockPublisher::from_model_id(upstream_id),
+            &fetched,
+            auto_prompt_caching_ttl(&ctx.model),
+        )?;
 
         let started = Instant::now();
         let deadline = ctx.deadline;
@@ -1223,8 +1238,12 @@ impl BedrockBridge {
         let fetched = fetch_media_urls(&req, ctx, Encoding::Bytes, |_| true).await?;
         let charged = fetched.charge(ctx);
         let ctx = &*charged;
-        let (system_blocks, message_blocks) =
-            build_converse_inputs(&req, BedrockPublisher::from_model_id(upstream_id), &fetched)?;
+        let (system_blocks, message_blocks) = build_converse_inputs(
+            &req,
+            BedrockPublisher::from_model_id(upstream_id),
+            &fetched,
+            auto_prompt_caching_ttl(&ctx.model),
+        )?;
 
         let started = Instant::now();
         let deadline = ctx.deadline;
@@ -1308,8 +1327,10 @@ fn build_converse_inputs(
     req: &ChatFormat,
     publisher: Option<BedrockPublisher>,
     fetched: &FetchedMedia,
+    auto_cache_ttl: Option<&str>,
 ) -> Result<(Vec<SystemContentBlock>, Vec<BedrockMessage>), BridgeError> {
     let claude = publisher == Some(BedrockPublisher::Anthropic);
+    let cache = CachePoints::for_publisher(publisher);
     let mut systems: Vec<SystemContentBlock> = Vec::new();
     let mut messages: Vec<BedrockMessage> = Vec::new();
     // #560: buffer for coalescing consecutive `role:"tool"` results
@@ -1334,22 +1355,36 @@ fn build_converse_inputs(
             )?);
         }
         match msg.role {
-            Role::System | Role::Developer => {
-                let content = msg.content_str();
-                if !content.is_empty() {
-                    systems.push(SystemContentBlock::Text(content.to_string()));
+            Role::System | Role::Developer => match marked_text_parts(msg, cache) {
+                Some(parts) => {
+                    for part in parts {
+                        if let Some(text) = part_text(part) {
+                            systems.push(SystemContentBlock::Text(text.to_string()));
+                        }
+                        if let Some(point) = cache.point(part.get("cache_control")) {
+                            if !systems.is_empty() {
+                                systems.push(SystemContentBlock::CachePoint(point));
+                            }
+                        }
+                    }
                 }
-            }
+                None => {
+                    let content = msg.content_str();
+                    if !content.is_empty() {
+                        systems.push(SystemContentBlock::Text(content.to_string()));
+                    }
+                }
+            },
             Role::User => {
                 messages.push(build_message(
                     ConversationRole::User,
-                    user_content_blocks(msg, index, claude, fetched)?,
+                    user_content_blocks(msg, index, claude, cache, fetched)?,
                 )?);
             }
             Role::Assistant => {
                 messages.push(build_message(
                     ConversationRole::Assistant,
-                    assistant_content_blocks(msg)?,
+                    assistant_content_blocks(msg, cache)?,
                 )?);
             }
             Role::Tool => {
@@ -1372,6 +1407,9 @@ fn build_converse_inputs(
                             BridgeError::Config(format!("bedrock converse: build tool_result: {e}"))
                         })?,
                 ));
+                if let Some(point) = cache.point(tool_message_cache_control(msg)) {
+                    pending_tool_results.push(ContentBlock::CachePoint(point));
+                }
             }
         }
     }
@@ -1379,7 +1417,144 @@ fn build_converse_inputs(
     if !pending_tool_results.is_empty() {
         messages.push(build_message(ConversationRole::User, pending_tool_results)?);
     }
+    // `auto_prompt_caching` is a Claude setting; Nova honours only the
+    // caller's own markers.
+    if let Some(ttl) =
+        auto_cache_ttl.filter(|_| cache == CachePoints::Claude && !chat_has_cache_markers(req))
+    {
+        inject_cache_points(&mut systems, &mut messages, cache, ttl)?;
+    }
     Ok((systems, messages))
+}
+
+/// Which Converse prompt-cache checkpoints a publisher's models take
+/// (<https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html>):
+/// Claude takes them in `system`, `messages` and `tools`, with a `ttl`;
+/// Amazon Nova in `system` and `messages`, without one. Every other
+/// publisher gets none, so a caller's `cache_control` marker is not
+/// forwarded to it — OpenAI models on Bedrock, for one, have no explicit
+/// caching on Converse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachePoints {
+    Off,
+    Nova,
+    Claude,
+}
+
+impl CachePoints {
+    fn for_publisher(publisher: Option<BedrockPublisher>) -> Self {
+        match publisher {
+            Some(BedrockPublisher::Anthropic) => Self::Claude,
+            Some(BedrockPublisher::AmazonNova) => Self::Nova,
+            _ => Self::Off,
+        }
+    }
+
+    /// The checkpoint a `cache_control` marker becomes, carrying its `ttl`
+    /// (`5m` or `1h`) for Claude only: Nova takes the five-minute default
+    /// alone and rejects the field.
+    fn point(self, marker: Option<&serde_json::Value>) -> Option<CachePointBlock> {
+        let marker = marker?;
+        let ttl = marker.get("ttl").and_then(|t| t.as_str());
+        self.point_at(ttl)
+    }
+
+    fn point_at(self, ttl: Option<&str>) -> Option<CachePointBlock> {
+        let mut builder = match self {
+            Self::Off => return None,
+            Self::Nova | Self::Claude => CachePointBlock::builder().r#type(CachePointType::Default),
+        };
+        if self == Self::Claude {
+            match ttl {
+                Some("5m") => builder = builder.ttl(CacheTtl::FiveMinutes),
+                Some("1h") => builder = builder.ttl(CacheTtl::OneHour),
+                _ => {}
+            }
+        }
+        builder.build().ok()
+    }
+
+    fn tool_point(self, marker: Option<&serde_json::Value>) -> Option<CachePointBlock> {
+        if self == Self::Claude {
+            self.point(marker)
+        } else {
+            None
+        }
+    }
+}
+
+/// A message's content parts when checkpoints apply and one of its text
+/// parts carries a marker: the text is then sent part by part, so each
+/// checkpoint follows exactly the text it marks. `None` keeps the
+/// message's text as the one block it has always been.
+fn marked_text_parts(msg: &ChatMessage, cache: CachePoints) -> Option<&[serde_json::Value]> {
+    let parts = msg.content_blocks.as_deref()?;
+    (cache != CachePoints::Off
+        && parts
+            .iter()
+            .any(|p| part_text(p).is_some() && p.get("cache_control").is_some()))
+    .then_some(parts)
+}
+
+/// The text of a non-empty `text` part. Converse rejects a blank text block.
+fn part_text(part: &serde_json::Value) -> Option<&str> {
+    (part.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .then(|| part.get("text").and_then(|t| t.as_str()))
+        .flatten()
+        .filter(|t| !t.trim().is_empty())
+}
+
+/// Whether the caller put any `cache_control` marker in the request — on a
+/// content part, a tool message, a tool call or a tool definition. The
+/// gateway's `auto_prompt_caching` stands down for such a request, as it
+/// does on every Claude rail.
+fn chat_has_cache_markers(req: &ChatFormat) -> bool {
+    let marked = |v: &serde_json::Value| v.get("cache_control").is_some();
+    req.messages.iter().any(|m| {
+        m.extra.contains_key("cache_control")
+            || m.content_blocks
+                .as_deref()
+                .is_some_and(|b| b.iter().any(marked))
+            || m.extra
+                .get("tool_calls")
+                .and_then(|v| v.as_array())
+                .is_some_and(|calls| calls.iter().any(marked))
+    }) || req
+        .extra
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|t| marked(t) || t.get("function").is_some_and(marked))
+        })
+}
+
+/// `auto_prompt_caching` on Converse for Claude: the two breakpoints the Anthropic
+/// rails inject — after the system prompt and after the final message's
+/// last block — as checkpoints, never after a blank text block.
+fn inject_cache_points(
+    systems: &mut Vec<SystemContentBlock>,
+    messages: &mut [BedrockMessage],
+    cache: CachePoints,
+    ttl: &str,
+) -> Result<(), BridgeError> {
+    let Some(point) = cache.point_at(Some(ttl)) else {
+        return Ok(());
+    };
+    if matches!(systems.last(), Some(SystemContentBlock::Text(t)) if !t.trim().is_empty()) {
+        systems.push(SystemContentBlock::CachePoint(point.clone()));
+    }
+    if let Some(last) = messages.last_mut() {
+        let blank =
+            matches!(last.content().last(), Some(ContentBlock::Text(t)) if t.trim().is_empty());
+        if !blank && !last.content().is_empty() {
+            let mut content = last.content().to_vec();
+            content.push(ContentBlock::CachePoint(point));
+            *last = build_message(last.role().clone(), content)?;
+        }
+    }
+    Ok(())
 }
 
 /// A user turn's content parts as Converse blocks, in the caller's order.
@@ -1394,13 +1569,14 @@ fn user_content_blocks(
     msg: &ChatMessage,
     index: usize,
     claude: bool,
+    cache: CachePoints,
     fetched: &FetchedMedia,
 ) -> Result<Vec<ContentBlock>, BridgeError> {
     let Some(parts) = msg.content_blocks.as_deref() else {
         return Ok(vec![ContentBlock::Text(msg.content_str().to_string())]);
     };
     let family = if claude { "Claude" } else { "Amazon Bedrock" };
-    let mut blocks = translate_user_parts(
+    let mut blocks = translate_user_parts_with(
         parts,
         index,
         family,
@@ -1412,6 +1588,11 @@ fn user_content_blocks(
                 fetched,
                 &format!("document-{index}-{part_index}"),
             )
+        },
+        |part| {
+            cache
+                .point(part.get("cache_control"))
+                .map(ContentBlock::CachePoint)
         },
     )
     .map_err(BridgeError::InvalidRequest)?;
@@ -1606,22 +1787,43 @@ fn build_message(
 ///
 /// When the assistant carried no tool calls this returns a single text
 /// block — byte-identical to the pre-#560 behaviour.
-fn assistant_content_blocks(msg: &ChatMessage) -> Result<Vec<ContentBlock>, BridgeError> {
+fn assistant_content_blocks(
+    msg: &ChatMessage,
+    cache: CachePoints,
+) -> Result<Vec<ContentBlock>, BridgeError> {
     let tool_calls = msg
         .extra
         .get("tool_calls")
         .and_then(|v| v.as_array())
         .filter(|calls| !calls.is_empty());
-    let Some(tool_calls) = tool_calls else {
-        // No tool calls: preserve the original single-text-block shape.
-        return Ok(vec![ContentBlock::Text(msg.content_str().to_string())]);
-    };
-
     let mut blocks: Vec<ContentBlock> = Vec::new();
-    let text = msg.content_str();
-    if !text.is_empty() {
-        blocks.push(ContentBlock::Text(text.to_string()));
+    match marked_text_parts(msg, cache) {
+        Some(parts) => {
+            for part in parts {
+                if let Some(text) = part_text(part) {
+                    blocks.push(ContentBlock::Text(text.to_string()));
+                }
+                if let Some(point) = cache.point(part.get("cache_control")) {
+                    if !blocks.is_empty() {
+                        blocks.push(ContentBlock::CachePoint(point));
+                    }
+                }
+            }
+        }
+        // No tool calls: preserve the original single-text-block shape.
+        None if tool_calls.is_none() => {
+            return Ok(vec![ContentBlock::Text(msg.content_str().to_string())]);
+        }
+        None => {
+            let text = msg.content_str();
+            if !text.is_empty() {
+                blocks.push(ContentBlock::Text(text.to_string()));
+            }
+        }
     }
+    let Some(tool_calls) = tool_calls else {
+        return Ok(blocks);
+    };
     for call in tool_calls {
         let function = call.get("function");
         let id = call.get("id").and_then(|v| v.as_str()).unwrap_or_default();
@@ -1650,6 +1852,9 @@ fn assistant_content_blocks(msg: &ChatMessage) -> Result<Vec<ContentBlock>, Brid
                     BridgeError::Config(format!("bedrock converse: build tool_use: {e}"))
                 })?,
         ));
+        if let Some(point) = cache.point(call.get("cache_control")) {
+            blocks.push(ContentBlock::CachePoint(point));
+        }
     }
     // If every tool_calls entry was malformed, fall back to a text block
     // so Converse still receives a valid (non-empty) assistant message.
@@ -2504,6 +2709,12 @@ fn build_tool_config(
         spec = spec.input_schema(ToolInputSchema::Json(json_to_document(&parameters)));
         if let Ok(spec) = spec.build() {
             tools.push(Tool::ToolSpec(spec));
+            let marker = entry
+                .get("cache_control")
+                .or_else(|| function.get("cache_control"));
+            if let Some(point) = CachePoints::for_publisher(publisher).tool_point(marker) {
+                tools.push(Tool::CachePoint(point));
+            }
         }
     }
     if let Some(schema) = json_tool_schema {
@@ -5183,7 +5394,7 @@ mod tests {
         }))
         .unwrap();
         let (_systems, messages) =
-            build_converse_inputs(&req, None, &FetchedMedia::default()).unwrap();
+            build_converse_inputs(&req, None, &FetchedMedia::default(), None).unwrap();
         let roles: Vec<ConversationRole> = messages.iter().map(|m| m.role().clone()).collect();
         assert_eq!(
             roles,
@@ -5211,7 +5422,7 @@ mod tests {
         );
 
         let (systems, messages) =
-            build_converse_inputs(&req, None, &FetchedMedia::default()).unwrap();
+            build_converse_inputs(&req, None, &FetchedMedia::default(), None).unwrap();
         assert_eq!(systems.len(), 1);
         assert_eq!(
             systems[0],
@@ -5243,7 +5454,7 @@ mod tests {
         .unwrap();
 
         let (systems, messages) =
-            build_converse_inputs(&req, None, &FetchedMedia::default()).unwrap();
+            build_converse_inputs(&req, None, &FetchedMedia::default(), None).unwrap();
         assert!(systems.is_empty());
         // user → assistant(2× toolUse) → user(2× toolResult, coalesced)
         assert_eq!(
@@ -6299,6 +6510,283 @@ mod tests {
                 assert!(msg.contains("cohere.embed-"));
             }
             other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+    /// The body one Converse(Stream) call sends for `model_id`, with the
+    /// model's `auto_prompt_caching` set to `apc` (JSON) when given.
+    async fn capture_cache_body(
+        model_id: &str,
+        apc: Option<serde_json::Value>,
+        req: &ChatFormat,
+        streaming: bool,
+    ) -> serde_json::Value {
+        let route = if streaming {
+            "converse-stream"
+        } else {
+            "converse"
+        };
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(format!(r"^/model/.+/{route}$")))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let mut model = serde_json::json!({
+            "display_name": "customer-facing-name",
+            "provider": "bedrock",
+            "model_name": model_id,
+            "provider_key_id": "11111111-1111-1111-1111-111111111111"
+        });
+        if let Some(apc) = apc {
+            model["auto_prompt_caching"] = apc;
+        }
+        let ctx = BridgeContext::new(
+            "req-1",
+            Arc::new(serde_json::from_value(model).unwrap()),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        if streaming {
+            let _ = bridge.chat_stream(req, &ctx).await;
+        } else {
+            let _ = bridge.chat(req, &ctx).await;
+        }
+        let body = responder.captured_body.lock().unwrap().clone();
+        body.unwrap_or_else(|| panic!("no {route} request was captured"))
+    }
+
+    /// A chat request carrying a marker on every slot one can sit on.
+    fn marked_request() -> ChatFormat {
+        let mut system = ChatMessage::system(String::new());
+        system.content = None;
+        system.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "stable rules"}),
+            serde_json::json!({"type": "text", "text": "big context",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}}),
+            serde_json::json!({"type": "text", "text": "volatile"}),
+        ]);
+        let mut assistant = ChatMessage::assistant(String::new());
+        assistant.content = None;
+        assistant.extra.insert(
+            "tool_calls".into(),
+            serde_json::json!([{"id": "call_1", "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+                "cache_control": {"type": "ephemeral"}}]),
+        );
+        let mut tool = ChatMessage::user("result text".to_string());
+        tool.role = Role::Tool;
+        tool.tool_call_id = Some("call_1".into());
+        tool.extra.insert(
+            "cache_control".into(),
+            serde_json::json!({"type": "ephemeral"}),
+        );
+        let mut user = ChatMessage::user(String::new());
+        user.content = None;
+        user.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "first"}),
+            serde_json::json!({"type": "text", "text": "second",
+                "cache_control": {"type": "ephemeral", "ttl": "5m"}}),
+            serde_json::json!({"type": "text", "text": "third"}),
+        ]);
+        let mut req = ChatFormat::new(
+            "m",
+            vec![
+                system,
+                ChatMessage::user("hi".to_string()),
+                assistant,
+                tool,
+                user,
+            ],
+        );
+        req.extra.insert(
+            "tools".into(),
+            serde_json::json!([{"type": "function", "cache_control": {"type": "ephemeral"},
+                "function": {"name": "lookup", "parameters": {"type": "object"}}}]),
+        );
+        req
+    }
+
+    #[tokio::test]
+    async fn converse_turns_claude_markers_into_cache_points_after_each_marked_slot() {
+        // Claude streams through ConverseStream (non-streaming is /invoke).
+        {
+            let streaming = true;
+            let body = capture_cache_body(
+                "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                None,
+                &marked_request(),
+                streaming,
+            )
+            .await;
+            assert_eq!(
+                body["system"],
+                serde_json::json!([
+                    {"text": "stable rules"},
+                    {"text": "big context"},
+                    {"cachePoint": {"type": "default", "ttl": "1h"}},
+                    {"text": "volatile"},
+                ]),
+                "streaming={streaming}"
+            );
+            let messages = body["messages"].as_array().unwrap();
+            let assistant = &messages[1]["content"];
+            assert!(assistant[0].get("toolUse").is_some(), "{assistant}");
+            assert_eq!(
+                assistant[1],
+                serde_json::json!({"cachePoint": {"type": "default"}})
+            );
+            let results = &messages[2]["content"];
+            assert!(results[0].get("toolResult").is_some(), "{results}");
+            assert_eq!(
+                results[1],
+                serde_json::json!({"cachePoint": {"type": "default"}})
+            );
+            assert_eq!(
+                messages[3]["content"],
+                serde_json::json!([
+                    {"text": "firstsecond"},
+                    {"cachePoint": {"type": "default", "ttl": "5m"}},
+                    {"text": "third"},
+                ])
+            );
+            let tools = body["toolConfig"]["tools"].as_array().unwrap();
+            assert!(tools[0].get("toolSpec").is_some());
+            assert_eq!(
+                tools[1],
+                serde_json::json!({"cachePoint": {"type": "default"}})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn converse_gives_nova_cache_points_without_ttl_and_none_on_tools() {
+        for streaming in [false, true] {
+            let body =
+                capture_cache_body("amazon.nova-pro-v1:0", None, &marked_request(), streaming)
+                    .await;
+            assert_eq!(
+                body["system"][2],
+                serde_json::json!({"cachePoint": {"type": "default"}})
+            );
+            let tools = body["toolConfig"]["tools"].as_array().unwrap();
+            assert_eq!(tools.len(), 1, "{tools:?}");
+            assert!(!body.to_string().contains("\"ttl\""), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn converse_forwards_no_cache_point_to_other_publishers() {
+        for model in ["openai.gpt-oss-120b-1:0", "meta.llama3-3-70b-instruct-v1:0"] {
+            let body = capture_cache_body(
+                model,
+                Some(serde_json::json!({"enabled": true})),
+                &marked_request(),
+                true,
+            )
+            .await;
+            assert!(!body.to_string().contains("cachePoint"), "{model}: {body}");
+            assert_eq!(
+                body["system"],
+                serde_json::json!([{"text": "stable rulesbig contextvolatile"}]),
+                "{model}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn converse_injects_auto_prompt_caching_points_for_claude_only() {
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::system("be brief".to_string()),
+                ChatMessage::user("hello".to_string()),
+            ],
+        );
+        let apc = serde_json::json!({"enabled": true, "ttl": "1h"});
+        {
+            let streaming = true;
+            let body = capture_cache_body(
+                "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                Some(apc.clone()),
+                &req,
+                streaming,
+            )
+            .await;
+            let point = serde_json::json!({"cachePoint": {"type": "default", "ttl": "1h"}});
+            assert_eq!(body["system"][1], point, "streaming={streaming}: {body}");
+            assert_eq!(body["messages"][0]["content"][1], point, "{body}");
+        }
+        let nova = capture_cache_body("amazon.nova-lite-v1:0", Some(apc), &req, true).await;
+        assert!(!nova.to_string().contains("cachePoint"), "{nova}");
+        // A caller's own marker makes the injection stand down.
+        let body = capture_cache_body(
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            Some(serde_json::json!({"enabled": true})),
+            &marked_request(),
+            true,
+        )
+        .await;
+        assert_eq!(body.to_string().matches("cachePoint").count(), 5, "{body}");
+    }
+
+    #[tokio::test]
+    async fn invoke_injects_auto_prompt_caching_markers_for_claude() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "c",
+            "provider": "bedrock",
+            "model_name": "anthropic.claude-3-5-haiku-20241022-v1:0",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111",
+            "auto_prompt_caching": {"enabled": true}
+        }))
+        .unwrap();
+        let ctx = BridgeContext::new(
+            "req-1",
+            Arc::new(model),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::system("be brief".to_string()),
+                ChatMessage::user("hello".to_string()),
+            ],
+        );
+        let _ = bridge.chat(&req, &ctx).await;
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        let marker = serde_json::json!({"type": "ephemeral"});
+        assert_eq!(body["system"][0]["cache_control"], marker, "{body}");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"], marker,
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn reads_cache_markers_only_for_claude_and_nova() {
+        let bridge = BedrockBridge::new();
+        for (id, reads) in [
+            ("anthropic.claude-3-5-haiku-20241022-v1:0", true),
+            ("eu.amazon.nova-pro-v1:0", true),
+            ("openai.gpt-oss-120b-1:0", false),
+            ("meta.llama3-3-70b-instruct-v1:0", false),
+        ] {
+            let ctx = BridgeContext::new(
+                "r",
+                sample_model_with(id),
+                sample_pk_with_secret(valid_secret_json()),
+            );
+            assert_eq!(bridge.reads_cache_markers(&ctx), reads, "{id}");
         }
     }
 }
