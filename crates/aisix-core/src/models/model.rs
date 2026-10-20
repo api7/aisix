@@ -219,7 +219,7 @@ impl CacheTtl {
 pub struct AutoPromptCaching {
     /// Whether automatic prompt-cache injection is active for this model.
     pub enabled: bool,
-    /// Cache lifetime for injected breakpoints: `5m` (default when omitted) or `1h`. A `1h` cache write costs 2x the base input rate versus 1.25x for `5m`, so it pays off only when the cached prefix is reused across a longer session.
+    /// Cache lifetime for injected breakpoints: `5m` (default when omitted) or `1h`. A `1h` cache write costs 2x the base input rate versus 1.25x for `5m`, so it pays off only when the cached prefix is reused across a longer session. Some Claude models on Amazon Bedrock accept only the 5-minute cache, and Bedrock rejects a request to such a model that asks for `1h`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<CacheTtl>,
 }

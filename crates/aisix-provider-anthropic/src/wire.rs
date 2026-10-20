@@ -517,7 +517,7 @@ pub fn split_system_with<'a>(
                     // System messages interleaved with user/assistant
                     // turns don't map cleanly; append as a user turn to
                     // preserve semantics without silently dropping them.
-                    messages.push(user_turn(m, index, urls, fetched)?);
+                    messages.push(marked_turn(user_turn(m, index, urls, fetched)?, m));
                 } else {
                     system_msgs.push(m);
                 }
@@ -531,7 +531,7 @@ pub fn split_system_with<'a>(
             }
             Role::User => {
                 seen_non_system = true;
-                messages.push(user_turn(m, index, urls, fetched)?);
+                messages.push(marked_turn(user_turn(m, index, urls, fetched)?, m));
             }
             Role::Assistant => {
                 seen_non_system = true;
@@ -540,10 +540,13 @@ pub fn split_system_with<'a>(
                     .get("tool_calls")
                     .and_then(|v| v.as_array())
                     .map(Vec::as_slice);
-                messages.push(AnthropicMessage::assistant(
-                    &m.content_str(),
-                    m.content_blocks.as_deref(),
-                    tool_calls,
+                messages.push(marked_turn(
+                    AnthropicMessage::assistant(
+                        &m.content_str(),
+                        m.content_blocks.as_deref(),
+                        tool_calls,
+                    ),
+                    m,
                 ));
             }
             Role::Tool => {
@@ -569,6 +572,32 @@ pub fn split_system_with<'a>(
         build_system(&system_msgs),
         merge_consecutive_roles(messages),
     ))
+}
+
+/// A message-level `cache_control` marker — written beside a message's
+/// `content` rather than on one of its parts, the form a caller with
+/// string content has to use. It marks the message's last block.
+pub fn message_cache_control(m: &ChatMessage) -> Option<&serde_json::Value> {
+    m.extra.get("cache_control")
+}
+
+/// Put `marker` on the last block unless that block carries its own or is
+/// a blank text block, which Anthropic refuses a marker on.
+fn mark_last_block(blocks: &mut [serde_json::Value], marker: Option<&serde_json::Value>) {
+    let Some(marker) = marker else { return };
+    if let Some(obj) = blocks
+        .last_mut()
+        .filter(|b| !is_empty_text_block(b) && b.get("cache_control").is_none())
+        .and_then(|b| b.as_object_mut())
+    {
+        obj.insert("cache_control".into(), marker.clone());
+    }
+}
+
+/// `turn` with the message-level marker `m` carries on its last block.
+fn marked_turn<'a>(mut turn: AnthropicMessage<'a>, m: &ChatMessage) -> AnthropicMessage<'a> {
+    mark_last_block(&mut turn.content, message_cache_control(m));
+    turn
 }
 
 /// The `cache_control` marker a `role:"tool"` message carries: its own, or
@@ -620,14 +649,21 @@ fn build_system(system_msgs: &[&ChatMessage]) -> Option<AnthropicSystem> {
             .collect::<Vec<_>>()
             .join("\n\n")
     };
-    if system_msgs.iter().all(|m| m.content_blocks.is_none()) {
+    if system_msgs
+        .iter()
+        .all(|m| m.content_blocks.is_none() && message_cache_control(m).is_none())
+    {
         return Some(AnthropicSystem::Text(joined()));
     }
     let blocks: Vec<serde_json::Value> = system_msgs
         .iter()
-        .flat_map(|m| match m.content_blocks.as_deref() {
-            Some(blocks) => anthropic_text_blocks(blocks),
-            None => vec![serde_json::json!({"type": "text", "text": m.content_str()})],
+        .flat_map(|m| {
+            let mut blocks = match m.content_blocks.as_deref() {
+                Some(blocks) => anthropic_text_blocks(blocks),
+                None => vec![serde_json::json!({"type": "text", "text": m.content_str()})],
+            };
+            mark_last_block(&mut blocks, message_cache_control(m));
+            blocks
         })
         .collect();
     if blocks.is_empty() {
@@ -1131,6 +1167,39 @@ pub fn auto_prompt_caching_ttl(model: &aisix_core::Model) -> Option<&'static str
 pub fn apply_auto_prompt_caching(req: &mut AnthropicRequest<'_>, model: &aisix_core::Model) {
     if let Some(ttl) = auto_prompt_caching_ttl(model) {
         inject_cache_breakpoints(req, ttl);
+    }
+}
+
+/// Keep only the `cache_control` sub-fields `keep` accepts, on every block
+/// of an Anthropic Messages body a marker can sit on: system blocks, tool
+/// definitions, message content blocks, and the items of a `tool_result`'s
+/// content. For a platform that refuses sub-fields the Anthropic API takes
+/// (`scope`, and whatever it adds next).
+pub fn retain_cache_control_fields(body: &mut serde_json::Value, keep: impl Fn(&str) -> bool) {
+    fn items(v: Option<&mut serde_json::Value>) -> impl Iterator<Item = &mut serde_json::Value> {
+        v.and_then(|v| v.as_array_mut()).into_iter().flatten()
+    }
+    let sanitize = |block: &mut serde_json::Value| {
+        if let Some(cc) = block
+            .get_mut("cache_control")
+            .and_then(|c| c.as_object_mut())
+        {
+            cc.retain(|k, _| keep(k));
+        }
+    };
+    for block in items(body.get_mut("system")) {
+        sanitize(block);
+    }
+    for block in items(body.get_mut("tools")) {
+        sanitize(block);
+    }
+    for message in items(body.get_mut("messages")) {
+        for block in items(message.get_mut("content")) {
+            for item in items(block.get_mut("content")) {
+                sanitize(item);
+            }
+            sanitize(block);
+        }
     }
 }
 
@@ -7736,6 +7805,47 @@ mod tests {
             messages[2].content[0]["cache_control"],
             serde_json::json!({"type": "ephemeral"})
         );
+    }
+
+    #[test]
+    fn a_message_level_marker_lands_on_the_message_s_last_block() {
+        let ec = serde_json::json!({"type": "ephemeral"});
+        let mut system = ChatMessage::system("rules".to_string());
+        system.extra.insert("cache_control".into(), ec.clone());
+        let mut user = ChatMessage::user("q".to_string());
+        user.extra.insert("cache_control".into(), ec.clone());
+        let mut blank = ChatMessage::assistant(String::new());
+        blank.extra.insert("cache_control".into(), ec.clone());
+        let chat = ChatFormat::new(
+            "m",
+            vec![system, user, blank, ChatMessage::user("again".to_string())],
+        );
+        let (system, messages) = split_system(&chat).unwrap();
+        assert_eq!(
+            serde_json::to_value(system).unwrap(),
+            serde_json::json!([{"type": "text", "text": "rules", "cache_control": ec}])
+        );
+        assert_eq!(messages[0].content[0]["cache_control"], ec);
+        // A blank text block takes no marker: Anthropic rejects one there.
+        assert!(messages[1].content[0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn retain_cache_control_fields_filters_every_marker_slot() {
+        let full = serde_json::json!({"type": "ephemeral", "ttl": "1h", "scope": "global"});
+        let mut body = serde_json::json!({
+            "system": [{"type": "text", "text": "s", "cache_control": full}],
+            "tools": [{"name": "t", "cache_control": full}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "u", "cache_control": full},
+                {"type": "tool_result", "tool_use_id": "x", "cache_control": full,
+                 "content": [{"type": "text", "text": "r", "cache_control": full}]},
+            ]}],
+        });
+        retain_cache_control_fields(&mut body, |k| matches!(k, "type" | "ttl"));
+        let text = body.to_string();
+        assert_eq!(text.matches("\"ttl\":\"1h\"").count(), 5, "{text}");
+        assert!(!text.contains("scope"), "{text}");
     }
 
     #[test]

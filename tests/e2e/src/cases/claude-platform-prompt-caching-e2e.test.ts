@@ -42,7 +42,9 @@ const BEDROCK_OPENAI = "pc-bedrock-openai";
 const VERTEX_CLAUDE = "pc-vertex-claude";
 const VERTEX_CLAUDE_AUTO = "pc-vertex-claude-auto";
 const OPENAI = "pc-openai";
+const ANTHROPIC = "pc-anthropic";
 const MODELS = [
+  ANTHROPIC,
   BEDROCK_CLAUDE,
   BEDROCK_CLAUDE_AUTO,
   BEDROCK_OPENAI,
@@ -157,7 +159,8 @@ function markedMessages(model: string, stream: boolean): Record<string, unknown>
     stream,
     system: [
       { type: "text", text: "You are a careful assistant." },
-      { type: "text", text: "Long reference material.", cache_control: HOUR },
+      // `scope` is an Anthropic API sub-field the platforms refuse.
+      { type: "text", text: "Long reference material.", cache_control: { ...HOUR, scope: "global" } },
     ],
     tools: [
       {
@@ -312,6 +315,13 @@ describe("prompt caching for Claude on Amazon Bedrock and Vertex AI", () => {
       secret: "sk-openai-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
+    const anthropicPk = await seed.createProviderKey({
+      display_name: "pc-anthropic-pk",
+      provider: "anthropic",
+      adapter: "anthropic",
+      secret: "sk-ant-mock",
+      api_base: upstream.baseUrl,
+    });
     const auto = { enabled: true, ttl: "1h" };
     for (const [display_name, pk, provider, model_name, apc] of [
       [BEDROCK_CLAUDE, bedrockPk, "bedrock", "global.anthropic.claude-sonnet-4-5-20250929-v1:0", undefined],
@@ -320,6 +330,7 @@ describe("prompt caching for Claude on Amazon Bedrock and Vertex AI", () => {
       [VERTEX_CLAUDE, vertexPk, "google", "claude-sonnet-4-5@20250929", undefined],
       [VERTEX_CLAUDE_AUTO, vertexPk, "google", "claude-sonnet-4-5@20250929", auto],
       [OPENAI, openaiPk, "openai", "gpt-4o", undefined],
+      [ANTHROPIC, anthropicPk, "anthropic", "claude-sonnet-4-5-20250929", undefined],
     ] as const) {
       await seed.createModel({
         display_name,
@@ -525,6 +536,37 @@ describe("prompt caching for Claude on Amazon Bedrock and Vertex AI", () => {
       content: "You are a careful assistant.\nLong reference material.",
     });
     expect(body.messages.at(-1)).toEqual({ role: "user", content: "Answer briefly." });
+  });
+
+  test("a message-level marker on string content reaches every Claude upstream", async (ctx) => {
+    if (skip(ctx)) return;
+    const body = (model: string, stream: boolean) => ({
+      model,
+      stream,
+      messages: [
+        { role: "system", content: "You are a careful assistant.", cache_control: HOUR },
+        { role: "user", content: "What is the value?", cache_control: EPHEMERAL },
+      ],
+    });
+    for (const model of [ANTHROPIC, BEDROCK_CLAUDE, VERTEX_CLAUDE]) {
+      const sent = await send("/v1/chat/completions", body(model, false));
+      expect(sent.upstream.body.system, model).toEqual([
+        { type: "text", text: "You are a careful assistant.", cache_control: HOUR },
+      ]);
+      expect(sent.upstream.body.messages[0].content, model).toEqual([
+        { type: "text", text: "What is the value?", cache_control: EPHEMERAL },
+      ]);
+    }
+    const stream = await send("/v1/chat/completions", body(BEDROCK_CLAUDE, true));
+    expect(stream.upstream.path).toMatch(/\/converse-stream$/);
+    expect(stream.upstream.body.system).toEqual([
+      { text: "You are a careful assistant." },
+      { cachePoint: { type: "default", ttl: "1h" } },
+    ]);
+    expect(stream.upstream.body.messages[0].content).toEqual([
+      { text: "What is the value?" },
+      { cachePoint: { type: "default" } },
+    ]);
   });
 
   test("auto_prompt_caching injects breakpoints for Claude on Bedrock and Vertex AI", async (ctx) => {

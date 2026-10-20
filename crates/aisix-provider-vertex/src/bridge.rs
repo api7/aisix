@@ -66,8 +66,9 @@ use crate::wire;
 // `StreamState` (the same decoder the direct Anthropic bridge uses).
 use aisix_provider_anthropic::wire::{
     anthropic_needs_fetch, apply_auto_prompt_caching, build_request as build_anthropic_request,
-    response_into_chat_response, split_system_with, structured_output_for, AnthropicResponse,
-    AnthropicStreamEvent, MediaUrls, StreamState, StructuredOutput,
+    response_into_chat_response, retain_cache_control_fields, split_system_with,
+    structured_output_for, AnthropicResponse, AnthropicStreamEvent, MediaUrls, StreamState,
+    StructuredOutput,
 };
 
 // Llama + the OpenAI-compatible MaaS family on Vertex use the OpenAI
@@ -1055,6 +1056,9 @@ impl VertexBridge {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
             })?;
             drop(anthropic_req);
+            // Vertex AI refuses the `scope` a marker may carry on the
+            // Anthropic API.
+            retain_cache_control_fields(&mut body_value, |k| k != "scope");
             // Apply the per-ProviderKey override pipeline (#339) before the
             // Vertex-specific shaping below, so the `model`/`stream` strip keeps
             // the final say and an override can never reintroduce a URL-borne
@@ -1173,6 +1177,9 @@ impl VertexBridge {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
             })?;
             drop(anthropic_req);
+            // Vertex AI refuses the `scope` a marker may carry on the
+            // Anthropic API.
+            retain_cache_control_fields(&mut body_value, |k| k != "scope");
             // Apply the per-ProviderKey override pipeline (#339) before the
             // Vertex-specific shaping below (see the non-stream path). Here
             // `stream` is intentionally KEPT in the body.

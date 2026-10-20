@@ -28,7 +28,7 @@
               "$ref": "#/definitions/CacheTtl"
             }
           ],
-          "description": "Cache lifetime for injected breakpoints: `5m` (default when omitted) or `1h`. A `1h` cache write costs 2x the base input rate versus 1.25x for `5m`, so it pays off only when the cached prefix is reused across a longer session."
+          "description": "Cache lifetime for injected breakpoints: `5m` (default when omitted) or `1h`. A `1h` cache write costs 2x the base input rate versus 1.25x for `5m`, so it pays off only when the cached prefix is reused across a longer session. Some Claude models on Amazon Bedrock accept only the 5-minute cache, and Bedrock rejects a request to such a model that asks for `1h`."
         }
       },
       "required": [

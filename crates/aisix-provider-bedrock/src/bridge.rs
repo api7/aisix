@@ -59,7 +59,8 @@ use std::time::{Duration, Instant};
 
 use aisix_provider_anthropic::wire::{
     anthropic_needs_fetch, apply_auto_prompt_caching, auto_prompt_caching_ttl, build_request,
-    claude_media_kind, response_into_chat_response, split_system_with, structured_output_for,
+    claude_media_kind, message_cache_control, response_into_chat_response,
+    retain_cache_control_fields, split_system_with, structured_output_for,
     tool_choice_states_a_preference, tool_message_cache_control,
     translate_reasoning_effort_to_anthropic, AnthropicResponse, MediaUrls, StructuredOutput,
 };
@@ -1037,6 +1038,8 @@ impl BedrockBridge {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
             })?;
             drop(anthropic_req);
+            // Bedrock takes a marker's `type` and `ttl` and nothing else.
+            retain_cache_control_fields(&mut body_value, |k| matches!(k, "type" | "ttl"));
             // Apply the per-ProviderKey body override pipeline (#340) BEFORE the
             // Vertex-style Bedrock shaping below, so the `model`/`stream` strip
             // keeps the final say and an override can never reintroduce a
@@ -1355,37 +1358,45 @@ fn build_converse_inputs(
             )?);
         }
         match msg.role {
-            Role::System | Role::Developer => match marked_text_parts(msg, cache) {
-                Some(parts) => {
-                    for part in parts {
-                        if let Some(text) = part_text(part) {
-                            systems.push(SystemContentBlock::Text(text.to_string()));
-                        }
-                        if let Some(point) = cache.point(part.get("cache_control")) {
-                            if matches!(systems.last(), Some(SystemContentBlock::Text(_))) {
-                                systems.push(SystemContentBlock::CachePoint(point));
+            Role::System | Role::Developer => {
+                let before = systems.len();
+                match marked_text_parts(msg, cache) {
+                    Some(parts) => {
+                        for part in parts {
+                            if let Some(text) = part_text(part) {
+                                systems.push(SystemContentBlock::Text(text.to_string()));
+                            }
+                            if let Some(point) = cache.point(part.get("cache_control")) {
+                                if matches!(systems.last(), Some(SystemContentBlock::Text(_))) {
+                                    systems.push(SystemContentBlock::CachePoint(point));
+                                }
                             }
                         }
                     }
-                }
-                None => {
-                    let content = msg.content_str();
-                    if !content.is_empty() {
-                        systems.push(SystemContentBlock::Text(content.to_string()));
+                    None => {
+                        let content = msg.content_str();
+                        if !content.is_empty() {
+                            systems.push(SystemContentBlock::Text(content.to_string()));
+                        }
                     }
                 }
-            },
+                if let Some(point) = cache.point(message_cache_control(msg)) {
+                    if systems.len() > before
+                        && matches!(systems.last(), Some(SystemContentBlock::Text(_)))
+                    {
+                        systems.push(SystemContentBlock::CachePoint(point));
+                    }
+                }
+            }
             Role::User => {
-                messages.push(build_message(
-                    ConversationRole::User,
-                    user_content_blocks(msg, index, claude, cache, fetched)?,
-                )?);
+                let mut blocks = user_content_blocks(msg, index, claude, cache, fetched)?;
+                mark_end_of_turn(&mut blocks, cache, msg);
+                messages.push(build_message(ConversationRole::User, blocks)?);
             }
             Role::Assistant => {
-                messages.push(build_message(
-                    ConversationRole::Assistant,
-                    assistant_content_blocks(msg, cache)?,
-                )?);
+                let mut blocks = assistant_content_blocks(msg, cache)?;
+                mark_end_of_turn(&mut blocks, cache, msg);
+                messages.push(build_message(ConversationRole::Assistant, blocks)?);
             }
             Role::Tool => {
                 check_tool_result_parts(msg, index).map_err(BridgeError::InvalidRequest)?;
@@ -1450,9 +1461,9 @@ impl CachePoints {
         }
     }
 
-    /// The checkpoint a `cache_control` marker becomes, carrying a `1h`
-    /// `ttl` for Claude only: Nova takes the five-minute default alone and
-    /// rejects the field.
+    /// The checkpoint a `cache_control` marker becomes, carrying the
+    /// marker's `ttl` (`5m` or `1h`) as written, for Claude only: Nova takes
+    /// the five-minute default alone and rejects the field.
     fn point(self, marker: Option<&serde_json::Value>) -> Option<CachePointBlock> {
         let marker = marker?;
         let ttl = marker.get("ttl").and_then(|t| t.as_str());
@@ -1464,11 +1475,12 @@ impl CachePoints {
             Self::Off => return None,
             Self::Nova | Self::Claude => CachePointBlock::builder().r#type(CachePointType::Default),
         };
-        // `5m` is the default every model takes, and a model that offers
-        // only that rejects an explicit `ttl`, so only `1h` is written out
-        // — the same rule the Anthropic rails follow for the marker.
-        if self == Self::Claude && ttl == Some("1h") {
-            builder = builder.ttl(CacheTtl::OneHour);
+        if self == Self::Claude {
+            match ttl {
+                Some("5m") => builder = builder.ttl(CacheTtl::FiveMinutes),
+                Some("1h") => builder = builder.ttl(CacheTtl::OneHour),
+                _ => {}
+            }
         }
         builder.build().ok()
     }
@@ -1479,6 +1491,22 @@ impl CachePoints {
         } else {
             None
         }
+    }
+}
+
+/// A message-level `cache_control` marker as a checkpoint after the turn's
+/// last block — unless that block is already one, or is blank text.
+fn mark_end_of_turn(blocks: &mut Vec<ContentBlock>, cache: CachePoints, msg: &ChatMessage) {
+    let Some(point) = cache.point(message_cache_control(msg)) else {
+        return;
+    };
+    let ends_on_content = match blocks.last() {
+        None | Some(ContentBlock::CachePoint(_)) => false,
+        Some(ContentBlock::Text(t)) => !t.trim().is_empty(),
+        Some(_) => true,
+    };
+    if ends_on_content {
+        blocks.push(ContentBlock::CachePoint(point));
     }
 }
 
@@ -1543,7 +1571,9 @@ fn inject_cache_points(
     cache: CachePoints,
     ttl: &str,
 ) -> Result<(), BridgeError> {
-    let Some(point) = cache.point_at(Some(ttl)) else {
+    // The marker the Anthropic rails inject: bare for the 5-minute default,
+    // an explicit `ttl` for `1h`.
+    let Some(point) = cache.point_at((ttl == "1h").then_some(ttl)) else {
         return Ok(());
     };
     if matches!(systems.last(), Some(SystemContentBlock::Text(t)) if !t.trim().is_empty()) {
@@ -6651,7 +6681,7 @@ mod tests {
                 messages[3]["content"],
                 serde_json::json!([
                     {"text": "firstsecond"},
-                    {"cachePoint": {"type": "default"}},
+                    {"cachePoint": {"type": "default", "ttl": "5m"}},
                     {"text": "third"},
                 ])
             );
@@ -6767,6 +6797,30 @@ mod tests {
         assert!(matches!(
             messages.last().unwrap().content().last(),
             Some(ContentBlock::CachePoint(_))
+        ));
+    }
+
+    #[test]
+    fn a_message_level_marker_places_a_cache_point_after_the_turn() {
+        let ec = serde_json::json!({"type": "ephemeral", "ttl": "1h"});
+        let mut system = ChatMessage::system("rules".to_string());
+        system.extra.insert("cache_control".into(), ec.clone());
+        let mut user = ChatMessage::user("q".to_string());
+        user.extra.insert("cache_control".into(), ec);
+        let req = ChatFormat::new("m", vec![system, user]);
+        let (systems, messages) = build_converse_inputs(
+            &req,
+            Some(BedrockPublisher::Anthropic),
+            &FetchedMedia::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(systems.as_slice(), [SystemContentBlock::Text(_), SystemContentBlock::CachePoint(p)] if p.ttl() == Some(&CacheTtl::OneHour))
+        );
+        assert!(matches!(
+            messages[0].content(),
+            [ContentBlock::Text(_), ContentBlock::CachePoint(_)]
         ));
     }
 
