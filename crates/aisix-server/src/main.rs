@@ -275,6 +275,7 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
             cfg.proxy.request_body_limit_bytes,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+        aisix_provider_bedrock::init_mantle_endpoint(cfg.upstream.bedrock.mantle_endpoint.clone());
         run(cfg).await
     }
     .await;

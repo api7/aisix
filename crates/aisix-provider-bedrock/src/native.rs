@@ -5,6 +5,7 @@
 //! [`aisix_provider_anthropic::platform::shape_request`] adapts, and the
 //! response comes back in the same wire.
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use aisix_gateway::media_fetch::{fetch_urls, Encoding};
@@ -22,7 +23,7 @@ use serde_json::Value;
 
 use crate::bridge::{
     map_aws_sdk_error_generic, strip_region_prefix, upstream_model, validate_model_id_chars,
-    BedrockBridge, BedrockPublisher,
+    BedrockBridge, BedrockPublisher, BedrockSecret,
 };
 
 /// Whether `/v1/messages` for `upstream_id` takes Bedrock's own Anthropic
@@ -168,15 +169,151 @@ impl BedrockBridge {
         };
         let client = self.build_client_from_ctx(ctx)?;
         let started = Instant::now();
-        let resp = client
+        let runtime = client
             .count_tokens()
             .model_id(model_id)
             .input(input)
             .send()
             .await
-            .map_err(|e| map_aws_sdk_error_generic(e, started, ctx.deadline))?;
-        Ok(serde_json::json!({"input_tokens": resp.input_tokens()}))
+            .map_err(|e| map_aws_sdk_error_generic(e, started, ctx.deadline));
+        match runtime {
+            Ok(resp) => Ok(serde_json::json!({"input_tokens": resp.input_tokens()})),
+            // bedrock-runtime's CountTokens does not count every Claude model
+            // (those Bedrock serves only through cross-region inference); AWS
+            // counts them on Bedrock Mantle's Anthropic count_tokens instead.
+            Err(BridgeError::UpstreamStatus {
+                status: 400 | 404, ..
+            }) if model_id.to_ascii_lowercase().contains("claude") => {
+                mantle_count_tokens(&body, model_id, ctx).await
+            }
+            Err(e) => Err(e),
+        }
     }
+}
+
+static MANTLE_ENDPOINT: OnceLock<Option<String>> = OnceLock::new();
+
+/// Install `upstream.bedrock.mantle_endpoint`. Called once during boot.
+pub fn init_mantle_endpoint(endpoint: Option<String>) {
+    let _ = MANTLE_ENDPOINT.set(endpoint.filter(|e| !e.trim().is_empty()));
+}
+
+const MANTLE_MESSAGES_PATH: &str = "/anthropic/v1/messages";
+
+/// `{mantle}/anthropic/v1/messages/count_tokens`, where `{mantle}` is the
+/// configured endpoint (which may already end in the messages path) or the
+/// public regional host.
+fn mantle_count_tokens_url(region: &str) -> String {
+    let base = match MANTLE_ENDPOINT.get().cloned().flatten() {
+        Some(configured) => {
+            let base = configured.trim().trim_end_matches('/').to_string();
+            if base.ends_with(MANTLE_MESSAGES_PATH) {
+                base
+            } else {
+                format!("{base}{MANTLE_MESSAGES_PATH}")
+            }
+        }
+        None => format!("https://bedrock-mantle.{region}.api.aws{MANTLE_MESSAGES_PATH}"),
+    };
+    format!("{base}/count_tokens")
+}
+
+/// Count on Bedrock Mantle's Anthropic `count_tokens`: the base model id,
+/// the request's messages, `system` and `tools`, and the options counting
+/// reads (`thinking`, `tool_choice`, `output_config`), signed with SigV4
+/// (service `bedrock`) from the provider key's credentials.
+async fn mantle_count_tokens(
+    body: &Value,
+    model_id: &str,
+    ctx: &BridgeContext,
+) -> Result<Value, BridgeError> {
+    let creds = BedrockSecret::parse(&ctx.provider_key.api_key)?;
+    let mut count = serde_json::Map::new();
+    count.insert("model".to_string(), Value::String(model_id.to_string()));
+    for key in [
+        "messages",
+        "system",
+        "tools",
+        "thinking",
+        "tool_choice",
+        "output_config",
+    ] {
+        if let Some(v) = body.get(key).filter(|v| !v.is_null()) {
+            count.insert(key.to_string(), v.clone());
+        }
+    }
+    let bytes = Vec::from(
+        aisix_gateway::json_body(&Value::Object(count))
+            .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?,
+    );
+    let url = mantle_count_tokens_url(&creds.region);
+
+    let identity = aws_credential_types::Credentials::new(
+        creds.access_key_id.clone(),
+        creds.secret_access_key.clone(),
+        creds.session_token.clone(),
+        None,
+        "aisix-provider-bedrock",
+    )
+    .into();
+    let params = aws_sigv4::sign::v4::SigningParams::builder()
+        .identity(&identity)
+        .region(&creds.region)
+        .name("bedrock")
+        .time(std::time::SystemTime::now())
+        .settings(aws_sigv4::http_request::SigningSettings::default())
+        .build()
+        .map_err(|e| BridgeError::Config(format!("sign bedrock-mantle request: {e}")))?
+        .into();
+    let unsigned = [
+        ("content-type", "application/json"),
+        ("anthropic-version", "2023-06-01"),
+    ];
+    let signable = aws_sigv4::http_request::SignableRequest::new(
+        "POST",
+        &url,
+        unsigned.iter().copied(),
+        aws_sigv4::http_request::SignableBody::Bytes(&bytes),
+    )
+    .map_err(|e| BridgeError::Config(format!("sign bedrock-mantle request: {e}")))?;
+    let (instructions, _) = aws_sigv4::http_request::sign(signable, &params)
+        .map_err(|e| BridgeError::Config(format!("sign bedrock-mantle request: {e}")))?
+        .into_parts();
+
+    let client = aisix_gateway::upstream_tls::raw_client_for_provider_key(
+        ctx.provider_key.upstream_connection().as_ref(),
+    );
+    let mut req = client.post(&url).body(bytes);
+    for (name, value) in unsigned.iter().copied().chain(instructions.headers()) {
+        req = req.header(name, value);
+    }
+    if let Some(d) = ctx.deadline {
+        req = req.timeout(d);
+    }
+    let resp = req.send().await.map_err(aisix_gateway::send_error)?;
+    aisix_gateway::note_upstream_response(resp.headers());
+    let status = resp.status();
+    if !status.is_success() {
+        let retry_after = aisix_gateway::parse_retry_after(resp.headers());
+        return Err(BridgeError::UpstreamStatus {
+            status: status.as_u16(),
+            message: format!("upstream returned {}", status.as_u16()),
+            parsed: None,
+            wire: aisix_gateway::UpstreamWire::Bedrock,
+            retry_after,
+        });
+    }
+    let json: Value = resp
+        .json()
+        .await
+        .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+    let tokens = json
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            BridgeError::UpstreamDecode("count_tokens answer carries no input_tokens".into())
+        })?;
+    Ok(serde_json::json!({"input_tokens": tokens}))
 }
 
 /// The `converse` input for a body whose messages are all plain strings:

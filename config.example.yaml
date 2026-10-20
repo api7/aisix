@@ -552,6 +552,16 @@ upstream:
   #   # against proxy.request_body_limit_bytes when that is set (413 past it).
   #   max_bytes: 52428800
 
+  # Amazon Bedrock endpoints a provider key's api_base does not name.
+  # bedrock:
+  #   # Bedrock Mantle, where /v1/messages/count_tokens for a Claude model is
+  #   # counted when bedrock-runtime's CountTokens refuses that model (Claude
+  #   # models served only through cross-region inference). null derives the
+  #   # public regional host from the provider key's region,
+  #   # https://bedrock-mantle.{region}.api.aws; set it for a VPC endpoint or
+  #   # GovCloud. One value serves every Bedrock provider key.
+  #   mantle_endpoint: null
+
 # Connection-layer settings for the inbound side — the clients, or the
 # gateway in front of this one, talking to the listeners above. The
 # mirror image of `upstream:`.

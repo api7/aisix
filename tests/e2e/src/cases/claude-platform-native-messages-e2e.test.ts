@@ -55,6 +55,8 @@ const BEDROCK_NO_COUNT = "nm-bedrock-no-count";
 const ANTHROPIC = "nm-anthropic";
 const COUNT_GROUP = "nm-count-group";
 const NO_COUNT_ID = "us.anthropic.claude-nocount-4-5-v1:0";
+const BEDROCK_MANTLE_ONLY = "nm-bedrock-mantle-only";
+const MANTLE_ONLY_ID = "global.anthropic.claude-opus-5-5";
 const BEDROCK_ID = "global.anthropic.claude-sonnet-4-5-20250929-v1:0";
 const THROTTLED_ID = "us.anthropic.claude-throttle-4-5-v1:0";
 const GUARDED_ID = "us.anthropic.claude-guarded-4-5-v1:0";
@@ -155,7 +157,15 @@ async function startUpstream(): Promise<Upstream> {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(body));
       };
-      if (path.endsWith("/count-tokens") && path.includes("claude-nocount")) {
+      if (path === "/anthropic/v1/messages/count_tokens") {
+        if (JSON.parse(received.at(-1)!.body).model.includes("claude-nocount")) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "unsupported" } }));
+          return;
+        }
+        return json({ input_tokens: 77 });
+      }
+      if (path.endsWith("/count-tokens") && (path.includes("claude-nocount") || path.includes("claude-opus-5-5"))) {
         res.writeHead(400, { "content-type": "application/json", "x-amzn-errortype": "ValidationException" });
         res.end(JSON.stringify({ message: "The provided model doesn't support counting tokens." }));
         return;
@@ -280,7 +290,12 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-ak-id",
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-ak-secret",
       },
-      extra: { upstream: { media_fetch: { allowed_hosts: [`localhost:${upstream.port}`] } } },
+      extra: {
+        upstream: {
+          media_fetch: { allowed_hosts: [`localhost:${upstream.port}`] },
+          bedrock: { mantle_endpoint: upstream.baseUrl },
+        },
+      },
     });
     const seed = new SeedClient(etcd, app.etcdPrefix);
     await seed.createObservabilityExporter({
@@ -324,6 +339,7 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
       [BEDROCK_GUARDED, bedrockPk, "bedrock", GUARDED_ID],
       [VERTEX, vertexPk, "google", VERTEX_ID],
       [BEDROCK_NO_COUNT, bedrockPk, "bedrock", NO_COUNT_ID],
+      [BEDROCK_MANTLE_ONLY, bedrockPk, "bedrock", MANTLE_ONLY_ID],
       [ANTHROPIC, anthropicPk, "anthropic", "claude-sonnet-4-5"],
     ] as const) {
       models[display_name] = await seed.createModel({
@@ -575,6 +591,37 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
     expect(converse.system).toEqual([{ text: "Be brief." }]);
   });
 
+  test("a Claude model bedrock-runtime cannot count is counted on Bedrock Mantle", async (ctx) => {
+    if (skip(ctx)) return;
+    const before = upstream!.received.length;
+    const res = await fetch(`${app!.proxyUrl}/v1/messages/count_tokens`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: BEDROCK_MANTLE_ONLY,
+        system: "Be brief.",
+        thinking: { type: "enabled", budget_tokens: 2048 },
+        messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      }),
+    });
+    const text = await res.text();
+    expect(res.status, text).toBe(200);
+    expect(JSON.parse(text)).toEqual({ input_tokens: 77 });
+    const [runtime, mantle] = upstream!.received.slice(before);
+    expect(runtime.path).toBe("/model/anthropic.claude-opus-5-5/count-tokens");
+    expect(mantle.path).toBe("/anthropic/v1/messages/count_tokens");
+    expect(mantle.headers["anthropic-version"]).toBe("2023-06-01");
+    expect(String(mantle.headers.authorization)).toMatch(
+      /^AWS4-HMAC-SHA256 Credential=AKIA-native-messages\/\d{8}\/us-west-2\/bedrock\/aws4_request/,
+    );
+    expect(JSON.parse(mantle.body)).toEqual({
+      model: "anthropic.claude-opus-5-5",
+      system: "Be brief.",
+      thinking: { type: "enabled", budget_tokens: 2048 },
+      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+    });
+  });
+
   test("a platform that cannot count a model's tokens hands count_tokens to the group's next target", async (ctx) => {
     if (skip(ctx)) return;
     const before = upstream!.received.length;
@@ -588,6 +635,7 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
     expect(JSON.parse(text)).toEqual({ input_tokens: 99 });
     expect(upstream!.received.slice(before).map((r) => r.path)).toEqual([
       "/model/anthropic.claude-nocount-4-5-v1:0/count-tokens",
+      "/anthropic/v1/messages/count_tokens",
       "/v1/messages/count_tokens",
     ]);
   });

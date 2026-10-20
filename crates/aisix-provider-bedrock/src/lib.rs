@@ -96,3 +96,4 @@ mod native;
 mod wire;
 
 pub use bridge::{BedrockBridge, BedrockPublisher};
+pub use native::init_mantle_endpoint;

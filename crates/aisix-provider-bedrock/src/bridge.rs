@@ -312,24 +312,24 @@ pub(crate) fn strip_region_prefix(model_id: &str) -> &str {
 /// URL-shape rules. Region is in here because Bedrock keys dispatch
 /// off region (`bedrock-runtime.<region>.amazonaws.com`).
 #[derive(Debug, Deserialize)]
-struct BedrockSecret {
-    access_key_id: String,
-    secret_access_key: String,
+pub(crate) struct BedrockSecret {
+    pub(crate) access_key_id: String,
+    pub(crate) secret_access_key: String,
     /// AWS STS session token. Optional — long-lived static keys
     /// don't have one; assume-role credentials do.
     #[serde(default)]
-    session_token: Option<String>,
+    pub(crate) session_token: Option<String>,
     /// AWS region the Bedrock dispatch targets (e.g. `us-west-2`).
     /// Required — Bedrock's URL is region-keyed and the SDK won't
     /// dispatch without it.
-    region: String,
+    pub(crate) region: String,
 }
 
 impl BedrockSecret {
     /// Parse the JSON-encoded credential blob. Audit M1: error
     /// messages here MUST NOT echo the raw secret content — only
     /// generic shape errors.
-    fn parse(secret: &str) -> Result<Self, BridgeError> {
+    pub(crate) fn parse(secret: &str) -> Result<Self, BridgeError> {
         if secret.trim().is_empty() {
             return Err(BridgeError::InvalidUpstreamCredentials(
                 "bedrock provider_key.api_key is empty — \
