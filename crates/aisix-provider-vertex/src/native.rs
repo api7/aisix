@@ -135,7 +135,7 @@ impl VertexBridge {
 
     pub(super) async fn native_count_tokens(
         &self,
-        mut body: Value,
+        body: Value,
         ctx: &BridgeContext,
     ) -> Result<Value, BridgeError> {
         let creds = VertexSecret::parse(&ctx.provider_key.api_key)?;
@@ -143,9 +143,7 @@ impl VertexBridge {
         // (`claude-sonnet-4-6@default`).
         let upstream_id = upstream_model(ctx)?;
         let model = upstream_id.split('@').next().unwrap_or(upstream_id);
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("model".to_string(), Value::String(model.to_string()));
-        }
+        let body = platform::vertex_count_tokens_body(&body, model);
         let url =
             self.anthropic_url(ctx, &creds, "count-tokens", "vertex/anthropic-count-tokens")?;
         let access_token = creds.resolve_access_token(&self.token_minter).await?;

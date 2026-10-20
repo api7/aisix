@@ -353,11 +353,13 @@ pub fn shape_request(
 }
 
 /// The token-counting body for Bedrock `CountTokens` with the
-/// `invokeModel` input: the caller's body without `model`, carrying the
-/// two fields the `InvokeModel` schema requires. Returns `None` when the
-/// caller's messages are all plain strings, which take the `converse`
-/// input instead (see [`converse_count_input`]).
-pub fn bedrock_count_tokens_invoke_body(body: &Value) -> Option<Value> {
+/// `invokeModel` input: the body `/v1/messages` would send to InvokeModel
+/// ([`shape_request`]), carrying the `max_tokens` the `InvokeModel` schema
+/// requires — above any thinking budget, which InvokeModel validates and
+/// which does not change the count. Returns `None` when the caller's
+/// messages are all plain strings, which take the `converse` input
+/// instead.
+pub fn bedrock_count_tokens_invoke_body(body: &Value, upstream_id: &str) -> Option<Value> {
     let typed_blocks = body
         .get("messages")
         .and_then(Value::as_array)
@@ -372,15 +374,37 @@ pub fn bedrock_count_tokens_invoke_body(body: &Value) -> Option<Value> {
         return None;
     }
     let mut out = body.clone();
+    shape_request(&mut out, Platform::Bedrock, upstream_id, Vec::new());
+    let budget = out
+        .get("thinking")
+        .and_then(|t| t.get("budget_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     if let Some(obj) = out.as_object_mut() {
-        obj.remove("model");
-        if obj.contains_key("messages") {
-            obj.entry("anthropic_version")
-                .or_insert_with(|| Value::String(Platform::Bedrock.anthropic_version().into()));
-            obj.entry("max_tokens").or_insert_with(|| Value::from(1024));
-        }
+        let max_tokens = obj
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(1024);
+        obj.insert(
+            "max_tokens".to_string(),
+            Value::from(max_tokens.max(budget + 1)),
+        );
     }
     Some(out)
+}
+
+/// The body for Vertex AI's count-tokens model: the fields, `metadata` and
+/// `cache_control` adjustments `/v1/messages` gets there, with `model` —
+/// which this route reads from the body — set to `model`.
+pub fn vertex_count_tokens_body(body: &Value, model: &str) -> Value {
+    let mut out = body.clone();
+    shape_request(&mut out, Platform::Vertex, model, Vec::new());
+    if let Some(obj) = out.as_object_mut() {
+        obj.remove("anthropic_version");
+        obj.remove("stream");
+        obj.insert("model".to_string(), Value::String(model.to_string()));
+    }
+    out
 }
 
 /// Where each media URL in an Anthropic Messages body sits: `image` and

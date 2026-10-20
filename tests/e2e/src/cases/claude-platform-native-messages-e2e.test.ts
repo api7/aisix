@@ -545,6 +545,24 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
     expect(invoke).not.toHaveProperty("model");
     expect(invoke.anthropic_version).toBe("bedrock-2023-05-31");
     expect(invoke.messages[1].content[0].signature).toBe("sig-history");
+    // The same adjustments InvokeModel gets: fields, metadata, markers.
+    expect(invoke).not.toHaveProperty("gateway_unknown_field");
+    expect(invoke.metadata).toEqual({ user_id: "user_abc_account_1_session_2" });
+    expect(invoke.system[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+    expect(invoke.max_tokens).toBe(1024);
+
+    // A thinking budget above the default max_tokens still makes a valid
+    // InvokeModel body; the value does not change the count.
+    const budgeted = await send("/v1/messages/count_tokens", {
+      model: BEDROCK,
+      thinking: { type: "enabled", budget_tokens: 4000 },
+      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+    });
+    expect(budgeted.status, budgeted.text).toBe(200);
+    const budgetedBody = JSON.parse(
+      Buffer.from(JSON.parse(budgeted.upstream.body).input.invokeModel.body, "base64").toString("utf8"),
+    );
+    expect(budgetedBody.max_tokens).toBeGreaterThan(4000);
 
     const plain = await send("/v1/messages/count_tokens", {
       model: BEDROCK,
@@ -627,6 +645,9 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
     if (skip(ctx)) return;
     const sent = await send("/v1/messages/count_tokens", {
       model: VERTEX,
+      metadata: { user_id: "u-1", tenant: "internal" },
+      gateway_unknown_field: 1,
+      system: [{ type: "text", text: "s", cache_control: { type: "ephemeral", ttl: "1h", scope: "global" } }],
       messages: [{ role: "user", content: "hello" }],
     });
     expect(sent.status, sent.text).toBe(200);
@@ -634,7 +655,11 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
     expect(sent.upstream.path).toBe(
       "/v1/projects/proj-e2e/locations/us-east5/publishers/anthropic/models/count-tokens:rawPredict",
     );
+    const body = JSON.parse(sent.upstream.body);
     // The count-tokens model refuses a versioned name.
-    expect(JSON.parse(sent.upstream.body).model).toBe("claude-sonnet-4-5");
+    expect(body.model).toBe("claude-sonnet-4-5");
+    expect(body).not.toHaveProperty("gateway_unknown_field");
+    expect(body.metadata).toEqual({ user_id: "u-1" });
+    expect(body.system[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
   });
 });

@@ -151,7 +151,7 @@ impl BedrockBridge {
         // ARN path.
         let tail = upstream_id.rsplit('/').next().unwrap_or(upstream_id);
         let model_id = strip_region_prefix(tail);
-        let input = match platform::bedrock_count_tokens_invoke_body(&body) {
+        let input = match platform::bedrock_count_tokens_invoke_body(&body, upstream_id) {
             Some(invoke) => {
                 let bytes =
                     Vec::from(aisix_gateway::json_body(&invoke).map_err(|e| {
