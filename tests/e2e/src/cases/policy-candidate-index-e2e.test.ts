@@ -62,8 +62,9 @@ test("policy candidates follow creation, identity edits, fallback conditions and
       });
       expect(response.status, JSON.stringify(response.body)).toBe(status);
     };
-    // Every step below reads counters of one UTC day.
-    await awaitWindowHeadroom(60, 86_400);
+    // Every step below reads counters of one UTC day. The wait, when it
+    // happens, is part of this test's timeout.
+    await awaitWindowHeadroom(30, 86_400);
     await synced();
     await request(0, 200);
     await request(1, 200);
@@ -111,4 +112,4 @@ test("policy candidates follow creation, identity edits, fallback conditions and
     await app?.exit();
     await upstream.close();
   }
-}, 30_000);
+}, 90_000);

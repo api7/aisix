@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  awaitWindowHeadroom,
   EtcdClient,
   SeedClient,
   ProxyClient,
@@ -213,6 +214,7 @@ describe("anthropic cache tokens count toward TPM (AISIX-Cloud#995)", () => {
     await waitModelVisible(MSG_CALLER, "msg-cache-tpm");
 
     // First call succeeds and commits 2+2+5+3 = 12 tokens against TPM=10.
+    await awaitWindowHeadroom();
     const first = await postMessages(MSG_CALLER, "msg-cache-tpm", false);
     expect(first.status).toBe(200);
     const body = (await first.json()) as { usage?: Record<string, number> };
@@ -254,6 +256,7 @@ describe("anthropic cache tokens count toward TPM (AISIX-Cloud#995)", () => {
     }
     await waitModelVisible(RESP_CALLER, "resp-cache-tpm");
 
+    await awaitWindowHeadroom();
     const first = await postResponses();
     expect(first.status).toBe(200);
     await first.text();

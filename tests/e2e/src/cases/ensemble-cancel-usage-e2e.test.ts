@@ -149,8 +149,10 @@ describe("an ensemble abandoned after its panel answered", () => {
         }
         const caller = stream ? STREAM_CALLER : NONSTREAM_CALLER;
         // The abandoned request's charge and the admission that must refuse
-        // the next one have to land in the same per-minute TPM window.
-        await awaitWindowHeadroom();
+        // the next one have to land in the same per-minute TPM window; 20s
+        // covers a slow judge call and row delivery, and still fits the
+        // test's timeout after the longest wait.
+        await awaitWindowHeadroom(20);
         const judgeCallsBefore = judge.receivedRequests.length;
         const slsFrom = sls.requests.length;
         const controller = new AbortController();

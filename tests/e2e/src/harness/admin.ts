@@ -121,9 +121,10 @@ export async function waitConfigPropagation(
  * call must be 429" assertion flaps depending on when in the minute CI
  * happened to run it.
  *
- * Call this immediately before a burst that must land inside one window.
- * Nothing else in the test needs to change: the wait only happens in the
- * last few seconds of a minute, so the usual run pays nothing.
+ * Call this immediately before a burst that must land inside one window,
+ * with `headroomSecs` covering the burst. The wait can last up to
+ * `headroomSecs`, so the calling test's timeout must allow for it; the
+ * usual run pays nothing.
  */
 export async function awaitWindowHeadroom(headroomSecs = 10, windowSecs = 60): Promise<void> {
   const secondsLeft = windowSecs - (Math.floor(Date.now() / 1000) % windowSecs);
