@@ -1003,10 +1003,14 @@ async fn host_embed(
             vectors: embedded.vectors,
         })
         .unwrap_or_else(|e| embed_error(e.to_string())),
-        Err(EmbedError { failure, error, .. }) => {
+        Err(EmbedError {
+            failure,
+            error,
+            model: resolved,
+        }) => {
             tracing::warn!(
                 guardrail_name = %row_name,
-                model = %model,
+                model = %resolved.as_deref().unwrap_or(&model),
                 failure = ?failure,
                 error = error.as_deref(),
                 elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
