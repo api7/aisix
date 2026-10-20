@@ -751,6 +751,7 @@ async fn dispatch(
                 crate::redact::redact_anthropic_request(resolved_chain.as_ref(), body),
             );
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "input",
                 model = %model_name,
                 reason = %reason,
@@ -1876,6 +1877,7 @@ async fn anthropic_passthrough_dispatch(
                 } = verdict
                 {
                     tracing::warn!(
+                        guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                         guardrail_hook = "output",
                         model = %model_name,
                         reason = %reason,
@@ -2559,6 +2561,7 @@ async fn cross_provider_dispatch(
         } = verdict
         {
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "output",
                 model = %model_name,
                 reason = %reason,
@@ -2836,7 +2839,7 @@ fn build_anthropic_sse_stream(
                         // held unscanned and unmasked, then stream the rest.
                         released = true;
                         if let Some(chain) = output_guardrail.as_ref() {
-                            chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                            crate::guardrail_stream::release_output_buffer_unscanned(chain.as_ref());
                         }
                         for chunk in held_chunks.drain(..) {
                             for ev in encoder.next_events(&chunk) {
@@ -2877,6 +2880,7 @@ fn build_anthropic_sse_stream(
         // not be fully held to scan must not be released.
         if let (true, Some((max_hold, _))) = (overflowed, hold_policy) {
             tracing::warn!(
+                guardrail_name = output_guardrail.as_deref().and_then(|c| crate::guardrail_stream::output_buffer_owner(c)),
                 guardrail_hook = "output",
                 max_buffer_bytes = max_hold,
                 "streaming /v1/messages response exceeded hold-back cap; failing closed",
@@ -2975,6 +2979,7 @@ fn build_anthropic_sse_stream(
                 } = verdict
                 {
                     tracing::warn!(
+                        guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                         guardrail_hook = "output",
                         model = %model_label,
                         reason = %reason,
@@ -4173,7 +4178,7 @@ where
                     hold = None;
                     released = true;
                     if let Some(chain) = output_guardrail.as_ref() {
-                        chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                        crate::guardrail_stream::release_output_buffer_unscanned(chain.as_ref());
                     }
                     forward = std::mem::take(&mut held);
                     held_len.clear();
@@ -4267,7 +4272,7 @@ where
                         hold = None;
                         released = true;
                         if let Some(chain) = output_guardrail.as_ref() {
-                            chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                            crate::guardrail_stream::release_output_buffer_unscanned(chain.as_ref());
                         }
                         if guard.usage().downstream_latency_ms == 0 {
                             guard.usage().downstream_latency_ms =
@@ -4318,6 +4323,7 @@ where
         // not be fully held to scan must not be released.
         if let (true, Some((max_hold, _))) = (overflowed, hold) {
             tracing::warn!(
+                guardrail_name = output_guardrail.as_deref().and_then(|c| crate::guardrail_stream::output_buffer_owner(c)),
                 guardrail_hook = "output",
                 max_buffer_bytes = max_hold,
                 "streaming /v1/messages passthrough exceeded hold-back cap; failing closed",
@@ -4494,6 +4500,7 @@ where
                 } = verdict
                 {
                     tracing::warn!(
+                        guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                         guardrail_hook = "output",
                         model = %model_label,
                         reason = %reason,

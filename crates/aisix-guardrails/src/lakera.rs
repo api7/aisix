@@ -184,7 +184,7 @@ impl LakeraGuardrail {
                 return Err(clock.fail(LakeraFailure::Timeout));
             };
             tracing::error!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 http_status = status.as_u16(),
                 response_body = %response_body,
                 "lakera guard returned 4xx — check endpoint, api_key, and project_id configuration",
@@ -302,7 +302,7 @@ impl LakeraGuardrail {
         // ConfigError is already logged at error level in call_api().
         if !matches!(failure.failure, LakeraFailure::ConfigError) {
             tracing::warn!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 failure = ?failure.failure,
                 http_status = failure.http_status,
                 fail_open = fail_open,

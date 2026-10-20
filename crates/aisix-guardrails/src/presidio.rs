@@ -237,7 +237,7 @@ impl PresidioGuardrail {
             };
             if crate::too_large::body_says_too_large(&response_body) {
                 tracing::error!(
-                    row = %self.row_name,
+                    guardrail_name = %self.row_name,
                     http_status = status.as_u16(),
                     response_body = %response_body,
                     "presidio refused the payload for its size",
@@ -256,7 +256,7 @@ impl PresidioGuardrail {
                 return Err(clock.fail(PresidioFailure::Timeout));
             };
             tracing::error!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 http_status = status.as_u16(),
                 url = %url,
                 response_body = %response_body,
@@ -384,7 +384,7 @@ impl PresidioGuardrail {
         // ConfigError is already logged at error level in post_json().
         if !matches!(failure.failure, PresidioFailure::ConfigError) {
             tracing::warn!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 failure = ?failure.failure,
                 http_status = failure.http_status,
                 fail_open = fail_open,

@@ -109,7 +109,7 @@ pub(crate) async fn read_body_capped(
             Ok(None) => break,
             Err(e) => {
                 tracing::warn!(
-                    row = %row,
+                    guardrail_name = %row,
                     http_status = resp.status().as_u16(),
                     error = call_error::error_chain(&e).as_str(),
                     error_kind = %call_error::error_kind(&e),
@@ -318,6 +318,11 @@ pub struct EmbedError {
     /// when the failure is ours, not the provider's (an unresolved alias,
     /// a vector count that does not match).
     pub error: Option<String>,
+    /// The embedding model as the gateway's other logs name a model: its
+    /// current display name when the reference resolved, else the id or
+    /// alias as configured. For the log line only. `None` when the
+    /// embedder never got as far as resolving it.
+    pub model: Option<String>,
 }
 
 impl From<EmbedFailure> for EmbedError {
@@ -325,6 +330,7 @@ impl From<EmbedFailure> for EmbedError {
         Self {
             failure,
             error: None,
+            model: None,
         }
     }
 }
@@ -891,6 +897,14 @@ pub trait Guardrail: Send + Sync + 'static {
     /// ([`GuardrailChain::record_bypass`]), so the default is a no-op.
     fn record_output_bypass(&self, _reason: &str) {}
 
+    /// The configured name of the row whose `max_buffer_bytes` is the cap
+    /// [`Self::stream_output_policy`] folded to — the row an operator
+    /// raises when held-back output outgrows it. Only [`GuardrailChain`]
+    /// folds members, so the default is `None`.
+    fn output_buffer_owner(&self) -> Option<&str> {
+        None
+    }
+
     /// Whether this guardrail actually inspects the OUTPUT hook. Drives
     /// whether its `stream_output_policy` participates in the streamed-output
     /// hold-back fold (#466): an input-only guardrail must NOT force output
@@ -1302,7 +1316,7 @@ mod tests {
             &logged,
             "guardrail response body read failed",
         );
-        assert!(line.contains("row=row-x"), "{line}");
+        assert!(line.contains("guardrail_name=row-x"), "{line}");
         assert!(line.contains("http_status=403"), "{line}");
         assert!(line.contains("error_kind=decode"), "{line}");
         assert!(

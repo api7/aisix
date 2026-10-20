@@ -344,7 +344,7 @@ impl CustomGuardrail {
                 // shift content from one message onto another.
                 if segments.len() != texts.len() {
                     tracing::warn!(
-                        row = %self.row_name,
+                        guardrail_name = %self.row_name,
                         returned = segments.len(),
                         expected = texts.len(),
                         "custom guardrail returned a mismatched number of masked segments",
@@ -382,7 +382,7 @@ impl CustomGuardrail {
     /// does not export `func`, which is an Allow rather than an error.
     async fn invoke(&self, func: &str, ctx_json: String) -> Result<ScriptOutcome, ScriptFailure> {
         let runtime = rquickjs::AsyncRuntime::new().map_err(|e| {
-            tracing::error!(row = %self.row_name, error = %e, "custom guardrail engine start failed");
+            tracing::error!(guardrail_name = %self.row_name, error = %e, "custom guardrail engine start failed");
             ScriptFailure::Engine
         })?;
         runtime.set_memory_limit(self.max_memory_bytes).await;
@@ -396,7 +396,7 @@ impl CustomGuardrail {
             .await;
 
         let context = rquickjs::AsyncContext::full(&runtime).await.map_err(|e| {
-            tracing::error!(row = %self.row_name, error = %e, "custom guardrail context start failed");
+            tracing::error!(guardrail_name = %self.row_name, error = %e, "custom guardrail context start failed");
             ScriptFailure::Engine
         })?;
 
@@ -472,7 +472,7 @@ impl CustomGuardrail {
                     Some(json) => Ok(Some(json)),
                     None => {
                         tracing::warn!(
-                            row = %row_name,
+                            guardrail_name = %row_name,
                             expected = ACTION_VOCABULARY,
                             "custom guardrail hook returned nothing instead of a verdict; \
                              the request is NOT screened and will be refused unless \
@@ -522,7 +522,7 @@ impl CustomGuardrail {
             "mask" => {
                 let Some(segments) = parsed.segments else {
                     tracing::warn!(
-                        row = %self.row_name,
+                        guardrail_name = %self.row_name,
                         "custom guardrail asked to mask without returning segments; the \
                          request is NOT screened and will be refused unless fail_open is set",
                     );
@@ -532,7 +532,7 @@ impl CustomGuardrail {
             }
             other => {
                 tracing::warn!(
-                    row = %self.row_name,
+                    guardrail_name = %self.row_name,
                     action = %other,
                     expected = ACTION_VOCABULARY,
                     "custom guardrail returned an unknown action; the request is NOT \
@@ -565,7 +565,7 @@ impl CustomGuardrail {
             Some(_) => (ScriptFailure::BadVerdict, "not an object"),
         };
         tracing::warn!(
-            row = %self.row_name,
+            guardrail_name = %self.row_name,
             error = %err,
             detail = detail,
             expected = ACTION_VOCABULARY,
@@ -578,7 +578,7 @@ impl CustomGuardrail {
     fn handle_failure(&self, failure: ScriptFailure, fail_open: bool) -> GuardrailVerdict {
         let tag = failure.bypass_tag();
         tracing::warn!(
-            row = %self.row_name,
+            guardrail_name = %self.row_name,
             failure = ?failure,
             fail_open = fail_open,
             "custom guardrail script failed",
@@ -802,10 +802,16 @@ fn install_host(
         // script cannot write an unbounded line into the gateway's log.
         let message: String = message.chars().take(2048).collect();
         match level.as_str() {
-            "error" => tracing::error!(row = %log_row, "custom guardrail script: {message}"),
-            "warn" => tracing::warn!(row = %log_row, "custom guardrail script: {message}"),
-            "debug" => tracing::debug!(row = %log_row, "custom guardrail script: {message}"),
-            _ => tracing::info!(row = %log_row, "custom guardrail script: {message}"),
+            "error" => {
+                tracing::error!(guardrail_name = %log_row, "custom guardrail script: {message}")
+            }
+            "warn" => {
+                tracing::warn!(guardrail_name = %log_row, "custom guardrail script: {message}")
+            }
+            "debug" => {
+                tracing::debug!(guardrail_name = %log_row, "custom guardrail script: {message}")
+            }
+            _ => tracing::info!(guardrail_name = %log_row, "custom guardrail script: {message}"),
         }
     })
     .map_err(|_| ScriptFailure::Engine)?;
@@ -997,10 +1003,14 @@ async fn host_embed(
             vectors: embedded.vectors,
         })
         .unwrap_or_else(|e| embed_error(e.to_string())),
-        Err(EmbedError { failure, error }) => {
+        Err(EmbedError {
+            failure,
+            error,
+            model: resolved,
+        }) => {
             tracing::warn!(
-                row = %row_name,
-                model = %model,
+                guardrail_name = %row_name,
+                model = %resolved.as_deref().unwrap_or(&model),
                 failure = ?failure,
                 error = error.as_deref(),
                 elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -1068,7 +1078,7 @@ async fn host_fetch(
             // (`${base}/scan?key=${ctx.secrets.SCAN_KEY}`), and this line
             // goes to the operator's log.
             tracing::warn!(
-                row = %row_name,
+                guardrail_name = %row_name,
                 target = %redact_url(&url),
                 error = %e,
                 "custom guardrail fetch failed",
@@ -1092,7 +1102,7 @@ async fn host_fetch(
         // Reported rather than handed over: a truncated body makes
         // `resp.json()` throw a parse error that reads like a bug in the
         // script, when the cause is the size limit.
-        tracing::warn!(row = %row_name, cap = body_cap, "custom guardrail fetch body hit the cap");
+        tracing::warn!(guardrail_name = %row_name, cap = body_cap, "custom guardrail fetch body hit the cap");
         return fetch_error(format!(
             "response body exceeded {body_cap} bytes (a quarter of max_memory_bytes)"
         ));
@@ -1140,10 +1150,10 @@ fn threw(
     deadline: Instant,
 ) -> ScriptFailure {
     if Instant::now() >= deadline {
-        tracing::warn!(row = %row_name, stage = %stage, "custom guardrail script exceeded its budget");
+        tracing::warn!(guardrail_name = %row_name, stage = %stage, "custom guardrail script exceeded its budget");
         return ScriptFailure::Timeout;
     }
-    tracing::warn!(row = %row_name, stage = %stage, error = %err, "custom guardrail script threw");
+    tracing::warn!(guardrail_name = %row_name, stage = %stage, error = %err, "custom guardrail script threw");
     ScriptFailure::Threw
 }
 

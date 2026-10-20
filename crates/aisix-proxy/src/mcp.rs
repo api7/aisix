@@ -570,6 +570,7 @@ async fn dispatch(
         } = verdict
         {
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "input",
                 tool = %mcp_tool,
                 reason = %reason,
@@ -1088,6 +1089,7 @@ async fn moderate_selected_segments(
     } = outcome.verdict
     {
         tracing::warn!(
+            guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
             guardrail_hook = if input { "input" } else { "output" },
             reason = %reason,
             "guardrail blocked MCP content in the segment pass"
@@ -1382,6 +1384,7 @@ async fn apply_output_guardrails(
     } = verdict
     {
         tracing::warn!(
+            guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
             guardrail_hook = "output",
             tool = %tool,
             reason = %reason,

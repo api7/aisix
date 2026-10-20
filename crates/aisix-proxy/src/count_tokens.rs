@@ -393,6 +393,7 @@ async fn screen_input(
     } = verdict
     {
         tracing::warn!(
+            guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
             guardrail_hook = "input",
             model = %model_name,
             reason = %reason,
