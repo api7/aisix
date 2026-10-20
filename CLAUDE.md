@@ -213,7 +213,7 @@ Retire it instead: drop the block from `config.example.yaml` / `config.managed.y
 Use the following terms in public prose, generated API descriptions, release
 notes, and configuration comments:
 
-- **AISIX AI Gateway** is the descriptive name for the product suite containing
+- **AISIX** is the descriptive name for the product suite containing
   AISIX OSS, AISIX Enterprise, and AISIX Cloud. Use it for suite-wide and
   discovery surfaces, not as the name of this repository's product or the
   shared gateway runtime.
