@@ -1012,10 +1012,12 @@ impl BedrockBridge {
         // Every intermediate stays inside this block, so only the wire
         // bytes are alive while the upstream is awaited.
         let urls = MediaUrls::Refused("Claude on Amazon Bedrock");
-        let fetched = fetch_media_urls(&req, ctx.deadline, Encoding::Base64, |m| {
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, |m| {
             anthropic_needs_fetch(m, urls)
         })
         .await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
         let body_bytes = {
             let (system, messages) = split_system_with(&req, urls, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
@@ -1113,7 +1115,9 @@ impl BedrockBridge {
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
         let client = self.build_client_from_ctx(ctx)?;
-        let fetched = fetch_media_urls(&req, ctx.deadline, Encoding::Bytes, |_| true).await?;
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Bytes, |_| true).await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
         let (system_blocks, message_blocks) =
             build_converse_inputs(&req, BedrockPublisher::from_model_id(upstream_id), &fetched)?;
 
@@ -1216,7 +1220,9 @@ impl BedrockBridge {
         upstream_id: &str,
     ) -> Result<ChatChunkStream, BridgeError> {
         let client = self.build_client_from_ctx(ctx)?;
-        let fetched = fetch_media_urls(&req, ctx.deadline, Encoding::Bytes, |_| true).await?;
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Bytes, |_| true).await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
         let (system_blocks, message_blocks) =
             build_converse_inputs(&req, BedrockPublisher::from_model_id(upstream_id), &fetched)?;
 
@@ -1377,10 +1383,10 @@ fn build_converse_inputs(
 }
 
 /// A user turn's content parts as Converse blocks, in the caller's order.
-/// Converse takes media only as bytes in the request, and the gateway does
-/// not fetch a caller's URL, so a URL part is refused. A Claude model on
-/// this rail takes what it takes through InvokeModel — images and PDFs —
-/// so the two rails refuse the same parts.
+/// Converse takes media only as bytes in the request, so a URL part gets
+/// the bytes the gateway downloaded for it, or is refused when there are
+/// none. A Claude model on this rail takes what it takes through
+/// InvokeModel — images and PDFs — so the two rails refuse the same parts.
 ///
 /// Converse rejects a user message that carries a document but no text,
 /// so such a message gets a one-character text block after its media.

@@ -918,8 +918,9 @@ impl VertexBridge {
             },
         )?;
 
-        let fetched =
-            fetch_media_urls(&req, ctx.deadline, Encoding::Base64, gemini_needs_fetch).await?;
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, gemini_needs_fetch).await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
         let body = {
             let typed = build_gemini_request_with(&req, upstream_id, &fetched)?;
             // Serialize to JSON, then apply the per-ProviderKey override
@@ -1032,10 +1033,12 @@ impl VertexBridge {
             StructuredOutput::Tool(_)
         );
         let urls = MediaUrls::Refused("Claude on Vertex AI");
-        let fetched = fetch_media_urls(&req, ctx.deadline, Encoding::Base64, |m| {
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, |m| {
             anthropic_needs_fetch(m, urls)
         })
         .await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
         let body_value = {
             let (system, messages) = split_system_with(&req, urls, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
@@ -1146,10 +1149,12 @@ impl VertexBridge {
         // in the body (only `model` is stripped into the URL). Add the
         // Vertex `anthropic_version`.
         let urls = MediaUrls::Refused("Claude on Vertex AI");
-        let fetched = fetch_media_urls(&req, ctx.deadline, Encoding::Base64, |m| {
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, |m| {
             anthropic_needs_fetch(m, urls)
         })
         .await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
         let body_value = {
             let (system, messages) = split_system_with(&req, urls, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
@@ -1740,8 +1745,9 @@ impl VertexBridge {
             },
         )?;
 
-        let fetched =
-            fetch_media_urls(&req, ctx.deadline, Encoding::Base64, gemini_needs_fetch).await?;
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, gemini_needs_fetch).await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
         let body = {
             let typed = build_gemini_request_with(&req, upstream_id, &fetched)?;
             // Serialize + apply the per-ProviderKey override pipeline (#339)

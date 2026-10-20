@@ -386,10 +386,12 @@ impl Bridge for AnthropicBridge {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        let fetched = fetch_media_urls(&req, ctx.deadline, Encoding::Base64, |m| {
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, |m| {
             anthropic_needs_fetch(m, MediaUrls::Accepted)
         })
         .await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
         let body = {
             let (system, messages) = split_system_with(&req, MediaUrls::Accepted, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
@@ -484,10 +486,12 @@ impl Bridge for AnthropicBridge {
             return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
         }
 
-        let fetched = fetch_media_urls(&req, ctx.deadline, Encoding::Base64, |m| {
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, |m| {
             anthropic_needs_fetch(m, MediaUrls::Accepted)
         })
         .await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
         let body = {
             let (system, messages) = split_system_with(&req, MediaUrls::Accepted, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;

@@ -11,6 +11,7 @@
 //! are followed by hand so each hop passes the same check.
 //! `upstream.media_fetch.allowed_hosts` is the only way past it.
 
+use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -23,7 +24,7 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{header, Url};
 use tokio::time::Instant;
 
-use crate::bridge::BridgeError;
+use crate::bridge::{BridgeContext, BridgeError};
 use crate::chat::{ChatFormat, Role};
 use crate::content_part::{
     display_uri, mime_type_from_path, normalize_mime_type, parse_part, part_error, ContentPart,
@@ -34,6 +35,7 @@ use crate::content_part::{
 /// status is an answer and is not retried.
 const MAX_ATTEMPTS: u32 = 3;
 const MAX_REDIRECTS: usize = 10;
+const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 /// Downloads of one request in flight at once.
 const MAX_CONCURRENT: usize = 8;
 
@@ -167,9 +169,29 @@ pub struct Fetched {
 #[derive(Debug, Default)]
 pub struct FetchedMedia {
     slots: Mutex<HashMap<String, (Fetched, usize)>>,
+    /// Time the downloads took, `None` when nothing was downloaded.
+    spent: Option<Duration>,
 }
 
 impl FetchedMedia {
+    /// `ctx` with the time the downloads took charged to its end-to-end
+    /// budget, so the downloads and the upstream call share it. A
+    /// streaming context's chunk-gap budget is not an end-to-end one and
+    /// stays as it is.
+    pub fn charge<'a>(&self, ctx: &'a BridgeContext) -> Cow<'a, BridgeContext> {
+        let Some(spent) = self.spent else {
+            return Cow::Borrowed(ctx);
+        };
+        let mut charged = ctx.clone();
+        let left = |budget: Duration| budget.saturating_sub(spent).max(Duration::from_millis(1));
+        if ctx.non_streaming_deadline.is_some() {
+            charged.non_streaming_deadline = ctx.non_streaming_deadline.map(left);
+        } else {
+            charged.deadline = ctx.deadline.map(left);
+        }
+        Cow::Owned(charged)
+    }
+
     pub fn take(&self, uri: &str) -> Option<Fetched> {
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
         let (media, uses) = slots.get_mut(uri)?;
@@ -196,11 +218,12 @@ struct Wanted {
 ///
 /// Off (`upstream.media_fetch.enabled: false`), nothing is downloaded and
 /// the translation refuses those parts. A failed download is a 400 naming
-/// the part. All downloads share `budget`, the request's own upstream
-/// timeout.
+/// the part. All downloads share the request's own end-to-end upstream
+/// budget; [`FetchedMedia::charge`] takes what they spent off the upstream
+/// call's.
 pub async fn fetch_media_urls(
     req: &ChatFormat,
-    budget: Option<Duration>,
+    ctx: &BridgeContext,
     encoding: Encoding,
     needs_fetch: impl Fn(&Media<'_>) -> bool,
 ) -> Result<FetchedMedia, BridgeError> {
@@ -208,10 +231,16 @@ pub async fn fetch_media_urls(
     if !settings.enabled {
         return Ok(FetchedMedia::default());
     }
+    let budget = ctx.non_streaming_deadline.or(ctx.deadline);
     let mut wanted: Vec<Wanted> = Vec::new();
     let mut seen: HashMap<&str, usize> = HashMap::new();
+    // Every part naming a URL takes the download from the result, whether
+    // or not that part alone would have needed it, so all are counted.
+    let mut occurrences: HashMap<&str, usize> = HashMap::new();
+    // System turns are included: the Anthropic translation carries a
+    // system turn that follows the conversation as a user turn.
     for (message, m) in req.messages.iter().enumerate() {
-        if m.role != Role::User {
+        if !matches!(m.role, Role::User | Role::System | Role::Developer) {
             continue;
         }
         for (part, block) in m.content_blocks.iter().flatten().enumerate() {
@@ -226,13 +255,14 @@ pub async fn fetch_media_urls(
             else {
                 continue;
             };
+            *occurrences.entry(uri).or_default() += 1;
             if !matches!(media.source.scheme().as_deref(), Some("http" | "https"))
                 || !needs_fetch(&media)
             {
                 continue;
             }
             match seen.entry(uri) {
-                Entry::Occupied(at) => wanted[*at.get()].uses += 1,
+                Entry::Occupied(_) => {}
                 Entry::Vacant(at) => {
                     at.insert(wanted.len());
                     wanted.push(Wanted {
@@ -240,7 +270,7 @@ pub async fn fetch_media_urls(
                         explicit_mime_type: mime_type.clone().filter(|_| *explicit),
                         message,
                         part,
-                        uses: 1,
+                        uses: 0,
                     });
                 }
             }
@@ -249,8 +279,12 @@ pub async fn fetch_media_urls(
     if wanted.is_empty() {
         return Ok(FetchedMedia::default());
     }
+    for w in &mut wanted {
+        w.uses = occurrences.get(w.uri.as_str()).copied().unwrap_or(1);
+    }
 
-    let deadline = budget.map(|b| Instant::now() + b);
+    let started = Instant::now();
+    let deadline = budget.map(|b| started + b);
     let mut downloads = futures::stream::iter(wanted.into_iter().map(|w| async move {
         let download = fetch_one(&w, settings, encoding);
         let result = match deadline {
@@ -279,6 +313,7 @@ pub async fn fetch_media_urls(
     }
     Ok(FetchedMedia {
         slots: Mutex::new(slots),
+        spent: Some(started.elapsed()),
     })
 }
 
@@ -291,7 +326,10 @@ async fn fetch_one(
     let mut attempt = 1;
     let (bytes, content_type, final_url) = loop {
         match download(&url, settings).await {
-            Err(f) if f.retryable() && attempt < MAX_ATTEMPTS => attempt += 1,
+            Err(f) if f.retryable() && attempt < MAX_ATTEMPTS => {
+                tokio::time::sleep(RETRY_BACKOFF * attempt).await;
+                attempt += 1;
+            }
             result => break result?,
         }
     };
@@ -404,7 +442,7 @@ fn client(guarded: bool) -> Result<&'static reqwest::Client, Failure> {
     static ALLOWED: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
     let cell = if guarded { &GUARDED } else { &ALLOWED };
     cell.get_or_init(|| {
-        crate::upstream_http::client_builder()
+        crate::upstream_http::caller_chosen_peer_client_builder()
             .dns_resolver(Arc::new(MediaResolver { guarded }))
             .redirect(reqwest::redirect::Policy::none())
             // A proxy would resolve the name itself, past the check.
@@ -482,7 +520,7 @@ enum Failure {
 
 impl Failure {
     fn retryable(&self) -> bool {
-        matches!(self, Self::Transport | Self::Timeout | Self::Unresolvable)
+        matches!(self, Self::Transport | Self::Timeout)
     }
 
     fn describe(&self, uri: &str, settings: &MediaFetchSettings) -> String {
@@ -823,6 +861,71 @@ mod tests {
         .await;
         assert_eq!(got.map(|_| ()), Err(Failure::Status(404)));
         assert!(!Failure::Status(404).retryable());
+    }
+
+    fn ctx() -> BridgeContext {
+        use aisix_core::models::{Model, ProviderKey};
+        BridgeContext::new(
+            "req-1",
+            Arc::new(
+                serde_json::from_str::<Model>(
+                    r#"{"display_name":"m","provider":"bedrock","model_name":"x","provider_key_id":"pk"}"#,
+                )
+                .unwrap(),
+            ),
+            Arc::new(serde_json::from_str::<ProviderKey>(r#"{"display_name":"pk","secret":"s"}"#).unwrap()),
+        )
+    }
+
+    /// Every part naming a downloaded URL can take it, including one that
+    /// would not have needed the download by itself; and the time spent is
+    /// charged to the end-to-end budget only.
+    #[tokio::test]
+    async fn every_part_naming_a_downloaded_url_gets_it_and_the_time_is_charged() {
+        init(&aisix_core::config::MediaFetchConfig {
+            allowed_hosts: vec!["127.0.0.1".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let port = serve(b"HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: 4\r\nconnection: close\r\n\r\nPNG!").await;
+        let url = format!("http://127.0.0.1:{port}/img");
+        let req: ChatFormat = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": url, "format": "image/png"}},
+                {"type": "image_url", "image_url": {"url": url}},
+            ]}],
+        }))
+        .unwrap();
+        let fetched = fetch_media_urls(&req, &ctx(), Encoding::Bytes, |m| {
+            matches!(
+                m.source,
+                MediaSource::Uri {
+                    explicit: false,
+                    ..
+                }
+            )
+        })
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            let got = fetched.take(&url).expect("each part gets the download");
+            assert_eq!(got.data.into_bytes(), b"PNG!");
+        }
+        assert!(fetched.take(&url).is_none());
+
+        let streaming = ctx()
+            .with_deadline(Duration::from_secs(10))
+            .with_non_streaming_deadline(Some(Duration::from_secs(60)));
+        let charged = fetched.charge(&streaming);
+        assert_eq!(charged.deadline, Some(Duration::from_secs(10)));
+        assert!(charged.non_streaming_deadline.unwrap() < Duration::from_secs(60));
+        let plain = ctx().with_deadline(Duration::from_secs(60));
+        assert!(fetched.charge(&plain).deadline.unwrap() < Duration::from_secs(60));
+        assert!(matches!(
+            FetchedMedia::default().charge(&plain),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]
