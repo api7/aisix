@@ -213,6 +213,10 @@ Retire it instead: drop the block from `config.example.yaml` / `config.managed.y
 Use the following terms in public prose, generated API descriptions, release
 notes, and configuration comments:
 
+- **AISIX** is the descriptive name for the product suite containing
+  AISIX OSS, AISIX Enterprise, and AISIX Cloud. Use it for suite-wide and
+  discovery surfaces, not as the name of this repository's product or the
+  shared gateway runtime.
 - **AISIX OSS** is the open-source product implemented by this repository.
   After establishing the product, use **AISIX gateway** or **gateway** for its
   runtime. Do not use **AISIX OSS** as the name of the shared gateway runtime.
@@ -222,8 +226,8 @@ notes, and configuration comments:
   control plane and dashboard; the customer operates the AISIX gateways.
 - Treat AISIX OSS, AISIX Enterprise, and AISIX Cloud as parallel products. Do
   not describe AISIX Cloud as an umbrella with Hybrid Cloud and On-Premises
-  deployment options. Retire **AISIX AI Gateway**, **Hybrid Cloud**, and
-  product-name uses of **On-Premises** from current public prose.
+  deployment options. Retire **Hybrid Cloud** and product-name uses of
+  **On-Premises** from current public prose.
 - The same gateway binary runs in all three products. A shared binary does not
   imply identical product behavior or configuration surfaces.
 - **Open-source AISIX gateway** is a valid descriptive component phrase, not a
