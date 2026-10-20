@@ -283,7 +283,13 @@ async fn mantle_count_tokens(
     let client = aisix_gateway::upstream_tls::raw_client_for_provider_key(
         ctx.provider_key.upstream_connection().as_ref(),
     );
-    let mut req = client.post(&url).body(bytes);
+    let endpoint = aisix_gateway::url_cache::cached_endpoint_url(
+        &ctx.provider_key_id,
+        "bedrock/mantle-count-tokens",
+        &[&url],
+        || Ok::<_, BridgeError>(url.clone()),
+    )?;
+    let mut req = endpoint.post_on(&client).body(bytes);
     for (name, value) in unsigned.iter().copied().chain(instructions.headers()) {
         req = req.header(name, value);
     }
