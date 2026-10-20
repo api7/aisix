@@ -3114,7 +3114,7 @@ async fn serve_connection<I, S>(
             // a request is retired when the drain ends, as before.
             let (dispatched_tx, mut dispatched) = watch::channel(false);
             let service = hyper::service::service_fn(move |req| {
-                dispatched_tx.send_replace(true);
+                dispatched_tx.send_if_modified(|d| !std::mem::replace(d, true));
                 hyper::service::Service::call(&service, req)
             });
             let conn = http1.serve_connection(io, service).with_upgrades();
