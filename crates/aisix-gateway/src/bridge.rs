@@ -135,6 +135,10 @@ pub struct BridgeContext {
     /// unpopulated field outside tests.
     pub model_id: String,
     pub provider_key_id: String,
+    /// Size of the caller's inbound request body, which media the gateway
+    /// downloads for the request counts against together with
+    /// `proxy.request_body_limit_bytes`. `0` on caller-less calls.
+    pub inbound_body_bytes: usize,
 }
 
 /// Print the context without its credentials.
@@ -183,7 +187,13 @@ impl BridgeContext {
             client_headers: None,
             model_id: String::new(),
             provider_key_id: String::new(),
+            inbound_body_bytes: 0,
         }
+    }
+
+    pub fn with_inbound_body_bytes(mut self, bytes: usize) -> Self {
+        self.inbound_body_bytes = bytes;
+        self
     }
 
     pub fn with_deadline(mut self, deadline: Duration) -> Self {
@@ -204,7 +214,9 @@ impl BridgeContext {
     /// under, whichever kind of dispatch this context came from.
     pub fn non_streaming_ctx(&self) -> Self {
         let mut ctx = self.clone();
-        if let Some(deadline) = self.non_streaming_deadline {
+        // The result is a non-streaming context, which carries its budget
+        // in `deadline` alone.
+        if let Some(deadline) = ctx.non_streaming_deadline.take() {
             ctx.deadline = Some(deadline);
         }
         ctx
@@ -403,6 +415,12 @@ pub enum BridgeError {
     /// caller is pointed at the request instead of the ProviderKey/Model.
     #[error("{0}")]
     InvalidRequest(String),
+    /// The request outgrew `proxy.request_body_limit_bytes` once the media
+    /// the gateway downloaded for it is counted with its inbound body.
+    /// The same 413 an over-limit inbound body gets; never retried, and
+    /// raised before the upstream is contacted.
+    #[error("request body exceeds {limit_bytes}-byte limit")]
+    RequestTooLarge { limit_bytes: usize },
     /// Customer-fixable upstream *credential* problem — the admin's
     /// ProviderKey secret/credential is missing, empty, or malformed
     /// (empty secret, api key with invalid HTTP-header bytes, unparseable
@@ -718,6 +736,7 @@ impl BridgeError {
             // here would change what those two return.
             BridgeError::Config(_) | BridgeError::UnsupportedCapability(_) => 500,
             BridgeError::InvalidUpstreamConfig(_) | BridgeError::InvalidRequest(_) => 400,
+            BridgeError::RequestTooLarge { .. } => 413,
             BridgeError::InvalidUpstreamCredentials(_) => 401,
             BridgeError::Transport(_) => 502,
             BridgeError::StreamAborted => 502,
@@ -754,6 +773,7 @@ impl BridgeError {
             | BridgeError::UnsupportedCapability(_)
             | BridgeError::InvalidUpstreamConfig(_)
             | BridgeError::InvalidRequest(_)
+            | BridgeError::RequestTooLarge { .. }
             | BridgeError::InvalidUpstreamCredentials(_) => false,
         }
     }
@@ -766,9 +786,9 @@ impl BridgeError {
             BridgeError::UpstreamDecode(_) => "upstream_decode_error",
             BridgeError::UpstreamInBand { .. } => "upstream_in_band_error",
             BridgeError::Config(_) | BridgeError::UnsupportedCapability(_) => "config_error",
-            BridgeError::InvalidUpstreamConfig(_) | BridgeError::InvalidRequest(_) => {
-                "invalid_request_error"
-            }
+            BridgeError::InvalidUpstreamConfig(_)
+            | BridgeError::InvalidRequest(_)
+            | BridgeError::RequestTooLarge { .. } => "invalid_request_error",
             BridgeError::InvalidUpstreamCredentials(_) => "authentication_error",
             BridgeError::Transport(_) => "transport_error",
             BridgeError::StreamAborted => "stream_aborted",

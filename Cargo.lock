@@ -167,6 +167,7 @@ dependencies = [
  "async-trait",
  "aws-smithy-http-client",
  "aws-smithy-runtime-api",
+ "base64 0.22.1",
  "bytes",
  "dashmap",
  "futures",
@@ -183,6 +184,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "url",
  "webpki-roots 0.26.11",
 ]
 
@@ -339,6 +341,7 @@ dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
+ "base64 0.22.1",
  "futures",
  "http 1.4.0",
  "serde",

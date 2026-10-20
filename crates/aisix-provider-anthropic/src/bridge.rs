@@ -24,11 +24,13 @@ use futures::StreamExt;
 use reqwest::{header, Client, StatusCode};
 use std::time::{Duration, Instant};
 
+use aisix_gateway::media_fetch::{fetch_media_urls, Encoding};
 use aisix_gateway::structured_output::{response_into_fake_stream_chunks, unwrap_json_tool_call};
 
 use crate::wire::{
-    build_request, inject_cache_breakpoints, response_into_chat_response, split_system,
-    structured_output_for, AnthropicResponse, AnthropicStreamEvent, StreamState, StructuredOutput,
+    anthropic_needs_fetch, build_request, inject_cache_breakpoints, response_into_chat_response,
+    split_system_with, structured_output_for, AnthropicResponse, AnthropicStreamEvent, MediaUrls,
+    StreamState, StructuredOutput,
 };
 
 /// Matches the API header that Anthropic bakes backwards-compat into.
@@ -384,9 +386,15 @@ impl Bridge for AnthropicBridge {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, |m| {
+            anthropic_needs_fetch(m, MediaUrls::Accepted)
+        })
+        .await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
         let body = {
-            let (system, messages) =
-                split_system(&req).map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
+            let (system, messages) = split_system_with(&req, MediaUrls::Accepted, &fetched)
+                .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
             let mut body = build_request(&req, upstream, system, messages, false);
             maybe_inject_cache_breakpoints(&mut body, ctx);
             outbound_bytes(&body)?
@@ -478,9 +486,15 @@ impl Bridge for AnthropicBridge {
             return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
         }
 
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, |m| {
+            anthropic_needs_fetch(m, MediaUrls::Accepted)
+        })
+        .await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
         let body = {
-            let (system, messages) =
-                split_system(&req).map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
+            let (system, messages) = split_system_with(&req, MediaUrls::Accepted, &fetched)
+                .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
             let mut body = build_request(&req, upstream, system, messages, true);
             maybe_inject_cache_breakpoints(&mut body, ctx);
             outbound_bytes(&body)?

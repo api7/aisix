@@ -649,7 +649,9 @@ pub(crate) fn bridge_ctx(
     let ctx = aisix_gateway::BridgeContext::new(request_id, model, provider_key)
         .with_resource_ids(model_id, provider_key_id);
     match client {
-        Some(c) => ctx.with_client(c.caller.clone(), Some(c.headers.clone())),
+        Some(c) => ctx
+            .with_client(c.caller.clone(), Some(c.headers.clone()))
+            .with_inbound_body_bytes(c.inbound_body.as_ref().map_or(0, |b| b.bytes())),
         None => ctx,
     }
 }

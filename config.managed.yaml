@@ -109,7 +109,8 @@ etcd:
 proxy:
   addr: "0.0.0.0:3000"
   # 0 = no request-body cap (the default); set a value to bound
-  # per-request memory.
+  # per-request memory. Media downloaded for a request (upstream.media_fetch)
+  # counts against it together with the inbound body.
   # request_body_limit_bytes: 0
   # TLS on the single listener `addr` describes.
   # tls:
@@ -279,6 +280,16 @@ upstream:
   #   ca_file: "/etc/aisix/tls/private-ca.pem"
   #   # client_cert_file / client_key_file for mutual TLS
   #   # verify: true   # false accepts ANY certificate — test use only
+  # Media URLs an upstream cannot read itself (Bedrock, Claude on Vertex,
+  # http:// toward Anthropic / Gemini) are downloaded and sent inline.
+  # Only publicly routable addresses are reached; allowed_hosts (host or
+  # host:port) is the only exception. A request's downloads count, with
+  # its inbound body, against proxy.request_body_limit_bytes when set.
+  # See config.example.yaml.
+  # media_fetch:
+  #   enabled: true
+  #   allowed_hosts: []
+  #   max_bytes: 52428800
 
 # Connection-layer settings for the inbound side. `idle_timeout_secs: 0`
 # (the default) never closes an idle client connection, leaving that to
