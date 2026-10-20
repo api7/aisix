@@ -211,14 +211,9 @@ describe("thread-per-core drain: shared Provider Key pool", () => {
         all.push(...outcomes);
         for (const fn of cleanup.reverse()) await fn().catch(() => {});
         cleanup.length = 0;
-        if (outcomes.some((o) => o.upstreamCount > 1 || (o.upstreamCount === 1 && o.status !== 200))) break;
+        if (outcomes.some((o) => o.upstreamCount !== 1 || o.status !== 200)) break;
       }
-      // A late connection can also be closed unanswered before its request
-      // is read — a separate defect that never reaches the upstream, so it
-      // is not this spec's subject.
-      const reached = all.filter((o) => o.upstreamCount > 0);
-      expect(reached.length, "no late request reached the upstream").toBeGreaterThan(0);
-      for (const o of reached) {
+      for (const o of all) {
         expect({ marker: o.marker, status: o.status, upstreamCount: o.upstreamCount }).toEqual({
           marker: o.marker,
           status: 200,

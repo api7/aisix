@@ -3106,6 +3106,14 @@ async fn serve_connection<I, S>(
             let mut retired = false;
             loop {
                 tokio::select! {
+                    // The connection is polled first so it has read the
+                    // bytes the version sniff already saw before it can be
+                    // retired. hyper closes a connection that has read
+                    // nothing yet on the spot, so a request that arrives
+                    // after the drain ends — on a connection accepted
+                    // before it — would otherwise lose a coin flip
+                    // against an already-fired cancel and go unanswered.
+                    biased;
                     served = conn.as_mut() => break served.map_err(|e| e.to_string()),
                     _ = shutdown.cancelled(), if !retired => {
                         conn.as_mut().graceful_shutdown();
@@ -3211,10 +3219,12 @@ async fn serve_http_tpc(
 
     // One slot per worker so no worker blocks reporting its exit.
     let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel::<anyhow::Result<()>>(workers);
+    let all_served = std::sync::Arc::new(tokio::sync::Barrier::new(workers));
     for (worker, listeners) in per_worker.into_iter().enumerate() {
         let router = router.clone();
         let shutdown = shutdown.clone();
         let exit_tx = exit_tx.clone();
+        let all_served = all_served.clone();
         // Every worker raises and lowers the same process-wide count, so
         // the drain heartbeat reports the listener as a whole rather than
         // whichever worker happened to accept.
@@ -3237,6 +3247,7 @@ async fn serve_http_tpc(
                     label,
                     worker,
                     drain,
+                    all_served,
                 ));
             })?;
     }
@@ -3245,10 +3256,11 @@ async fn serve_http_tpc(
     drop(exit_tx);
 
     // A graceful shutdown ends the workers together, but each drains its
-    // own connections on its own clock — an idle worker returns at once
-    // while a sibling may hold an in-flight stream for minutes. Wait for
-    // every worker, so the fastest drain cannot end the process under
-    // the slowest. Everything else stays immediately fatal: an accept
+    // own connections on its own clock — an idle worker is done at once
+    // while a sibling may hold an in-flight stream for minutes. A done
+    // worker waits for the slowest before it drops its runtime (see
+    // `run_tpc_worker`), and this waits for every worker, so the fastest
+    // drain cannot end the process under the slowest. Everything else stays immediately fatal: an accept
     // loop failing, a panic unwinding, or a worker stopping without a
     // shutdown signal has to bring the process down rather than leave it
     // serving on fewer listeners than it reported binding.
@@ -3304,6 +3316,7 @@ fn run_tpc_worker(
     label: &'static str,
     worker: usize,
     drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
+    all_served: std::sync::Arc<tokio::sync::Barrier>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3341,7 +3354,23 @@ fn run_tpc_worker(
                 drain.clone(),
             ));
         }
-        join_listeners(serving, label).await
+        let served = join_listeners(serving, label).await;
+        // An upstream connection is driven by a task on the runtime of
+        // the worker that opened it, and every process-wide client pool
+        // (Provider Key overrides, the shared fallback, guardrail, MCP,
+        // ...) hands that connection to whichever worker checks it out
+        // next. Dropping this runtime would kill those tasks under a
+        // sibling's request still in flight on them, which then fails
+        // as "dispatch task is gone" and is retried — a duplicate
+        // upstream call. So a drained worker keeps polling its runtime
+        // until every worker has finished serving, and only then lets it
+        // drop. A failure skips the wait: it ends the process anyway, and
+        // a worker that stopped without a shutdown signal must be
+        // reported rather than parked.
+        if served.is_ok() && *shutdown.cancel.borrow() {
+            all_served.wait().await;
+        }
+        served
     })
 }
 
