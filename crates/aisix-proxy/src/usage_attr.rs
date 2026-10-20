@@ -1026,16 +1026,11 @@ pub(crate) fn emit_usage(
         if event.upstream_response_headers.is_empty() {
             event.upstream_response_headers = response.headers;
         }
-        // A failed attempt has no response object to take an id from — nor
-        // does an upstream error a route relays as its own answer (the jobs
-        // and passthrough families) — and count_tokens' answer carries none;
-        // the provider's request-id header is what its support traces the
-        // call by.
-        if event.provider_request_id.is_empty()
-            && (!event.error_class.is_empty()
-                || event.status_code >= 400
-                || surface.operation == crate::operation::COUNT_TOKENS.operation)
-        {
+        // The response object's id when it had one; otherwise — a failed
+        // attempt, a token count, an embedding, an image, a Bedrock answer —
+        // the provider's request-id header, which is what its support traces
+        // the call by.
+        if event.provider_request_id.is_empty() {
             event.provider_request_id = sanitize_provider_response_id(&response.request_id);
         }
     }
@@ -1050,7 +1045,13 @@ pub(crate) fn emit_usage(
             event.status_code,
             &event.error_class,
             &event.error_message,
-            &event.provider_request_id,
+            // Only an upstream's own id: a cache hit's stored one is not this
+            // request's call.
+            if dispatched {
+                &event.provider_request_id
+            } else {
+                ""
+            },
         );
         crate::attribution::emit_deferred_access_log(&event);
     }

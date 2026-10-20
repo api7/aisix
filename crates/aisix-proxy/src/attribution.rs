@@ -538,9 +538,7 @@ impl Cell {
                 message,
                 &self.terminal_provider_request_id,
             );
-        } else if record.is_error_status() {
-            // An upstream error relayed as the route's own answer names no
-            // error class, and is still a failed call.
+        } else {
             record.fill_provider_request_id_if_absent(&self.terminal_provider_request_id);
         }
     }
@@ -1443,8 +1441,9 @@ pub(crate) fn note_e2e_downstream(
     record_e2e_upstream(|cell| cell.e2e_labels = Some((metrics, labels, downstream)));
 }
 
-/// Note the failure the request's terminal usage event names, so the
-/// access-log line carries it too ([`Cell::name_failure`]). Called from the
+/// Note the failure, and the provider's id, the request's terminal usage
+/// event names, so the access-log line carries them too
+/// ([`Cell::name_failure`]). Called from the
 /// emission chokepoint, so every family records it the same way.
 pub(crate) fn note_terminal_error(
     status: u16,

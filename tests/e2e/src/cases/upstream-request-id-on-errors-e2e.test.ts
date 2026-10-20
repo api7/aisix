@@ -25,7 +25,9 @@ import {
 // dispatches to:
 //   - each failed attempt's usage event carries the id of the response that
 //     failed it (`provider_request_id`);
-//   - a `/v1/messages/count_tokens` event carries the id of the count;
+//   - a `/v1/messages/count_tokens` event carries the id of the count, and
+//     so does a success whose response has no id of its own (an embedding,
+//     a Bedrock answer), while one that has an id keeps it;
 //   - the failed request's access-log line carries the id, and names the
 //     provider the request was sent to rather than `unknown`, on every
 //     route.
@@ -38,6 +40,7 @@ const LOGSTORE = "upstream-request-id-store";
 const OPENAI = "urid-openai";
 const OPENAI_RETRIED = "urid-openai-retried";
 const OPENAI_OK = "urid-openai-ok";
+const BEDROCK_OK = "urid-bedrock-nova-ok";
 const ANTHROPIC = "urid-anthropic";
 const AZURE = "urid-azure";
 const BEDROCK = "urid-bedrock-nova";
@@ -73,6 +76,18 @@ async function startUpstream(): Promise<{ server: Server; baseUrl: string }> {
       if (path.endsWith("/count-tokens")) {
         res.writeHead(200, { "content-type": "application/json", ...awsId("count") });
         res.end(JSON.stringify({ inputTokens: 21 }));
+        return;
+      }
+      if (path.includes("nova-ok") && path.endsWith("/converse")) {
+        res.writeHead(200, { "content-type": "application/json", ...awsId("converse-ok") });
+        res.end(
+          JSON.stringify({
+            output: { message: { role: "assistant", content: [{ text: "ok" }] } },
+            stopReason: "end_turn",
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            metrics: { latencyMs: 1 },
+          }),
+        );
         return;
       }
       if (path.endsWith("/converse-stream")) {
@@ -119,6 +134,20 @@ async function startUpstream(): Promise<{ server: Server; baseUrl: string }> {
       return fail(400, { "x-request-id": "dec-systemone" }, { detail: "rejected by the mock" });
     }
     // OpenAI, answering: an embedding carries no id of its own.
+    if (path.startsWith("/oai-ok/v1/chat/completions")) {
+      res.writeHead(200, { "content-type": "application/json", "x-request-id": "oai-ok-chat" });
+      res.end(
+        JSON.stringify({
+          id: "chatcmpl-urid-ok",
+          object: "chat.completion",
+          created: 1_700_000_000,
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      );
+      return;
+    }
     if (path.startsWith("/oai-ok/")) {
       res.writeHead(200, { "content-type": "application/json", "x-request-id": "oai-ok-embeddings" });
       res.end(
@@ -265,6 +294,7 @@ describe("the provider's request id on failed attempts and token counts", () => 
       [ANTHROPIC, anthropic, "anthropic", "claude-sonnet-4-5", 0],
       [AZURE, azure, "azure-openai", "gpt-4o-mini", 0],
       [BEDROCK, bedrock, "bedrock", "amazon.nova-lite-v1:0", 0],
+      [BEDROCK_OK, bedrock, "bedrock", "amazon.nova-ok-v1:0", 0],
       [BEDROCK_CLAUDE, bedrock, "bedrock", "global.anthropic.claude-sonnet-4-5-20250929-v1:0", 0],
       [VERTEX, vertex, "google", "gemini-2.5-flash", 0],
       [DECISIONS, decisions, "typesafe", "jev-latest", 0],
@@ -338,14 +368,32 @@ describe("the provider's request id on failed attempts and token counts", () => 
     expect(field(line, "provider_request_id"), line).toBe("oai-batches");
   });
 
-  test("a success whose response has no id of its own records none", async (ctx) => {
+  test("a success whose response has no id of its own records the provider's request id", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const res = await json("/v1/embeddings", { model: OPENAI_OK, input: "hi" });
     expect(res.status, res.text).toBe(200);
     const [row] = await rowsFor(res.requestId, 1);
-    expect(row.has("provider_request_id"), JSON.stringify(Object.fromEntries(row))).toBe(false);
+    expect(row.get("provider_request_id"), JSON.stringify(Object.fromEntries(row))).toBe("oai-ok-embeddings");
     const line = await accessLine(res.requestId);
-    expect(field(line, "provider_request_id"), line).toBeUndefined();
+    expect(field(line, "provider_request_id"), line).toBe("oai-ok-embeddings");
+  });
+
+  test("a success whose response has an id keeps it over the header", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const res = await json("/v1/chat/completions", chat(OPENAI_OK));
+    expect(res.status, res.text).toBe(200);
+    const [row] = await rowsFor(res.requestId, 1);
+    expect(row.get("provider_request_id"), JSON.stringify(Object.fromEntries(row))).toBe("chatcmpl-urid-ok");
+    const line = await accessLine(res.requestId);
+    expect(field(line, "provider_request_id"), line).toBe("chatcmpl-urid-ok");
+  });
+
+  test("a successful Bedrock Converse call records the provider's request id", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const res = await json("/v1/chat/completions", chat(BEDROCK_OK));
+    expect(res.status, res.text).toBe(200);
+    const [row] = await rowsFor(res.requestId, 1);
+    expect(row.get("provider_request_id"), JSON.stringify(Object.fromEntries(row))).toBe("amzn-converse-ok");
   });
 
   test("each retried attempt carries the id of its own response", async (ctx) => {

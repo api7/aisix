@@ -464,11 +464,6 @@ impl AccessLogRecord {
         }
     }
 
-    /// Whether the line reports a 4xx or 5xx.
-    pub fn is_error_status(&self) -> bool {
-        self.status >= 400
-    }
-
     pub fn emit(&self) {
         fn borrowed(v: &Option<String>) -> Option<&str> {
             v.as_deref()
