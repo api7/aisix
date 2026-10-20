@@ -2838,6 +2838,7 @@ pub fn build_responses_bridge_stream(
                 unavailable,
             } = verdict {
                 tracing::warn!(
+                    guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                     guardrail_hook = "output",
                     model = %model_label,
                     reason = %reason,

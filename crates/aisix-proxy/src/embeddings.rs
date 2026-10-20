@@ -449,6 +449,7 @@ async fn dispatch(
             // Per #153 keep the matched-pattern detail in ops logs only; the
             // wire envelope names only the guardrail that fired (#519 B.4b).
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "input",
                 model = %body.model,
                 reason = %reason,

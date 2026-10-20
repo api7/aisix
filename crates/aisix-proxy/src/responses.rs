@@ -708,6 +708,7 @@ async fn dispatch(
                 crate::redact::redact_responses_request(resolved_chain.as_ref(), body),
             );
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "input",
                 model = %model_name,
                 reason = %reason,
@@ -1802,6 +1803,7 @@ async fn responses_to_target(
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
                 tracing::warn!(
+                    guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                     guardrail_hook = "output",
                     model = %model.display_name,
                     reason = %reason,
@@ -2259,6 +2261,7 @@ async fn responses_to_target(
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
                 tracing::warn!(
+                    guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                     guardrail_hook = "output",
                     model = %model.display_name,
                     reason = %reason,
@@ -2860,6 +2863,7 @@ async fn responses_cross_provider_to_target(
         } = verdict
         {
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "output",
                 model = %requested_model,
                 reason = %reason,

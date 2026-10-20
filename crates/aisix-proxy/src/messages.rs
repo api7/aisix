@@ -751,6 +751,7 @@ async fn dispatch(
                 crate::redact::redact_anthropic_request(resolved_chain.as_ref(), body),
             );
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "input",
                 model = %model_name,
                 reason = %reason,
@@ -1876,6 +1877,7 @@ async fn anthropic_passthrough_dispatch(
                 } = verdict
                 {
                     tracing::warn!(
+                        guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                         guardrail_hook = "output",
                         model = %model_name,
                         reason = %reason,
@@ -2559,6 +2561,7 @@ async fn cross_provider_dispatch(
         } = verdict
         {
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "output",
                 model = %model_name,
                 reason = %reason,
@@ -2976,6 +2979,7 @@ fn build_anthropic_sse_stream(
                 } = verdict
                 {
                     tracing::warn!(
+                        guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                         guardrail_hook = "output",
                         model = %model_label,
                         reason = %reason,
@@ -4496,6 +4500,7 @@ where
                 } = verdict
                 {
                     tracing::warn!(
+                        guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                         guardrail_hook = "output",
                         model = %model_label,
                         reason = %reason,

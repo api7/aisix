@@ -874,6 +874,7 @@ async fn guardrail_block_response(
         return None;
     };
     tracing::warn!(
+        guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
         guardrail_hook = "input",
         agent = %agent,
         reason = %reason,

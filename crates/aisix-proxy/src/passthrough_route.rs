@@ -712,6 +712,7 @@ async fn dispatch(
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
                 tracing::warn!(
+                    guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                     guardrail_hook = "input",
                     route = %route.name,
                     reason = %reason,
@@ -1204,6 +1205,7 @@ async fn dispatch(
             } = verdict
             {
                 tracing::warn!(
+                    guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                     guardrail_hook = "output",
                     route = %route.name,
                     reason = %reason,
@@ -6307,6 +6309,7 @@ fn stream_response(
                                     unavailable,
                                 } => {
                                     tracing::warn!(
+                                        guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                                         guardrail_hook = "output",
                                         route = %route_name,
                                         reason = %reason,
@@ -6687,6 +6690,7 @@ fn stream_response(
                         } = scan_output_candidates(&chain, &route_name, &candidates, &mut telemetry).await
                         {
                             tracing::warn!(
+                                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                                 guardrail_hook = "output",
                                 route = %route_name,
                                 reason = %reason,

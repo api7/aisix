@@ -94,8 +94,14 @@ impl EosOutputScan {
             },
         )
         .await;
-        if let aisix_guardrails::GuardrailVerdict::Block { reason, .. } = verdict {
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+            ..
+        } = verdict
+        {
             tracing::warn!(
+                guardrail_name = guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "output",
                 model = %self.upstream_model,
                 reason = %reason,
@@ -128,5 +134,14 @@ pub(crate) fn release_output_buffer_unscanned(chain: &dyn aisix_guardrails::Guar
 pub(crate) fn output_buffer_owner(
     chain: &dyn aisix_guardrails::Guardrail,
 ) -> Option<tracing::field::DisplayValue<&str>> {
-    chain.output_buffer_owner().map(tracing::field::display)
+    guardrail_name_field(chain.output_buffer_owner())
+}
+
+/// A guardrail's configured name as the `guardrail_name` log field,
+/// rendered like every guardrail log line renders it (unquoted), and
+/// omitted when no single guardrail is named.
+pub(crate) fn guardrail_name_field(
+    name: Option<&str>,
+) -> Option<tracing::field::DisplayValue<&str>> {
+    name.map(tracing::field::display)
 }

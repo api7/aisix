@@ -509,6 +509,7 @@ async fn scan_input_blob(
     } = verdict
     {
         tracing::warn!(
+            guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
             guardrail_hook = "input",
             model = %target.display_name(),
             reason = %reason,
@@ -585,6 +586,7 @@ async fn scan_output_blob(
     } = verdict
     {
         tracing::warn!(
+            guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
             guardrail_hook = "output",
             model = %target.display_name(),
             reason = %reason,

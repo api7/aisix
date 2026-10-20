@@ -1242,6 +1242,7 @@ async fn guardrail_block_event(
     {
         let side = if input_side { "input" } else { "output" };
         tracing::warn!(
+            guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
             guardrail_hook = side,
             reason = %reason,
             "guardrail blocked realtime frame",

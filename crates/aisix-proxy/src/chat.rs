@@ -1651,6 +1651,7 @@ async fn dispatch(
                 crate::redact::redact_chat_format(resolved_chain.as_ref(), req),
             );
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "input",
                 model = %req.model,
                 reason = %reason,
@@ -2830,6 +2831,7 @@ async fn dispatch(
                         unavailable,
                     } => {
                         tracing::warn!(
+                            guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                             guardrail_hook = "output",
                             model = %req.model,
                             reason = %reason,
@@ -3515,6 +3517,7 @@ async fn dispatch(
             // the wire — naming only the guardrail that fired (#519
             // B.4b) — and keep the rich detail in tracing for ops.
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "output",
                 model = %req.model,
                 reason = %reason,
@@ -4568,6 +4571,7 @@ async fn dispatch_ensemble(
             unavailable,
         } => {
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "output",
                 model = %req.model,
                 reason = %reason,
@@ -6519,6 +6523,7 @@ where
                                         unavailable,
                                     } => {
                                         tracing::warn!(
+                                            guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                                             guardrail_hook = "output",
                                             model = %ctx.model_name,
                                             reason = %reason,
@@ -6768,6 +6773,7 @@ where
                                 unavailable,
                             } => {
                                 tracing::warn!(
+                                    guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                                     guardrail_hook = "output",
                                     model = %ctx.model_name,
                                     reason = %reason,
@@ -6898,6 +6904,7 @@ where
                         // carries the matched-pattern detail) goes to
                         // operator logs only.
                         tracing::warn!(
+                            guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                             guardrail_hook = "output",
                             model = %ctx.model_name,
                             reason = %reason,
