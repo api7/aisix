@@ -8793,6 +8793,31 @@ data: [DONE]\n\n";
         assert_ne!(terminal[0].attempt_index, 0, "{events:?}");
     }
 
+    /// The judge of the two-member council failed upstream: its own
+    /// zero-token row, at the panel size, names the judge model and the error.
+    fn assert_failed_judge_row(events: &[aisix_obs::UsageEvent]) {
+        let judge: Vec<_> = events
+            .iter()
+            .filter(|e| e.attempt_kind == "judge")
+            .collect();
+        assert_eq!(judge.len(), 1, "{events:?}");
+        let judge = judge[0];
+        assert_eq!(judge.attempt_index, 2);
+        assert_eq!(judge.attempt_model, "judge-m");
+        assert_eq!(judge.model_id, "m-judge");
+        assert_eq!(judge.requested_model, "council");
+        assert_eq!(judge.status_code, 502);
+        assert_eq!(judge.error_class, "upstream_status");
+        assert!(
+            judge.error_message.contains("judge upstream exploded"),
+            "{}",
+            judge.error_message
+        );
+        assert_eq!((judge.prompt_tokens, judge.completion_tokens), (0, 0));
+        let terminal = events.last().unwrap();
+        assert_eq!(terminal.attempt_index, 3, "{events:?}");
+    }
+
     async fn next_event(
         rx: &mut tokio::sync::mpsc::Receiver<aisix_obs::UsageEvent>,
     ) -> aisix_obs::UsageEvent {
@@ -11737,10 +11762,8 @@ data: [DONE]\n\n";
                 .all(|e| e.prompt_tokens == 5 && e.completion_tokens == 11),
             "panel events must carry the panel call's own tokens"
         );
-        assert!(
-            events.iter().all(|e| e.attempt_kind != "judge"),
-            "the judge connect failed, so no judge usage event"
-        );
+        // The failed judge connect is a sub-call of its own.
+        assert_failed_judge_row(&events);
         assert_attempt_indices_increase(&events);
         assert_ensemble_terminal_row_names_no_kind(&events);
     }
@@ -12072,6 +12095,68 @@ data: [DONE]\n\n";
         assert_eq!(events[0].prompt_tokens, 5, "{events:?}");
         assert_eq!(events[1].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
         assert_eq!(events[1].error_message, cancel::CANCELLED_BEFORE_HEAD);
+        assert_attempt_indices_increase(&events);
+        assert_council_charged(&state, app, 16).await;
+    }
+
+    /// A non-streaming ensemble cancelled while its judge runs, after one
+    /// panel member had failed: the failed member returned too, so its
+    /// zero-token row is owed beside the answered member's, in slot order and
+    /// ahead of the 499 row, and only the answered member's tokens are charged.
+    #[tokio::test]
+    async fn ensemble_cancelled_after_a_member_failed_emits_its_failed_row() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("fail-upstream"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": {"message": "panel upstream exploded", "type": "server_error"}
+            })))
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        mount_council_with_a_slow_tail(&upstream, false).await;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        seed_council_with_a_tpm_cap(&snap);
+        snap.models
+            .insert(direct_model_entry("m-panel-a", "panel-a", "fail-upstream"));
+        snap.models.insert(ensemble_model_entry_min(
+            "m-council",
+            "council",
+            &["panel-a", "panel-b"],
+            "judge-m",
+            1,
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        // No retries, so the failed member has returned well before the
+        // cancel.
+        let state = build_state(snap, hub)
+            .with_default_retries(0)
+            .with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state.clone());
+
+        cancel_in_flight(app.clone(), cancellable_chat_request("council")).await;
+
+        let events = collect_events(&mut rx).await;
+        assert_eq!(
+            events.len(),
+            3,
+            "two panel rows and the 499 row: {events:?}"
+        );
+        let failed = &events[0];
+        assert_eq!(failed.attempt_kind, "panel", "{events:?}");
+        assert_eq!(failed.attempt_model, "panel-a", "{events:?}");
+        assert_eq!(failed.model_id, "m-panel-a", "{events:?}");
+        assert_eq!(failed.status_code, 502, "{events:?}");
+        assert_eq!(failed.error_class, "upstream_status", "{events:?}");
+        assert_eq!((failed.prompt_tokens, failed.completion_tokens), (0, 0));
+        assert_eq!(events[1].attempt_model, "panel-b", "{events:?}");
+        assert_eq!(events[1].status_code, 200, "{events:?}");
+        assert_eq!(events[1].prompt_tokens, 5, "{events:?}");
+        assert_eq!(events[2].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
         assert_attempt_indices_increase(&events);
         assert_council_charged(&state, app, 16).await;
     }
@@ -12411,7 +12496,8 @@ data: [DONE]\n\n";
 
         // The surviving panel member's usage event must still fire (FIX C):
         // it hit upstream and was billed even though the request 502'd. The
-        // failed member and the never-run judge emit nothing here.
+        // failed member gets a zero-token row of its own at its slot; the
+        // never-run judge emits nothing.
         let mut events = Vec::new();
         while let Ok(Some(ev)) =
             tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
@@ -12420,7 +12506,7 @@ data: [DONE]\n\n";
         }
         let panel_events: Vec<_> = events
             .iter()
-            .filter(|e| e.attempt_kind == "panel")
+            .filter(|e| e.attempt_kind == "panel" && e.status_code == 200)
             .collect();
         assert_eq!(
             panel_events.len(),
@@ -12428,6 +12514,23 @@ data: [DONE]\n\n";
             "exactly the one surviving panel member must emit a usage event; got {} events total",
             events.len()
         );
+        assert_eq!(panel_events[0].attempt_index, 0);
+        let failed: Vec<_> = events
+            .iter()
+            .filter(|e| e.attempt_kind == "panel" && e.status_code != 200)
+            .collect();
+        assert_eq!(failed.len(), 1, "{events:?}");
+        assert_eq!(failed[0].attempt_index, 1);
+        assert_eq!(failed[0].attempt_model, "panel-fail");
+        assert_eq!(failed[0].model_id, "m-panel-fail");
+        assert_eq!(failed[0].status_code, 502);
+        assert_eq!(failed[0].error_class, "upstream_status");
+        assert!(failed[0].error_message.contains("upstream busy"));
+        assert_eq!(
+            (failed[0].prompt_tokens, failed[0].completion_tokens),
+            (0, 0)
+        );
+        assert_eq!(events.last().unwrap().attempt_index, 2, "{events:?}");
         assert_eq!(panel_events[0].prompt_tokens, 5);
         assert_eq!(panel_events[0].completion_tokens, 11);
         assert!(
@@ -12812,10 +12915,8 @@ data: [DONE]\n\n";
             panel_events.iter().all(|e| !e.guardrail_blocked),
             "the judge-failure panel bill is not a guardrail block"
         );
-        assert!(
-            events.iter().all(|e| e.attempt_kind != "judge"),
-            "the judge produced no response, so no judge usage event"
-        );
+        // The failed judge call is a sub-call of its own.
+        assert_failed_judge_row(&events);
         assert_attempt_indices_increase(&events);
         assert_ensemble_terminal_row_names_no_kind(&events);
     }

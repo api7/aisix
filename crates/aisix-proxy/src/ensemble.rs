@@ -21,7 +21,7 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::future::join_all;
@@ -241,6 +241,8 @@ impl ModelCaller for ProxyModelCaller<'_> {
 /// Consumed by the dispatch layer to emit one usage event per sub-call.
 #[derive(Debug)]
 pub struct PanelOutcome {
+    /// The member's slot in the configured panel — its row's `attempt_index`.
+    pub slot: u32,
     pub model: String,
     /// Provider-reported usage retained for the client-facing aggregate.
     pub usage: UsageStats,
@@ -253,13 +255,52 @@ pub struct PanelOutcome {
 }
 
 impl PanelOutcome {
-    fn of(model: &str, outcome: &ModelCallOutcome) -> Self {
+    fn of(slot: u32, model: &str, outcome: &ModelCallOutcome) -> Self {
         Self {
+            slot,
             model: model.to_string(),
             usage: outcome.response.usage.clone(),
             effective_usage: outcome.effective_usage.clone(),
             usage_estimated: outcome.usage_estimated,
             service_tier: tier_value(&outcome.response),
+        }
+    }
+}
+
+/// A panel member or judge call that failed. It earns a zero-token usage row
+/// of its own, the same shape a failed routing attempt gets.
+#[derive(Debug, Clone)]
+pub struct SubcallFailure {
+    /// The member's panel slot, or the panel size for the judge.
+    pub index: u32,
+    /// `"panel"` or `"judge"`.
+    pub kind: &'static str,
+    pub model: String,
+    pub status: u16,
+    pub error_class: &'static str,
+    pub error_message: String,
+    pub latency_ms: u32,
+    /// Whether the call reached the upstream (`BridgeError::reached_upstream`).
+    pub dispatched: bool,
+}
+
+impl SubcallFailure {
+    pub(crate) fn new(
+        index: u32,
+        kind: &'static str,
+        model: &str,
+        err: &BridgeError,
+        started: Instant,
+    ) -> Self {
+        Self {
+            index,
+            kind,
+            model: model.to_string(),
+            status: err.http_status(),
+            error_class: crate::attempt::routing_error_class(err),
+            error_message: crate::attempt::attempt_error_message(err),
+            latency_ms: crate::attempt::ms_since(started),
+            dispatched: err.reached_upstream(),
         }
     }
 }
@@ -276,6 +317,8 @@ pub(crate) fn tier_value(resp: &ChatResponse) -> Option<String> {
 pub struct EnsembleOutcome {
     pub response: ChatResponse,
     pub panel: Vec<PanelOutcome>,
+    /// The panel members that failed, in slot order.
+    pub failed: Vec<SubcallFailure>,
     pub judge_model: String,
     pub judge_effective_usage: UsageStats,
     pub judge_usage_estimated: bool,
@@ -293,8 +336,9 @@ pub struct EnsembleProgress {
 
 #[derive(Debug, Default)]
 struct ProgressInner {
-    /// `(slot in the configured panel, outcome)`, in completion order.
-    panel: Vec<(usize, PanelOutcome)>,
+    /// Every panel member that returned, answered or failed, in completion
+    /// order.
+    panel: Vec<Result<PanelOutcome, SubcallFailure>>,
     judge: Option<JudgeReturn>,
 }
 
@@ -309,29 +353,35 @@ pub(crate) struct JudgeReturn {
 }
 
 impl EnsembleProgress {
-    fn record_panel(&self, slot: usize, outcome: PanelOutcome) {
-        self.inner.lock().unwrap().panel.push((slot, outcome));
+    fn record_panel(&self, outcome: Result<PanelOutcome, SubcallFailure>) {
+        self.inner.lock().unwrap().panel.push(outcome);
     }
 
-    fn record_judge(&self, model: &str, judge: &ModelCallOutcome) {
+    fn record_judge(&self, index: u32, model: &str, judge: &ModelCallOutcome) {
         self.inner.lock().unwrap().judge = Some(JudgeReturn {
-            outcome: PanelOutcome::of(model, judge),
+            outcome: PanelOutcome::of(index, model, judge),
             response_id: judge.response.id.clone(),
             response_model: judge.response.model.clone(),
             finish_reason: judge.response.finish_reason.clone(),
         });
     }
 
-    /// The panel members that returned, in configured order, and the judge
-    /// if it returned.
-    pub(crate) fn take(&self) -> (Vec<PanelOutcome>, Option<JudgeReturn>) {
+    /// The panel members that returned, answered or failed, in configured
+    /// order, and the judge if it returned.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn take(
+        &self,
+    ) -> (
+        Vec<Result<PanelOutcome, SubcallFailure>>,
+        Option<JudgeReturn>,
+    ) {
         let mut inner = self.inner.lock().unwrap();
         let mut panel = std::mem::take(&mut inner.panel);
-        panel.sort_by_key(|(slot, _)| *slot);
-        (
-            panel.into_iter().map(|(_, outcome)| outcome).collect(),
-            inner.judge.take(),
-        )
+        panel.sort_by_key(|member| match member {
+            Ok(answered) => answered.slot,
+            Err(failed) => failed.index,
+        });
+        (panel, inner.judge.take())
     }
 }
 
@@ -346,6 +396,8 @@ pub enum EnsembleError {
         /// layer must still commit + emit their usage even though the request
         /// fails — dropping them would under-report panel usage to cp-api.
         panel: Vec<PanelOutcome>,
+        /// The panel members that failed, each owed its own usage row.
+        failed: Vec<SubcallFailure>,
     },
     #[error("ensemble judge call failed")]
     Judge {
@@ -356,6 +408,9 @@ pub enum EnsembleError {
         /// layer must still commit + emit their usage on this exit too —
         /// same invariant as `InsufficientPanel`.
         panel: Vec<PanelOutcome>,
+        failed: Vec<SubcallFailure>,
+        /// The judge call's own failure row.
+        judge: SubcallFailure,
     },
 }
 
@@ -379,46 +434,64 @@ impl EnsembleError {
 /// streaming dispatch path can stream the judge's tokens while the
 /// non-streaming path ([`run_ensemble`]) buffers them.
 ///
-/// Returns the per-member accounting (`panel`), the raw candidate
-/// responses (`candidates`, kept so the caller can re-derive context if
-/// needed), and the ready-to-dispatch `judge_req`. The returned
+/// Returns the per-member accounting (`panel`), the members that failed
+/// (`failed`), the raw candidate responses (`candidates`, kept so the caller
+/// can re-derive context if needed), and the ready-to-dispatch `judge_req`. The returned
 /// `judge_req` is non-streaming (`stream = Some(false)`); a streaming
 /// caller flips it to `Some(true)` before dispatching.
 ///
 /// An exhausted panel returns [`EnsembleError::InsufficientPanel`] with
-/// the already-billed survivors, exactly as before — the dispatch layer
-/// must still commit + emit their usage.
+/// the already-billed survivors and the failed members — the dispatch layer
+/// must still emit a row for each and commit the survivors' usage.
+#[allow(clippy::type_complexity)]
 pub(crate) async fn run_ensemble_panel(
     req: &ChatFormat,
     config: &EnsembleConfig,
     caller: &dyn ModelCaller,
     progress: &EnsembleProgress,
-) -> Result<(Vec<PanelOutcome>, Vec<ChatResponse>, ChatFormat), EnsembleError> {
+) -> Result<
+    (
+        Vec<PanelOutcome>,
+        Vec<SubcallFailure>,
+        Vec<ChatResponse>,
+        ChatFormat,
+    ),
+    EnsembleError,
+> {
     let per_call_timeout = config.timeout();
 
     // Phase 1: fan out to every panel member concurrently.
     let calls = config.panel.iter().enumerate().map(|(slot, member)| {
         let model = member.model.clone();
+        let slot = slot as u32;
         async move {
             let member_req = || panel_request(req, member);
+            let started = Instant::now();
             let result =
                 call_with_optional_timeout(caller, &model, &member_req, per_call_timeout).await;
-            if let Ok(outcome) = &result {
-                progress.record_panel(slot, PanelOutcome::of(&model, outcome));
-            }
-            (model, result)
+            let result = result.map_err(|err| {
+                tracing::warn!(panel_model = %model, error = %err, "ensemble panel member failed");
+                SubcallFailure::new(slot, "panel", &model, &err, started)
+            });
+            progress.record_panel(match &result {
+                Ok(outcome) => Ok(PanelOutcome::of(slot, &model, outcome)),
+                Err(failed) => Err(failed.clone()),
+            });
+            (slot, model, result)
         }
     });
     let results = join_all(calls).await;
 
     // Phase 2: keep the successes, enforce min_responses.
     let mut panel: Vec<PanelOutcome> = Vec::new();
+    let mut failed: Vec<SubcallFailure> = Vec::new();
     let mut candidates: Vec<ChatResponse> = Vec::new();
-    for (model, result) in results {
+    for (slot, model, result) in results {
         match result {
             Ok(outcome) => {
                 let resp = outcome.response;
                 panel.push(PanelOutcome {
+                    slot,
                     model,
                     usage: resp.usage.clone(),
                     effective_usage: outcome.effective_usage,
@@ -427,9 +500,7 @@ pub(crate) async fn run_ensemble_panel(
                 });
                 candidates.push(resp);
             }
-            Err(err) => {
-                tracing::warn!(panel_model = %model, error = %err, "ensemble panel member failed");
-            }
+            Err(failure) => failed.push(failure),
         }
     }
     let needed = config.min_responses_or_default();
@@ -440,12 +511,13 @@ pub(crate) async fn run_ensemble_panel(
             got: candidates.len(),
             needed,
             panel,
+            failed,
         });
     }
 
     // Build the judge's synthesis request from the labeled candidates.
     let judge_req = judge_request(req, &config.judge, &candidates);
-    Ok((panel, candidates, judge_req))
+    Ok((panel, failed, candidates, judge_req))
 }
 
 /// Run one ensemble request to completion. See the module docs for the
@@ -457,7 +529,8 @@ pub async fn run_ensemble(
     progress: &EnsembleProgress,
 ) -> Result<EnsembleOutcome, EnsembleError> {
     // Phases 1-2 + judge-request construction.
-    let (panel, candidates, judge_req) = run_ensemble_panel(req, config, caller, progress).await?;
+    let (panel, failed, candidates, judge_req) =
+        run_ensemble_panel(req, config, caller, progress).await?;
     // The judge's prompt renders the caller's messages, so it is rebuilt per
     // attempt like a panel member's request rather than held for the wait.
     drop(judge_req);
@@ -470,6 +543,8 @@ pub async fn run_ensemble(
     // the judge model's own retry budget — it used to be a hardcoded single
     // retry here, which both ignored the operator's configuration and would
     // have stacked on top of the caller-level budget.
+    let judge_index = config.panel.len() as u32;
+    let judge_started = Instant::now();
     let judge = match call_with_optional_timeout(
         caller,
         &config.judge.model,
@@ -481,13 +556,28 @@ pub async fn run_ensemble(
         Ok(r) => r,
         // Carry the (already-billed) panel survivors out on the judge
         // failure so the dispatch layer commits + emits them too.
-        Err(source) => return Err(EnsembleError::Judge { source, panel }),
+        Err(source) => {
+            let judge = SubcallFailure::new(
+                judge_index,
+                "judge",
+                &config.judge.model,
+                &source,
+                judge_started,
+            );
+            return Err(EnsembleError::Judge {
+                source,
+                panel,
+                failed,
+                judge,
+            });
+        }
     };
-    progress.record_judge(&config.judge.model, &judge);
+    progress.record_judge(judge_index, &config.judge.model, &judge);
 
     Ok(EnsembleOutcome {
         response: judge.response,
         panel,
+        failed,
         judge_model: config.judge.model.clone(),
         judge_effective_usage: judge.effective_usage,
         judge_usage_estimated: judge.usage_estimated,
@@ -752,13 +842,27 @@ mod tests {
         .unwrap_err();
 
         match err {
-            EnsembleError::InsufficientPanel { got, needed, panel } => {
+            EnsembleError::InsufficientPanel {
+                got,
+                needed,
+                panel,
+                failed,
+            } => {
                 assert_eq!(got, 1);
                 assert_eq!(needed, 2);
                 // The one survivor (gpt) is carried out so the dispatch
                 // layer can still commit + emit its (already-billed) usage.
                 assert_eq!(panel.len(), 1);
                 assert_eq!(panel[0].model, "gpt");
+                assert_eq!(panel[0].slot, 0);
+                // The failed member is carried out too, at its own slot.
+                assert_eq!(failed.len(), 1);
+                assert_eq!(failed[0].model, "claude");
+                assert_eq!(failed[0].index, 1);
+                assert_eq!(failed[0].kind, "panel");
+                // The status the same failure would give the caller.
+                assert_eq!(failed[0].status, 502);
+                assert_eq!(failed[0].error_class, "upstream_status");
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -788,6 +892,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(out.panel.len(), 2);
+        // Members keep their configured slots; the failed one is reported at
+        // its own.
+        let slots: Vec<u32> = out.panel.iter().map(|p| p.slot).collect();
+        assert_eq!(slots, [0, 2]);
+        assert_eq!(out.failed.len(), 1);
+        assert_eq!(
+            (out.failed[0].index, out.failed[0].model.as_str()),
+            (1, "b")
+        );
+        assert_eq!(out.failed[0].error_class, "transport");
         let judge_prompt = caller.calls_to("judge")[0].messages[0]
             .content_str()
             .to_string();
@@ -857,9 +971,19 @@ mod tests {
                                                        // so the survivors are carried out on the error for the dispatch
                                                        // layer to commit + emit (FIX G).
         match err {
-            EnsembleError::Judge { source, panel } => {
+            EnsembleError::Judge {
+                source,
+                panel,
+                failed,
+                judge,
+            } => {
                 assert_eq!(source.http_status(), 400);
                 assert_eq!(panel.len(), 2);
+                assert!(failed.is_empty());
+                // The judge's row follows the panel's two slots.
+                assert_eq!(judge.index, 2);
+                assert_eq!(judge.kind, "judge");
+                assert_eq!(judge.status, 400);
             }
             other => panic!("unexpected error: {other:?}"),
         }
