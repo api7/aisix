@@ -365,24 +365,25 @@ pub fn shape_request(
 /// `invokeModel` input: the body `/v1/messages` would send to InvokeModel
 /// ([`shape_request`]), carrying the `max_tokens` the `InvokeModel` schema
 /// requires — above any thinking budget, which InvokeModel validates and
-/// which does not change the count. Returns `None` when the caller's
-/// messages are all plain strings, which take the `converse` input
-/// instead.
-pub fn bedrock_count_tokens_invoke_body(body: &Value, upstream_id: &str) -> Option<Value> {
-    let typed_blocks = body
-        .get("messages")
-        .and_then(Value::as_array)
-        .is_none_or(|ms| {
-            ms.iter().any(|m| {
-                m.get("content")
-                    .and_then(Value::as_array)
-                    .is_some_and(|c| c.iter().any(|b| b.get("type").is_some()))
-            })
-        });
-    if !typed_blocks {
-        return None;
-    }
+/// which does not change the count. A plain-string message content goes in
+/// as one text block, so a body counts the same in either content form,
+/// `thinking` included.
+pub fn bedrock_count_tokens_invoke_body(body: &Value, upstream_id: &str) -> Value {
     let mut out = body.clone();
+    for message in out
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(text) = message
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            message["content"] = serde_json::json!([{"type": "text", "text": text}]);
+        }
+    }
     shape_request(&mut out, Platform::Bedrock, upstream_id, Vec::new());
     let budget = out
         .get("thinking")
@@ -399,7 +400,7 @@ pub fn bedrock_count_tokens_invoke_body(body: &Value, upstream_id: &str) -> Opti
             Value::from(max_tokens.max(budget + 1)),
         );
     }
-    Some(out)
+    out
 }
 
 /// The body for Vertex AI's count-tokens model: the fields, `metadata` and
@@ -611,20 +612,18 @@ fn fold_output_format(obj: &mut Map<String, Value>) {
     }
 }
 
-/// The `thinking.display` values Bedrock takes for Claude; any other
-/// (`updates`) is refused with a 400.
-const BEDROCK_THINKING_DISPLAYS: &[&str] = &["summarized", "omitted"];
-
 /// Drop a `thinking.display` Bedrock refuses from a body bound for it,
-/// leaving the model's default display.
+/// leaving the model's default display. Bedrock takes `summarized` and
+/// `omitted` and answers any other value (`updates`) with a 400.
 pub fn retain_bedrock_thinking_display(obj: &mut Map<String, Value>) {
     let Some(thinking) = obj.get_mut("thinking").and_then(Value::as_object_mut) else {
         return;
     };
-    if thinking.get("display").is_some_and(|d| {
-        !d.as_str()
-            .is_some_and(|d| BEDROCK_THINKING_DISPLAYS.contains(&d))
-    }) {
+    let Some(value) = thinking.get("display") else {
+        return;
+    };
+    if !matches!(value.as_str(), Some("summarized" | "omitted")) {
+        tracing::debug!(display = %value, "thinking.display Bedrock refuses was not sent");
         thinking.remove("display");
     }
 }
@@ -716,6 +715,39 @@ mod tests {
                 body.get(gone).is_none(),
                 "{gone} must not reach InvokeModel"
             );
+        }
+    }
+
+    #[test]
+    fn bedrock_thinking_display_keeps_only_the_values_bedrock_takes() {
+        for (display, kept) in [
+            (json!("summarized"), true),
+            (json!("omitted"), true),
+            (json!("updates"), false),
+            (json!(null), false),
+            (json!(1), false),
+        ] {
+            let mut body = json!({
+                "model": "m",
+                "max_tokens": 10,
+                "thinking": {"type": "enabled", "budget_tokens": 1024, "display": display.clone()},
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            shape_request(
+                &mut body,
+                Platform::Bedrock,
+                "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                Vec::new(),
+            );
+            assert_eq!(body["thinking"]["budget_tokens"], 1024);
+            assert_eq!(
+                body["thinking"].get("display") == Some(&display),
+                kept,
+                "{display}: {body}"
+            );
+            if !kept {
+                assert!(body["thinking"].get("display").is_none(), "{body}");
+            }
         }
     }
 

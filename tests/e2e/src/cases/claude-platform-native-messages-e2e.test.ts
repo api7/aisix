@@ -643,15 +643,28 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
     );
     expect(budgetedBody.max_tokens).toBeGreaterThan(4000);
 
-    const plain = await send("/v1/messages/count_tokens", {
-      model: BEDROCK,
-      system: "Be brief.",
-      messages: [{ role: "user", content: "hello" }],
-    });
-    expect(plain.status, plain.text).toBe(200);
-    const converse = JSON.parse(plain.upstream.body).input.converse;
-    expect(converse.messages).toEqual([{ role: "user", content: [{ text: "hello" }] }]);
-    expect(converse.system).toEqual([{ text: "Be brief." }]);
+    // Plain-string content counts exactly as its typed form, thinking
+    // included.
+    const counted = async (content: (text: string) => unknown) => {
+      const sent = await send("/v1/messages/count_tokens", {
+        model: BEDROCK,
+        system: "Be brief.",
+        thinking: { type: "enabled", budget_tokens: 2048 },
+        messages: [
+          { role: "user", content: content("hello") },
+          { role: "assistant", content: content("Hi.") },
+          { role: "user", content: content("What is 17*23?") },
+        ],
+      });
+      expect(sent.status, sent.text).toBe(200);
+      const input = JSON.parse(sent.upstream.body).input;
+      expect(input).not.toHaveProperty("converse");
+      return JSON.parse(Buffer.from(input.invokeModel.body, "base64").toString("utf8"));
+    };
+    const plain = await counted((text) => text);
+    const blocks = await counted((text) => [{ type: "text", text }]);
+    expect(plain.thinking).toEqual({ type: "enabled", budget_tokens: 2048 });
+    expect(plain).toEqual(blocks);
   });
 
   test("a Claude model bedrock-runtime cannot count is counted on Bedrock Mantle", async (ctx) => {
