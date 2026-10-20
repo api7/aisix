@@ -155,14 +155,22 @@ impl<'a> AnthropicMessage<'a> {
     /// Translates the OpenAI `{role:"tool", tool_call_id, content}`
     /// turn so agent-loop round-trips work — without this, the
     /// caller's tool-result reply 400s at the Anthropic upstream.
-    pub(crate) fn tool_result(tool_use_id: &str, content: &str) -> Self {
+    pub(crate) fn tool_result(
+        tool_use_id: &str,
+        content: &str,
+        cache_control: Option<&serde_json::Value>,
+    ) -> Self {
+        let mut block = serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": content,
+        });
+        if let Some(marker) = cache_control {
+            block["cache_control"] = marker.clone();
+        }
         Self {
             role: "user",
-            content: vec![serde_json::json!({
-                "type": "tool_result",
-                "tool_use_id": tool_use_id,
-                "content": content,
-            })],
+            content: vec![block],
             _lifetime: std::marker::PhantomData,
         }
     }
@@ -423,12 +431,16 @@ fn tool_use_blocks_from_openai(tool_calls: &[serde_json::Value]) -> Vec<serde_js
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
                 .filter(|v| v.is_object())
                 .unwrap_or(serde_json::json!({}));
-            Some(serde_json::json!({
+            let mut block = serde_json::json!({
                 "type": "tool_use",
                 "id": id,
                 "name": name,
                 "input": input,
-            }))
+            });
+            if let Some(marker) = tc.get("cache_control") {
+                block["cache_control"] = marker.clone();
+            }
+            Some(block)
         })
         .collect()
 }
@@ -505,7 +517,7 @@ pub fn split_system_with<'a>(
                     // System messages interleaved with user/assistant
                     // turns don't map cleanly; append as a user turn to
                     // preserve semantics without silently dropping them.
-                    messages.push(user_turn(m, index, urls, fetched)?);
+                    messages.push(marked_turn(user_turn(m, index, urls, fetched)?, m));
                 } else {
                     system_msgs.push(m);
                 }
@@ -519,7 +531,7 @@ pub fn split_system_with<'a>(
             }
             Role::User => {
                 seen_non_system = true;
-                messages.push(user_turn(m, index, urls, fetched)?);
+                messages.push(marked_turn(user_turn(m, index, urls, fetched)?, m));
             }
             Role::Assistant => {
                 seen_non_system = true;
@@ -528,10 +540,13 @@ pub fn split_system_with<'a>(
                     .get("tool_calls")
                     .and_then(|v| v.as_array())
                     .map(Vec::as_slice);
-                messages.push(AnthropicMessage::assistant(
-                    &m.content_str(),
-                    m.content_blocks.as_deref(),
-                    tool_calls,
+                messages.push(marked_turn(
+                    AnthropicMessage::assistant(
+                        &m.content_str(),
+                        m.content_blocks.as_deref(),
+                        tool_calls,
+                    ),
+                    m,
                 ));
             }
             Role::Tool => {
@@ -541,7 +556,11 @@ pub fn split_system_with<'a>(
                     .as_deref()
                     .ok_or(TranslateError::MissingToolCallId)?;
                 check_tool_result_parts(m, index).map_err(TranslateError::InvalidContent)?;
-                messages.push(AnthropicMessage::tool_result(tool_use_id, &m.content_str()));
+                messages.push(AnthropicMessage::tool_result(
+                    tool_use_id,
+                    &m.content_str(),
+                    tool_message_cache_control(m),
+                ));
             }
         }
     }
@@ -553,6 +572,44 @@ pub fn split_system_with<'a>(
         build_system(&system_msgs),
         merge_consecutive_roles(messages),
     ))
+}
+
+/// A message-level `cache_control` marker — written beside a message's
+/// `content` rather than on one of its parts, the form a caller with
+/// string content has to use. It marks the message's last block.
+pub fn message_cache_control(m: &ChatMessage) -> Option<&serde_json::Value> {
+    m.extra.get("cache_control")
+}
+
+/// Put `marker` on the last block unless that block carries its own or is
+/// a blank text block, which Anthropic refuses a marker on.
+fn mark_last_block(blocks: &mut [serde_json::Value], marker: Option<&serde_json::Value>) {
+    let Some(marker) = marker else { return };
+    if let Some(obj) = blocks
+        .last_mut()
+        .filter(|b| !is_empty_text_block(b) && b.get("cache_control").is_none())
+        .and_then(|b| b.as_object_mut())
+    {
+        obj.insert("cache_control".into(), marker.clone());
+    }
+}
+
+/// `turn` with the message-level marker `m` carries on its last block.
+fn marked_turn<'a>(mut turn: AnthropicMessage<'a>, m: &ChatMessage) -> AnthropicMessage<'a> {
+    mark_last_block(&mut turn.content, message_cache_control(m));
+    turn
+}
+
+/// The `cache_control` marker a `role:"tool"` message carries: its own, or
+/// the one on any of its content parts — the result travels as a single
+/// block, so either places the breakpoint after it.
+pub fn tool_message_cache_control(m: &ChatMessage) -> Option<&serde_json::Value> {
+    m.extra.get("cache_control").or_else(|| {
+        m.content_blocks
+            .as_deref()?
+            .iter()
+            .find_map(|part| part.get("cache_control"))
+    })
 }
 
 /// A user-role turn: the caller's typed content blocks translated by
@@ -592,14 +649,21 @@ fn build_system(system_msgs: &[&ChatMessage]) -> Option<AnthropicSystem> {
             .collect::<Vec<_>>()
             .join("\n\n")
     };
-    if system_msgs.iter().all(|m| m.content_blocks.is_none()) {
+    if system_msgs
+        .iter()
+        .all(|m| m.content_blocks.is_none() && message_cache_control(m).is_none())
+    {
         return Some(AnthropicSystem::Text(joined()));
     }
     let blocks: Vec<serde_json::Value> = system_msgs
         .iter()
-        .flat_map(|m| match m.content_blocks.as_deref() {
-            Some(blocks) => anthropic_text_blocks(blocks),
-            None => vec![serde_json::json!({"type": "text", "text": m.content_str()})],
+        .flat_map(|m| {
+            let mut blocks = match m.content_blocks.as_deref() {
+                Some(blocks) => anthropic_text_blocks(blocks),
+                None => vec![serde_json::json!({"type": "text", "text": m.content_str()})],
+            };
+            mark_last_block(&mut blocks, message_cache_control(m));
+            blocks
         })
         .collect();
     if blocks.is_empty() {
@@ -1084,6 +1148,61 @@ pub fn inject_cache_breakpoints(req: &mut AnthropicRequest<'_>, ttl: &str) {
     }
 }
 
+/// The breakpoint TTL (`5m` / `1h`) the Model's `auto_prompt_caching` asks
+/// the gateway to inject at, or `None` while it is off. One reading for
+/// every Claude rail — the Anthropic API, Claude on Vertex AI, and Claude on
+/// Amazon Bedrock through InvokeModel or Converse — so they cannot disagree
+/// about when injection applies.
+pub fn auto_prompt_caching_ttl(model: &aisix_core::Model) -> Option<&'static str> {
+    model
+        .auto_prompt_caching
+        .as_ref()
+        .filter(|apc| apc.enabled)
+        .map(|apc| apc.ttl_or_default().as_wire_str())
+}
+
+/// Apply the Model's `auto_prompt_caching` setting to an outbound Anthropic
+/// Messages body: [`inject_cache_breakpoints`] at its TTL, or nothing while
+/// it is off.
+pub fn apply_auto_prompt_caching(req: &mut AnthropicRequest<'_>, model: &aisix_core::Model) {
+    if let Some(ttl) = auto_prompt_caching_ttl(model) {
+        inject_cache_breakpoints(req, ttl);
+    }
+}
+
+/// Keep only the `cache_control` sub-fields `keep` accepts, on every block
+/// of an Anthropic Messages body a marker can sit on: system blocks, tool
+/// definitions, message content blocks, and the items of a `tool_result`'s
+/// content. For a platform that refuses sub-fields the Anthropic API takes
+/// (`scope`, and whatever it adds next).
+pub fn retain_cache_control_fields(body: &mut serde_json::Value, keep: impl Fn(&str) -> bool) {
+    fn items(v: Option<&mut serde_json::Value>) -> impl Iterator<Item = &mut serde_json::Value> {
+        v.and_then(|v| v.as_array_mut()).into_iter().flatten()
+    }
+    let sanitize = |block: &mut serde_json::Value| {
+        if let Some(cc) = block
+            .get_mut("cache_control")
+            .and_then(|c| c.as_object_mut())
+        {
+            cc.retain(|k, _| keep(k));
+        }
+    };
+    for block in items(body.get_mut("system")) {
+        sanitize(block);
+    }
+    for block in items(body.get_mut("tools")) {
+        sanitize(block);
+    }
+    for message in items(body.get_mut("messages")) {
+        for block in items(message.get_mut("content")) {
+            for item in items(block.get_mut("content")) {
+                sanitize(item);
+            }
+            sanitize(block);
+        }
+    }
+}
+
 /// Whether a content block is a text block with empty or whitespace-only
 /// text. Anthropic rejects `cache_control` on such a block with a 400
 /// (`cache_control cannot be set for empty text blocks`), so the
@@ -1239,6 +1358,13 @@ pub fn translate_openai_tool_choice_to_anthropic(
 /// Returns `None` when the input isn't an array or when no entries
 /// translated — keeping the field absent from the outbound request.
 pub fn translate_anthropic_tools_to_openai(tools: serde_json::Value) -> Option<serde_json::Value> {
+    anthropic_tools_to_openai(tools, CacheMarkers::Drop)
+}
+
+fn anthropic_tools_to_openai(
+    tools: serde_json::Value,
+    markers: CacheMarkers,
+) -> Option<serde_json::Value> {
     let arr = tools.as_array()?;
     let translated: Vec<serde_json::Value> = arr
         .iter()
@@ -1252,10 +1378,14 @@ pub fn translate_anthropic_tools_to_openai(tools: serde_json::Value) -> Option<s
             if let Some(schema) = t.get("input_schema") {
                 function.insert("parameters".into(), schema.clone());
             }
-            Some(serde_json::json!({
-                "type": "function",
-                "function": serde_json::Value::Object(function),
-            }))
+            Some(with_marker_of(
+                serde_json::json!({
+                    "type": "function",
+                    "function": serde_json::Value::Object(function),
+                }),
+                t,
+                markers,
+            ))
         })
         .collect();
     if translated.is_empty() {
@@ -1322,6 +1452,17 @@ pub fn translate_extras_to_openai_shape(
     extra: &mut serde_json::Map<String, serde_json::Value>,
     mapped_effort: MappedEffort,
 ) {
+    translate_extras_to_openai_shape_with(extra, mapped_effort, CacheMarkers::Drop)
+}
+
+/// [`translate_extras_to_openai_shape`] that, under [`CacheMarkers::Keep`],
+/// carries a tool definition's `cache_control` marker onto the translated
+/// `{type:"function"}` tool entry.
+pub fn translate_extras_to_openai_shape_with(
+    extra: &mut serde_json::Map<String, serde_json::Value>,
+    mapped_effort: MappedEffort,
+    markers: CacheMarkers,
+) {
     let anthropic = std::mem::take(extra);
     let mut thinking = None;
     let mut output_config = None;
@@ -1330,7 +1471,7 @@ pub fn translate_extras_to_openai_shape(
     for (key, value) in anthropic {
         match key.as_str() {
             "tools" => {
-                if let Some(translated) = translate_anthropic_tools_to_openai(value) {
+                if let Some(translated) = anthropic_tools_to_openai(value, markers) {
                     extra.insert("tools".to_string(), translated);
                 }
             }
@@ -2448,7 +2589,44 @@ pub fn strip_billing_header_attribution(body: &serde_json::Value) -> Cow<'_, ser
 pub fn parse_inbound_request(
     body: &serde_json::Value,
 ) -> Result<ChatFormat, AnthropicInboundError> {
-    parse_inbound(body, InboundUse::Dispatch)
+    parse_inbound(body, InboundUse::Dispatch, CacheMarkers::Drop)
+}
+
+/// What a translation does with the caller's `cache_control` prompt-cache
+/// markers.
+///
+/// They are kept only for an upstream that reads them — a Claude or Amazon
+/// Nova model behind a platform adapter ([`aisix_gateway::Bridge::reads_cache_markers`]).
+/// Every other upstream gets the request exactly as before: no marker, and
+/// the plain-string shapes a marker would otherwise force into content-part
+/// arrays, which several OpenAI-compatible upstreams reject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheMarkers {
+    Drop,
+    Keep,
+}
+
+/// [`parse_inbound_request`] that, under [`CacheMarkers::Keep`], carries each
+/// `cache_control` marker into the chat form where the bridges that read
+/// one look for it:
+///
+/// - a `system` block (top-level or a mid-conversation system turn) → the
+///   matching `text` part of the system message, which then holds its text
+///   as parts;
+/// - a user `text` / `image` / `document` block → the matching content part;
+/// - an assistant `text` block → the matching text part of the turn;
+/// - an assistant `tool_use` block → its `tool_calls[]` entry;
+/// - a `tool_result` block → the `role:"tool"` message it becomes, as a
+///   message-level `cache_control`.
+///
+/// Tool definitions are translated by [`translate_extras_to_openai_shape_with`].
+/// A `thinking` block's marker is not carried: replayed reasoning has no
+/// block of its own on the translated wires.
+pub fn parse_inbound_request_with(
+    body: &serde_json::Value,
+    markers: CacheMarkers,
+) -> Result<ChatFormat, AnthropicInboundError> {
+    parse_inbound(body, InboundUse::Dispatch, markers)
 }
 
 /// The same parse, for the **input guardrail scan**: an assistant turn's
@@ -2465,12 +2643,13 @@ pub fn parse_inbound_request(
 pub fn parse_inbound_request_for_scan(
     body: &serde_json::Value,
 ) -> Result<ChatFormat, AnthropicInboundError> {
-    parse_inbound(body, InboundUse::Scan)
+    parse_inbound(body, InboundUse::Scan, CacheMarkers::Drop)
 }
 
 fn parse_inbound(
     body: &serde_json::Value,
     purpose: InboundUse,
+    markers: CacheMarkers,
 ) -> Result<ChatFormat, AnthropicInboundError> {
     use serde_json::Value;
     let obj = body.as_object().ok_or(AnthropicInboundError::NotAnObject)?;
@@ -2491,22 +2670,26 @@ fn parse_inbound(
     // `system`: prepend as leading system message. Anthropic accepts
     // string OR array of text blocks; we accept both shapes.
     if let Some(system) = obj.get("system") {
-        let system_text = match system {
-            Value::String(s) => s.clone(),
-            Value::Array(blocks) => {
-                let mut parts = Vec::new();
-                for block in blocks {
-                    if let Some(text) = block.get("text").and_then(Value::as_str) {
-                        parts.push(text);
+        if let Some(msg) = marked_system_message(system, markers) {
+            messages.push(msg);
+        } else {
+            let system_text = match system {
+                Value::String(s) => s.clone(),
+                Value::Array(blocks) => {
+                    let mut parts = Vec::new();
+                    for block in blocks {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            parts.push(text);
+                        }
                     }
+                    parts.join("\n")
                 }
-                parts.join("\n")
+                Value::Null => String::new(),
+                _ => return Err(AnthropicInboundError::UnsupportedSystem),
+            };
+            if !system_text.is_empty() {
+                messages.push(ChatMessage::system(system_text));
             }
-            Value::Null => String::new(),
-            _ => return Err(AnthropicInboundError::UnsupportedSystem),
-        };
-        if !system_text.is_empty() {
-            messages.push(ChatMessage::system(system_text));
         }
     }
 
@@ -2526,13 +2709,17 @@ fn parse_inbound(
             // upstreams receive it natively instead of a 400 here.
             ("system", Some(Value::String(s))) => messages.push(ChatMessage::system(s.clone())),
             ("user", Some(Value::Array(blocks))) => {
-                translate_user_blocks(blocks, &mut messages);
+                translate_user_blocks(blocks, markers, &mut messages);
             }
             ("assistant", Some(Value::Array(blocks))) => {
-                messages.push(translate_assistant_blocks(blocks, purpose));
+                messages.push(translate_assistant_blocks(blocks, purpose, markers));
             }
             ("system", Some(Value::Array(blocks))) => {
-                messages.push(ChatMessage::system(concat_text_blocks(blocks)));
+                let content = m.get("content").unwrap_or(&Value::Null);
+                messages.push(
+                    marked_system_message(content, markers)
+                        .unwrap_or_else(|| ChatMessage::system(concat_text_blocks(blocks))),
+                );
             }
             ("user" | "assistant" | "system", _) => {
                 return Err(AnthropicInboundError::UnsupportedContent { idx })
@@ -2587,6 +2774,51 @@ fn truncate_tool_name(name: &str) -> &str {
     }
 }
 
+/// Under [`CacheMarkers::Keep`], a system prompt given as blocks of which at
+/// least one carries a `cache_control` marker, as a system message holding
+/// its text blocks as parts with their markers. `None` otherwise, for the
+/// joined-string form every other system prompt keeps.
+fn marked_system_message(system: &serde_json::Value, markers: CacheMarkers) -> Option<ChatMessage> {
+    let blocks = system.as_array()?;
+    if markers == CacheMarkers::Drop || !blocks.iter().any(has_cache_control) {
+        return None;
+    }
+    let parts: Vec<serde_json::Value> = blocks
+        .iter()
+        .filter_map(|block| {
+            let text = block.get("text").and_then(serde_json::Value::as_str)?;
+            Some(with_marker_of(
+                serde_json::json!({"type": "text", "text": text}),
+                block,
+                markers,
+            ))
+        })
+        .collect();
+    let mut msg = ChatMessage::system(String::new());
+    msg.content = None;
+    msg.content_blocks = Some(parts);
+    Some(msg)
+}
+
+fn has_cache_control(block: &serde_json::Value) -> bool {
+    block.get("cache_control").is_some()
+}
+
+/// `part` with the `cache_control` marker `source` carries, under
+/// [`CacheMarkers::Keep`].
+fn with_marker_of(
+    mut part: serde_json::Value,
+    source: &serde_json::Value,
+    markers: CacheMarkers,
+) -> serde_json::Value {
+    if markers == CacheMarkers::Keep {
+        if let (Some(marker), Some(obj)) = (source.get("cache_control"), part.as_object_mut()) {
+            obj.insert("cache_control".into(), marker.clone());
+        }
+    }
+    part
+}
+
 fn concat_text_blocks(blocks: &[serde_json::Value]) -> String {
     let mut out = String::new();
     for block in blocks {
@@ -2623,28 +2855,35 @@ fn openai_media_part_from_anthropic(block: &serde_json::Value) -> Option<serde_j
 
 /// Translate one Anthropic assistant `tool_use` block into an OpenAI
 /// `tool_calls[]` entry (`arguments` is the JSON-*encoded* input).
-fn tool_call_from_tool_use(block: &serde_json::Value) -> Option<serde_json::Value> {
+fn tool_call_from_tool_use(
+    block: &serde_json::Value,
+    markers: CacheMarkers,
+) -> Option<serde_json::Value> {
     let id = block.get("id").and_then(serde_json::Value::as_str)?;
     let name = block.get("name").and_then(serde_json::Value::as_str)?;
     let input = block
         .get("input")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    Some(serde_json::json!({
-        "id": id,
-        "type": "function",
-        "function": {
-            "name": truncate_tool_name(name),
-            "arguments": input.to_string(),
-        }
-    }))
+    Some(with_marker_of(
+        serde_json::json!({
+            "id": id,
+            "type": "function",
+            "function": {
+                "name": truncate_tool_name(name),
+                "arguments": input.to_string(),
+            }
+        }),
+        block,
+        markers,
+    ))
 }
 
 /// Translate one Anthropic `tool_result` block into the OpenAI
 /// `role:"tool"` message. Content forms (LiteLLM parity): absent → "",
 /// string → string, single-text array → collapsed string, multi-block
 /// array → combined text+image content parts on ONE tool message.
-fn tool_message_from_tool_result(block: &serde_json::Value) -> ChatMessage {
+fn tool_message_from_tool_result(block: &serde_json::Value, markers: CacheMarkers) -> ChatMessage {
     use serde_json::Value;
     let tool_use_id = block
         .get("tool_use_id")
@@ -2683,13 +2922,26 @@ fn tool_message_from_tool_result(block: &serde_json::Value) -> ChatMessage {
         _ => (Some(String::new()), None),
     };
 
+    // The result travels as one block, so a marker on the block or on any
+    // item of its `content` sets the breakpoint after it.
+    let marker = block.get("cache_control").or_else(|| {
+        block
+            .get("content")?
+            .as_array()?
+            .iter()
+            .find_map(|item| item.get("cache_control"))
+    });
+    let mut extra = serde_json::Map::new();
+    if let (CacheMarkers::Keep, Some(marker)) = (markers, marker) {
+        extra.insert("cache_control".into(), marker.clone());
+    }
     ChatMessage {
         role: Role::Tool,
         content,
         content_blocks,
         name: None,
         tool_call_id: (!tool_use_id.is_empty()).then_some(tool_use_id),
-        extra: serde_json::Map::new(),
+        extra,
     }
 }
 
@@ -2698,24 +2950,35 @@ fn tool_message_from_tool_result(block: &serde_json::Value) -> ChatMessage {
 /// user turn (OpenAI requires tool messages to directly follow the
 /// assistant `tool_calls` turn); the remaining text/image/document
 /// blocks form the user message itself.
-fn translate_user_blocks(blocks: &[serde_json::Value], out: &mut Vec<ChatMessage>) {
+fn translate_user_blocks(
+    blocks: &[serde_json::Value],
+    markers: CacheMarkers,
+    out: &mut Vec<ChatMessage>,
+) {
     use serde_json::Value;
     let mut tool_messages: Vec<ChatMessage> = Vec::new();
     let mut parts: Vec<Value> = Vec::new();
     let mut text = String::new();
+    // Media, or a part carrying a kept marker: either needs the parts array.
     let mut non_text = false;
 
     for block in blocks {
+        let marked = markers == CacheMarkers::Keep && has_cache_control(block);
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
                 if let Some(t) = block.get("text").and_then(Value::as_str) {
                     text.push_str(t);
-                    parts.push(serde_json::json!({"type": "text", "text": t}));
+                    parts.push(with_marker_of(
+                        serde_json::json!({"type": "text", "text": t}),
+                        block,
+                        markers,
+                    ));
+                    non_text |= marked;
                 }
             }
             Some("image") | Some("document") => {
                 if let Some(p) = openai_media_part_from_anthropic(block) {
-                    parts.push(p);
+                    parts.push(with_marker_of(p, block, markers));
                     non_text = true;
                 } else {
                     tracing::debug!(
@@ -2724,7 +2987,9 @@ fn translate_user_blocks(blocks: &[serde_json::Value], out: &mut Vec<ChatMessage
                     );
                 }
             }
-            Some("tool_result") => tool_messages.push(tool_message_from_tool_result(block)),
+            Some("tool_result") => {
+                tool_messages.push(tool_message_from_tool_result(block, markers))
+            }
             other => {
                 tracing::debug!(
                     block_type = ?other,
@@ -2761,9 +3026,15 @@ fn translate_user_blocks(blocks: &[serde_json::Value], out: &mut Vec<ChatMessage
 /// `tool_calls`. `thinking` blocks become the turn's `reasoning_content`
 /// for [`InboundUse::Dispatch`] and contribute to its text for
 /// [`InboundUse::Scan`]; `redacted_thinking` drops for both.
-fn translate_assistant_blocks(blocks: &[serde_json::Value], purpose: InboundUse) -> ChatMessage {
+fn translate_assistant_blocks(
+    blocks: &[serde_json::Value],
+    purpose: InboundUse,
+    markers: CacheMarkers,
+) -> ChatMessage {
     use serde_json::Value;
     let mut text = String::new();
+    let mut text_parts: Vec<Value> = Vec::new();
+    let mut marked_text = false;
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut reasoning: Vec<&str> = Vec::new();
 
@@ -2772,10 +3043,16 @@ fn translate_assistant_blocks(blocks: &[serde_json::Value], purpose: InboundUse)
             Some("text") => {
                 if let Some(t) = block.get("text").and_then(Value::as_str) {
                     text.push_str(t);
+                    marked_text |= markers == CacheMarkers::Keep && has_cache_control(block);
+                    text_parts.push(with_marker_of(
+                        serde_json::json!({"type": "text", "text": t}),
+                        block,
+                        markers,
+                    ));
                 }
             }
             Some("tool_use") => {
-                if let Some(tc) = tool_call_from_tool_use(block) {
+                if let Some(tc) = tool_call_from_tool_use(block, markers) {
                     tool_calls.push(tc);
                 } else {
                     tracing::debug!(
@@ -2809,6 +3086,12 @@ fn translate_assistant_blocks(blocks: &[serde_json::Value], purpose: InboundUse)
     }
 
     let mut msg = ChatMessage::assistant(text);
+    if marked_text {
+        // The marker sits on one text block of the turn, so the turn keeps
+        // its text as parts.
+        msg.content_blocks = Some(text_parts);
+        msg.drop_derived_content();
+    }
     if !tool_calls.is_empty() {
         if msg.content.as_deref() == Some("") {
             // OpenAI's canonical history shape for a pure tool-call turn
@@ -7398,6 +7681,171 @@ mod tests {
         assert_eq!(chat.messages[2].content_str(), "sunny, 21C");
         assert_eq!(chat.messages[3].role, Role::User);
         assert_eq!(chat.messages[3].content_str(), "and now?");
+    }
+
+    /// A `/v1/messages` body with a `cache_control` marker on every block
+    /// kind that takes one.
+    fn marked_messages_body() -> serde_json::Value {
+        let ec = serde_json::json!({"type": "ephemeral"});
+        serde_json::json!({
+            "model": "claude",
+            "max_tokens": 64,
+            "system": [
+                {"type": "text", "text": "rules"},
+                {"type": "text", "text": "context", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+            ],
+            "tools": [{"name": "lookup", "input_schema": {"type": "object"}, "cache_control": ec}],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}, "cache_control": ec},
+                    {"type": "text", "text": "look", "cache_control": ec},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "calling", "cache_control": ec},
+                    {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}, "cache_control": ec},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "42", "cache_control": ec},
+                    {"type": "text", "text": "and?"},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_2", "name": "lookup", "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_2",
+                     "content": [{"type": "text", "text": "43", "cache_control": ec}]},
+                ]},
+            ],
+        })
+    }
+
+    #[test]
+    fn kept_markers_reach_the_claude_body_where_the_caller_put_them() {
+        let body = marked_messages_body();
+        let mut chat = parse_inbound_request_with(&body, CacheMarkers::Keep).unwrap();
+        translate_extras_to_openai_shape_with(
+            &mut chat.extra,
+            MappedEffort::AsWritten,
+            CacheMarkers::Keep,
+        );
+        let (system, messages) = split_system(&chat).unwrap();
+        let wire =
+            serde_json::to_value(build_request(&chat, "claude", system, messages, false)).unwrap();
+        let ec = serde_json::json!({"type": "ephemeral"});
+        assert_eq!(
+            wire["system"],
+            serde_json::json!([
+                {"type": "text", "text": "rules"},
+                {"type": "text", "text": "context", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+            ])
+        );
+        assert_eq!(wire["tools"][0]["cache_control"], ec);
+        let m = &wire["messages"];
+        assert_eq!(m[0]["content"][0]["type"], "image");
+        assert_eq!(m[0]["content"][0]["cache_control"], ec);
+        assert_eq!(m[0]["content"][1]["cache_control"], ec);
+        assert_eq!(
+            m[1]["content"][0],
+            serde_json::json!({"type": "text", "text": "calling", "cache_control": ec})
+        );
+        assert_eq!(m[1]["content"][1]["type"], "tool_use");
+        assert_eq!(m[1]["content"][1]["cache_control"], ec);
+        assert_eq!(m[2]["content"][0]["type"], "tool_result");
+        assert_eq!(m[2]["content"][0]["cache_control"], ec);
+        assert!(m[2]["content"][1].get("cache_control").is_none());
+        assert_eq!(m[4]["content"][0]["type"], "tool_result");
+        assert_eq!(m[4]["content"][0]["cache_control"], ec);
+        assert_eq!(
+            wire.to_string().matches("cache_control").count(),
+            8,
+            "{wire}"
+        );
+    }
+
+    #[test]
+    fn dropped_markers_leave_the_chat_form_as_it_always_was() {
+        let body = marked_messages_body();
+        let plain = parse_inbound_request(&body).unwrap();
+        let dropped = parse_inbound_request_with(&body, CacheMarkers::Drop).unwrap();
+        let plain = serde_json::to_value(&plain).unwrap();
+        assert_eq!(plain, serde_json::to_value(&dropped).unwrap());
+        assert!(
+            !plain["messages"].to_string().contains("cache_control"),
+            "{plain}"
+        );
+        assert_eq!(plain["messages"][0]["content"], "rules\ncontext");
+        let mut extra = dropped.extra.clone();
+        translate_extras_to_openai_shape(&mut extra, MappedEffort::AsWritten);
+        assert!(!serde_json::Value::Object(extra)
+            .to_string()
+            .contains("cache_control"));
+    }
+
+    #[test]
+    fn a_tool_message_marker_lands_on_its_tool_result_block() {
+        let mut tool = ChatMessage::user("42".to_string());
+        tool.role = Role::Tool;
+        tool.tool_call_id = Some("call_1".into());
+        tool.content = None;
+        tool.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "42", "cache_control": {"type": "ephemeral"}}),
+        ]);
+        let mut assistant = ChatMessage::assistant(String::new());
+        assistant.extra.insert(
+            "tool_calls".into(),
+            serde_json::json!([{"id": "call_1", "type": "function",
+                "function": {"name": "f", "arguments": "{}"}}]),
+        );
+        let chat = ChatFormat::new(
+            "m",
+            vec![ChatMessage::user("q".to_string()), assistant, tool],
+        );
+        let (_, messages) = split_system(&chat).unwrap();
+        assert_eq!(
+            messages[2].content[0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn a_message_level_marker_lands_on_the_message_s_last_block() {
+        let ec = serde_json::json!({"type": "ephemeral"});
+        let mut system = ChatMessage::system("rules".to_string());
+        system.extra.insert("cache_control".into(), ec.clone());
+        let mut user = ChatMessage::user("q".to_string());
+        user.extra.insert("cache_control".into(), ec.clone());
+        let mut blank = ChatMessage::assistant(String::new());
+        blank.extra.insert("cache_control".into(), ec.clone());
+        let chat = ChatFormat::new(
+            "m",
+            vec![system, user, blank, ChatMessage::user("again".to_string())],
+        );
+        let (system, messages) = split_system(&chat).unwrap();
+        assert_eq!(
+            serde_json::to_value(system).unwrap(),
+            serde_json::json!([{"type": "text", "text": "rules", "cache_control": ec}])
+        );
+        assert_eq!(messages[0].content[0]["cache_control"], ec);
+        // A blank text block takes no marker: Anthropic rejects one there.
+        assert!(messages[1].content[0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn retain_cache_control_fields_filters_every_marker_slot() {
+        let full = serde_json::json!({"type": "ephemeral", "ttl": "1h", "scope": "global"});
+        let mut body = serde_json::json!({
+            "system": [{"type": "text", "text": "s", "cache_control": full}],
+            "tools": [{"name": "t", "cache_control": full}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "u", "cache_control": full},
+                {"type": "tool_result", "tool_use_id": "x", "cache_control": full,
+                 "content": [{"type": "text", "text": "r", "cache_control": full}]},
+            ]}],
+        });
+        retain_cache_control_fields(&mut body, |k| matches!(k, "type" | "ttl"));
+        let text = body.to_string();
+        assert_eq!(text.matches("\"ttl\":\"1h\"").count(), 5, "{text}");
+        assert!(!text.contains("scope"), "{text}");
     }
 
     #[test]
