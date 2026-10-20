@@ -5581,16 +5581,8 @@ data: [DONE]\n\n";
         // 5xx upstream → 502 BadGateway via Bridge collapse; status
         // maps to `api_error` per Anthropic SDK ErrorType literal.
         let env = assert_anthropic_error_envelope(resp, StatusCode::BAD_GATEWAY, "api_error").await;
-        // 5xx body redaction is preserved.
-        let msg = env["error"]["message"].as_str().unwrap_or("");
-        assert!(
-            !msg.contains("engine internal panic"),
-            "upstream 5xx body must be redacted on the Anthropic envelope, got: {msg}",
-        );
-        assert!(
-            msg.contains("500"),
-            "redacted message must surface the upstream status, got: {msg}",
-        );
+        // The caller receives the upstream's own message.
+        assert_eq!(env["error"]["message"], "engine internal panic");
     }
 
     #[tokio::test]

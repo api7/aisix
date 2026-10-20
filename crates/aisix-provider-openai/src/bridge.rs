@@ -2035,6 +2035,8 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
             input_was_single: true,
             encoding_format: None,
             dimensions: None,
+            input_type: None,
+            embedding_types: None,
         };
         bridge
             .embed(&request, &ctx)

@@ -3378,13 +3378,10 @@ mod tests {
     }
 
     /// Issue #322 sanity check on the 5xx branch: upstream 5xx still
-    /// collapses to 502 with the generic envelope AND the upstream
-    /// `error.message` is suppressed. Engine names / shard ids / queue
-    /// depth routinely appear in upstream 5xx bodies (in this fixture:
-    /// "engine offline shard 47") — those are operator-internal and
-    /// must not bleed through to the customer envelope.
+    /// collapses to 502 with the generic envelope, carrying the
+    /// upstream's own `error.message`.
     #[tokio::test]
-    async fn upstream_openai_5xx_with_json_envelope_collapses_and_redacts_message() {
+    async fn upstream_openai_5xx_with_json_envelope_collapses_and_keeps_the_message() {
         let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -3414,11 +3411,7 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 2048).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "upstream_error");
-        let msg = v["error"]["message"].as_str().unwrap();
-        assert!(
-            !msg.contains("engine offline") && !msg.contains("shard 47"),
-            "upstream 5xx `error.message` must NOT leak to customer; got: {msg:?}"
-        );
+        assert_eq!(v["error"]["message"], "engine offline shard 47");
         // Upstream `code` (engine_overloaded) must also not pass
         // through on 5xx.
         assert!(

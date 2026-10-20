@@ -1129,6 +1129,15 @@ pub struct EmbeddingRequest {
     /// Optional dimensions hint forwarded verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<u32>,
+    /// The caller's embedding purpose for providers that take one (Cohere's
+    /// `input_type`: `search_document`, `search_query`, `classification`,
+    /// `clustering`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_type: Option<String>,
+    /// The caller's requested embedding types for providers that take them
+    /// (Cohere's `embedding_types`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_types: Option<serde_json::Value>,
 }
 
 /// Normalised embedding response.
