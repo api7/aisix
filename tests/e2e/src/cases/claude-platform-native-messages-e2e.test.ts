@@ -60,6 +60,8 @@ const BEDROCK_MANTLE_ONLY = "nm-bedrock-mantle-only";
 const MANTLE_ONLY_ID = "global.anthropic.claude-opus-5-5";
 const BEDROCK_OPERATOR_BETAS = "nm-bedrock-operator-betas";
 const BEDROCK_FORWARDED_BETAS = "nm-bedrock-forwarded-betas";
+const VERTEX_OPERATOR_BETAS = "nm-vertex-operator-betas";
+const VERTEX_FORWARDED_BETAS = "nm-vertex-forwarded-betas";
 // One beta Bedrock runs, one it refuses.
 const OPERATOR_BETAS = "context-1m-2025-08-07,files-api-2025-04-14";
 const BEDROCK_ID = "global.anthropic.claude-sonnet-4-5-20250929-v1:0";
@@ -374,6 +376,30 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
       secret: JSON.stringify({ access_token: "ya29.native-messages", project: "proj-e2e", region: "us-east5" }),
       api_base: upstream.baseUrl,
     });
+    const vertexSecret = JSON.stringify({
+      access_token: "ya29.native-messages",
+      project: "proj-e2e",
+      region: "us-east5",
+    });
+    const vertexOperatorBetasPk = await seed.createProviderKey({
+      display_name: "nm-vertex-operator-betas-pk",
+      provider: "google",
+      adapter: "vertex",
+      secret: vertexSecret,
+      api_base: upstream.baseUrl,
+      request: {
+        default_headers: { "anthropic-beta": OPERATOR_BETAS },
+        forward_client_headers: ["anthropic-beta"],
+      },
+    });
+    const vertexForwardedBetasPk = await seed.createProviderKey({
+      display_name: "nm-vertex-forwarded-betas-pk",
+      provider: "google",
+      adapter: "vertex",
+      secret: vertexSecret,
+      api_base: upstream.baseUrl,
+      request: { forward_client_headers: ["anthropic-beta"] },
+    });
     const anthropicPk = await seed.createProviderKey({
       display_name: "nm-anthropic-pk",
       provider: "anthropic",
@@ -391,6 +417,8 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
       [BEDROCK_MANTLE_ONLY, bedrockPk, "bedrock", MANTLE_ONLY_ID],
       [BEDROCK_OPERATOR_BETAS, operatorBetasPk, "bedrock", BEDROCK_ID],
       [BEDROCK_FORWARDED_BETAS, forwardedBetasPk, "bedrock", BEDROCK_ID],
+      [VERTEX_OPERATOR_BETAS, vertexOperatorBetasPk, "google", VERTEX_ID],
+      [VERTEX_FORWARDED_BETAS, vertexForwardedBetasPk, "google", VERTEX_ID],
       [ANTHROPIC, anthropicPk, "anthropic", "claude-sonnet-4-5"],
     ] as const) {
       models[display_name] = await seed.createModel({
@@ -739,6 +767,27 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
       expect(sent.upstream.path).toBe(`/model/${BEDROCK_ID}/invoke`);
       expect(sent.upstream.headers["anthropic-beta"], model).toBeUndefined();
       expect(JSON.parse(sent.upstream.body).anthropic_beta, model).toEqual(expected);
+    }
+  });
+
+  // Vertex AI reads betas from the header. Chat to Claude there sends the
+  // provider key's `anthropic-beta` (its `default_headers`, or else the
+  // forwarded caller's) filtered to the betas Vertex AI takes.
+  test("chat to Claude on Vertex AI sends only the header betas it takes", async (ctx) => {
+    if (skip(ctx)) return;
+    const callerBetas = "interleaved-thinking-2025-05-14,prompt-caching-2024-07-31";
+    const messages = [{ role: "user", content: "What is 17*23?" }];
+    for (const [model, expected] of [
+      [VERTEX_OPERATOR_BETAS, "context-1m-2025-08-07"],
+      [VERTEX_FORWARDED_BETAS, "interleaved-thinking-2025-05-14"],
+    ] as const) {
+      for (const stream of [false, true]) {
+        const sent = await send("/v1/chat/completions", { model, max_tokens: 64, stream, messages }, callerBetas);
+        expect(sent.status, sent.text).toBe(200);
+        expect(sent.upstream.path).toMatch(stream ? /:streamRawPredict$/ : /:rawPredict$/);
+        expect(sent.upstream.headers["anthropic-beta"], `${model} stream=${stream}`).toBe(expected);
+        expect(JSON.parse(sent.upstream.body), `${model} stream=${stream}`).not.toHaveProperty("anthropic_beta");
+      }
     }
   });
 
