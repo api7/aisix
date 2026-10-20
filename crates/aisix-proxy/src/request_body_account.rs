@@ -42,6 +42,24 @@ impl BodyAccount {
     }
 }
 
+/// A request's [`BodyAccount`], published as a request extension so the
+/// dispatch can tell how large the inbound body was once it is read.
+#[derive(Clone)]
+pub(crate) struct InboundBody(Arc<BodyAccount>);
+
+impl std::fmt::Debug for InboundBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("InboundBody").field(&self.bytes()).finish()
+    }
+}
+
+impl InboundBody {
+    /// Body bytes read so far: the whole body once the handler has it.
+    pub(crate) fn bytes(&self) -> usize {
+        self.0.bytes.load(Ordering::Relaxed)
+    }
+}
+
 impl Drop for BodyAccount {
     fn drop(&mut self) {
         let bytes = *self.bytes.get_mut();
@@ -54,7 +72,7 @@ impl Drop for BodyAccount {
 
 /// Count `body` as it is read, into an account the caller keeps until the
 /// request is done.
-pub(crate) fn counted(body: axum::body::Body) -> (axum::body::Body, Arc<BodyAccount>) {
+pub(crate) fn counted(body: axum::body::Body) -> (axum::body::Body, InboundBody) {
     let account = Arc::new(BodyAccount::default());
     let reader = Arc::clone(&account);
     let body = body.map_frame(move |frame| {
@@ -63,5 +81,5 @@ pub(crate) fn counted(body: axum::body::Body) -> (axum::body::Body, Arc<BodyAcco
         }
         frame
     });
-    (axum::body::Body::new(body), account)
+    (axum::body::Body::new(body), InboundBody(account))
 }

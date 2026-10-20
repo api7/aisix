@@ -36,23 +36,31 @@ use aws_sdk_bedrockruntime::operation::invoke_model::InvokeModelError;
 use aws_sdk_bedrockruntime::primitives::Blob;
 use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
 use aws_sdk_bedrockruntime::types::{
-    AnyToolChoice, ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole,
-    ConverseStreamOutput, InferenceConfiguration, JsonSchemaDefinition, Message as BedrockMessage,
-    OutputConfig, OutputFormat, OutputFormatStructure, OutputFormatType, ReasoningContentBlock,
-    ReasoningContentBlockDelta, SpecificToolChoice, StopReason as SdkStopReason,
-    SystemContentBlock, Tool, ToolChoice, ToolConfiguration, ToolInputSchema, ToolResultBlock,
-    ToolResultContentBlock, ToolSpecification, ToolUseBlock,
+    AnyToolChoice, AudioBlock, AudioFormat, AudioSource, ContentBlock, ContentBlockDelta,
+    ContentBlockStart, ConversationRole, ConverseStreamOutput, DocumentBlock, DocumentFormat,
+    DocumentSource, ImageBlock, ImageFormat, ImageSource, InferenceConfiguration,
+    JsonSchemaDefinition, Message as BedrockMessage, OutputConfig, OutputFormat,
+    OutputFormatStructure, OutputFormatType, ReasoningContentBlock, ReasoningContentBlockDelta,
+    SpecificToolChoice, StopReason as SdkStopReason, SystemContentBlock, Tool, ToolChoice,
+    ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolSpecification,
+    ToolUseBlock, VideoBlock, VideoFormat, VideoSource,
 };
 use aws_sdk_bedrockruntime::Client as BedrockClient;
+use base64::Engine as _;
+
+use aisix_gateway::content_part::{
+    check_tool_result_parts, display_uri, translate_user_parts, Media, MediaSource,
+};
+use aisix_gateway::media_fetch::{fetch_media_urls, Encoding, FetchedMedia};
 use aws_smithy_runtime_api::client::result::ServiceError;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use serde::Deserialize;
 use std::time::{Duration, Instant};
 
 use aisix_provider_anthropic::wire::{
-    build_request, response_into_chat_response, split_system, structured_output_for,
-    tool_choice_states_a_preference, translate_reasoning_effort_to_anthropic, AnthropicResponse,
-    StructuredOutput,
+    anthropic_needs_fetch, build_request, claude_media_kind, response_into_chat_response,
+    split_system_with, structured_output_for, tool_choice_states_a_preference,
+    translate_reasoning_effort_to_anthropic, AnthropicResponse, MediaUrls, StructuredOutput,
 };
 
 // Per-`ProviderKey` request override pipeline (#302 §5 / #340). The JSON-body
@@ -1003,9 +1011,16 @@ impl BedrockBridge {
         );
         // Every intermediate stays inside this block, so only the wire
         // bytes are alive while the upstream is awaited.
+        let urls = MediaUrls::Refused("Claude on Amazon Bedrock");
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, |m| {
+            anthropic_needs_fetch(m, urls)
+        })
+        .await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
         let body_bytes = {
-            let (system, messages) =
-                split_system(&req).map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
+            let (system, messages) = split_system_with(&req, urls, &fetched)
+                .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
             let anthropic_req = build_request(&req, anthropic_model, system, messages, false);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -1100,7 +1115,11 @@ impl BedrockBridge {
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
         let client = self.build_client_from_ctx(ctx)?;
-        let (system_blocks, message_blocks) = build_converse_inputs(&req)?;
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Bytes, |_| true).await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
+        let (system_blocks, message_blocks) =
+            build_converse_inputs(&req, BedrockPublisher::from_model_id(upstream_id), &fetched)?;
 
         let started = Instant::now();
         let deadline = ctx.deadline;
@@ -1201,7 +1220,11 @@ impl BedrockBridge {
         upstream_id: &str,
     ) -> Result<ChatChunkStream, BridgeError> {
         let client = self.build_client_from_ctx(ctx)?;
-        let (system_blocks, message_blocks) = build_converse_inputs(&req)?;
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Bytes, |_| true).await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
+        let (system_blocks, message_blocks) =
+            build_converse_inputs(&req, BedrockPublisher::from_model_id(upstream_id), &fetched)?;
 
         let started = Instant::now();
         let deadline = ctx.deadline;
@@ -1283,7 +1306,10 @@ impl BedrockBridge {
 /// it before the rail is picked.
 fn build_converse_inputs(
     req: &ChatFormat,
+    publisher: Option<BedrockPublisher>,
+    fetched: &FetchedMedia,
 ) -> Result<(Vec<SystemContentBlock>, Vec<BedrockMessage>), BridgeError> {
+    let claude = publisher == Some(BedrockPublisher::Anthropic);
     let mut systems: Vec<SystemContentBlock> = Vec::new();
     let mut messages: Vec<BedrockMessage> = Vec::new();
     // #560: buffer for coalescing consecutive `role:"tool"` results
@@ -1291,7 +1317,7 @@ fn build_converse_inputs(
     // rejects two consecutive user messages.
     let mut pending_tool_results: Vec<ContentBlock> = Vec::new();
 
-    for msg in &req.messages {
+    for (index, msg) in req.messages.iter().enumerate() {
         // Converse has no slot for replayed reasoning, and a turn that
         // holds only that would become a blank text block, which Converse
         // rejects. Skipped before the flush below, so tool results on
@@ -1317,7 +1343,7 @@ fn build_converse_inputs(
             Role::User => {
                 messages.push(build_message(
                     ConversationRole::User,
-                    vec![ContentBlock::Text(msg.content_str().to_string())],
+                    user_content_blocks(msg, index, claude, fetched)?,
                 )?);
             }
             Role::Assistant => {
@@ -1327,6 +1353,7 @@ fn build_converse_inputs(
                 )?);
             }
             Role::Tool => {
+                check_tool_result_parts(msg, index).map_err(BridgeError::InvalidRequest)?;
                 // #560: `role:"tool"` → Converse `toolResult` block. The
                 // correlation id rides `tool_call_id`, the result text
                 // rides `content`. A result that names no call still goes
@@ -1353,6 +1380,189 @@ fn build_converse_inputs(
         messages.push(build_message(ConversationRole::User, pending_tool_results)?);
     }
     Ok((systems, messages))
+}
+
+/// A user turn's content parts as Converse blocks, in the caller's order.
+/// Converse takes media only as bytes in the request, so a URL part gets
+/// the bytes the gateway downloaded for it, or is refused when there are
+/// none. A Claude model on this rail takes what it takes through
+/// InvokeModel — images and PDFs — so the two rails refuse the same parts.
+///
+/// Converse rejects a user message that carries a document but no text,
+/// so such a message gets a one-character text block after its media.
+fn user_content_blocks(
+    msg: &ChatMessage,
+    index: usize,
+    claude: bool,
+    fetched: &FetchedMedia,
+) -> Result<Vec<ContentBlock>, BridgeError> {
+    let Some(parts) = msg.content_blocks.as_deref() else {
+        return Ok(vec![ContentBlock::Text(msg.content_str().to_string())]);
+    };
+    let family = if claude { "Claude" } else { "Amazon Bedrock" };
+    let mut blocks = translate_user_parts(
+        parts,
+        index,
+        family,
+        ContentBlock::Text,
+        |media, part_index| {
+            converse_media_block(
+                media,
+                claude,
+                fetched,
+                &format!("document-{index}-{part_index}"),
+            )
+        },
+    )
+    .map_err(BridgeError::InvalidRequest)?;
+    let has_document = blocks
+        .iter()
+        .any(|b| matches!(b, ContentBlock::Document(_)));
+    let has_text = blocks.iter().any(|b| matches!(b, ContentBlock::Text(_)));
+    if has_document && !has_text {
+        blocks.push(ContentBlock::Text(".".to_string()));
+    }
+    Ok(blocks)
+}
+
+/// Line-wrapped or unpadded base64 is common in callers' payloads; the
+/// upstreams that take base64 text accept it, so the bytes decoded for
+/// Converse must too.
+const LENIENT_BASE64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    base64::engine::GeneralPurposeConfig::new()
+        .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+);
+
+/// One media part — inline, or a URL the gateway downloaded — as a
+/// Converse `image` / `document` / `audio` / `video` block, chosen by its
+/// media type. A Claude model takes only what it takes through
+/// InvokeModel: images and PDFs.
+fn converse_media_block(
+    media: &Media<'_>,
+    claude: bool,
+    fetched: &FetchedMedia,
+    document_name: &str,
+) -> Result<ContentBlock, String> {
+    enum Payload<'a> {
+        Base64(&'a str),
+        Bytes(Vec<u8>),
+    }
+    let (mime_type, payload) = match &media.source {
+        MediaSource::Inline { mime_type, data } => (mime_type.clone(), Payload::Base64(data)),
+        MediaSource::Uri { uri, .. } => match fetched.take(uri) {
+            Some(download) => (
+                download.mime_type,
+                Payload::Bytes(download.data.into_bytes()),
+            ),
+            None => {
+                let upstream = if claude {
+                    "Claude on Amazon Bedrock"
+                } else {
+                    "Amazon Bedrock"
+                };
+                return Err(format!(
+                    "{upstream} does not read media from a URL, and the gateway did not \
+                     download {}; send the content inline as a base64 data: URL",
+                    display_uri(uri)
+                ));
+            }
+        },
+    };
+    let mime_type = mime_type.as_str();
+    if claude {
+        claude_media_kind(mime_type)?;
+    }
+    let unsupported = || format!("Amazon Bedrock does not accept media of type {mime_type:?}");
+    let bytes = move || match payload {
+        Payload::Bytes(bytes) => Ok(Blob::new(bytes)),
+        Payload::Base64(data) => {
+            let compact: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+            LENIENT_BASE64
+                .decode(compact)
+                .map(Blob::new)
+                .map_err(|_| "the media data is not valid base64".to_string())
+        }
+    };
+    let built = |e: aws_smithy_types::error::operation::BuildError| {
+        format!("bedrock converse: build media block: {e}")
+    };
+    let subtype = mime_type.split_once('/').map_or("", |(_, sub)| sub);
+    if mime_type.starts_with("image/") {
+        let format = match subtype {
+            "png" => ImageFormat::Png,
+            "jpeg" | "jpg" => ImageFormat::Jpeg,
+            "gif" => ImageFormat::Gif,
+            "webp" => ImageFormat::Webp,
+            _ => return Err(unsupported()),
+        };
+        let block = ImageBlock::builder()
+            .format(format)
+            .source(ImageSource::Bytes(bytes()?))
+            .build()
+            .map_err(built)?;
+        return Ok(ContentBlock::Image(block));
+    }
+    if mime_type.starts_with("audio/") {
+        let format = match subtype {
+            "wav" | "x-wav" => AudioFormat::Wav,
+            "mp3" | "mpeg" => AudioFormat::Mp3,
+            "aac" => AudioFormat::Aac,
+            "flac" => AudioFormat::Flac,
+            "ogg" => AudioFormat::Ogg,
+            "opus" => AudioFormat::Opus,
+            "webm" => AudioFormat::Webm,
+            "m4a" | "mp4" => AudioFormat::M4A,
+            "pcm" => AudioFormat::Pcm,
+            _ => return Err(unsupported()),
+        };
+        let block = AudioBlock::builder()
+            .format(format)
+            .source(AudioSource::Bytes(bytes()?))
+            .build()
+            .map_err(built)?;
+        return Ok(ContentBlock::Audio(block));
+    }
+    if mime_type.starts_with("video/") {
+        let format = match subtype {
+            "mp4" => VideoFormat::Mp4,
+            "mov" | "quicktime" => VideoFormat::Mov,
+            "webm" => VideoFormat::Webm,
+            "x-matroska" => VideoFormat::Mkv,
+            "mpeg" => VideoFormat::Mpeg,
+            "x-flv" => VideoFormat::Flv,
+            "wmv" | "x-ms-wmv" => VideoFormat::Wmv,
+            "3gpp" => VideoFormat::ThreeGp,
+            _ => return Err(unsupported()),
+        };
+        let block = VideoBlock::builder()
+            .format(format)
+            .source(VideoSource::Bytes(bytes()?))
+            .build()
+            .map_err(built)?;
+        return Ok(ContentBlock::Video(block));
+    }
+    let format = match mime_type {
+        "application/pdf" => DocumentFormat::Pdf,
+        "text/plain" => DocumentFormat::Txt,
+        "text/csv" => DocumentFormat::Csv,
+        "text/html" => DocumentFormat::Html,
+        "text/markdown" => DocumentFormat::Md,
+        "application/msword" => DocumentFormat::Doc,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+            DocumentFormat::Docx
+        }
+        "application/vnd.ms-excel" => DocumentFormat::Xls,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => DocumentFormat::Xlsx,
+        _ => return Err(unsupported()),
+    };
+    let block = DocumentBlock::builder()
+        .name(document_name)
+        .format(format)
+        .source(DocumentSource::Bytes(bytes()?))
+        .build()
+        .map_err(built)?;
+    Ok(ContentBlock::Document(block))
 }
 
 /// Bedrock rejects an empty `messages[]`, which is what a request holding
@@ -4972,7 +5182,8 @@ mod tests {
             ]
         }))
         .unwrap();
-        let (_systems, messages) = build_converse_inputs(&req).unwrap();
+        let (_systems, messages) =
+            build_converse_inputs(&req, None, &FetchedMedia::default()).unwrap();
         let roles: Vec<ConversationRole> = messages.iter().map(|m| m.role().clone()).collect();
         assert_eq!(
             roles,
@@ -4999,7 +5210,8 @@ mod tests {
             ],
         );
 
-        let (systems, messages) = build_converse_inputs(&req).unwrap();
+        let (systems, messages) =
+            build_converse_inputs(&req, None, &FetchedMedia::default()).unwrap();
         assert_eq!(systems.len(), 1);
         assert_eq!(
             systems[0],
@@ -5030,7 +5242,8 @@ mod tests {
         }))
         .unwrap();
 
-        let (systems, messages) = build_converse_inputs(&req).unwrap();
+        let (systems, messages) =
+            build_converse_inputs(&req, None, &FetchedMedia::default()).unwrap();
         assert!(systems.is_empty());
         // user → assistant(2× toolUse) → user(2× toolResult, coalesced)
         assert_eq!(

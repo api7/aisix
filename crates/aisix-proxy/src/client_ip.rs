@@ -165,6 +165,9 @@ pub struct ClientContext {
     /// The operator-selected request headers every usage event of this
     /// request records ([`capture_request_headers`]).
     pub request_headers: BTreeMap<String, String>,
+    /// The inbound body's byte count, read at dispatch time (the handler
+    /// has the whole body by then). `None` outside the body-limit layer.
+    pub(crate) inbound_body: Option<crate::request_body_account::InboundBody>,
 }
 
 /// The values of the request headers any enabled exporter of this snapshot
@@ -312,6 +315,10 @@ where
                 .get::<Arc<aisix_obs::RequestTraceBundle>>()
                 .cloned(),
             request_headers: capture_request_headers(&parts.headers, &proxy_state.snapshot.load()),
+            inbound_body: parts
+                .extensions
+                .get::<crate::request_body_account::InboundBody>()
+                .cloned(),
         };
         // Hand the caller to the request's attribution cell as well
         // (AISIX-Cloud#1571). This extractor is the one place every

@@ -136,6 +136,24 @@ pub fn config() -> &'static UpstreamHttpConfig {
 /// A `reqwest::ClientBuilder` with the connection settings, deployment's
 /// outbound TLS trust, and versioned `aisix` user agent applied.
 pub fn client_builder() -> reqwest::ClientBuilder {
+    let b = base_client_builder();
+    apply_tls(b, &config().tls)
+}
+
+/// [`client_builder`] for a peer the caller, not the operator, chose (a
+/// media URL): the same connection settings and trust roots, but never
+/// the upstream mTLS client identity, which only upstreams may be shown,
+/// and never `upstream.tls.verify: false`, which an operator sets for the
+/// upstreams they configured, not for any host a caller names.
+pub fn caller_chosen_peer_client_builder() -> reqwest::ClientBuilder {
+    let mut b = base_client_builder();
+    for root in &crate::upstream_tls::reqwest_material().roots {
+        b = b.add_root_certificate(root.clone());
+    }
+    b
+}
+
+fn base_client_builder() -> reqwest::ClientBuilder {
     let cfg = config();
     let mut b = reqwest::Client::builder()
         .user_agent(format!("aisix/{}", &*aisix_core::BUILD_VERSION))
@@ -160,7 +178,7 @@ pub fn client_builder() -> reqwest::ClientBuilder {
     if let Some(n) = cfg.pool_max_idle_per_host {
         b = b.pool_max_idle_per_host(n);
     }
-    apply_tls(b, &cfg.tls)
+    b
 }
 
 /// Layer the outbound trust decision onto a builder. Split out so the

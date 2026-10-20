@@ -1838,6 +1838,46 @@ pub struct UpstreamConfig {
     /// Trust settings for the TLS handshake with every upstream peer —
     /// see [`OutboundTlsConfig`].
     pub tls: OutboundTlsConfig,
+    /// Downloading a chat request's media URL for an upstream that cannot
+    /// read one itself — see [`MediaFetchConfig`].
+    pub media_fetch: MediaFetchConfig,
+}
+
+/// When a chat request carries an image, audio or file part as a URL and
+/// the target upstream cannot read that URL (Amazon Bedrock, Claude on
+/// Vertex AI, an `http://` URL toward Anthropic or Gemini), the gateway
+/// downloads it and sends the bytes inline. An upstream that reads the URL
+/// itself still gets the URL.
+///
+/// The download refuses any address that is not publicly routable
+/// (loopback, private, link-local, cloud metadata, …); `allowed_hosts` is
+/// the only way past that check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields, default)]
+pub struct MediaFetchConfig {
+    /// `false` refuses a media URL the target upstream cannot read with a
+    /// 400 instead of downloading it.
+    pub enabled: bool,
+    /// Hosts the download may reach even though they resolve to a
+    /// non-public address, as `host` (any port) or `host:port`; an IPv6
+    /// address is written in brackets when it carries a port
+    /// (`[fd00::1]:8080`). The host is still resolved once and the
+    /// connection pinned to that answer.
+    pub allowed_hosts: Vec<String>,
+    /// Largest body accepted per URL, in bytes. A larger download is
+    /// abandoned and the request refused with a 400.
+    pub max_bytes: u64,
+}
+
+impl Default for MediaFetchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_hosts: Vec::new(),
+            max_bytes: 50 * 1024 * 1024,
+        }
+    }
 }
 
 impl Default for UpstreamConfig {
@@ -1853,6 +1893,7 @@ impl Default for UpstreamConfig {
             pool_max_idle_per_host: None,
             retries: DEFAULT_UPSTREAM_RETRIES,
             tls: OutboundTlsConfig::default(),
+            media_fetch: MediaFetchConfig::default(),
         }
     }
 }
@@ -2169,6 +2210,7 @@ const ENV_LIST_PARSE_KEYS: &[&str] = &[
     "cache.redis.sentinels",
     "ratelimit.redis.nodes",
     "ratelimit.redis.sentinels",
+    "upstream.media_fetch.allowed_hosts",
 ];
 
 impl Config {

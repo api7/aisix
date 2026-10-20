@@ -98,6 +98,7 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
         // non-429 4xx.
         BridgeError::InvalidUpstreamConfig(_)
         | BridgeError::InvalidRequest(_)
+        | BridgeError::RequestTooLarge { .. }
         | BridgeError::InvalidUpstreamCredentials(_) => false,
         // A capability the adapter simply does not implement. Static per
         // adapter, so the same call answers the same way every time and a
