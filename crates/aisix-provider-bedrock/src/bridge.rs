@@ -746,6 +746,9 @@ fn filtered_extra_headers(hdr: &UpstreamHeaderContext<'_>) -> Vec<(String, Strin
     let forwarded = aisix_gateway::ForwardedClientHeaders::resolve(hdr);
     aisix_gateway::resolve_extra_headers(hdr)
         .into_iter()
+        // Bedrock reads betas from the body only; Claude's paths fold these
+        // values into `anthropic_beta` (see [`header_betas`]).
+        .filter(|(name, _)| name.as_str() != ANTHROPIC_BETA)
         .filter(|(name, _)| {
             if reserved.contains(&name.as_str()) {
                 let dropped = "header not sent to a Bedrock upstream: AWS SigV4 derives \
@@ -768,6 +771,37 @@ fn filtered_extra_headers(hdr: &UpstreamHeaderContext<'_>) -> Vec<(String, Strin
             )
         })
         .collect()
+}
+
+const ANTHROPIC_BETA: &str = "anthropic-beta";
+
+/// The `anthropic-beta` values the ProviderKey's headers carry — its
+/// `default_headers` and a client header `forward_client_headers` admits.
+/// No `anthropic-beta` header is sent to Bedrock, which reads betas from
+/// the body, so a Claude request carries these in `anthropic_beta`,
+/// filtered to the ones Bedrock takes like the caller's own.
+pub(crate) fn header_betas(ctx: &BridgeContext) -> Vec<String> {
+    let mut headers = http::HeaderMap::new();
+    for (name, value) in aisix_gateway::resolve_extra_headers(&ctx.header_ctx()) {
+        if name.as_str() == ANTHROPIC_BETA {
+            headers.append(name, value);
+        }
+    }
+    aisix_provider_anthropic::platform::header_betas(Some(&headers))
+}
+
+/// Add `betas` to a Claude body's `anthropic_beta`, ahead of
+/// [`aisix_provider_anthropic::platform::retain_bedrock_betas`].
+fn fold_betas(obj: &mut serde_json::Map<String, serde_json::Value>, betas: Vec<String>) {
+    if betas.is_empty() {
+        return;
+    }
+    let field = obj
+        .entry("anthropic_beta")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let serde_json::Value::Array(list) = field {
+        list.extend(betas.into_iter().map(serde_json::Value::String));
+    }
 }
 
 /// Apply the per-`ProviderKey` request/response **body** override pipeline to
@@ -1234,6 +1268,7 @@ fn shape_invoke_body(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     req: &ChatFormat,
     upstream_id: &str,
+    header_betas: Vec<String>,
 ) {
     if let Some(stops) = crate::converse_req::stop_sequences(req, upstream_id) {
         obj.insert("stop_sequences".into(), stops.into());
@@ -1258,6 +1293,7 @@ fn shape_invoke_body(
         }
     }
     aisix_provider_anthropic::platform::retain_bedrock_thinking_display(obj);
+    fold_betas(obj, header_betas);
     aisix_provider_anthropic::platform::retain_bedrock_betas(obj);
 }
 
@@ -1325,7 +1361,7 @@ impl BedrockBridge {
             // URL-borne `model` into the /invoke body.
             apply_body_overrides(&mut body_value, ctx);
             if let Some(obj) = body_value.as_object_mut() {
-                shape_invoke_body(obj, &req, upstream_id);
+                shape_invoke_body(obj, &req, upstream_id, header_betas(ctx));
                 obj.remove("model");
                 obj.remove("stream");
                 obj.insert(
@@ -1485,6 +1521,7 @@ impl BedrockBridge {
             tool_config.as_ref(),
             native.guardrail.is_some(),
             pk_param_constraints(ctx),
+            header_betas(ctx),
         )?;
 
         let started = Instant::now();
@@ -1576,6 +1613,7 @@ impl BedrockBridge {
             tool_config.as_ref(),
             native.guardrail.is_some(),
             pk_param_constraints(ctx),
+            header_betas(ctx),
         )?;
 
         let started = Instant::now();
@@ -1666,6 +1704,7 @@ impl ConverseParts {
         tool_config: Option<&ToolConfiguration>,
         guarded: bool,
         constraints: Option<&ParamConstraints>,
+        header_betas: Vec<String>,
     ) -> Result<Self, BridgeError> {
         let publisher = BedrockPublisher::from_model_id(upstream_id);
         // Converse rejects tool blocks in a request without a
@@ -1683,8 +1722,12 @@ impl ConverseParts {
             auto_cache_ttl,
             guarded,
         )?;
-        let (additional, thinking_max_tokens) =
-            build_converse_additional_model_request_fields(req, upstream_id, tool_config)?;
+        let (additional, thinking_max_tokens) = build_converse_additional_model_request_fields(
+            req,
+            upstream_id,
+            tool_config,
+            header_betas,
+        )?;
         let inference = build_inference_config(req, upstream_id, thinking_max_tokens, constraints);
         Ok(Self {
             systems,
@@ -2917,6 +2960,7 @@ fn build_converse_additional_model_request_fields(
     req: &ChatFormat,
     upstream_id: &str,
     tool_config: Option<&ToolConfiguration>,
+    header_betas: Vec<String>,
 ) -> Result<(Option<aws_smithy_types::Document>, Option<u32>), BridgeError> {
     let mut fields = crate::converse_req::caller_additional_fields(req);
     let mut thinking_max_tokens = None;
@@ -2934,6 +2978,7 @@ fn build_converse_additional_model_request_fields(
             }
         }
         aisix_provider_anthropic::platform::retain_bedrock_thinking_display(&mut fields);
+        fold_betas(&mut fields, header_betas);
         aisix_provider_anthropic::platform::retain_bedrock_betas(&mut fields);
     } else if let Some((name, value)) = crate::converse_req::reasoning_field(req, upstream_id)? {
         fields.insert(name.to_string(), value);

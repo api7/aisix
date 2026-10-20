@@ -57,6 +57,10 @@ const COUNT_GROUP = "nm-count-group";
 const NO_COUNT_ID = "us.anthropic.claude-nocount-4-5-v1:0";
 const BEDROCK_MANTLE_ONLY = "nm-bedrock-mantle-only";
 const MANTLE_ONLY_ID = "global.anthropic.claude-opus-5-5";
+const BEDROCK_OPERATOR_BETAS = "nm-bedrock-operator-betas";
+const BEDROCK_FORWARDED_BETAS = "nm-bedrock-forwarded-betas";
+// One beta Bedrock runs, one it refuses.
+const OPERATOR_BETAS = "context-1m-2025-08-07,files-api-2025-04-14";
 const BEDROCK_ID = "global.anthropic.claude-sonnet-4-5-20250929-v1:0";
 const THROTTLED_ID = "us.anthropic.claude-throttle-4-5-v1:0";
 const GUARDED_ID = "us.anthropic.claude-guarded-4-5-v1:0";
@@ -325,6 +329,30 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
       }),
       api_base: upstream.baseUrl,
     });
+    const bedrockSecret = JSON.stringify({
+      access_key_id: "AKIA-native-messages",
+      secret_access_key: "sk-native-messages",
+      region: "us-west-2",
+    });
+    const operatorBetasPk = await seed.createProviderKey({
+      display_name: "nm-bedrock-operator-betas-pk",
+      provider: "bedrock",
+      adapter: "bedrock",
+      secret: bedrockSecret,
+      api_base: upstream.baseUrl,
+      request: {
+        default_headers: { "anthropic-beta": OPERATOR_BETAS },
+        forward_client_headers: ["anthropic-beta"],
+      },
+    });
+    const forwardedBetasPk = await seed.createProviderKey({
+      display_name: "nm-bedrock-forwarded-betas-pk",
+      provider: "bedrock",
+      adapter: "bedrock",
+      secret: bedrockSecret,
+      api_base: upstream.baseUrl,
+      request: { forward_client_headers: ["anthropic-beta"] },
+    });
     const vertexPk = await seed.createProviderKey({
       display_name: "nm-vertex-pk",
       provider: "google",
@@ -347,6 +375,8 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
       [VERTEX, vertexPk, "google", VERTEX_ID],
       [BEDROCK_NO_COUNT, bedrockPk, "bedrock", NO_COUNT_ID],
       [BEDROCK_MANTLE_ONLY, bedrockPk, "bedrock", MANTLE_ONLY_ID],
+      [BEDROCK_OPERATOR_BETAS, operatorBetasPk, "bedrock", BEDROCK_ID],
+      [BEDROCK_FORWARDED_BETAS, forwardedBetasPk, "bedrock", BEDROCK_ID],
       [ANTHROPIC, anthropicPk, "anthropic", "claude-sonnet-4-5"],
     ] as const) {
       models[display_name] = await seed.createModel({
@@ -614,6 +644,68 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
     const fields = JSON.parse(converse.upstream.body).additionalModelRequestFields;
     expect(fields.anthropic_beta).toEqual(expected);
     expect(fields.thinking).toEqual({ type: "enabled", budget_tokens: 1024 });
+  });
+
+  // Bedrock reads betas from the body only. A provider key's
+  // `default_headers` beta joins the caller's, filtered the same way, and
+  // no `anthropic-beta` header reaches Bedrock — not even the caller's raw
+  // value when `forward_client_headers` names it.
+  test("a provider key's anthropic-beta header reaches Bedrock in the body, filtered, never as a header", async (ctx) => {
+    if (skip(ctx)) return;
+    const callerBetas = "interleaved-thinking-2025-05-14,prompt-caching-2024-07-31";
+    const messages = [{ role: "user", content: "What is 17*23?" }];
+    const cases = [
+      [BEDROCK_OPERATOR_BETAS, ["context-1m-2025-08-07", "interleaved-thinking-2025-05-14"]],
+      [BEDROCK_FORWARDED_BETAS, ["interleaved-thinking-2025-05-14"]],
+    ] as const;
+    for (const [model, expected] of cases) {
+      for (const stream of [false, true]) {
+        const sent = await send("/v1/messages", { model, max_tokens: 64, stream, messages }, callerBetas);
+        expect(sent.status, sent.text).toBe(200);
+        expect(sent.upstream.headers["anthropic-beta"], `${model} stream=${stream}`).toBeUndefined();
+        expect(JSON.parse(sent.upstream.body).anthropic_beta, `${model} stream=${stream}`).toEqual(expected);
+      }
+
+      // CountTokens takes no beta.
+      const counted = await send("/v1/messages/count_tokens", { model, messages }, callerBetas);
+      expect(counted.status, counted.text).toBe(200);
+      expect(counted.upstream.headers["anthropic-beta"], model).toBeUndefined();
+      const invoke = JSON.parse(
+        Buffer.from(JSON.parse(counted.upstream.body).input.invokeModel.body, "base64").toString("utf8"),
+      );
+      expect(invoke, model).not.toHaveProperty("anthropic_beta");
+    }
+
+    // Chat to Claude: the header's betas (the operator's, or else the
+    // forwarded caller's) join the body's own on InvokeModel and Converse.
+    const chat = {
+      max_tokens: 64,
+      messages,
+      anthropic_beta: ["tool-examples-2025-10-29", "files-api-2025-04-14"],
+    };
+    const chatCases = [
+      [BEDROCK_OPERATOR_BETAS, ["context-1m-2025-08-07", "tool-examples-2025-10-29"]],
+      [BEDROCK_FORWARDED_BETAS, ["interleaved-thinking-2025-05-14", "tool-examples-2025-10-29"]],
+    ] as const;
+    for (const [model, expected] of chatCases) {
+      const invoke = await send("/v1/chat/completions", { ...chat, model }, callerBetas);
+      expect(invoke.status, invoke.text).toBe(200);
+      expect(invoke.upstream.path).toBe(`/model/${BEDROCK_ID}/invoke`);
+      expect(invoke.upstream.headers["anthropic-beta"], model).toBeUndefined();
+      expect(JSON.parse(invoke.upstream.body).anthropic_beta, model).toEqual(expected);
+
+      const converse = await send(
+        "/v1/chat/completions",
+        { ...chat, model, requestMetadata: { team: "a" } },
+        callerBetas,
+      );
+      expect(converse.status, converse.text).toBe(200);
+      expect(converse.upstream.path).toBe(`/model/${BEDROCK_ID}/converse`);
+      expect(converse.upstream.headers["anthropic-beta"], model).toBeUndefined();
+      expect(JSON.parse(converse.upstream.body).additionalModelRequestFields.anthropic_beta, model).toEqual(
+        expected,
+      );
+    }
   });
 
   test("an image URL inside a tool result is downloaded for Bedrock and Vertex AI", async (ctx) => {
