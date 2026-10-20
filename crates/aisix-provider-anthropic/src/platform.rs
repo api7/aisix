@@ -105,12 +105,14 @@ pub fn allowed_fields(platform: Platform) -> &'static [&'static str] {
 }
 
 /// `anthropic-beta` values Bedrock accepts, keyed by the Anthropic name.
-/// A value not listed is dropped: Bedrock answers an unknown one with 400.
+/// A value not listed is dropped: Bedrock answers an unknown one with 400
+/// ("invalid beta flag"). Measured against Claude Sonnet 4.5 `InvokeModel`.
 const BEDROCK_BETAS: &[(&str, &str)] = &[
     (
         "advanced-tool-use-2025-11-20",
         "tool-search-tool-2025-10-19",
     ),
+    ("claude-code-20250219", "claude-code-20250219"),
     ("compact-2026-01-12", "compact-2026-01-12"),
     ("computer-use-2025-01-24", "computer-use-2025-01-24"),
     ("computer-use-2025-11-24", "computer-use-2025-11-24"),
@@ -119,32 +121,38 @@ const BEDROCK_BETAS: &[(&str, &str)] = &[
         "context-management-2025-06-27",
         "context-management-2025-06-27",
     ),
-    (
-        "dangerous-tool-use-2026-09-03",
-        "dangerous-tool-use-2026-09-03",
-    ),
     ("effort-2025-11-24", "effort-2025-11-24"),
     (
         "fine-grained-tool-streaming-2025-05-14",
         "fine-grained-tool-streaming-2025-05-14",
     ),
     (
-        "thinking-binding-controls-2026-08-01",
-        "thinking-binding-controls-2026-08-01",
+        "interleaved-thinking-2025-05-14",
+        "interleaved-thinking-2025-05-14",
     ),
+    (
+        "mid-conversation-output-config-2026-07-01",
+        "mid-conversation-output-config-2026-07-01",
+    ),
+    (
+        "mid-conversation-tool-changes-2026-07-01",
+        "mid-conversation-tool-changes-2026-07-01",
+    ),
+    ("output-128k-2025-02-19", "output-128k-2025-02-19"),
+    (
+        "structured-outputs-2025-11-13",
+        "structured-outputs-2025-11-13",
+    ),
+    (
+        "thinking-token-count-2026-05-13",
+        "thinking-token-count-2026-05-13",
+    ),
+    (
+        "token-efficient-tools-2025-02-19",
+        "token-efficient-tools-2025-02-19",
+    ),
+    ("tool-examples-2025-10-29", "tool-examples-2025-10-29"),
     ("tool-search-tool-2025-10-19", "tool-search-tool-2025-10-19"),
-    (
-        "mid-conversation-output-config-2026-07-01",
-        "mid-conversation-output-config-2026-07-01",
-    ),
-    (
-        "thinking-display-updates-2026-08-18",
-        "thinking-display-updates-2026-08-18",
-    ),
-    (
-        "mid-conversation-tool-changes-2026-07-01",
-        "mid-conversation-tool-changes-2026-07-01",
-    ),
 ];
 
 /// `anthropic-beta` values Vertex AI accepts, keyed by the Anthropic name.
@@ -276,6 +284,7 @@ pub fn shape_request(
                 wanted.insert(TOOL_SEARCH_BETA.to_string());
             }
             filter_bedrock_context_management(obj, &mut wanted);
+            retain_bedrock_thinking_display(obj);
         }
         Platform::Vertex => {
             if let Some(edits) = obj
@@ -356,24 +365,25 @@ pub fn shape_request(
 /// `invokeModel` input: the body `/v1/messages` would send to InvokeModel
 /// ([`shape_request`]), carrying the `max_tokens` the `InvokeModel` schema
 /// requires — above any thinking budget, which InvokeModel validates and
-/// which does not change the count. Returns `None` when the caller's
-/// messages are all plain strings, which take the `converse` input
-/// instead.
-pub fn bedrock_count_tokens_invoke_body(body: &Value, upstream_id: &str) -> Option<Value> {
-    let typed_blocks = body
-        .get("messages")
-        .and_then(Value::as_array)
-        .is_none_or(|ms| {
-            ms.iter().any(|m| {
-                m.get("content")
-                    .and_then(Value::as_array)
-                    .is_some_and(|c| c.iter().any(|b| b.get("type").is_some()))
-            })
-        });
-    if !typed_blocks {
-        return None;
-    }
+/// which does not change the count. A plain-string message content goes in
+/// as one text block, so a body counts the same in either content form,
+/// `thinking` included.
+pub fn bedrock_count_tokens_invoke_body(body: &Value, upstream_id: &str) -> Value {
     let mut out = body.clone();
+    for message in out
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(text) = message
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            message["content"] = serde_json::json!([{"type": "text", "text": text}]);
+        }
+    }
     shape_request(&mut out, Platform::Bedrock, upstream_id, Vec::new());
     let budget = out
         .get("thinking")
@@ -390,7 +400,7 @@ pub fn bedrock_count_tokens_invoke_body(body: &Value, upstream_id: &str) -> Opti
             Value::from(max_tokens.max(budget + 1)),
         );
     }
-    Some(out)
+    out
 }
 
 /// The body for Vertex AI's count-tokens model: the fields, `metadata` and
@@ -602,6 +612,51 @@ fn fold_output_format(obj: &mut Map<String, Value>) {
     }
 }
 
+/// Keep only the `anthropic_beta` values Bedrock takes in a body bound for
+/// it, under Bedrock's names, and drop the field when none is left.
+pub fn retain_bedrock_betas(obj: &mut Map<String, Value>) {
+    let Some(Value::Array(betas)) = obj.get("anthropic_beta") else {
+        return;
+    };
+    let kept: BTreeSet<&str> = betas
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(|b| platform_beta(Platform::Bedrock, b))
+        .collect();
+    if kept.len() != betas.len() {
+        tracing::debug!(
+            sent = ?betas,
+            kept = ?kept,
+            "anthropic_beta values Bedrock does not take were not sent"
+        );
+    }
+    if kept.is_empty() {
+        obj.remove("anthropic_beta");
+    } else {
+        let kept = kept
+            .into_iter()
+            .map(|b| Value::String(b.to_string()))
+            .collect();
+        obj.insert("anthropic_beta".to_string(), Value::Array(kept));
+    }
+}
+
+/// Drop a `thinking.display` Bedrock refuses from a body bound for it,
+/// leaving the model's default display. Bedrock takes `summarized` and
+/// `omitted` and answers any other value (`updates`) with a 400.
+pub fn retain_bedrock_thinking_display(obj: &mut Map<String, Value>) {
+    let Some(thinking) = obj.get_mut("thinking").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(value) = thinking.get("display") else {
+        return;
+    };
+    if !matches!(value.as_str(), Some("summarized" | "omitted")) {
+        tracing::debug!(display = %value, "thinking.display Bedrock refuses was not sent");
+        thinking.remove("display");
+    }
+}
+
 /// Keep the `context_management.edits` Bedrock runs and add the beta each
 /// needs; drop the field when none is left.
 fn filter_bedrock_context_management(obj: &mut Map<String, Value>, betas: &mut BTreeSet<String>) {
@@ -669,7 +724,8 @@ mod tests {
             [
                 "context-1m-2025-08-07",
                 "context-management-2025-06-27",
-                "effort-2025-11-24"
+                "effort-2025-11-24",
+                "interleaved-thinking-2025-05-14"
             ]
         );
         assert_eq!(body["anthropic_beta"], json!(betas));
@@ -688,6 +744,39 @@ mod tests {
                 body.get(gone).is_none(),
                 "{gone} must not reach InvokeModel"
             );
+        }
+    }
+
+    #[test]
+    fn bedrock_thinking_display_keeps_only_the_values_bedrock_takes() {
+        for (display, kept) in [
+            (json!("summarized"), true),
+            (json!("omitted"), true),
+            (json!("updates"), false),
+            (json!(null), false),
+            (json!(1), false),
+        ] {
+            let mut body = json!({
+                "model": "m",
+                "max_tokens": 10,
+                "thinking": {"type": "enabled", "budget_tokens": 1024, "display": display.clone()},
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            shape_request(
+                &mut body,
+                Platform::Bedrock,
+                "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                Vec::new(),
+            );
+            assert_eq!(body["thinking"]["budget_tokens"], 1024);
+            assert_eq!(
+                body["thinking"].get("display") == Some(&display),
+                kept,
+                "{display}: {body}"
+            );
+            if !kept {
+                assert!(body["thinking"].get("display").is_none(), "{body}");
+            }
         }
     }
 

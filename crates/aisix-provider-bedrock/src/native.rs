@@ -14,11 +14,7 @@ use aisix_provider_anthropic::platform::{self, Platform};
 use aws_sdk_bedrockruntime::error::SdkError;
 use aws_sdk_bedrockruntime::primitives::Blob;
 use aws_sdk_bedrockruntime::types::error::ResponseStreamError;
-use aws_sdk_bedrockruntime::types::{
-    ContentBlock, ConversationRole, ConverseTokensRequest, CountTokensInput,
-    InvokeModelTokensRequest, Message, ResponseStream, SystemContentBlock, Tool, ToolConfiguration,
-    ToolInputSchema, ToolSpecification,
-};
+use aws_sdk_bedrockruntime::types::{CountTokensInput, InvokeModelTokensRequest, ResponseStream};
 use serde_json::Value;
 
 use crate::bridge::{
@@ -152,21 +148,17 @@ impl BedrockBridge {
         // ARN path.
         let tail = upstream_id.rsplit('/').next().unwrap_or(upstream_id);
         let model_id = strip_region_prefix(tail);
-        let input = match platform::bedrock_count_tokens_invoke_body(&body, upstream_id) {
-            Some(invoke) => {
-                let bytes =
-                    Vec::from(aisix_gateway::json_body(&invoke).map_err(|e| {
-                        BridgeError::Config(format!("serialize request body: {e}"))
-                    })?);
-                CountTokensInput::InvokeModel(
-                    InvokeModelTokensRequest::builder()
-                        .body(Blob::new(bytes))
-                        .build()
-                        .map_err(|e| BridgeError::Config(e.to_string()))?,
-                )
-            }
-            None => CountTokensInput::Converse(converse_count_input(&body)?),
-        };
+        let invoke = platform::bedrock_count_tokens_invoke_body(&body, upstream_id);
+        let bytes = Vec::from(
+            aisix_gateway::json_body(&invoke)
+                .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?,
+        );
+        let input = CountTokensInput::InvokeModel(
+            InvokeModelTokensRequest::builder()
+                .body(Blob::new(bytes))
+                .build()
+                .map_err(|e| BridgeError::Config(e.to_string()))?,
+        );
         let client = self.build_client_from_ctx(ctx)?;
         let started = Instant::now();
         let runtime = client
@@ -241,6 +233,10 @@ async fn mantle_count_tokens(
         if let Some(v) = body.get(key).filter(|v| !v.is_null()) {
             count.insert(key.to_string(), v.clone());
         }
+    }
+    // A display cannot change the count, and Bedrock refuses some values.
+    if let Some(thinking) = count.get_mut("thinking").and_then(Value::as_object_mut) {
+        thinking.remove("display");
     }
     let bytes = Vec::from(
         aisix_gateway::json_body(&Value::Object(count))
@@ -330,99 +326,6 @@ async fn mantle_count_tokens(
             BridgeError::UpstreamDecode("count_tokens answer carries no input_tokens".into())
         })?;
     Ok(serde_json::json!({"input_tokens": tokens}))
-}
-
-/// The `converse` input for a body whose messages are all plain strings:
-/// each message as one text block, `system` as text blocks, and the tools
-/// as tool specs under a Bedrock-valid name.
-fn converse_count_input(body: &Value) -> Result<ConverseTokensRequest, BridgeError> {
-    let mut req = ConverseTokensRequest::builder();
-    for m in body
-        .get("messages")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let role = match m.get("role").and_then(Value::as_str) {
-            Some("assistant") => ConversationRole::Assistant,
-            _ => ConversationRole::User,
-        };
-        let mut msg = Message::builder().role(role);
-        if let Some(text) = m.get("content").and_then(Value::as_str) {
-            msg = msg.content(ContentBlock::Text(text.to_string()));
-        }
-        req = req.messages(
-            msg.build()
-                .map_err(|e| BridgeError::Config(e.to_string()))?,
-        );
-    }
-    match body.get("system") {
-        Some(Value::String(s)) => req = req.system(SystemContentBlock::Text(s.clone())),
-        Some(Value::Array(blocks)) => {
-            for b in blocks {
-                let text = b.get("text").and_then(Value::as_str).unwrap_or_default();
-                req = req.system(SystemContentBlock::Text(text.to_string()));
-            }
-        }
-        _ => {}
-    }
-    let tools: Vec<Tool> = body
-        .get("tools")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|t| {
-            let name = converse_tool_name(t.get("name").and_then(Value::as_str).unwrap_or(""));
-            let description = t
-                .get("description")
-                .and_then(Value::as_str)
-                .filter(|d| !d.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| name.clone());
-            let schema = t
-                .get("input_schema")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
-            ToolSpecification::builder()
-                .name(name)
-                .description(description)
-                .input_schema(ToolInputSchema::Json(crate::convert::json_to_document(
-                    &schema,
-                )))
-                .build()
-                .ok()
-                .map(Tool::ToolSpec)
-        })
-        .collect();
-    if !tools.is_empty() {
-        req = req.tool_config(
-            ToolConfiguration::builder()
-                .set_tools(Some(tools))
-                .build()
-                .map_err(|e| BridgeError::Config(e.to_string()))?,
-        );
-    }
-    Ok(req.build())
-}
-
-/// A tool name Converse accepts: `[a-zA-Z0-9_]`, starting with a letter,
-/// at most 64 characters.
-fn converse_tool_name(raw: &str) -> String {
-    let name: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let name = match name.chars().next() {
-        Some(c) if !c.is_ascii_alphabetic() => format!("t_{name}"),
-        _ => name,
-    };
-    name.chars().take(64).collect()
 }
 
 /// One stream event as an Anthropic SSE frame. A `chunk` carries the
@@ -527,11 +430,5 @@ mod tests {
         ] {
             assert!(!serves_anthropic_messages(id), "{id}");
         }
-    }
-
-    #[test]
-    fn converse_tool_names_are_made_valid() {
-        assert_eq!(converse_tool_name("mcp__fs.read"), "mcp__fs_read");
-        assert_eq!(converse_tool_name("1st"), "t_1st");
     }
 }

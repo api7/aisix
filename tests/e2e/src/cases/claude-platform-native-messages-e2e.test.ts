@@ -174,6 +174,13 @@ async function startUpstream(): Promise<Upstream> {
       if (path === "/v1/messages/count_tokens") return json({ input_tokens: 99 });
       if (path.endsWith("/models/count-tokens:rawPredict")) return json({ input_tokens: 17 });
       if (path.endsWith("/invoke")) return json(reply("msg_bdrk_nonstream"));
+      if (path.endsWith("/converse"))
+        return json({
+          output: { message: { role: "assistant", content: [{ text: "ok" }] } },
+          stopReason: "end_turn",
+          usage: { inputTokens: UNCACHED_IN, outputTokens: 2, totalTokens: UNCACHED_IN + 2 },
+          metrics: { latencyMs: 1 },
+        });
       if (path.endsWith(":rawPredict")) return json(reply("msg_vrtx_nonstream"));
       if (path.endsWith(":streamRawPredict")) {
         res.writeHead(200, { "content-type": "text/event-stream" });
@@ -446,10 +453,12 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
     // Only the Bedrock-known betas, with the ones the body's own features
     // need; the effort beta because Claude 4.5 takes `effort` as a beta.
     expect(body.anthropic_beta).toEqual([
+      "claude-code-20250219",
       "context-1m-2025-08-07",
       "context-management-2025-06-27",
       "effort-2025-11-24",
       "fine-grained-tool-streaming-2025-05-14",
+      "interleaved-thinking-2025-05-14",
     ]);
     // Bedrock runs only some context-management edits.
     expect(body.context_management).toEqual({ edits: [{ type: "clear_tool_uses_20250919" }] });
@@ -486,6 +495,14 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
     expect(sent.upstream.path).toBe(`/model/${BEDROCK_ID}/invoke-with-response-stream`);
     const body = JSON.parse(sent.upstream.body);
     expect(body).not.toHaveProperty("stream");
+    expect(body.anthropic_beta).toEqual([
+      "claude-code-20250219",
+      "context-1m-2025-08-07",
+      "context-management-2025-06-27",
+      "effort-2025-11-24",
+      "fine-grained-tool-streaming-2025-05-14",
+      "interleaved-thinking-2025-05-14",
+    ]);
     expect(body.messages[1].content[0].signature).toBe("sig-history");
     expect(body.messages[2].content[0].content[1]).toEqual(BASE64_IMAGE);
 
@@ -511,6 +528,92 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
     expect(row.get("cache_read_tokens")).toBe(String(CACHE_READ));
     expect(row.get("cache_creation_tokens")).toBe(String(CACHE_WRITE));
     expect(row.get("provider_request_id")).toBe("msg_bdrk_stream");
+  });
+
+  test("Bedrock receives the betas it runs and none it refuses", async (ctx) => {
+    if (skip(ctx)) return;
+    const runs = [
+      "interleaved-thinking-2025-05-14",
+      "output-128k-2025-02-19",
+      "structured-outputs-2025-11-13",
+      "thinking-token-count-2026-05-13",
+      "token-efficient-tools-2025-02-19",
+      "tool-examples-2025-10-29",
+    ];
+    const refused = [
+      "dangerous-tool-use-2026-09-03",
+      "extended-cache-ttl-2025-04-11",
+      "files-api-2025-04-14",
+      "prompt-caching-2024-07-31",
+      "prompt-caching-scope-2026-01-05",
+      "thinking-binding-controls-2026-08-01",
+      "thinking-display-updates-2026-08-18",
+      "token-counting-2024-11-01",
+    ];
+    for (const stream of [false, true]) {
+      const sent = await send(
+        "/v1/messages",
+        {
+          model: BEDROCK,
+          max_tokens: 2000,
+          stream,
+          thinking: { type: "enabled", budget_tokens: 1024, display: "updates" },
+          messages: [{ role: "user", content: "What is 17*23?" }],
+        },
+        [...refused, ...runs].join(","),
+      );
+      expect(sent.status, sent.text).toBe(200);
+      const body = JSON.parse(sent.upstream.body);
+      expect(body.anthropic_beta, `stream=${stream}`).toEqual(runs);
+      // Bedrock refuses `display: "updates"`; the default display applies.
+      expect(body.thinking, `stream=${stream}`).toEqual({ type: "enabled", budget_tokens: 1024 });
+    }
+
+    const summarized = await send("/v1/messages", {
+      model: BEDROCK,
+      max_tokens: 2000,
+      thinking: { type: "enabled", budget_tokens: 1024, display: "summarized" },
+      messages: [{ role: "user", content: "What is 17*23?" }],
+    });
+    expect(summarized.status, summarized.text).toBe(200);
+    expect(JSON.parse(summarized.upstream.body).thinking).toEqual({
+      type: "enabled",
+      budget_tokens: 1024,
+      display: "summarized",
+    });
+  });
+
+  test("chat to Claude on Bedrock sends only the body betas Bedrock runs", async (ctx) => {
+    if (skip(ctx)) return;
+    const chat = {
+      model: BEDROCK,
+      max_tokens: 2000,
+      messages: [{ role: "user", content: "What is 17*23?" }],
+      thinking: { type: "enabled", budget_tokens: 1024, display: "updates" },
+      anthropic_beta: [
+        "interleaved-thinking-2025-05-14",
+        "thinking-display-updates-2026-08-18",
+        "advanced-tool-use-2025-11-20",
+        "files-api-2025-04-14",
+      ],
+    };
+    const expected = ["interleaved-thinking-2025-05-14", "tool-search-tool-2025-10-19"];
+
+    const invoke = await send("/v1/chat/completions", chat);
+    expect(invoke.status, invoke.text).toBe(200);
+    expect(invoke.upstream.path).toBe(`/model/${BEDROCK_ID}/invoke`);
+    const invokeBody = JSON.parse(invoke.upstream.body);
+    expect(invokeBody.anthropic_beta).toEqual(expected);
+    expect(invokeBody.thinking).toEqual({ type: "enabled", budget_tokens: 1024 });
+
+    // `requestMetadata` has no place in InvokeModel, so this one is served
+    // by Converse.
+    const converse = await send("/v1/chat/completions", { ...chat, requestMetadata: { team: "a" } });
+    expect(converse.status, converse.text).toBe(200);
+    expect(converse.upstream.path).toBe(`/model/${BEDROCK_ID}/converse`);
+    const fields = JSON.parse(converse.upstream.body).additionalModelRequestFields;
+    expect(fields.anthropic_beta).toEqual(expected);
+    expect(fields.thinking).toEqual({ type: "enabled", budget_tokens: 1024 });
   });
 
   test("an image URL inside a tool result is downloaded for Bedrock and Vertex AI", async (ctx) => {
@@ -580,15 +683,28 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
     );
     expect(budgetedBody.max_tokens).toBeGreaterThan(4000);
 
-    const plain = await send("/v1/messages/count_tokens", {
-      model: BEDROCK,
-      system: "Be brief.",
-      messages: [{ role: "user", content: "hello" }],
-    });
-    expect(plain.status, plain.text).toBe(200);
-    const converse = JSON.parse(plain.upstream.body).input.converse;
-    expect(converse.messages).toEqual([{ role: "user", content: [{ text: "hello" }] }]);
-    expect(converse.system).toEqual([{ text: "Be brief." }]);
+    // Plain-string content counts exactly as its typed form, thinking
+    // included.
+    const counted = async (content: (text: string) => unknown) => {
+      const sent = await send("/v1/messages/count_tokens", {
+        model: BEDROCK,
+        system: "Be brief.",
+        thinking: { type: "enabled", budget_tokens: 2048 },
+        messages: [
+          { role: "user", content: content("hello") },
+          { role: "assistant", content: content("Hi.") },
+          { role: "user", content: content("What is 17*23?") },
+        ],
+      });
+      expect(sent.status, sent.text).toBe(200);
+      const input = JSON.parse(sent.upstream.body).input;
+      expect(input).not.toHaveProperty("converse");
+      return JSON.parse(Buffer.from(input.invokeModel.body, "base64").toString("utf8"));
+    };
+    const plain = await counted((text) => text);
+    const blocks = await counted((text) => [{ type: "text", text }]);
+    expect(plain.thinking).toEqual({ type: "enabled", budget_tokens: 2048 });
+    expect(plain).toEqual(blocks);
   });
 
   test("a Claude model bedrock-runtime cannot count is counted on Bedrock Mantle", async (ctx) => {
@@ -600,7 +716,7 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
       body: JSON.stringify({
         model: BEDROCK_MANTLE_ONLY,
         system: "Be brief.",
-        thinking: { type: "enabled", budget_tokens: 2048 },
+        thinking: { type: "enabled", budget_tokens: 2048, display: "updates" },
         messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
       }),
     });
