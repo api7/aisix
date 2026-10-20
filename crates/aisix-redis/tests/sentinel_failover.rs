@@ -45,12 +45,17 @@ async fn master_addr(sentinel_url: &str, master: &str) -> (String, String) {
     (addr[0].clone(), addr[1].clone())
 }
 
-async fn sentinel_conn(sentinel_url: &str) -> redis::aio::MultiplexedConnection {
-    redis::Client::open(sentinel_url)
-        .expect("sentinel client")
+/// One Sentinel round trip. The polling below opens a connection per call
+/// and treats an error as "ask again", so a Sentinel that is briefly
+/// unreachable mid-failover does not end the test.
+async fn sentinel_query<T: redis::FromRedisValue>(
+    sentinel_url: &str,
+    cmd: &redis::Cmd,
+) -> redis::RedisResult<T> {
+    let mut conn = redis::Client::open(sentinel_url)?
         .get_multiplexed_async_connection()
-        .await
-        .expect("sentinel conn")
+        .await?;
+    cmd.query_async(&mut conn).await
 }
 
 /// Whether the sentinel is in TILT mode. A sentinel that finds its own
@@ -58,66 +63,62 @@ async fn sentinel_conn(sentinel_url: &str) -> redis::aio::MultiplexedConnection 
 /// under load — stops acting for thirty seconds, failovers included, so
 /// a failover it accepted does not start until TILT ends.
 async fn sentinel_tilted(sentinel_url: &str) -> bool {
-    let info: String = redis::cmd("INFO")
-        .arg("sentinel")
-        .query_async(&mut sentinel_conn(sentinel_url).await)
+    sentinel_query::<String>(sentinel_url, redis::cmd("INFO").arg("sentinel"))
         .await
-        .expect("INFO sentinel");
-    info.lines().any(|l| l.trim() == "sentinel_tilt:1")
+        .is_ok_and(|info| info.lines().any(|l| l.trim() == "sentinel_tilt:1"))
 }
 
 /// Sentinel's own view of the failover, for the message of a test that
 /// gave up on it.
 async fn sentinel_state(sentinel_url: &str, master: &str) -> String {
-    let mut conn = sentinel_conn(sentinel_url).await;
-    let info: String = redis::cmd("INFO")
-        .arg("sentinel")
-        .query_async(&mut conn)
+    let info = sentinel_query::<String>(sentinel_url, redis::cmd("INFO").arg("sentinel"))
         .await
         .unwrap_or_else(|e| format!("INFO sentinel failed: {e}"));
-    let fields: Vec<String> = redis::cmd("SENTINEL")
-        .arg("MASTER")
-        .arg(master)
-        .query_async(&mut conn)
-        .await
-        .unwrap_or_else(|e| vec![format!("SENTINEL MASTER failed: {e}")]);
-    let replicas: redis::Value = redis::cmd("SENTINEL")
-        .arg("REPLICAS")
-        .arg(master)
-        .query_async(&mut conn)
-        .await
-        .unwrap_or_else(|e| redis::Value::SimpleString(format!("SENTINEL REPLICAS failed: {e}")));
+    let fields = sentinel_query::<Vec<String>>(
+        sentinel_url,
+        redis::cmd("SENTINEL").arg("MASTER").arg(master),
+    )
+    .await
+    .unwrap_or_else(|e| vec![format!("SENTINEL MASTER failed: {e}")]);
+    let replicas = sentinel_query::<redis::Value>(
+        sentinel_url,
+        redis::cmd("SENTINEL").arg("REPLICAS").arg(master),
+    )
+    .await
+    .unwrap_or_else(|e| redis::Value::SimpleString(format!("SENTINEL REPLICAS failed: {e}")));
     format!(
         "{}\nmaster: {fields:?}\nreplicas: {replicas:?}",
         info.trim()
     )
 }
 
-/// Whether Sentinel is running a failover of `master` right now.
+/// Whether Sentinel is running a failover of `master` right now. No answer
+/// counts as yes, so the caller polls again rather than asking for another.
 async fn failover_in_progress(sentinel_url: &str, master: &str) -> bool {
-    let fields: Vec<String> = redis::cmd("SENTINEL")
-        .arg("MASTER")
-        .arg(master)
-        .query_async(&mut sentinel_conn(sentinel_url).await)
-        .await
-        .expect("SENTINEL MASTER");
-    fields.chunks(2).any(|kv| {
-        kv[0] == "flags"
-            && kv
-                .get(1)
-                .is_some_and(|f| f.contains("failover_in_progress"))
+    sentinel_query::<Vec<String>>(
+        sentinel_url,
+        redis::cmd("SENTINEL").arg("MASTER").arg(master),
+    )
+    .await
+    .map_or(true, |fields| {
+        fields.chunks(2).any(|kv| {
+            kv[0] == "flags"
+                && kv
+                    .get(1)
+                    .is_some_and(|f| f.contains("failover_in_progress"))
+        })
     })
 }
 
 /// Ask Sentinel for a failover; what it answered, for the failure message.
 /// A refusal is not fatal: the caller asks again until the deadline.
 async fn request_failover(sentinel_url: &str, master: &str) -> String {
-    redis::cmd("SENTINEL")
-        .arg("FAILOVER")
-        .arg(master)
-        .query_async::<redis::Value>(&mut sentinel_conn(sentinel_url).await)
-        .await
-        .map_or_else(|e| e.to_string(), |v| format!("{v:?}"))
+    sentinel_query::<redis::Value>(
+        sentinel_url,
+        redis::cmd("SENTINEL").arg("FAILOVER").arg(master),
+    )
+    .await
+    .map_or_else(|e| e.to_string(), |v| format!("{v:?}"))
 }
 
 /// How long TILT lasts once entered (Sentinel's `SENTINEL_TILT_PERIOD`).
@@ -153,7 +154,11 @@ async fn sentinel_reresolves_master_after_failover() {
     // or the client can shorten, so the wait is extended by a TILT period
     // whenever one is observed, and a failover Sentinel is no longer
     // running is requested again.
-    let mut deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let started = tokio::time::Instant::now();
+    let mut deadline = started + Duration::from_secs(30);
+    // However often Sentinel re-enters TILT, give up — with the diagnostic
+    // below — rather than wait for the job's own timeout.
+    let ceiling = started + 3 * TILT_PERIOD + Duration::from_secs(30);
     let mut tilt_seen_until = tokio::time::Instant::now();
     let mut requests = Vec::new();
     let mut promoted = false;
@@ -166,7 +171,9 @@ async fn sentinel_reresolves_master_after_failover() {
         let now = tokio::time::Instant::now();
         if now >= tilt_seen_until && sentinel_tilted(&sentinel_url).await {
             tilt_seen_until = now + TILT_PERIOD;
-            deadline = deadline.max(tilt_seen_until + Duration::from_secs(30));
+            deadline = deadline
+                .max(tilt_seen_until + Duration::from_secs(30))
+                .min(ceiling);
         }
         // The port is read again after the flags: a failover that ended
         // between the first read and the flags has already switched it,

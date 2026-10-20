@@ -25,9 +25,11 @@ const PIECES_IN_FLIGHT: usize = 2;
 #[cfg(not(test))]
 const PIECE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Shortened so a case can drive a reader that stops without waiting one
-/// out; what the case pins is the abandonment, not the number.
+/// out; what the case pins is the abandonment, not the number. Still long
+/// enough that a reader a loaded runner merely descheduled is not taken
+/// for one that stopped.
 #[cfg(test)]
-const PIECE_TIMEOUT: Duration = Duration::from_millis(200);
+const PIECE_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(crate) struct Scrape {
     /// One render at a time. Walking and formatting every series is the
