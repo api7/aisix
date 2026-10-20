@@ -1170,7 +1170,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_input_returns_allow_and_signs_request() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/"))
             // proves the signed form body carries Action + Service + Signature
@@ -1188,7 +1188,7 @@ mod tests {
 
     #[tokio::test]
     async fn block_suggestion_blocks() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(suggestion_body("block")))
             .mount(&server)
@@ -1200,7 +1200,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_suggestion_releases_on_both_paths() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(suggestion_body("watch")))
             .mount(&server)
@@ -1245,7 +1245,7 @@ mod tests {
         // check_input / check_output have no write-back channel (they
         // serve the mid-stream windows): releasing un-masked content
         // there would defeat the operator's desensitization policy.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -1260,7 +1260,7 @@ mod tests {
 
     #[tokio::test]
     async fn mask_rewrites_a_single_segment() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -1291,7 +1291,7 @@ mod tests {
     /// submitted.
     #[tokio::test]
     async fn segment_scan_covers_content_past_the_cap() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("RISKMARKER"))
             .respond_with(ResponseTemplate::new(200).set_body_json(suggestion_body("block")))
@@ -1317,7 +1317,7 @@ mod tests {
     /// what the embeddings / rerank / audio / images endpoints use.
     #[tokio::test]
     async fn blob_scan_covers_content_past_the_cap() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("RISKMARKER"))
             .respond_with(ResponseTemplate::new(200).set_body_json(suggestion_body("block")))
@@ -1340,7 +1340,7 @@ mod tests {
     /// but the tail had never been examined.
     #[tokio::test]
     async fn mask_covers_every_chunk_of_an_oversized_segment() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // Every chunk masks, rewriting its content to a fixed marker.
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(mask_body(Some("[MASKED]"))))
@@ -1365,7 +1365,7 @@ mod tests {
     /// than losing the clean parts.
     #[tokio::test]
     async fn unmasked_chunks_are_reassembled_verbatim() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("SECRET"))
             .respond_with(ResponseTemplate::new(200).set_body_json(mask_body(Some("[MASKED]"))))
@@ -1413,7 +1413,7 @@ mod tests {
 
     #[tokio::test]
     async fn mask_realigns_multi_segment_via_per_segment_recalls() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(mount_segment_aware_mask(&server.uri()))
             .mount(&server)
@@ -1442,7 +1442,7 @@ mod tests {
         // Aliyun says the content must be masked but returns nothing to
         // rewrite it with → releasing the original would defeat the
         // policy, so the segment path must block.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(mask_body(None)))
             .mount(&server)
@@ -1462,7 +1462,7 @@ mod tests {
         // string-encoded form is a defensive tolerance for the way Aliyun
         // types `Ext` inconsistently across its green actions; keep it covered
         // so a nested-JSON-string body can't silently drop the mask.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "Code": 200,
@@ -1498,7 +1498,7 @@ mod tests {
         // `Ext.SensitiveData` (the original matched values — a leak vector we
         // must never read) with NO Desensitization. The write-back must be
         // the one full-text carrier, not an empty/partial sibling.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "Code": 200,
@@ -1553,7 +1553,7 @@ mod tests {
 
     #[tokio::test]
     async fn basic_service_level_uses_non_pro_codes() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("Service=query_security_check"))
             .respond_with(ResponseTemplate::new(200).set_body_json(suggestion_body("pass")))
@@ -1568,7 +1568,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_sends_session_and_chat_id() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("Service=response_security_check_pro"))
             // sessionId and chatId are JSON-encoded inside ServiceParameters,
@@ -1587,7 +1587,7 @@ mod tests {
     async fn unknown_dimension_and_fields_flow_through() {
         // A future Aliyun dimension (unknown Type, extra fields, S-level
         // vocabulary) must not fail the call (#1070 forward-compat).
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "Code": 200,
@@ -1614,7 +1614,7 @@ mod tests {
     async fn missing_suggestion_releases() {
         // HTTP 200 / Code 200 with no Data.Suggestion at all: tolerate and
         // release rather than block on a field Aliyun didn't send.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -1635,7 +1635,7 @@ mod tests {
             (581, "aliyun_timeout"),
             (500, "aliyun_5xx"),
         ] {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(200)
@@ -1653,7 +1653,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_5xx_fail_open_true_returns_bypass() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
@@ -1667,7 +1667,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_5xx_fails_closed_by_default() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
@@ -1776,7 +1776,7 @@ mod tests {
         //    only the DETECTED labels — while the matched content in Ext
         //    stays out of the log (#153).
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(200)
@@ -1821,7 +1821,7 @@ mod tests {
         // 2. The commodity-not-activated business error (Code 408 on HTTP
         //    200) — the most common first-run failure — must name the fix.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "Code": 408,
@@ -1846,7 +1846,7 @@ mod tests {
         // 3. An HTTP-4xx RPC error logs the symbolic code, never the body
         //    (the SignatureDoesNotMatch echo problem — see crate::aliyun).
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(400).set_body_json(json!({
                     "RequestId": "SIG-ERR-1",
@@ -1876,7 +1876,7 @@ mod tests {
 
         // 4. Timeout: no response, empty id, failure bucket named.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(200)
@@ -1901,7 +1901,7 @@ mod tests {
         // 5. HTTP 200 with a non-JSON body: header id survives, failure
         //    type says malformed (not 5xx).
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(200)

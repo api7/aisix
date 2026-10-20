@@ -558,7 +558,7 @@ mod tests {
     /// can't come from an unmatched-route 404 (which would also block).
     #[tokio::test]
     async fn output_5xx_fails_closed_by_default() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .and(query_param("api-version", "2024-09-01"))
@@ -580,7 +580,7 @@ mod tests {
     /// `output_fail_open`, not the input policy.
     #[tokio::test]
     async fn output_fail_open_true_bypasses_on_output() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .and(query_param("api-version", "2024-09-01"))
@@ -605,7 +605,7 @@ mod tests {
     async fn output_only_row_skips_input_check() {
         // No mock mounted — if check_input reached the HTTP layer, it would
         // time out quickly; Allow proves the hook-point guard fired first.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let mut g = build(&server.uri(), true);
         g.hook_point = GuardrailHookPoint::Output;
 
@@ -619,7 +619,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_only_row_skips_output_check() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let mut g = build(&server.uri(), true);
         g.hook_point = GuardrailHookPoint::Input;
 
@@ -644,7 +644,7 @@ mod tests {
     ///   (a version bump in SHIELD_PATH would otherwise silently pass all tests)
     #[tokio::test]
     async fn clean_input_returns_allow_and_sends_auth_header() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .and(query_param("api-version", "2024-09-01"))
@@ -670,7 +670,7 @@ mod tests {
     /// API returns `attackDetected=true` → Block verdict.
     #[tokio::test]
     async fn attack_detected_returns_block() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -690,7 +690,7 @@ mod tests {
     /// HTTP 500 + fail_open=true → Bypass tagged `azure_cs_5xx`.
     #[tokio::test]
     async fn http_5xx_fail_open_true_returns_bypass() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(ResponseTemplate::new(500))
@@ -708,7 +708,7 @@ mod tests {
     /// HTTP 500 + fail_open=false → Block.
     #[tokio::test]
     async fn http_5xx_fail_open_false_returns_block() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(ResponseTemplate::new(500))
@@ -723,7 +723,7 @@ mod tests {
     /// HTTP 429 → `azure_cs_throttled`.
     #[tokio::test]
     async fn http_429_fail_open_true_returns_bypass_throttled() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(ResponseTemplate::new(429))
@@ -742,7 +742,7 @@ mod tests {
     /// `azure_cs_config_error` (NOT `azure_cs_5xx`).
     #[tokio::test]
     async fn http_401_fail_open_true_returns_bypass_config_error() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(ResponseTemplate::new(401))
@@ -762,7 +762,7 @@ mod tests {
     /// HTTP 401 + fail_open=false → Block (same as other failures).
     #[tokio::test]
     async fn http_401_fail_open_false_returns_block() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(ResponseTemplate::new(401))
@@ -777,7 +777,7 @@ mod tests {
     /// `timeout=100ms` + wiremock delayed 800ms → Bypass tagged `azure_cs_timeout`.
     #[tokio::test]
     async fn call_timeout_fail_open_true_returns_bypass_timeout() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(
@@ -805,7 +805,7 @@ mod tests {
     /// `attackDetected=true` the overall verdict is Block.
     #[tokio::test]
     async fn long_prompt_splits_and_blocks_on_attack() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // Respond with attackDetected=true for all calls.
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
@@ -826,7 +826,7 @@ mod tests {
     /// Long clean prompt: all chunks return clean → Allow overall.
     #[tokio::test]
     async fn long_clean_prompt_returns_allow() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -845,7 +845,7 @@ mod tests {
     /// Output check: response content with attack → Block.
     #[tokio::test]
     async fn attack_in_output_returns_block() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -864,7 +864,7 @@ mod tests {
     #[tokio::test]
     async fn empty_input_skips_api_call() {
         // No mock mounted — if the API were called it would fail immediately.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let g = build(&server.uri(), true);
         let empty_req = ChatFormat::new("m", vec![ChatMessage::user("")]);
         let v = g.check_input(&empty_req).await;

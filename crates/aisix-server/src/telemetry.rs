@@ -847,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_posts_events_array_with_no_authorization() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/telemetry"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -893,7 +893,7 @@ mod tests {
     /// ride it.
     #[tokio::test]
     async fn send_never_posts_captured_header_values() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/telemetry"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -936,7 +936,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_propagates_non_success_with_body_excerpt() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/telemetry"))
             .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
@@ -1053,7 +1053,7 @@ mod tests {
     type RecordedBatches = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
 
     async fn recording_server(first_status: u16) -> (MockServer, RecordedBatches) {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&batches);
         Mock::given(method("POST"))
@@ -1078,7 +1078,7 @@ mod tests {
     /// arrives behind it. The body is recorded before the wait, so the
     /// test can tell "in flight" from "not sent yet".
     async fn recording_server_holding_first(held: Duration) -> (MockServer, RecordedBatches) {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&batches);
         Mock::given(method("POST"))
@@ -1173,7 +1173,7 @@ mod tests {
     /// one dp-manager Service a rolling upgrade answers from both kinds of
     /// replica.
     async fn scripted_server(script: Vec<Answer>) -> (MockServer, RecordedPosts) {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let posts: RecordedPosts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&posts);
         Mock::given(method("POST"))

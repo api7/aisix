@@ -1152,7 +1152,7 @@ mod tests {
     /// `query` returns 422 content_filter and the upstream is never contacted.
     #[tokio::test]
     async fn input_guardrail_blocks_query_returns_422() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/rerank"))
             .respond_with(
@@ -1188,7 +1188,7 @@ mod tests {
     /// #545: a blocked literal in `documents` (not the query) is also scanned.
     #[tokio::test]
     async fn input_guardrail_blocks_document_returns_422() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/rerank"))
             .respond_with(
@@ -1226,7 +1226,7 @@ mod tests {
     /// guardrail must not block clean rerank traffic.
     #[tokio::test]
     async fn input_guardrail_allows_benign_rerank_forwards_200() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/rerank"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1364,7 +1364,7 @@ mod tests {
     async fn jina_provider_dispatches_to_upstream_with_bearer_auth() {
         use wiremock::matchers::header;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/rerank"))
             .and(header("authorization", "Bearer jina_mock_secret"))
@@ -1437,7 +1437,7 @@ mod tests {
     async fn cohere_provider_dispatches_to_upstream_with_bearer_auth() {
         use wiremock::matchers::header;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/rerank"))
             .and(header("authorization", "Bearer sk-cohere-mock"))
@@ -1527,7 +1527,7 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_forwards_to_upstream() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/rerank"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1561,7 +1561,7 @@ mod tests {
     async fn records_the_provider_response_id_1289() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/rerank"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1612,7 +1612,7 @@ mod tests {
     async fn emits_usage_event_on_200_openai_compat_issue_405() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // OpenAI-compat rerank: `usage.prompt_tokens`.
         let upstream_body = serde_json::json!({
             "id": "rerank-1",
@@ -1678,7 +1678,7 @@ mod tests {
     async fn applied_guardrails_recorded_on_usage_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // OpenAI-compat rerank: `usage.prompt_tokens` so the handler reaches
         // the emit path (emission is gated on a recognisable usage field).
         let upstream_body = serde_json::json!({
@@ -1743,7 +1743,7 @@ mod tests {
     async fn emits_usage_event_on_jina_total_tokens_only_shape_audit_m1() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // Jina wire shape: `usage.total_tokens` only (no prompt /
         // input variant). Real Jina rerank responses look exactly
         // like this.
@@ -1802,7 +1802,7 @@ mod tests {
     async fn emits_usage_event_on_cohere_wire_shape_issue_405() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // Cohere's live wire shape: search units only, no token count.
         let upstream_body = serde_json::json!({
             "id": "rerank-cohere",
@@ -1861,7 +1861,7 @@ mod tests {
     async fn emits_zero_token_usage_event_when_upstream_lacks_usage_fields() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let upstream_body = serde_json::json!({
             "id": "rerank-bare",
             "results": []
@@ -1908,7 +1908,7 @@ mod tests {
     async fn no_usage_response_still_emits_guardrail_attribution() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/rerank"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1960,7 +1960,7 @@ mod tests {
     async fn upstream_5xx_emits_zero_token_error_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/rerank"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal"))
@@ -2035,7 +2035,7 @@ mod tests {
     async fn emits_provider_telemetry_tags_issue_867() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // OpenAI-compat rerank: `usage.prompt_tokens` so the handler reaches
         // the emit path (emission is gated on a recognisable usage field).
         let upstream_body = serde_json::json!({
@@ -2107,7 +2107,7 @@ mod tests {
     async fn applies_pk_request_overrides_issue_867() {
         use wiremock::matchers::{body_partial_json, header};
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/rerank"))
             .and(body_partial_json(serde_json::json!({"safe_flag": true})))
@@ -2152,7 +2152,7 @@ mod tests {
     /// the raw text was forwarded. Also pins the counts on the UsageEvent.
     #[tokio::test]
     async fn pii_mask_rewrites_query_and_documents_before_upstream_issue_696() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/rerank"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2213,7 +2213,7 @@ mod tests {
     async fn blocked_request_names_the_policy_on_the_usage_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let snap = new_snap(&upstream.uri());
         snap.models.insert(openai_model("rerank-model"));
         snap.apikeys.insert(apikey_entry(&["*"]));
@@ -2276,7 +2276,7 @@ mod tests {
     async fn masked_request_names_the_policy_on_the_usage_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/rerank"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

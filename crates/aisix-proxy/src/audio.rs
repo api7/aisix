@@ -2956,7 +2956,7 @@ mod tests {
     /// UsageEvent's `applied_guardrails`.
     #[tokio::test]
     async fn speech_applied_guardrails_recorded_on_usage_event() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/speech"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"AUDIO".to_vec()))
@@ -2993,7 +2993,7 @@ mod tests {
     /// blocked `input` returns 422 content_filter, upstream never contacted.
     #[tokio::test]
     async fn input_guardrail_blocks_speech_input_returns_422() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/speech"))
             .respond_with(
@@ -3032,7 +3032,7 @@ mod tests {
     /// (`expect(1)`) and returns the audio bytes.
     #[tokio::test]
     async fn input_guardrail_allows_benign_speech_input() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/speech"))
             .respond_with(
@@ -3100,7 +3100,7 @@ mod tests {
 
     #[tokio::test]
     async fn speech_happy_path_returns_audio_bytes() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // TTS endpoint returns raw MP3 bytes.
         let fake_mp3 = b"ID3\x03\x00\x00\x00";
         Mock::given(method("POST"))
@@ -3168,7 +3168,7 @@ mod tests {
     /// guardrail. The upstream must never be contacted.
     #[tokio::test]
     async fn non_utf8_prompt_rejected_400_before_guardrail_and_upstream() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"text":"x"})))
@@ -3329,7 +3329,7 @@ mod tests {
     /// "openai".
     #[tokio::test]
     async fn transcriptions_emit_usage_event_with_tokens() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let body = serde_json::json!({
             "text": "hello world",
             "usage": {
@@ -3421,7 +3421,7 @@ mod tests {
     /// nothing to price the request with.
     #[tokio::test]
     async fn whisper_response_emits_the_duration_cost_basis() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let body = serde_json::json!({
             "text": "hello world",
             "usage": {"type": "duration", "seconds": 11.0}
@@ -3467,7 +3467,7 @@ mod tests {
     /// the uploaded file's own length.
     #[tokio::test]
     async fn text_format_falls_back_to_the_uploaded_file_duration() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
             .respond_with(ResponseTemplate::new(200).set_body_raw("hello world", "text/plain"))
@@ -3594,7 +3594,7 @@ mod tests {
     /// <https://platform.openai.com/docs/api-reference/audio/create-transcription>
     #[tokio::test]
     async fn streamed_transcription_bills_the_terminal_event_usage() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = concat!(
             "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello\"}\n\n",
             "data: {\"type\":\"transcript.text.delta\",\"delta\":\" world\"}\n\n",
@@ -3645,7 +3645,7 @@ mod tests {
     /// the request must be billed exactly once.
     #[tokio::test]
     async fn streamed_transcription_relays_verbatim_and_bills_once() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = concat!(
             "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello\"}\n\n",
             "data: {\"type\":\"transcript.text.delta\",\"delta\":\" world\"}\n\n",
@@ -3715,7 +3715,7 @@ mod tests {
     /// channel just because the upstream declined to stream (#998).
     #[tokio::test]
     async fn stream_requested_but_json_answered_is_still_billed() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let body = serde_json::json!({
             "text": "hello world",
             "usage": {"type": "tokens", "input_tokens": 14, "output_tokens": 4},
@@ -3866,7 +3866,7 @@ mod tests {
     /// chat / messages / responses. Fails before the fix (empty tags).
     #[tokio::test]
     async fn emits_provider_telemetry_tags_issue_867() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let body = serde_json::json!({
             "text": "hello world",
             "usage": {"type": "tokens", "input_tokens": 9, "output_tokens": 2, "total_tokens": 11}
@@ -3910,7 +3910,7 @@ mod tests {
     /// follow-up).
     #[tokio::test]
     async fn transcriptions_emit_zero_token_event_without_usage() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
             .respond_with(
@@ -3951,7 +3951,7 @@ mod tests {
     /// attributed.
     #[tokio::test]
     async fn speech_emits_zero_token_usage_event() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/speech"))
             .respond_with(
@@ -4015,7 +4015,7 @@ mod tests {
     /// `completions.rs::upstream_5xx_emits_zero_token_error_event`.
     #[tokio::test]
     async fn speech_5xx_emits_zero_token_error_event() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/speech"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal"))
@@ -4073,7 +4073,7 @@ mod tests {
     /// body field AND header, so a 200 proves both were applied.
     #[tokio::test]
     async fn speech_applies_pk_request_overrides_issue_867() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/speech"))
             .and(body_partial_json(serde_json::json!({"safe_flag": true})))
@@ -4107,7 +4107,7 @@ mod tests {
     /// 200 proves the operator header was applied.
     #[tokio::test]
     async fn transcriptions_applies_default_headers_issue_867() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
             .and(header("x-custom", "trace-on"))
@@ -4173,7 +4173,7 @@ mod tests {
     /// silent no-op on /v1/audio/speech.
     #[tokio::test]
     async fn speech_pii_mask_rewrites_input_before_upstream_issue_696() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/speech"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fakeaudio".to_vec()))
@@ -4211,7 +4211,7 @@ mod tests {
     /// 422 and the upstream is never contacted.
     #[tokio::test]
     async fn transcription_prompt_field_input_guardrail_blocks_issue_696() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"text":"x"})))
@@ -4241,7 +4241,7 @@ mod tests {
     /// `prompt` form field before the form is forwarded upstream.
     #[tokio::test]
     async fn transcription_prompt_field_pii_masked_before_upstream_issue_696() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"text":"x"})))
@@ -4281,7 +4281,7 @@ mod tests {
     /// was returned raw. Counts must land on the emitted UsageEvent.
     #[tokio::test]
     async fn transcription_output_pii_masked_issue_696() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let body = serde_json::json!({
             "text": "my address is a@x.com thanks",
             "usage": {"type": "tokens", "input_tokens": 9, "output_tokens": 6, "total_tokens": 15}
@@ -4332,7 +4332,7 @@ mod tests {
     /// convention as completions #911 [23].
     #[tokio::test]
     async fn transcription_output_guardrail_blocks_with_billed_usage_issue_696() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let body = serde_json::json!({
             "text": "the secret word is BLOCKME",
             "usage": {"type": "tokens", "input_tokens": 21, "output_tokens": 7, "total_tokens": 28}
@@ -4408,7 +4408,7 @@ mod tests {
         body: Vec<u8>,
         guardrail: ResourceEntry<aisix_core::Guardrail>,
     ) -> (StatusCode, axum::body::Bytes, aisix_obs::UsageEvent) {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
             .respond_with(
@@ -4553,7 +4553,7 @@ mod tests {
     /// streamed request is blocked exactly like the non-streamed one.
     #[tokio::test]
     async fn streamed_transcription_is_not_an_output_guardrail_bypass() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = concat!(
             "data: {\"type\":\"transcript.text.delta\",\"delta\":\"the secret word is \"}\n\n",
             "data: {\"type\":\"transcript.text.delta\",\"delta\":\"BLOCKME\"}\n\n",
@@ -4610,7 +4610,7 @@ mod tests {
     /// the success path misses it silently.
     #[tokio::test]
     async fn blocked_request_names_the_policy_on_the_usage_event() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let snap = new_snap(&upstream.uri());
         snap.models.insert(tts_model("my-tts"));
         snap.apikeys.insert(apikey_entry(&["*"]));
@@ -4676,7 +4676,7 @@ mod tests {
     /// unasserted.
     #[tokio::test]
     async fn transcription_mask_names_the_policy_on_the_usage_event() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4730,7 +4730,7 @@ mod tests {
     /// Nothing else in the suite reaches it.
     #[tokio::test]
     async fn streamed_transcription_mask_names_the_policy_on_the_usage_event() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = "\
 data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello\"}\n\n\
 data: {\"type\":\"transcript.text.done\",\"text\":\"hello world\"}\n\n\

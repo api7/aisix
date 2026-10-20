@@ -474,7 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_input_allows() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/moderations"))
             .and(bearer_token("sk-test-key"))
@@ -491,7 +491,7 @@ mod tests {
 
     #[tokio::test]
     async fn flagged_blocks_with_category_names() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/moderations"))
             .respond_with(ResponseTemplate::new(200).set_body_json(flagged_response()))
@@ -514,7 +514,7 @@ mod tests {
     async fn threshold_mode_overrides_flagged_boolean() {
         // score 0.4: flagged=false from the API, but the operator set a
         // 0.3 threshold — threshold mode blocks anyway.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/moderations"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -544,7 +544,7 @@ mod tests {
 
     #[tokio::test]
     async fn threshold_mode_under_threshold_allows_even_when_flagged() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/moderations"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -564,7 +564,7 @@ mod tests {
 
     #[tokio::test]
     async fn five_xx_fail_open_bypasses_fail_closed_blocks() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/moderations"))
             .respond_with(ResponseTemplate::new(503))
@@ -583,7 +583,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_error_4xx_tagged_separately() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/moderations"))
             .respond_with(ResponseTemplate::new(401))
@@ -600,7 +600,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_hook_uses_its_own_fail_policy() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/moderations"))
             .respond_with(ResponseTemplate::new(500))
@@ -622,7 +622,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_only_hook_skips_output() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let g = OpenaiModerationGuardrail::new(
             "t",
             &cfg(&server.uri()),

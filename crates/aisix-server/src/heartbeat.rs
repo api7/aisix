@@ -736,7 +736,7 @@ managed:
 
     #[tokio::test]
     async fn send_omits_authorization_header_and_posts_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .and(body_string_contains("\"dp_id\":\"dp_test_node_42\""))
@@ -775,7 +775,7 @@ managed:
     /// per-exporter delivery health (sorted by name).
     #[tokio::test]
     async fn send_includes_guardrail_kinds_revision_and_exporter_health() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -856,7 +856,7 @@ managed:
     /// serving omits the field (historical body shape).
     #[tokio::test]
     async fn send_includes_stale_serving_since_on_rejections() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -904,7 +904,7 @@ managed:
 
     #[tokio::test]
     async fn send_includes_partially_compatible_resources_when_wired() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -939,7 +939,7 @@ managed:
     /// serialize: revision 0 and an empty exporter_health array.
     #[tokio::test]
     async fn send_defaults_new_fields_without_fetchers() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -981,7 +981,7 @@ managed:
     /// is clamped to 128 chars (the cp-api ingestion contract).
     #[tokio::test]
     async fn send_includes_and_clamps_config_hash() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1021,7 +1021,7 @@ managed:
     /// same, and the legacy body shape is preserved.
     #[tokio::test]
     async fn send_omits_config_hash_when_fetcher_yields_none() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1049,7 +1049,7 @@ managed:
     /// presenting the same cert bundle (k8s replicas).
     #[tokio::test]
     async fn send_includes_per_boot_instance_identity() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1092,7 +1092,7 @@ managed:
 
     #[tokio::test]
     async fn send_propagates_non_success_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
@@ -1123,7 +1123,7 @@ managed:
         // Bundle is real but the tick uses plain HTTP wiremock — the
         // mTLS client builder still has to succeed for `run` to enter
         // its loop, which is what this test exercises.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))

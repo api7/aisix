@@ -1252,7 +1252,7 @@ mod tests {
     }
 
     async fn receiver_answering(status: u16, body: String) -> wiremock::MockServer {
-        let server = wiremock::MockServer::start().await;
+        let server = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("PUT"))
             .respond_with(wiremock::ResponseTemplate::new(status).set_body_string(body))
             .mount(&server)

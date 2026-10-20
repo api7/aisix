@@ -1079,7 +1079,7 @@ mod tests {
     async fn applied_guardrails_recorded_on_usage_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1132,7 +1132,7 @@ mod tests {
     async fn prompt_falls_back_to_total_tokens_unflagged() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1182,7 +1182,7 @@ mod tests {
     async fn prompt_estimated_and_flagged_when_usage_absent() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1227,7 +1227,7 @@ mod tests {
     /// upstream is never contacted (`expect(0)`).
     #[tokio::test]
     async fn input_guardrail_blocks_string_input_returns_422_content_filter() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
@@ -1259,7 +1259,7 @@ mod tests {
     /// in any element blocks the call.
     #[tokio::test]
     async fn input_guardrail_blocks_array_input() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
@@ -1290,7 +1290,7 @@ mod tests {
     /// must not block clean traffic.
     #[tokio::test]
     async fn input_guardrail_allows_benign_input_forwards_200() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
@@ -1317,7 +1317,7 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_single_string_input() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
@@ -1345,7 +1345,7 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_array_input() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
@@ -1371,7 +1371,7 @@ mod tests {
     /// the upstream regardless of the caller's shape.
     #[tokio::test]
     async fn single_string_input_preserves_string_shape_on_upstream_wire() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
@@ -1412,7 +1412,7 @@ mod tests {
     /// silently rewrite the caller's explicit array.
     #[tokio::test]
     async fn array_input_preserves_array_shape_on_upstream_wire() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
@@ -1494,7 +1494,7 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_error_propagates_as_502_envelope() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
@@ -1520,7 +1520,7 @@ mod tests {
     async fn response_contains_usage_tokens_from_upstream() {
         // The existing `happy_path_*` tests assert response.data shape but
         // never pin the usage envelope; cp-api depends on it for billing.
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1557,7 +1557,7 @@ mod tests {
         // wiremock's body_partial_json matcher only fires on the
         // rewritten body; a 200 OK proves the alias was resolved.
         use wiremock::matchers::body_partial_json;
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // `.expect(1)` forces wiremock to assert on Drop that the mock
         // fired exactly once. The 200-status check below already catches
         // the wiremock-default-404 fallthrough path; the additional value
@@ -1598,7 +1598,7 @@ mod tests {
         // through (see crates/aisix-proxy/src/error.rs); this test pins
         // the contract for the embeddings path so a refactor can't
         // silently turn upstream 429 into a generic 502.
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(429).set_body_string(
@@ -1631,7 +1631,7 @@ mod tests {
     async fn emits_usage_event_on_200_with_prompt_tokens_issue_226() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // Pin a specific upstream token count so a regression that
         // hardcoded 0 (or swapped prompt/completion semantics) would
         // surface here.
@@ -1721,7 +1721,7 @@ mod tests {
     async fn emits_provider_telemetry_tags_issue_867() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let upstream_body = serde_json::json!({
             "object": "list",
             "data": [{"object": "embedding", "index": 0, "embedding": [0.1_f32]}],
@@ -1771,7 +1771,7 @@ mod tests {
     /// the model's retry budget applies here too.
     #[tokio::test]
     async fn retries_a_transient_upstream_failure() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
@@ -1900,7 +1900,7 @@ mod tests {
     async fn emits_usage_event_on_200_with_zero_prompt_tokens_audit_m1() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // 200 with usage.prompt_tokens=0. The contract: emit anyway —
         // attribution belongs to the api_key for compliance / audit
         // even when the billable count is zero.
@@ -2025,7 +2025,7 @@ mod tests {
     async fn upstream_5xx_emits_zero_token_error_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal"))
@@ -2120,7 +2120,7 @@ mod tests {
     /// — /v1/embeddings previously never touched it.
     #[tokio::test]
     async fn upstream_5xx_marks_cooldown_issue_701() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
@@ -2167,7 +2167,7 @@ mod tests {
     async fn blocked_request_names_the_policy_on_the_usage_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("my-embed"));
         snap.apikeys.insert(apikey_entry(&["*"]));
@@ -2227,7 +2227,7 @@ mod tests {
     async fn masked_request_names_the_policy_on_the_usage_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
