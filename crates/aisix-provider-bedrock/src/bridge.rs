@@ -759,6 +759,7 @@ impl Bridge for BedrockBridge {
         // streaming follow-up can wire SigV4-reserved-header checks
         // for any operator default_headers override.
         let _ = wire::reserved_sigv4_headers();
+        reject_system_only(&req)?;
 
         // Phase G productionization (#302 Step 3): unified Converse
         // wire for non-Anthropic publishers (Meta / Mistral / Cohere /
@@ -806,6 +807,7 @@ impl Bridge for BedrockBridge {
                  (optionally prefixed with a cross-region inference profile like us. / eu. / apac.)"
             ))
         })?;
+        reject_system_only(&req)?;
         // The tool route's JSON only exists once the synthetic tool call
         // has been assembled, so it cannot be streamed as it arrives.
         // Run the request non-streaming — through `chat`, so each
@@ -1004,9 +1006,6 @@ impl BedrockBridge {
         let body_bytes = {
             let (system, messages) =
                 split_system(&req).map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
-            if messages.is_empty() {
-                return Err(system_only_request());
-            }
             let anthropic_req = build_request(&req, anthropic_model, system, messages, false);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -1102,9 +1101,6 @@ impl BedrockBridge {
     ) -> Result<ChatResponse, BridgeError> {
         let client = self.build_client_from_ctx(ctx)?;
         let (system_blocks, message_blocks) = build_converse_inputs(&req)?;
-        if message_blocks.is_empty() {
-            return Err(system_only_request());
-        }
 
         let started = Instant::now();
         let deadline = ctx.deadline;
@@ -1206,9 +1202,6 @@ impl BedrockBridge {
     ) -> Result<ChatChunkStream, BridgeError> {
         let client = self.build_client_from_ctx(ctx)?;
         let (system_blocks, message_blocks) = build_converse_inputs(&req)?;
-        if message_blocks.is_empty() {
-            return Err(system_only_request());
-        }
 
         let started = Instant::now();
         let deadline = ctx.deadline;
@@ -1285,9 +1278,9 @@ impl BedrockBridge {
 /// `tool_calls` entry (#560, multi-turn history).
 /// `role:"tool"` results → `toolResult` blocks carried in a user
 /// message; consecutive results coalesce into one (Converse requires all
-/// of a turn's results in a single user message). Bedrock Converse
-/// rejects empty `messages[]` so the caller must check the returned
-/// `Vec` length.
+/// of a turn's results in a single user message). A request that leaves
+/// `messages[]` empty never reaches here: [`reject_system_only`] refuses
+/// it before the rail is picked.
 fn build_converse_inputs(
     req: &ChatFormat,
 ) -> Result<(Vec<SystemContentBlock>, Vec<BedrockMessage>), BridgeError> {
@@ -1363,16 +1356,24 @@ fn build_converse_inputs(
 }
 
 /// Bedrock rejects an empty `messages[]`, which is what a request holding
-/// only system / developer turns leaves behind. That is the caller's
-/// request to fix, so it is refused as one rather than as a gateway fault,
-/// on every rail (Converse, ConverseStream and the Claude `/invoke` path),
-/// so one request gets one answer whether or not it streams.
-fn system_only_request() -> BridgeError {
-    BridgeError::InvalidRequest(
+/// only system / developer turns (and replayed reasoning, which no rail
+/// carries) leaves behind. That is the caller's request to fix, so it is
+/// refused as one rather than as a gateway fault. Checked once before the
+/// rail is picked, so Converse, ConverseStream and the Claude `/invoke`
+/// path give one request the same answer whether or not it streams.
+fn reject_system_only(req: &ChatFormat) -> Result<(), BridgeError> {
+    let has_turn = req
+        .messages
+        .iter()
+        .any(|m| !matches!(m.role, Role::System | Role::Developer) && !m.is_reasoning_only());
+    if has_turn {
+        return Ok(());
+    }
+    Err(BridgeError::InvalidRequest(
         "messages must include at least one user or assistant turn; \
          a system-only request is not supported for this model"
             .into(),
-    )
+    ))
 }
 
 /// Build a Converse [`BedrockMessage`] from a role and its content blocks.
