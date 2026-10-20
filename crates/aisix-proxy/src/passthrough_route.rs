@@ -712,6 +712,7 @@ async fn dispatch(
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
                 tracing::warn!(
+                    guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                     guardrail_hook = "input",
                     route = %route.name,
                     reason = %reason,
@@ -1204,6 +1205,7 @@ async fn dispatch(
             } = verdict
             {
                 tracing::warn!(
+                    guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                     guardrail_hook = "output",
                     route = %route.name,
                     reason = %reason,
@@ -6066,7 +6068,7 @@ fn stream_response(
                         if held_content.would_exceed_after(0, frame.len(), max_buffer_bytes) {
                             if on_exceeded_fail_open {
                                 fail_opened = true;
-                                chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                                crate::guardrail_stream::release_output_buffer_unscanned(&chain);
                                 for pending_frame in pending.drain(..) {
                                     telemetry.mark_first_delivery();
                                     yield Ok(pending_frame);
@@ -6079,6 +6081,7 @@ fn stream_response(
                             }
 
                             tracing::warn!(
+                                guardrail_name = crate::guardrail_stream::output_buffer_owner(&chain),
                                 route = %route_name,
                                 "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
                             );
@@ -6134,7 +6137,7 @@ fn stream_response(
                         if held_content.would_exceed_after(held, frame.len(), max_buffer_bytes) {
                             if on_exceeded_fail_open {
                                 fail_opened = true;
-                                chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                                crate::guardrail_stream::release_output_buffer_unscanned(&chain);
                                 for pending_frame in pending.drain(..) {
                                     telemetry.mark_first_delivery();
                                     yield Ok(pending_frame);
@@ -6147,6 +6150,7 @@ fn stream_response(
                             }
 
                             tracing::warn!(
+                                guardrail_name = crate::guardrail_stream::output_buffer_owner(&chain),
                                 route = %route_name,
                                 "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
                             );
@@ -6256,7 +6260,7 @@ fn stream_response(
                         if held_content.exceeds(*max_buffer_bytes) {
                             if *on_exceeded_fail_open {
                                 fail_opened = true;
-                                chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                                crate::guardrail_stream::release_output_buffer_unscanned(&chain);
                                 for f in pending.drain(..) {
                                     telemetry.mark_first_delivery();
                                     yield Ok(f);
@@ -6265,6 +6269,7 @@ fn stream_response(
                                 held_content = crate::held_content::HeldBuffer::default();
                             } else {
                                 tracing::warn!(
+                                    guardrail_name = crate::guardrail_stream::output_buffer_owner(&chain),
                                     route = %route_name,
                                     "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
                                 );
@@ -6304,6 +6309,7 @@ fn stream_response(
                                     unavailable,
                                 } => {
                                     tracing::warn!(
+                                        guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                                         guardrail_hook = "output",
                                         route = %route_name,
                                         reason = %reason,
@@ -6372,7 +6378,7 @@ fn stream_response(
                         if held_content.exceeds(*max_buffer_bytes) {
                             if *on_exceeded_fail_open {
                                 fail_opened = true;
-                                chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                                crate::guardrail_stream::release_output_buffer_unscanned(&chain);
                                 for f in pending.drain(..) {
                                     telemetry.mark_first_delivery();
                                     yield Ok(f);
@@ -6381,6 +6387,7 @@ fn stream_response(
                                 held_content = crate::held_content::HeldBuffer::default();
                             } else {
                                 tracing::warn!(
+                                    guardrail_name = crate::guardrail_stream::output_buffer_owner(&chain),
                                     route = %route_name,
                                     "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
                                 );
@@ -6431,6 +6438,7 @@ fn stream_response(
                 match tail_raw_cap_hit {
                     Some(false) => {
                         tracing::warn!(
+                            guardrail_name = crate::guardrail_stream::output_buffer_owner(&chain),
                             route = %route_name,
                             "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
                         );
@@ -6445,7 +6453,7 @@ fn stream_response(
                     }
                     Some(true) => {
                         fail_opened = true;
-                        chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                        crate::guardrail_stream::release_output_buffer_unscanned(&chain);
                         for frame in pending.drain(..) {
                             telemetry.mark_first_delivery();
                             yield Ok(frame);
@@ -6505,6 +6513,7 @@ fn stream_response(
                 match tail_cap_hit {
                     Some(false) => {
                         tracing::warn!(
+                            guardrail_name = crate::guardrail_stream::output_buffer_owner(&chain),
                             route = %route_name,
                             "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
                         );
@@ -6519,7 +6528,7 @@ fn stream_response(
                     }
                     Some(true) => {
                         fail_opened = true;
-                        chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                        crate::guardrail_stream::release_output_buffer_unscanned(&chain);
                         for frame in pending.drain(..) {
                             telemetry.mark_first_delivery();
                             yield Ok(frame);
@@ -6617,6 +6626,7 @@ fn stream_response(
                 match tripped {
                     Some(false) => {
                         tracing::warn!(
+                            guardrail_name = crate::guardrail_stream::output_buffer_owner(&chain),
                             route = %route_name,
                             "passthrough-route stream exceeded the guardrail buffer cap (fail-closed)",
                         );
@@ -6631,7 +6641,7 @@ fn stream_response(
                     }
                     Some(true) => {
                         fail_opened = true;
-                        chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                        crate::guardrail_stream::release_output_buffer_unscanned(&chain);
                         for f in pending.drain(..) {
                             telemetry.mark_first_delivery();
                             yield Ok(f);
@@ -6680,6 +6690,7 @@ fn stream_response(
                         } = scan_output_candidates(&chain, &route_name, &candidates, &mut telemetry).await
                         {
                             tracing::warn!(
+                                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                                 guardrail_hook = "output",
                                 route = %route_name,
                                 reason = %reason,

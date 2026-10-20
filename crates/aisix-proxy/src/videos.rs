@@ -1838,6 +1838,7 @@ async fn dispatch_create(
         {
             // Matched-pattern detail stays in ops logs only (#153).
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "input",
                 model = %body.model,
                 reason = %reason,

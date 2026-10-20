@@ -708,6 +708,7 @@ async fn dispatch(
                 crate::redact::redact_responses_request(resolved_chain.as_ref(), body),
             );
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "input",
                 model = %model_name,
                 reason = %reason,
@@ -1597,10 +1598,11 @@ async fn responses_to_target(
                 exceeded = held_content.exceeds(max_buffer_bytes);
             }
             if exceeded && on_exceeded_fail_open {
-                chain.record_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+                crate::guardrail_stream::release_output_buffer_unscanned(chain);
                 fail_open_prefix = Some(std::mem::take(&mut buf));
             } else if exceeded {
                 tracing::warn!(
+                    guardrail_name = crate::guardrail_stream::output_buffer_owner(chain),
                     guardrail_hook = "output",
                     model = %model.display_name,
                     max_buffer_bytes,
@@ -1801,6 +1803,7 @@ async fn responses_to_target(
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
                 tracing::warn!(
+                    guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                     guardrail_hook = "output",
                     model = %model.display_name,
                     reason = %reason,
@@ -2258,6 +2261,7 @@ async fn responses_to_target(
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
                 tracing::warn!(
+                    guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                     guardrail_hook = "output",
                     model = %model.display_name,
                     reason = %reason,
@@ -2859,6 +2863,7 @@ async fn responses_cross_provider_to_target(
         } = verdict
         {
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "output",
                 model = %requested_model,
                 reason = %reason,

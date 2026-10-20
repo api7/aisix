@@ -188,7 +188,7 @@ impl AliyunTextModerationGuardrail {
                 // request, so it stays at debug.
                 if blocked {
                     tracing::info!(
-                        row = %self.row_name,
+                        guardrail_name = %self.row_name,
                         service,
                         aliyun_request_id = %diag.request_id,
                         aliyun_code = %diag.code,
@@ -198,7 +198,7 @@ impl AliyunTextModerationGuardrail {
                     );
                 } else {
                     tracing::debug!(
-                        row = %self.row_name,
+                        guardrail_name = %self.row_name,
                         service,
                         aliyun_request_id = %diag.request_id,
                         aliyun_code = %diag.code,
@@ -356,7 +356,7 @@ impl AliyunTextModerationGuardrail {
             };
             diag.code = extract_error_code(&response_body);
             tracing::error!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 aliyun_request_id = %diag.request_id,
                 http_status = status.as_u16(),
                 aliyun_code = %diag.code,
@@ -387,7 +387,7 @@ impl AliyunTextModerationGuardrail {
             }),
             408 | 401 | 403 | 400 => {
                 tracing::error!(
-                    row = %self.row_name,
+                    guardrail_name = %self.row_name,
                     aliyun_request_id = %diag.request_id,
                     aliyun_code = %diag.code,
                     aliyun_message = %diag.message_field(),
@@ -398,7 +398,7 @@ impl AliyunTextModerationGuardrail {
             code => {
                 let (failure, meaning) = classify_body_error_code(code);
                 tracing::warn!(
-                    row = %self.row_name,
+                    guardrail_name = %self.row_name,
                     aliyun_request_id = %diag.request_id,
                     aliyun_code = %diag.code,
                     aliyun_message = %diag.message_field(),
@@ -419,7 +419,7 @@ impl AliyunTextModerationGuardrail {
         let tag = failure.failure.bypass_tag();
         if !matches!(failure.failure, AliyunFailure::ConfigError) {
             tracing::warn!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 aliyun_request_id = %diag.request_id,
                 failure = ?failure.failure,
                 http_status = failure.http_status,

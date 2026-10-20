@@ -734,15 +734,12 @@ impl Guardrail for GuardrailChain {
         self.record_bypass(reason);
     }
 
-    /// Names the member whose cap is the one [`Self::stream_output_policy`]
+    /// The member whose cap is the one [`Self::stream_output_policy`]
     /// folded to: the smallest `max_buffer_bytes` among output members of
     /// the chain policy's own rank (a `window` member does not set a chain
     /// that has a `buffer_full` member), the first in chain order on a tie —
     /// the row an operator raises, not the chain.
-    fn record_output_buffer_exceeded(&self) {
-        let Some(audit) = self.audit.as_deref() else {
-            return;
-        };
+    fn output_buffer_owner(&self) -> Option<&str> {
         let chain_policy = std::mem::discriminant(&self.stream_output_policy());
         let mut owner: Option<(&str, usize)> = None;
         for m in self.members.iter().filter(|m| m.guardrail.runs_on_output()) {
@@ -756,7 +753,15 @@ impl Guardrail for GuardrailChain {
                 }
             }
         }
-        if let Some((name, _)) = owner {
+        owner.map(|(name, _)| name)
+    }
+
+    /// Audits the refusal against [`Self::output_buffer_owner`].
+    fn record_output_buffer_exceeded(&self) {
+        let Some(audit) = self.audit.as_deref() else {
+            return;
+        };
+        if let Some(name) = self.output_buffer_owner() {
             audit.record(
                 name,
                 "output",
@@ -1437,7 +1442,7 @@ async fn fold_segments(
                 Redaction::merge_counts(&mut counts, &outcome.counts);
             } else {
                 tracing::warn!(
-                    member = %m.name,
+                    guardrail_name = %m.name,
                     expected = src.len(),
                     got = new_masked.len(),
                     "segment moderation returned misaligned mask; keeping originals",

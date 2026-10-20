@@ -94,8 +94,14 @@ impl EosOutputScan {
             },
         )
         .await;
-        if let aisix_guardrails::GuardrailVerdict::Block { reason, .. } = verdict {
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+            ..
+        } = verdict
+        {
             tracing::warn!(
+                guardrail_name = guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "output",
                 model = %self.upstream_model,
                 reason = %reason,
@@ -105,4 +111,37 @@ impl EosOutputScan {
         }
         hits
     }
+}
+
+/// Release held-back output unscanned because it outgrew the chain's
+/// `max_buffer_bytes` under `on_buffer_exceeded: fail_open`: records the
+/// bypass and logs which row's cap was exceeded. Every relay's fail-open
+/// branch goes through here; a fail-closed branch logs
+/// [`output_buffer_owner`] itself.
+pub(crate) fn release_output_buffer_unscanned(chain: &dyn aisix_guardrails::Guardrail) {
+    tracing::warn!(
+        guardrail_name = output_buffer_owner(chain),
+        guardrail_hook = "output",
+        max_buffer_bytes = chain.stream_output_policy().hold_cap().map(|(cap, _)| cap),
+        fail_open = true,
+        "streamed output exceeded the guardrail buffer cap; releasing it without an output scan",
+    );
+    chain.record_output_bypass(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED);
+}
+
+/// The row whose `max_buffer_bytes` held-back output outgrew, as a log
+/// field value.
+pub(crate) fn output_buffer_owner(
+    chain: &dyn aisix_guardrails::Guardrail,
+) -> Option<tracing::field::DisplayValue<&str>> {
+    guardrail_name_field(chain.output_buffer_owner())
+}
+
+/// A guardrail's configured name as the `guardrail_name` log field,
+/// rendered like every guardrail log line renders it (unquoted), and
+/// omitted when no single guardrail is named.
+pub(crate) fn guardrail_name_field(
+    name: Option<&str>,
+) -> Option<tracing::field::DisplayValue<&str>> {
+    name.map(tracing::field::display)
 }
