@@ -182,6 +182,14 @@ mod tests {
     /// actual latency, and an exposition this size is thousands of
     /// pieces. The first version of this shipped a 10 ms retry and took
     /// 13.6x as long per byte on a warm registry.
+    ///
+    /// The handover is driven from a plain thread rather than through
+    /// `Scrape::stream`, whose renderer runs at the lowest CPU priority
+    /// there is: on a saturated runner that thread is late by whole
+    /// seconds whether it waits or polls, which says nothing about the
+    /// handover. And both sides are measured rather than assumed, since
+    /// the same runner stretches the reader's own sleeps well past
+    /// `READER_LATENCY` too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reader_only_costs_the_render_its_own_latency() {
         const PIECES: usize = 1200;
@@ -189,30 +197,51 @@ mod tests {
         /// rather than this is what a poll would spend.
         const READER_LATENCY: Duration = Duration::from_millis(1);
 
-        let scrape = Scrape::default();
-        let mut body = scrape.stream(|emit| {
+        let (sender, mut body) = mpsc::channel(PIECES_IN_FLIGHT);
+        let runtime = tokio::runtime::Handle::current();
+        let renderer = std::thread::spawn(move || {
             for _ in 0..PIECES {
-                assert!(emit("a series line\n".to_owned()));
+                assert!(hand_over(
+                    &runtime,
+                    &sender,
+                    Bytes::from_static(b"a series line\n")
+                ));
             }
         });
-        let started = std::time::Instant::now();
-        let mut taken = 0;
-        while let Some(piece) = body.recv().await {
+        // The first piece also pays for starting the renderer; what is
+        // measured is every handover after it.
+        body.recv()
+            .await
+            .expect("a first piece")
+            .expect("a piece, not an error");
+        let mut taken = 1;
+        let (mut reading, mut waiting) = (Duration::ZERO, Duration::ZERO);
+        loop {
+            let started = std::time::Instant::now();
+            tokio::time::sleep(READER_LATENCY).await;
+            reading += started.elapsed();
+            let started = std::time::Instant::now();
+            let Some(piece) = body.recv().await else {
+                break;
+            };
+            waiting += started.elapsed();
             piece.expect("a piece, not an error");
             taken += 1;
-            tokio::time::sleep(READER_LATENCY).await;
         }
-        let elapsed = started.elapsed();
+        renderer.join().expect("the renderer finishes");
         assert_eq!(taken, PIECES);
-        // Against the reader's OWN cost rather than a wall-clock number,
-        // so a slow machine moves both sides together. Measured here:
-        // ~2.1x the floor waiting on the reader, ~5x polling for it.
-        let floor = READER_LATENCY * PIECES as u32;
+        // A renderer that waits on the reader has the next piece queued
+        // before the reader comes back for it, so the reader spends next
+        // to nothing waiting. One that polls only notices the free slot
+        // on its next look, and the reader, faster than the interval,
+        // drains the channel and waits out most of it — measured at 1.4x
+        // its own latency against a 10 ms poll, against under 2% when
+        // the renderer waits, contended or not.
         assert!(
-            elapsed < floor * 3,
-            "handing over {PIECES} pieces to a reader that takes each in \
-             {READER_LATENCY:?} took {elapsed:?}, against a floor of {floor:?} — \
-             the renderer is waiting on something other than the reader",
+            waiting < reading / 2,
+            "a reader that spent {reading:?} on its own latency over {PIECES} \
+             pieces then spent {waiting:?} waiting for the next piece — the \
+             renderer is waiting on something other than the reader",
         );
     }
 
