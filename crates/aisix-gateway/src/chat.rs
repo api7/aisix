@@ -561,6 +561,24 @@ impl CacheCreationTtl {
         *self == Self::NONE
     }
 
+    /// The split as a record of a `total`-token write: kept, with an
+    /// unreported part as `0`, only when its parts add up to a non-zero
+    /// total. A split that misses the total — a partial upstream report, a
+    /// lifetime this gateway does not read, frames or members merged
+    /// unevenly — would misstate what was written at which lifetime, so it
+    /// is no split at all, as is any split of a write that did not happen.
+    pub fn accounting_for(self, total: u32) -> Self {
+        let five_m = self.cache_creation_5m_tokens.unwrap_or(0);
+        let one_h = self.cache_creation_1h_tokens.unwrap_or(0);
+        if self.is_empty() || total == 0 || five_m.saturating_add(one_h) != total {
+            return Self::NONE;
+        }
+        Self {
+            cache_creation_5m_tokens: Some(five_m),
+            cache_creation_1h_tokens: Some(one_h),
+        }
+    }
+
     /// Field-wise sum, `None` only where neither side reported.
     pub fn saturating_add(&self, other: &Self) -> Self {
         fn add(a: Option<u32>, b: Option<u32>) -> Option<u32> {
@@ -1749,6 +1767,24 @@ mod tests {
             CacheCreationTtl::from_converse_details([("1h", 300), ("24h", 20)], 320).is_empty()
         );
         assert!(CacheCreationTtl::from_converse_details([], 320).is_empty());
+
+        let one_hour = CacheCreationTtl {
+            cache_creation_5m_tokens: None,
+            cache_creation_1h_tokens: Some(300),
+        };
+        assert_eq!(
+            one_hour.accounting_for(300),
+            CacheCreationTtl {
+                cache_creation_5m_tokens: Some(0),
+                cache_creation_1h_tokens: Some(300),
+            }
+        );
+        assert!(one_hour.accounting_for(320).is_empty());
+        let zeros = CacheCreationTtl {
+            cache_creation_5m_tokens: Some(0),
+            cache_creation_1h_tokens: Some(0),
+        };
+        assert!(zeros.accounting_for(0).is_empty());
     }
 
     #[test]

@@ -216,6 +216,17 @@ impl OtlpHttpFanOut {
     ) where
         I: IntoIterator<Item = &'a ObservabilityExporter>,
     {
+        let settled;
+        let event = match event.settled_cache_creation_ttl() {
+            ttl if ttl == event.cache_creation_ttl => event,
+            ttl => {
+                settled = UsageEvent {
+                    cache_creation_ttl: ttl,
+                    ..event.clone()
+                };
+                &settled
+            }
+        };
         // The shared metadata-only record, built once on first sighting and
         // reused by every exporter that does not capture content.
         let mut metadata_record: Option<Arc<SinkRecord>> = None;

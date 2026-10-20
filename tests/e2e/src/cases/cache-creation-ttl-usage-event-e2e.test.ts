@@ -44,28 +44,48 @@ const CACHE_WRITE = WRITE_5M + WRITE_1H;
 
 const ANTHROPIC = "ttl-anthropic";
 const ANTHROPIC_NO_SPLIT = "ttl-anthropic-nosplit";
+const ANTHROPIC_PARTIAL = "ttl-anthropic-partial";
+const ANTHROPIC_UNCACHED = "ttl-anthropic-uncached";
 const BEDROCK_CLAUDE = "ttl-bedrock-claude";
 const VERTEX_CLAUDE = "ttl-vertex-claude";
 const CONVERSE = "ttl-bedrock-nova";
 const CONVERSE_PARTIAL = "ttl-bedrock-nova-partial";
 
-// The model name an upstream sees tells it whether to report the split.
+// The model name an upstream sees tells it which split to report.
 const NO_SPLIT_MARKER = "nosplit";
 const PARTIAL_MARKER = "partial";
+const UNCACHED_MARKER = "uncached";
 
-function anthropicUsage(split: boolean, output: number): Record<string, unknown> {
+// `split`: the parts add up to the write. `none`: no `cache_creation`.
+// `partial`: the parts miss part of the write. `uncached`: nothing was
+// written, and the breakdown is all zeros, as Anthropic sends it then.
+type Split = "split" | "none" | "partial" | "uncached";
+
+function splitFor(model: unknown): Split {
+  const name = String(model);
+  if (name.includes(NO_SPLIT_MARKER)) return "none";
+  if (name.includes(PARTIAL_MARKER)) return "partial";
+  if (name.includes(UNCACHED_MARKER)) return "uncached";
+  return "split";
+}
+
+function anthropicUsage(split: Split, output: number): Record<string, unknown> {
+  const parts: Record<Split, Record<string, unknown>> = {
+    split: { cache_creation: { ephemeral_5m_input_tokens: WRITE_5M, ephemeral_1h_input_tokens: WRITE_1H } },
+    none: {},
+    partial: { cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: WRITE_1H } },
+    uncached: { cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 } },
+  };
   return {
     input_tokens: UNCACHED_IN,
     output_tokens: output,
     cache_read_input_tokens: CACHE_READ,
-    cache_creation_input_tokens: CACHE_WRITE,
-    ...(split
-      ? { cache_creation: { ephemeral_5m_input_tokens: WRITE_5M, ephemeral_1h_input_tokens: WRITE_1H } }
-      : {}),
+    cache_creation_input_tokens: split === "uncached" ? 0 : CACHE_WRITE,
+    ...parts[split],
   };
 }
 
-function anthropicReply(split: boolean): Record<string, unknown> {
+function anthropicReply(split: Split): Record<string, unknown> {
   return {
     id: "msg_ttl",
     type: "message",
@@ -78,7 +98,7 @@ function anthropicReply(split: boolean): Record<string, unknown> {
   };
 }
 
-function anthropicStream(split: boolean): Array<Record<string, unknown>> {
+function anthropicStream(split: Split): Array<Record<string, unknown>> {
   return [
     {
       type: "message_start",
@@ -137,7 +157,7 @@ async function startUpstream(): Promise<{ server: Server; baseUrl: string }> {
         res.end(payload);
       };
       if (path === "/v1/messages") {
-        const split = !String(body.model).includes(NO_SPLIT_MARKER);
+        const split = splitFor(body.model);
         if (body.stream) {
           res.writeHead(200, { "content-type": "text/event-stream" });
           res.end(sse(anthropicStream(split)));
@@ -145,14 +165,14 @@ async function startUpstream(): Promise<{ server: Server; baseUrl: string }> {
         }
         return json(anthropicReply(split));
       }
-      if (path.endsWith("/invoke")) return json(anthropicReply(true));
+      if (path.endsWith("/invoke")) return json(anthropicReply("split"));
       if (path.endsWith("/invoke-with-response-stream")) {
-        return eventStreamBody(Buffer.concat(anthropicStream(true).map(invokeChunk)));
+        return eventStreamBody(Buffer.concat(anthropicStream("split").map(invokeChunk)));
       }
-      if (path.endsWith(":rawPredict")) return json(anthropicReply(true));
+      if (path.endsWith(":rawPredict")) return json(anthropicReply("split"));
       if (path.endsWith(":streamRawPredict")) {
         res.writeHead(200, { "content-type": "text/event-stream" });
-        res.end(sse(anthropicStream(true)));
+        res.end(sse(anthropicStream("split")));
         return;
       }
       const partial = path.includes(PARTIAL_MARKER);
@@ -252,6 +272,8 @@ describe("UsageEvent: prompt-cache writes split by cache lifetime", () => {
     for (const [display_name, pk, provider, model_name] of [
       [ANTHROPIC, anthropicPk, "anthropic", "claude-sonnet-4-5"],
       [ANTHROPIC_NO_SPLIT, anthropicPk, "anthropic", `claude-sonnet-4-5-${NO_SPLIT_MARKER}`],
+      [ANTHROPIC_PARTIAL, anthropicPk, "anthropic", `claude-sonnet-4-5-${PARTIAL_MARKER}`],
+      [ANTHROPIC_UNCACHED, anthropicPk, "anthropic", `claude-sonnet-4-5-${UNCACHED_MARKER}`],
       [BEDROCK_CLAUDE, bedrockPk, "bedrock", "global.anthropic.claude-sonnet-4-5-20250929-v1:0"],
       [VERTEX_CLAUDE, vertexPk, "google", "claude-sonnet-4-5@20250929"],
       [CONVERSE, bedrockPk, "bedrock", "amazon.nova-lite-v1:0"],
@@ -320,6 +342,8 @@ describe("UsageEvent: prompt-cache writes split by cache lifetime", () => {
   const unsplit: Array<[string, Protocol, string, boolean]> = [
     ["Anthropic without usage.cache_creation, non-streamed", "messages", ANTHROPIC_NO_SPLIT, false],
     ["Anthropic without usage.cache_creation, streamed", "messages", ANTHROPIC_NO_SPLIT, true],
+    ["Anthropic with a usage.cache_creation short of the write, non-streamed", "messages", ANTHROPIC_PARTIAL, false],
+    ["Anthropic with a usage.cache_creation short of the write, streamed", "chat", ANTHROPIC_PARTIAL, true],
     ["Bedrock Converse with a partial cacheDetails, non-streamed", "chat", CONVERSE_PARTIAL, false],
     ["Bedrock Converse with a partial cacheDetails, streamed", "chat", CONVERSE_PARTIAL, true],
   ];
@@ -331,6 +355,19 @@ describe("UsageEvent: prompt-cache writes split by cache lifetime", () => {
       expect(row.get("cache_creation_tokens")).toBe(String(CACHE_WRITE));
       expect(row.has("cache_creation_5m_tokens")).toBe(false);
       expect(row.has("cache_creation_1h_tokens")).toBe(false);
+    });
+  }
+
+  // Anthropic reports an all-zero breakdown on a request that wrote nothing
+  // to the cache; the parts of a write that did not happen are not reported.
+  for (const stream of [false, true]) {
+    test(`an uncached Anthropic request, ${stream ? "streamed" : "non-streamed"}, reports no split`, async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const row = await usageRowFor("messages", ANTHROPIC_UNCACHED, stream);
+      expect(row.has("cache_creation_tokens")).toBe(false);
+      expect(row.has("cache_creation_5m_tokens")).toBe(false);
+      expect(row.has("cache_creation_1h_tokens")).toBe(false);
+      expect(row.get("cache_read_tokens")).toBe(String(CACHE_READ));
     });
   }
 });

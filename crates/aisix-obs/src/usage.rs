@@ -298,9 +298,11 @@ pub struct UsageEvent {
     /// `cache_creation_tokens` written with a five-minute and a one-hour
     /// cache lifetime, exactly as the upstream reported them (Anthropic
     /// `usage.cache_creation`, Bedrock Converse `usage.cacheDetails`). A
-    /// one-hour write bills above a five-minute one. Both are absent when
-    /// the upstream reported no split; `cache_creation_tokens` stays the
-    /// total either way.
+    /// one-hour write bills above a five-minute one. Present only together,
+    /// and only when they add up to a non-zero `cache_creation_tokens`;
+    /// absent when the upstream reported no split, or one that does not
+    /// account for the whole write. `cache_creation_tokens` stays the total
+    /// either way.
     #[serde(flatten)]
     pub cache_creation_ttl: aisix_gateway::CacheCreationTtl,
 
@@ -1069,6 +1071,14 @@ impl UsageEvent {
             .saturating_add(self.cache_read_tokens)
     }
 
+    /// The cache-write split as every outlet reports it — see
+    /// `CacheCreationTtl::accounting_for`. The two outlets, `UsageSink::try_emit`
+    /// and `OtlpHttpFanOut::fan_out`, both apply it.
+    pub fn settled_cache_creation_ttl(&self) -> aisix_gateway::CacheCreationTtl {
+        self.cache_creation_ttl
+            .accounting_for(self.cache_creation_tokens)
+    }
+
     /// OTel GenAI `gen_ai.usage.cache_read.input_tokens`: the subset-shape
     /// hit count or the additive-shape read count, whichever the upstream
     /// reported (one family is always zero).
@@ -1247,7 +1257,13 @@ impl UsageSink {
     /// reason `PkLabels` keeps a key's id and name together — a name that
     /// can be sourced separately from its id is a name that will
     /// eventually be wrong.
-    pub fn try_emit(&self, handler: &'static str, event: UsageEvent, labels: UsageEventLabels<'_>) {
+    pub fn try_emit(
+        &self,
+        handler: &'static str,
+        mut event: UsageEvent,
+        labels: UsageEventLabels<'_>,
+    ) {
+        event.cache_creation_ttl = event.settled_cache_creation_ttl();
         log_provider_call(handler, &event);
         // Owned because `event` is moved into the channel below while the
         // drop counter still needs the labels.
@@ -1538,6 +1554,42 @@ mod tests {
         let b = rx.recv().await.unwrap();
         assert_eq!(a.request_id, "req-a");
         assert_eq!(b.request_id, "req-b");
+    }
+
+    /// A split that does not account for the write never reaches the
+    /// control plane; one that does is sent whole.
+    #[tokio::test]
+    async fn emit_sends_the_cache_write_split_only_when_it_accounts_for_the_write() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let sink = UsageSink::new(tx);
+        let with = |total, five_m, one_h| UsageEvent {
+            cache_creation_tokens: total,
+            cache_creation_ttl: aisix_gateway::CacheCreationTtl {
+                cache_creation_5m_tokens: five_m,
+                cache_creation_1h_tokens: one_h,
+            },
+            ..sample_event("req")
+        };
+        sink.try_emit(
+            "test",
+            with(300, None, Some(300)),
+            UsageEventLabels::default(),
+        );
+        sink.try_emit(
+            "test",
+            with(300, Some(0), Some(260)),
+            UsageEventLabels::default(),
+        );
+        sink.try_emit(
+            "test",
+            with(0, Some(0), Some(0)),
+            UsageEventLabels::default(),
+        );
+        let whole = rx.recv().await.unwrap().cache_creation_ttl;
+        assert_eq!(whole.cache_creation_5m_tokens, Some(0));
+        assert_eq!(whole.cache_creation_1h_tokens, Some(300));
+        assert!(rx.recv().await.unwrap().cache_creation_ttl.is_empty());
+        assert!(rx.recv().await.unwrap().cache_creation_ttl.is_empty());
     }
 
     #[test]
