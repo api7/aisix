@@ -468,11 +468,11 @@ fn emit_guardrail_attachments(
         };
         let scope_name = match a.scope_type {
             GuardrailScopeType::Env => None,
-            GuardrailScopeType::Model => Some(("model", model_names.get(scope_ref(a)))),
+            GuardrailScopeType::Model => Some(("a model", model_names.get(scope_ref(a)))),
             GuardrailScopeType::McpServer => {
-                Some(("MCP server", mcp_server_names.get(scope_ref(a))))
+                Some(("an MCP server", mcp_server_names.get(scope_ref(a))))
             }
-            GuardrailScopeType::ApiKey => Some(("api key", api_key_names.get(scope_ref(a)))),
+            GuardrailScopeType::ApiKey => Some(("an api key", api_key_names.get(scope_ref(a)))),
             // The export carries no `passthrough_routes` collection, so a
             // route-scoped attachment has nothing to point at in the file —
             // emitting the name anyway makes the whole file fail to load.
@@ -485,17 +485,14 @@ fn emit_guardrail_attachments(
             }
             // Verbatim: `api_keys[].team_id` is a file field and
             // `IndexEntry::applies_to` compares the two ids as bare strings.
-            GuardrailScopeType::Team => Some(("team", a.scope_id.as_ref())),
+            GuardrailScopeType::Team => Some(("a team", a.scope_id.as_ref())),
         };
         let resolved = match scope_name {
             None => None,
-            Some((label, Some(name))) => {
-                let _ = label;
-                Some(name.clone())
-            }
+            Some((_, Some(name))) => Some(name.clone()),
             Some((label, None)) => {
                 diag.warnings.push(format!(
-                    "guardrail {guardrail:?} is scoped to a {label} that is not in the snapshot; \
+                    "guardrail {guardrail:?} is scoped to {label} that is not in the snapshot; \
                      that scope is omitted",
                 ));
                 continue;

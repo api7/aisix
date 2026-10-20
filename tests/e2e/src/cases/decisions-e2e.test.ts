@@ -839,15 +839,17 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
   test("unsupported kinds and providers are refused with a 400 that names them", async (ctx) => {
     if (!ready(ctx)) return;
     for (const [model, kind] of [
-      ["dec-semantic", "semantic"],
-      ["dec-ensemble", "ensemble"],
-      ["dec-embedding", "embedding"],
+      ["dec-semantic", "a `semantic`"],
+      ["dec-ensemble", "an `ensemble`"],
+      ["dec-embedding", "an `embedding`"],
     ]) {
       for (const path of ["/v1/systemone", "/v1/decisions"]) {
         const res = await post(path, { model, state: "x", input: "x", questions: {} });
         expect(res.status, `${path} ${model}`).toBe(400);
-        expect(res.body.error.message).toContain(`\`${kind}\``);
-        expect(res.body.error.message).toContain(path);
+        expect(res.body.error.type).toBe("invalid_request_error");
+        expect(res.body.error.message).toBe(
+          `request payload is invalid: model \`${model}\` is ${kind} model; ${path} serves direct and routing models only`,
+        );
       }
     }
 
