@@ -518,7 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn appends_batch_posts_signed_lz4_protobuf() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(200))
@@ -645,7 +645,7 @@ mod tests {
     /// prompt/response.
     #[tokio::test]
     async fn selected_headers_ride_the_log_and_content_is_structured() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(200))
@@ -752,7 +752,7 @@ mod tests {
     /// other side is still structured.
     #[tokio::test]
     async fn truncated_side_falls_back_to_flat_text() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(200))
@@ -801,7 +801,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_error_is_transient() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(500).set_body_string(
@@ -822,7 +822,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_error_is_permanent() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(403).set_body_string(
@@ -845,7 +845,7 @@ mod tests {
     async fn quota_exceeded_on_4xx_is_transient() {
         // SLS signals shard write throttling with a 4xx + a quota code; a log
         // sink must back off and retry, not drop the batch.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(403).set_body_string(

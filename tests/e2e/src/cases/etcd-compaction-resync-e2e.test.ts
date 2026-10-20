@@ -26,9 +26,9 @@ import {
 // gateway dials etcd through a relay that stops delivering etcd's replies
 // while still forwarding the gateway's requests; etcd keeps producing
 // events for the watch until the stream's flow-control window and etcd's
-// per-stream buffer are full, and then parks the watcher as slow (visible
-// in etcd's own `slow_watcher_total`). Only then is the store compacted
-// past everything that watcher still has to deliver.
+// per-stream buffer are full, and then parks the watcher as slow. Only
+// then is the store compacted past everything that watcher still has to
+// deliver.
 
 const CALLER_PLAINTEXT = "sk-etcd-compaction-resync-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -41,10 +41,13 @@ const RESYNC_LINE = "etcd compaction detected";
 const BACKOFF_LINE = "etcd watch failed; backing off";
 
 // Enough filler to exceed any flow-control window plus etcd's 128-response
-// per-stream buffer many times over; the loop stops as soon as etcd
-// reports the watcher slow.
+// per-stream buffer many times over; the loop stops as soon as the watcher
+// is provably parked.
 const FILLER_VALUE_BYTES = 16 * 1024;
 const MAX_FILLER_PUTS = 4096;
+// etcd's per-stream response buffer, plus the one response its send loop
+// is blocked on.
+const WATCH_STREAM_BUFFERED = 128 + 1;
 
 describe("etcd compaction behind a lagging watch", () => {
   let etcd: EtcdClient | undefined;
@@ -109,22 +112,31 @@ describe("etcd compaction behind a lagging watch", () => {
     const doomed = await model(DELETED);
     await waitConfigPropagation(async () => (await served()).includes(DELETED));
 
-    // Make the gateway's watch fall behind. The gauge is cluster-wide, and
-    // locally several forks share one etcd, so wait for it to rise above
-    // what it read before the stall rather than for it to be non-zero.
-    const slowBefore = await etcd.slowWatchers();
+    // Make the gateway's watch fall behind, and prove it has. Each filler
+    // put is one event for this watch alone (the key is unique to it), so
+    // once etcd has produced more events for it than it has sent to every
+    // watch stream in the cluster plus what the stream can buffer, the
+    // rest are parked on the watcher — which is what "slow" means. Other
+    // streams' sends only make that harder to reach, never easier. etcd's
+    // own `slow_watcher_total` gauge cannot carry this: it counts every
+    // slow watcher in the cluster, so another one leaving the slow set as
+    // this one joins it leaves the gauge where it started.
     relay.stallReplies();
+    const sentBefore = await etcd.watchResponsesSent();
     const filler = "x".repeat(FILLER_VALUE_BYTES);
     const fillerKey = `${prefix}/compaction_filler/${randomUUID()}`;
     let puts = 0;
+    let sent = 0;
     do {
       if (puts >= MAX_FILLER_PUTS) {
-        throw new Error(`etcd never reported the stalled watch as slow after ${puts} puts`);
+        throw new Error(
+          `the stalled watch was never parked: after ${puts} puts etcd had still sent ` +
+            `${sent} watch responses since the stall`,
+        );
       }
       for (let i = 0; i < 64; i++, puts++) await etcd.put(fillerKey, filler);
-      // etcd refreshes the gauge on its ~100ms sync tick.
-      await new Promise((r) => setTimeout(r, 150));
-    } while ((await etcd.slowWatchers()) <= slowBefore);
+      sent = (await etcd.watchResponsesSent()) - sentBefore;
+    } while (puts - sent <= WATCH_STREAM_BUFFERED);
     await etcd.delete(fillerKey);
 
     // A deletion the lagging watch has not delivered, then a compaction

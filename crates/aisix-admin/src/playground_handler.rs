@@ -140,7 +140,7 @@ mod tests {
 
     #[tokio::test]
     async fn playground_forwards_to_proxy_and_returns_completion() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

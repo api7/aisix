@@ -2760,7 +2760,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_happy_path_returns_video_object_and_maps_upstream_wire() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
@@ -2828,7 +2828,7 @@ mod tests {
     /// see. The `.expect(1)` is the assertion.
     #[tokio::test]
     async fn submit_decode_failure_is_not_replayed() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
@@ -2857,7 +2857,7 @@ mod tests {
     /// second attempt recovers the request.
     #[tokio::test]
     async fn submit_transient_5xx_is_retried_then_succeeds() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
@@ -2896,7 +2896,7 @@ mod tests {
     async fn failure_after_a_retried_winner_keeps_one_index_zero_row() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
@@ -2946,7 +2946,7 @@ mod tests {
 
     #[tokio::test]
     async fn poll_maps_running_to_in_progress() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{DASHSCOPE_TASK_PATH}/task-123")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2972,7 +2972,7 @@ mod tests {
 
     #[tokio::test]
     async fn poll_failed_task_carries_error_object() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{DASHSCOPE_TASK_PATH}/task-bad")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3002,7 +3002,7 @@ mod tests {
 
     #[tokio::test]
     async fn content_redirects_302_to_provider_url_when_completed() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{DASHSCOPE_TASK_PATH}/task-123")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3032,7 +3032,7 @@ mod tests {
 
     #[tokio::test]
     async fn content_not_ready_returns_400_invalid_request() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{DASHSCOPE_TASK_PATH}/task-123")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3139,7 +3139,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_guardrail_blocks_prompt_and_upstream_is_never_called() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
@@ -3171,7 +3171,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_hits_model_rpm_cap_but_polling_stays_exempt() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
@@ -3222,7 +3222,7 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_4xx_maps_to_error_envelope() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
@@ -3294,7 +3294,7 @@ mod tests {
     /// #451 cardinality failure on this route too.
     #[tokio::test]
     async fn submit_success_metric_label_is_resolved_display_name_not_alias() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
@@ -3360,7 +3360,7 @@ mod tests {
     /// the caller's own task.
     #[tokio::test]
     async fn wildcard_alias_submit_poll_content_all_succeed() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
@@ -3438,7 +3438,7 @@ mod tests {
     /// must not turn the poll route into a Model-table existence probe.
     #[tokio::test]
     async fn restricted_key_gets_404_on_poll_and_upstream_untouched() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{DASHSCOPE_TASK_PATH}/task-123")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3482,7 +3482,7 @@ mod tests {
     /// of producing `…/compatible-mode/v1/api/v1/services/…` 404s.
     #[tokio::test]
     async fn compatible_mode_api_base_reaches_native_dashscope_paths() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
@@ -3510,7 +3510,7 @@ mod tests {
     /// not ride the Location header to the caller.
     #[tokio::test]
     async fn content_rejects_non_http_video_url_scheme() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{DASHSCOPE_TASK_PATH}/task-123")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3537,7 +3537,7 @@ mod tests {
     /// source IP the request is rejected before any upstream contact.
     #[tokio::test]
     async fn allowed_cidrs_enforced_on_poll_route() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{DASHSCOPE_TASK_PATH}/task-123")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3570,7 +3570,7 @@ mod tests {
     /// content 302s to that URL.
     #[tokio::test]
     async fn zhipu_submit_poll_content_journey() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(ZHIPU_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3663,7 +3663,7 @@ mod tests {
     /// content 302s to the URL.
     #[tokio::test]
     async fn ark_submit_poll_content_journey() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(ARK_TASKS_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3747,7 +3747,7 @@ mod tests {
     /// message}` through the unified error object on poll.
     #[tokio::test]
     async fn ark_failed_task_carries_error_object() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{ARK_TASKS_PATH}/cgt-bad")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3779,7 +3779,7 @@ mod tests {
     /// fallback code.
     #[tokio::test]
     async fn zhipu_fail_status_yields_generic_error_object() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{ZHIPU_TASK_PATH}/zt-bad")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3805,7 +3805,7 @@ mod tests {
     /// top-level shape is covered by upstream_4xx_maps_to_error_envelope).
     #[tokio::test]
     async fn zhipu_nested_error_envelope_maps_to_4xx_message() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(ZHIPU_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
@@ -3839,7 +3839,7 @@ mod tests {
     /// POST and the poll GET.
     #[tokio::test]
     async fn runway_submit_poll_content_journey_sends_version_header_on_both_legs() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(RUNWAY_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3945,7 +3945,7 @@ mod tests {
     /// `failureCode` fields through the unified error object on poll.
     #[tokio::test]
     async fn runway_failed_task_carries_failure_code_and_message() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{RUNWAY_TASK_PATH}/rw-bad")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4105,7 +4105,7 @@ mod tests {
     /// client.
     #[tokio::test]
     async fn openai_submit_poll_content_proxy_journey() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/videos"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4222,7 +4222,7 @@ mod tests {
     /// envelope — it must NOT stream an error body back as video/mp4.
     #[tokio::test]
     async fn openai_content_proxy_upstream_403_maps_to_error_envelope() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/v1/videos/video_x/content"))
             .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
@@ -4276,7 +4276,7 @@ mod tests {
     async fn blocked_request_names_the_policy_on_the_usage_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let snap = new_snap(&upstream.uri(), "alibaba", "");
         let g: aisix_core::Guardrail = serde_json::from_str(
             r#"{"name":"test-block","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,

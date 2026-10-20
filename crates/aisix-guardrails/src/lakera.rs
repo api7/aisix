@@ -647,7 +647,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_input_allows() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .and(bearer_token("lk-test-key"))
@@ -664,7 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn flagged_injection_blocks_with_detector_name() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(200).set_body_json(injection_response()))
@@ -684,7 +684,7 @@ mod tests {
     async fn pii_only_blob_path_blocks() {
         // The blob path has no write-back channel, so PII-only maps to
         // Block there (kind=bedrock ANONYMIZE contract).
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -709,7 +709,7 @@ mod tests {
 
     #[tokio::test]
     async fn pii_only_segment_path_masks_by_offsets() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // slot 1 is empty and must NOT be sent; slot 2's detection is
         // message_id=1 (the second SENT message).
         Mock::given(method("POST"))
@@ -752,7 +752,7 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_pii_and_injection_blocks_on_segment_path() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -775,7 +775,7 @@ mod tests {
 
     #[tokio::test]
     async fn flagged_without_breakdown_blocks() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "flagged": true })))
@@ -789,7 +789,7 @@ mod tests {
     async fn pii_only_without_payload_spans_blocks_on_segment_path() {
         // Maskable classification but no spans to rewrite — releasing the
         // content would defeat the policy.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -806,7 +806,7 @@ mod tests {
 
     #[tokio::test]
     async fn five_xx_fail_open_bypasses_fail_closed_blocks() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(500))
@@ -825,7 +825,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_error_4xx_tagged_separately() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(401))
@@ -842,7 +842,7 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_respects_fail_open() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .respond_with(
@@ -865,7 +865,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_only_hook_skips_output_and_stream_holdback() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let g = LakeraGuardrail::new("t", &cfg(&server.uri()), GuardrailHookPoint::Input, false);
         assert!(!g.runs_on_output());
         let out = g.moderate_output_segments(&["x".to_owned()]).await;

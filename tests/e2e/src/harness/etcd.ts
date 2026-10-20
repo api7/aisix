@@ -273,16 +273,21 @@ export class EtcdClient {
   }
 
   /**
-   * etcd's own count of watchers that have fallen behind the store
-   * (`etcd_debugging_mvcc_slow_watcher_total`: unsynced plus those whose
-   * delivery blocked). Refreshed by etcd every ~100ms.
+   * How many responses etcd has handed to watch streams, on every stream
+   * in the cluster (`grpc_server_msg_sent_total` for `Watch`). Monotonic,
+   * so a delta over an interval is exact; a send counts once gRPC has
+   * taken the message, which stops when the stream's flow-control window
+   * is full.
    */
-  async slowWatchers(): Promise<number> {
+  async watchResponsesSent(): Promise<number> {
     const res = await harnessRequest(`${this.endpoint}/metrics`, { method: "GET" });
     const text = await res.body.text();
     if (res.statusCode >= 300) throw new Error(`etcd /metrics failed (${res.statusCode})`);
-    const m = /^etcd_debugging_mvcc_slow_watcher_total (\S+)$/m.exec(text);
-    if (!m) throw new Error("etcd /metrics carries no etcd_debugging_mvcc_slow_watcher_total");
+    const m =
+      /^grpc_server_msg_sent_total\{grpc_method="Watch",grpc_service="etcdserverpb\.Watch",grpc_type="bidi_stream"\} (\S+)$/m.exec(
+        text,
+      );
+    if (!m) throw new Error("etcd /metrics carries no grpc_server_msg_sent_total for Watch");
     return Number(m[1]);
   }
 

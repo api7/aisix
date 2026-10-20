@@ -294,7 +294,7 @@ pub(crate) mod testing {
     /// provider that echoes its input would. Tagged with `request_id` in
     /// the `x-acs-request-id` header.
     pub(crate) async fn undecodable_server(request_id: &str) -> wiremock::MockServer {
-        let server = wiremock::MockServer::start().await;
+        let server = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::any())
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
@@ -330,7 +330,7 @@ pub(crate) mod testing {
     /// A provider that answers every call with `status` and an empty JSON
     /// object.
     pub(crate) async fn status_server(status: u16) -> wiremock::MockServer {
-        let server = wiremock::MockServer::start().await;
+        let server = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::any())
             .respond_with(wiremock::ResponseTemplate::new(status).set_body_string("{}"))
             .mount(&server)

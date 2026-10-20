@@ -1181,7 +1181,7 @@ mod tests {
     async fn a_served_request_emits_a_zero_token_row_carrying_the_mask_it_applied() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .respond_with(
@@ -1253,7 +1253,7 @@ mod tests {
     /// goes upstream. Fails on `a456ab71` with 422.
     #[tokio::test]
     async fn unparseable_body_with_an_output_only_guardrail_is_forwarded() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .respond_with(
@@ -1318,7 +1318,7 @@ mod tests {
     /// `/v1/messages`. Fails on `8955d6ab` with 422.
     #[tokio::test]
     async fn unparseable_body_with_a_fail_open_guardrail_is_forwarded() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .respond_with(
@@ -1385,7 +1385,7 @@ mod tests {
     async fn a_forwarded_unparseable_body_records_the_bypass_on_its_usage_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .respond_with(
@@ -1440,7 +1440,7 @@ mod tests {
     /// The same body with an INPUT-hook row keeps the fail-closed refusal.
     #[tokio::test]
     async fn unparseable_body_with_an_input_guardrail_is_refused() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .respond_with(
@@ -1498,7 +1498,7 @@ mod tests {
     /// on the first transient 502.
     #[tokio::test]
     async fn mixed_group_spends_the_default_budget_on_the_only_anthropic_target() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
@@ -1656,7 +1656,7 @@ mod tests {
         let big_body = format!("{}€", "a".repeat(1023));
         assert!(!big_body.is_char_boundary(1024), "test setup invariant");
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .respond_with(ResponseTemplate::new(500).set_body_string(big_body))
@@ -1688,7 +1688,7 @@ mod tests {
     /// `{"input_tokens": <n>}` body verbatim.
     #[tokio::test]
     async fn happy_path_forwards_to_anthropic_count_tokens() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .and(header("x-api-key", "sk-ant-test"))
@@ -1734,7 +1734,7 @@ mod tests {
     /// `/v1/messages` happily served the same model.
     #[tokio::test]
     async fn byo_model_on_the_anthropic_adapter_is_served() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .and(header("x-api-key", "sk-byo"))
@@ -1803,7 +1803,7 @@ mod tests {
     /// block injecting `anthropic-beta` must reach the upstream request.
     #[tokio::test]
     async fn applies_default_headers_anthropic_beta() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .and(header("anthropic-beta", "token-counting-2024-11-01"))
@@ -1842,7 +1842,7 @@ mod tests {
     /// count_tokens request, exactly as on /v1/messages.
     #[tokio::test]
     async fn applies_param_renames() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .and(wiremock::matchers::body_partial_json(
@@ -1885,7 +1885,7 @@ mod tests {
     /// reserved blacklist in `apply_request_headers` protects it.
     #[tokio::test]
     async fn default_headers_cannot_overwrite_x_api_key() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // Mock only 200s when x-api-key is the PK secret, NOT the value
         // the operator tried to smuggle via default_headers.
         Mock::given(method("POST"))

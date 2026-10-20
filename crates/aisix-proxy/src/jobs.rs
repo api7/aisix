@@ -2407,7 +2407,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_file_routes_by_form_model_and_encodes_response_id() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(path("/v1/files"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2476,7 +2476,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_content_relays_bytes_with_query_model_routing() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("GET"))
             .and(path("/v1/files/file-raw/content"))
             .respond_with(
@@ -2512,8 +2512,8 @@ mod tests {
         // Two providers; the encoded file id names model B — the request
         // must land on upstream B with the RAW file id and no gateway
         // routing fields.
-        let upstream_a = MockServer::start().await;
-        let upstream_b = MockServer::start().await;
+        let upstream_a = MockServer::builder().start().await;
+        let upstream_b = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(path("/v1/batches"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2575,7 +2575,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_batch_retrieve_attributes_usage_once() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("GET"))
             .and(path("/v1/batches/batch_1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2699,7 +2699,7 @@ mod tests {
 
     #[tokio::test]
     async fn ft_create_routes_by_training_file_and_reencodes_ids() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(path("/v1/fine_tuning/jobs"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2758,7 +2758,7 @@ mod tests {
 
     #[tokio::test]
     async fn azure_adapter_uses_api_key_header_and_resource_scoped_path() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("GET"))
             .and(path("/openai/batches/batch_az"))
             .and(query_param("api-version", AZURE_JOBS_API_VERSION))
@@ -2975,7 +2975,7 @@ mod tests {
     #[tokio::test]
     async fn an_upload_is_forwarded_under_every_purpose_class() {
         for purpose in [Some("batch"), Some("assistants"), None] {
-            let upstream = MockServer::start().await;
+            let upstream = MockServer::builder().start().await;
             files_upstream_mock().expect(1).mount(&upstream).await;
 
             let snap = AisixSnapshot::new();
@@ -3025,7 +3025,7 @@ mod tests {
     /// which the provider echoes back as the stored file's `filename`.
     #[tokio::test]
     async fn an_upload_response_is_relayed_past_a_blocking_output_row() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         files_upstream_mock().expect(1).mount(&upstream).await;
 
         let snap = AisixSnapshot::new();
@@ -3055,7 +3055,7 @@ mod tests {
     async fn a_file_download_is_relayed_past_a_blocking_output_row() {
         const STORED: &[u8] = b"{\"custom_id\":\"r1\",\"note\":\"forbidden-term\"}\n";
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("GET"))
             .and(path("/v1/files/file-abc/content"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(STORED))
@@ -3087,7 +3087,7 @@ mod tests {
     /// uploaded blob and is still screened.
     #[tokio::test]
     async fn a_batch_create_is_still_screened() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(path("/v1/batches"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3132,7 +3132,7 @@ mod tests {
     /// naming the surface it belongs to.
     #[tokio::test]
     async fn a_fine_tuning_job_read_is_still_screened() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("GET"))
             .and(path("/v1/fine_tuning/jobs/ftjob-9"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

@@ -356,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn mint_posts_client_credentials_grant_with_correct_scope() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let captured_body: Arc<std::sync::Mutex<Option<String>>> =
             Arc::new(std::sync::Mutex::new(None));
         let captured_for_responder = captured_body.clone();
@@ -392,7 +392,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_token_caches_within_ttl_and_only_calls_endpoint_once() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "aad.cache-hit",
@@ -415,7 +415,7 @@ mod tests {
         // a regression that keyed only by tenant_id would serve
         // app B's request app A's token (or vice versa). Pin the
         // separation explicitly.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("client_id=aaaa"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -462,7 +462,7 @@ mod tests {
         // serves the pre-rotation token for its full hour. The gateway
         // would keep authenticating with the secret the operator just
         // replaced, and report success while doing it.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("client_secret=secret-old"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -507,7 +507,7 @@ mod tests {
         // authority_host selects which AAD cloud minted the token, so a
         // public-cloud token must never be served to a sovereign-cloud
         // request that happens to share tenant_id + client_id.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "token-per-authority",
@@ -532,7 +532,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_endpoint_5xx_surfaces_as_upstream_status_with_retry_hint() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(503)
@@ -558,7 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_endpoint_4xx_invalid_client_surfaces_as_config_error() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(401).set_body_string(
                 r#"{"error":"invalid_client","error_description":"AADSTS7000215: Invalid client secret provided"}"#,
@@ -578,7 +578,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_tenant_id_rejected_before_endpoint_call() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
@@ -605,7 +605,7 @@ mod tests {
         // A `/` in tenant_id could redirect the token POST to a path
         // the operator never authorized. validate() must catch this
         // before we interpolate into the URL.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
@@ -688,7 +688,7 @@ mod tests {
     /// authority_host) would not match and the mock would 404.
     #[tokio::test]
     async fn mint_via_production_authority_host_posts_to_interpolated_path() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(wiremock::matchers::path("/tenant-xyz/oauth2/v2.0/token"))
             .and(body_string_contains("grant_type=client_credentials"))

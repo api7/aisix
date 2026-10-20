@@ -1,0 +1,7 @@
+disallowed-methods = [
+    # `MockServer::start()` lends out a server from a process-wide pool, so
+    # a request another test sent just before it ended can land on the
+    # server this test is counting. `MockServer::builder().start()` gives
+    # each test a server no other test has ever seen.
+    { path = "wiremock::MockServer::start", reason = "pooled servers are shared across tests; use `MockServer::builder().start()`" },
+]

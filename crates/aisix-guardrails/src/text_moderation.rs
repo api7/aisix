@@ -693,7 +693,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_input_returns_allow_and_sends_wire_shape() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:analyze"))
             .and(query_param("api-version", "2024-09-01"))
@@ -716,7 +716,7 @@ mod tests {
 
     #[tokio::test]
     async fn high_severity_input_returns_block() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:analyze"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -732,7 +732,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_5xx_fail_open_true_returns_bypass() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:analyze"))
             .respond_with(ResponseTemplate::new(500))
@@ -748,7 +748,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_5xx_fails_closed_by_default() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:analyze"))
             .respond_with(ResponseTemplate::new(500))
@@ -765,7 +765,7 @@ mod tests {
 
     #[tokio::test]
     async fn high_severity_output_returns_block() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:analyze"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
