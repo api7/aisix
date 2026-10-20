@@ -489,10 +489,7 @@ fn emit_guardrail_attachments(
         };
         let resolved = match scope_name {
             None => None,
-            Some((label, Some(name))) => {
-                let _ = label;
-                Some(name.clone())
-            }
+            Some((_, Some(name))) => Some(name.clone()),
             Some((label, None)) => {
                 diag.warnings.push(format!(
                     "guardrail {guardrail:?} is scoped to {label} that is not in the snapshot; \

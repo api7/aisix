@@ -900,7 +900,7 @@ async fn embed_texts_inner(
                 if let Some(expected) = expected_dims {
                     if v.len() != expected {
                         return Err(ProxyError::InvalidRequest(format!(
-                            "embedding endpoint returned a vector of {} dimensions; expected {expected}",
+                            "embedding endpoint returned a vector of length {}; expected {expected}",
                             v.len(),
                         )));
                     }

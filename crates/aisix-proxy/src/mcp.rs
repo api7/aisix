@@ -2522,7 +2522,7 @@ mod tests {
             assert_eq!(
                 response.status(),
                 StatusCode::UNAUTHORIZED,
-                "a {label} anonymous principal must close the entry"
+                "the {label} anonymous principal must close the entry"
             );
         }
     }

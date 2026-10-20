@@ -312,14 +312,15 @@ async fn handle(
     }
 }
 
-/// The kind a decision endpoint refuses to serve, if `model` is one.
+/// The kind a decision endpoint refuses to serve, if `model` is one, with
+/// the article it takes.
 fn unserved_kind(model: &aisix_core::Model) -> Option<&'static str> {
     if model.is_ensemble() {
-        Some("ensemble")
+        Some("an `ensemble`")
     } else if model.is_semantic() {
-        Some("semantic")
+        Some("a `semantic`")
     } else if model.is_embedding() {
-        Some("embedding")
+        Some("an `embedding`")
     } else {
         None
     }
@@ -327,7 +328,7 @@ fn unserved_kind(model: &aisix_core::Model) -> Option<&'static str> {
 
 fn unserved_kind_error(endpoint: &Endpoint, label: String, kind: &str) -> ProxyError {
     ProxyError::InvalidRequest(format!(
-        "{label} has kind `{kind}`; {} serves direct and routing models only",
+        "{label} is {kind} model; {} serves direct and routing models only",
         endpoint.path
     ))
 }
