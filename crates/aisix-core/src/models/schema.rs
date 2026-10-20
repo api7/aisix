@@ -506,18 +506,18 @@ pub fn validate_model(value: &Value) -> Result<(), SchemaError> {
     }
     // strip_kind_inapplicable reports only on these non-direct shapes.
     let kind = if model.is_routing() {
-        "model group"
+        "a model group"
     } else if model.is_ensemble() {
-        "ensemble"
+        "an ensemble"
     } else if model.is_embedding() {
-        "embedding model"
+        "an embedding model"
     } else {
-        "semantic router"
+        "a semantic router"
     };
     Err(SchemaError {
         path: err.path,
         message: format!(
-            "{} not accepted on a {kind}",
+            "{} not accepted on {kind}",
             dead.iter()
                 .map(|f| format!("`{f}`"))
                 .collect::<Vec<_>>()
@@ -6153,7 +6153,7 @@ mod tests {
         let msg = validate_model(&group).unwrap_err().message;
         assert!(msg.contains("`cost`"), "{msg}");
         assert!(msg.contains("`retries`"), "{msg}");
-        assert!(msg.contains("model group"), "{msg}");
+        assert!(msg.contains("not accepted on a model group"), "{msg}");
         assert!(
             !msg.contains("oneOf"),
             "generic message should be replaced: {msg}"
@@ -6166,7 +6166,7 @@ mod tests {
         });
         let msg = validate_model(&ensemble).unwrap_err().message;
         assert!(msg.contains("`timeout`"), "{msg}");
-        assert!(msg.contains("ensemble"), "{msg}");
+        assert!(msg.contains("not accepted on an ensemble"), "{msg}");
 
         let semantic = json!({
             "display_name": "s",
@@ -6181,7 +6181,7 @@ mod tests {
         });
         let msg = validate_model(&semantic).unwrap_err().message;
         assert!(msg.contains("`auto_prompt_caching`"), "{msg}");
-        assert!(msg.contains("semantic router"), "{msg}");
+        assert!(msg.contains("not accepted on a semantic router"), "{msg}");
 
         let embedding = json!({
             "display_name": "embed",
@@ -6193,7 +6193,7 @@ mod tests {
         });
         let msg = validate_model(&embedding).unwrap_err().message;
         assert!(msg.contains("`effort_mapping`"), "{msg}");
-        assert!(msg.contains("embedding model"), "{msg}");
+        assert!(msg.contains("not accepted on an embedding model"), "{msg}");
         assert!(!msg.contains("semantic router"), "{msg}");
     }
 
@@ -6212,7 +6212,7 @@ mod tests {
             "definitely_not_a_field": 1
         });
         let msg = validate_model(&unknown).unwrap_err().message;
-        assert!(!msg.contains("not accepted on a"), "{msg}");
+        assert!(!msg.contains("not accepted on"), "{msg}");
 
         // A dead knob on a DIRECT model is not dead at all — it resolves
         // there — so a direct model carrying `retries` must still VALIDATE.

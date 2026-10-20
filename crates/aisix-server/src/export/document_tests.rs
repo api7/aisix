@@ -470,6 +470,11 @@ fn an_attachment_the_file_cannot_name_is_dropped_with_a_warning() {
         serde_json::from_value(attachment("g-1", "model", Some("m-gone"))).unwrap(),
         1,
     ));
+    snap.guardrail_attachments.insert(ResourceEntry::new(
+        "att-missing-key",
+        serde_json::from_value(attachment("g-1", "api_key", Some("k-gone"))).unwrap(),
+        1,
+    ));
     // The export carries no passthrough_routes collection at all, so a
     // route-scoped attachment has nothing to point at. Emitting the name
     // anyway produced a file the loader rejected WHOLE, with export still
@@ -491,8 +496,15 @@ fn an_attachment_the_file_cannot_name_is_dropped_with_a_warning() {
     assert!(
         doc.warnings
             .iter()
-            .any(|w| w.contains("not in the snapshot")),
+            .any(|w| w.contains("scoped to a model that is not in the snapshot")),
         "dangling model scope must be reported: {:?}",
+        doc.warnings
+    );
+    assert!(
+        doc.warnings
+            .iter()
+            .any(|w| w.contains("scoped to an api key that is not in the snapshot")),
+        "dangling api key scope must be reported: {:?}",
         doc.warnings
     );
     assert!(

@@ -846,8 +846,10 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
       for (const path of ["/v1/systemone", "/v1/decisions"]) {
         const res = await post(path, { model, state: "x", input: "x", questions: {} });
         expect(res.status, `${path} ${model}`).toBe(400);
-        expect(res.body.error.message).toContain(`\`${kind}\``);
-        expect(res.body.error.message).toContain(path);
+        expect(res.body.error.type).toBe("invalid_request_error");
+        expect(res.body.error.message).toBe(
+          `model \`${model}\` has kind \`${kind}\`; ${path} serves direct and routing models only`,
+        );
       }
     }
 

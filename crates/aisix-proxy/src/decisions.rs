@@ -327,7 +327,7 @@ fn unserved_kind(model: &aisix_core::Model) -> Option<&'static str> {
 
 fn unserved_kind_error(endpoint: &Endpoint, label: String, kind: &str) -> ProxyError {
     ProxyError::InvalidRequest(format!(
-        "{label} is a `{kind}` model; {} serves direct and routing models only",
+        "{label} has kind `{kind}`; {} serves direct and routing models only",
         endpoint.path
     ))
 }
