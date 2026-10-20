@@ -31,7 +31,7 @@ use aisix_guardrails::{EmbedError, EmbedFailure, Embedded, GuardrailEmbedder};
 use async_trait::async_trait;
 
 use crate::error::ProxyError;
-use crate::semantic::SemanticVectorCache;
+use crate::semantic::{EmbedTextsError, SemanticVectorCache};
 
 pub struct ProxyGuardrailEmbedder {
     hub: Arc<Hub>,
@@ -177,13 +177,19 @@ fn embedding_dimensions(model: &Model) -> Option<u32> {
 /// the only place it is reported: nothing on the dispatch path logs it. Its
 /// text is [`crate::semantic::embed_failure_text`], which keeps anything an
 /// upstream response said out of it (#153).
-fn classify(err: ProxyError) -> EmbedError {
+fn classify(err: EmbedTextsError) -> EmbedError {
     let failure = match &err {
-        ProxyError::Bridge(BridgeError::Timeout { .. }) => EmbedFailure::Timeout,
+        EmbedTextsError::Dispatch(ProxyError::Bridge(BridgeError::Timeout { .. })) => {
+            EmbedFailure::Timeout
+        }
         // No bridge for the provider key, or the model has no provider /
         // upstream model name — configuration, not an outage.
-        ProxyError::ProviderUnavailable | ProxyError::InvalidRequest(_) => EmbedFailure::Unresolved,
-        _ => EmbedFailure::Upstream,
+        EmbedTextsError::Dispatch(
+            ProxyError::ProviderUnavailable | ProxyError::InvalidRequest(_),
+        ) => EmbedFailure::Unresolved,
+        EmbedTextsError::Dispatch(_) | EmbedTextsError::UnusableResponse(_) => {
+            EmbedFailure::Upstream
+        }
     };
     EmbedError {
         failure,

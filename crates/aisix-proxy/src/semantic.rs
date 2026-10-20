@@ -128,18 +128,22 @@ impl DecisionFailure {
         (failure, aisix_gateway::transport_error_message(err))
     }
 
-    fn of_embedding_error(err: &ProxyError) -> Self {
+    fn of_embedding_error(err: &EmbedTextsError) -> Self {
         use aisix_gateway::BridgeError;
         match err {
-            ProxyError::Bridge(BridgeError::Timeout { .. }) => Self::EmbeddingTimeout,
-            ProxyError::Bridge(
+            EmbedTextsError::Dispatch(ProxyError::Bridge(BridgeError::Timeout { .. })) => {
+                Self::EmbeddingTimeout
+            }
+            EmbedTextsError::Dispatch(ProxyError::Bridge(
                 BridgeError::UpstreamStatus { .. }
                 | BridgeError::UpstreamInBand { .. }
                 | BridgeError::UpstreamDecode(_)
                 | BridgeError::Transport(_)
                 | BridgeError::StreamAborted,
-            ) => Self::EmbeddingUpstream,
-            _ => Self::EmbeddingUnavailable,
+            )) => Self::EmbeddingUpstream,
+            EmbedTextsError::Dispatch(_) | EmbedTextsError::UnusableResponse(_) => {
+                Self::EmbeddingUnavailable
+            }
         }
     }
 }
@@ -776,6 +780,24 @@ fn select_eligible(
     Ok((attempt, fell_back))
 }
 
+/// Why [`embed_texts`] produced no vectors.
+#[derive(Debug)]
+pub(crate) enum EmbedTextsError {
+    /// The call could not be made, or it failed: the embedding model's
+    /// configuration, transport, a timeout, or an upstream error answer.
+    Dispatch(ProxyError),
+    /// The upstream answered 2xx with vectors that do not fit the request:
+    /// the wrong dimension, base64 instead of floats, or the wrong count.
+    /// The text names only lengths, never response content.
+    UnusableResponse(String),
+}
+
+impl From<ProxyError> for EmbedTextsError {
+    fn from(err: ProxyError) -> Self {
+        Self::Dispatch(err)
+    }
+}
+
 /// Embed `texts` through the embedding model's bridge in one batched call,
 /// returning one float vector per input in input order. Shared by the
 /// semantic router (route matching) and the cache gate's semantic layer
@@ -789,7 +811,7 @@ pub(crate) async fn embed_texts(
     request_id: &str,
     purpose: GatewayEmbeddingPurpose,
     texts: &[String],
-) -> Result<Vec<Vec<f32>>, ProxyError> {
+) -> Result<Vec<Vec<f32>>, EmbedTextsError> {
     // Detached: this is a dispatch the GATEWAY decided to make — for a
     // semantic guardrail, a semantic route, or the semantic cache — not one
     // the caller addressed. Two of its three callers run after the winning
@@ -817,7 +839,7 @@ async fn embed_texts_inner(
     request_id: &str,
     purpose: GatewayEmbeddingPurpose,
     texts: &[String],
-) -> Result<Vec<Vec<f32>>, ProxyError> {
+) -> Result<Vec<Vec<f32>>, EmbedTextsError> {
     let model = &embed_entry.value;
     crate::dispatch::require_provider(model)?;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -884,7 +906,7 @@ async fn embed_texts_inner(
                 latency_ms,
                 outcome: GatewayEmbeddingOutcome::Failed,
             });
-            return Err(ProxyError::Bridge(err));
+            return Err(ProxyError::Bridge(err).into());
         }
     };
     let mut data = resp.data;
@@ -899,7 +921,7 @@ async fn embed_texts_inner(
                 // 0.0 (which would silently route every request to default).
                 if let Some(expected) = expected_dims {
                     if v.len() != expected {
-                        return Err(ProxyError::InvalidRequest(format!(
+                        return Err(EmbedTextsError::UnusableResponse(format!(
                             "embedding endpoint returned a vector of length {}; expected {expected}",
                             v.len(),
                         )));
@@ -908,7 +930,7 @@ async fn embed_texts_inner(
                 out.push(v);
             }
             EmbeddingVector::Base64(_) => {
-                return Err(ProxyError::InvalidRequest(
+                return Err(EmbedTextsError::UnusableResponse(
                     "embedding endpoint returned base64 vectors; semantic routing needs \
                      encoding_format=float support"
                         .into(),
@@ -917,7 +939,7 @@ async fn embed_texts_inner(
         }
     }
     if out.len() != texts.len() {
-        return Err(ProxyError::InvalidRequest(format!(
+        return Err(EmbedTextsError::UnusableResponse(format!(
             "embedding endpoint returned {} vectors for {} inputs",
             out.len(),
             texts.len(),
@@ -934,8 +956,12 @@ async fn embed_texts_inner(
 /// only the position serde reported (its message quotes the offending
 /// value). Everything else — transport, timeout, configuration — keeps
 /// its full error chain.
-pub(crate) fn embed_failure_text(err: &ProxyError) -> String {
+pub(crate) fn embed_failure_text(err: &EmbedTextsError) -> String {
     use aisix_gateway::BridgeError;
+    let err = match err {
+        EmbedTextsError::Dispatch(err) => err,
+        EmbedTextsError::UnusableResponse(message) => return message.clone(),
+    };
     match err {
         ProxyError::Bridge(BridgeError::UpstreamStatus { status, .. }) => {
             format!("upstream returned HTTP {status}")
@@ -970,7 +996,7 @@ mod embed_failure_text_tests {
     use aisix_gateway::BridgeError;
 
     fn logged(err: BridgeError) -> String {
-        embed_failure_text(&ProxyError::Bridge(err))
+        embed_failure_text(&EmbedTextsError::Dispatch(ProxyError::Bridge(err)))
     }
 
     #[test]
@@ -1099,9 +1125,12 @@ mod tests {
             .await
             .expect_err("premise: no bridge is registered, so this must fail");
             assert!(
-                matches!(err, ProxyError::ProviderUnavailable),
+                matches!(
+                    err,
+                    EmbedTextsError::Dispatch(ProxyError::ProviderUnavailable)
+                ),
                 "premise: it must fail at bridge resolution, i.e. after the \
-                 provider key was resolved — got {err}",
+                 provider key was resolved — got {err:?}",
             );
 
             let resolved = crate::attribution::current().expect("in scope");
