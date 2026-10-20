@@ -36,23 +36,30 @@ use aws_sdk_bedrockruntime::operation::invoke_model::InvokeModelError;
 use aws_sdk_bedrockruntime::primitives::Blob;
 use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
 use aws_sdk_bedrockruntime::types::{
-    AnyToolChoice, ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole,
-    ConverseStreamOutput, InferenceConfiguration, JsonSchemaDefinition, Message as BedrockMessage,
-    OutputConfig, OutputFormat, OutputFormatStructure, OutputFormatType, ReasoningContentBlock,
-    ReasoningContentBlockDelta, SpecificToolChoice, StopReason as SdkStopReason,
-    SystemContentBlock, Tool, ToolChoice, ToolConfiguration, ToolInputSchema, ToolResultBlock,
-    ToolResultContentBlock, ToolSpecification, ToolUseBlock,
+    AnyToolChoice, AudioBlock, AudioFormat, AudioSource, ContentBlock, ContentBlockDelta,
+    ContentBlockStart, ConversationRole, ConverseStreamOutput, DocumentBlock, DocumentFormat,
+    DocumentSource, ImageBlock, ImageFormat, ImageSource, InferenceConfiguration,
+    JsonSchemaDefinition, Message as BedrockMessage, OutputConfig, OutputFormat,
+    OutputFormatStructure, OutputFormatType, ReasoningContentBlock, ReasoningContentBlockDelta,
+    SpecificToolChoice, StopReason as SdkStopReason, SystemContentBlock, Tool, ToolChoice,
+    ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolSpecification,
+    ToolUseBlock, VideoBlock, VideoFormat, VideoSource,
 };
 use aws_sdk_bedrockruntime::Client as BedrockClient;
+use base64::Engine as _;
+
+use aisix_gateway::content_part::{
+    check_tool_result_parts, parse_part, part_error, ContentPart, Media, MediaSource,
+};
 use aws_smithy_runtime_api::client::result::ServiceError;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use serde::Deserialize;
 use std::time::{Duration, Instant};
 
 use aisix_provider_anthropic::wire::{
-    build_request, response_into_chat_response, split_system, structured_output_for,
+    build_request, response_into_chat_response, split_system_with, structured_output_for,
     tool_choice_states_a_preference, translate_reasoning_effort_to_anthropic, AnthropicResponse,
-    StructuredOutput,
+    MediaUrls, StructuredOutput,
 };
 
 // Per-`ProviderKey` request override pipeline (#302 §5 / #340). The JSON-body
@@ -1003,7 +1010,8 @@ impl BedrockBridge {
         // bytes are alive while the upstream is awaited.
         let body_bytes = {
             let (system, messages) =
-                split_system(&req).map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
+                split_system_with(&req, MediaUrls::Refused("Claude on Amazon Bedrock"))
+                    .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
             let anthropic_req = build_request(&req, anthropic_model, system, messages, false);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -1295,7 +1303,7 @@ fn build_converse_inputs(
     // rejects two consecutive user messages.
     let mut pending_tool_results: Vec<ContentBlock> = Vec::new();
 
-    for msg in &req.messages {
+    for (index, msg) in req.messages.iter().enumerate() {
         // Converse has no slot for replayed reasoning, and a turn that
         // holds only that would become a blank text block, which Converse
         // rejects. Skipped before the flush below, so tool results on
@@ -1321,7 +1329,7 @@ fn build_converse_inputs(
             Role::User => {
                 messages.push(build_message(
                     ConversationRole::User,
-                    vec![ContentBlock::Text(msg.content_str().to_string())],
+                    user_content_blocks(msg, index)?,
                 )?);
             }
             Role::Assistant => {
@@ -1331,6 +1339,7 @@ fn build_converse_inputs(
                 )?);
             }
             Role::Tool => {
+                check_tool_result_parts(msg, index).map_err(BridgeError::InvalidRequest)?;
                 // #560: `role:"tool"` → Converse `toolResult` block. The
                 // correlation id rides `tool_call_id`, the result text
                 // rides `content`. A result that names no call still goes
@@ -1357,6 +1366,142 @@ fn build_converse_inputs(
         messages.push(build_message(ConversationRole::User, pending_tool_results)?);
     }
     Ok((systems, messages))
+}
+
+/// A user turn's content parts as Converse blocks, in the caller's order.
+/// Adjacent text parts join into one, so a text-only message keeps the
+/// single text block it has always had. Converse takes media only as bytes
+/// in the request, and the gateway does not fetch a caller's URL, so a URL
+/// part is refused.
+fn user_content_blocks(msg: &ChatMessage, index: usize) -> Result<Vec<ContentBlock>, BridgeError> {
+    let Some(parts) = msg.content_blocks.as_deref() else {
+        return Ok(vec![ContentBlock::Text(msg.content_str().to_string())]);
+    };
+    let mut blocks = Vec::new();
+    let mut text = String::new();
+    for (part_index, part) in parts.iter().enumerate() {
+        let invalid =
+            |reason: &str| BridgeError::InvalidRequest(part_error(index, part_index, reason));
+        match parse_part(part).map_err(|r| invalid(&r))? {
+            ContentPart::Text(t) => text.push_str(t),
+            ContentPart::Media(media) => {
+                if !text.is_empty() {
+                    blocks.push(ContentBlock::Text(std::mem::take(&mut text)));
+                }
+                let name = format!("document-{index}-{part_index}");
+                blocks.push(converse_media_block(&media, &name).map_err(|r| invalid(&r))?);
+            }
+            ContentPart::Unsupported(ty) => {
+                return Err(invalid(&format!(
+                    "content part type {ty:?} is not supported for Amazon Bedrock models"
+                )));
+            }
+        }
+    }
+    if !text.is_empty() || blocks.is_empty() {
+        blocks.push(ContentBlock::Text(text));
+    }
+    Ok(blocks)
+}
+
+/// One inline media part as a Converse `image` / `document` / `audio` /
+/// `video` block, chosen by its media type.
+fn converse_media_block(media: &Media<'_>, document_name: &str) -> Result<ContentBlock, String> {
+    let (mime_type, data) = match &media.source {
+        MediaSource::Inline { mime_type, data } => (mime_type.as_str(), *data),
+        MediaSource::Uri { uri, .. } => {
+            return Err(format!(
+                "Amazon Bedrock does not read media from a URL, and the gateway does not \
+                 fetch {uri:?} itself; send the content inline as a base64 data: URL"
+            ));
+        }
+    };
+    let unsupported = || format!("Amazon Bedrock does not accept media of type {mime_type:?}");
+    let bytes = || {
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map(Blob::new)
+            .map_err(|_| "the media data is not valid base64".to_string())
+    };
+    let built = |e: aws_smithy_types::error::operation::BuildError| {
+        format!("bedrock converse: build media block: {e}")
+    };
+    let subtype = mime_type.split_once('/').map_or("", |(_, sub)| sub);
+    if mime_type.starts_with("image/") {
+        let format = match subtype {
+            "png" => ImageFormat::Png,
+            "jpeg" | "jpg" => ImageFormat::Jpeg,
+            "gif" => ImageFormat::Gif,
+            "webp" => ImageFormat::Webp,
+            _ => return Err(unsupported()),
+        };
+        let block = ImageBlock::builder()
+            .format(format)
+            .source(ImageSource::Bytes(bytes()?))
+            .build()
+            .map_err(built)?;
+        return Ok(ContentBlock::Image(block));
+    }
+    if mime_type.starts_with("audio/") {
+        let format = match subtype {
+            "wav" | "x-wav" => AudioFormat::Wav,
+            "mp3" | "mpeg" => AudioFormat::Mp3,
+            "aac" => AudioFormat::Aac,
+            "flac" => AudioFormat::Flac,
+            "ogg" => AudioFormat::Ogg,
+            "opus" => AudioFormat::Opus,
+            "webm" => AudioFormat::Webm,
+            "m4a" | "mp4" => AudioFormat::M4A,
+            "pcm" => AudioFormat::Pcm,
+            _ => return Err(unsupported()),
+        };
+        let block = AudioBlock::builder()
+            .format(format)
+            .source(AudioSource::Bytes(bytes()?))
+            .build()
+            .map_err(built)?;
+        return Ok(ContentBlock::Audio(block));
+    }
+    if mime_type.starts_with("video/") {
+        let format = match subtype {
+            "mp4" => VideoFormat::Mp4,
+            "mov" | "quicktime" => VideoFormat::Mov,
+            "webm" => VideoFormat::Webm,
+            "x-matroska" => VideoFormat::Mkv,
+            "mpeg" => VideoFormat::Mpeg,
+            "x-flv" => VideoFormat::Flv,
+            "wmv" | "x-ms-wmv" => VideoFormat::Wmv,
+            "3gpp" => VideoFormat::ThreeGp,
+            _ => return Err(unsupported()),
+        };
+        let block = VideoBlock::builder()
+            .format(format)
+            .source(VideoSource::Bytes(bytes()?))
+            .build()
+            .map_err(built)?;
+        return Ok(ContentBlock::Video(block));
+    }
+    let format = match mime_type {
+        "application/pdf" => DocumentFormat::Pdf,
+        "text/plain" => DocumentFormat::Txt,
+        "text/csv" => DocumentFormat::Csv,
+        "text/html" => DocumentFormat::Html,
+        "text/markdown" => DocumentFormat::Md,
+        "application/msword" => DocumentFormat::Doc,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+            DocumentFormat::Docx
+        }
+        "application/vnd.ms-excel" => DocumentFormat::Xls,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => DocumentFormat::Xlsx,
+        _ => return Err(unsupported()),
+    };
+    let block = DocumentBlock::builder()
+        .name(document_name)
+        .format(format)
+        .source(DocumentSource::Bytes(bytes()?))
+        .build()
+        .map_err(built)?;
+    Ok(ContentBlock::Document(block))
 }
 
 /// Converse rejects an empty `messages[]`, which is what a request holding

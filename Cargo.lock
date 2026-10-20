@@ -339,6 +339,7 @@ dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
+ "base64 0.22.1",
  "futures",
  "http 1.4.0",
  "serde",

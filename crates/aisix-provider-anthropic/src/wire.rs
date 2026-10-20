@@ -24,6 +24,9 @@
 use std::borrow::Cow;
 
 use aisix_core::MappedEffort;
+use aisix_gateway::content_part::{
+    check_tool_result_parts, parse_part, part_error, ContentPart, Media, MediaKind, MediaSource,
+};
 use aisix_gateway::structured_output::{
     apply_schema_limits, json_schema_from_response_format, seal_object_schemas,
     ANTHROPIC_SCHEMA_LIMITS, JSON_TOOL_DESCRIPTION, JSON_TOOL_NAME,
@@ -162,17 +165,10 @@ impl<'a> AnthropicMessage<'a> {
         }
     }
 
-    /// Message content built from a caller's typed content blocks
-    /// ([`ChatMessage::content_blocks`]): text blocks map 1:1 — OpenAI
-    /// and Anthropic share the `{type:"text", text}` shape, and the
-    /// block-level fields Anthropic accepts (notably `cache_control`
-    /// prompt-cache markers) ride along in place. Flattening through the
-    /// concatenated-text path would silently strip them (AISIX-Cloud#1110
-    /// Gap A); see [`anthropic_text_blocks`] for the per-block filter.
-    /// Degrades to a single empty text block when nothing survives,
+    /// Message content built from already-translated Anthropic content
+    /// blocks. Degrades to a single empty text block when there are none,
     /// because Anthropic rejects an empty `content` array.
-    pub(crate) fn from_blocks(role: &'a str, blocks: &[serde_json::Value]) -> Self {
-        let mut content = anthropic_text_blocks(blocks);
+    pub(crate) fn from_blocks(role: &'a str, mut content: Vec<serde_json::Value>) -> Self {
         if content.is_empty() {
             content.push(serde_json::json!({"type": "text", "text": ""}));
         }
@@ -235,29 +231,133 @@ impl<'a> AnthropicMessage<'a> {
 ///   per-block upstream — both previously vanished in the flatten, so
 ///   forwarding them would break requests that worked before.
 ///
-/// Non-text blocks (images/audio) are dropped — the documented
-/// cross-provider content limitation, unchanged by this helper.
+/// Serves system and assistant turns, which this translation keeps to
+/// text; a user turn's media goes through [`anthropic_user_blocks`].
 fn anthropic_text_blocks(blocks: &[serde_json::Value]) -> Vec<serde_json::Value> {
-    const KEEP: &[&str] = &["type", "text", "cache_control", "citations"];
     blocks
         .iter()
         .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-        .filter(|b| {
-            b.get("text")
-                .and_then(|t| t.as_str())
-                .is_some_and(|t| !t.trim().is_empty())
-        })
-        .map(|b| {
-            let kept: serde_json::Map<String, serde_json::Value> = b
-                .as_object()
-                .into_iter()
-                .flatten()
-                .filter(|(k, _)| KEEP.contains(&k.as_str()))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            serde_json::Value::Object(kept)
-        })
+        .filter_map(anthropic_text_block)
         .collect()
+}
+
+/// One OpenAI `text` part as an Anthropic text block, under the two
+/// guarantees [`anthropic_text_blocks`] describes; `None` for a
+/// degenerate one.
+fn anthropic_text_block(block: &serde_json::Value) -> Option<serde_json::Value> {
+    const KEEP: &[&str] = &["type", "text", "cache_control", "citations"];
+    block
+        .get("text")
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.trim().is_empty())?;
+    let kept: serde_json::Map<String, serde_json::Value> = block
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, _)| KEEP.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    Some(serde_json::Value::Object(kept))
+}
+
+/// Whether the upstream reads an image or document from a URL itself
+/// (Anthropic's `url` source). Claude on Vertex AI and on Amazon Bedrock
+/// does not, and the gateway never fetches a caller's URL, so there a URL
+/// part is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaUrls {
+    Accepted,
+    /// Refused; carries the upstream's name for the error message.
+    Refused(&'static str),
+}
+
+/// A user turn's content parts as Anthropic blocks, in the caller's
+/// order: text under [`anthropic_text_block`]'s rules, images and PDFs as
+/// `image` / `document` blocks. A part Claude cannot take is a 400 naming
+/// it, never a block silently left out.
+fn anthropic_user_blocks(
+    blocks: &[serde_json::Value],
+    message_index: usize,
+    urls: MediaUrls,
+) -> Result<Vec<serde_json::Value>, TranslateError> {
+    let mut out = Vec::with_capacity(blocks.len());
+    for (part_index, block) in blocks.iter().enumerate() {
+        let invalid = |reason: &str| {
+            TranslateError::InvalidContent(part_error(message_index, part_index, reason))
+        };
+        match parse_part(block).map_err(|r| invalid(&r))? {
+            ContentPart::Text(_) => out.extend(anthropic_text_block(block)),
+            ContentPart::Media(media) => {
+                let mut translated =
+                    anthropic_media_block(&media, urls).map_err(|r| invalid(&r))?;
+                if let Some(marker) = block.get("cache_control") {
+                    translated["cache_control"] = marker.clone();
+                }
+                out.push(translated);
+            }
+            ContentPart::Unsupported(ty) => {
+                return Err(invalid(&format!(
+                    "content part type {ty:?} is not supported for Claude models"
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One media part as an Anthropic `image` or `document` block.
+fn anthropic_media_block(media: &Media<'_>, urls: MediaUrls) -> Result<serde_json::Value, String> {
+    match &media.source {
+        MediaSource::Inline { mime_type, data } => {
+            let kind = match mime_type.as_str() {
+                m if m.starts_with("image/") => "image",
+                "application/pdf" => "document",
+                m if m.starts_with("audio/") => {
+                    return Err("Claude models do not accept audio input".into());
+                }
+                m => {
+                    return Err(format!(
+                        "Claude models accept images and PDF documents, not {m:?}"
+                    ));
+                }
+            };
+            Ok(serde_json::json!({
+                "type": kind,
+                "source": {"type": "base64", "media_type": mime_type, "data": data},
+            }))
+        }
+        MediaSource::Uri { uri, mime_type } => {
+            if let MediaUrls::Refused(upstream) = urls {
+                return Err(format!(
+                    "{upstream} does not read media from a URL, and the gateway does not \
+                     fetch {uri:?} itself; send the content inline as a base64 data: URL"
+                ));
+            }
+            if media.source.scheme().as_deref() != Some("https") {
+                return Err(format!(
+                    "Claude models read only https:// URLs, and the gateway does not fetch \
+                     {uri:?} itself; send the content inline as a base64 data: URL"
+                ));
+            }
+            let kind = match (mime_type.as_deref(), media.kind) {
+                (Some("application/pdf"), _) | (None, MediaKind::File) => "document",
+                (Some(m), _) if m.starts_with("image/") => "image",
+                (None, MediaKind::Image) => "image",
+                (Some(m), _) => {
+                    return Err(format!(
+                        "Claude models accept images and PDF documents, not {m:?}"
+                    ));
+                }
+                (None, MediaKind::Audio) => {
+                    return Err("Claude models do not accept audio input".into());
+                }
+            };
+            Ok(serde_json::json!({
+                "type": kind,
+                "source": {"type": "url", "url": uri},
+            }))
+        }
+    }
 }
 
 /// Translate an array of OpenAI-shape `tool_calls`
@@ -319,6 +419,9 @@ fn merge_consecutive_roles(messages: Vec<AnthropicMessage<'_>>) -> Vec<Anthropic
 pub enum TranslateError {
     #[error("tool message missing tool_call_id field")]
     MissingToolCallId,
+    /// A content part Claude cannot take; the message is the 400 sentence.
+    #[error("{0}")]
+    InvalidContent(String),
 }
 
 /// Split the gateway's flat ChatFormat into Anthropic's (system, messages)
@@ -339,11 +442,20 @@ pub enum TranslateError {
 pub fn split_system<'a>(
     req: &'a ChatFormat,
 ) -> Result<(Option<AnthropicSystem>, Vec<AnthropicMessage<'a>>), TranslateError> {
+    split_system_with(req, MediaUrls::Accepted)
+}
+
+/// [`split_system`] for an upstream whose handling of media URLs is
+/// `urls`.
+pub fn split_system_with<'a>(
+    req: &'a ChatFormat,
+    urls: MediaUrls,
+) -> Result<(Option<AnthropicSystem>, Vec<AnthropicMessage<'a>>), TranslateError> {
     let mut system_msgs: Vec<&'a ChatMessage> = Vec::new();
     let mut messages: Vec<AnthropicMessage<'a>> = Vec::new();
     let mut seen_non_system = false;
 
-    for m in &req.messages {
+    for (index, m) in req.messages.iter().enumerate() {
         // Nothing on this wire carries replayed reasoning, so a turn that
         // holds only that would become an empty text block, which the
         // upstream rejects. The user turns it separated fold together
@@ -357,7 +469,7 @@ pub fn split_system<'a>(
                     // System messages interleaved with user/assistant
                     // turns don't map cleanly; append as a user turn to
                     // preserve semantics without silently dropping them.
-                    messages.push(user_turn(m));
+                    messages.push(user_turn(m, index, urls)?);
                 } else {
                     system_msgs.push(m);
                 }
@@ -371,7 +483,7 @@ pub fn split_system<'a>(
             }
             Role::User => {
                 seen_non_system = true;
-                messages.push(user_turn(m));
+                messages.push(user_turn(m, index, urls)?);
             }
             Role::Assistant => {
                 seen_non_system = true;
@@ -392,6 +504,7 @@ pub fn split_system<'a>(
                     .tool_call_id
                     .as_deref()
                     .ok_or(TranslateError::MissingToolCallId)?;
+                check_tool_result_parts(m, index).map_err(TranslateError::InvalidContent)?;
                 messages.push(AnthropicMessage::tool_result(tool_use_id, &m.content_str()));
             }
         }
@@ -406,15 +519,21 @@ pub fn split_system<'a>(
     ))
 }
 
-/// A user-role turn: forward typed content blocks verbatim when the
-/// caller sent them (preserving `cache_control` markers), else the
-/// single-text-block shape from the flattened text.
-fn user_turn(m: &ChatMessage) -> AnthropicMessage<'_> {
-    match m.content_blocks.as_deref() {
-        Some(blocks) => AnthropicMessage::from_blocks("user", blocks),
+/// A user-role turn: the caller's typed content blocks translated by
+/// [`anthropic_user_blocks`] (preserving `cache_control` markers), else
+/// the single-text-block shape from the flattened text.
+fn user_turn(
+    m: &ChatMessage,
+    index: usize,
+    urls: MediaUrls,
+) -> Result<AnthropicMessage<'_>, TranslateError> {
+    Ok(match m.content_blocks.as_deref() {
+        Some(blocks) => {
+            AnthropicMessage::from_blocks("user", anthropic_user_blocks(blocks, index, urls)?)
+        }
         // No blocks: the text is the stored string.
         None => AnthropicMessage::text("user", m.content.as_deref().unwrap_or("")),
-    }
+    })
 }
 
 /// Collapse the leading system messages into the top-level `system`
@@ -4051,25 +4170,91 @@ mod tests {
     }
 
     #[test]
-    fn user_message_with_only_non_text_blocks_degrades_to_empty_text_block() {
-        // Image-only content: non-text blocks are skipped on this
-        // bridge (documented cross-provider limitation), and the
-        // message must still carry a non-empty content array —
-        // Anthropic rejects `content: []`.
+    fn user_image_parts_become_image_blocks_in_order() {
+        // An image part reaches Claude as an image block in the caller's
+        // position, never dropped — a dropped image is a request the model
+        // answers blind. The part's prompt-cache marker rides along.
         let req = ChatFormat::new(
             "claude",
             vec![block_message(
                 Role::User,
                 serde_json::json!([
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"}},
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"},
+                     "cache_control": {"type": "ephemeral"}},
+                    {"type": "image_url", "image_url": {"url": "https://x.example/cat.webp"}},
+                    {"type": "file", "file": {"file_data": "data:application/pdf;base64,JVBE"}},
                 ]),
             )],
         );
         let (_system, msgs) = split_system(&req).unwrap();
-        assert_eq!(msgs.len(), 1);
         assert_eq!(
             msgs[0].content,
-            vec![serde_json::json!({"type": "text", "text": ""})]
+            vec![
+                serde_json::json!({"type": "text", "text": "what is this?"}),
+                serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "xyz"},
+                                   "cache_control": {"type": "ephemeral"}}),
+                serde_json::json!({"type": "image", "source": {"type": "url", "url": "https://x.example/cat.webp"}}),
+                serde_json::json!({"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBE"}}),
+            ]
+        );
+    }
+
+    #[test]
+    fn user_parts_claude_cannot_take_are_refused_by_name() {
+        let cases = [
+            (
+                MediaUrls::Accepted,
+                serde_json::json!({"type": "input_audio", "input_audio": {"data": "UklG", "format": "wav"}}),
+                "audio",
+            ),
+            (
+                MediaUrls::Accepted,
+                serde_json::json!({"type": "image_url", "image_url": {"url": "http://x.example/cat.png"}}),
+                "https://",
+            ),
+            (
+                MediaUrls::Accepted,
+                serde_json::json!({"type": "image_url", "image_url": {"url": "gs://b/cat.png"}}),
+                "https://",
+            ),
+            (
+                MediaUrls::Accepted,
+                serde_json::json!({"type": "video_url", "video_url": {"url": "x"}}),
+                "video_url",
+            ),
+            (
+                MediaUrls::Refused("Claude on Vertex AI"),
+                serde_json::json!({"type": "image_url", "image_url": {"url": "https://x.example/cat.png"}}),
+                "Claude on Vertex AI",
+            ),
+        ];
+        for (urls, part, expected) in cases {
+            let req = ChatFormat::new(
+                "claude",
+                vec![block_message(
+                    Role::User,
+                    serde_json::json!([{"type": "text", "text": "hi"}, part]),
+                )],
+            );
+            let err = split_system_with(&req, urls).unwrap_err().to_string();
+            assert!(err.starts_with("messages[0].content[1]: "), "{err}");
+            assert!(err.contains(expected), "{expected} not in {err}");
+        }
+    }
+
+    #[test]
+    fn tool_result_with_a_non_text_part_is_refused() {
+        let mut tool = block_message(
+            Role::Tool,
+            serde_json::json!([{"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"}}]),
+        );
+        tool.tool_call_id = Some("call_1".into());
+        let req = ChatFormat::new("claude", vec![ChatMessage::user("hi"), tool]);
+        let err = split_system(&req).unwrap_err().to_string();
+        assert!(
+            err.contains("messages[1].content[0]") && err.contains("tool result"),
+            "{err}"
         );
     }
 
@@ -4269,10 +4454,9 @@ mod tests {
 
     #[test]
     fn inject_skips_empty_text_final_block() {
-        // An image-only final user turn flattens to a single empty text
-        // block (images dropped on this bridge). Anthropic 400s on
-        // cache_control attached to an empty text block, so the injector
-        // must leave it unmarked.
+        // A final user turn of only blank text parts degrades to a single
+        // empty text block. Anthropic 400s on cache_control attached to an
+        // empty text block, so the injector must leave it unmarked.
         let req = ChatFormat::new(
             "claude",
             vec![
@@ -4280,7 +4464,7 @@ mod tests {
                 block_message(
                     Role::User,
                     serde_json::json!([
-                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"}},
+                        {"type": "text", "text": "  "},
                     ]),
                 ),
             ],

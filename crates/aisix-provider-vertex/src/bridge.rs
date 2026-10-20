@@ -44,6 +44,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aisix_gateway::content_part::{
+    check_tool_result_parts, parse_part, part_error, ContentPart, Media, MediaSource,
+};
 use aisix_gateway::tool_calls::reject_legacy_function_calling;
 
 use crate::gemini_tools::{
@@ -61,8 +64,9 @@ use crate::wire;
 // Anthropic SSE, decoded by the shared `AnthropicStreamEvent` +
 // `StreamState` (the same decoder the direct Anthropic bridge uses).
 use aisix_provider_anthropic::wire::{
-    build_request as build_anthropic_request, response_into_chat_response, split_system,
-    structured_output_for, AnthropicResponse, AnthropicStreamEvent, StreamState, StructuredOutput,
+    build_request as build_anthropic_request, response_into_chat_response, split_system_with,
+    structured_output_for, AnthropicResponse, AnthropicStreamEvent, MediaUrls, StreamState,
+    StructuredOutput,
 };
 
 // Llama + the OpenAI-compatible MaaS family on Vertex use the OpenAI
@@ -1026,7 +1030,8 @@ impl VertexBridge {
         );
         let body_value = {
             let (system, messages) =
-                split_system(&req).map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
+                split_system_with(&req, MediaUrls::Refused("Claude on Vertex AI"))
+                    .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
             let anthropic_req = build_anthropic_request(&req, upstream_id, system, messages, false);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -1135,7 +1140,8 @@ impl VertexBridge {
         // Vertex `anthropic_version`.
         let body_value = {
             let (system, messages) =
-                split_system(&req).map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
+                split_system_with(&req, MediaUrls::Refused("Claude on Vertex AI"))
+                    .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
             let anthropic_req = build_anthropic_request(&req, upstream_id, system, messages, true);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -2058,10 +2064,9 @@ struct GeminiContent {
     parts: Vec<GeminiPart>,
 }
 
-/// One `parts[]` entry: a text part, or a part built by
-/// [`crate::gemini_tools`] (`functionCall` / `functionResponse`, with
-/// its `thoughtSignature`). Vision / multimodal parts (`inlineData`,
-/// `fileData`) deferred to a follow-up.
+/// One `parts[]` entry: a text part, or a raw part — a media part from
+/// [`gemini_media_part`], or one built by [`crate::gemini_tools`]
+/// (`functionCall` / `functionResponse`, with its `thoughtSignature`).
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum GeminiPart {
@@ -2237,6 +2242,74 @@ fn rewrite_gemini_openapi_schema(schema: &mut serde_json::Value) {
     }
 }
 
+/// A user turn's `parts[]`, in the caller's order. Adjacent text parts
+/// join into one, so a text-only message keeps the single text part it
+/// has always had; media becomes `inlineData` (base64 in the request) or
+/// `fileData` (a `gs://` or `https://` reference Gemini resolves itself).
+fn gemini_user_parts(m: &ChatMessage, index: usize) -> Result<Vec<GeminiPart>, BridgeError> {
+    let Some(blocks) = m.content_blocks.as_deref() else {
+        return Ok(vec![GeminiPart::text(m.content_str())]);
+    };
+    let mut parts = Vec::new();
+    let mut text = String::new();
+    for (part_index, block) in blocks.iter().enumerate() {
+        let invalid =
+            |reason: &str| BridgeError::InvalidRequest(part_error(index, part_index, reason));
+        match parse_part(block).map_err(|r| invalid(&r))? {
+            ContentPart::Text(t) => text.push_str(t),
+            ContentPart::Media(media) => {
+                if !text.is_empty() {
+                    parts.push(GeminiPart::text(std::mem::take(&mut text)));
+                }
+                parts.push(GeminiPart::Raw(
+                    gemini_media_part(&media).map_err(|r| invalid(&r))?,
+                ));
+            }
+            ContentPart::Unsupported(ty) => {
+                return Err(invalid(&format!(
+                    "content part type {ty:?} is not supported for Gemini models"
+                )));
+            }
+        }
+    }
+    if !text.is_empty() || parts.is_empty() {
+        parts.push(GeminiPart::text(text));
+    }
+    Ok(parts)
+}
+
+/// One media part on the Gemini wire. The gateway does not fetch URLs: a
+/// `gs://` or `https://` URL goes up as `fileData` for Gemini to read, and
+/// `fileData` needs the media type, which is the caller's `format` or the
+/// URL's extension.
+fn gemini_media_part(media: &Media<'_>) -> Result<serde_json::Value, String> {
+    match &media.source {
+        MediaSource::Inline { mime_type, data } => Ok(serde_json::json!({
+            "inlineData": {"mimeType": mime_type, "data": data}
+        })),
+        MediaSource::Uri { uri, mime_type } => {
+            match media.source.scheme().as_deref() {
+                Some("gs" | "https") => {}
+                _ => {
+                    return Err(format!(
+                        "Gemini models read only gs:// and https:// URLs, and the gateway does \
+                         not fetch {uri:?} itself; send the content inline as a base64 data: URL"
+                    ));
+                }
+            }
+            let mime_type = mime_type.as_deref().ok_or_else(|| {
+                format!(
+                    "the media type of {uri:?} cannot be told from its extension; \
+                     set it in image_url.format (or file.format), for example \"image/png\""
+                )
+            })?;
+            Ok(serde_json::json!({
+                "fileData": {"mimeType": mime_type, "fileUri": uri}
+            }))
+        }
+    }
+}
+
 /// Translate the gateway's [`ChatFormat`] into Gemini's
 /// `generateContent` body.
 ///
@@ -2273,7 +2346,7 @@ fn build_gemini_request(
     let mut contents: Vec<GeminiContent> = Vec::new();
     let mut tool_responses: Vec<GeminiPart> = Vec::new();
     let mut prior_tool_calls: Vec<&serde_json::Value> = Vec::new();
-    for m in &req.messages {
+    for (index, m) in req.messages.iter().enumerate() {
         // `generateContent` has no slot for replayed reasoning; a turn that
         // holds only that would become an empty `model` turn.
         if m.is_reasoning_only() {
@@ -2289,12 +2362,15 @@ fn build_gemini_request(
             Role::System | Role::Developer => system_parts.push(m.content_str().to_string()),
             Role::User => contents.push(GeminiContent {
                 role: "user",
-                parts: vec![GeminiPart::text(m.content_str())],
+                parts: gemini_user_parts(m, index)?,
             }),
-            Role::Tool => tool_responses.push(GeminiPart::Raw(function_response_part(
-                m,
-                &prior_tool_calls,
-            )?)),
+            Role::Tool => {
+                check_tool_result_parts(m, index).map_err(BridgeError::InvalidRequest)?;
+                tool_responses.push(GeminiPart::Raw(function_response_part(
+                    m,
+                    &prior_tool_calls,
+                )?))
+            }
             Role::Assistant => {
                 let tool_calls = m
                     .extra
