@@ -1050,7 +1050,7 @@ mod tests {
         use wiremock::matchers::{body_string_contains, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/tenant-1/oauth2/v2.0/token"))
             .and(body_string_contains("client_id=app-1"))

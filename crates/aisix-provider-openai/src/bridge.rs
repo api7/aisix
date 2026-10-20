@@ -1081,8 +1081,8 @@ mod tests {
     /// revalidation), never serve the previously cached host.
     #[tokio::test]
     async fn url_cache_follows_api_base_edit_for_same_key_id() {
-        let s1 = MockServer::start().await;
-        let s2 = MockServer::start().await;
+        let s1 = MockServer::builder().start().await;
+        let s2 = MockServer::builder().start().await;
         mount_ok(&s1).await;
         mount_ok(&s2).await;
 
@@ -1111,7 +1111,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_streaming_happy_path() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(header("authorization", "Bearer sk-test"))
@@ -1141,7 +1141,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_streaming_429_maps_to_upstream_status() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
@@ -1169,7 +1169,7 @@ mod tests {
     /// `read_body_capped` end-to-end through the OpenAI bridge.
     #[tokio::test]
     async fn non_streaming_oversize_error_body_truncated_to_max_message_bytes() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // 200 KB body — well above the 64 KB read cap and the 1024-byte
         // message cap.
         let huge_body = "x".repeat(200 * 1024);
@@ -1205,7 +1205,7 @@ mod tests {
     /// HIGH-2 from the audit.
     #[tokio::test]
     async fn non_streaming_oversize_parsed_message_truncated() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let huge = "y".repeat(60 * 1024);
         let body = format!(r#"{{"error":{{"message":"{huge}","type":"big","code":"big_code"}}}}"#);
         Mock::given(method("POST"))
@@ -1243,7 +1243,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_streaming_429_surfaces_retry_after_header() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
@@ -1272,7 +1272,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_streaming_503_with_garbled_retry_after_is_none() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
@@ -1308,7 +1308,7 @@ mod tests {
     /// envelope. (Already worked pre-#543.)
     #[tokio::test]
     async fn non_streaming_401_json_content_type_surfaces_code() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(401).set_body_raw(
@@ -1338,7 +1338,7 @@ mod tests {
     /// body into `message` and emitting an empty `code`.
     #[tokio::test]
     async fn non_streaming_401_non_json_content_type_still_surfaces_code() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
@@ -1373,7 +1373,7 @@ mod tests {
     /// over-parsing.
     #[tokio::test]
     async fn non_streaming_non_json_error_body_falls_back() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
@@ -1396,7 +1396,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_streaming_decode_error_on_malformed_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
@@ -1411,7 +1411,7 @@ mod tests {
 
     #[tokio::test]
     async fn deadline_elapses_to_timeout_error() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
@@ -1461,7 +1461,7 @@ mod tests {
             }
             b
         };
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
@@ -1492,7 +1492,7 @@ mod tests {
             Some(ServiceTier::OpenAi("flex".into()))
         );
 
-        let stream_server = MockServer::start().await;
+        let stream_server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
@@ -1513,7 +1513,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_happy_path_emits_chunks_then_done() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse = "\
 data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
 data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n\
@@ -1546,7 +1546,7 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn streaming_upstream_error_surfaces_before_stream_start() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(500).set_body_string("oops"))
@@ -1569,7 +1569,7 @@ data: [DONE]\n\n";
     /// type/message were lost.
     #[tokio::test]
     async fn streaming_in_band_error_frame_surfaces_as_typed_error() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse = "\
 data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n\
 data: {\"error\":{\"message\":\"The server had an error processing your request\",\"type\":\"server_error\",\"code\":\"server_error\"}}\n\n";
@@ -1874,7 +1874,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[tokio::test]
     async fn chat_applies_param_renames_to_outbound_body() {
         use wiremock::matchers::body_partial_json;
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(body_partial_json(serde_json::json!({
@@ -1905,7 +1905,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[tokio::test]
     async fn chat_applies_param_constraints_clamp_to_outbound_body() {
         use wiremock::matchers::body_partial_json;
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(body_partial_json(serde_json::json!({"temperature": 1.0})))
@@ -1933,7 +1933,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[tokio::test]
     async fn chat_applies_default_body_fields_to_outbound_body() {
         use wiremock::matchers::body_partial_json;
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(body_partial_json(serde_json::json!({"safe_prompt": true})))
@@ -1958,7 +1958,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     /// must carry it.
     #[tokio::test]
     async fn chat_applies_default_headers_to_outbound_request() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(header("x-custom", "trace-on"))
@@ -1982,7 +1982,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     /// override value.
     #[tokio::test]
     async fn chat_default_headers_cannot_override_authorization() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(header("authorization", "Bearer sk-test"))
@@ -2009,7 +2009,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[tokio::test]
     async fn embed_applies_request_overrides_like_chat() {
         use wiremock::matchers::body_partial_json;
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .and(body_partial_json(serde_json::json!({"safe_flag": true})))
@@ -2046,7 +2046,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[tokio::test]
     async fn complete_applies_request_overrides_like_chat() {
         use wiremock::matchers::body_partial_json;
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .and(body_partial_json(serde_json::json!({"safe_flag": true})))
@@ -2075,7 +2075,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[tokio::test]
     async fn generate_image_applies_request_overrides_like_chat() {
         use wiremock::matchers::body_partial_json;
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/images/generations"))
             .and(body_partial_json(serde_json::json!({"safe_flag": true})))
@@ -2109,7 +2109,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[tokio::test]
     async fn chat_content_list_to_string_flattens_text_blocks_in_outbound_body() {
         use wiremock::matchers::body_partial_json;
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(body_partial_json(serde_json::json!({
@@ -2146,7 +2146,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     /// `reasoning_content="step1"` for the downstream emitter.
     #[tokio::test]
     async fn chat_stream_extracts_reasoning_field_onto_canonical_slot() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // Upstream chunk uses `delta.thinking` (hypothetical vendor
         // shape); after extract_reasoning_field the parsed chunk's
         // delta should have reasoning_content="step1".
@@ -2186,7 +2186,7 @@ data: [DONE]\n\n";
     /// omitted the `[DONE]` marker.
     #[tokio::test]
     async fn chat_stream_done_marker_required_but_missing_does_not_error() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // No `data: [DONE]` line — Required policy will fire a
         // MissingDoneMarker warning, but the stream must still
         // complete cleanly.
@@ -2221,7 +2221,7 @@ data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\
     /// — the typed↔Value detour must not swallow parse errors.
     #[tokio::test]
     async fn chat_stream_malformed_chunk_surfaces_decode_error_via_reasoning_path() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse = "data: not-json\n\ndata: [DONE]\n\n";
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -2257,7 +2257,7 @@ data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\
     /// arrive intact.)
     #[tokio::test]
     async fn chat_stream_done_marker_in_decoder_finish_tail_is_counted_as_seen() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // Note: NO trailing `\n\n` after [DONE] — exercises the
         // decoder.finish() flush path rather than feed().
         let sse = "\
@@ -2297,7 +2297,7 @@ data: [DONE]\n";
     /// through and the response parses.
     #[tokio::test]
     async fn chat_with_no_overrides_behaves_like_pre_d2() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(header("authorization", "Bearer sk-test"))

@@ -4829,7 +4829,7 @@ mod tests {
     /// what the upstream bills.
     #[tokio::test]
     async fn byo_model_on_the_anthropic_adapter_passes_the_body_through() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(header("x-api-key", "sk-byo"))
@@ -4882,7 +4882,7 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_non_streaming_returns_anthropic_response() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(header("x-api-key", "sk-ant-test"))
@@ -4912,7 +4912,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_field_is_rewritten_to_upstream_name() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // Expect upstream receives "claude-3-5-haiku-20241022" (no prefix).
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
@@ -4991,7 +4991,7 @@ mod tests {
         // primitive now fires on outbound. mock-llm matcher is
         // strict on body — the rename MUST be applied or wiremock
         // returns 404.
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(wiremock::matchers::body_partial_json(
@@ -5029,7 +5029,7 @@ mod tests {
         // ai-gateway#335: caller temperature 0.9 with override max 0.5
         // must arrive upstream as 0.5. The mock body matcher strict-
         // checks temperature == 0.5 — wiremock 404s on mismatch.
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(wiremock::matchers::body_partial_json(
@@ -5067,7 +5067,7 @@ mod tests {
     async fn anthropic_passthrough_fills_default_body_fields_when_caller_omits() {
         // ai-gateway#335 sibling: caller omits top_p, override
         // populates it on outbound.
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(wiremock::matchers::body_partial_json(
@@ -5105,7 +5105,7 @@ mod tests {
         // ai-gateway#337: operator-injected custom header reaches
         // upstream. Strict header matcher on wiremock surfaces a 404
         // on miss.
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(header("x-tenant-id", "acme-prod-42"))
@@ -5143,7 +5143,7 @@ mod tests {
         // entry of the same name is declined and the PK's secret stays
         // the auth value upstream sees. (Putting the CALLER's own
         // credential there is what `forward_client_headers` is for.)
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             // Strict: must match the PK's secret, NOT the override value.
@@ -5239,7 +5239,7 @@ mod tests {
     async fn non_anthropic_model_dispatches_through_bridge_and_returns_anthropic_shape() {
         use aisix_provider_openai::OpenAiBridge;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // Mock an OpenAI /chat/completions response. The proxy will
         // translate it back to Anthropic shape on the way out.
         Mock::given(method("POST"))
@@ -5306,7 +5306,7 @@ mod tests {
     async fn non_anthropic_model_preserves_system_role_in_messages() {
         use aisix_provider_openai::OpenAiBridge;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_partial_json(serde_json::json!({
@@ -5365,7 +5365,7 @@ mod tests {
     async fn non_anthropic_model_streams_anthropic_sse_events() {
         use aisix_provider_openai::OpenAiBridge;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // OpenAI-style SSE stream with two content deltas + a done marker.
         let sse = "\
 data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
@@ -5429,7 +5429,7 @@ data: [DONE]\n\n";
         use aisix_obs::UsageSink;
         use aisix_provider_openai::OpenAiBridge;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = "\
 data: {\"id\":\"cmpl-359\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
 data: {\"id\":\"cmpl-359\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":4,\"total_tokens\":17}}\n\n\
@@ -5491,7 +5491,7 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn upstream_error_returns_502() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
@@ -5560,7 +5560,7 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn upstream_5xx_emits_anthropic_envelope_api_error() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(500).set_body_string("engine internal panic"))
@@ -5689,7 +5689,7 @@ data: [DONE]\n\n";
     async fn matrix_anthropic_in_gemini_upstream_non_streaming() {
         use aisix_provider_openai::OpenAiBridge;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5751,7 +5751,7 @@ data: [DONE]\n\n";
         use aisix_obs::UsageSink;
         use aisix_provider_openai::OpenAiBridge;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5842,7 +5842,7 @@ data: [DONE]\n\n";
         use aisix_provider_openai::OpenAiBridge;
         use futures::StreamExt;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = "\
 data: {\"id\":\"chatcmpl-cache-test\",\"model\":\"MiniMax-M3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n\
 data: {\"id\":\"chatcmpl-cache-test\",\"model\":\"MiniMax-M3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
@@ -5913,7 +5913,7 @@ data: [DONE]\n\n";
     async fn matrix_anthropic_in_deepseek_upstream_non_streaming() {
         use aisix_provider_openai::OpenAiBridge;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5962,7 +5962,7 @@ data: [DONE]\n\n";
     /// translation layer in between.
     #[tokio::test]
     async fn matrix_anthropic_in_anthropic_upstream_streaming() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = "\
 event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n\
 event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
@@ -6015,7 +6015,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     async fn anthropic_passthrough_streaming_records_usage_from_sse_frames() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // Canonical Anthropic streaming wire shape:
         // - message_start carries usage.input_tokens (+ cache fields)
         //   and the message id / model
@@ -6139,7 +6139,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     async fn anthropic_passthrough_streaming_harvests_input_tokens_from_message_delta() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = "\
 event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"gen_01REPRO952\",\"role\":\"assistant\",\"content\":[],\"model\":\"mco-5\",\"stop_reason\":null}}\n\n\
 event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
@@ -6586,7 +6586,7 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
         model_entry: ResourceEntry<Model>,
         model_name: &str,
     ) {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = "\
 data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
 data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"yo\"},\"finish_reason\":\"stop\"}]}\n\n\
@@ -6735,7 +6735,7 @@ data: [DONE]\n\n";
     async fn messages_usage_event_carries_the_enforced_mask() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -6792,7 +6792,7 @@ data: [DONE]\n\n";
     async fn streaming_messages_usage_event_carries_the_enforced_mask() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = "\
 event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_mask_2\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":37,\"output_tokens\":1}}}\n\n\
 event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
@@ -6892,7 +6892,7 @@ data: [DONE]\n\n";
             ("anthropic passthrough", "/v1/messages", anthropic_sse),
             ("cross-provider bridge", "/chat/completions", openai_sse),
         ] {
-            let upstream = MockServer::start().await;
+            let upstream = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .and(path(upstream_path))
                 .respond_with(
@@ -6984,7 +6984,7 @@ data: [DONE]\n\n";
         // Past DEFAULT_STREAM_OUTPUT_BUFFER_BYTES (256 KiB) of held text,
         // and deliberately clean: the cap, not the content, is what refuses.
         let big = "x".repeat(300_000);
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = format!(
             "\
 event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_big\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{{\"input_tokens\":11,\"output_tokens\":1}}}}}}\n\n\
@@ -7058,7 +7058,7 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
     /// request-shape validator. Fails on `a456ab71` with 422.
     #[tokio::test]
     async fn unparseable_body_with_an_output_only_guardrail_is_forwarded() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -7117,7 +7117,22 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+        // The request id tells a retry by the gateway (the same id twice)
+        // from traffic that is not this request's at all.
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            1,
+            "the upstream saw: {:?}",
+            received
+                .iter()
+                .map(|r| (
+                    r.method.as_str(),
+                    r.url.path(),
+                    r.headers.get("x-aisix-request-id")
+                ))
+                .collect::<Vec<_>>(),
+        );
     }
 
     /// `fail_open: true` opts an input-hook row out of the refusal, on the
@@ -7125,7 +7140,7 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
     /// the condition that setting governs. Fails on `8955d6ab` with 422.
     #[tokio::test]
     async fn unparseable_body_with_a_fail_open_guardrail_is_forwarded() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -7191,7 +7206,7 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
     async fn a_forwarded_unparseable_body_records_the_bypass_on_its_usage_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -7248,7 +7263,7 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
     /// fail-closed refusal #1022 introduced.
     #[tokio::test]
     async fn unparseable_body_with_an_input_guardrail_is_refused() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
@@ -7300,7 +7315,7 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
     async fn holdback_case(sse: String) -> (String, aisix_obs::UsageEvent) {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(
@@ -7517,7 +7532,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
     async fn a_streamed_request_writes_one_line_per_stream_ending() {
         use aisix_provider_openai::OpenAiBridge;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = "\
 data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
 data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n\

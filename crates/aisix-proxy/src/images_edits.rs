@@ -914,7 +914,7 @@ mod tests {
     /// upstream JSON relays back.
     #[tokio::test]
     async fn happy_path_rebuilds_form_and_relays_json() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/images/edits"))
             .and(wiremock::matchers::body_string_contains("gpt-image-2"))
@@ -947,7 +947,7 @@ mod tests {
     /// fails here.
     #[tokio::test]
     async fn repeated_image_and_mask_parts_forward_intact() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/images/edits"))
             .and(wiremock::matchers::body_string_contains("IMAGE-ONE-BYTES"))
@@ -990,7 +990,7 @@ mod tests {
     /// fails over to its next target instead of answering 502.
     #[tokio::test]
     async fn a_non_json_2xx_fails_over_to_the_next_group_target() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/images/edits"))
             .and(wiremock::matchers::body_string_contains("garbage-upstream"))
@@ -1037,7 +1037,7 @@ mod tests {
     /// is rewritten to the Model row's upstream name.
     #[tokio::test]
     async fn alias_never_reaches_upstream() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/images/edits"))
             .and(wiremock::matchers::body_string_contains("img-edit-prod"))
@@ -1065,7 +1065,7 @@ mod tests {
     /// gpt-image usage block → UsageEvent with those tokens (#407 parity).
     #[tokio::test]
     async fn emits_usage_event_with_tokens() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/images/edits"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
@@ -1097,7 +1097,7 @@ mod tests {
     /// form field — 422 content_filter, upstream never contacted.
     #[tokio::test]
     async fn input_guardrail_blocks_prompt_returns_422() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/images/edits"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
@@ -1132,7 +1132,7 @@ mod tests {
     /// image, no output hook). Upstream must never be contacted.
     #[tokio::test]
     async fn non_utf8_prompt_rejected_400_before_guardrail_and_upstream() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/images/edits"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
@@ -1369,7 +1369,7 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_error_propagates_as_502() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/images/edits"))
             .respond_with(ResponseTemplate::new(500).set_body_string("server error"))
@@ -1394,7 +1394,7 @@ mod tests {
     /// the success path misses it silently.
     #[tokio::test]
     async fn blocked_request_names_the_policy_on_the_usage_event() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("my-image"));
         snap.apikeys.insert(apikey_entry(&["*"]));
@@ -1441,7 +1441,7 @@ mod tests {
     /// guardrail touched.
     #[tokio::test]
     async fn masked_request_names_the_policy_on_the_usage_event() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/images/edits"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))

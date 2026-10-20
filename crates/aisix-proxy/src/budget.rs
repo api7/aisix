@@ -560,7 +560,7 @@ managed:
 
     #[tokio::test]
     async fn live_client_returns_cp_api_decision() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/dp/budget_check"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -577,7 +577,7 @@ managed:
 
     #[tokio::test]
     async fn live_client_parses_optional_budget_details() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/dp/budget_check"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -608,7 +608,7 @@ managed:
 
     #[tokio::test]
     async fn live_client_returns_deny_when_cp_says_no() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/dp/budget_check"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -649,7 +649,7 @@ managed:
 
     #[tokio::test]
     async fn cache_hit_skips_network_within_ttl() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/dp/budget_check"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -668,7 +668,7 @@ managed:
 
     #[tokio::test]
     async fn fallback_serves_cache_when_cp_fails() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/dp/budget_check"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -817,7 +817,7 @@ managed:
 
     #[tokio::test]
     async fn fallback_with_no_cache_denies() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/dp/budget_check"))
             .respond_with(ResponseTemplate::new(500))

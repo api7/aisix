@@ -318,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn mint_signs_jwt_with_correct_claims_and_posts_to_token_uri() {
         let (private_pem, public_pem) = test_key_pair();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
 
         // Capture the inbound JWT assertion so we can decode + verify
         // its claims independently using the public key.
@@ -377,7 +377,7 @@ mod tests {
         let rotated_pem = include_str!("../test-fixtures/test_sa_private_rotated.pem").to_string();
         assert_ne!(private_pem, rotated_pem, "fixture keys must differ");
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "ya29.per-key",
@@ -402,7 +402,7 @@ mod tests {
     #[tokio::test]
     async fn get_token_caches_within_ttl_and_only_calls_endpoint_once() {
         let (private_pem, _) = test_key_pair();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "ya29.cache-hit",
@@ -426,7 +426,7 @@ mod tests {
         // be UpstreamStatus (502 with cooldown semantics), not
         // Config (500 operator-must-fix).
         let (private_pem, _) = test_key_pair();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(503)
@@ -459,7 +459,7 @@ mod tests {
         // Audit MEDIUM (PR #387): 4xx remains Config — invalid_grant
         // / bad SA / clock skew are operator-actionable.
         let (private_pem, _) = test_key_pair();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(400).set_body_string(
                 r#"{"error":"invalid_grant","error_description":"JWT iat/exp out of range"}"#,
@@ -480,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_pem_surfaces_clear_error_before_endpoint_call() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // Mock with .expect(0) — endpoint must NOT be called for a
         // pre-flight validation failure.
         Mock::given(method("POST"))
@@ -508,7 +508,7 @@ mod tests {
     #[tokio::test]
     async fn wrong_type_field_rejected_before_endpoint_call() {
         let (private_pem, _) = test_key_pair();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)

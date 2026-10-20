@@ -1191,7 +1191,7 @@ mod tests {
     /// contacted (`expect(0)`).
     #[tokio::test]
     async fn input_guardrail_blocks_prompt_returns_422() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(
@@ -1227,7 +1227,7 @@ mod tests {
     /// forwards (`expect(1)`) and returns 200.
     #[tokio::test]
     async fn input_guardrail_allows_benign_prompt_forwards_200() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1258,7 +1258,7 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_forwards_to_completions_endpoint() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1342,7 +1342,7 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_error_propagates_as_502() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(500).set_body_string("error"))
@@ -1370,7 +1370,7 @@ mod tests {
     async fn emits_usage_event_on_200_with_tokens_issue_403() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // Legacy OpenAI completions wire shape. Pin specific token
         // counts so a regression that swapped prompt/completion
         // semantics would fail here.
@@ -1434,7 +1434,7 @@ mod tests {
     async fn records_the_provider_response_id_1289() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1485,7 +1485,7 @@ mod tests {
     async fn estimates_usage_event_when_upstream_usage_block_is_empty() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let upstream_body = serde_json::json!({
             "id": "cmpl-up-1",
             "object": "text_completion",
@@ -1541,7 +1541,7 @@ mod tests {
     async fn emits_with_zero_completion_when_completion_tokens_missing() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let upstream_body = serde_json::json!({
             "id": "cmpl-up-1",
             "object": "text_completion",
@@ -1593,7 +1593,7 @@ mod tests {
     async fn upstream_5xx_emits_zero_token_error_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal"))
@@ -1808,7 +1808,7 @@ mod tests {
     async fn estimates_usage_event_when_upstream_omits_usage_block_entirely() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // No `usage` key at all — distinct from `usage: {}`.
         let upstream_body = serde_json::json!({
             "id": "cmpl-no-usage",
@@ -1863,7 +1863,7 @@ mod tests {
     async fn emits_provider_telemetry_tags_issue_867() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let upstream_body = serde_json::json!({
             "id": "cmpl-up-1",
             "object": "text_completion",
@@ -1914,7 +1914,7 @@ mod tests {
     /// Healthy.
     #[tokio::test]
     async fn upstream_5xx_marks_cooldown_issue_701() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
@@ -1961,7 +1961,7 @@ mod tests {
     async fn blocked_request_names_the_policy_on_the_usage_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("my-completions"));
         snap.apikeys.insert(apikey_entry(&["*"]));
@@ -2020,7 +2020,7 @@ mod tests {
     async fn masked_request_names_the_policy_on_the_usage_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2073,7 +2073,7 @@ mod tests {
     /// the whole response, which is the whole request.
     #[tokio::test]
     async fn a_buffered_request_reports_one_line_whose_duration_is_its_latency() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
