@@ -21,8 +21,8 @@ use aws_sdk_bedrockruntime::types::{
 use serde_json::Value;
 
 use crate::bridge::{
-    apply_body_overrides, map_aws_sdk_error_generic, strip_region_prefix, upstream_model,
-    validate_model_id_chars, BedrockBridge, BedrockPublisher,
+    map_aws_sdk_error_generic, strip_region_prefix, upstream_model, validate_model_id_chars,
+    BedrockBridge, BedrockPublisher,
 };
 
 /// Whether `/v1/messages` for `upstream_id` takes Bedrock's own Anthropic
@@ -64,7 +64,6 @@ impl BedrockBridge {
         platform::inline_media(&mut body, Platform::Bedrock, &fetched)
             .map_err(BridgeError::InvalidRequest)?;
         drop(fetched);
-        apply_body_overrides(&mut body, ctx);
         let betas = platform::header_betas(ctx.client_headers.as_deref());
         platform::shape_request(&mut body, Platform::Bedrock, upstream_id, betas);
         let bytes = Vec::from(

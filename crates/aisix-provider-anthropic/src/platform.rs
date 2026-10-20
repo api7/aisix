@@ -486,7 +486,8 @@ fn inline_block(
             aisix_gateway::content_part::display_uri(&url),
         ));
     };
-    let source = if download.mime_type.starts_with("text/") {
+    let document = block.get("type").and_then(Value::as_str) == Some("document");
+    let source = if document && download.mime_type.starts_with("text/") {
         let text = String::from_utf8(download.data.into_bytes())
             .map_err(|_| format!("{at}: the document at the URL is not UTF-8 text"))?;
         serde_json::json!({"type": "text", "media_type": "text/plain", "data": text})

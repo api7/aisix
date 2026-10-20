@@ -15,8 +15,8 @@ use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 
 use super::{
-    apply_body_overrides, build_request_headers, map_http_error, outbound_bytes, upstream_model,
-    validate_url_token, with_deadline, VertexBridge, VertexPublisher, VertexSecret,
+    build_request_headers, map_http_error, outbound_bytes, upstream_model, validate_url_token,
+    with_deadline, VertexBridge, VertexPublisher, VertexSecret,
 };
 
 pub(super) fn serves_anthropic_messages(upstream_id: &str) -> bool {
@@ -83,7 +83,6 @@ impl VertexBridge {
         platform::inline_media(&mut body, Platform::Vertex, &fetched)
             .map_err(BridgeError::InvalidRequest)?;
         drop(fetched);
-        apply_body_overrides(&mut body, ctx);
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
@@ -150,7 +149,9 @@ impl VertexBridge {
         let url =
             self.anthropic_url(ctx, &creds, "count-tokens", "vertex/anthropic-count-tokens")?;
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        // Token counting takes no beta, and an unknown one is a 400.
+        headers.remove("anthropic-beta");
         let bytes = outbound_bytes(&body)?;
         let client = self.client_for(ctx);
         let started = Instant::now();
@@ -174,7 +175,11 @@ impl VertexBridge {
             let tokens = json
                 .get("input_tokens")
                 .and_then(Value::as_u64)
-                .unwrap_or(0);
+                .ok_or_else(|| {
+                    BridgeError::UpstreamDecode(
+                        "count-tokens answer carries no input_tokens".into(),
+                    )
+                })?;
             Ok(serde_json::json!({"input_tokens": tokens}))
         })
         .await

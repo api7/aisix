@@ -1273,7 +1273,7 @@ async fn anthropic_passthrough_dispatch(
     // body the handler keeps for fail-over, so an owned `Value` copy alive
     // across the await would be a third copy of the whole request. Later
     // readers (content capture, token estimation) work from the bytes.
-    let (body_bytes, is_stream) = {
+    let (body_bytes, is_stream, platform_body) = {
         let mut body = body.into_owned();
 
         // Rewrite the `model` field to the upstream value.
@@ -1296,9 +1296,7 @@ async fn anthropic_passthrough_dispatch(
         //
         // Apply order matches §5: renames → constraints → defaults. Each
         // primitive is a no-op when its configured map is empty.
-        // A platform bridge applies the block itself, before its own
-        // shaping has the last word.
-        if let Some(r) = pk_value.request.as_ref().filter(|_| platform.is_none()) {
+        if let Some(r) = pk_value.request.as_ref() {
             aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
             if let Some(constraints) = &r.param_constraints {
                 aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
@@ -1313,7 +1311,10 @@ async fn anthropic_passthrough_dispatch(
             .get("stream")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        (crate::util::outbound_json(&body)?, is_stream)
+        let bytes = crate::util::outbound_json(&body)?;
+        // A platform bridge adapts the body itself, so it takes the value
+        // rather than parsing the bytes back.
+        (bytes, is_stream, platform.is_some().then_some(body))
     };
 
     let wire_protocol = match &platform {
@@ -1465,7 +1466,7 @@ async fn anthropic_passthrough_dispatch(
                 ctx = ctx.with_deadline(d);
             }
             let native = bridge
-                .anthropic_messages(crate::util::outbound_value(&body_bytes), &ctx)
+                .anthropic_messages(platform_body.unwrap_or_default(), &ctx)
                 .await
                 .map_err(|be| {
                     crate::cooldown::note_failure(

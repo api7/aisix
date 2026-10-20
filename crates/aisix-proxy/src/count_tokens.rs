@@ -705,7 +705,8 @@ async fn dispatch(
         return Err(ProxyError::InvalidRequest(format!(
             "model `{model_name}` is not backed by an Anthropic-protocol upstream; \
              /v1/messages/count_tokens requires a provider key that either uses \
-             the anthropic adapter or declares `apis.messages`"
+             the anthropic adapter or declares `apis.messages`, or a Claude model \
+             on Amazon Bedrock or Vertex AI"
         )));
     }
     Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))
