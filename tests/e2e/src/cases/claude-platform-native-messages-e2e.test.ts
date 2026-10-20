@@ -51,6 +51,10 @@ const BEDROCK = "nm-bedrock-claude";
 const BEDROCK_THROTTLED = "nm-bedrock-throttled";
 const BEDROCK_GUARDED = "nm-bedrock-guarded";
 const VERTEX = "nm-vertex-claude";
+const BEDROCK_NO_COUNT = "nm-bedrock-no-count";
+const ANTHROPIC = "nm-anthropic";
+const COUNT_GROUP = "nm-count-group";
+const NO_COUNT_ID = "us.anthropic.claude-nocount-4-5-v1:0";
 const BEDROCK_ID = "global.anthropic.claude-sonnet-4-5-20250929-v1:0";
 const THROTTLED_ID = "us.anthropic.claude-throttle-4-5-v1:0";
 const GUARDED_ID = "us.anthropic.claude-guarded-4-5-v1:0";
@@ -151,7 +155,13 @@ async function startUpstream(): Promise<Upstream> {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(body));
       };
+      if (path.endsWith("/count-tokens") && path.includes("claude-nocount")) {
+        res.writeHead(400, { "content-type": "application/json", "x-amzn-errortype": "ValidationException" });
+        res.end(JSON.stringify({ message: "The provided model doesn't support counting tokens." }));
+        return;
+      }
       if (path.endsWith("/count-tokens")) return json({ inputTokens: 42 });
+      if (path === "/v1/messages/count_tokens") return json({ input_tokens: 99 });
       if (path.endsWith("/models/count-tokens:rawPredict")) return json({ input_tokens: 17 });
       if (path.endsWith("/invoke")) return json(reply("msg_bdrk_nonstream"));
       if (path.endsWith(":rawPredict")) return json(reply("msg_vrtx_nonstream"));
@@ -300,12 +310,21 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
       secret: JSON.stringify({ access_token: "ya29.native-messages", project: "proj-e2e", region: "us-east5" }),
       api_base: upstream.baseUrl,
     });
+    const anthropicPk = await seed.createProviderKey({
+      display_name: "nm-anthropic-pk",
+      provider: "anthropic",
+      adapter: "anthropic",
+      secret: "sk-ant-mock",
+      api_base: upstream.baseUrl,
+    });
     const models: Record<string, { id: string }> = {};
     for (const [display_name, pk, provider, model_name] of [
       [BEDROCK, bedrockPk, "bedrock", BEDROCK_ID],
       [BEDROCK_THROTTLED, bedrockPk, "bedrock", THROTTLED_ID],
       [BEDROCK_GUARDED, bedrockPk, "bedrock", GUARDED_ID],
       [VERTEX, vertexPk, "google", VERTEX_ID],
+      [BEDROCK_NO_COUNT, bedrockPk, "bedrock", NO_COUNT_ID],
+      [ANTHROPIC, anthropicPk, "anthropic", "claude-sonnet-4-5"],
     ] as const) {
       models[display_name] = await seed.createModel({
         display_name,
@@ -314,6 +333,14 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
         provider_key_id: pk.id,
       });
     }
+    await seed.createModel({
+      display_name: COUNT_GROUP,
+      routing: {
+        strategy: "failover",
+        targets: [{ model: BEDROCK_NO_COUNT }, { model: ANTHROPIC }],
+        max_fallbacks: 1,
+      },
+    });
     const guardrail = await seed.createGuardrail(
       {
         name: "nm-output-keyword",
@@ -528,6 +555,23 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
     const converse = JSON.parse(plain.upstream.body).input.converse;
     expect(converse.messages).toEqual([{ role: "user", content: [{ text: "hello" }] }]);
     expect(converse.system).toEqual([{ text: "Be brief." }]);
+  });
+
+  test("a platform that cannot count a model's tokens hands count_tokens to the group's next target", async (ctx) => {
+    if (skip(ctx)) return;
+    const before = upstream!.received.length;
+    const res = await fetch(`${app!.proxyUrl}/v1/messages/count_tokens`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: COUNT_GROUP, messages: [{ role: "user", content: "hello" }] }),
+    });
+    const text = await res.text();
+    expect(res.status, text).toBe(200);
+    expect(JSON.parse(text)).toEqual({ input_tokens: 99 });
+    expect(upstream!.received.slice(before).map((r) => r.path)).toEqual([
+      "/model/anthropic.claude-nocount-4-5-v1:0/count-tokens",
+      "/v1/messages/count_tokens",
+    ]);
   });
 
   test("Vertex AI rawPredict gets the caller's body, adapted, and answers natively", async (ctx) => {

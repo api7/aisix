@@ -687,6 +687,21 @@ async fn dispatch(
                         _ => true,
                     };
                     last_err = Some(e);
+                    // A platform's token-counting API serves fewer models and
+                    // regions than its Messages route, so a refusal there moves
+                    // on to the group's next target rather than ending the
+                    // request a target behind it could have answered.
+                    if !retryable
+                        && has_usable_fallback
+                        && crate::dispatch::anthropic_platform_bridge(
+                            &state.hub,
+                            snapshot,
+                            &target.model,
+                        )
+                        .is_some()
+                    {
+                        break;
+                    }
                     if !retryable {
                         return Err(last_err.unwrap_or(ProxyError::ProviderUnavailable));
                     }

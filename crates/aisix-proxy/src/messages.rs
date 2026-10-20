@@ -1465,6 +1465,11 @@ async fn anthropic_passthrough_dispatch(
             } {
                 ctx = ctx.with_deadline(d);
             }
+            // Media downloads are bounded by the end-to-end budget, not the
+            // chunk gap a streaming deadline is.
+            if is_stream {
+                ctx = ctx.with_non_streaming_deadline(timeouts.request);
+            }
             let native = bridge
                 .anthropic_messages(platform_body.unwrap_or_default(), &ctx)
                 .await
