@@ -303,6 +303,12 @@ pub async fn fetch_media_urls(
                 slots.insert(w.uri, (media, w.uses));
             }
             Err(failure) => {
+                tracing::warn!(
+                    request_id = %ctx.request_id,
+                    url = %display_uri(&w.uri),
+                    failure = ?failure,
+                    "media URL not downloaded"
+                );
                 return Err(BridgeError::InvalidRequest(part_error(
                     w.message,
                     w.part,
@@ -526,12 +532,7 @@ impl Failure {
     fn describe(&self, uri: &str, settings: &MediaFetchSettings) -> String {
         let shown = display_uri(uri);
         let why = match self {
-            Self::Blocked(ip) => {
-                tracing::warn!(
-                    url = %shown,
-                    address = %ip,
-                    "media URL not downloaded: the address is not publicly routable"
-                );
+            Self::Blocked(_) => {
                 return format!(
                     "the gateway does not download the media URL {shown}: its host is not \
                      a publicly routable address. To allow it, an operator adds the host to \

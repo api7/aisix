@@ -554,6 +554,29 @@ describe("chat media content parts → native provider media shapes", () => {
     });
   });
 
+  for (const [model, label, pick] of [
+    ["media-claude", "anthropic", (b: any) => b.messages[0].content],
+    ["media-vertex-claude", "Claude on Vertex AI", (b: any) => b.messages[0].content],
+    ["media-gemini", "gemini", (b: any) => b.contents[0].parts],
+  ] as const) {
+    test(`${label}: the streaming rail downloads a URL too`, async (ctx) => {
+      if (!ready(ctx)) return;
+      const before = upstream!.received.length;
+      await post("/v1/chat/completions", {
+        model,
+        stream: true,
+        messages: [{ role: "user", content: [text("What color?"), image(allowed("/cat.png"))] }],
+      });
+      // The mock does not answer in SSE framing, so the gateway may retry;
+      // what matters is what reached the upstream.
+      expect(upstream!.received.length).toBeGreaterThan(before);
+      const sent = JSON.parse(upstream!.received[before].body);
+      const parts = JSON.stringify(pick(sent));
+      expect(parts).toContain(PNG_B64);
+      expect(parts).not.toContain(`localhost:${media!.port}`);
+    });
+  }
+
   test("anthropic and gemini: an http:// URL is downloaded, an https:// one still goes up as a reference", async (ctx) => {
     if (!ready(ctx)) return;
     const claude = await chat("media-claude", [text("What color?"), image(allowed("/cat.png"))]);
