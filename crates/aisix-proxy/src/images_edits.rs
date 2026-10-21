@@ -189,7 +189,7 @@ pub async fn image_edits(
                 &success.applied_guardrails,
                 status,
                 elapsed,
-                &success.usage.clone().unwrap_or_default(),
+                success.usage.as_ref().unwrap_or(&Default::default()),
                 &client,
                 success.redactions.clone(),
                 success.monitor_hits.clone(),

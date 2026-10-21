@@ -1737,7 +1737,7 @@ fn probe_json(body: &[u8]) -> JsonProbe {
 enum RawUsageShape {
     /// Cohere-style rerank: top-level `query` beside a `documents` array
     /// (Cohere, Jina, DashScope's compatible rerank). Usage is read exactly
-    /// as `/v1/rerank` reads it ([`crate::rerank::rerank_prompt_tokens`]).
+    /// as `/v1/rerank` reads it ([`crate::rerank::rerank_usage`]).
     Rerank,
     /// DashScope native service envelope: `{model, input: {…}, parameters}`
     /// (native rerank, multimodal embedding, …). Usage per
@@ -3640,13 +3640,10 @@ fn buffered_usage(
 ) -> Option<PassthroughUsage> {
     match metering {
         Metering::Rerank => {
-            return crate::rerank::rerank_prompt_tokens(v).map(|prompt_tokens| {
-                let total = crate::usage_attr::reported_total_tokens(v.get("usage"));
-                PassthroughUsage {
-                    prompt_tokens,
-                    upstream_total_tokens: (total > 0).then_some(total),
-                    ..PassthroughUsage::default()
-                }
+            return crate::rerank::rerank_usage(v).map(|u| PassthroughUsage {
+                prompt_tokens: u.prompt_tokens,
+                upstream_total_tokens: u.upstream_total_tokens,
+                ..PassthroughUsage::default()
             })
         }
         Metering::DashscopeNative => return dashscope_native_usage(v.get("usage")?, false),

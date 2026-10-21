@@ -2454,7 +2454,7 @@ fn extract_token_usage(body: &Value) -> Option<UsageStats> {
     );
     Some(UsageStats {
         modality,
-        upstream_total_tokens: crate::usage_attr::reported_total_tokens(Some(usage)),
+        upstream_total_tokens: crate::usage_attr::reported_total_tokens(Some(usage)).unwrap_or(0),
         ..UsageStats::new(input, output)
     })
 }
@@ -2585,7 +2585,7 @@ fn emit_audio_usage(
         &success.applied_guardrails,
         status,
         elapsed,
-        &success.usage.clone().unwrap_or_default(),
+        success.usage.as_ref().unwrap_or(&Default::default()),
         success.duration_seconds,
         client,
         success.redactions.clone(),

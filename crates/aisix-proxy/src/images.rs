@@ -199,7 +199,7 @@ pub async fn image_generations(
                     &success.applied_guardrails,
                     status,
                     elapsed,
-                    &success.usage.clone().unwrap_or_default(),
+                    success.usage.as_ref().unwrap_or(&Default::default()),
                     &client,
                     success.redactions.clone(),
                     success.monitor_hits.clone(),
@@ -602,7 +602,7 @@ pub(crate) fn image_usage_stats(body: &Value) -> Option<aisix_gateway::UsageStat
     );
     Some(aisix_gateway::UsageStats {
         modality,
-        upstream_total_tokens: crate::usage_attr::reported_total_tokens(Some(usage)),
+        upstream_total_tokens: crate::usage_attr::reported_total_tokens(Some(usage)).unwrap_or(0),
         ..aisix_gateway::UsageStats::new(input, output)
     })
 }
