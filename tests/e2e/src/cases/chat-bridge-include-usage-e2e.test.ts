@@ -22,7 +22,8 @@ import {
 // one extra chunk, after the finish chunk, whose `choices` is empty and which
 // alone carries `usage`. Claude reports usage on the same event that ends the
 // message, and Gemini on its last chunk beside the finish reason, so the usage
-// has to arrive on a chunk of its own all the same.
+// has to arrive on a chunk of its own all the same — and once, even when
+// the upstream reports running counts on earlier frames too.
 //
 // The mock upstream accepts only the top-level fields the Messages API
 // documents and rejects anything else the way Anthropic does.
@@ -88,7 +89,12 @@ function anthropicStream(): string {
 
 function geminiStream(): string {
   return [
-    { candidates: [{ content: { role: "model", parts: [{ text: "Par" }] } }], modelVersion: "gemini-2.5-flash" },
+    // Gemini may report running counts before the last frame.
+    {
+      candidates: [{ content: { role: "model", parts: [{ text: "Par" }] } }],
+      usageMetadata: { promptTokenCount: 21, candidatesTokenCount: 2, totalTokenCount: 23 },
+      modelVersion: "gemini-2.5-flash",
+    },
     {
       candidates: [{ content: { role: "model", parts: [{ text: "is." }] }, finishReason: "STOP" }],
       usageMetadata: { promptTokenCount: 21, candidatesTokenCount: 5, totalTokenCount: 26 },

@@ -537,6 +537,7 @@ where
         let mut decoder = SseDecoder::new();
         let mut stream = Box::pin(byte_stream);
         let mut state = StreamState::default();
+        let mut usage = aisix_gateway::IncludeUsage::new(include_usage);
 
         loop {
             // At EOF, `finish` flushes a last frame the upstream never
@@ -560,18 +561,22 @@ where
                     Err(crate::wire::stream_error_into_bridge_error(error))?;
                 }
                 state.update(&parsed);
-                if let Some(c) = state.to_chunk(&parsed) {
-                    for c in c.into_frames(include_usage) {
-                        yield c;
-                    }
+                if let Some(c) = state.to_chunk(&parsed).and_then(|c| usage.pass(c)) {
+                    yield c;
                 }
                 if StreamState::is_terminal(&parsed) {
+                    if let Some(u) = usage.finish() {
+                        yield u;
+                    }
                     return;
                 }
             }
             if eof {
                 break;
             }
+        }
+        if let Some(u) = usage.finish() {
+            yield u;
         }
     }
 }

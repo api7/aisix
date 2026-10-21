@@ -1245,6 +1245,7 @@ impl VertexBridge {
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
             let mut state = StreamState::default();
+            let mut usage = aisix_gateway::IncludeUsage::new(include_usage);
             let mut byte_stream = Box::pin(byte_stream);
 
             loop {
@@ -1273,18 +1274,22 @@ impl VertexBridge {
                         Err(aisix_provider_anthropic::wire::stream_error_into_bridge_error(error))?;
                     }
                     state.update(&parsed);
-                    if let Some(chunk) = state.to_chunk(&parsed) {
-                        for chunk in chunk.into_frames(include_usage) {
-                            yield chunk;
-                        }
+                    if let Some(chunk) = state.to_chunk(&parsed).and_then(|c| usage.pass(c)) {
+                        yield chunk;
                     }
                     if StreamState::is_terminal(&parsed) {
+                        if let Some(u) = usage.finish() {
+                            yield u;
+                        }
                         return;
                     }
                 }
                 if eof {
                     break;
                 }
+            }
+            if let Some(u) = usage.finish() {
+                yield u;
             }
         };
 
@@ -1839,6 +1844,7 @@ impl VertexBridge {
                 service_tier: header_tier,
                 ..Default::default()
             };
+            let mut usage = aisix_gateway::IncludeUsage::new(include_usage);
             let mut byte_stream = Box::pin(byte_stream);
 
             while let Some(item) = byte_stream.next().await {
@@ -1852,7 +1858,7 @@ impl VertexBridge {
                         for chunk in
                             gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut state)
                                 .into_iter()
-                                .flat_map(|c| c.into_frames(include_usage))
+                                .filter_map(|c| usage.pass(c))
                         {
                             yield chunk;
                         }
@@ -1878,10 +1884,13 @@ impl VertexBridge {
                 for chunk in
                     gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut state)
                         .into_iter()
-                        .flat_map(|c| c.into_frames(include_usage))
+                        .filter_map(|c| usage.pass(c))
                 {
                     yield chunk;
                 }
+            }
+            if let Some(u) = usage.finish() {
+                yield u;
             }
         };
 

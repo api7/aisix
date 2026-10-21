@@ -1270,23 +1270,52 @@ impl ChatChunk {
     pub fn is_usage_only(&self) -> bool {
         self.usage.is_some() && self.finish_reason.is_none() && self.has_no_payload()
     }
+}
 
-    /// The chunks this one is sent to the caller as. Under
-    /// `include_usage`, usage carried beside a finish reason or a delta
-    /// moves onto a usage-only chunk that follows it: a bridge whose
-    /// upstream reports usage on the event that ends the message must
-    /// still send it on a chunk of its own, as OpenAI does.
-    pub fn into_frames(mut self, include_usage: bool) -> impl Iterator<Item = ChatChunk> {
-        let split = include_usage && self.usage.is_some() && !self.is_usage_only();
-        let usage_only = split.then(|| ChatChunk {
-            id: self.id.clone(),
-            model: self.model.clone(),
-            delta: ChatDelta::default(),
-            finish_reason: None,
-            usage: self.usage.take(),
-            service_tier: self.service_tier.clone(),
-        });
-        std::iter::once(self).chain(usage_only)
+/// What `include_usage` promises a streaming caller: the usage goes out
+/// once, on a chunk of its own after every other chunk, and no other chunk
+/// carries it. For a bridge whose upstream reports usage on the event that
+/// ends the message, or on several events: it holds the usage back and
+/// sends the last report at the end. Without `include_usage` it passes
+/// every chunk through unchanged.
+pub struct IncludeUsage {
+    enabled: bool,
+    held: Option<ChatChunk>,
+}
+
+impl IncludeUsage {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            held: None,
+        }
+    }
+
+    /// `chunk` as it is sent now, or `None` when it carried nothing but
+    /// usage.
+    pub fn pass(&mut self, mut chunk: ChatChunk) -> Option<ChatChunk> {
+        if !self.enabled {
+            return Some(chunk);
+        }
+        if let Some(usage) = chunk.usage.take() {
+            self.held = Some(ChatChunk {
+                id: chunk.id.clone(),
+                model: chunk.model.clone(),
+                delta: ChatDelta::default(),
+                finish_reason: None,
+                usage: Some(usage),
+                service_tier: chunk.service_tier.clone(),
+            });
+            if chunk.finish_reason.is_none() && chunk.has_no_payload() {
+                return None;
+            }
+        }
+        Some(chunk)
+    }
+
+    /// The usage-only chunk that ends the stream, once.
+    pub fn finish(&mut self) -> Option<ChatChunk> {
+        self.held.take()
     }
 }
 
