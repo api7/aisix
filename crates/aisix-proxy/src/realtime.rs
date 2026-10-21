@@ -1065,10 +1065,9 @@ async fn run_session(
                     }
                 }
                 Some(Ok(TgMessage::Close(frame))) => {
-                    let reason = frame.as_ref().map(|f| f.reason.to_string());
-                    let end = match (&frame, &reason) {
-                        (Some(f), Some(r)) => UpstreamEnd::Close(f.code.into(), r),
-                        _ => UpstreamEnd::NoStatus,
+                    let end = match &frame {
+                        Some(f) => UpstreamEnd::Close(f.code.into(), &f.reason),
+                        None => UpstreamEnd::NoStatus,
                     };
                     close_client_after_upstream(&mut client_tx, end).await;
                     break;
@@ -1076,15 +1075,10 @@ async fn run_session(
                 Some(Ok(_)) => {} // ping/pong/raw frames
                 Some(Err(e)) => {
                     tracing::debug!(error = %e, "realtime upstream stream error");
-                    close_client_after_upstream(
-                        &mut client_tx,
-                        UpstreamEnd::Failed(&e.to_string()),
-                    )
-                    .await;
+                    let error = aisix_gateway::error_with_causes(&e);
+                    close_client_after_upstream(&mut client_tx, UpstreamEnd::Failed(&error)).await;
                     close_status = 502;
-                    session_error = Some(ProxyError::Bridge(BridgeError::Transport(
-                        aisix_gateway::error_with_causes(&e),
-                    )));
+                    session_error = Some(ProxyError::Bridge(BridgeError::Transport(error)));
                     break;
                 }
                 None => {
@@ -1487,6 +1481,32 @@ fn emit_access_log(
 
 #[cfg(test)]
 mod tests {
+    /// `LIBRARY_REJECTED_CLOSE` mirrors a literal private to tungstenite;
+    /// this fails if a tungstenite bump changes what it substitutes.
+    #[tokio::test]
+    async fn library_rejected_close_matches_what_tungstenite_substitutes() {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        let (local, mut remote) = tokio::io::duplex(64);
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            local,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        // Unmasked server Close carrying 1004, a code that may not be sent.
+        remote
+            .write_all(&[0x88, 0x04, 0x03, 0xEC, b'r', b'1'])
+            .await
+            .unwrap();
+        let Some(Ok(TgMessage::Close(Some(frame)))) = ws.next().await else {
+            panic!("expected a Close frame");
+        };
+        assert_eq!(
+            (u16::from(frame.code), frame.reason.as_ref()),
+            super::LIBRARY_REJECTED_CLOSE
+        );
+    }
 
     /// JSON lets both a key and a string value be spelled with escapes, and
     /// the two halves are handled in different places — so they are pinned

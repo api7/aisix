@@ -199,10 +199,8 @@ describe("/v1/realtime close handshake", () => {
   test("an upstream that drops the connection becomes 1011, without claiming a code", async (ctx) => {
     if (!ready(ctx)) return;
     const { closed, message } = await upstreamEnds({ type: "test.drop" });
-    expect(closed.code).toBe(1011);
-    expect(message).toMatch(
-      /^upstream websocket (connection failed: |connection ended without a close frame$)/,
-    );
+    expect(closed).toEqual({ code: 1011, reason: "upstream error" });
+    expect(message).toMatch(/^upstream websocket connection failed: /);
     expect(message).not.toMatch(/code \d/);
   });
 
