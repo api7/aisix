@@ -253,6 +253,30 @@ describe("chat streaming with stream_options.include_usage on bridged upstreams"
       expect(out.chunks.indexOf(finishes[0]!)).toBe(out.chunks.length - 2);
     });
 
+    if (label !== "vertexGemini") {
+      // OpenAI's `max_completion_tokens` and `stop` are Anthropic's `max_tokens`
+      // and `stop_sequences`; sent under their OpenAI names they are refused.
+      test(`${label}: max_completion_tokens and stop reach Claude under the Messages API names`, async (ctx) => {
+        if (!etcdReachable || !app) return ctx.skip();
+        const cases: Array<[Record<string, unknown>, Record<string, unknown>]> = [
+          [{ max_completion_tokens: 77, stop: "END" }, { max_tokens: 77, stop_sequences: ["END"] }],
+          [{ max_completion_tokens: 77, max_tokens: 33, stop: ["A", "B"] }, { max_tokens: 77, stop_sequences: ["A", "B"] }],
+          [{ max_tokens: 33, stop: null }, { max_tokens: 33 }],
+          [{ stop: [] }, { max_tokens: 4096 }],
+        ];
+        for (const [extra, expected] of cases) {
+          const before = received.length;
+          const out = await streamChat(model, extra);
+          expect(out.status, `${JSON.stringify(extra)}: ${out.raw}`).toBe(200);
+          const body = received.slice(before)[0]!.body;
+          expect(body).toMatchObject(expected);
+          expect(body).not.toHaveProperty("max_completion_tokens");
+          expect(body).not.toHaveProperty("stop");
+          if (!("stop_sequences" in expected)) expect(body).not.toHaveProperty("stop_sequences");
+        }
+      });
+    }
+
     test(`${label}: without include_usage no usage-only chunk is sent`, async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
       for (const extra of [{}, { stream_options: { include_usage: false } }]) {
