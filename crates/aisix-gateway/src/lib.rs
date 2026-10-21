@@ -41,6 +41,7 @@ pub mod sse;
 pub mod ssrf;
 pub mod structured_output;
 pub mod tool_calls;
+pub mod upstream_dial;
 pub mod upstream_headers;
 pub mod upstream_http;
 pub mod upstream_tls;

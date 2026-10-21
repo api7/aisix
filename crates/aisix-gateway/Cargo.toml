@@ -25,8 +25,13 @@ tracing.workspace = true
 base64.workspace = true
 url.workspace = true
 # The environment-proxy matcher reqwest itself uses, so `ssrf` knows which
-# caller-supplied URLs a proxy will take.
-hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
+# caller-supplied URLs a proxy will take, and the CONNECT tunnel reqwest
+# itself uses, for the outbound paths that dial without reqwest.
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy", "client-legacy", "tokio"] }
+# `upstream_dial`: the CONNECT tunnel above is a tower `Service`, and an
+# `https://` proxy is reached over rustls directly.
+tower-service = "0.3"
+tokio-rustls.workspace = true
 # Outbound TLS trust (upstream_tls): the non-reqwest outbound stacks need
 # the root store assembled directly, so the rustls side is a direct dep.
 rustls.workspace = true

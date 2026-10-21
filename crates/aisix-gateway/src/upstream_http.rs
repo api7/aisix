@@ -461,6 +461,20 @@ mod tests {
                  `upstream.connect_timeout`",
             ),
             (
+                // The proxy-aware dial: `client_async_tls_with_config`
+                // takes whatever connector it is handed, `None` included.
+                "client_async_tls_with_config",
+                "rustls_client_config",
+                "the Realtime WebSocket connector must come from \
+                 `upstream_tls::rustls_client_config()`",
+            ),
+            (
+                "client_async_tls_with_config",
+                "upstream_http::config().connect_timeout",
+                "the Realtime WebSocket dial must be bounded by \
+                 `upstream.connect_timeout`",
+            ),
+            (
                 "aws_config::SdkConfig::builder()",
                 // Spelled in full: `build_aws_http_client()` contains
                 // the bare name, and it is the un-memoized builder a
