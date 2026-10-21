@@ -520,20 +520,27 @@ async fn read_capped(
 
 fn client(route: Route) -> Result<&'static reqwest::Client, Failure> {
     static PINNED: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
-    static UNCHECKED: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
-    let pinned = route == Route::Pinned;
-    let cell = if pinned { &PINNED } else { &UNCHECKED };
+    static DIRECT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    static PROXIED: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    let cell = match route {
+        Route::Pinned => &PINNED,
+        Route::Direct => &DIRECT,
+        Route::Proxied => &PROXIED,
+    };
     cell.get_or_init(|| {
         let b = crate::upstream_http::caller_chosen_peer_client_builder()
             .redirect(reqwest::redirect::Policy::none());
-        // `Route::Pinned` is only chosen for a URL no proxy takes; without
-        // proxies the client cannot hand one the name to resolve unchecked.
-        // The unchecked client keeps the shared resolver, which also
-        // resolves a proxy's own host.
-        let b = if pinned {
-            b.dns_resolver(crate::ssrf::pinning_resolver()).no_proxy()
-        } else {
-            b
+        // The route already decided whether a proxy takes the URL. The
+        // proxied client keeps the shared resolver: it only resolves the
+        // proxy's own host.
+        let b = match route {
+            Route::Pinned => b
+                .dns_resolver(crate::ssrf::direct_resolver(true))
+                .no_proxy(),
+            Route::Direct => b
+                .dns_resolver(crate::ssrf::direct_resolver(false))
+                .no_proxy(),
+            Route::Proxied => b,
         };
         b.build().map_err(|e| e.to_string())
     })
@@ -725,6 +732,7 @@ mod tests {
             allowed_hosts: hosts.iter().map(|h| h.to_string()).collect(),
         })
         .unwrap()
+        .without_proxies()
     }
 
     #[tokio::test]

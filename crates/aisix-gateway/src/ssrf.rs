@@ -20,10 +20,22 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::Url;
 
 /// `outbound.ssrf_protection`, parsed once at boot.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SsrfProtection {
     enabled: bool,
     allowed_hosts: Vec<AllowedHost>,
+    /// Which URLs an environment proxy takes: the matcher the HTTP clients
+    /// themselves use, read from the same environment.
+    proxies: Arc<Matcher>,
+}
+
+impl std::fmt::Debug for SsrfProtection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SsrfProtection")
+            .field("enabled", &self.enabled)
+            .field("allowed_hosts", &self.allowed_hosts)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +61,21 @@ impl SsrfProtection {
         Ok(Self {
             enabled: cfg.enabled,
             allowed_hosts,
+            proxies: Arc::new(Matcher::from_system()),
         })
+    }
+
+    /// As if no proxy were configured, whatever the environment says.
+    #[cfg(test)]
+    pub(crate) fn without_proxies(mut self) -> Self {
+        self.proxies = Arc::new(Matcher::builder().build());
+        self
+    }
+
+    fn proxied(&self, url: &Url) -> bool {
+        url.as_str()
+            .parse::<http::Uri>()
+            .is_ok_and(|uri| self.proxies.intercept(&uri).is_some())
     }
 
     fn allows(&self, host: &str, port: u16) -> bool {
@@ -68,22 +94,28 @@ impl SsrfProtection {
             None => return Err(Refusal::BadUrl),
         };
         let port = url.port_or_known_default().ok_or(Refusal::BadUrl)?;
+        let proxied = self.proxied(url);
+        let unchecked = if proxied {
+            Route::Proxied
+        } else {
+            Route::Direct
+        };
         if !self.enabled || self.allows(&host, port) {
-            return Ok(Route::Unchecked);
+            return Ok(unchecked);
         }
         // The resolver never sees an address literal, so it is checked here.
         if let Some(ip) = ip {
             return if is_public(ip) {
-                Ok(Route::Unchecked)
+                Ok(unchecked)
             } else {
                 Err(Refusal::Blocked(ip))
             };
         }
-        if !proxied(url) {
+        if !proxied {
             return Ok(Route::Pinned);
         }
         check_all(resolve(&host).await?)?;
-        Ok(Route::Unchecked)
+        Ok(Route::Proxied)
     }
 }
 
@@ -92,9 +124,12 @@ impl SsrfProtection {
 pub enum Route {
     /// Direct, through the resolver that refuses non-public addresses.
     Pinned,
-    /// Nothing further to check: the target is allowed, already checked,
-    /// or protection is off. Environment proxies apply.
-    Unchecked,
+    /// Direct with nothing to check: the target is allowed or protection
+    /// is off.
+    Direct,
+    /// Through the environment proxy that takes the URL; the target is
+    /// allowed, already checked, or protection is off.
+    Proxied,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,36 +178,30 @@ pub fn settings() -> &'static SsrfProtection {
     })
 }
 
-/// Whether an environment proxy takes `url`, by the same rules — and the
-/// same matcher — the HTTP clients use.
-fn proxied(url: &Url) -> bool {
-    static MATCHER: OnceLock<Matcher> = OnceLock::new();
-    let Ok(uri) = url.as_str().parse::<http::Uri>() else {
-        return false;
-    };
-    MATCHER
-        .get_or_init(Matcher::from_system)
-        .intercept(&uri)
-        .is_some()
+/// The resolver for a direct client: for [`Route::Pinned`] (`guarded`)
+/// it refuses the whole answer if any address in it is not publicly
+/// routable, and the client connects only to the addresses it returns.
+/// Caller-chosen names never enter the shared DNS cache, whose capacity
+/// assumes configured upstream hosts.
+pub fn direct_resolver(guarded: bool) -> Arc<impl Resolve> {
+    Arc::new(DirectResolver { guarded })
 }
 
-/// The resolver for the client of [`Route::Pinned`]: it refuses the whole
-/// answer if any address in it is not publicly routable, and the client
-/// connects only to the addresses it returns.
-pub fn pinning_resolver() -> Arc<impl Resolve> {
-    Arc::new(PinningResolver)
+struct DirectResolver {
+    guarded: bool,
 }
 
-struct PinningResolver;
-
-impl Resolve for PinningResolver {
+impl Resolve for DirectResolver {
     fn resolve(&self, name: Name) -> Resolving {
+        let guarded = self.guarded;
         Box::pin(async move {
             let addrs = resolve(name.as_str())
                 .await
                 .map_err(|_| Box::new(Unresolvable) as Box<dyn std::error::Error + Send + Sync>)?;
-            if let Err(Refusal::Blocked(ip)) = check_all(addrs.iter().copied()) {
-                return Err(Box::new(BlockedAddress(ip)) as _);
+            if guarded {
+                if let Err(Refusal::Blocked(ip)) = check_all(addrs.iter().copied()) {
+                    return Err(Box::new(BlockedAddress(ip)) as _);
+                }
             }
             Ok(Box::new(addrs.into_iter()) as Addrs)
         })
@@ -321,6 +350,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap()
+        .without_proxies()
     }
 
     #[test]
@@ -396,10 +426,11 @@ mod tests {
             enabled: false,
             allowed_hosts: vec![],
         })
-        .unwrap();
+        .unwrap()
+        .without_proxies();
         for url in ["http://127.0.0.1/a", "http://localhost/a", "http://[::1]/a"] {
             let url = Url::parse(url).unwrap();
-            assert_eq!(off.route(&url).await, Ok(Route::Unchecked), "{url}");
+            assert_eq!(off.route(&url).await, Ok(Route::Direct), "{url}");
         }
         let on = with_allowed(&[]);
         assert_eq!(
