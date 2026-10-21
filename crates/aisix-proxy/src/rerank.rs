@@ -74,6 +74,8 @@ struct RerankDispatchSuccess {
 /// model's per-token price for billing.
 struct RerankUsage {
     prompt_tokens: u32,
+    /// `usage.total_tokens` as reported; 0 when it reports none.
+    upstream_total_tokens: u32,
 }
 
 pub async fn rerank(
@@ -186,10 +188,10 @@ pub async fn rerank(
             // that reports no token count (Cohere bills search units) still
             // gets its event, at zero tokens.
             {
-                let usage = success
-                    .usage
-                    .as_ref()
-                    .unwrap_or(&RerankUsage { prompt_tokens: 0 });
+                let usage = success.usage.as_ref().unwrap_or(&RerankUsage {
+                    prompt_tokens: 0,
+                    upstream_total_tokens: 0,
+                });
                 emit_usage_event(
                     &state,
                     &snapshot,
@@ -696,7 +698,10 @@ async fn dispatch(
     // operators need to see it).
     let (usage, provider_request_id) = match serde_json::from_slice::<Value>(&body_bytes) {
         Ok(v) => (
-            rerank_prompt_tokens(&v).map(|prompt_tokens| RerankUsage { prompt_tokens }),
+            rerank_prompt_tokens(&v).map(|prompt_tokens| RerankUsage {
+                prompt_tokens,
+                upstream_total_tokens: crate::usage_attr::reported_total_tokens(v.get("usage")),
+            }),
             crate::usage_attr::provider_response_id(&v),
         ),
         Err(e) => {
@@ -862,6 +867,7 @@ fn emit_usage_event(
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
         prompt_tokens: usage.prompt_tokens,
+        total_tokens: usage.upstream_total_tokens,
         // Narrowed to the winning attempt's own latency below
         // (`apply_winning_attempt`) once a failover put earlier attempts
         // in front of it; they emitted their own events.

@@ -709,6 +709,10 @@ struct SessionUsage {
     /// Summed across the session's usage frames, `None` where none
     /// reported the modality.
     modality: aisix_gateway::ModalityTokens,
+    /// The upstream's own `total_tokens`, summed across the usage frames.
+    upstream_total_tokens: u64,
+    /// A usage frame reported no total, so the session has none.
+    total_unreported: bool,
 }
 
 impl SessionUsage {
@@ -736,6 +740,7 @@ impl SessionUsage {
                         usage.get("output_token_details"),
                     ),
                 );
+                self.absorb_total(usage);
                 self.responses += 1;
             }
             Some("conversation.item.input_audio_transcription.completed") => {
@@ -751,10 +756,30 @@ impl SessionUsage {
                             None,
                         ),
                     );
+                    self.absorb_total(usage);
                     self.responses += 1;
                 }
             }
             _ => {}
+        }
+    }
+
+    /// A session total stands only while every usage frame reported one —
+    /// the rule `UsageStats::saturating_add` applies to a merge.
+    fn absorb_total(&mut self, usage: &Value) {
+        match crate::usage_attr::reported_total_tokens(Some(usage)) {
+            0 => self.total_unreported = true,
+            total => self.upstream_total_tokens += u64::from(total),
+        }
+    }
+
+    /// The total the usage event records; 0 (unset) unless every usage
+    /// frame reported one.
+    fn recorded_total_tokens(&self) -> u32 {
+        if self.total_unreported {
+            0
+        } else {
+            self.upstream_total_tokens.min(u64::from(u32::MAX)) as u32
         }
     }
 }
@@ -1133,6 +1158,7 @@ async fn run_session(
         requested_model_id: model_entry.id.clone(),
         prompt_tokens: usage.input_tokens.min(u32::MAX as u64) as u32,
         completion_tokens: usage.output_tokens.min(u32::MAX as u64) as u32,
+        total_tokens: usage.recorded_total_tokens(),
         cached_prompt_tokens: usage.cached_tokens.min(u32::MAX as u64) as u32,
         modality_tokens: usage.modality,
         status_code: close_status,

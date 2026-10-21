@@ -375,6 +375,17 @@ pub(crate) fn total_tokens_with_cache(
         + u64::from(cache_read_tokens)
 }
 
+/// The `total_tokens` a JSON `usage` object reports, verbatim — the value
+/// `UsageEvent::total_tokens` records (`UsageStats::upstream_total_tokens`).
+/// `0` when the object carries none: the event leaves the field unset then,
+/// and is never given a total summed here.
+pub(crate) fn reported_total_tokens(usage: Option<&serde_json::Value>) -> u32 {
+    usage
+        .and_then(|u| u.get("total_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .map_or(0, |n| n.min(u64::from(u32::MAX)) as u32)
+}
+
 /// The `model` metric label for a request whose client-supplied `model`
 /// field never resolved to a configured model (e.g. model-not-found). See
 /// [`metric_model_label`].

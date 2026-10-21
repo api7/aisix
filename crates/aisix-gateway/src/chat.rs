@@ -1302,6 +1302,12 @@ pub enum EmbeddingUsageSource {
 pub struct EmbeddingUsage {
     pub prompt_tokens: u32,
     pub total_tokens: u32,
+    /// The upstream's own total, verbatim; `0` when it reported none. A
+    /// bridge fills `total_tokens` for the client from the prompt count, so
+    /// only this is what the usage event records — see
+    /// [`UsageStats::upstream_total_tokens`].
+    #[serde(skip)]
+    pub upstream_total_tokens: u32,
     /// Internal provenance for telemetry. Client embedding response bodies
     /// retain their established OpenAI-compatible `usage` shape.
     #[serde(skip)]

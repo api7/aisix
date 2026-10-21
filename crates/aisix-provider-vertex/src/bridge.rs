@@ -864,6 +864,9 @@ impl Bridge for VertexBridge {
                 usage: EmbeddingUsage {
                     prompt_tokens: tokens,
                     total_tokens: tokens,
+                    // The upstream reports no total; the one above is the
+                    // prompt count, filled for the client.
+                    upstream_total_tokens: 0,
                     source,
                 },
             })

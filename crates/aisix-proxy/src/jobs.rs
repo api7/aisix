@@ -2073,6 +2073,10 @@ async fn attribute_batch_usage(
         completion: u64,
         cached: u64,
         modality: aisix_gateway::ModalityTokens,
+        /// Summed `usage.total_tokens`; recorded only while no line lacked
+        /// one (`total_unreported`).
+        total: u64,
+        total_unreported: bool,
         lines: u64,
         service_tier: TierAgreement,
     }
@@ -2099,6 +2103,10 @@ async fn attribute_batch_usage(
         agg.prompt += prompt;
         agg.completion += completion;
         agg.cached += cached;
+        match crate::usage_attr::reported_total_tokens(Some(usage)) {
+            0 => agg.total_unreported = true,
+            total => agg.total += u64::from(total),
+        }
         agg.modality =
             agg.modality
                 .saturating_add(&aisix_gateway::ModalityTokens::from_openai_details(
@@ -2137,6 +2145,11 @@ async fn attribute_batch_usage(
             requested_model_id: model_id.to_string(),
             prompt_tokens: agg.prompt.min(u32::MAX as u64) as u32,
             completion_tokens: agg.completion.min(u32::MAX as u64) as u32,
+            total_tokens: if agg.total_unreported {
+                0
+            } else {
+                agg.total.min(u32::MAX as u64) as u32
+            },
             cached_prompt_tokens: agg.cached.min(u32::MAX as u64) as u32,
             modality_tokens: agg.modality,
             status_code: 200,

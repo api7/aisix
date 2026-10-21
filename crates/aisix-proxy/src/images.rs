@@ -43,11 +43,11 @@ struct ImageDispatchSuccess {
     /// The `{kind, hook}` set of guardrails that governed this request (#379
     /// parity) — surfaced on the emitted UsageEvent.
     applied_guardrails: Vec<AppliedGuardrail>,
-    /// `(prompt_tokens, completion_tokens)` from the upstream `usage`
-    /// block when the model returns one (gpt-image-1). `None` for
-    /// models that don't (dall-e-3) — those still emit a zero-token
-    /// event so the request is visible + attributed.
-    usage: Option<(u32, u32, aisix_gateway::ModalityTokens)>,
+    /// The upstream `usage` block when the model returns one
+    /// (gpt-image-1). `None` for models that don't (dall-e-3) — those
+    /// still emit a zero-token event so the request is visible +
+    /// attributed.
+    usage: Option<aisix_gateway::UsageStats>,
     /// `false` on the 501 NotImplemented branch (provider lacks image
     /// generation → no upstream call). That path still emits a zero-token
     /// event.
@@ -184,10 +184,6 @@ pub async fn image_generations(
             // documented cross-repo follow-up — needs image-count /
             // size / quality on the wire + cp-api pricing).
             {
-                let (prompt_tokens, completion_tokens, modality) =
-                    success
-                        .usage
-                        .unwrap_or((0, 0, aisix_gateway::ModalityTokens::NONE));
                 emit_usage_event(
                     &state,
                     &snapshot,
@@ -203,9 +199,7 @@ pub async fn image_generations(
                     &success.applied_guardrails,
                     status,
                     elapsed,
-                    prompt_tokens,
-                    completion_tokens,
-                    modality,
+                    &success.usage.clone().unwrap_or_default(),
                     &client,
                     success.redactions.clone(),
                     success.monitor_hits.clone(),
@@ -531,13 +525,13 @@ async fn dispatch(
             // Extract usage tokens (gpt-image-1 returns a `usage` block;
             // dall-e-3 doesn't) BEFORE moving resp_json into the
             // Response, so the success struct carries typed counters.
-            let usage = extract_token_usage(&resp_json);
+            let usage = image_usage_stats(&resp_json);
             // #911 [21]: commit the actual token cost so TPM/TPD is enforced
             // for /v1/images/generations like chat + embeddings. Pre-fix the
             // reservation dropped uncommitted and the token counter never moved.
-            let total_tokens = usage
-                .map(|(prompt, completion, _)| u64::from(prompt) + u64::from(completion))
-                .unwrap_or(0);
+            let total_tokens = usage.as_ref().map_or(0, |u| {
+                u64::from(u.prompt_tokens) + u64::from(u.completion_tokens)
+            });
             reservation.commit_tokens(total_tokens).await;
             // Content capture (#700): the full response JSON (LiteLLM
             // parity); CapturedContent::new truncates to the cap.
@@ -588,14 +582,12 @@ async fn dispatch(
     }
 }
 
-/// Pull `(prompt_tokens, completion_tokens)` from an OpenAI image
-/// response `usage` block. gpt-image-1 returns
+/// The token usage of an OpenAI image response, shared with passthrough
+/// routes relaying an image body. gpt-image-1 returns
 /// `usage: {input_tokens, output_tokens, total_tokens, ...}`; dall-e-2/3
 /// return no `usage` block → `None`. Wire shape:
 /// <https://platform.openai.com/docs/api-reference/images/object>
-pub(crate) fn extract_token_usage(
-    body: &Value,
-) -> Option<(u32, u32, aisix_gateway::ModalityTokens)> {
+pub(crate) fn image_usage_stats(body: &Value) -> Option<aisix_gateway::UsageStats> {
     let usage = body.get("usage")?;
     let input = usage.get("input_tokens").and_then(Value::as_u64)? as u32;
     let output = usage
@@ -608,14 +600,9 @@ pub(crate) fn extract_token_usage(
         usage.get("input_tokens_details"),
         usage.get("output_tokens_details"),
     );
-    Some((input, output, modality))
-}
-
-/// [`extract_token_usage`] as `UsageStats`, shared with passthrough routes
-/// relaying an image body.
-pub(crate) fn image_usage_stats(body: &Value) -> Option<aisix_gateway::UsageStats> {
-    extract_token_usage(body).map(|(input, output, modality)| aisix_gateway::UsageStats {
+    Some(aisix_gateway::UsageStats {
         modality,
+        upstream_total_tokens: crate::usage_attr::reported_total_tokens(Some(usage)),
         ..aisix_gateway::UsageStats::new(input, output)
     })
 }
@@ -657,9 +644,7 @@ pub(crate) fn emit_usage_event(
     applied_guardrails: &[AppliedGuardrail],
     status_code: u16,
     elapsed: Duration,
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    modality_tokens: aisix_gateway::ModalityTokens,
+    usage: &aisix_gateway::UsageStats,
     client: &ClientContext,
     // Per-detector PII mask counts (#932/#696). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -681,9 +666,10 @@ pub(crate) fn emit_usage_event(
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
-        prompt_tokens,
-        completion_tokens,
-        modality_tokens,
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        total_tokens: usage.upstream_total_tokens,
+        modality_tokens: usage.modality,
         // Narrowed to the winning attempt's own latency below
         // (`apply_winning_attempt`) once a failover put earlier attempts
         // in front of it; they emitted their own events.
@@ -731,9 +717,9 @@ pub(crate) fn emit_usage_event(
             ..Default::default()
         },
         crate::request_metrics::Tokens {
-            input: prompt_tokens,
-            output: completion_tokens,
-            total: prompt_tokens.saturating_add(completion_tokens),
+            input: usage.prompt_tokens,
+            output: usage.completion_tokens,
+            total: usage.prompt_tokens.saturating_add(usage.completion_tokens),
             // No upstream on this surface reports prompt-cache detail.
             cached: 0,
             cache_read: 0,

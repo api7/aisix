@@ -64,10 +64,9 @@ struct EditsDispatchSuccess {
     provider_key_id: String,
     upstream_model: String,
     applied_guardrails: Vec<AppliedGuardrail>,
-    /// `(prompt_tokens, completion_tokens)` from the upstream `usage`
-    /// block (gpt-image-*). `None` still emits a zero-token event so the
-    /// request is visible + attributed.
-    usage: Option<(u32, u32, aisix_gateway::ModalityTokens)>,
+    /// The upstream `usage` block (gpt-image-*). `None` still emits a
+    /// zero-token event so the request is visible + attributed.
+    usage: Option<aisix_gateway::UsageStats>,
     redactions: crate::redact::RedactionCounts,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     captured_content: Option<CapturedContent>,
@@ -175,10 +174,6 @@ pub async fn image_edits(
                 crate::redact::RedactionCounts::new(),
                 &audit,
             );
-            let (prompt_tokens, completion_tokens, modality) =
-                success
-                    .usage
-                    .unwrap_or((0, 0, aisix_gateway::ModalityTokens::NONE));
             crate::images::emit_usage_event(
                 &state,
                 &snapshot,
@@ -194,9 +189,7 @@ pub async fn image_edits(
                 &success.applied_guardrails,
                 status,
                 elapsed,
-                prompt_tokens,
-                completion_tokens,
-                modality,
+                &success.usage.clone().unwrap_or_default(),
                 &client,
                 success.redactions.clone(),
                 success.monitor_hits.clone(),
@@ -735,10 +728,10 @@ async fn dispatch(
     state.runtime_status.mark_healthy(&target.id);
 
     // #911 [21]: commit the actual token cost so TPM/TPD is enforced.
-    let usage = crate::images::extract_token_usage(&resp_json);
-    let total_tokens = usage
-        .map(|(prompt, completion, _)| u64::from(prompt) + u64::from(completion))
-        .unwrap_or(0);
+    let usage = crate::images::image_usage_stats(&resp_json);
+    let total_tokens = usage.as_ref().map_or(0, |u| {
+        u64::from(u.prompt_tokens) + u64::from(u.completion_tokens)
+    });
     reservation.commit_tokens(total_tokens).await;
 
     let captured_content = match (&captured_prompt, content_cap) {
