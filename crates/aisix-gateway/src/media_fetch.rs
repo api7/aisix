@@ -597,6 +597,9 @@ enum Failure {
     Blocked(IpAddr),
     Unresolvable,
     Transport,
+    /// The peer's TLS certificate failed verification; carries the
+    /// verifier's error for the log, never for the caller.
+    UntrustedCertificate(String),
     Timeout,
     Status(u16),
     TooLarge,
@@ -678,6 +681,9 @@ impl Failure {
             Self::BadUrl => "it is not a valid URL".to_string(),
             Self::Unresolvable => "its host does not resolve".to_string(),
             Self::Transport => "the connection failed".to_string(),
+            Self::UntrustedCertificate(_) => {
+                "its TLS certificate could not be verified (see upstream.tls.ca_file)".to_string()
+            }
             Self::Timeout => "the download timed out".to_string(),
             Self::Status(code) => format!("the server answered HTTP {code}"),
             Self::TooLarge => format!(
@@ -711,11 +717,38 @@ fn classify(err: reqwest::Error) -> Failure {
     if let Some(refusal) = Refusal::from_error(&err) {
         return refusal.into();
     }
+    if let Some(cert) = certificate_error(&err) {
+        return Failure::UntrustedCertificate(cert.to_string());
+    }
     if err.is_timeout() {
         Failure::Timeout
     } else {
         Failure::Transport
     }
+}
+
+/// The certificate-verification error in `err`'s source chain, if any.
+/// An `io::Error` hides the error it wraps from `source()`, so each one is
+/// opened by hand.
+fn certificate_error<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a rustls::Error> {
+    let mut source = Some(err);
+    while let Some(e) = source {
+        if let Some(wrapped) = e
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+        {
+            source = Some(wrapped as &(dyn std::error::Error + 'static));
+            continue;
+        }
+        if let Some(
+            tls @ (rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented),
+        ) = e.downcast_ref::<rustls::Error>()
+        {
+            return Some(tls);
+        }
+        source = e.source();
+    }
+    None
 }
 
 /// The media type a body's first bytes announce, for the formats the
@@ -987,6 +1020,61 @@ mod tests {
         let message = direct.describe(&uri, &settings);
         assert!(message.contains("adds 127.0.0.1 to"), "{message}");
         assert!(!message.contains("redirected"), "{message}");
+    }
+
+    /// A loopback https server whose self-signed certificate nobody
+    /// trusts; counts the connections it accepts.
+    async fn serve_untrusted_tls() -> (u16, Arc<AtomicUsize>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::Relaxed);
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = acceptor.accept(sock).await;
+                });
+            }
+        });
+        (port, accepted)
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_certificate_is_named_and_not_retried() {
+        let (port, accepted) = serve_untrusted_tls().await;
+        let settings = with_allowed(&["localhost"]);
+        let w = Wanted {
+            uri: format!("https://localhost:{port}/a.png"),
+            explicit_mime_type: None,
+            location: String::new(),
+            uses: 1,
+        };
+        let got = fetch_one(&w, &settings, Encoding::Bytes, &RequestBudget::unlimited())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(got.failure, Failure::UntrustedCertificate(_)),
+            "{got:?}"
+        );
+        assert_eq!(accepted.load(Ordering::Relaxed), 1, "not retried");
+        let message = got.describe(&w.uri, &settings);
+        assert!(
+            message
+                .ends_with("its TLS certificate could not be verified (see upstream.tls.ca_file)"),
+            "{message}"
+        );
     }
 
     #[tokio::test]

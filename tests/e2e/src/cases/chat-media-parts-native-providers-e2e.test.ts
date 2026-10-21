@@ -925,7 +925,7 @@ async function startForwardProxy(): Promise<{
 /** Serves `/cat.png` over https with a self-signed certificate for
  * `localhost`, or `undefined` without openssl. */
 async function startHttpsMediaServer(): Promise<
-  { port: number; hits: () => number; close(): Promise<void> } | undefined
+  { port: number; hits: () => number; connections: () => number; close(): Promise<void> } | undefined
 > {
   try {
     execFileSync("openssl", ["version"], { stdio: "ignore" });
@@ -952,12 +952,17 @@ async function startHttpsMediaServer(): Promise<
       res.end(PNG);
     },
   );
+  let connections = 0;
+  server.on("connection", () => {
+    connections += 1;
+  });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const addr = server.address();
   if (addr === null || typeof addr === "string") throw new Error("no port");
   return {
     port: addr.port,
     hits: () => hits,
+    connections: () => connections,
     close: () =>
       new Promise<void>((resolve) => {
         server.closeAllConnections();
@@ -1020,6 +1025,46 @@ async function chatWithImage(app: SpawnedApp, caller: string, url: string) {
 }
 
 const NOVA_IMAGE = { image: { format: "png", source: { bytes: PNG_B64 } } };
+
+describe("a media host whose TLS certificate the gateway does not trust", () => {
+  let upstream: RecordingUpstream | undefined;
+  let tlsMedia: Awaited<ReturnType<typeof startHttpsMediaServer>>;
+  let app: SpawnedApp | undefined;
+  const CALLER = "sk-media-untrusted-cert";
+
+  beforeAll(async () => {
+    if (!(await new EtcdClient().ping())) return;
+    tlsMedia = await startHttpsMediaServer();
+    if (!tlsMedia) return;
+    upstream = await startUpstream();
+    // No upstream.tls.ca_file, and verification on: the self-signed
+    // certificate is not trusted.
+    app = await spawnNovaGateway(CALLER, upstream.baseUrl, {
+      extra: { outbound: { ssrf_protection: { allowed_hosts: [`localhost:${tlsMedia.port}`] } } },
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+    await tlsMedia?.close();
+  });
+
+  test("is a 400 that names the certificate and the setting, and is not retried", async (ctx) => {
+    if (!app || !tlsMedia || !upstream) return ctx.skip();
+    const before = tlsMedia.connections();
+    const res = await chatWithImage(app, CALLER, `https://localhost:${tlsMedia.port}/cat.png`);
+    expect(res.status, res.text).toBe(400);
+    const error = JSON.parse(res.text).error;
+    expect(error.type).toBe("invalid_request_error");
+    expect(error.message).toContain("TLS certificate could not be verified");
+    expect(error.message).toContain("upstream.tls.ca_file");
+    expect(error.message).not.toContain("the connection failed");
+    // A certificate that fails verification fails the same way next time.
+    expect(tlsMedia.connections() - before).toBe(1);
+    expect(upstream.received.length).toBe(0);
+  });
+});
 
 describe("chat media downloads with outbound.ssrf_protection.enabled: false", () => {
   let app: SpawnedApp | undefined;
