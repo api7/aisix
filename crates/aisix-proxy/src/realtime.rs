@@ -1015,9 +1015,21 @@ async fn run_session(
                     // the client's code; it goes out on the flush, and
                     // without one the client sees 1006.
                     let _ = client_tx.close().await;
-                    let frame = frame.map(|f| TgCloseFrame {
-                        code: f.code.into(),
-                        reason: f.reason.to_string().into(),
+                    // A client code that may not be sent arrives as the
+                    // library's substitute; the upstream gets 1011, not a
+                    // 1002 the client never sent.
+                    let frame = frame.map(|f| {
+                        if (f.code, f.reason.as_ref()) == LIBRARY_REJECTED_CLOSE {
+                            TgCloseFrame {
+                                code: 1011.into(),
+                                reason: "".into(),
+                            }
+                        } else {
+                            TgCloseFrame {
+                                code: f.code.into(),
+                                reason: f.reason.to_string().into(),
+                            }
+                        }
                     });
                     close_upstream(&mut up_tx, &mut up_rx, frame, &mut usage).await;
                     break;
@@ -1297,9 +1309,10 @@ enum UpstreamEnd<'a> {
     Dropped,
 }
 
-/// tungstenite replaces a received Close whose code may not be sent
-/// (1004, 1016–2999, …) with exactly this frame and drops the original
-/// code, so it is indistinguishable from an upstream sending it itself.
+/// tungstenite (under both the upstream client and axum's server side)
+/// replaces a received Close whose code may not be sent (1004, 1016–2999,
+/// …) with exactly this frame and drops the original code, so it is
+/// indistinguishable from the peer sending it itself.
 const LIBRARY_REJECTED_CLOSE: (u16, &str) = (1002, "Protocol violation");
 
 /// Relay the upstream's end of the session to the client: its code and
