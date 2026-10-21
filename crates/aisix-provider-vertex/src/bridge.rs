@@ -1458,8 +1458,9 @@ impl VertexBridge {
                                 &data,
                                 "vertex openai-shim stream chunk parse",
                             )?;
-                            yield openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer)
-                    .with_fallback_service_tier(&header_tier);
+                            if let Some(chunk) = openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                                yield chunk.with_fallback_service_tier(&header_tier);
+                            }
                         }
                         // OpenAI shim terminates with `data: [DONE]`;
                         // stop emitting on the sentinel.
@@ -1477,8 +1478,9 @@ impl VertexBridge {
                     &data,
                     "vertex openai-shim stream tail parse",
                 )?;
-                yield openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer)
-                    .with_fallback_service_tier(&header_tier);
+                if let Some(chunk) = openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                    yield chunk.with_fallback_service_tier(&header_tier);
+                }
             }
         };
 
@@ -1699,8 +1701,9 @@ impl VertexBridge {
                                 &data,
                                 "vertex partner :streamRawPredict chunk parse",
                             )?;
-                            yield openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer)
-                    .with_fallback_service_tier(&header_tier);
+                            if let Some(chunk) = openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                                yield chunk.with_fallback_service_tier(&header_tier);
+                            }
                         }
                         // OpenAI-compatible upstreams (Mistral / AI21)
                         // terminate with `data: [DONE]`; stop on the sentinel.
@@ -1716,8 +1719,9 @@ impl VertexBridge {
                     &data,
                     "vertex partner :streamRawPredict tail parse",
                 )?;
-                yield openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer)
-                    .with_fallback_service_tier(&header_tier);
+                if let Some(chunk) = openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                    yield chunk.with_fallback_service_tier(&header_tier);
+                }
             }
         };
 

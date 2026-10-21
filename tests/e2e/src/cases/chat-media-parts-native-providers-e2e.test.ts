@@ -109,6 +109,10 @@ async function startMediaServer(): Promise<MediaServer> {
         res.statusCode = 302;
         res.setHeader("location", `http://localhost:${port}/cat.png`);
         return res.end();
+      case "/to-gone.png":
+        res.statusCode = 302;
+        res.setHeader("location", `http://localhost:${port}/gone.png`);
+        return res.end();
       default:
         return send(404, "text/plain", "not found");
     }
@@ -615,13 +619,17 @@ describe("chat media content parts → native provider media shapes", () => {
       expect(message).toMatch(/^messages\[0\]\.content\[1\]: /);
       expect(message).toContain("outbound.ssrf_protection.allowed_hosts");
       expect(message).toContain("outbound.ssrf_protection.enabled");
+      expect(message).toContain("adds 127.0.0.1 to");
     }
     // Refused before any request left the gateway.
     expect(hits("/cat.png")).toBe(before);
 
-    expect(await refused("media-nova", user(allowed("/to-private.png")))).toContain(
-      "outbound.ssrf_protection.allowed_hosts",
-    );
+    // Refused on the second hop: the error names that hop and its host,
+    // since allow-listing the first one would change nothing.
+    const redirected = await refused("media-nova", user(allowed("/to-private.png")));
+    expect(redirected).toContain("outbound.ssrf_protection.allowed_hosts");
+    expect(redirected).toContain(`redirected to ${JSON.stringify(unlisted("/cat.png"))}`);
+    expect(redirected).toContain("adds 127.0.0.1 to");
     const followed = await chat("media-nova", [text("hi"), image(allowed("/to-allowed.png"))]);
     expect(followed.messages[0].content).toContainEqual({
       image: { format: "png", source: { bytes: PNG_B64 } },
@@ -640,6 +648,10 @@ describe("chat media content parts → native provider media shapes", () => {
     expect(missing).not.toContain("sekrit");
     // An answer, not a transport failure: asked once.
     expect(hits("/gone.png") - before).toBe(1);
+    // A later hop's answer names that hop.
+    expect(await refused("media-nova", user(allowed("/to-gone.png")))).toContain(
+      `from ${JSON.stringify(allowed("/gone.png"))}`,
+    );
 
     expect(await refused("media-nova", user("ftp://files.example/cat.png"))).toContain(
       "does not read media from a URL",
@@ -799,6 +811,20 @@ describe("chat media downloads count against proxy.request_body_limit_bytes", ()
 
   const url = (path: string) => `http://localhost:${media!.port}${path}`;
 
+  /** The inbound body alone is under the limit, so the 413 has to say the
+   * downloads are what took it over, with both counts. */
+  function expectCountsTheDownload(message: string, body: unknown) {
+    const inbound = Buffer.byteLength(JSON.stringify(body));
+    expect(inbound).toBeLessThan(LIMIT);
+    const m = message.match(
+      /request body \((\d+) bytes\) plus downloaded media \((\d+) bytes\) exceeds the (\d+)-byte/,
+    );
+    expect(m, message).not.toBeNull();
+    expect(Number(m![1])).toBe(inbound);
+    expect(Number(m![1]) + Number(m![2])).toBeGreaterThan(LIMIT);
+    expect(Number(m![3])).toBe(LIMIT);
+  }
+
   test("under the limit the request goes through; past it, the same 413 an oversized body gets", async (ctx) => {
     if (!etcdReachable || !app || !upstream || !media) return ctx.skip();
     const one = await send("/v1/chat/completions", {
@@ -808,19 +834,21 @@ describe("chat media downloads count against proxy.request_body_limit_bytes", ()
     expect(one.status, one.text).toBe(200);
 
     const before = upstream.received.length;
-    const two = await send("/v1/chat/completions", {
+    const twoBody = {
       model: "media-total-nova",
       messages: [
         { role: "user", content: [text("hi"), image(url("/pad-a.png")), image(url("/pad-b.png"))] },
       ],
-    });
+    };
+    const two = await send("/v1/chat/completions", twoBody);
     expect(two.status, two.text).toBe(413);
     const error = JSON.parse(two.text).error;
     expect(error.type).toBe("invalid_request_error");
-    expect(error.message).toContain(`${LIMIT}-byte limit`);
+    expect(error.message).toContain(`${LIMIT}-byte`);
+    expectCountsTheDownload(error.message, twoBody);
     expect(upstream.received.length).toBe(before);
 
-    const viaMessages = await send("/v1/messages", {
+    const messagesBody = {
       model: "media-total-nova",
       max_tokens: 16,
       messages: [
@@ -833,9 +861,11 @@ describe("chat media downloads count against proxy.request_body_limit_bytes", ()
           ],
         },
       ],
-    });
+    };
+    const viaMessages = await send("/v1/messages", messagesBody);
     expect(viaMessages.status, viaMessages.text).toBe(413);
     expect(JSON.parse(viaMessages.text).error.type).toBe("request_too_large");
+    expectCountsTheDownload(JSON.parse(viaMessages.text).error.message, messagesBody);
   });
 });
 
@@ -895,7 +925,7 @@ async function startForwardProxy(): Promise<{
 /** Serves `/cat.png` over https with a self-signed certificate for
  * `localhost`, or `undefined` without openssl. */
 async function startHttpsMediaServer(): Promise<
-  { port: number; hits: () => number; close(): Promise<void> } | undefined
+  { port: number; hits: () => number; connections: () => number; close(): Promise<void> } | undefined
 > {
   try {
     execFileSync("openssl", ["version"], { stdio: "ignore" });
@@ -922,12 +952,17 @@ async function startHttpsMediaServer(): Promise<
       res.end(PNG);
     },
   );
+  let connections = 0;
+  server.on("connection", () => {
+    connections += 1;
+  });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const addr = server.address();
   if (addr === null || typeof addr === "string") throw new Error("no port");
   return {
     port: addr.port,
     hits: () => hits,
+    connections: () => connections,
     close: () =>
       new Promise<void>((resolve) => {
         server.closeAllConnections();
@@ -990,6 +1025,46 @@ async function chatWithImage(app: SpawnedApp, caller: string, url: string) {
 }
 
 const NOVA_IMAGE = { image: { format: "png", source: { bytes: PNG_B64 } } };
+
+describe("a media host whose TLS certificate the gateway does not trust", () => {
+  let upstream: RecordingUpstream | undefined;
+  let tlsMedia: Awaited<ReturnType<typeof startHttpsMediaServer>>;
+  let app: SpawnedApp | undefined;
+  const CALLER = "sk-media-untrusted-cert";
+
+  beforeAll(async () => {
+    if (!(await new EtcdClient().ping())) return;
+    tlsMedia = await startHttpsMediaServer();
+    if (!tlsMedia) return;
+    upstream = await startUpstream();
+    // No upstream.tls.ca_file, and verification on: the self-signed
+    // certificate is not trusted.
+    app = await spawnNovaGateway(CALLER, upstream.baseUrl, {
+      extra: { outbound: { ssrf_protection: { allowed_hosts: [`localhost:${tlsMedia.port}`] } } },
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+    await tlsMedia?.close();
+  });
+
+  test("is a 400 that names the certificate and the setting, and is not retried", async (ctx) => {
+    if (!app || !tlsMedia || !upstream) return ctx.skip();
+    const before = tlsMedia.connections();
+    const res = await chatWithImage(app, CALLER, `https://localhost:${tlsMedia.port}/cat.png`);
+    expect(res.status, res.text).toBe(400);
+    const error = JSON.parse(res.text).error;
+    expect(error.type).toBe("invalid_request_error");
+    expect(error.message).toContain("TLS certificate could not be verified");
+    expect(error.message).toContain("upstream.tls.ca_file");
+    expect(error.message).not.toContain("the connection failed");
+    // A certificate that fails verification fails the same way next time.
+    expect(tlsMedia.connections() - before).toBe(1);
+    expect(upstream.received.length).toBe(0);
+  });
+});
 
 describe("chat media downloads with outbound.ssrf_protection.enabled: false", () => {
   let app: SpawnedApp | undefined;

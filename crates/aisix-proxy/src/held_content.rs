@@ -1003,6 +1003,7 @@ mod tests {
             tool_calls: Some(vec![
                 json!({"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":1}"}}),
             ]),
+            audio: None,
         };
         assert_eq!(chat_delta(&delta), 3 + 2 + 7);
     }

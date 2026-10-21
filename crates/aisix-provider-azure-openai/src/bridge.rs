@@ -938,7 +938,9 @@ where
                     }
                     SseEvent::Data(payload) => {
                         let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                        yield stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer);
+                        if let Some(chunk) = stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                            yield chunk;
+                        }
                     }
                 }
             }
@@ -949,7 +951,9 @@ where
             }
             Some(SseEvent::Data(payload)) => {
                 let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                yield stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer);
+                if let Some(chunk) = stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                    yield chunk;
+                }
             }
             None => {}
         }

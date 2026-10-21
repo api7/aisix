@@ -74,6 +74,7 @@ pub fn init(cfg: &aisix_core::config::MediaFetchConfig, request_body_limit_bytes
 /// What one request may still hold: its inbound body plus every byte
 /// downloaded for it, against `proxy.request_body_limit_bytes`.
 struct RequestBudget {
+    inbound: usize,
     used: AtomicUsize,
     limit: usize,
 }
@@ -81,6 +82,7 @@ struct RequestBudget {
 impl RequestBudget {
     fn new(inbound: usize, limit: usize) -> Self {
         Self {
+            inbound,
             used: AtomicUsize::new(inbound),
             limit,
         }
@@ -91,16 +93,27 @@ impl RequestBudget {
         Self::new(0, 0)
     }
 
-    fn would_exceed(&self, more: u64) -> bool {
-        self.limit > 0 && self.used.load(Ordering::Relaxed) as u64 + more > self.limit as u64
+    /// Refuses a body of `more` bytes the request cannot hold.
+    fn check(&self, more: u64) -> Result<(), Failure> {
+        let total = self.used.load(Ordering::Relaxed) as u64 + more;
+        if self.limit > 0 && total > self.limit as u64 {
+            return Err(self.over(total));
+        }
+        Ok(())
     }
 
     fn claim(&self, n: usize) -> Result<(), Failure> {
         let used = self.used.fetch_add(n, Ordering::Relaxed) + n;
         if self.limit > 0 && used > self.limit {
-            return Err(Failure::OverRequestLimit);
+            return Err(self.over(used as u64));
         }
         Ok(())
+    }
+
+    fn over(&self, total: u64) -> Failure {
+        Failure::OverRequestLimit {
+            downloaded: total.saturating_sub(self.inbound as u64),
+        }
     }
 
     fn release(&self, n: usize) {
@@ -357,7 +370,7 @@ async fn fetch_wanted(
         let result = match deadline {
             Some(at) => tokio::time::timeout_at(at, download)
                 .await
-                .unwrap_or(Err(Failure::Timeout)),
+                .unwrap_or(Err(Failure::Timeout.into())),
             None => download.await,
         };
         (w, result)
@@ -369,16 +382,22 @@ async fn fetch_wanted(
             Ok(media) => {
                 slots.insert(w.uri, (media, w.uses));
             }
-            Err(Failure::OverRequestLimit) => {
+            Err(Failed {
+                failure: Failure::OverRequestLimit { downloaded },
+                ..
+            }) => {
                 return Err(BridgeError::RequestTooLarge {
                     limit_bytes: settings.request_body_limit_bytes,
+                    inbound_bytes: ctx.inbound_body_bytes,
+                    downloaded_bytes: downloaded,
                 });
             }
             Err(failure) => {
                 tracing::warn!(
                     request_id = %ctx.request_id,
                     url = %display_uri(&w.uri),
-                    failure = ?failure,
+                    redirected_to = failure.redirected_to.as_ref().map(|u| display_uri(u.as_str())),
+                    failure = ?failure.failure,
                     "media URL not downloaded"
                 );
                 return Err(BridgeError::InvalidRequest(format!(
@@ -400,12 +419,12 @@ async fn fetch_one(
     settings: &MediaFetchSettings,
     encoding: Encoding,
     held: &RequestBudget,
-) -> Result<Fetched, Failure> {
+) -> Result<Fetched, Failed> {
     let url = Url::parse(&w.uri).map_err(|_| Failure::BadUrl)?;
     let mut attempt = 1;
     let (bytes, content_type, final_url) = loop {
         match download(&url, settings, held).await {
-            Err(f) if f.retryable() && attempt < MAX_ATTEMPTS => {
+            Err(f) if f.failure.retryable() && attempt < MAX_ATTEMPTS => {
                 tokio::time::sleep(RETRY_BACKOFF * attempt).await;
                 attempt += 1;
             }
@@ -436,36 +455,23 @@ async fn download(
     url: &Url,
     settings: &MediaFetchSettings,
     held: &RequestBudget,
-) -> Result<(Vec<u8>, Option<String>, Url), Failure> {
+) -> Result<(Vec<u8>, Option<String>, Url), Failed> {
     let mut current = url.clone();
     for hop in 0..=MAX_REDIRECTS {
-        let route = settings.ssrf.route(&current).await?;
-        let resp = client(route)?
-            .get(current.clone())
-            .send()
-            .await
-            .map_err(classify)?;
-        let status = resp.status();
-        if status.is_redirection() {
-            if let Some(location) = resp.headers().get(header::LOCATION) {
-                if hop == MAX_REDIRECTS {
-                    return Err(Failure::TooManyRedirects);
-                }
-                let next = location
-                    .to_str()
-                    .ok()
-                    .and_then(|l| current.join(l).ok())
-                    .ok_or(Failure::BadRedirect)?;
-                if !matches!(next.scheme(), "http" | "https") {
-                    return Err(Failure::BadRedirect);
-                }
+        let at = |failure: Failure| Failed {
+            failure,
+            redirected_to: (hop > 0).then(|| current.clone()),
+        };
+        let resp = match fetch_hop(&current, settings, hop < MAX_REDIRECTS).await {
+            Ok(Hop::Answered(resp)) => resp,
+            Ok(Hop::Redirect(next)) => {
                 current = next;
                 continue;
             }
-        }
-        if !status.is_success() {
-            return Err(Failure::Status(status.as_u16()));
-        }
+            // About the whole chain, not one hop.
+            Err(Failure::TooManyRedirects) => return Err(Failure::TooManyRedirects.into()),
+            Err(failure) => return Err(at(failure)),
+        };
         let content_type = resp
             .headers()
             .get(header::CONTENT_TYPE)
@@ -474,10 +480,53 @@ async fn download(
             .filter(|m| {
                 !m.is_empty() && m != "application/octet-stream" && !m.starts_with("binary/")
             });
-        let body = read_capped(resp, settings.max_bytes, held).await?;
+        let body = read_capped(resp, settings.max_bytes, held)
+            .await
+            .map_err(at)?;
         return Ok((body, content_type, current));
     }
-    Err(Failure::TooManyRedirects)
+    Err(Failure::TooManyRedirects.into())
+}
+
+enum Hop {
+    Answered(reqwest::Response),
+    Redirect(Url),
+}
+
+/// One hop: checked, sent, and either answered with a success status or
+/// redirected, if `may_redirect`.
+async fn fetch_hop(
+    url: &Url,
+    settings: &MediaFetchSettings,
+    may_redirect: bool,
+) -> Result<Hop, Failure> {
+    let route = settings.ssrf.route(url).await?;
+    let resp = client(route)?
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(classify)?;
+    let status = resp.status();
+    if status.is_redirection() {
+        if let Some(location) = resp.headers().get(header::LOCATION) {
+            if !may_redirect {
+                return Err(Failure::TooManyRedirects);
+            }
+            let next = location
+                .to_str()
+                .ok()
+                .and_then(|l| url.join(l).ok())
+                .ok_or(Failure::BadRedirect)?;
+            if !matches!(next.scheme(), "http" | "https") {
+                return Err(Failure::BadRedirect);
+            }
+            return Ok(Hop::Redirect(next));
+        }
+    }
+    if !status.is_success() {
+        return Err(Failure::Status(status.as_u16()));
+    }
+    Ok(Hop::Answered(resp))
 }
 
 /// Read the body into one buffer, refusing it once it passes `max` or
@@ -492,8 +541,8 @@ async fn read_capped(
     if declared.is_some_and(|len| len > max) {
         return Err(Failure::TooLarge);
     }
-    if declared.is_some_and(|len| held.would_exceed(len)) {
-        return Err(Failure::OverRequestLimit);
+    if let Some(len) = declared {
+        held.check(len)?;
     }
     let mut body = Vec::with_capacity(declared.unwrap_or(0) as usize);
     let mut claimed = 0;
@@ -554,15 +603,77 @@ enum Failure {
     Blocked(IpAddr),
     Unresolvable,
     Transport,
+    /// The peer's TLS certificate failed verification; carries the
+    /// verifier's error for the log, never for the caller.
+    UntrustedCertificate(String),
     Timeout,
     Status(u16),
     TooLarge,
     /// The request's inbound body plus its downloads passed
-    /// `proxy.request_body_limit_bytes`.
-    OverRequestLimit,
+    /// `proxy.request_body_limit_bytes`; `downloaded` is what the downloads
+    /// had reached when they did.
+    OverRequestLimit {
+        downloaded: u64,
+    },
     TooManyRedirects,
     BadRedirect,
     UnknownType,
+}
+
+/// A failed download, and the redirect target it failed at when that is
+/// not the URL the request names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Failed {
+    failure: Failure,
+    redirected_to: Option<Url>,
+}
+
+impl From<Failure> for Failed {
+    fn from(failure: Failure) -> Self {
+        Self {
+            failure,
+            redirected_to: None,
+        }
+    }
+}
+
+impl Failed {
+    /// The 400 sentence for `uri`, naming the hop that failed.
+    fn describe(&self, uri: &str, settings: &MediaFetchSettings) -> String {
+        let shown = display_uri(uri);
+        let hop = self.redirected_to.as_ref();
+        let why = match &self.failure {
+            Failure::Blocked(_) => {
+                let direct = Url::parse(uri).ok();
+                let hint = Refusal::blocked_hint(hop.or(direct.as_ref()));
+                return match hop {
+                    Some(to) => format!(
+                        "the gateway does not download the media URL {shown}: it redirected to \
+                         {}, whose host is not a publicly routable address. {hint}",
+                        display_uri(to.as_str())
+                    ),
+                    None => format!(
+                        "the gateway does not download the media URL {shown}: its host is not \
+                         a publicly routable address. {hint}"
+                    ),
+                };
+            }
+            Failure::UnknownType => {
+                return format!(
+                    "the media type of {shown} cannot be told from the URL or the download; \
+                     set it in image_url.format (or file.format), for example \"image/png\""
+                );
+            }
+            other => other.reason(settings),
+        };
+        match hop {
+            Some(to) => format!(
+                "could not download the media URL {shown} from {}, where it redirected: {why}",
+                display_uri(to.as_str())
+            ),
+            None => format!("could not download the media URL {shown}: {why}"),
+        }
+    }
 }
 
 impl Failure {
@@ -570,32 +681,23 @@ impl Failure {
         matches!(self, Self::Transport | Self::Timeout)
     }
 
-    fn describe(&self, uri: &str, settings: &MediaFetchSettings) -> String {
-        let shown = display_uri(uri);
-        let why = match self {
-            Self::Blocked(_) => {
-                return format!(
-                    "the gateway does not download the media URL {shown}: its host is not \
-                     a publicly routable address. {}",
-                    Refusal::blocked_hint()
-                );
-            }
-            Self::UnknownType => {
-                return format!(
-                    "the media type of {shown} cannot be told from the URL or the download; \
-                     set it in image_url.format (or file.format), for example \"image/png\""
-                );
-            }
+    fn reason(&self, settings: &MediaFetchSettings) -> String {
+        match self {
+            Self::Blocked(_) | Self::UnknownType => unreachable!("described by Failed::describe"),
             Self::BadUrl => "it is not a valid URL".to_string(),
             Self::Unresolvable => "its host does not resolve".to_string(),
             Self::Transport => "the connection failed".to_string(),
+            Self::UntrustedCertificate(_) => {
+                "its TLS certificate could not be verified (see upstream.tls.ca_file)".to_string()
+            }
             Self::Timeout => "the download timed out".to_string(),
             Self::Status(code) => format!("the server answered HTTP {code}"),
             Self::TooLarge => format!(
                 "it is larger than the {}-byte limit (upstream.media_fetch.max_bytes)",
                 settings.max_bytes
             ),
-            Self::OverRequestLimit => format!(
+            // Answered as a 413 before it is described.
+            Self::OverRequestLimit { .. } => format!(
                 "the request would exceed its {}-byte limit",
                 settings.request_body_limit_bytes
             ),
@@ -603,8 +705,7 @@ impl Failure {
             Self::BadRedirect => {
                 "it redirects to a location that is not an http:// or https:// URL".to_string()
             }
-        };
-        format!("could not download the media URL {shown}: {why}")
+        }
     }
 }
 
@@ -622,11 +723,38 @@ fn classify(err: reqwest::Error) -> Failure {
     if let Some(refusal) = Refusal::from_error(&err) {
         return refusal.into();
     }
+    if let Some(cert) = certificate_error(&err) {
+        return Failure::UntrustedCertificate(cert.to_string());
+    }
     if err.is_timeout() {
         Failure::Timeout
     } else {
         Failure::Transport
     }
+}
+
+/// The certificate-verification error in `err`'s source chain, if any.
+/// An `io::Error` hides the error it wraps from `source()`, so each one is
+/// opened by hand.
+fn certificate_error<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a rustls::Error> {
+    let mut source = Some(err);
+    while let Some(e) = source {
+        if let Some(wrapped) = e
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+        {
+            source = Some(wrapped as &(dyn std::error::Error + 'static));
+            continue;
+        }
+        if let Some(
+            tls @ (rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented),
+        ) = e.downcast_ref::<rustls::Error>()
+        {
+            return Some(tls);
+        }
+        source = e.source();
+    }
+    None
 }
 
 /// The media type a body's first bytes announce, for the formats the
@@ -678,7 +806,9 @@ mod tests {
         url: &Url,
         settings: &MediaFetchSettings,
     ) -> Result<(Vec<u8>, Option<String>, Url), Failure> {
-        download(url, settings, &RequestBudget::unlimited()).await
+        download(url, settings, &RequestBudget::unlimited())
+            .await
+            .map_err(|f| f.failure)
     }
 
     #[tokio::test]
@@ -689,7 +819,10 @@ mod tests {
         // 5 inbound + 10 downloaded > 12.
         let held = RequestBudget::new(5, 12);
         let got = download(&url, &settings, &held).await;
-        assert_eq!(got.map(|_| ()), Err(Failure::OverRequestLimit));
+        assert_eq!(
+            got.map(|_| ()).map_err(|f| f.failure),
+            Err(Failure::OverRequestLimit { downloaded: 10 })
+        );
         assert_eq!(
             held.used.load(Ordering::Relaxed),
             5,
@@ -844,6 +977,110 @@ mod tests {
         .unwrap();
         assert_eq!(body, b"ok");
         assert_eq!(answered.path(), "/b.png");
+    }
+
+    /// A refusal on a later hop names that hop, not the URL the request
+    /// named, and never the address the hop's name resolved to.
+    #[tokio::test]
+    async fn a_failure_after_a_redirect_names_the_hop_that_failed() {
+        let target =
+            serve(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        let location = Box::leak(
+            format!(
+                "HTTP/1.1 302 Found\r\nlocation: http://localhost:{target}/b.png\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .into_boxed_str(),
+        );
+        let redirector = serve(location.as_bytes()).await;
+        let uri = format!("http://127.0.0.1:{redirector}/a.png?sig=secret");
+        let url = Url::parse(&uri).unwrap();
+        let hop = format!("\"http://localhost:{target}/b.png\"");
+
+        let settings = with_allowed(&["127.0.0.1"]);
+        let got = download(&url, &settings, &RequestBudget::unlimited())
+            .await
+            .unwrap_err();
+        let message = got.describe(&uri, &settings);
+        assert!(matches!(got.failure, Failure::Blocked(_)), "{got:?}");
+        assert!(
+            message.contains(&format!("redirected to {hop}")),
+            "{message}"
+        );
+        assert!(message.contains("adds localhost to"), "{message}");
+        assert!(
+            !message.contains("127.0.0.1\"") && !message.contains("::1"),
+            "{message}"
+        );
+        assert!(!message.contains("secret"), "{message}");
+
+        let settings = with_allowed(&["127.0.0.1", "localhost"]);
+        let got = download(&url, &settings, &RequestBudget::unlimited())
+            .await
+            .unwrap_err();
+        let message = got.describe(&uri, &settings);
+        assert_eq!(got.failure, Failure::Status(404));
+        assert!(message.contains(&format!("from {hop}")), "{message}");
+
+        let direct = Failed::from(Failure::Blocked("127.0.0.1".parse().unwrap()));
+        let message = direct.describe(&uri, &settings);
+        assert!(message.contains("adds 127.0.0.1 to"), "{message}");
+        assert!(!message.contains("redirected"), "{message}");
+    }
+
+    /// A loopback https server whose self-signed certificate nobody
+    /// trusts; counts the connections it accepts.
+    async fn serve_untrusted_tls() -> (u16, Arc<AtomicUsize>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::Relaxed);
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = acceptor.accept(sock).await;
+                });
+            }
+        });
+        (port, accepted)
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_certificate_is_named_and_not_retried() {
+        let (port, accepted) = serve_untrusted_tls().await;
+        let settings = with_allowed(&["localhost"]);
+        let w = Wanted {
+            uri: format!("https://localhost:{port}/a.png"),
+            explicit_mime_type: None,
+            location: String::new(),
+            uses: 1,
+        };
+        let got = fetch_one(&w, &settings, Encoding::Bytes, &RequestBudget::unlimited())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(got.failure, Failure::UntrustedCertificate(_)),
+            "{got:?}"
+        );
+        assert_eq!(accepted.load(Ordering::Relaxed), 1, "not retried");
+        let message = got.describe(&w.uri, &settings);
+        assert!(
+            message
+                .ends_with("its TLS certificate could not be verified (see upstream.tls.ca_file)"),
+            "{message}"
+        );
     }
 
     #[tokio::test]

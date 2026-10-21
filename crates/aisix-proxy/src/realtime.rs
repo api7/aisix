@@ -72,6 +72,7 @@ use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame as TgCloseFrame;
 use tokio_tungstenite::tungstenite::Message as TgMessage;
 
 use crate::auth::AuthenticatedKey;
@@ -1001,13 +1002,21 @@ async fn run_session(
                         break;
                     }
                 }
-                Some(Ok(AxMessage::Close(_))) | None => {
-                    let _ = up_tx.send(TgMessage::Close(None)).await;
+                Some(Ok(AxMessage::Close(frame))) => {
+                    // The transport has already queued the reply echoing
+                    // the client's code; it goes out on the flush, and
+                    // without one the client sees 1006.
+                    let _ = client_tx.close().await;
+                    let frame = frame.map(|f| TgCloseFrame {
+                        code: f.code.into(),
+                        reason: f.reason.to_string().into(),
+                    });
+                    close_upstream(&mut up_tx, &mut up_rx, frame, &mut usage).await;
                     break;
                 }
                 Some(Ok(_)) => {} // ping/pong handled by the transports
-                Some(Err(_)) => {
-                    let _ = up_tx.send(TgMessage::Close(None)).await;
+                Some(Err(_)) | None => {
+                    close_upstream(&mut up_tx, &mut up_rx, None, &mut usage).await;
                     break;
                 }
             },
@@ -1048,23 +1057,18 @@ async fn run_session(
                     }
                 }
                 Some(Ok(TgMessage::Close(frame))) => {
-                    let _ = client_tx
-                        .send(AxMessage::Close(frame.map(|f| CloseFrame {
-                            code: f.code.into(),
-                            reason: f.reason.to_string().into(),
-                        })))
-                        .await;
+                    // A close frame without a status reads as 1005, which
+                    // may not be sent on; the client gets 1011.
+                    let (code, reason) = frame.map_or((1005, String::new()), |f| {
+                        (f.code.into(), f.reason.to_string())
+                    });
+                    close_client_after_upstream(&mut client_tx, code, &reason).await;
                     break;
                 }
                 Some(Ok(_)) => {} // ping/pong/raw frames
                 Some(Err(e)) => {
                     tracing::debug!(error = %e, "realtime upstream stream error");
-                    let _ = client_tx
-                        .send(AxMessage::Close(Some(CloseFrame {
-                            code: 1011,
-                            reason: "upstream error".into(),
-                        })))
-                        .await;
+                    close_client_after_upstream(&mut client_tx, 1006, "upstream error").await;
                     close_status = 502;
                     session_error = Some(ProxyError::Bridge(BridgeError::Transport(
                         aisix_gateway::error_with_causes(&e),
@@ -1072,12 +1076,16 @@ async fn run_session(
                     break;
                 }
                 None => {
-                    let _ = client_tx.send(AxMessage::Close(None)).await;
+                    close_client_after_upstream(&mut client_tx, 1006, "").await;
                     break;
                 }
             },
         }
     }
+
+    // Every other way out of the loop leaves the upstream half open: send
+    // its Close, or flush the reply to the one it sent.
+    let _ = tokio::time::timeout(UPSTREAM_CLOSE_ACK, up_tx.close()).await;
 
     let elapsed = started.elapsed();
     let total_tokens = usage.input_tokens + usage.output_tokens;
@@ -1227,6 +1235,83 @@ async fn run_session(
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );
+}
+
+/// How long a session that the client closed waits for the upstream to
+/// acknowledge its own close before dropping the connection.
+const UPSTREAM_CLOSE_ACK: Duration = Duration::from_secs(2);
+
+/// Close the upstream socket and wait, briefly, for its acknowledgement,
+/// so the upstream sees a completed handshake rather than a reset. Usage
+/// in the frames that arrive meanwhile (a response finishing) still counts.
+async fn close_upstream<T, R>(
+    up_tx: &mut T,
+    up_rx: &mut R,
+    frame: Option<TgCloseFrame<'static>>,
+    usage: &mut SessionUsage,
+) where
+    T: futures::Sink<TgMessage> + Unpin,
+    R: futures::Stream<Item = Result<TgMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    if up_tx.send(TgMessage::Close(frame)).await.is_err() {
+        return;
+    }
+    let _ = tokio::time::timeout(UPSTREAM_CLOSE_ACK, async {
+        while let Some(Ok(m)) = up_rx.next().await {
+            match m {
+                TgMessage::Text(text) => usage.absorb(&text),
+                TgMessage::Close(_) => break,
+                _ => {}
+            }
+        }
+    })
+    .await;
+}
+
+/// Close codes an endpoint may put in a Close frame (RFC 6455 §7.4.1 and
+/// the IANA registry), plus the 3000–4999 application range.
+fn sendable_close_code(code: u16) -> bool {
+    matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
+}
+
+/// The longest reason a Close frame carries: 125 payload bytes minus the
+/// two-byte code.
+const CLOSE_REASON_MAX_BYTES: usize = 123;
+
+/// Relay the upstream's end of the session to the client: its code and
+/// reason, a code that may not be sent becoming 1011. A close other than a
+/// normal one is preceded by a Realtime `error` event naming it, since
+/// many clients surface only events.
+async fn close_client_after_upstream<S>(client_tx: &mut S, code: u16, reason: &str)
+where
+    S: futures::Sink<AxMessage> + Unpin,
+{
+    if code != 1000 {
+        let message = if reason.is_empty() {
+            format!("upstream websocket closed with code {code}")
+        } else {
+            format!("upstream websocket closed with code {code}: {reason}")
+        };
+        let event = serde_json::json!({
+            "type": "error",
+            "error": { "type": "server_error", "message": message }
+        });
+        let _ = client_tx.send(AxMessage::Text(event.to_string())).await;
+    }
+    let mut cut = reason.len().min(CLOSE_REASON_MAX_BYTES);
+    while !reason.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let _ = client_tx
+        .send(AxMessage::Close(Some(CloseFrame {
+            code: if sendable_close_code(code) {
+                code
+            } else {
+                1011
+            },
+            reason: reason[..cut].to_string().into(),
+        })))
+        .await;
 }
 
 enum Dir {
@@ -1624,6 +1709,53 @@ mod tests {
         assert_eq!(ev.error_class, "transport", "{ev:?}");
         assert_eq!(ev.model_id, "m-rt");
         assert_eq!(ev.requested_model_id, "m-rt");
+    }
+
+    #[tokio::test]
+    async fn a_response_finishing_while_the_client_closes_still_counts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
+            while let Some(Ok(msg)) = rx.next().await {
+                if let TgMessage::Text(_) = msg {
+                    // Finish the response after the client has hung up.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let done = serde_json::json!({
+                        "type": "response.done",
+                        "response": {"usage": {"input_tokens": 5, "output_tokens": 2}}
+                    });
+                    let _ = tx.send(TgMessage::Text(done.to_string())).await;
+                }
+            }
+        });
+        let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
+        let (addr, _state, mut rx) = serve(snap).await;
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("handshake");
+        let (mut tx, mut client_rx) = ws.split();
+        tx.send(TgMessage::Text(r#"{"type":"response.create"}"#.into()))
+            .await
+            .unwrap();
+        tx.send(TgMessage::Close(None)).await.unwrap();
+        while let Some(Ok(msg)) = client_rx.next().await {
+            if matches!(msg, TgMessage::Close(_)) {
+                break;
+            }
+        }
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("usage event expected")
+            .expect("sink closed");
+        assert_eq!((ev.prompt_tokens, ev.completion_tokens), (5, 2));
     }
 
     #[tokio::test]

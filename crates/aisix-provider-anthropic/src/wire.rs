@@ -2302,6 +2302,7 @@ impl StreamState {
                     content: Some(text.clone()),
                     tool_calls: None,
                     reasoning_content: None,
+                    audio: None,
                 },
                 finish_reason: None,
                 usage: None,
@@ -2322,6 +2323,7 @@ impl StreamState {
                     } else {
                         thinking.clone()
                     }),
+                    audio: None,
                 },
                 finish_reason: None,
                 usage: None,
@@ -6711,6 +6713,7 @@ mod tests {
                 content: Some(text.into()),
                 tool_calls: None,
                 reasoning_content: None,
+                audio: None,
             },
             finish_reason: None,
             usage: None,
@@ -7066,6 +7069,7 @@ mod tests {
                 content: None,
                 tool_calls: Some(vec![tc]),
                 reasoning_content: None,
+                audio: None,
             },
             finish_reason: None,
             usage: None,
