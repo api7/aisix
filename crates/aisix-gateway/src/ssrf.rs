@@ -316,6 +316,8 @@ fn is_public_v6(a: Ipv6Addr) -> bool {
     match s {
         // IPv4-compatible (deprecated) ::/96
         [0, 0, 0, 0, 0, 0, _, _] => false,
+        // IPv4-translated (SIIT) ::ffff:0:0:0/96 reaches the IPv4 address it embeds.
+        [0, 0, 0, 0, 0xffff, 0, hi, lo] => is_public_v4(embedded(hi, lo)),
         // NAT64 64:ff9b::/96 reaches the IPv4 address it embeds.
         [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] => is_public_v4(embedded(hi, lo)),
         // Local-use NAT64 64:ff9b:1::/48
@@ -376,6 +378,8 @@ mod tests {
             "::1",
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
+            "::ffff:0:7f00:1",
+            "::ffff:0:a9fe:a9fe",
             "64:ff9b::a00:1",
             "2002:a00:1::",
             "2001:db8::1",
@@ -391,6 +395,7 @@ mod tests {
             "8.8.8.8",
             "100.128.0.1",
             "::ffff:8.8.8.8",
+            "::ffff:0:808:808",
             "2606:4700:4700::1111",
             "64:ff9b::808:808",
         ] {
