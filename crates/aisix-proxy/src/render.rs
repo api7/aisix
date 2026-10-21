@@ -477,6 +477,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: tier,
+            accounting_usage: None,
         };
         let frame = |tier| serde_json::to_value(render_chunk(0, chunk(tier), "m")).unwrap();
         assert_eq!(
@@ -633,6 +634,7 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             usage: Some(usage),
             service_tier: None,
+            accounting_usage: None,
         };
         let json = serde_json::to_value(render_chunk(0, chunk, "m")).unwrap();
         assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 32);
@@ -679,6 +681,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         };
         let out = render_chunk(1, chunk, "m");
         let json = serde_json::to_value(&out).unwrap();
@@ -706,6 +709,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         };
         let out = render_chunk(0, chunk, "failover-group-XXX");
         let json = serde_json::to_value(&out).unwrap();

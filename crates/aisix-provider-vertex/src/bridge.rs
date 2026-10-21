@@ -1274,7 +1274,7 @@ impl VertexBridge {
                         Err(aisix_provider_anthropic::wire::stream_error_into_bridge_error(error))?;
                     }
                     state.update(&parsed);
-                    if let Some(chunk) = state.to_chunk(&parsed).and_then(|c| usage.pass(c)) {
+                    if let Some(chunk) = state.to_chunk(&parsed).map(|c| usage.pass(c)) {
                         yield chunk;
                     }
                     if StreamState::is_terminal(&parsed) {
@@ -1858,7 +1858,7 @@ impl VertexBridge {
                         for chunk in
                             gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut state)
                                 .into_iter()
-                                .filter_map(|c| usage.pass(c))
+                                .map(|c| usage.pass(c))
                         {
                             yield chunk;
                         }
@@ -1884,7 +1884,7 @@ impl VertexBridge {
                 for chunk in
                     gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut state)
                         .into_iter()
-                        .filter_map(|c| usage.pass(c))
+                        .map(|c| usage.pass(c))
                 {
                     yield chunk;
                 }
@@ -1988,6 +1988,7 @@ fn gemini_chunk_into_chat_chunks(
             finish_reason: None,
             usage: None,
             service_tier: state.service_tier.clone(),
+            accounting_usage: None,
         });
     }
 
@@ -2015,6 +2016,7 @@ fn gemini_chunk_into_chat_chunks(
             finish_reason,
             usage,
             service_tier: state.service_tier.clone(),
+            accounting_usage: None,
         });
     }
 

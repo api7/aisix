@@ -2302,6 +2302,7 @@ impl StreamState {
             finish_reason: None,
             usage: None,
             service_tier: self.service_tier.clone(),
+            accounting_usage: None,
         }
     }
 
@@ -2347,6 +2348,7 @@ impl StreamState {
                 finish_reason: None,
                 usage: None,
                 service_tier: self.service_tier.clone(),
+                accounting_usage: None,
             }),
             AnthropicStreamEvent::ContentBlockDelta {
                 delta: AnthropicStreamDelta::ThinkingDelta { thinking },
@@ -2368,6 +2370,7 @@ impl StreamState {
                 finish_reason: None,
                 usage: None,
                 service_tier: self.service_tier.clone(),
+                accounting_usage: None,
             }),
             AnthropicStreamEvent::MessageDelta { delta, usage } => {
                 let finish = delta
@@ -2395,6 +2398,7 @@ impl StreamState {
                     finish_reason: finish,
                     usage,
                     service_tier: self.service_tier.clone(),
+                    accounting_usage: None,
                 })
             }
             _ => None,
@@ -6812,6 +6816,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         }
     }
 
@@ -6823,6 +6828,7 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             usage: Some(UsageStats::new(0, out_tokens)),
             service_tier: None,
+            accounting_usage: None,
         }
     }
 
@@ -6890,6 +6896,7 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         };
         let events = enc.next_events(&stop_no_usage);
         let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
@@ -6905,6 +6912,7 @@ mod tests {
             finish_reason: None,
             usage: Some(UsageStats::new(17, 23)),
             service_tier: None,
+            accounting_usage: None,
         };
         let events = enc.next_events(&usage_only);
         let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
@@ -6993,6 +7001,7 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         };
         let _ = enc.next_events(&stop_no_usage);
 
@@ -7009,6 +7018,7 @@ mod tests {
                 ..UsageStats::default()
             }),
             service_tier: None,
+            accounting_usage: None,
         };
         let events = enc.next_events(&usage_only);
         let usage = &events[0].data["usage"];
@@ -7029,6 +7039,7 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             usage: Some(UsageStats::with_cache(10, 4, 200, 800)),
             service_tier: None,
+            accounting_usage: None,
         };
         let events = enc.next_events(&stop_with_usage);
         let delta = events
@@ -7051,6 +7062,7 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             usage: Some(UsageStats::new(17, 23)),
             service_tier: None,
+            accounting_usage: None,
         });
         let delta = events
             .iter()
@@ -7077,6 +7089,7 @@ mod tests {
             finish_reason: Some(FinishReason::ToolCalls),
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         };
         let _ = enc.next_events(&stop_no_usage);
         assert!(!enc.is_finished());
@@ -7168,6 +7181,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         }
     }
 
@@ -7179,6 +7193,7 @@ mod tests {
             finish_reason: Some(FinishReason::ToolCalls),
             usage: Some(UsageStats::new(10, 5)),
             service_tier: None,
+            accounting_usage: None,
         }
     }
 
@@ -7286,6 +7301,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         }
     }
 

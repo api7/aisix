@@ -3953,6 +3953,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         }
     }
 
@@ -3974,6 +3975,7 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             usage: Some(UsageStats::new(5, 2)),
             service_tier: None,
+            accounting_usage: None,
         }));
         let types = types_of(&all);
         assert_eq!(
@@ -4017,6 +4019,7 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         });
         assert!(!types_of(&at_finish).contains(&"response.completed"));
         assert!(!enc.is_finished());
@@ -4028,6 +4031,7 @@ mod tests {
             finish_reason: None,
             usage: Some(UsageStats::new(3, 4)),
             service_tier: None,
+            accounting_usage: None,
         });
         assert_eq!(types_of(&usage_frame), vec!["response.completed"]);
         assert_eq!(usage_frame[0].data["response"]["usage"]["output_tokens"], 4);
@@ -4049,6 +4053,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         };
         let mut all = enc.next_events(&chunk);
         all.extend(enc.next_events(&ChatChunk {
@@ -4063,6 +4068,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         }));
         all.extend(enc.next_events(&ChatChunk {
             id: "c".into(),
@@ -4071,6 +4077,7 @@ mod tests {
             finish_reason: Some(FinishReason::ToolCalls),
             usage: Some(UsageStats::new(4, 6)),
             service_tier: None,
+            accounting_usage: None,
         }));
         let types = types_of(&all);
         assert!(types.contains(&"response.output_item.added"));
@@ -4104,6 +4111,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         });
         all.extend(enc.next_events(&ChatChunk {
             id: "c".into(),
@@ -4117,6 +4125,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         }));
         all.extend(enc.next_events(&ChatChunk {
             id: "c".into(),
@@ -4125,6 +4134,7 @@ mod tests {
             finish_reason: Some(FinishReason::ToolCalls),
             usage: Some(UsageStats::new(4, 6)),
             service_tier: None,
+            accounting_usage: None,
         }));
 
         assert_eq!(
@@ -4198,6 +4208,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         });
         all.extend(enc.next_events(&ChatChunk {
             id: "c".into(),
@@ -4211,6 +4222,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         }));
         all.extend(enc.force_finish());
 
@@ -4245,6 +4257,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         });
         all.extend(enc.force_finish());
         let types = types_of(&all);
@@ -4271,8 +4284,7 @@ mod tests {
             },
             finish_reason: None,
             usage: None,
-            service_tier: None,
-        });
+            service_tier: None, accounting_usage: None, });
         all.extend(enc.next_events(&ChatChunk {
             id: "c".into(),
             model: "m".into(),
@@ -4280,6 +4292,7 @@ mod tests {
             finish_reason: Some(FinishReason::ToolCalls),
             usage: Some(UsageStats::new(4, 6)),
             service_tier: None,
+            accounting_usage: None,
         }));
         let types = types_of(&all);
         assert!(types.contains(&"response.function_call_arguments.delta"));
@@ -4312,6 +4325,7 @@ mod tests {
             finish_reason: None,
             usage: Some(UsageStats::new(10, 0)),
             service_tier: None,
+            accounting_usage: None,
         };
         assert!(enc.next_events(&usage_only).is_empty());
         assert!(!enc.has_output());
@@ -4337,6 +4351,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         });
         let at_finish = enc.next_events(&ChatChunk {
             id: "c".into(),
@@ -4345,6 +4360,7 @@ mod tests {
             finish_reason: Some(FinishReason::ToolCalls),
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         });
         assert_eq!(
             types_of(&at_finish)
@@ -4382,6 +4398,7 @@ mod tests {
                 finish_reason: Some(FinishReason::Stop),
                 usage: Some(usage),
                 service_tier: None,
+                accounting_usage: None,
             });
             done.last().unwrap().data["response"]["usage"].clone()
         }
@@ -4422,6 +4439,7 @@ mod tests {
             finish_reason: Some(FinishReason::Length),
             usage: Some(UsageStats::new(3, 9)),
             service_tier: None,
+            accounting_usage: None,
         });
         let completed = done.last().unwrap();
         assert_eq!(completed.event_type, "response.incomplete");
@@ -4601,6 +4619,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         }
     }
 
@@ -4612,6 +4631,7 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             usage,
             service_tier: None,
+            accounting_usage: None,
         }
     }
 
@@ -4685,6 +4705,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         }));
         all.extend(enc.next_events(&finish_chunk(Some(UsageStats::new(1, 2)))));
         assert_eq!(
@@ -4810,6 +4831,7 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         });
         // …the trailing usage frame never arrives; the relay hands the
         // encoder the same estimate it wrote to the usage record.
@@ -4864,6 +4886,7 @@ mod tests {
             finish_reason: None,
             usage: Some(partial),
             service_tier: None,
+            accounting_usage: None,
         });
         enc.set_estimated_usage(3, 7);
         let events = enc.force_finish();
@@ -4885,6 +4908,7 @@ mod tests {
             finish_reason: None,
             usage: Some(UsageStats::new(3, 4)),
             service_tier: None,
+            accounting_usage: None,
         });
         enc.set_estimated_usage(99, 99);
         let events = enc.force_finish();
@@ -5197,6 +5221,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         });
         events.extend(enc.next_events(&ChatChunk {
             id: "c".into(),
@@ -5210,6 +5235,7 @@ mod tests {
             finish_reason: Some(FinishReason::ToolCalls),
             usage: Some(UsageStats::new(3, 2)),
             service_tier: None,
+            accounting_usage: None,
         }));
         let item_of = |t: &str| {
             events
@@ -5456,6 +5482,7 @@ mod tests {
             finish_reason: None,
             usage: Some(UsageStats::new(10, 0)),
             service_tier: None,
+            accounting_usage: None,
         };
         let (events, comp) = relay(vec![Ok(usage_only)]).await;
         assert_eq!(event_names(&events), FAILED_BEFORE_ANY_OUTPUT);

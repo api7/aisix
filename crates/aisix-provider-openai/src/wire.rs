@@ -661,6 +661,7 @@ pub fn stream_chunk_into_chat_chunk(
         finish_reason: finish,
         usage: raw.usage.map(into_usage),
         service_tier: service_tier_of(raw.service_tier.as_ref()),
+        accounting_usage: None,
     })
 }
 

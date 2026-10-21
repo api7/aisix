@@ -2676,6 +2676,7 @@ fn emit_converse_chunk(
                     finish_reason: None,
                     usage: None,
                     service_tier: None,
+                    accounting_usage: None,
                 });
             }
         }
@@ -2710,6 +2711,7 @@ fn emit_converse_chunk(
                         finish_reason: None,
                         usage: None,
                         service_tier: None,
+                        accounting_usage: None,
                     });
                 }
                 // #560: a tool-use `arguments` fragment. Correlate to the
@@ -2746,6 +2748,7 @@ fn emit_converse_chunk(
                         finish_reason: None,
                         usage: None,
                         service_tier: None,
+                        accounting_usage: None,
                     });
                 }
                 _ => {}
@@ -2759,6 +2762,7 @@ fn emit_converse_chunk(
                 finish_reason: Some(map_stop_reason(&m.stop_reason)),
                 usage: None,
                 service_tier: None,
+                accounting_usage: None,
             });
         }
         ConverseStreamOutput::Metadata(m) => {
@@ -2788,6 +2792,7 @@ fn emit_converse_chunk(
                         ..Default::default()
                     }),
                     service_tier,
+                    accounting_usage: None,
                 });
             }
         }
@@ -2843,6 +2848,7 @@ fn tool_call_chunk(
         finish_reason: None,
         usage: None,
         service_tier: None,
+        accounting_usage: None,
     }
 }
 

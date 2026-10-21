@@ -6364,7 +6364,7 @@ where
                             buf.push_str(args);
                         }
                     }
-                    if let Some(u) = chunk.usage.as_ref() {
+                    if let Some(u) = chunk.usage.as_ref().or(chunk.accounting_usage.as_ref()) {
                         let acc = match stream_usage.as_ref() {
                             Some(prev) => prev.max_fieldwise(u),
                             None => u.clone(),
@@ -6392,6 +6392,15 @@ where
                     // already folded into `comp` above — forward it only when
                     // the client itself asked for usage.
                     if !client_requested_usage && chunk.is_usage_only() {
+                        continue;
+                    }
+                    // Usage held back for `include_usage`, already folded
+                    // above, on a chunk with nothing else for the caller.
+                    if chunk.accounting_usage.is_some()
+                        && chunk.usage.is_none()
+                        && chunk.finish_reason.is_none()
+                        && chunk.has_no_payload()
+                    {
                         continue;
                     }
                     // #614/#617: an ensemble reports usage on ONE synthesized
@@ -6661,8 +6670,7 @@ where
                 delta: Default::default(),
                 finish_reason: None,
                 usage: Some(judge_usage.saturating_add(&base_usage)),
-                service_tier: last_chunk_tier.take(),
-            };
+                service_tier: last_chunk_tier.take(), accounting_usage: None, };
             if !hold_back || cap_released {
                 let ev = chunk_event!(chunk);
                 yield Ok::<_, Infallible>(ev);
@@ -6877,8 +6885,7 @@ where
                         },
                         finish_reason: None,
                         usage: None,
-                        service_tier: None,
-                    }];
+                        service_tier: None, accounting_usage: None, }];
                     let mut segments = crate::redact::collect_segments(|g| {
                         let _ = crate::redact::redact_chat_chunks(g, &mut chunks);
                     });

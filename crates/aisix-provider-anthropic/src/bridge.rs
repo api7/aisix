@@ -561,7 +561,7 @@ where
                     Err(crate::wire::stream_error_into_bridge_error(error))?;
                 }
                 state.update(&parsed);
-                if let Some(c) = state.to_chunk(&parsed).and_then(|c| usage.pass(c)) {
+                if let Some(c) = state.to_chunk(&parsed).map(|c| usage.pass(c)) {
                     yield c;
                 }
                 if StreamState::is_terminal(&parsed) {

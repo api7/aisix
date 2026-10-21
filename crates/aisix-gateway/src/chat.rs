@@ -1244,6 +1244,12 @@ pub struct ChatChunk {
     /// [`ChatResponse::service_tier`] for why it is not serialized.
     #[serde(skip)]
     pub service_tier: Option<ServiceTier>,
+    /// Usage [`IncludeUsage`] holds back from the caller until the end of
+    /// the stream. The gateway's own accounting still reads it as it
+    /// arrives, so a stream that stops before its end is accounted as far
+    /// as the upstream reported. Never serialized.
+    #[serde(skip)]
+    pub accounting_usage: Option<UsageStats>,
 }
 
 impl ChatChunk {
@@ -1275,9 +1281,10 @@ impl ChatChunk {
 /// What `include_usage` promises a streaming caller: the usage goes out
 /// once, on a chunk of its own after every other chunk, and no other chunk
 /// carries it. For a bridge whose upstream reports usage on the event that
-/// ends the message, or on several events: it holds the usage back and
-/// sends the last report at the end. Without `include_usage` it passes
-/// every chunk through unchanged.
+/// ends the message, or on several events: it moves each report off the
+/// chunk into [`ChatChunk::accounting_usage`], where the gateway's
+/// accounting still reads it, and sends the last report at the end. Without
+/// `include_usage` it passes every chunk through unchanged.
 pub struct IncludeUsage {
     enabled: bool,
     held: Option<ChatChunk>,
@@ -1291,11 +1298,11 @@ impl IncludeUsage {
         }
     }
 
-    /// `chunk` as it is sent now, or `None` when it carried nothing but
-    /// usage.
-    pub fn pass(&mut self, mut chunk: ChatChunk) -> Option<ChatChunk> {
+    /// `chunk` as it is sent now. One that carried nothing but usage is
+    /// left with nothing for the caller, only for the accounting.
+    pub fn pass(&mut self, mut chunk: ChatChunk) -> ChatChunk {
         if !self.enabled {
-            return Some(chunk);
+            return chunk;
         }
         if let Some(usage) = chunk.usage.take() {
             self.held = Some(ChatChunk {
@@ -1303,14 +1310,13 @@ impl IncludeUsage {
                 model: chunk.model.clone(),
                 delta: ChatDelta::default(),
                 finish_reason: None,
-                usage: Some(usage),
+                usage: Some(usage.clone()),
                 service_tier: chunk.service_tier.clone(),
+                accounting_usage: None,
             });
-            if chunk.finish_reason.is_none() && chunk.has_no_payload() {
-                return None;
-            }
+            chunk.accounting_usage = Some(usage);
         }
-        Some(chunk)
+        chunk
     }
 
     /// The usage-only chunk that ends the stream, once.
@@ -2247,6 +2253,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         };
         let json = serde_json::to_string(&chunk).unwrap();
         assert!(!json.contains("\"finish_reason\""));
