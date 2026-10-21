@@ -83,6 +83,7 @@ mod rerank;
 mod responses;
 mod responses_affinity;
 mod responses_bridge;
+mod responses_by_id;
 mod rewrite;
 mod routing;
 mod semantic;
@@ -154,6 +155,16 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/v1/systemone", post(decisions::systemone))
         .route("/v1/decisions", post(decisions::decisions))
         .route("/v1/responses", post(responses::responses))
+        // Stored responses by id; a Model Group's id names its target.
+        .route(
+            "/v1/responses/:id",
+            get(responses_by_id::response).delete(responses_by_id::response),
+        )
+        .route(
+            "/v1/responses/:id/input_items",
+            get(responses_by_id::input_items),
+        )
+        .route("/v1/responses/:id/cancel", post(responses_by_id::cancel))
         .route("/v1/audio/transcriptions", post(audio::transcriptions))
         .route("/v1/audio/translations", post(audio::translations))
         .route("/v1/audio/speech", post(audio::speech))
@@ -395,6 +406,7 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         // `/v1/videos/:id` and `/v1/videos/:id/content` collapse together:
         // the id is the only thing that varies and neither is worth its own
         // series.
+        _ if path.starts_with("/v1/responses/") => "/v1/responses/:id",
         _ if path.starts_with("/v1/videos/") => "/v1/videos/:id",
         _ if path.starts_with("/v1/files/") => "/v1/files/:id",
         _ if path.starts_with("/v1/batches/") => "/v1/batches/:id",

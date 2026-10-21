@@ -175,7 +175,10 @@ fn supported_adapter(pk: &ProviderKey) -> Option<Adapter> {
 }
 
 /// Explicit routing hint from `?model=` / `x-aisix-model` header.
-fn explicit_model(params: &HashMap<String, String>, headers: &HeaderMap) -> Option<String> {
+pub(crate) fn explicit_model(
+    params: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> Option<String> {
     if let Some(m) = params.get("model").filter(|m| !m.trim().is_empty()) {
         return Some(m.trim().to_string());
     }
@@ -254,23 +257,41 @@ pub(crate) fn resolve_target(
     })?;
     let secret = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
 
-    let header_ctx = crate::dispatch::upstream_header_ctx(
-        &pk_entry.value,
-        &pk_entry.id,
-        model,
-        &model_entry.id,
-        client_ctx,
-    );
-    let forwarded_client = aisix_gateway::ForwardedClientHeaders::resolve(&header_ctx);
-    let extra_headers = aisix_gateway::resolve_default_headers(&header_ctx);
-    Ok(JobTarget {
+    Ok(JobTarget::new(
         model_entry,
         pk_entry,
         secret,
         adapter,
-        extra_headers,
-        forwarded_client,
-    })
+        client_ctx,
+    ))
+}
+
+impl JobTarget {
+    pub(crate) fn new(
+        model_entry: Arc<ResourceEntry<Model>>,
+        pk_entry: Arc<ResourceEntry<ProviderKey>>,
+        secret: String,
+        adapter: Adapter,
+        client_ctx: &ClientContext,
+    ) -> Self {
+        let header_ctx = crate::dispatch::upstream_header_ctx(
+            &pk_entry.value,
+            &pk_entry.id,
+            &model_entry.value,
+            &model_entry.id,
+            client_ctx,
+        );
+        let forwarded_client = aisix_gateway::ForwardedClientHeaders::resolve(&header_ctx);
+        let extra_headers = aisix_gateway::resolve_default_headers(&header_ctx);
+        JobTarget {
+            model_entry,
+            pk_entry,
+            secret,
+            adapter,
+            extra_headers,
+            forwarded_client,
+        }
+    }
 }
 
 // ──────────────────────── upstream plumbing ────────────────────────
@@ -328,7 +349,7 @@ fn upstream_url(target: &JobTarget, path: &str, query: &str) -> Result<String, P
 }
 
 /// Client query pairs forwarded upstream — routing hints are gateway-only.
-fn forwardable_query(raw_query: Option<&str>) -> String {
+pub(crate) fn forwardable_query(raw_query: Option<&str>) -> String {
     raw_query
         .unwrap_or("")
         .split('&')
@@ -340,7 +361,7 @@ fn forwardable_query(raw_query: Option<&str>) -> String {
         .join("&")
 }
 
-enum UpstreamBody {
+pub(crate) enum UpstreamBody {
     Empty,
     Json(Bytes),
     Multipart(reqwest::multipart::Form),
@@ -349,7 +370,7 @@ enum UpstreamBody {
 /// Send one upstream request with per-adapter auth, the model's E2E
 /// timeout, and cooldown accounting on transport failures (parity with
 /// `/passthrough`, #701).
-async fn send_upstream(
+pub(crate) async fn send_upstream(
     state: &ProxyState,
     target: &JobTarget,
     method: Method,
@@ -357,6 +378,41 @@ async fn send_upstream(
     body: UpstreamBody,
     request_id: &str,
 ) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
+    let resp = send_upstream_head(state, target, method, url, body, request_id, true).await?;
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = resp.bytes().await;
+    crate::attribution::note_upstream_wait_end(bytes.is_ok());
+    let bytes = bytes
+        .map_err(|e| {
+            crate::cooldown::note_failure(
+                &state.runtime_status,
+                &target.model_entry.id,
+                target.model_entry.value.cooldown.as_ref(),
+                aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+            )
+        })
+        .map_err(ProxyError::Bridge)?;
+
+    Ok((
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+        headers,
+        bytes,
+    ))
+}
+
+/// [`send_upstream`] up to the response head, leaving the body unread.
+/// `request_timeout` false leaves a streamed body uncapped by the model's
+/// E2E timeout.
+pub(crate) async fn send_upstream_head(
+    state: &ProxyState,
+    target: &JobTarget,
+    method: Method,
+    url: &str,
+    body: UpstreamBody,
+    request_id: &str,
+    request_timeout: bool,
+) -> Result<reqwest::Response, ProxyError> {
     let client =
         crate::http_client::client_for(target.pk_entry.value.upstream_connection().as_ref());
     let mut builder = client.request(
@@ -407,6 +463,7 @@ async fn send_upstream(
     if let Some(d) =
         crate::routing::effective_timeouts(&target.model_entry.value, None, state.default_timeouts)
             .request
+            .filter(|_| request_timeout)
     {
         builder = builder.timeout(d);
     }
@@ -426,28 +483,8 @@ async fn send_upstream(
             )
         })
         .map_err(ProxyError::Bridge)?;
-
-    let status = resp.status();
-    let headers = resp.headers().clone();
-    aisix_gateway::note_upstream_response(&headers);
-    let bytes = resp.bytes().await;
-    crate::attribution::note_upstream_wait_end(bytes.is_ok());
-    let bytes = bytes
-        .map_err(|e| {
-            crate::cooldown::note_failure(
-                &state.runtime_status,
-                &target.model_entry.id,
-                target.model_entry.value.cooldown.as_ref(),
-                aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
-            )
-        })
-        .map_err(ProxyError::Bridge)?;
-
-    Ok((
-        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-        headers,
-        bytes,
-    ))
+    aisix_gateway::note_upstream_response(resp.headers());
+    Ok(resp)
 }
 
 /// Run the resolved input-guardrail chain over an opaque blob (whole-body
@@ -758,7 +795,7 @@ fn emit_access_log(
 /// Shared success/error tail for every handler: access log, metrics,
 /// usage event, response header.
 #[allow(clippy::too_many_arguments)]
-fn finish(
+pub(crate) fn finish(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     surface: crate::operation::Surface,

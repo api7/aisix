@@ -241,6 +241,11 @@ pub enum ProxyError {
     /// caller supplied it, so it leaks nothing.
     #[error("video {0:?} not found")]
     VideoNotFound(String),
+    /// A `/v1/responses/{id}` id whose target the caller cannot reach, that
+    /// no longer exists, or that never stored a response. One 404 for all,
+    /// so a crafted id cannot tell them apart.
+    #[error("response {0:?} not found")]
+    ResponseNotFound(String),
     #[error("API key is not allowed to use model {0:?}")]
     ModelForbidden(String),
     /// The resolved client IP is outside the model's `allowed_cidrs`
@@ -465,7 +470,7 @@ impl ProxyError {
             ProxyError::RouteIpRestricted(_) => StatusCode::FORBIDDEN,
             ProxyError::RouteForbidden(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
-            ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
+            ProxyError::VideoNotFound(_) | ProxyError::ResponseNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             ProxyError::WebSocketUpgradeRequired { status, .. } => *status,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -504,6 +509,7 @@ impl ProxyError {
             ProxyError::RouteForbidden(_) => "permission_denied",
             ProxyError::ModelNotFound(_) => "model_not_found",
             ProxyError::VideoNotFound(_) => "video_not_found",
+            ProxyError::ResponseNotFound(_) => "response_not_found",
             ProxyError::InvalidRequest(_) => "invalid_request_error",
             ProxyError::WebSocketUpgradeRequired { .. } => "websocket_upgrade_required",
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",

@@ -72,7 +72,7 @@ fn decode_encrypted_content(value: &str) -> EncryptedContent {
 
 /// `(origin target id, original id)` of a tagged response id; `None` for any
 /// other id, which is forwarded unchanged.
-fn decode_response_id(value: &str) -> Option<(String, String)> {
+pub(crate) fn decode_response_id(value: &str) -> Option<(String, String)> {
     let raw = b64().decode(value.strip_prefix(RESP_ID_PREFIX)?).ok()?;
     let text = String::from_utf8(raw).ok()?;
     let (origin, original) = text.strip_prefix(RESP_ID_TAG)?.split_once(';')?;
@@ -261,6 +261,15 @@ enum Slot {
 }
 
 impl ResponseMark {
+    /// The tags of a response `target_id` produced, with no request to
+    /// echo back.
+    pub(crate) fn for_target(target_id: &str) -> Self {
+        Self {
+            target_id: Some(target_id.to_string()),
+            previous_echo: None,
+        }
+    }
+
     fn is_noop(&self) -> bool {
         self.target_id.is_none() && self.previous_echo.is_none()
     }

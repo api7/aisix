@@ -92,6 +92,20 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
         Posture::NoUpstreamContent("fetches a rendered asset by id; carries no caller text"),
     ),
     (
+        "/v1/responses/:id",
+        Posture::NoUpstreamContent(
+            "GET/DELETE a stored response by id; screened when it was created",
+        ),
+    ),
+    (
+        "/v1/responses/:id/input_items",
+        Posture::NoUpstreamContent("lists a stored response's input; carries no caller text"),
+    ),
+    (
+        "/v1/responses/:id/cancel",
+        Posture::NoUpstreamContent("cancels a background response by id; carries no caller text"),
+    ),
+    (
         "/v1/files/:id",
         Posture::NoUpstreamContent("GET/DELETE by id; carries no caller text"),
     ),

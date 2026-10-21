@@ -534,7 +534,10 @@ pub(crate) fn gateway_error_message(err: &ProxyError) -> String {
         // `InvalidRequest` can quote the request body (a serde message
         // names the offending value), a video id is whatever the caller
         // sent, and a bridge error carries upstream response text.
-        ProxyError::InvalidRequest(_) | ProxyError::VideoNotFound(_) | ProxyError::Bridge(_) => {
+        ProxyError::InvalidRequest(_)
+        | ProxyError::VideoNotFound(_)
+        | ProxyError::ResponseNotFound(_)
+        | ProxyError::Bridge(_) => {
             false
         }
     };
@@ -577,6 +580,7 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         | ProxyError::JwksUnavailable
         | ProxyError::ModelNotFound(_)
         | ProxyError::VideoNotFound(_)
+        | ProxyError::ResponseNotFound(_)
         | ProxyError::ModelForbidden(_)
         | ProxyError::ModelIpRestricted(_)
         | ProxyError::RouteIpRestricted(_)
