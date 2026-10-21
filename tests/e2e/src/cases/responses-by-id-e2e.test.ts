@@ -495,28 +495,12 @@ describe("/v1/responses/{id} retrieve, delete, input_items and cancel", () => {
     expect(upstream!.forAccount("acct-bridge").length).toBe(before);
   });
 
-  test("a retrieve is a zero-token usage row and an access-log line for the target", async (ctx) => {
+  test("a by-id call writes an access-log line and no usage row", async (ctx) => {
     if (!etcdReachable) return ctx.skip();
     const c = await create("byid-group");
-    const origin = decodeResponseId(c.id)!;
     const got = await call("GET", `/v1/responses/${c.id}`);
     expect(got.status, got.text).toBe(200);
     expect(got.requestId).not.toBe("");
-    // The retrieved object reports usage; it was billed by the create.
-    expect(got.json.usage.total_tokens).toBe(5);
-
-    const row = await waitForSlsLog(
-      sls!,
-      LOGSTORE,
-      (log) => log.get("request_id") === got.requestId,
-      "the retrieve's usage row",
-    );
-    expect(row.get("model_id")).toBe(origin.target);
-    expect(row.get("status_code")).toBe("200");
-    for (const field of ["prompt_tokens", "completion_tokens", "total_tokens"]) {
-      expect(Number(row.get(field) ?? "0"), field).toBe(0);
-    }
-
     const access = await waitForLogLine(
       app!,
       (l) => l.includes("proxy request completed") && l.includes(`request_id="${got.requestId}"`),
@@ -524,5 +508,14 @@ describe("/v1/responses/{id} retrieve, delete, input_items and cancel", () => {
     );
     expect(access).toContain("status=200");
     expect(access).toContain(`/v1/responses/${c.id}`);
+
+    // A metered request after it: once its row is exported, a row for the
+    // retrieve would have been too.
+    const created = await call("POST", "/v1/responses", { body: { model: "byid-group", input: "barrier" } });
+    expect(created.status, created.text).toBe(200);
+    await waitForSlsLog(sls!, LOGSTORE, (log) => log.get("request_id") === created.requestId, "the barrier's row");
+    await expect(
+      waitForSlsLog(sls!, LOGSTORE, (log) => log.get("request_id") === got.requestId, "a retrieve row", 1_000),
+    ).rejects.toThrow();
   });
 });

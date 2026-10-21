@@ -14,9 +14,10 @@
 //! not serve `/v1/responses` natively (nothing was stored upstream), answers
 //! the same 404, so a crafted id learns nothing about what exists.
 //!
-//! Telemetry is the jobs surface's management-call contract: a zero-token
-//! UsageEvent and an access-log line. A retrieved Response object's `usage`
-//! was billed when it was created and is not read here.
+//! These calls act on a response its creation already metered and screened,
+//! as a video poll does: they write the access log and no usage row, skip
+//! model-level rate limits (key-level ones still apply), and run no output
+//! guardrails over what they return.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ use aisix_core::Model;
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use futures::StreamExt as _;
 use serde_json::Value;
 
@@ -113,19 +114,11 @@ async fn forward(
     let request_id = client.request_id.clone();
     let snapshot = state.snapshot.load();
 
-    let result = async {
+    let result: Result<(Response, JobTarget), ProxyError> = async {
         let (target, raw, mark) = resolve(&snapshot, &auth, &client, &id, &params, &headers)?;
-        let _reservation = crate::quota::enforce(
-            &state,
-            &snapshot,
-            &auth,
-            Some(&crate::quota::ModelRateLimit::from_model(
-                &target.model_entry.value.display_name,
-                &target.model_entry.id,
-                &target.model_entry.value,
-            )),
-        )
-        .await?;
+        // Model-level limits do not apply, as on a video poll: the response
+        // was admitted when it was created. Key-level layers still do.
+        let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
 
         let base = crate::dispatch::resolve_base_url_for(
             &target.pk_entry.value,
@@ -176,27 +169,54 @@ async fn forward(
             .body(Body::from(body))
             .unwrap()
         };
+        reservation.commit_tokens(0).await;
         Ok((resp, target))
     }
     .await;
 
-    crate::jobs::finish(
+    // No usage row, whatever the outcome: these calls act on a response its
+    // creation already metered.
+    crate::attribution::note_unmetered_route();
+    let path = format!("/v1/responses/{id}{suffix}");
+    let elapsed = started.elapsed();
+    let (target, status, error) = match &result {
+        Ok((resp, target)) => (Some(target), resp.status().as_u16(), None),
+        Err(err) => (None, err.status().as_u16(), Some(err)),
+    };
+    crate::jobs::emit_access_log(
+        &method,
+        &path,
+        target,
+        &auth.entry.id,
+        status,
+        elapsed,
+        &request_id,
+        error,
+    );
+    crate::request_metrics::record(
         &state,
-        &snapshot,
-        crate::operation::RESPONSES,
-        method,
-        format!("/v1/responses/{id}{suffix}"),
-        &auth,
-        &client,
-        started,
-        request_id,
-        result,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        String::new(),
-        Vec::new(),
-    )
+        crate::normalize_endpoint_label(&path),
+        crate::request_metrics::Caller::new(&auth),
+        crate::request_metrics::Upstream {
+            provider: target
+                .and_then(|t| t.model_entry.value.provider.as_deref())
+                .unwrap_or(""),
+            model: target.map_or(crate::usage_attr::UNRESOLVED_MODEL_LABEL, |t| {
+                t.model_entry.value.display_name.as_str()
+            }),
+            ..Default::default()
+        },
+        status,
+        elapsed,
+    );
+    let mut resp = match result {
+        Ok((resp, _)) => resp,
+        Err(err) => err.into_response(),
+    };
+    if let Ok(hv) = HeaderValue::from_str(&request_id) {
+        resp.headers_mut().insert("x-aisix-request-id", hv);
+    }
+    resp
 }
 
 /// The target, the upstream's own id, and how the reply is tagged.

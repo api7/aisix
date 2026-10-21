@@ -752,7 +752,7 @@ fn emit_job_usage_event(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_access_log(
+pub(crate) fn emit_access_log(
     method: &Method,
     path: &str,
     target: Option<&JobTarget>,
@@ -804,7 +804,7 @@ fn emit_access_log(
 /// Shared success/error tail for every handler: access log, metrics,
 /// usage event, response header.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn finish(
+fn finish(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     surface: crate::operation::Surface,
