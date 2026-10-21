@@ -525,11 +525,16 @@ fn client(route: Route) -> Result<&'static reqwest::Client, Failure> {
     let cell = if pinned { &PINNED } else { &UNCHECKED };
     cell.get_or_init(|| {
         let b = crate::upstream_http::caller_chosen_peer_client_builder()
-            .dns_resolver(crate::ssrf::resolver(pinned))
             .redirect(reqwest::redirect::Policy::none());
         // `Route::Pinned` is only chosen for a URL no proxy takes; without
         // proxies the client cannot hand one the name to resolve unchecked.
-        let b = if pinned { b.no_proxy() } else { b };
+        // The unchecked client keeps the shared resolver, which also
+        // resolves a proxy's own host.
+        let b = if pinned {
+            b.dns_resolver(crate::ssrf::pinning_resolver()).no_proxy()
+        } else {
+            b
+        };
         b.build().map_err(|e| e.to_string())
     })
     .as_ref()

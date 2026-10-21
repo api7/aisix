@@ -156,30 +156,23 @@ fn proxied(url: &Url) -> bool {
         .is_some()
 }
 
-/// A resolver for the client of [`Route::Pinned`] (`guarded`), which
-/// refuses the whole answer if any address in it is not publicly
-/// routable, or for the client of [`Route::Unchecked`], which only
-/// reports a name that does not resolve as such. The client connects only
-/// to the addresses returned here.
-pub fn resolver(guarded: bool) -> Arc<impl Resolve> {
-    Arc::new(CheckingResolver { guarded })
+/// The resolver for the client of [`Route::Pinned`]: it refuses the whole
+/// answer if any address in it is not publicly routable, and the client
+/// connects only to the addresses it returns.
+pub fn pinning_resolver() -> Arc<impl Resolve> {
+    Arc::new(PinningResolver)
 }
 
-struct CheckingResolver {
-    guarded: bool,
-}
+struct PinningResolver;
 
-impl Resolve for CheckingResolver {
+impl Resolve for PinningResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        let guarded = self.guarded;
         Box::pin(async move {
             let addrs = resolve(name.as_str())
                 .await
                 .map_err(|_| Box::new(Unresolvable) as Box<dyn std::error::Error + Send + Sync>)?;
-            if guarded {
-                if let Err(Refusal::Blocked(ip)) = check_all(addrs.iter().copied()) {
-                    return Err(Box::new(BlockedAddress(ip)) as _);
-                }
+            if let Err(Refusal::Blocked(ip)) = check_all(addrs.iter().copied()) {
+                return Err(Box::new(BlockedAddress(ip)) as _);
             }
             Ok(Box::new(addrs.into_iter()) as Addrs)
         })
