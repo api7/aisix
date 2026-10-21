@@ -408,9 +408,7 @@ pub fn into_usage(u: OpenAiUsage) -> UsageStats {
         // nested form when present, else fall back to DeepSeek's native
         // field. This is what surfaces as `prompt_tokens_details.cached_tokens`
         // on the client response regardless of upstream.
-        cached_prompt_tokens: u
-            .prompt_tokens_details
-            .as_ref()
+        cached_prompt_tokens: prompt
             .and_then(|d| d.cached_tokens)
             // A *zeroed* nested detail must not mask a real native
             // count (PR #442 audit MEDIUM-1): a hybrid OpenAI-compat
@@ -421,15 +419,8 @@ pub fn into_usage(u: OpenAiUsage) -> UsageStats {
             .filter(|&n| n > 0)
             .or(u.prompt_cache_hit_tokens)
             .unwrap_or(0),
-        cache_write_tokens: u
-            .prompt_tokens_details
-            .as_ref()
-            .and_then(|d| d.cache_write_tokens),
-        reasoning_tokens: u
-            .completion_tokens_details
-            .as_ref()
-            .and_then(|d| d.reasoning_tokens)
-            .unwrap_or(0),
+        cache_write_tokens: prompt.and_then(|d| d.cache_write_tokens),
+        reasoning_tokens: completion.and_then(|d| d.reasoning_tokens).unwrap_or(0),
         // OpenAI doesn't currently expose Anthropic-style cache
         // creation/read counters; leave at 0 (cp-api falls back to
         // prompt rate for unset cache counters).
@@ -443,26 +434,14 @@ pub fn into_usage(u: OpenAiUsage) -> UsageStats {
         prompt_cache_hit_tokens: u.prompt_cache_hit_tokens,
         prompt_cache_miss_tokens: u.prompt_cache_miss_tokens,
         modality: aisix_gateway::ModalityTokens {
-            prompt_audio_tokens: u
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|d| d.audio_tokens),
-            prompt_image_tokens: u
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|d| d.image_tokens),
-            completion_audio_tokens: u
-                .completion_tokens_details
-                .as_ref()
-                .and_then(|d| d.audio_tokens),
-            completion_image_tokens: u
-                .completion_tokens_details
-                .as_ref()
-                .and_then(|d| d.image_tokens),
+            prompt_audio_tokens: prompt.and_then(|d| d.audio_tokens),
+            prompt_image_tokens: prompt.and_then(|d| d.image_tokens),
+            completion_audio_tokens: completion.and_then(|d| d.audio_tokens),
+            completion_image_tokens: completion.and_then(|d| d.image_tokens),
         },
         openai_details: aisix_gateway::OpenAiUsageDetails {
-            cached_tokens_reported: prompt.and_then(|d| d.cached_tokens),
-            reasoning_tokens_reported: completion.and_then(|d| d.reasoning_tokens),
+            cached_tokens_reported: prompt.is_some_and(|d| d.cached_tokens.is_some()),
+            reasoning_tokens_reported: completion.is_some_and(|d| d.reasoning_tokens.is_some()),
             prompt_text_tokens: prompt.and_then(|d| d.text_tokens),
             completion_text_tokens: completion.and_then(|d| d.text_tokens),
             accepted_prediction_tokens: completion.and_then(|d| d.accepted_prediction_tokens),

@@ -739,16 +739,15 @@ impl ModalityTokens {
 
 /// The OpenAI `prompt_tokens_details` / `completion_tokens_details`
 /// counters the gateway has no accounting slot for, plus whether the cache
-/// and reasoning counters were reported at all. Each is `None` when the
-/// upstream did not report it — distinct from a reported `0` — so the
+/// and reasoning counters were reported at all. Each count is `None` when
+/// the upstream did not report it — distinct from a reported `0` — so the
 /// client sees what the upstream sent and nothing it did not. The values
 /// that do have a slot (`cached_prompt_tokens`, `reasoning_tokens`,
-/// `modality`) stay there; the two `*_reported` counts here only mark
-/// presence.
+/// `modality`) stay there; the two `*_reported` flags only mark presence.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OpenAiUsageDetails {
-    pub cached_tokens_reported: Option<u32>,
-    pub reasoning_tokens_reported: Option<u32>,
+    pub cached_tokens_reported: bool,
+    pub reasoning_tokens_reported: bool,
     pub prompt_text_tokens: Option<u32>,
     pub completion_text_tokens: Option<u32>,
     pub accepted_prediction_tokens: Option<u32>,
@@ -765,11 +764,9 @@ impl OpenAiUsageDetails {
             }
         }
         Self {
-            cached_tokens_reported: add(self.cached_tokens_reported, other.cached_tokens_reported),
-            reasoning_tokens_reported: add(
-                self.reasoning_tokens_reported,
-                other.reasoning_tokens_reported,
-            ),
+            cached_tokens_reported: self.cached_tokens_reported || other.cached_tokens_reported,
+            reasoning_tokens_reported: self.reasoning_tokens_reported
+                || other.reasoning_tokens_reported,
             prompt_text_tokens: add(self.prompt_text_tokens, other.prompt_text_tokens),
             completion_text_tokens: add(self.completion_text_tokens, other.completion_text_tokens),
             accepted_prediction_tokens: add(
@@ -787,12 +784,9 @@ impl OpenAiUsageDetails {
     /// one frame.
     pub fn max_fieldwise(&self, other: &Self) -> Self {
         Self {
-            cached_tokens_reported: self
-                .cached_tokens_reported
-                .max(other.cached_tokens_reported),
-            reasoning_tokens_reported: self
-                .reasoning_tokens_reported
-                .max(other.reasoning_tokens_reported),
+            cached_tokens_reported: self.cached_tokens_reported || other.cached_tokens_reported,
+            reasoning_tokens_reported: self.reasoning_tokens_reported
+                || other.reasoning_tokens_reported,
             prompt_text_tokens: self.prompt_text_tokens.max(other.prompt_text_tokens),
             completion_text_tokens: self
                 .completion_text_tokens
@@ -1248,6 +1242,22 @@ impl ChatChunk {
             self.service_tier.clone_from(fallback);
         }
         self
+    }
+
+    /// Carries nothing for the caller but a finish reason or usage: no
+    /// delta payload of any kind.
+    pub fn has_no_payload(&self) -> bool {
+        let d = &self.delta;
+        d.role.is_none()
+            && d.content.is_none()
+            && d.tool_calls.is_none()
+            && d.reasoning_content.is_none()
+            && d.audio.is_none()
+    }
+
+    /// The `include_usage` terminal frame: usage and nothing else.
+    pub fn is_usage_only(&self) -> bool {
+        self.usage.is_some() && self.finish_reason.is_none() && self.has_no_payload()
     }
 }
 

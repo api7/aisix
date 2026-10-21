@@ -6401,14 +6401,7 @@ where
                     // `include_usage` on the upstream leg. Its counts are
                     // already folded into `comp` above — forward it only when
                     // the client itself asked for usage.
-                    if !client_requested_usage
-                        && chunk.usage.is_some()
-                        && chunk.finish_reason.is_none()
-                        && chunk.delta.role.is_none()
-                        && chunk.delta.content.is_none()
-                        && chunk.delta.tool_calls.is_none()
-                        && chunk.delta.reasoning_content.is_none()
-                    {
+                    if !client_requested_usage && chunk.is_usage_only() {
                         continue;
                     }
                     // #614/#617: an ensemble reports usage on ONE synthesized
@@ -6421,12 +6414,7 @@ where
                     if fold_base && chunk.usage.is_some() {
                         let mut chunk = chunk;
                         chunk.usage = None;
-                        if chunk.finish_reason.is_none()
-                            && chunk.delta.role.is_none()
-                            && chunk.delta.content.is_none()
-                            && chunk.delta.tool_calls.is_none()
-                            && chunk.delta.reasoning_content.is_none()
-                        {
+                        if chunk.finish_reason.is_none() && chunk.has_no_payload() {
                             continue;
                         }
                         Some(chunk)

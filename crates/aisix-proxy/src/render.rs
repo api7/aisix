@@ -191,7 +191,7 @@ impl Usage {
         let cached_tokens = u.openai_cached_tokens();
         let cache_creation_tokens = u.anthropic_cache_creation_input_tokens();
         let cache_detail = cached_tokens > 0
-            || reported.cached_tokens_reported.is_some()
+            || reported.cached_tokens_reported
             || cache_creation_tokens > 0
             || u.cache_write_tokens.is_some();
         let prompt = PromptTokensDetails {
@@ -203,9 +203,8 @@ impl Usage {
             cache_creation_tokens: (cache_creation_tokens > 0).then_some(cache_creation_tokens),
         };
         let completion = CompletionTokensDetails {
-            reasoning_tokens: (u.reasoning_tokens > 0
-                || reported.reasoning_tokens_reported.is_some())
-            .then_some(u.reasoning_tokens),
+            reasoning_tokens: (u.reasoning_tokens > 0 || reported.reasoning_tokens_reported)
+                .then_some(u.reasoning_tokens),
             audio_tokens: u.modality.completion_audio_tokens,
             text_tokens: reported.completion_text_tokens,
             image_tokens: u.modality.completion_image_tokens,
@@ -301,13 +300,7 @@ pub fn render_chunk(
 ) -> ChatCompletionChunk {
     // A frame that carries only usage is the `include_usage` terminal
     // frame, which OpenAI sends with an empty `choices` array.
-    let usage_only = chunk.usage.is_some()
-        && chunk.finish_reason.is_none()
-        && chunk.delta.role.is_none()
-        && chunk.delta.content.is_none()
-        && chunk.delta.tool_calls.is_none()
-        && chunk.delta.reasoning_content.is_none()
-        && chunk.delta.audio.is_none();
+    let usage_only = chunk.is_usage_only();
     let choices = if usage_only {
         Vec::new()
     } else {
