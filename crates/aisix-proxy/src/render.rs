@@ -82,14 +82,16 @@ pub struct Usage {
     /// OpenAI-canonical prompt-token breakdown. Emitted whenever the
     /// gateway has a non-zero cache-hit count (#542) — for OpenAI it
     /// comes from the upstream's `prompt_tokens_details.cached_tokens`,
-    /// for DeepSeek from the normalized native `prompt_cache_hit_tokens`.
+    /// for DeepSeek from the normalized native `prompt_cache_hit_tokens`
+    /// — or the upstream reported a prompt audio count.
     /// Skipped (not `{}`) when there's nothing to report, so callers
     /// that branch on the field's presence behave like they do against
     /// api.openai.com.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
     /// OpenAI-canonical completion-token breakdown. Emitted when the
-    /// upstream reported reasoning tokens (o1/o3/DeepSeek-R1) (#542/#466).
+    /// upstream reported reasoning tokens (o1/o3/DeepSeek-R1) (#542/#466)
+    /// or a completion audio count.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
     /// DeepSeek-native cache-hit counter, passed through verbatim
@@ -106,8 +108,15 @@ pub struct Usage {
 
 #[derive(Debug, Serialize, Default)]
 pub struct PromptTokensDetails {
-    /// Prompt tokens served from the provider's prompt cache.
-    pub cached_tokens: u32,
+    /// Prompt tokens served from the provider's prompt cache. Absent when
+    /// the object is here only for `audio_tokens`: a `0` would read as
+    /// "the provider reported no cache hit".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
+    /// Audio input tokens, exactly when the upstream reported them — a
+    /// reported `0` included, an unreported count never fabricated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_tokens: Option<u32>,
     /// Raw OpenAI cache-write counter, kept separate from additive cache creation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u32>,
@@ -119,7 +128,11 @@ pub struct PromptTokensDetails {
 #[derive(Debug, Serialize, Default)]
 pub struct CompletionTokensDetails {
     /// o1 / o3 / DeepSeek-R1 reasoning tokens (subset of completion).
-    pub reasoning_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
+    /// Audio output tokens, exactly when the upstream reported them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_tokens: Option<u32>,
 }
 
 impl Usage {
@@ -143,29 +156,37 @@ impl Usage {
     ///   increase the caller cannot price
     /// - `reasoning_tokens > 0` → emit
     ///   `completion_tokens_details.reasoning_tokens`
+    /// - an audio count the upstream reported → emit it as
+    ///   `*_tokens_details.audio_tokens`, OpenAI's own names
     /// - DeepSeek-native `prompt_cache_hit_tokens` /
     ///   `prompt_cache_miss_tokens` passed through verbatim when the
     ///   upstream sent them (Some), omitted otherwise
     fn from_stats(u: &aisix_gateway::UsageStats) -> Self {
         let cached_tokens = u.openai_cached_tokens();
         let cache_creation_tokens = u.anthropic_cache_creation_input_tokens();
+        let cache_detail =
+            cached_tokens > 0 || cache_creation_tokens > 0 || u.cache_write_tokens.is_some();
+        let prompt_audio_tokens = u.modality.prompt_audio_tokens;
+        let completion_audio_tokens = u.modality.completion_audio_tokens;
         Usage {
             prompt_tokens: u.openai_prompt_tokens(),
             completion_tokens: u.completion_tokens,
             total_tokens: u.openai_total_tokens(),
-            prompt_tokens_details: (cached_tokens > 0
-                || cache_creation_tokens > 0
-                || u.cache_write_tokens.is_some())
-            .then_some(PromptTokensDetails {
-                cached_tokens,
-                cache_write_tokens: u.cache_write_tokens,
-                cache_creation_tokens: (cache_creation_tokens > 0).then_some(cache_creation_tokens),
-            }),
-            completion_tokens_details: (u.reasoning_tokens > 0).then_some(
-                CompletionTokensDetails {
-                    reasoning_tokens: u.reasoning_tokens,
+            prompt_tokens_details: (cache_detail || prompt_audio_tokens.is_some()).then_some(
+                PromptTokensDetails {
+                    cached_tokens: cache_detail.then_some(cached_tokens),
+                    audio_tokens: prompt_audio_tokens,
+                    cache_write_tokens: u.cache_write_tokens,
+                    cache_creation_tokens: (cache_creation_tokens > 0)
+                        .then_some(cache_creation_tokens),
                 },
             ),
+            completion_tokens_details: (u.reasoning_tokens > 0
+                || completion_audio_tokens.is_some())
+            .then_some(CompletionTokensDetails {
+                reasoning_tokens: (u.reasoning_tokens > 0).then_some(u.reasoning_tokens),
+                audio_tokens: completion_audio_tokens,
+            }),
             prompt_cache_hit_tokens: u.prompt_cache_hit_tokens,
             prompt_cache_miss_tokens: u.prompt_cache_miss_tokens,
         }
