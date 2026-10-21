@@ -61,3 +61,7 @@ aws = [
 tokio = { workspace = true, features = ["macros", "rt"] }
 rcgen.workspace = true
 tempfile.workspace = true
+
+[[test]]
+name = "aws_credential_endpoints_direct"
+required-features = ["aws"]

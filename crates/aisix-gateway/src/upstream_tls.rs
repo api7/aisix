@@ -551,7 +551,7 @@ fn root_store(tls: &TlsSettings) -> rustls::RootCertStore {
 // ─── AWS SDK (Bedrock) ───────────────────────────────────────────────
 
 /// The smithy connector builder [`aws_http_client`] starts from,
-/// carrying `upstream.pool_idle_timeout` and the environment proxy.
+/// carrying `upstream.pool_idle_timeout` and the given proxy setting.
 ///
 /// Split out because `build_https` returns an opaque `SharedHttpClient`:
 /// this builder is the last point at which a test can observe the values.
@@ -559,30 +559,49 @@ fn root_store(tls: &TlsSettings) -> rustls::RootCertStore {
 /// longer than a typical hop's idle timeout, which is exactly the stale
 /// pooled connection `upstream.pool_idle_timeout` exists to prevent.
 ///
-/// The proxy is `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`,
-/// read through the same matcher reqwest uses for every other upstream
-/// client, so a host is proxied or not the same way on both stacks. The
-/// smithy default is no proxy at all, which sent Bedrock — and the STS
-/// and credential calls it makes on this client — straight past an
-/// egress proxy every other provider went through.
-///
 /// `pool_max_idle_per_host` and the three `tcp_keepalive_*` settings have
 /// no entry point on the smithy builder, so they still stop at the reqwest
 /// clients — the same shape as the two `upstream.tls` knobs
 /// [`warn_unsupported_for_aws`] calls out, and worth knowing before
 /// assuming the whole block reaches here.
 #[cfg(feature = "aws")]
-fn aws_pooled_builder() -> aws_smithy_http_client::ConnectorBuilder {
+fn aws_pooled_builder(
+    proxy: aws_smithy_http_client::proxy::ProxyConfig,
+) -> aws_smithy_http_client::ConnectorBuilder {
     aws_smithy_http_client::Connector::builder()
         .pool_idle_timeout(crate::upstream_http::config().pool_idle_timeout)
-        .proxy_config(aws_smithy_http_client::proxy::ProxyConfig::from_env())
+        .proxy_config(proxy)
 }
 
+/// The link-local credential endpoints of the AWS default credential
+/// chain — EC2 instance metadata (IPv4 and IPv6), ECS task credentials,
+/// and EKS Pod Identity — which [`aws_http_client`] always reaches
+/// directly, whatever the proxy environment says. They are only
+/// reachable from the host itself, so an egress proxy can never serve
+/// them; before the AWS client honoured the proxy environment they were
+/// always reached directly, and a deployment's `NO_PROXY` was never
+/// written with them in mind.
+#[cfg(feature = "aws")]
+pub const AWS_CREDENTIAL_ENDPOINT_HOSTS: [&str; 4] = [
+    "169.254.169.254",
+    "[fd00:ec2::254]",
+    "169.254.170.2",
+    "169.254.170.23",
+];
+
 /// The HTTP client every Bedrock SDK client is built on, carrying the
-/// deployment's extra trust roots and `upstream.pool_idle_timeout`.
+/// deployment's extra trust roots, `upstream.pool_idle_timeout`, and the
+/// proxy environment.
 ///
 /// Built once and shared: the AWS SDK otherwise constructs a connector
 /// per client, and each construction re-reads the platform trust store.
+///
+/// The proxy is `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`,
+/// read through the same matcher reqwest uses for every other upstream
+/// client, so a host is proxied or not the same way on both stacks —
+/// except [`AWS_CREDENTIAL_ENDPOINT_HOSTS`], which are always direct. The
+/// Bedrock runtime, the Bedrock guardrail and every STS call go through
+/// the proxy like any other upstream.
 ///
 /// Two of the four `upstream.tls` knobs stop here, because the SDK's
 /// HTTP stack exposes trust roots and nothing else on its stable
@@ -613,6 +632,18 @@ pub fn aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClie
 /// "runtime dropped the dispatch task" instead of reaching the server.
 #[cfg(feature = "aws")]
 pub fn build_aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    build_aws_http_client_direct_to(&AWS_CREDENTIAL_ENDPOINT_HOSTS)
+}
+
+/// [`build_aws_http_client`] with the always-direct hosts given, so a
+/// test can name a loopback host in place of the link-local endpoints it
+/// cannot bind. Hosts are compared as a URL spells them: an IPv6 address
+/// in brackets, no port.
+#[cfg(feature = "aws")]
+pub fn build_aws_http_client_direct_to(
+    direct_hosts: &[&str],
+) -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    use aws_smithy_http_client::proxy::ProxyConfig;
     use aws_smithy_http_client::tls;
     let tls_cfg = &crate::upstream_http::config().tls;
     warn_unsupported_for_aws(tls_cfg);
@@ -629,19 +660,123 @@ pub fn build_aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHt
     // The connector-level builder, because the client-level one has no
     // proxy setting. Built per connector-settings key and cached by the
     // returned client, as `Builder::build_https` would.
-    aws_smithy_http_client::Builder::new().build_with_connector_fn(move |settings, components| {
-        let mut builder = aws_pooled_builder();
-        builder.set_connector_settings(settings.cloned());
-        if let Some(components) = components {
-            builder.set_sleep_impl(components.sleep_impl());
-        }
-        builder
-            .tls_provider(tls::Provider::rustls(
-                tls::rustls_provider::CryptoMode::AwsLc,
-            ))
-            .tls_context(context.clone())
-            .build()
+    let client = |proxy: ProxyConfig| {
+        let context = context.clone();
+        aws_smithy_http_client::Builder::new().build_with_connector_fn(
+            move |settings, components| {
+                let mut builder = aws_pooled_builder(proxy.clone());
+                builder.set_connector_settings(settings.cloned());
+                if let Some(components) = components {
+                    builder.set_sleep_impl(components.sleep_impl());
+                }
+                builder
+                    .tls_provider(tls::Provider::rustls(
+                        tls::rustls_provider::CryptoMode::AwsLc,
+                    ))
+                    .tls_context(context.clone())
+                    .build()
+            },
+        )
+    };
+    // Two clients because the smithy proxy setting cannot add hosts to
+    // the environment's `NO_PROXY`: the environment one, and one that is
+    // never proxied for the hosts that must stay direct.
+    aws_smithy_runtime_api::client::http::SharedHttpClient::new(aws_split::DirectForHosts {
+        proxied: client(ProxyConfig::from_env()),
+        direct: client(ProxyConfig::disabled()),
+        hosts: direct_hosts
+            .iter()
+            .map(|h| h.to_ascii_lowercase())
+            .collect(),
     })
+}
+
+#[cfg(feature = "aws")]
+mod aws_split {
+    use std::sync::Arc;
+
+    use aws_smithy_runtime_api::box_error::BoxError;
+    use aws_smithy_runtime_api::client::http::{
+        HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpClient,
+        SharedHttpConnector,
+    };
+    use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
+    use aws_smithy_runtime_api::client::runtime_components::{
+        RuntimeComponents, RuntimeComponentsBuilder,
+    };
+    use aws_smithy_types::config_bag::ConfigBag;
+
+    /// Sends a request for one of `hosts` through `direct`, and every
+    /// other request through `proxied`. Each inner client keeps its own
+    /// per-settings connector cache, so pooling is unchanged.
+    #[derive(Debug)]
+    pub(super) struct DirectForHosts {
+        pub(super) proxied: SharedHttpClient,
+        pub(super) direct: SharedHttpClient,
+        pub(super) hosts: Arc<[String]>,
+    }
+
+    impl HttpClient for DirectForHosts {
+        fn http_connector(
+            &self,
+            settings: &HttpConnectorSettings,
+            components: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(Split {
+                proxied: self.proxied.http_connector(settings, components),
+                direct: self.direct.http_connector(settings, components),
+                hosts: self.hosts.clone(),
+            })
+        }
+
+        fn validate_base_client_config(
+            &self,
+            runtime_components: &RuntimeComponentsBuilder,
+            cfg: &ConfigBag,
+        ) -> Result<(), BoxError> {
+            self.proxied
+                .validate_base_client_config(runtime_components, cfg)?;
+            self.direct
+                .validate_base_client_config(runtime_components, cfg)
+        }
+
+        fn validate_final_config(
+            &self,
+            runtime_components: &RuntimeComponents,
+            cfg: &ConfigBag,
+        ) -> Result<(), BoxError> {
+            self.proxied
+                .validate_final_config(runtime_components, cfg)?;
+            self.direct.validate_final_config(runtime_components, cfg)
+        }
+
+        fn connector_metadata(
+            &self,
+        ) -> Option<aws_smithy_runtime_api::client::connector_metadata::ConnectorMetadata> {
+            self.proxied.connector_metadata()
+        }
+    }
+
+    #[derive(Debug)]
+    struct Split {
+        proxied: SharedHttpConnector,
+        direct: SharedHttpConnector,
+        hosts: Arc<[String]>,
+    }
+
+    impl HttpConnector for Split {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let direct = url::Url::parse(request.uri())
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+                .is_some_and(|host| self.hosts.contains(&host));
+            if direct {
+                self.direct.call(request)
+            } else {
+                self.proxied.call(request)
+            }
+        }
+    }
 }
 
 /// Say out loud which `upstream.tls` knobs the AWS SDK stack cannot
@@ -757,7 +892,10 @@ mod tests {
         // `Builder`'s fields are private; its derived `Debug` is the only
         // way to read back what was applied. `None` there means the
         // setting never reached the builder.
-        let applied = format!("{:?}", aws_pooled_builder());
+        let applied = format!(
+            "{:?}",
+            aws_pooled_builder(aws_smithy_http_client::proxy::ProxyConfig::from_env())
+        );
         assert!(
             applied.contains(&format!("pool_idle_timeout: Some({:?})", configured)),
             "the configured pool idle timeout did not reach the AWS builder: {applied}"
@@ -767,16 +905,39 @@ mod tests {
         // function body: this test's own text mentions the helper too.
         let src = include_str!("upstream_tls.rs");
         let body = src
-            .split_once("pub fn build_aws_http_client()")
+            .split_once("pub fn build_aws_http_client_direct_to(")
             .expect("build_aws_http_client is defined in this file")
             .1
             .split_once("\n}\n")
             .expect("its body ends at a top-level brace")
             .0;
         assert!(
-            body.contains("aws_pooled_builder()"),
-            "build_aws_http_client must build on `aws_pooled_builder()`: {body}"
+            body.contains("aws_pooled_builder("),
+            "build_aws_http_client must build on `aws_pooled_builder`: {body}"
         );
+    }
+
+    /// The credential endpoints the AWS client never proxies: EC2
+    /// instance metadata over IPv4 and IPv6, ECS task credentials, and
+    /// EKS Pod Identity — and nothing else, since every other AWS call
+    /// must follow the proxy environment.
+    #[cfg(feature = "aws")]
+    #[test]
+    fn the_aws_client_bypasses_exactly_the_credential_endpoints() {
+        assert_eq!(
+            AWS_CREDENTIAL_ENDPOINT_HOSTS,
+            [
+                "169.254.169.254",
+                "[fd00:ec2::254]",
+                "169.254.170.2",
+                "169.254.170.23",
+            ]
+        );
+        // Spelled as a parsed URL reports the host, or the match never hits.
+        for host in AWS_CREDENTIAL_ENDPOINT_HOSTS {
+            let parsed = url::Url::parse(&format!("http://{host}/latest/api/token")).unwrap();
+            assert_eq!(parsed.host_str(), Some(host));
+        }
     }
 
     #[test]
