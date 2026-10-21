@@ -112,6 +112,19 @@ pub(crate) fn restamp_sse_frame(
     client_facing_model: &str,
     selects_model: fn(&[PathSeg]) -> bool,
 ) -> Option<Vec<u8>> {
+    splice_sse_frame(frame, |payload| {
+        restamp_json_bytes(payload, client_facing_model, selects_model)
+    })
+}
+
+/// Rewrite one SSE frame's joined `data:` payload with `splice`, writing the
+/// result back line by line (see [`restamp_sse_frame`]). `None` from
+/// `splice`, a `[DONE]` sentinel, or a rewrite that changed the line count
+/// forwards the frame unchanged.
+pub(crate) fn splice_sse_frame(
+    frame: &[u8],
+    splice: impl FnOnce(&[u8]) -> Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
     let ranges = crate::redact::data_line_ranges(frame);
     if ranges.is_empty() {
         return None;
@@ -132,7 +145,7 @@ pub(crate) fn restamp_sse_frame(
     if payload == b"[DONE]" {
         return None;
     }
-    let spliced = restamp_json_bytes(&payload, client_facing_model, selects_model)?;
+    let spliced = splice(&payload)?;
     // The splice re-encodes the value as a JSON string, so it can never
     // introduce a raw newline and the line count is preserved. Forward
     // verbatim if that ever stops holding: the module's failure policy is
@@ -164,11 +177,22 @@ pub(crate) fn restamp_sse_buffer(
     client_facing_model: &str,
     selects_model: fn(&[PathSeg]) -> bool,
 ) -> Vec<u8> {
+    splice_sse_buffer(buf, |payload| {
+        restamp_json_bytes(payload, client_facing_model, selects_model)
+    })
+}
+
+/// [`splice_sse_frame`] over every frame of a COMPLETE SSE document,
+/// including a final frame the upstream never terminated.
+pub(crate) fn splice_sse_buffer(
+    buf: &[u8],
+    mut splice: impl FnMut(&[u8]) -> Option<Vec<u8>>,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(buf.len());
     let mut rest = buf;
     while let Some(end) = aisix_gateway::sse::find_frame_end(rest) {
         let (frame, tail) = rest.split_at(end);
-        match restamp_sse_frame(frame, client_facing_model, selects_model) {
+        match splice_sse_frame(frame, &mut splice) {
             Some(rewritten) => out.extend_from_slice(&rewritten),
             None => out.extend_from_slice(frame),
         }
@@ -182,7 +206,7 @@ pub(crate) fn restamp_sse_buffer(
     // readers of this same buffer parse it line-by-line, so they already see
     // this frame; skipping it here would make the echo the only thing that
     // misses it.
-    match restamp_sse_frame(rest, client_facing_model, selects_model) {
+    match splice_sse_frame(rest, &mut splice) {
         Some(rewritten) => out.extend_from_slice(&rewritten),
         None => out.extend_from_slice(rest),
     }

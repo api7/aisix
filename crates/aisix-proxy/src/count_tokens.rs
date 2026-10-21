@@ -495,6 +495,7 @@ async fn dispatch(
             headers: Some(&client.headers),
             api_key_id: auth.entry.id.as_str(),
             source_ip: &client.source_ip,
+            context_origin: None,
         },
     )?;
     let retry_on_429 = model_entry
