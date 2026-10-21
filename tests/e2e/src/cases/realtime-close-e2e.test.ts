@@ -154,6 +154,22 @@ describe("/v1/realtime close handshake", () => {
     expect(upstream!.closesSeen[before]).toBe(1000);
   });
 
+  test("a client close with a code that may not be sent reaches the upstream as 1011", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = upstream!.closesSeen.length;
+    const s = await openSession(app!);
+    // `ws` refuses to send 1004, so write the masked Close frame by hand
+    // (an all-zero mask leaves the payload as is).
+    const payload = Buffer.concat([Buffer.from([1004 >> 8, 1004 & 0xff]), Buffer.from("r1004")]);
+    (s.ws as unknown as { _socket: NodeJS.WritableStream })._socket.write(
+      Buffer.concat([Buffer.from([0x88, 0x80 | payload.length, 0, 0, 0, 0]), payload]),
+    );
+    // The client's own close is still answered rather than reset.
+    expect((await s.closed).code).not.toBe(1006);
+    await expect.poll(() => upstream!.closesSeen.length).toBe(before + 1);
+    expect(upstream!.closesSeen[before]).toBe(1011);
+  });
+
   test("a normal upstream close reaches the client as is, with no error event", async (ctx) => {
     if (!ready(ctx)) return;
     const before = upstream!.closesSeen.length;
