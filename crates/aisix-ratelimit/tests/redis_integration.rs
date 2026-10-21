@@ -59,7 +59,7 @@ fn unique_key(tag: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    format!("test:{tag}:{nanos:x}")
+    format!("test:{tag}:{nanos:x}-{}", std::process::id())
 }
 
 fn rl() -> RateLimit {

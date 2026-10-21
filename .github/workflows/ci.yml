@@ -328,7 +328,7 @@ jobs:
         # nextest runs every test in its own process, test binaries in
         # parallel. Tests that share external state across binaries are
         # serialised by the test groups in .config/nextest.toml.
-        run: cargo llvm-cov nextest --workspace --all-features --lcov --output-path lcov-unit.info
+        run: cargo llvm-cov nextest --no-fail-fast --workspace --all-features --lcov --output-path lcov-unit.info
       - uses: actions/upload-artifact@v7
         with:
           name: coverage-unit
@@ -365,7 +365,7 @@ jobs:
           retention-days: 1
 
   e2e:
-    name: e2e (vitest, ${{ matrix.serving }}, ${{ matrix.shard }}/4) + coverage
+    name: e2e (vitest, ${{ matrix.serving }}, ${{ matrix.shard }}/${{ matrix.shard_total }}) + coverage
     needs: [build-bin]
     runs-on: ubuntu-latest
     # Explicit, so the job's token stays read-only regardless of the
@@ -384,9 +384,10 @@ jobs:
         serving: [thread-per-core, work-stealing]
         # Each serving mode's suite is split across four jobs with
         # `vitest --shard`; every shard keeps the full per-job setup below
-        # (four etcds, four forks). The `/4` in the job name and in the
-        # `--shard` argument must match the length of this list.
+        # (four etcds, four forks). `shard_total` must equal the length of
+        # `shard`, or part of the suite runs in no job.
         shard: [1, 2, 3, 4]
+        shard_total: [4]
         include:
           # The Linux default, and so the one production runs.
           - serving: thread-per-core
@@ -497,7 +498,7 @@ jobs:
           # from this list (see tests/e2e/vitest.config.ts), and
           # harness/etcd.ts hands each fork its own entry.
           AISIX_E2E_ETCD_ENDPOINTS: http://127.0.0.1:2379,http://127.0.0.1:2380,http://127.0.0.1:2381,http://127.0.0.1:2382
-        run: pnpm test --shard=${{ matrix.shard }}/4
+        run: pnpm test --shard=${{ matrix.shard }}/${{ matrix.shard_total }}
       - name: tag coverage by leg
         # The gate downloads every leg with `merge-multiple: true`, which
         # flattens same-named files to one — the legs must upload distinct

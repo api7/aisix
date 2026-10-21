@@ -33,7 +33,7 @@ fn unique_prefix() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    format!("/aisix-auth-it-{nanos}")
+    format!("/aisix-auth-it-{nanos}-{}", std::process::id())
 }
 
 fn host_port(url: &str) -> String {

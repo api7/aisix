@@ -43,14 +43,16 @@ fn etcd_url() -> Option<String> {
     std::env::var("ADMIN_TEST_ETCD_URL").ok()
 }
 
-/// Per-test prefix so concurrent tests in this binary don't collide.
+/// Per-test prefix so concurrent tests don't collide. The pid tells apart
+/// tests that nextest runs as parallel processes, where thread ids repeat.
 fn unique_prefix() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     format!(
-        "/aisix-admin-it/{nanos:x}-{:?}",
+        "/aisix-admin-it/{nanos:x}-{}-{:?}",
+        std::process::id(),
         std::thread::current().id()
     )
     .replace(['(', ')', ' '], "")
@@ -620,6 +622,9 @@ async fn loader_picks_up_every_direct_write() {
 /// cluster `.github/workflows/ci.yml` starts (the container and the
 /// short-TTL approach come from community PR api7/aisix#763, `okaybase`);
 /// no-ops when it is unset, like every other integration test here.
+/// `auth_token_recovery` changes that cluster's auth store, so this test
+/// shares its `etcd-auth-ttl` group in `.config/nextest.toml`; any new test
+/// on the cluster belongs in that group too.
 #[tokio::test]
 async fn admin_reads_survive_a_token_the_server_forgets() {
     let (Ok(url), Ok(user), Ok(password), Ok(ttl)) = (

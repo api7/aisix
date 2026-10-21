@@ -89,7 +89,7 @@ fn unique_suffix() -> u128 {
 }
 
 fn unique_prefix() -> String {
-    format!("/aisix-token-it-{}", unique_suffix())
+    format!("/aisix-token-it-{}-{}", unique_suffix(), std::process::id())
 }
 
 impl AuthEtcd {
