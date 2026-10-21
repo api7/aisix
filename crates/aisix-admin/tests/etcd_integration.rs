@@ -124,7 +124,7 @@ async fn body_json(resp: axum::http::Response<Body>) -> Value {
 }
 
 /// Seed a document directly, read it back through the Admin HTTP layer
-/// (list + get), then delete it directly and assert the list empties.
+/// (list + get), then delete it directly and assert both reads lose it.
 async fn direct_write_read_round_trip(
     url: &str,
     kind: &str,
@@ -153,16 +153,38 @@ async fn direct_write_read_round_trip(
     let item_uri = format!("{list_uri}/{id}");
     let resp = app.oneshot(auth_get(&item_uri)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "GET {item_uri}");
+    let got = body_json(resp).await;
+    assert_eq!(got["id"], id);
+    assert!(
+        got["revision"].as_i64().unwrap_or(0) >= 1,
+        "GET {item_uri}: {got}"
+    );
+    // The served value may add defaults, but every written field must come
+    // back with the content that was written.
+    for (field, written) in payload.as_object().expect("payload object") {
+        assert_eq!(
+            &got["value"][field], written,
+            "GET {item_uri} field {field}: {got}"
+        );
+    }
 
     // Direct delete → the read surface empties.
     client
         .delete(format!("{prefix}/{kind}/{id}"), None)
         .await
         .expect("direct etcd delete");
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let resp = app.oneshot(auth_get(list_uri)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "GET {list_uri} after delete");
     let listed = body_json(resp).await;
     assert!(listed.as_array().unwrap().is_empty());
+    let app = build_router(state);
+    let resp = app.oneshot(auth_get(&item_uri)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "GET {item_uri} after delete"
+    );
 }
 
 // ─────────────────────────── Per-resource round-trips ───────────────────────────
@@ -295,7 +317,7 @@ async fn provider_keys_round_trip_through_real_etcd() {
             "display_name": "openai-it",
             "provider": "openai",
             "adapter": "openai",
-            "secret": "sk-it"
+            "api_key": "sk-it"
         }),
     )
     .await;
