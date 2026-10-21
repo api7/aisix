@@ -13,6 +13,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_config::default_provider::{use_dual_stack, use_fips};
 use aws_config::provider_config::ProviderConfig;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_credential_types::provider::{
@@ -239,24 +240,40 @@ impl RefreshingCredentials {
                     None => timeouts = timeouts.disable_connect_timeout(),
                 }
                 let region = Region::new(self.spec.region.clone());
-                // The chain's instance-metadata calls never go through the
-                // proxy environment, wherever aws-config resolves the
-                // endpoint (the default, the IPv6 endpoint mode, or a
-                // configured endpoint); everything else on the chain —
-                // its STS calls included — uses the shared client.
+                // The chain reaches its own credential endpoints directly
+                // and everything else — its STS calls included — through
+                // the proxy environment; its instance-metadata client is
+                // never proxied, wherever aws-config resolves the endpoint
+                // (the default, the IPv6 endpoint mode, or a configured
+                // one). Building the chain here, rather than letting the
+                // loader do it, is what lets it take that client, so the
+                // FIPS / dual-stack settings the loader would have read for
+                // it are read here the same way.
                 let imds = aws_config::imds::Client::builder()
                     .configure(&ProviderConfig::default().with_http_client(
                         crate::upstream_tls::aws_credential_endpoint_http_client(),
                     ))
                     .build();
+                let conf = ProviderConfig::default()
+                    .with_http_client(crate::upstream_tls::aws_credential_chain_http_client());
+                let use_fips = use_fips::use_fips_provider(&conf).await;
+                let use_dual_stack = use_dual_stack::use_dual_stack_provider(&conf).await;
+                let conf = conf
+                    .with_use_fips(use_fips)
+                    .with_use_dual_stack(use_dual_stack);
+                // A profile's `credential_source = Ec2InstanceMetadata`
+                // builds an instance-metadata provider of its own; this
+                // one replaces it so that call is direct too.
+                let profile_imds =
+                    aws_config::imds::credentials::ImdsCredentialsProvider::builder()
+                        .imds_client(imds.clone())
+                        .configure(&conf)
+                        .build();
                 let chain = DefaultCredentialsChain::builder()
-                    .configure(
-                        ProviderConfig::default()
-                            .with_http_client(crate::upstream_tls::aws_http_client())
-                            .with_region(Some(region.clone())),
-                    )
+                    .configure(conf)
                     .region(region.clone())
                     .imds_client(imds)
+                    .with_custom_credential_source("Ec2InstanceMetadata", profile_imds)
                     .build()
                     .await;
                 aws_config::defaults(BehaviorVersion::latest())

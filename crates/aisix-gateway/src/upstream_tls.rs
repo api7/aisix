@@ -575,14 +575,9 @@ fn aws_pooled_builder(
 
 /// The fixed addresses of the AWS default credential chain's endpoints —
 /// EC2 instance metadata (IPv4 and IPv6), ECS task credentials, and EKS
-/// Pod Identity (IPv4 and IPv6) — which [`aws_http_client`] always reaches
-/// directly, whatever the proxy environment says. They are only reachable
-/// from the host itself, so an egress proxy can never serve them; before
-/// the AWS client honoured the proxy environment they were always reached
-/// directly, and a deployment's `NO_PROXY` was never written with them in
-/// mind. Loopback hosts and a configured container-credentials URI go
-/// direct too, and the instance-metadata client is direct whatever
-/// endpoint it resolves — see [`aws_http_client`].
+/// Pod Identity (IPv4 and IPv6). The chain always reaches them directly,
+/// whatever the proxy environment says — see
+/// [`aws_credential_chain_http_client`].
 #[cfg(feature = "aws")]
 pub const AWS_CREDENTIAL_ENDPOINT_HOSTS: [&str; 5] = [
     "169.254.169.254",
@@ -594,7 +589,8 @@ pub const AWS_CREDENTIAL_ENDPOINT_HOSTS: [&str; 5] = [
 
 #[cfg(feature = "aws")]
 struct AwsClients {
-    routed: aws_smithy_runtime_api::client::http::SharedHttpClient,
+    proxied: aws_smithy_runtime_api::client::http::SharedHttpClient,
+    chain: aws_smithy_runtime_api::client::http::SharedHttpClient,
     direct: aws_smithy_runtime_api::client::http::SharedHttpClient,
 }
 
@@ -614,16 +610,9 @@ fn aws_clients() -> &'static AwsClients {
 /// The proxy is `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`,
 /// read through the same matcher reqwest uses for every other upstream
 /// client, so a host is proxied or not the same way on both stacks. The
-/// Bedrock runtime, the Bedrock guardrail and every STS call — including
-/// the ones the default credential chain makes for web identity, SSO or a
-/// profile role — go through the proxy like any other upstream. What the
-/// chain sends to its own credential endpoints does not: a request for
-/// one of [`AWS_CREDENTIAL_ENDPOINT_HOSTS`], for a loopback host (a local
-/// credential agent), or for the host of
-/// `AWS_CONTAINER_CREDENTIALS_FULL_URI` is sent by a never-proxied client
-/// instead, and the instance-metadata client is built on
-/// [`aws_credential_endpoint_http_client`] outright, so a custom IMDS
-/// endpoint is direct however aws-config resolved it.
+/// Bedrock runtime, the Bedrock guardrail and every STS call go through
+/// the proxy like any other upstream; only the default credential chain's
+/// own endpoints do not — see [`aws_credential_chain_http_client`].
 ///
 /// Two of the four `upstream.tls` knobs stop here, because the SDK's
 /// HTTP stack exposes trust roots and nothing else on its stable
@@ -635,12 +624,28 @@ fn aws_clients() -> &'static AwsClients {
 /// — is fully served by `ca_file`.
 #[cfg(feature = "aws")]
 pub fn aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
-    aws_clients().routed.clone()
+    aws_clients().proxied.clone()
 }
 
-/// The never-proxied side of [`aws_http_client`], with the same trust
-/// roots and connection pool: the HTTP client for the default credential
-/// chain's instance-metadata calls.
+/// The client for the AWS default credential chain: [`aws_http_client`]
+/// (same pool), except that a request for one of
+/// [`AWS_CREDENTIAL_ENDPOINT_HOSTS`], for a loopback host (a local
+/// credential agent), or for the host of
+/// `AWS_CONTAINER_CREDENTIALS_FULL_URI` is sent by a never-proxied client.
+/// Those endpoints are only reachable from the host itself, so an egress
+/// proxy can never serve them, and they were always reached directly
+/// before the AWS client honoured the proxy environment. The chain's STS
+/// calls (web identity, SSO, a profile role) name none of them and stay
+/// on the proxy.
+#[cfg(feature = "aws")]
+pub fn aws_credential_chain_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient
+{
+    aws_clients().chain.clone()
+}
+
+/// The never-proxied client, with the same trust roots: what the default
+/// credential chain's instance-metadata client is built on, so a custom
+/// IMDS endpoint is direct however aws-config resolves it.
 #[cfg(feature = "aws")]
 pub fn aws_credential_endpoint_http_client(
 ) -> aws_smithy_runtime_api::client::http::SharedHttpClient {
@@ -661,7 +666,7 @@ pub fn aws_credential_endpoint_http_client(
 /// "runtime dropped the dispatch task" instead of reaching the server.
 #[cfg(feature = "aws")]
 pub fn build_aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
-    build_aws_clients().routed
+    build_aws_clients().proxied
 }
 
 #[cfg(feature = "aws")]
@@ -701,9 +706,9 @@ fn build_aws_clients() -> AwsClients {
             },
         )
     };
-    // Two clients because the smithy proxy setting cannot add hosts to
-    // the environment's `NO_PROXY`: the environment one, and one that is
-    // never proxied for the credential endpoints.
+    let proxied = client(ProxyConfig::from_env());
+    // A second client because the smithy proxy setting cannot add hosts
+    // to the environment's `NO_PROXY`.
     let direct = client(ProxyConfig::disabled());
     let mut hosts: Vec<String> = AWS_CREDENTIAL_ENDPOINT_HOSTS
         .iter()
@@ -713,21 +718,30 @@ fn build_aws_clients() -> AwsClients {
     // `https` URI there may name any host.
     if let Some(host) = std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI")
         .ok()
-        .and_then(|uri| uri.parse::<http::Uri>().ok())
-        .and_then(|uri| uri.host().map(str::to_owned))
+        .and_then(|uri| container_credentials_host(&uri))
     {
         hosts.push(host);
     }
     AwsClients {
-        routed: aws_smithy_runtime_api::client::http::SharedHttpClient::new(
+        chain: aws_smithy_runtime_api::client::http::SharedHttpClient::new(
             aws_split::DirectForHosts {
-                proxied: client(ProxyConfig::from_env()),
+                proxied: proxied.clone(),
                 direct: direct.clone(),
                 hosts: hosts.into(),
             },
         ),
+        proxied,
         direct,
     }
+}
+
+/// The host a container-credentials URI names, spelled as a request URI
+/// reports it.
+#[cfg(feature = "aws")]
+fn container_credentials_host(uri: &str) -> Option<String> {
+    uri.parse::<http::Uri>()
+        .ok()
+        .and_then(|uri| uri.host().map(str::to_owned))
 }
 
 #[cfg(feature = "aws")]
@@ -1010,6 +1024,16 @@ mod tests {
         ] {
             assert!(direct(uri), "{uri}");
         }
+        // The host of a container-credentials URI, which over https may be
+        // any host, joins the list as the request will spell it.
+        assert_eq!(
+            container_credentials_host("https://creds.example.internal:8443/v1/creds").as_deref(),
+            Some("creds.example.internal")
+        );
+        assert_eq!(
+            container_credentials_host("http://[fd00:ec2::23]/v1/credentials").as_deref(),
+            Some("[fd00:ec2::23]")
+        );
         // Everything else follows the proxy environment.
         for uri in [
             "https://bedrock-runtime.us-east-1.amazonaws.com/model/x/converse",

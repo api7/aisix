@@ -486,6 +486,22 @@ mod tests {
                 "AWS SDK configuration must be built on `upstream_tls::aws_http_client()`",
             ),
             (
+                // A credential chain built by hand takes its HTTP client from
+                // its `ProviderConfig`; without one it falls back to the
+                // SDK's own connector, which carries neither the trust roots
+                // nor the credential-endpoint routing.
+                "DefaultCredentialsChain::builder()",
+                "upstream_tls::aws_credential_chain_http_client()",
+                "the AWS default credential chain must be built on \
+                 `upstream_tls::aws_credential_chain_http_client()`",
+            ),
+            (
+                "aws_config::imds::Client::builder()",
+                "upstream_tls::aws_credential_endpoint_http_client()",
+                "the instance-metadata client must be built on \
+                 `upstream_tls::aws_credential_endpoint_http_client()`",
+            ),
+            (
                 "aws_config::defaults(",
                 "timeout_config",
                 "AWS SDK configuration must carry a `TimeoutConfig` built from \

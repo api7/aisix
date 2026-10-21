@@ -8,8 +8,11 @@
 //! production credential path (`aws_auth::resolve`): a local credential
 //! agent on loopback named by `AWS_CONTAINER_CREDENTIALS_FULL_URI`, and a
 //! custom instance-metadata endpoint on this machine's own non-loopback
-//! address named by `AWS_EC2_METADATA_SERVICE_ENDPOINT`. Matching of the
-//! fixed addresses is pinned by a unit test in `upstream_tls`.
+//! address named by `AWS_EC2_METADATA_SERVICE_ENDPOINT` (also reached
+//! through a profile's `credential_source = Ec2InstanceMetadata`). The
+//! chain's own STS calls — web identity, a profile role — and the gateway's
+//! AssumeRole are shown to go through the proxy. Matching of the fixed
+//! addresses is pinned by a unit test in `upstream_tls`.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -124,7 +127,10 @@ fn default_chain(region: &str, assume_role: Option<AssumeRole>) -> AwsAuthSpec {
 
 #[tokio::test]
 async fn credential_endpoints_bypass_the_proxy_environment_and_sts_does_not() {
-    let own = own_address().expect("a non-loopback address on the default route");
+    let Some(own) = own_address() else {
+        eprintln!("skipped: no non-loopback address on a default route to host the mock IMDS on");
+        return;
+    };
     let (proxy, proxy_hits) = serve(IpAddr::from([127, 0, 0, 1]), refusing_proxy).await;
     let (imds_addr, imds_hits) = serve(own, imds).await;
     let (agent_addr, agent_hits) = serve(IpAddr::from([127, 0, 0, 1]), credential_agent).await;
@@ -178,8 +184,8 @@ async fn credential_endpoints_bypass_the_proxy_environment_and_sts_does_not() {
         "an instance-metadata call reached the proxy"
     );
 
-    // The chain's STS call is the proxy's: the proxy is really in force,
-    // and only the credential endpoints are exempt from it.
+    // The gateway's AssumeRole is the proxy's: the proxy is really in
+    // force, and only the credential endpoints are exempt from it.
     let role = AssumeRole {
         role_arn: "arn:aws:iam::111122223333:role/ViaProxy".into(),
         external_id: None,
@@ -196,6 +202,54 @@ async fn credential_endpoints_bypass_the_proxy_environment_and_sts_does_not() {
         0,
         "STS was reached directly"
     );
+
+    // The chain's own STS calls follow the proxy too: web identity …
+    let scratch = tempfile::tempdir().unwrap();
+    let token = scratch.path().join("web-identity-token");
+    std::fs::write(&token, "web-identity-token").unwrap();
+    std::env::set_var("AWS_WEB_IDENTITY_TOKEN_FILE", &token);
+    std::env::set_var("AWS_ROLE_ARN", "arn:aws:iam::111122223333:role/WebIdentity");
+    let proxy_before = proxy_hits.load(Ordering::SeqCst);
+    let web = credentials(default_chain("ap-south-1", None)).await;
+    assert!(web.is_err(), "the proxy refuses STS: {web:?}");
+    assert!(
+        proxy_hits.load(Ordering::SeqCst) > proxy_before,
+        "the web-identity STS call did not go through the proxy"
+    );
+    assert_eq!(
+        sts_hits.load(Ordering::SeqCst),
+        0,
+        "STS was reached directly"
+    );
+    std::env::remove_var("AWS_WEB_IDENTITY_TOKEN_FILE");
+    std::env::remove_var("AWS_ROLE_ARN");
+
+    // … and a profile role whose source is the instance: the metadata call
+    // is direct, the STS call is the proxy's.
+    let config = scratch.path().join("config");
+    std::fs::write(
+        &config,
+        "[default]\nrole_arn = arn:aws:iam::111122223333:role/ViaProfile\ncredential_source = Ec2InstanceMetadata\n",
+    )
+    .unwrap();
+    std::env::set_var("AWS_CONFIG_FILE", &config);
+    let (proxy_before, imds_before) = (
+        proxy_hits.load(Ordering::SeqCst),
+        imds_hits.load(Ordering::SeqCst),
+    );
+    let profile = credentials(default_chain("ap-northeast-1", None)).await;
+    assert!(profile.is_err(), "the proxy refuses STS: {profile:?}");
+    assert!(
+        imds_hits.load(Ordering::SeqCst) > imds_before,
+        "the profile's instance-metadata call did not reach the endpoint directly"
+    );
+    assert!(proxy_hits.load(Ordering::SeqCst) > proxy_before);
+    assert_eq!(
+        sts_hits.load(Ordering::SeqCst),
+        0,
+        "STS was reached directly"
+    );
+    std::env::set_var("AWS_CONFIG_FILE", "/nonexistent/aisix-test-aws-config");
 
     // A local credential agent on loopback is reached directly.
     std::env::set_var(
