@@ -1592,7 +1592,7 @@ pub(crate) fn resolve_attempt_models(
         resolved.sort_by_key(|a| std::cmp::Reverse(a.priority));
     }
     if let Some(origin) = req.context_origin {
-        resolved = pin_context_origin(snapshot, routing, resolved, origin);
+        resolved = pin_context_origin(snapshot, runtime_status, routing, resolved, origin);
         tracing::debug!(
             virtual_model = %virtual_name,
             origin,
@@ -1627,13 +1627,17 @@ pub(crate) fn resolve_attempt_models(
 
 /// Put the targets that can read a conversation's context first: the origin
 /// target, then the other targets on its provider key, then the rest in the
-/// strategy's order. A boundary member the strategy left out of `resolved`
-/// (its `max_fallbacks` cut) is brought back, since the cut is applied again
-/// after this. Only targets that survived the tag and client-IP filters are
-/// considered — `routing.targets` is already that set; health and cooldown
-/// are still judged by [`filter_attempt_models`] afterwards.
+/// strategy's order. Targets the strategy left out of `resolved` (its
+/// `max_fallbacks` cut) are brought back behind the ones it ordered, since
+/// the pinned order can push those out and the cut is applied again after
+/// this. Only targets that survived the tag and client-IP filters are
+/// considered — `routing.targets` is already that set. A boundary member
+/// that is cooling or unhealthy goes behind every other target, so it cannot
+/// spend the `max_fallbacks` budget ahead of an available one; whether it is
+/// tried at all is still [`filter_attempt_models`]'s call.
 fn pin_context_origin(
     snapshot: &AisixSnapshot,
+    runtime_status: &crate::ModelRuntimeStatusTracker,
     routing: &Routing,
     resolved: Vec<AttemptModel>,
     origin: &str,
@@ -1644,9 +1648,7 @@ fn pin_context_origin(
         let Some(entry) = snapshot.models.get_by_name(&t.model) else {
             continue;
         };
-        if candidates.iter().any(|a| a.id == entry.id)
-            || !boundary.contains(&entry.id, entry.value.provider_key_id.as_deref())
-        {
+        if candidates.iter().any(|a| a.id == entry.id) {
             continue;
         }
         candidates.push(AttemptModel {
@@ -1659,10 +1661,23 @@ fn pin_context_origin(
     let (mut inside, outside): (Vec<_>, Vec<_>) = candidates
         .into_iter()
         .partition(|a| boundary.contains(&a.id, a.model.provider_key_id.as_deref()));
+    let unavailable = |a: &AttemptModel| {
+        let stale_after = a
+            .model
+            .background_model_check
+            .as_ref()
+            .map(|cfg| Duration::from_secs(cfg.stale_after_seconds));
+        matches!(
+            runtime_status.status_with_stale(&a.id, stale_after).status,
+            crate::RuntimeStatus::Unhealthy | crate::RuntimeStatus::Cooldown
+        )
+    };
     // Stable, so the peers keep the strategy's order behind the origin.
     inside.sort_by_key(|a| !boundary.is_origin(&a.id));
-    inside.extend(outside);
-    inside
+    let (mut order, demoted): (Vec<_>, Vec<_>) = inside.into_iter().partition(|a| !unavailable(a));
+    order.extend(outside);
+    order.extend(demoted);
+    order
 }
 
 /// Name every target the health/cooldown filter dropped, and how many
@@ -1990,6 +2005,113 @@ mod tests {
     }
 
     // ───────────────── per-target client-IP allowlist ─────────────────
+
+    fn pk_snapshot(models: &[(&str, &str)]) -> AisixSnapshot {
+        let table = aisix_core::snapshot::ResourceTable::default();
+        for (name, pk) in models {
+            let model: Model = serde_json::from_value(serde_json::json!({
+                "display_name": name,
+                "provider": "openai",
+                "model_name": "up",
+                "provider_key_id": pk,
+            }))
+            .unwrap();
+            table.insert(aisix_core::ResourceEntry::new(
+                format!("id-{name}"),
+                model,
+                1,
+            ));
+        }
+        AisixSnapshot {
+            models: table,
+            ..Default::default()
+        }
+    }
+
+    fn pinned_order(
+        snap: &AisixSnapshot,
+        status: &crate::ModelRuntimeStatusTracker,
+        strategy: RoutingStrategy,
+        targets: &[&str],
+        max_fallbacks: Option<u32>,
+        origin: &str,
+    ) -> Vec<String> {
+        let mut group: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "group",
+            "routing": {"strategy": "failover", "targets": []},
+        }))
+        .unwrap();
+        group.routing = Some(r(
+            strategy,
+            targets.iter().map(|t| RoutingTarget::new(*t)).collect(),
+            max_fallbacks,
+        ));
+        resolve_attempt_models(
+            &RoutingRegistry::new(),
+            status,
+            &LivePricingIndex::new(),
+            snap,
+            "group",
+            "g-1",
+            &group,
+            RoutingRequest {
+                context_origin: Some(origin),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|a| a.model.display_name)
+        .collect()
+    }
+
+    #[test]
+    fn context_origin_goes_first_then_its_provider_key_peers() {
+        let snap = pk_snapshot(&[("c", "pk-2"), ("a", "pk-1"), ("b", "pk-3"), ("a2", "pk-1")]);
+        let status = crate::ModelRuntimeStatusTracker::new();
+        assert_eq!(
+            pinned_order(
+                &snap,
+                &status,
+                RoutingStrategy::Failover,
+                &["c", "a", "b", "a2"],
+                None,
+                "id-a2"
+            ),
+            ["a2", "a", "c", "b"],
+        );
+        // A peer the max_fallbacks cut left out is brought back ahead of the rest.
+        assert_eq!(
+            pinned_order(
+                &snap,
+                &status,
+                RoutingStrategy::Failover,
+                &["c", "b", "a2"],
+                Some(1),
+                "id-a"
+            ),
+            ["a2", "c"],
+        );
+    }
+
+    #[test]
+    fn an_unavailable_boundary_does_not_spend_the_fallback_budget() {
+        let snap = pk_snapshot(&[("a", "pk-1"), ("a2", "pk-1"), ("c", "pk-2")]);
+        let status = crate::ModelRuntimeStatusTracker::new();
+        status.mark_cooldown("id-a", Duration::from_secs(60), "test");
+        status.mark_cooldown("id-a2", Duration::from_secs(60), "test");
+        assert_eq!(
+            pinned_order(
+                &snap,
+                &status,
+                RoutingStrategy::Failover,
+                &["a", "a2", "c"],
+                Some(1),
+                "id-a"
+            ),
+            ["c"],
+        );
+    }
 
     fn ip_snapshot(models: &[(&str, Option<Vec<&str>>)]) -> AisixSnapshot {
         let table = aisix_core::snapshot::ResourceTable::default();

@@ -817,6 +817,19 @@ async fn dispatch(
             Some(&model_entry.value),
             state.default_timeouts,
         );
+        // A group target that cannot read some tagged ciphertext gets the
+        // request without it, rather than a certain 400. Built once per
+        // target: every same-target retry sends the same body.
+        let stripped_body = is_routing_request
+            .then(|| {
+                affinity.body_for_target(
+                    snapshot,
+                    body,
+                    &target.id,
+                    target.model.provider_key_id.as_deref(),
+                )
+            })
+            .flatten();
         for attempt_idx in 0..=budget.attempts {
             // Upstream `Retry-After` when the last failure carried one, else
             // exponential backoff + jitter, before re-hitting the SAME target
@@ -889,18 +902,6 @@ async fn dispatch(
                     continue 'targets;
                 }
             };
-            // A group target that cannot read some tagged ciphertext gets
-            // the request without it, rather than a certain 400.
-            let stripped_body = is_routing_request
-                .then(|| {
-                    affinity.body_for_target(
-                        snapshot,
-                        body,
-                        &target.id,
-                        target.model.provider_key_id.as_deref(),
-                    )
-                })
-                .flatten();
             let attempt_body = stripped_body.as_ref().unwrap_or(body);
             let mark = affinity.response_mark(is_routing_request.then_some(target.id.as_str()));
             let result = if crate::dispatch::serves_natively(

@@ -23,6 +23,7 @@ import {
   SeedClient,
   spawnApp,
   waitConfigPropagation,
+  waitForLogLine,
   type SpawnedApp,
 } from "../harness/index.js";
 
@@ -243,7 +244,8 @@ describe("/v1/responses context affinity through model groups", () => {
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     upstream = await AccountsUpstream.start();
-    app = await spawnApp();
+    // `info` for the access log the telemetry assertion reads.
+    app = await spawnApp({ extraEnv: { RUST_LOG: "info" } });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = async (account: string, extra: Record<string, unknown> = {}) =>
@@ -302,7 +304,9 @@ describe("/v1/responses context affinity through model groups", () => {
     await upstream?.close();
   });
 
-  async function respond(body: Record<string, unknown>): Promise<{ status: number; json: any; text: string }> {
+  async function respond(
+    body: Record<string, unknown>,
+  ): Promise<{ status: number; json: any; text: string; requestId: string }> {
     const res = await fetch(`${app!.proxyUrl}/v1/responses`, {
       method: "POST",
       headers: {
@@ -318,7 +322,7 @@ describe("/v1/responses context affinity through model groups", () => {
     } catch {
       json = undefined;
     }
-    return { status: res.status, json, text };
+    return { status: res.status, json, text, requestId: res.headers.get("x-aisix-request-id") ?? "" };
   }
 
   const userTurn = (text: string) => ({ type: "message", role: "user", content: text });
@@ -333,6 +337,13 @@ describe("/v1/responses context affinity through model groups", () => {
     const decoded = decodeResponseId(r.json.id);
     expect(decoded?.target).toBe(target);
     expect(decoded?.original).toMatch(new RegExp(`^resp_${served.account}_\\d+$`));
+    // Telemetry records the upstream's own id, not the tagged one.
+    const access = await waitForLogLine(
+      app,
+      (l) => l.includes("proxy request completed") && l.includes(`request_id="${r.requestId}"`),
+      "the access-log line for the tagged response",
+    );
+    expect(access).toContain(`provider_request_id="${decoded!.original}"`);
     const reasoning = r.json.output.find((i: any) => i.type === "reasoning");
     const enc = decodeEncrypted(reasoning.encrypted_content);
     expect(enc?.target).toBe(target);
