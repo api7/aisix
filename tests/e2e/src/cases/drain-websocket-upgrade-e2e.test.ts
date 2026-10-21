@@ -1,8 +1,15 @@
 import { randomBytes } from "node:crypto";
+import { createServer } from "node:http";
 import { connect, type AddressInfo, type Socket } from "node:net";
-import { WebSocketServer } from "ws";
+import { WebSocket as WsClient, WebSocketServer } from "ws";
 import { afterEach, describe, expect, test } from "vitest";
-import { spawnApp, waitForLogLine, type SpawnedApp } from "../harness/index.js";
+import {
+  metricDelta,
+  scrapeMetrics,
+  spawnApp,
+  waitForLogLine,
+  type SpawnedApp,
+} from "../harness/index.js";
 
 // E2E: a WebSocket upgrade (`/v1/realtime`) during a drain.
 //
@@ -12,6 +19,10 @@ import { spawnApp, waitForLogLine, type SpawnedApp } from "../harness/index.js";
 // and once upgraded the connection is no longer HTTP, so there is nothing
 // to retire. A client that checks the header — as RFC 6455 requires —
 // fails the handshake if the gateway rewrites it.
+//
+// An open session is in flight for the drain like a streaming response:
+// the drain does not end under it, and its usage is recorded when it
+// closes.
 
 const CALLER_PLAINTEXT = "sk-drain-ws-upgrade";
 const CALLER_KEY_ENV = "DRAIN_WS_UPGRADE_CALLER_KEY";
@@ -83,19 +94,54 @@ describe("drain: a WebSocket upgrade", () => {
   });
 
   async function start(minDrainSecs: number): Promise<{ app: SpawnedApp; port: number }> {
-    const upstream = new WebSocketServer({ host: "127.0.0.1", port: 0 });
-    await new Promise<void>((r) => upstream.on("listening", () => r()));
+    // One mock for both protocols: the Realtime WebSocket, which answers
+    // a client event with a usage-bearing `response.done`, and a chat
+    // completion that takes as long as its `delay=` marker asks.
+    const http = createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+      const marker: string = body.messages?.[0]?.content ?? "";
+      await new Promise((r) => setTimeout(r, Number(/delay=(\d+)/.exec(marker)?.[1] ?? 0)));
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          id: "cmpl",
+          object: "chat.completion",
+          created: 1,
+          model: "gpt-realtime-mock",
+          choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      );
+    });
+    const upstream = new WebSocketServer({ server: http });
+    upstream.on("connection", (socket) => {
+      socket.on("message", () =>
+        socket.send(
+          JSON.stringify({
+            type: "response.done",
+            response: {
+              usage: { input_tokens: 9, output_tokens: 4, input_token_details: { cached_tokens: 0 } },
+            },
+          }),
+        ),
+      );
+    });
+    await new Promise<void>((r) => http.listen(0, "127.0.0.1", () => r()));
     cleanup.push(
       () =>
         new Promise<void>((r) => {
           for (const c of upstream.clients) c.terminate();
-          upstream.close(() => r());
+          upstream.close();
+          http.closeAllConnections();
+          http.close(() => r());
         }),
     );
     const app = await spawnApp({
       // The drain phases are reported at INFO; the suite default is WARN.
       logLevel: "info",
-      resourcesFile: resources((upstream.address() as AddressInfo).port),
+      resourcesFile: resources((http.address() as AddressInfo).port),
       extraEnv: { [CALLER_KEY_ENV]: CALLER_PLAINTEXT },
       extra: { shutdown: { min_drain_secs: minDrainSecs } },
     });
@@ -131,6 +177,57 @@ describe("drain: a WebSocket upgrade", () => {
       expect(summarise(head), head).toEqual({ status: "101", connection: "upgrade" });
       // An upgraded session does not hold the drain, so nothing holds the
       // gateway once the handshake is answered.
+      await app.waitForExit(20_000);
+    },
+    60_000,
+  );
+  test(
+    "an open session holds the drain, and its usage is recorded when it closes",
+    async () => {
+      const { app, port } = await start(1);
+      const session = new WsClient(`ws://127.0.0.1:${port}/v1/realtime?model=${MODEL}`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      await new Promise<void>((resolve, reject) => {
+        session.once("open", () => resolve());
+        session.once("error", reject);
+      });
+      const before = await scrapeMetrics(app.metricsUrl);
+
+      app.signal("SIGTERM");
+      // Well past the one-second window: a drain that ignored the session
+      // would have ended by now.
+      await new Promise((r) => setTimeout(r, 3_000));
+      expect(app.output()).not.toContain("drain complete");
+
+      // A chat request still in flight keeps the drain — and with it the
+      // metrics listener — open after the session has closed, so the
+      // session's usage can be read off the scrape.
+      const held = fetch(`${app.proxyUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}`, "content-type": "application/json" },
+        body: JSON.stringify({ model: MODEL, messages: [{ role: "user", content: "delay=3000" }] }),
+      });
+      await new Promise((r) => setTimeout(r, 300));
+
+      const done = new Promise<void>((r) => session.once("message", () => r()));
+      session.send(JSON.stringify({ type: "response.create" }));
+      await done;
+      session.close();
+      await new Promise<void>((r) => session.once("close", () => r()));
+
+      let recorded = 0;
+      const deadline = Date.now() + 2_000;
+      while (Date.now() < deadline) {
+        const after = await scrapeMetrics(app.metricsUrl);
+        recorded = metricDelta(before, after, "aisix_llm_input_tokens_total");
+        if (recorded > 0) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      expect(recorded, "the session's input tokens on the scrape").toBe(9);
+
+      expect((await held).status).toBe(200);
+      await waitForLogLine(app, (l) => l.includes("drain complete"), "the drain to end", 10_000);
       await app.waitForExit(20_000);
     },
     60_000,

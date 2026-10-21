@@ -467,12 +467,12 @@ impl InFlightGuard {
 /// released there would read zero while SSE bytes are still flowing and
 /// let the shutdown coordinator close the listener under exactly the
 /// traffic the drain window exists to protect.
-struct DrainGuard {
+pub(crate) struct DrainGuard {
     livez: std::sync::Arc<health::LivezState>,
 }
 
 impl DrainGuard {
-    fn new(livez: std::sync::Arc<health::LivezState>) -> Self {
+    pub(crate) fn new(livez: std::sync::Arc<health::LivezState>) -> Self {
         livez.enter();
         Self { livez }
     }

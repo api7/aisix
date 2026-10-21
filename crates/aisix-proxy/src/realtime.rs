@@ -275,10 +275,17 @@ pub(crate) async fn realtime(
             // inherited — without it the session's guardrail checks log
             // without a `request_id` (AISIX-Cloud#1060).
             let span = tracing::Span::current();
+            // The session is in flight for the drain exactly like a
+            // streaming response, so a shutdown waits for it. Taken here,
+            // while the request's own guard is still held, and released
+            // only after `run_session` has emitted the session's
+            // UsageEvent, so the usage sender cannot stop between the two.
+            let in_flight = crate::DrainGuard::new(state.livez.clone());
             ws.protocols(["realtime"]).on_upgrade(move |socket| {
                 use tracing::Instrument as _;
                 async move {
                     run_session(state2, prep, socket, client2, request_id, started).await;
+                    drop(in_flight);
                 }
                 .instrument(span)
             })
