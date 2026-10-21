@@ -710,6 +710,8 @@ struct SessionUsage {
     /// Summed across the session's usage frames, `None` where none
     /// reported the modality.
     modality: aisix_gateway::ModalityTokens,
+    /// The upstream's own `total_tokens` across the usage frames.
+    upstream_total: crate::usage_attr::ReportedTotalSum,
 }
 
 impl SessionUsage {
@@ -726,8 +728,11 @@ impl SessionUsage {
         match v.get("type").and_then(Value::as_str) {
             Some("response.done") => {
                 let usage = &v["response"]["usage"];
-                self.input_tokens += usage["input_tokens"].as_u64().unwrap_or(0);
-                self.output_tokens += usage["output_tokens"].as_u64().unwrap_or(0);
+                let input = usage["input_tokens"].as_u64().unwrap_or(0);
+                let output = usage["output_tokens"].as_u64().unwrap_or(0);
+                self.input_tokens += input;
+                self.output_tokens += output;
+                self.upstream_total.add(usage, input + output > 0);
                 self.cached_tokens += usage["input_token_details"]["cached_tokens"]
                     .as_u64()
                     .unwrap_or(0);
@@ -744,8 +749,11 @@ impl SessionUsage {
                 // (LiteLLM `_capture_transcription_usage`).
                 let usage = &v["usage"];
                 if usage.get("type").and_then(Value::as_str) == Some("tokens") {
-                    self.input_tokens += usage["input_tokens"].as_u64().unwrap_or(0);
-                    self.output_tokens += usage["output_tokens"].as_u64().unwrap_or(0);
+                    let input = usage["input_tokens"].as_u64().unwrap_or(0);
+                    let output = usage["output_tokens"].as_u64().unwrap_or(0);
+                    self.input_tokens += input;
+                    self.output_tokens += output;
+                    self.upstream_total.add(usage, input + output > 0);
                     self.modality = self.modality.saturating_add(
                         &aisix_gateway::ModalityTokens::from_openai_details(
                             usage.get("input_token_details"),
@@ -1141,6 +1149,7 @@ async fn run_session(
         requested_model_id: model_entry.id.clone(),
         prompt_tokens: usage.input_tokens.min(u32::MAX as u64) as u32,
         completion_tokens: usage.output_tokens.min(u32::MAX as u64) as u32,
+        total_tokens: usage.upstream_total.recorded(),
         cached_prompt_tokens: usage.cached_tokens.min(u32::MAX as u64) as u32,
         modality_tokens: usage.modality,
         status_code: close_status,

@@ -815,6 +815,7 @@ pub fn embed_usage_into(usage: Option<OpenAiEmbedUsage>) -> EmbeddingUsage {
     EmbeddingUsage {
         prompt_tokens,
         total_tokens,
+        upstream_total_tokens: total_tokens,
         source,
     }
 }

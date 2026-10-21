@@ -375,6 +375,47 @@ pub(crate) fn total_tokens_with_cache(
         + u64::from(cache_read_tokens)
 }
 
+/// The `total_tokens` a JSON `usage` object reports, verbatim — the value
+/// `UsageEvent::total_tokens` records (`UsageStats::upstream_total_tokens`).
+/// `None` when the object carries none: the event leaves the field unset
+/// then, and is never given a total summed here.
+pub(crate) fn reported_total_tokens(usage: Option<&serde_json::Value>) -> Option<u32> {
+    usage
+        .and_then(|u| u.get("total_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| n.min(u64::from(u32::MAX)) as u32)
+}
+
+/// The upstream total of a usage record built from several reports (a
+/// realtime session's frames, a batch's output lines): their sum, standing
+/// only while every report that counted tokens carried a total.
+#[derive(Debug, Default)]
+pub(crate) struct ReportedTotalSum {
+    sum: u64,
+    unreported: bool,
+}
+
+impl ReportedTotalSum {
+    /// Fold one report in. A report that counted no tokens (a cancelled
+    /// response's empty usage) neither adds nor breaks the total.
+    pub(crate) fn add(&mut self, usage: &serde_json::Value, counted_tokens: bool) {
+        match reported_total_tokens(Some(usage)) {
+            Some(total) => self.sum += u64::from(total),
+            None if counted_tokens => self.unreported = true,
+            None => {}
+        }
+    }
+
+    /// The value the usage event records; 0 (unset) without a total.
+    pub(crate) fn recorded(&self) -> u32 {
+        if self.unreported {
+            0
+        } else {
+            self.sum.min(u64::from(u32::MAX)) as u32
+        }
+    }
+}
+
 /// The `model` metric label for a request whose client-supplied `model`
 /// field never resolved to a configured model (e.g. model-not-found). See
 /// [`metric_model_label`].
@@ -1207,6 +1248,25 @@ fn attach_gateway_embedding_audit(event: &mut UsageEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summed_upstream_total_stands_only_while_every_counting_report_carried_one() {
+        let with = |n: u64| serde_json::json!({ "input_tokens": 1, "total_tokens": n });
+        let without = serde_json::json!({ "input_tokens": 1 });
+
+        let mut all = ReportedTotalSum::default();
+        all.add(&with(4), true);
+        all.add(&with(6), true);
+        // A cancelled response's empty usage counted nothing.
+        all.add(&serde_json::Value::Null, false);
+        assert_eq!(all.recorded(), 10);
+
+        let mut gap = ReportedTotalSum::default();
+        gap.add(&with(4), true);
+        gap.add(&without, true);
+        gap.add(&with(6), true);
+        assert_eq!(gap.recorded(), 0);
+    }
 
     #[tokio::test]
     async fn terminal_event_receives_the_bounded_gateway_embedding_audit_once() {

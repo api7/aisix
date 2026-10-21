@@ -1737,7 +1737,7 @@ fn probe_json(body: &[u8]) -> JsonProbe {
 enum RawUsageShape {
     /// Cohere-style rerank: top-level `query` beside a `documents` array
     /// (Cohere, Jina, DashScope's compatible rerank). Usage is read exactly
-    /// as `/v1/rerank` reads it ([`crate::rerank::rerank_prompt_tokens`]).
+    /// as `/v1/rerank` reads it ([`crate::rerank::rerank_usage`]).
     Rerank,
     /// DashScope native service envelope: `{model, input: {…}, parameters}`
     /// (native rerank, multimodal embedding, …). Usage per
@@ -3640,8 +3640,9 @@ fn buffered_usage(
 ) -> Option<PassthroughUsage> {
     match metering {
         Metering::Rerank => {
-            return crate::rerank::rerank_prompt_tokens(v).map(|prompt_tokens| PassthroughUsage {
-                prompt_tokens,
+            return crate::rerank::rerank_usage(v).map(|u| PassthroughUsage {
+                prompt_tokens: u.prompt_tokens,
+                upstream_total_tokens: u.upstream_total_tokens,
                 ..PassthroughUsage::default()
             })
         }
@@ -10451,17 +10452,26 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         let embeddings = br#"{"object":"list","data":[{"object":"embedding","embedding":[0.1]}],"usage":{"prompt_tokens":8,"total_tokens":8}}"#;
         assert_eq!(
             usage_for(PassthroughProtocol::OpenaiResponses, None, embeddings),
-            Some(usage_dims(8, 0))
+            Some(PassthroughUsage {
+                upstream_total_tokens: Some(8),
+                ..usage_dims(8, 0)
+            })
         );
         let total_only = br#"{"object":"list","data":[],"usage":{"total_tokens":6}}"#;
         assert_eq!(
             response_usage(Metering::Embeddings, total_only),
-            Some(usage_dims(6, 0))
+            Some(PassthroughUsage {
+                upstream_total_tokens: Some(6),
+                ..usage_dims(6, 0)
+            })
         );
         let image = br#"{"created":1,"data":[{"b64_json":"x"}],"usage":{"input_tokens":50,"output_tokens":4160,"total_tokens":4210}}"#;
         assert_eq!(
             response_usage(Metering::Images, image),
-            Some(usage_dims(50, 4160))
+            Some(PassthroughUsage {
+                upstream_total_tokens: Some(4210),
+                ..usage_dims(50, 4160)
+            })
         );
         // Behind the bare request envelope those bodies are identified as,
         // the identified protocol's parser cannot read them: no usage, as on

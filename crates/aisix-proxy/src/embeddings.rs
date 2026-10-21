@@ -267,6 +267,7 @@ pub async fn embeddings(
                     elapsed,
                     success.prompt_tokens,
                     success.usage_estimated,
+                    success.upstream_total_tokens,
                     &client,
                     success.redactions.clone(),
                     success.monitor_hits.clone(),
@@ -385,6 +386,8 @@ struct EmbedDispatchSuccess {
     /// True when `prompt_tokens` came from the local estimator because
     /// the upstream reported no usage (AISIX-Cloud#1074).
     usage_estimated: bool,
+    /// The upstream's own `usage.total_tokens`; 0 when it reported none.
+    upstream_total_tokens: u32,
     /// `true` when the dispatch produced a real 200 from the upstream
     /// (we have authoritative usage data to attribute). `false` for the
     /// 501-NotImplemented branch where no upstream call was made.
@@ -658,6 +661,7 @@ async fn dispatch(
                 ))
                 .await;
             let provider_label = provider.clone();
+            let upstream_total_tokens = embed_resp.usage.upstream_total_tokens;
             // Content capture (#700): the full response JSON, vectors
             // included (LiteLLM parity); CapturedContent::new truncates to
             // the cap.
@@ -681,6 +685,7 @@ async fn dispatch(
                 monitor_hits: monitor_hits.clone(),
                 prompt_tokens,
                 usage_estimated,
+                upstream_total_tokens,
                 upstream_called: true,
                 captured_content,
             })
@@ -705,6 +710,7 @@ async fn dispatch(
                 monitor_hits: monitor_hits.clone(),
                 prompt_tokens: 0,
                 usage_estimated: false,
+                upstream_total_tokens: 0,
                 captured_content: None,
                 // No upstream call happened. The handler normally skips the
                 // event, except when guardrail attribution must survive.
@@ -789,7 +795,10 @@ pub(crate) fn embedding_usage_stats(body: &serde_json::Value) -> Option<aisix_ga
     let wire =
         aisix_provider_openai::wire::OpenAiEmbedUsage::deserialize(body.get("usage")?).ok()?;
     let usage = aisix_provider_openai::wire::embed_usage_into(Some(wire));
-    reported_prompt_tokens(&usage).map(|prompt| aisix_gateway::UsageStats::new(prompt, 0))
+    reported_prompt_tokens(&usage).map(|prompt| aisix_gateway::UsageStats {
+        upstream_total_tokens: usage.upstream_total_tokens,
+        ..aisix_gateway::UsageStats::new(prompt, 0)
+    })
 }
 
 /// Push one `UsageEvent` onto cp-api's telemetry sink **and** fan it
@@ -834,6 +843,7 @@ fn emit_usage_event(
     elapsed: Duration,
     prompt_tokens: u32,
     usage_estimated: bool,
+    upstream_total_tokens: u32,
     client: &ClientContext,
     // Per-detector PII mask counts (#932) applied to the input.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -877,6 +887,7 @@ fn emit_usage_event(
         requested_model: requested_model.to_string(),
         prompt_tokens,
         usage_estimated,
+        total_tokens: upstream_total_tokens,
         // Narrowed to the winning attempt's own latency below
         // (`apply_winning_attempt`) once a failover put earlier attempts
         // in front of it; they emitted their own events.
