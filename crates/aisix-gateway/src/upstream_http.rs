@@ -478,6 +478,12 @@ mod tests {
                 // The proxy environment: a WebSocket dial that opens its
                 // own socket reaches the upstream directly even where
                 // every other upstream call goes through HTTPS_PROXY.
+                "tokio_tungstenite::connect_async(",
+                "upstream_dial::connect(",
+                "the Realtime WebSocket must open its stream with `upstream_dial::connect` \
+                 so it follows the proxy environment",
+            ),
+            (
                 "connect_async_tls_with_config",
                 "upstream_dial::connect(",
                 "the Realtime WebSocket must open its stream with `upstream_dial::connect` \
