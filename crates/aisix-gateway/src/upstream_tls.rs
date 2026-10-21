@@ -550,25 +550,32 @@ fn root_store(tls: &TlsSettings) -> rustls::RootCertStore {
 
 // ─── AWS SDK (Bedrock) ───────────────────────────────────────────────
 
-/// The smithy builder [`aws_http_client`] starts from, carrying
-/// `upstream.pool_idle_timeout`.
+/// The smithy connector builder [`aws_http_client`] starts from,
+/// carrying `upstream.pool_idle_timeout` and the environment proxy.
 ///
 /// Split out because `build_https` returns an opaque `SharedHttpClient`:
-/// this builder is the last point at which a test can observe the value.
-/// Without the setting the SDK keeps hyper's own 90s idle lifetime —
+/// this builder is the last point at which a test can observe the values.
+/// Without the idle setting the SDK keeps hyper's own 90s idle lifetime —
 /// longer than a typical hop's idle timeout, which is exactly the stale
 /// pooled connection `upstream.pool_idle_timeout` exists to prevent.
 ///
-/// It is the only one of the `upstream` connection knobs this stack can
-/// take. `pool_max_idle_per_host` and the three `tcp_keepalive_*`
-/// settings have no entry point on the smithy builder or its connector
-/// builder, so they still stop at the reqwest clients — the same shape
-/// as the two `upstream.tls` knobs [`warn_unsupported_for_aws`] calls
-/// out, and worth knowing before assuming the whole block reaches here.
+/// The proxy is `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`,
+/// read through the same matcher reqwest uses for every other upstream
+/// client, so a host is proxied or not the same way on both stacks. The
+/// smithy default is no proxy at all, which sent Bedrock — and the STS
+/// and credential calls it makes on this client — straight past an
+/// egress proxy every other provider went through.
+///
+/// `pool_max_idle_per_host` and the three `tcp_keepalive_*` settings have
+/// no entry point on the smithy builder, so they still stop at the reqwest
+/// clients — the same shape as the two `upstream.tls` knobs
+/// [`warn_unsupported_for_aws`] calls out, and worth knowing before
+/// assuming the whole block reaches here.
 #[cfg(feature = "aws")]
-fn aws_pooled_builder() -> aws_smithy_http_client::Builder {
-    aws_smithy_http_client::Builder::new()
+fn aws_pooled_builder() -> aws_smithy_http_client::ConnectorBuilder {
+    aws_smithy_http_client::Connector::builder()
         .pool_idle_timeout(crate::upstream_http::config().pool_idle_timeout)
+        .proxy_config(aws_smithy_http_client::proxy::ProxyConfig::from_env())
 }
 
 /// The HTTP client every Bedrock SDK client is built on, carrying the
@@ -619,12 +626,22 @@ pub fn build_aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHt
         .build()
         .expect("TLS context from a bundle validated at boot");
 
-    aws_pooled_builder()
-        .tls_provider(tls::Provider::rustls(
-            tls::rustls_provider::CryptoMode::AwsLc,
-        ))
-        .tls_context(context)
-        .build_https()
+    // The connector-level builder, because the client-level one has no
+    // proxy setting. Built per connector-settings key and cached by the
+    // returned client, as `Builder::build_https` would.
+    aws_smithy_http_client::Builder::new().build_with_connector_fn(move |settings, components| {
+        let mut builder = aws_pooled_builder();
+        builder.set_connector_settings(settings.cloned());
+        if let Some(components) = components {
+            builder.set_sleep_impl(components.sleep_impl());
+        }
+        builder
+            .tls_provider(tls::Provider::rustls(
+                tls::rustls_provider::CryptoMode::AwsLc,
+            ))
+            .tls_context(context.clone())
+            .build()
+    })
 }
 
 /// Say out loud which `upstream.tls` knobs the AWS SDK stack cannot
