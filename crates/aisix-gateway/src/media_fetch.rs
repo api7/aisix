@@ -2,26 +2,22 @@
 //! the URL itself, so the bytes can travel inline instead.
 //!
 //! The URL is the caller's, and the download runs from inside the
-//! operator's network, so every address it connects to must be publicly
-//! routable. The name is resolved here, every address the answer holds is
-//! checked, and the connection goes to exactly those addresses — never to
-//! a second lookup that a rebinding name could answer differently. That
-//! holds for `http` and `https` alike, because the check lives in the
-//! client's resolver; the host name still rides `Host` and SNI. Redirects
-//! are followed by hand so each hop passes the same check.
-//! `upstream.media_fetch.allowed_hosts` is the only way past it.
+//! operator's network, so each hop goes through `outbound.ssrf_protection`
+//! ([`crate::ssrf`]); redirects are followed by hand so every hop passes
+//! the same check. Otherwise it is an ordinary upstream request: the
+//! environment proxies and `upstream.tls` certificate verification apply,
+//! but never the upstream client identity.
 
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use base64::Engine as _;
 use futures::StreamExt;
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{header, Url};
 use tokio::time::Instant;
 
@@ -31,6 +27,7 @@ use crate::content_part::{
     display_uri, mime_type_from_path, normalize_mime_type, parse_part, ContentPart, Media,
     MediaSource,
 };
+use crate::ssrf::{Refusal, Route, SsrfProtection};
 
 /// Attempts per URL on a timeout or transport failure. An HTTP error
 /// status is an answer and is not retried.
@@ -44,90 +41,34 @@ const MAX_CONCURRENT: usize = 8;
 #[derive(Debug, Clone)]
 pub struct MediaFetchSettings {
     enabled: bool,
-    allowed_hosts: Vec<AllowedHost>,
     max_bytes: u64,
+    /// `outbound.ssrf_protection`, which every hop goes through.
+    ssrf: SsrfProtection,
     /// `proxy.request_body_limit_bytes`: the inbound body and everything
     /// downloaded for the request share it. `0` is no limit.
     request_body_limit_bytes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AllowedHost {
-    host: String,
-    port: Option<u16>,
-}
-
 impl MediaFetchSettings {
-    pub fn from_config(cfg: &aisix_core::config::MediaFetchConfig) -> Result<Self, String> {
-        let allowed_hosts = cfg
-            .allowed_hosts
-            .iter()
-            .map(|entry| {
-                parse_allowed_host(entry).ok_or_else(|| {
-                    format!(
-                        "upstream.media_fetch.allowed_hosts: {entry:?} is not a host or \
-                         host:port (write an IPv6 address with a port as [addr]:port)"
-                    )
-                })
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(Self {
+    pub fn new(cfg: &aisix_core::config::MediaFetchConfig, ssrf: SsrfProtection) -> Self {
+        Self {
             enabled: cfg.enabled,
-            allowed_hosts,
             max_bytes: cfg.max_bytes,
+            ssrf,
             request_body_limit_bytes: 0,
-        })
+        }
     }
-
-    fn allows(&self, host: &str, port: u16) -> bool {
-        self.allowed_hosts
-            .iter()
-            .any(|a| a.host == host && a.port.is_none_or(|p| p == port))
-    }
-}
-
-fn parse_allowed_host(entry: &str) -> Option<AllowedHost> {
-    let entry = entry.trim();
-    if entry.is_empty() || entry.contains(['/', '@', '?', '#']) {
-        return None;
-    }
-    let port = |p: &str| p.parse::<u16>().ok();
-    if let Some(rest) = entry.strip_prefix('[') {
-        let (addr, tail) = rest.split_once(']')?;
-        let host = addr.parse::<Ipv6Addr>().ok()?.to_string();
-        let port = match tail {
-            "" => None,
-            tail => Some(port(tail.strip_prefix(':')?)?),
-        };
-        return Some(AllowedHost { host, port });
-    }
-    if let Ok(v6) = entry.parse::<Ipv6Addr>() {
-        return Some(AllowedHost {
-            host: v6.to_string(),
-            port: None,
-        });
-    }
-    let (host, port) = match entry.rsplit_once(':') {
-        Some((host, p)) => (host, Some(port(p)?)),
-        None => (entry, None),
-    };
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    (!host.is_empty()).then_some(AllowedHost { host, port })
 }
 
 static SETTINGS: OnceLock<MediaFetchSettings> = OnceLock::new();
 
 /// Install `upstream.media_fetch`, with `proxy.request_body_limit_bytes`
-/// as the per-request total. Called once during boot; fails on an
-/// `allowed_hosts` entry that does not parse.
-pub fn init(
-    cfg: &aisix_core::config::MediaFetchConfig,
-    request_body_limit_bytes: usize,
-) -> Result<(), String> {
-    let mut settings = MediaFetchSettings::from_config(cfg)?;
+/// as the per-request total. Called once during boot, after
+/// [`crate::ssrf::init`].
+pub fn init(cfg: &aisix_core::config::MediaFetchConfig, request_body_limit_bytes: usize) {
+    let mut settings = MediaFetchSettings::new(cfg, crate::ssrf::settings().clone());
     settings.request_body_limit_bytes = request_body_limit_bytes;
     let _ = SETTINGS.set(settings);
-    Ok(())
 }
 
 /// What one request may still hold: its inbound body plus every byte
@@ -169,7 +110,7 @@ impl RequestBudget {
 
 fn settings() -> &'static MediaFetchSettings {
     SETTINGS.get_or_init(|| {
-        MediaFetchSettings::from_config(&Default::default()).expect("the default config parses")
+        MediaFetchSettings::new(&Default::default(), crate::ssrf::settings().clone())
     })
 }
 
@@ -498,8 +439,8 @@ async fn download(
 ) -> Result<(Vec<u8>, Option<String>, Url), Failure> {
     let mut current = url.clone();
     for hop in 0..=MAX_REDIRECTS {
-        let guarded = check_target(&current, settings)?;
-        let resp = client(guarded)?
+        let route = settings.ssrf.route(&current).await?;
+        let resp = client(route)?
             .get(current.clone())
             .send()
             .await
@@ -577,93 +518,35 @@ async fn read_capped(
     }
 }
 
-/// Whether `url` may be requested, and through which client: `true` for
-/// the one whose resolver refuses non-public addresses, `false` for an
-/// allow-listed host.
-fn check_target(url: &Url, settings: &MediaFetchSettings) -> Result<bool, Failure> {
-    let (host, ip) = match url.host() {
-        Some(url::Host::Domain(d)) => (d.trim_end_matches('.').to_ascii_lowercase(), None),
-        Some(url::Host::Ipv4(a)) => (a.to_string(), Some(IpAddr::V4(a))),
-        Some(url::Host::Ipv6(a)) => (a.to_string(), Some(IpAddr::V6(a))),
-        None => return Err(Failure::BadUrl),
+fn client(route: Route) -> Result<&'static reqwest::Client, Failure> {
+    static PINNED: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    static DIRECT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    static PROXIED: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    let cell = match route {
+        Route::Pinned => &PINNED,
+        Route::Direct => &DIRECT,
+        Route::Proxied => &PROXIED,
     };
-    let port = url.port_or_known_default().ok_or(Failure::BadUrl)?;
-    if settings.allows(&host, port) {
-        return Ok(false);
-    }
-    // The resolver never sees an address literal, so it is checked here.
-    if let Some(ip) = ip.filter(|ip| !is_public(*ip)) {
-        return Err(Failure::Blocked(ip));
-    }
-    Ok(true)
-}
-
-fn client(guarded: bool) -> Result<&'static reqwest::Client, Failure> {
-    static GUARDED: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
-    static ALLOWED: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
-    let cell = if guarded { &GUARDED } else { &ALLOWED };
     cell.get_or_init(|| {
-        crate::upstream_http::caller_chosen_peer_client_builder()
-            .dns_resolver(Arc::new(MediaResolver { guarded }))
-            .redirect(reqwest::redirect::Policy::none())
-            // A proxy would resolve the name itself, past the check.
-            .no_proxy()
-            .build()
-            .map_err(|e| e.to_string())
+        let b = crate::upstream_http::caller_chosen_peer_client_builder()
+            .redirect(reqwest::redirect::Policy::none());
+        // The route already decided whether a proxy takes the URL. The
+        // proxied client keeps the shared resolver: it only resolves the
+        // proxy's own host.
+        let b = match route {
+            Route::Pinned => b
+                .dns_resolver(crate::ssrf::direct_resolver(true))
+                .no_proxy(),
+            Route::Direct => b
+                .dns_resolver(crate::ssrf::direct_resolver(false))
+                .no_proxy(),
+            Route::Proxied => b,
+        };
+        b.build().map_err(|e| e.to_string())
     })
     .as_ref()
     .map_err(|_| Failure::Transport)
 }
-
-/// Resolves a name and, when `guarded`, refuses the whole answer if any
-/// address in it is not publicly routable. The client connects only to
-/// the addresses returned here.
-struct MediaResolver {
-    guarded: bool,
-}
-
-impl Resolve for MediaResolver {
-    fn resolve(&self, name: Name) -> Resolving {
-        let guarded = self.guarded;
-        Box::pin(async move {
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((name.as_str(), 0))
-                .await
-                .map_err(|_| Box::new(Unresolvable) as Box<dyn std::error::Error + Send + Sync>)?
-                .collect();
-            if addrs.is_empty() {
-                return Err(Box::new(Unresolvable) as _);
-            }
-            if guarded {
-                if let Some(ip) = addrs.iter().map(SocketAddr::ip).find(|ip| !is_public(*ip)) {
-                    return Err(Box::new(BlockedAddress(ip)) as _);
-                }
-            }
-            Ok(Box::new(addrs.into_iter()) as Addrs)
-        })
-    }
-}
-
-#[derive(Debug)]
-struct BlockedAddress(IpAddr);
-
-impl std::fmt::Display for BlockedAddress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} is not a publicly routable address", self.0)
-    }
-}
-
-impl std::error::Error for BlockedAddress {}
-
-#[derive(Debug)]
-struct Unresolvable;
-
-impl std::fmt::Display for Unresolvable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the host does not resolve")
-    }
-}
-
-impl std::error::Error for Unresolvable {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Failure {
@@ -693,8 +576,8 @@ impl Failure {
             Self::Blocked(_) => {
                 return format!(
                     "the gateway does not download the media URL {shown}: its host is not \
-                     a publicly routable address. To allow it, an operator adds the host to \
-                     upstream.media_fetch.allowed_hosts"
+                     a publicly routable address. {}",
+                    Refusal::blocked_hint()
                 );
             }
             Self::UnknownType => {
@@ -725,84 +608,24 @@ impl Failure {
     }
 }
 
+impl From<Refusal> for Failure {
+    fn from(r: Refusal) -> Self {
+        match r {
+            Refusal::BadUrl => Self::BadUrl,
+            Refusal::Blocked(ip) => Self::Blocked(ip),
+            Refusal::Unresolvable => Self::Unresolvable,
+        }
+    }
+}
+
 fn classify(err: reqwest::Error) -> Failure {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&err);
-    while let Some(e) = source {
-        if let Some(BlockedAddress(ip)) = e.downcast_ref::<BlockedAddress>() {
-            return Failure::Blocked(*ip);
-        }
-        if e.downcast_ref::<Unresolvable>().is_some() {
-            return Failure::Unresolvable;
-        }
-        source = e.source();
+    if let Some(refusal) = Refusal::from_error(&err) {
+        return refusal.into();
     }
     if err.is_timeout() {
         Failure::Timeout
     } else {
         Failure::Transport
-    }
-}
-
-/// Whether an address is one the download may reach without an
-/// allow-list entry: globally routable unicast, and not a cloud
-/// platform's own service address.
-fn is_public(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_public_v4(v4),
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => is_public_v4(v4),
-            None => is_public_v6(v6),
-        },
-    }
-}
-
-fn is_public_v4(a: Ipv4Addr) -> bool {
-    let [o0, o1, o2, _] = a.octets();
-    let blocked = o0 == 0 // "this network", incl. 0.0.0.0
-        || a.is_loopback()
-        || a.is_private()
-        || (o0 == 100 && (o1 & 0xc0) == 64) // CGNAT 100.64.0.0/10
-        || a.is_link_local() // 169.254.0.0/16, incl. instance metadata
-        || (o0 == 192 && o1 == 0 && o2 == 0) // IETF protocol assignments
-        || a.is_documentation()
-        || (o0 == 198 && (o1 & 0xfe) == 18) // benchmarking 198.18.0.0/15
-        || (o0 == 192 && o1 == 88 && o2 == 99) // 6to4 relay anycast
-        || a.is_multicast()
-        || o0 >= 240 // reserved, incl. broadcast
-        || a == Ipv4Addr::new(168, 63, 129, 16); // Azure platform endpoint
-    !blocked
-}
-
-fn is_public_v6(a: Ipv6Addr) -> bool {
-    let s = a.segments();
-    let embedded = |hi: u16, lo: u16| Ipv4Addr::from(((hi as u32) << 16) | lo as u32);
-    if a.is_unspecified() || a.is_loopback() || a.is_multicast() {
-        return false;
-    }
-    match s {
-        // IPv4-compatible (deprecated) ::/96
-        [0, 0, 0, 0, 0, 0, _, _] => false,
-        // NAT64 64:ff9b::/96 reaches the IPv4 address it embeds.
-        [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] => is_public_v4(embedded(hi, lo)),
-        // Local-use NAT64 64:ff9b:1::/48
-        [0x64, 0xff9b, 1, ..] => false,
-        // Discard-only 100::/64
-        [0x100, 0, 0, 0, ..] => false,
-        // IETF protocol assignments 2001::/23 (Teredo included), documentation 2001:db8::/32
-        [0x2001, b, ..] if b < 0x200 || b == 0xdb8 => false,
-        // 6to4 2002::/16 reaches the IPv4 address it embeds.
-        [0x2002, hi, lo, ..] => is_public_v4(embedded(hi, lo)),
-        // Documentation 3fff::/20
-        [0x3fff, b, ..] if b < 0x1000 => false,
-        // Unique-local fc00::/7, link-local fe80::/10, site-local fec0::/10
-        [first, ..]
-            if (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80
-                || (first & 0xffc0) == 0xfec0 =>
-        {
-            false
-        }
-        _ => true,
     }
 }
 
@@ -847,6 +670,8 @@ fn sniff(b: &[u8]) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     async fn dl(
@@ -875,72 +700,6 @@ mod tests {
         assert_eq!(roomy.used.load(Ordering::Relaxed), 15);
     }
 
-    #[test]
-    fn only_globally_routable_addresses_are_public() {
-        for blocked in [
-            "0.0.0.0",
-            "127.0.0.1",
-            "10.1.2.3",
-            "172.16.0.1",
-            "192.168.1.1",
-            "100.64.0.1",
-            "100.127.255.255",
-            "169.254.169.254",
-            "192.0.0.8",
-            "192.0.2.1",
-            "198.18.0.1",
-            "198.51.100.1",
-            "203.0.113.1",
-            "224.0.0.1",
-            "255.255.255.255",
-            "168.63.129.16",
-            "::",
-            "::1",
-            "::ffff:127.0.0.1",
-            "::ffff:169.254.169.254",
-            "64:ff9b::a00:1",
-            "2002:a00:1::",
-            "2001:db8::1",
-            "fd00::1",
-            "fe80::1",
-            "ff02::1",
-        ] {
-            let ip: IpAddr = blocked.parse().unwrap();
-            assert!(!is_public(ip), "{blocked} must be refused");
-        }
-        for public in [
-            "1.1.1.1",
-            "8.8.8.8",
-            "100.128.0.1",
-            "::ffff:8.8.8.8",
-            "2606:4700:4700::1111",
-            "64:ff9b::808:808",
-        ] {
-            let ip: IpAddr = public.parse().unwrap();
-            assert!(is_public(ip), "{public} must be allowed");
-        }
-    }
-
-    #[test]
-    fn allowed_hosts_match_host_and_optional_port() {
-        let settings = MediaFetchSettings::from_config(&aisix_core::config::MediaFetchConfig {
-            allowed_hosts: vec![
-                "Media.Internal".into(),
-                "127.0.0.1:9000".into(),
-                "[fd00::1]:8080".into(),
-            ],
-            ..Default::default()
-        })
-        .unwrap();
-        assert!(settings.allows("media.internal", 443));
-        assert!(settings.allows("127.0.0.1", 9000));
-        assert!(!settings.allows("127.0.0.1", 9001));
-        assert!(settings.allows("fd00::1", 8080));
-        for bad in ["", "http://x", "a:b", "[::1", "user@host"] {
-            assert!(parse_allowed_host(bad).is_none(), "{bad:?}");
-        }
-    }
-
     /// A one-shot HTTP server on loopback answering every request with
     /// `response`.
     async fn serve(response: &'static [u8]) -> u16 {
@@ -958,12 +717,22 @@ mod tests {
     }
 
     fn with_allowed(hosts: &[&str]) -> MediaFetchSettings {
-        MediaFetchSettings::from_config(&aisix_core::config::MediaFetchConfig {
+        MediaFetchSettings::new(
+            &aisix_core::config::MediaFetchConfig {
+                max_bytes: 16,
+                ..Default::default()
+            },
+            ssrf(true, hosts),
+        )
+    }
+
+    fn ssrf(enabled: bool, hosts: &[&str]) -> SsrfProtection {
+        SsrfProtection::from_config(&aisix_core::config::SsrfProtectionConfig {
+            enabled,
             allowed_hosts: hosts.iter().map(|h| h.to_string()).collect(),
-            max_bytes: 16,
-            ..Default::default()
         })
         .unwrap()
+        .without_proxies()
     }
 
     #[tokio::test]
@@ -994,6 +763,45 @@ mod tests {
         )
         .await;
         assert!(matches!(got, Err(Failure::Blocked(_))), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn with_protection_off_a_private_address_is_fetched_and_redirects_stay_capped() {
+        let port =
+            serve(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\nPNG!").await;
+        let off = MediaFetchSettings::new(&Default::default(), ssrf(false, &[]));
+        for url in [
+            format!("http://localhost:{port}/a.png"),
+            format!("http://127.0.0.1:{port}/a.png"),
+        ] {
+            let (body, ..) = dl(&Url::parse(&url).unwrap(), &off).await.unwrap();
+            assert_eq!(body, b"PNG!", "{url}");
+        }
+        let redirector = serve_self_redirect().await;
+        let got = dl(
+            &Url::parse(&format!("http://127.0.0.1:{redirector}/a")).unwrap(),
+            &off,
+        )
+        .await;
+        assert_eq!(got.map(|_| ()), Err(Failure::TooManyRedirects));
+    }
+
+    /// A loopback server that redirects every request back to itself.
+    async fn serve_self_redirect() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{port}/again\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        );
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+        port
     }
 
     #[tokio::test]
@@ -1071,14 +879,10 @@ mod tests {
     /// charged to the end-to-end budget only.
     #[tokio::test]
     async fn every_part_naming_a_downloaded_url_gets_it_and_the_time_is_charged() {
-        init(
-            &aisix_core::config::MediaFetchConfig {
-                allowed_hosts: vec!["127.0.0.1".into()],
-                ..Default::default()
-            },
-            0,
-        )
-        .unwrap();
+        let _ = SETTINGS.set(MediaFetchSettings::new(
+            &Default::default(),
+            ssrf(true, &["127.0.0.1"]),
+        ));
         let port = serve(b"HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: 4\r\nconnection: close\r\n\r\nPNG!").await;
         let url = format!("http://127.0.0.1:{port}/img");
         let req: ChatFormat = serde_json::from_value(serde_json::json!({

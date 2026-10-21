@@ -69,6 +69,10 @@ pub struct Config {
     /// see [`UpstreamConfig`].
     #[serde(default)]
     pub upstream: UpstreamConfig,
+    /// Rules for outbound requests to URLs an API caller supplied — see
+    /// [`OutboundConfig`].
+    #[serde(default)]
+    pub outbound: OutboundConfig,
     /// Connection-layer tuning for the inbound side: how long an idle
     /// client connection is held, and how often a stalled SSE response
     /// emits a heartbeat — see [`DownstreamConfig`].
@@ -1869,9 +1873,8 @@ pub struct BedrockUpstreamConfig {
 /// downloads it and sends the bytes inline. An upstream that reads the URL
 /// itself still gets the URL.
 ///
-/// The download refuses any address that is not publicly routable
-/// (loopback, private, link-local, cloud metadata, …); `allowed_hosts` is
-/// the only way past that check.
+/// Which addresses the download may reach is
+/// [`OutboundConfig::ssrf_protection`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields, default)]
@@ -1879,12 +1882,6 @@ pub struct MediaFetchConfig {
     /// `false` refuses a media URL the target upstream cannot read with a
     /// 400 instead of downloading it.
     pub enabled: bool,
-    /// Hosts the download may reach even though they resolve to a
-    /// non-public address, as `host` (any port) or `host:port`; an IPv6
-    /// address is written in brackets when it carries a port
-    /// (`[fd00::1]:8080`). The host is still resolved once and the
-    /// connection pinned to that answer.
-    pub allowed_hosts: Vec<String>,
     /// Largest body accepted per URL, in bytes. A larger download is
     /// abandoned and the request refused with a 400.
     pub max_bytes: u64,
@@ -1894,8 +1891,54 @@ impl Default for MediaFetchConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            allowed_hosts: Vec::new(),
             max_bytes: 50 * 1024 * 1024,
+        }
+    }
+}
+
+/// Outbound requests to a URL an API caller supplied, as opposed to one an
+/// operator configured. Today that is the media download
+/// (`upstream.media_fetch`). Configured URLs — a provider key's
+/// `api_base`, guardrail, MCP and A2A endpoints, JWKS, exporters — are not
+/// governed by it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields, default)]
+pub struct OutboundConfig {
+    /// Server-side request forgery protection — see
+    /// [`SsrfProtectionConfig`].
+    pub ssrf_protection: SsrfProtectionConfig,
+}
+
+/// Keeps a caller-supplied URL from reaching the operator's own network.
+///
+/// On, every address such a request connects to must be publicly routable
+/// (not loopback, private, link-local, CGNAT, cloud metadata, benchmarking
+/// `198.18.0.0/15`, …). A host name is resolved and every address in the
+/// answer checked; a direct connection goes only to those addresses, and
+/// each redirect hop is checked the same way. When an `HTTP(S)_PROXY`
+/// applies to the URL, the name is resolved and checked the same way
+/// before the request is handed to the proxy, which then resolves it
+/// again itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields, default)]
+pub struct SsrfProtectionConfig {
+    /// `false` turns the address check off entirely: the request is an
+    /// ordinary fetch and `allowed_hosts` is ignored.
+    pub enabled: bool,
+    /// Hosts a request may reach even though they resolve to a
+    /// non-public address, as `host` (any port) or `host:port`; an IPv6
+    /// address is written in brackets when it carries a port
+    /// (`[fd00::1]:8080`).
+    pub allowed_hosts: Vec<String>,
+}
+
+impl Default for SsrfProtectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_hosts: Vec::new(),
         }
     }
 }
@@ -2095,7 +2138,7 @@ impl Default for ShutdownConfig {
 /// than handed to a root struct that rejects unknown fields.
 /// `config_top_level_keys_match_the_struct` fails the build when a field
 /// is added or renamed without this list following.
-const TOP_LEVEL_ENV_KEYS: [&str; 12] = [
+const TOP_LEVEL_ENV_KEYS: [&str; 13] = [
     "admin",
     "bedrock_endpoint_url",
     "cache",
@@ -2103,6 +2146,7 @@ const TOP_LEVEL_ENV_KEYS: [&str; 12] = [
     "etcd",
     "managed",
     "observability",
+    "outbound",
     "proxy",
     "ratelimit",
     "resources_file",
@@ -2231,7 +2275,7 @@ const ENV_LIST_PARSE_KEYS: &[&str] = &[
     "cache.redis.sentinels",
     "ratelimit.redis.nodes",
     "ratelimit.redis.sentinels",
-    "upstream.media_fetch.allowed_hosts",
+    "outbound.ssrf_protection.allowed_hosts",
 ];
 
 impl Config {
@@ -5170,6 +5214,7 @@ observability:
             "cache": {},
             "ratelimit": {},
             "upstream": {"tls": {}},
+            "outbound": {},
             "downstream": {},
             "shutdown": {},
             "managed": {},

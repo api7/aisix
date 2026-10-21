@@ -38,6 +38,7 @@ pub mod hub;
 pub mod media_fetch;
 pub mod response_tap;
 pub mod sse;
+pub mod ssrf;
 pub mod structured_output;
 pub mod tool_calls;
 pub mod upstream_headers;

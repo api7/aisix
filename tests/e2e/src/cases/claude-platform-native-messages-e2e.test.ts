@@ -318,10 +318,8 @@ describe("Claude on Amazon Bedrock and Vertex AI on their own Messages routes", 
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-ak-secret",
       },
       extra: {
-        upstream: {
-          media_fetch: { allowed_hosts: [`localhost:${upstream.port}`] },
-          bedrock: { mantle_endpoint: upstream.baseUrl },
-        },
+        upstream: { bedrock: { mantle_endpoint: upstream.baseUrl } },
+        outbound: { ssrf_protection: { allowed_hosts: [`localhost:${upstream.port}`] } },
       },
     });
     const seed = new SeedClient(etcd, app.etcdPrefix);

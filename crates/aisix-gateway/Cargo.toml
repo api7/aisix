@@ -24,6 +24,9 @@ dashmap.workspace = true
 tracing.workspace = true
 base64.workspace = true
 url.workspace = true
+# The environment-proxy matcher reqwest itself uses, so `ssrf` knows which
+# caller-supplied URLs a proxy will take.
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 # Outbound TLS trust (upstream_tls): the non-reqwest outbound stacks need
 # the root store assembled directly, so the rustls side is a direct dep.
 rustls.workspace = true

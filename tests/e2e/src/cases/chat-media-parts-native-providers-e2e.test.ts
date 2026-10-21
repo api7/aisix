@@ -1,5 +1,11 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createServer, type Server } from "node:http";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { createServer, request as httpRequest, type Server } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
+import { connect as netConnect } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -17,9 +23,11 @@ import {
 // reference where the upstream reads that URL itself; otherwise the gateway
 // downloads it and sends the bytes inline. The download reaches only
 // publicly routable addresses unless the host is in
-// `upstream.media_fetch.allowed_hosts`: the media server below listens on
-// loopback, so `localhost:<port>` is allow-listed and `127.0.0.1:<port>`,
-// the same server, is not.
+// `outbound.ssrf_protection.allowed_hosts` or that protection is off: the
+// media server below listens on loopback, so `localhost:<port>` is
+// allow-listed and `127.0.0.1:<port>`, the same server, is not. Like any
+// other upstream request, the download goes through an environment proxy
+// and follows `upstream.tls`.
 //
 // Reference:
 //   - <https://platform.openai.com/docs/api-reference/chat/create>
@@ -184,9 +192,8 @@ describe("chat media content parts → native provider media shapes", () => {
     media = await startMediaServer();
     app = await spawnApp({
       extra: {
-        upstream: {
-          media_fetch: { allowed_hosts: [`localhost:${media.port}`], max_bytes: MAX_BYTES },
-        },
+        upstream: { media_fetch: { max_bytes: MAX_BYTES } },
+        outbound: { ssrf_protection: { allowed_hosts: [`localhost:${media.port}`] } },
       },
     });
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -606,13 +613,14 @@ describe("chat media content parts → native provider media shapes", () => {
     for (const model of ["media-nova", "media-bedrock-claude", "media-vertex-claude", "media-claude", "media-gemini"]) {
       const message = await refused(model, user(unlisted("/cat.png")));
       expect(message).toMatch(/^messages\[0\]\.content\[1\]: /);
-      expect(message).toContain("upstream.media_fetch.allowed_hosts");
+      expect(message).toContain("outbound.ssrf_protection.allowed_hosts");
+      expect(message).toContain("outbound.ssrf_protection.enabled");
     }
     // Refused before any request left the gateway.
     expect(hits("/cat.png")).toBe(before);
 
     expect(await refused("media-nova", user(allowed("/to-private.png")))).toContain(
-      "upstream.media_fetch.allowed_hosts",
+      "outbound.ssrf_protection.allowed_hosts",
     );
     const followed = await chat("media-nova", [text("hi"), image(allowed("/to-allowed.png"))]);
     expect(followed.messages[0].content).toContainEqual({
@@ -661,9 +669,8 @@ describe("chat media URLs with upstream.media_fetch.enabled: false", () => {
     media = await startMediaServer();
     app = await spawnApp({
       extra: {
-        upstream: {
-          media_fetch: { enabled: false, allowed_hosts: [`localhost:${media.port}`] },
-        },
+        upstream: { media_fetch: { enabled: false } },
+        outbound: { ssrf_protection: { allowed_hosts: [`localhost:${media.port}`] } },
       },
     });
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -742,7 +749,7 @@ describe("chat media downloads count against proxy.request_body_limit_bytes", ()
     media = await startMediaServer();
     app = await spawnApp({
       requestBodyLimitBytes: LIMIT,
-      extra: { upstream: { media_fetch: { allowed_hosts: [`localhost:${media.port}`] } } },
+      extra: { outbound: { ssrf_protection: { allowed_hosts: [`localhost:${media.port}`] } } },
     });
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
@@ -829,5 +836,302 @@ describe("chat media downloads count against proxy.request_body_limit_bytes", ()
     });
     expect(viaMessages.status, viaMessages.text).toBe(413);
     expect(JSON.parse(viaMessages.text).error.type).toBe("request_too_large");
+  });
+});
+
+/** A forward proxy on loopback: absolute-form `http://` requests are
+ * relayed, `CONNECT` is tunnelled. `seen` records each request line. */
+async function startForwardProxy(): Promise<{
+  url: string;
+  seen: string[];
+  close(): Promise<void>;
+}> {
+  const seen: string[] = [];
+  const server: Server = createServer((req, res) => {
+    seen.push(`${req.method} ${req.url}`);
+    const target = new URL(req.url ?? "");
+    const out = httpRequest(
+      {
+        host: target.hostname,
+        port: target.port,
+        path: `${target.pathname}${target.search}`,
+        method: req.method,
+        headers: req.headers,
+      },
+      (up) => {
+        res.writeHead(up.statusCode ?? 502, up.headers);
+        up.pipe(res);
+      },
+    );
+    out.on("error", () => res.destroy());
+    req.pipe(out);
+  });
+  server.on("connect", (req, client, head) => {
+    seen.push(`CONNECT ${req.url}`);
+    const [host, port] = (req.url ?? "").split(":");
+    const up = netConnect(Number(port), host, () => {
+      client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      up.write(head);
+      up.pipe(client);
+      client.pipe(up);
+    });
+    up.on("error", () => client.destroy());
+    client.on("error", () => up.destroy());
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  if (addr === null || typeof addr === "string") throw new Error("no port");
+  return {
+    url: `http://127.0.0.1:${addr.port}`,
+    seen,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+/** Serves `/cat.png` over https with a self-signed certificate for
+ * `localhost`, or `undefined` without openssl. */
+async function startHttpsMediaServer(): Promise<
+  { port: number; hits: () => number; close(): Promise<void> } | undefined
+> {
+  try {
+    execFileSync("openssl", ["version"], { stdio: "ignore" });
+  } catch {
+    return undefined;
+  }
+  const dir = mkdtempSync(join(tmpdir(), "aisix-media-tls-"));
+  execFileSync(
+    "openssl",
+    [
+      "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+      "-keyout", join(dir, "key.pem"), "-out", join(dir, "cert.pem"),
+      "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
+    ],
+    { stdio: "ignore" },
+  );
+  let hits = 0;
+  const server = createHttpsServer(
+    { key: readFileSync(join(dir, "key.pem")), cert: readFileSync(join(dir, "cert.pem")) },
+    (req, res) => {
+      hits += 1;
+      res.statusCode = req.url === "/cat.png" ? 200 : 404;
+      res.setHeader("content-type", "image/png");
+      res.end(PNG);
+    },
+  );
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  if (addr === null || typeof addr === "string") throw new Error("no port");
+  return {
+    port: addr.port,
+    hits: () => hits,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+/** A gateway with one Bedrock Nova model (which cannot read a media URL,
+ * so every URL is downloaded) and a caller allowed to use it. */
+async function spawnNovaGateway(
+  caller: string,
+  upstreamBase: string,
+  options: Parameters<typeof spawnApp>[0],
+): Promise<SpawnedApp> {
+  const etcd = new EtcdClient();
+  const app = await spawnApp(options);
+  const seed = new SeedClient(etcd, app.etcdPrefix);
+  const pk = await seed.createProviderKey({
+    display_name: `${caller}-bedrock-pk`,
+    provider: "bedrock",
+    adapter: "bedrock",
+    secret: JSON.stringify({
+      access_key_id: "AKIA-media-e2e",
+      secret_access_key: "sk-media-e2e",
+      region: "us-west-2",
+    }),
+    api_base: upstreamBase,
+  });
+  await seed.createModel({
+    display_name: `${caller}-nova`,
+    provider: "bedrock",
+    model_name: "amazon.nova-pro-v1:0",
+    provider_key_id: pk.id,
+  });
+  await seed.createApiKey({
+    key_hash: createHash("sha256").update(caller).digest("hex"),
+    allowed_models: [`${caller}-nova`],
+  });
+  await waitConfigPropagation(async () => {
+    const res = await fetch(`${app.proxyUrl}/v1/models`, {
+      headers: { authorization: `Bearer ${caller}` },
+    });
+    await res.text();
+    return res.status === 200;
+  });
+  return app;
+}
+
+async function chatWithImage(app: SpawnedApp, caller: string, url: string) {
+  const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${caller}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      model: `${caller}-nova`,
+      messages: [{ role: "user", content: [text("hi"), image(url)] }],
+    }),
+  });
+  return { status: res.status, text: await res.text() };
+}
+
+const NOVA_IMAGE = { image: { format: "png", source: { bytes: PNG_B64 } } };
+
+describe("chat media downloads with outbound.ssrf_protection.enabled: false", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: RecordingUpstream | undefined;
+  let media: MediaServer | undefined;
+  let etcdReachable = false;
+  const CALLER = "sk-media-ssrf-off";
+
+  beforeAll(async () => {
+    etcdReachable = await new EtcdClient().ping();
+    if (!etcdReachable) return;
+    upstream = await startUpstream();
+    media = await startMediaServer();
+    app = await spawnNovaGateway(CALLER, upstream.baseUrl, {
+      extra: { outbound: { ssrf_protection: { enabled: false } } },
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+    await media?.close();
+  });
+
+  test("a loopback address is downloaded like any other, directly and through a redirect", async (ctx) => {
+    if (!etcdReachable || !app || !upstream || !media) return ctx.skip();
+    for (const path of ["/cat.png", "/to-private.png"]) {
+      const before = upstream.received.length;
+      const res = await chatWithImage(app, CALLER, `http://127.0.0.1:${media.port}${path}`);
+      expect(res.status, res.text).toBe(200);
+      const sent = JSON.parse(upstream.received[before].body);
+      expect(sent.messages[0].content).toContainEqual(NOVA_IMAGE);
+    }
+  });
+});
+
+describe("chat media downloads go through the environment proxy", () => {
+  let upstream: RecordingUpstream | undefined;
+  let media: MediaServer | undefined;
+  let unlistedMedia: MediaServer | undefined;
+  let tlsMedia: Awaited<ReturnType<typeof startHttpsMediaServer>>;
+  let proxy: Awaited<ReturnType<typeof startForwardProxy>> | undefined;
+  let guarded: SpawnedApp | undefined;
+  let open: SpawnedApp | undefined;
+  let etcdReachable = false;
+  const GUARDED = "sk-media-proxy-guarded";
+  const OPEN = "sk-media-proxy-open";
+
+  beforeAll(async () => {
+    etcdReachable = await new EtcdClient().ping();
+    if (!etcdReachable) return;
+    upstream = await startUpstream();
+    media = await startMediaServer();
+    unlistedMedia = await startMediaServer();
+    tlsMedia = await startHttpsMediaServer();
+    proxy = await startForwardProxy();
+    // The provider upstream is on 127.0.0.1 and stays direct; every
+    // `localhost` URL is the proxy's.
+    const proxyEnv = {
+      HTTP_PROXY: proxy.url,
+      HTTPS_PROXY: proxy.url,
+      http_proxy: proxy.url,
+      https_proxy: proxy.url,
+      NO_PROXY: "127.0.0.1",
+      no_proxy: "127.0.0.1",
+    };
+    const allowed = [`localhost:${media.port}`];
+    if (tlsMedia) allowed.push(`localhost:${tlsMedia.port}`);
+    [guarded, open] = await Promise.all([
+      spawnNovaGateway(GUARDED, upstream.baseUrl, {
+        extraEnv: proxyEnv,
+        extra: {
+          // The https media server's certificate is self-signed.
+          upstream: { tls: { verify: false } },
+          outbound: { ssrf_protection: { allowed_hosts: allowed } },
+        },
+      }),
+      spawnNovaGateway(OPEN, upstream.baseUrl, {
+        extraEnv: proxyEnv,
+        extra: { outbound: { ssrf_protection: { enabled: false } } },
+      }),
+    ]);
+  });
+
+  afterAll(async () => {
+    await guarded?.exit();
+    await open?.exit();
+    await upstream?.close();
+    await media?.close();
+    await unlistedMedia?.close();
+    await tlsMedia?.close();
+    await proxy?.close();
+  });
+
+  const ready = (ctx: { skip: () => void }) => {
+    if (!etcdReachable || !guarded || !open || !upstream || !media || !unlistedMedia || !proxy) {
+      ctx.skip();
+      return false;
+    }
+    return true;
+  };
+
+  test("an allow-listed http:// host is fetched through HTTP_PROXY", async (ctx) => {
+    if (!ready(ctx)) return;
+    const url = `http://localhost:${media!.port}/cat.png`;
+    const before = upstream!.received.length;
+    const res = await chatWithImage(guarded!, GUARDED, url);
+    expect(res.status, res.text).toBe(200);
+    expect(JSON.parse(upstream!.received[before].body).messages[0].content).toContainEqual(
+      NOVA_IMAGE,
+    );
+    expect(proxy!.seen).toContain(`GET ${url}`);
+  });
+
+  test("an https:// host is tunnelled through HTTPS_PROXY and follows upstream.tls.verify", async (ctx) => {
+    if (!ready(ctx)) return;
+    if (!tlsMedia) return ctx.skip();
+    const before = upstream!.received.length;
+    const res = await chatWithImage(guarded!, GUARDED, `https://localhost:${tlsMedia.port}/cat.png`);
+    expect(res.status, res.text).toBe(200);
+    expect(JSON.parse(upstream!.received[before].body).messages[0].content).toContainEqual(
+      NOVA_IMAGE,
+    );
+    expect(proxy!.seen).toContain(`CONNECT localhost:${tlsMedia.port}`);
+    expect(tlsMedia.hits()).toBeGreaterThan(0);
+  });
+
+  test("with protection on, a name resolving to a private address is refused before the proxy sees it", async (ctx) => {
+    if (!ready(ctx)) return;
+    const url = `http://localhost:${unlistedMedia!.port}/cat.png`;
+    const res = await chatWithImage(guarded!, GUARDED, url);
+    expect(res.status, res.text).toBe(400);
+    expect(JSON.parse(res.text).error.message).toContain("outbound.ssrf_protection.allowed_hosts");
+    expect(proxy!.seen.filter((l) => l.includes(`:${unlistedMedia!.port}`))).toEqual([]);
+    expect(unlistedMedia!.hits.get("/cat.png") ?? 0).toBe(0);
+  });
+
+  test("with protection off, the same host goes through the proxy unchecked", async (ctx) => {
+    if (!ready(ctx)) return;
+    const url = `http://localhost:${unlistedMedia!.port}/cat.png`;
+    const res = await chatWithImage(open!, OPEN, url);
+    expect(res.status, res.text).toBe(200);
+    expect(proxy!.seen).toContain(`GET ${url}`);
   });
 });
