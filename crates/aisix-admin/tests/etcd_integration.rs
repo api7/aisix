@@ -155,6 +155,10 @@ async fn direct_write_read_round_trip(
     assert_eq!(resp.status(), StatusCode::OK, "GET {item_uri}");
     let got = body_json(resp).await;
     assert_eq!(got["id"], id);
+    assert!(
+        got["revision"].as_i64().unwrap_or(0) >= 1,
+        "GET {item_uri}: {got}"
+    );
     // The served value may add defaults, but every written field must come
     // back with the content that was written.
     for (field, written) in payload.as_object().expect("payload object") {
@@ -171,6 +175,7 @@ async fn direct_write_read_round_trip(
         .expect("direct etcd delete");
     let app = build_router(state.clone());
     let resp = app.oneshot(auth_get(list_uri)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "GET {list_uri} after delete");
     let listed = body_json(resp).await;
     assert!(listed.as_array().unwrap().is_empty());
     let app = build_router(state);

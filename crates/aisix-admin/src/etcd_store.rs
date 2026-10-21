@@ -379,9 +379,8 @@ impl ConfigStore for EtcdConfigStore {
 mod tests {
     use super::*;
 
-    // Build a store *without* a real client so pure helper tests don't
-    // pay a Docker tax. Nothing is dialled until a read needs it, and
-    // these tests never issue one.
+    // The endpoint is never dialled: nothing connects until a read needs
+    // it, and these helper tests never issue one.
     fn store_for(prefix: &str) -> EtcdConfigStore {
         let client = Arc::new(LazyEtcdClient::new(
             vec!["http://127.0.0.1:59999".to_string()],
