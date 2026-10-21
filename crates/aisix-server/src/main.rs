@@ -3112,16 +3112,31 @@ async fn serve_connection<I, S>(
             // a plaintext one whose request is still arriving — nothing
             // has been read at the moment the drain ends. That client is
             // owed an answer like any other (AISIX-Cloud#1394), so a
-            // connection is retired only once it has dispatched a request:
+            // connection is retired only once it has answered a request:
             // the one that arrives is served with `Connection: close`, and
             // a connection that never sends one is bounded by
             // `downstream.idle_timeout_secs` exactly as the version sniff
             // bounds a plaintext one. A pooled connection that has served
             // a request is retired when the drain ends, as before.
+            //
+            // A 101 does not count: the connection stops being HTTP once
+            // it is upgraded, and retiring it first would make hyper stamp
+            // `Connection: close` over the 101's `Connection: upgrade`,
+            // which a WebSocket client rejects (RFC 6455 §4.1).
             let (dispatched_tx, mut dispatched) = watch::channel(false);
+            let dispatched_tx = std::sync::Arc::new(dispatched_tx);
             let service = hyper::service::service_fn(move |req| {
-                dispatched_tx.send_if_modified(|d| !std::mem::replace(d, true));
-                hyper::service::Service::call(&service, req)
+                let call = hyper::service::Service::call(&service, req);
+                let dispatched_tx = dispatched_tx.clone();
+                async move {
+                    let response = call.await;
+                    if let Ok(response) = &response {
+                        if response.status() != axum::http::StatusCode::SWITCHING_PROTOCOLS {
+                            dispatched_tx.send_if_modified(|d| !std::mem::replace(d, true));
+                        }
+                    }
+                    response
+                }
             });
             let conn = http1.serve_connection(io, service).with_upgrades();
             tokio::pin!(conn);
@@ -4567,6 +4582,21 @@ managed:
                     tokio::time::sleep(Duration::from_millis(1_500)).await;
                     "ok"
                 }),
+            )
+            .route(
+                "/upgrade-slow",
+                axum::routing::get(|| async {
+                    // An upgrade handler that awaits before answering, as
+                    // `/v1/realtime` does whenever authentication has to
+                    // go out (a JWKS fetch, a budget check).
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    axum::http::Response::builder()
+                        .status(axum::http::StatusCode::SWITCHING_PROTOCOLS)
+                        .header("connection", "upgrade")
+                        .header("upgrade", "websocket")
+                        .body(axum::body::Body::empty())
+                        .expect("101")
+                }),
             );
         let serving = tokio::spawn(accept_loop(
             listener,
@@ -4608,6 +4638,46 @@ managed:
         // previous body is read off it.
         response.into_body().collect().await?;
         Ok(())
+    }
+
+    /// A connection accepted before the drain ended that asks to upgrade
+    /// afterwards gets its 101 with `Connection: upgrade` intact. Retiring
+    /// it while the handler is still running would make hyper stamp
+    /// `Connection: close` over it, and a WebSocket client rejects that.
+    #[tokio::test]
+    async fn an_upgrade_after_the_drain_ended_keeps_connection_upgrade() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let harness = drain_harness().await;
+        let mut tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("connect");
+        // Accepted before the listener closes, or the kernel resets it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        harness.retire.send(true).expect("retire");
+        harness.cancel.send(true).expect("cancel");
+        tcp.write_all(
+            b"GET /upgrade-slow HTTP/1.1\r\nhost: 127.0.0.1\r\n\
+              connection: upgrade\r\nupgrade: websocket\r\n\r\n",
+        )
+        .await
+        .expect("write");
+
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut buf))
+                .await
+                .expect("response head in time")
+                .expect("read");
+            assert!(n > 0, "closed before a response head: {head:?}");
+            head.extend_from_slice(&buf[..n]);
+        }
+        let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 101"), "{head}");
+        assert!(head.contains("\r\nconnection: upgrade\r\n"), "{head}");
+        drop(tcp);
+        harness.serving.await.expect("join").expect("serve");
     }
 
     /// The whole of AISIX-Cloud#1395: an HTTP/2 downstream is told to
