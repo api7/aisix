@@ -188,6 +188,8 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
+ "tower-service",
  "tracing",
  "url",
  "webpki-roots 0.26.11",

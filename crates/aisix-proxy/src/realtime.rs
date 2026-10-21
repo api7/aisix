@@ -153,7 +153,7 @@ fn client_requested_beta_realtime(headers: &HeaderMap) -> bool {
 type UpstreamDial = Result<
     (
         tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            tokio_tungstenite::MaybeTlsStream<aisix_gateway::upstream_dial::UpstreamStream>,
         >,
         tokio_tungstenite::tungstenite::handshake::client::Response,
     ),
@@ -161,7 +161,8 @@ type UpstreamDial = Result<
 >;
 
 /// Dial the upstream Realtime endpoint under the deployment's outbound
-/// TLS trust, on the deployment's connect budget.
+/// TLS trust, on the deployment's connect budget, through the
+/// environment proxy that takes it (`upstream_dial`).
 ///
 /// `connect_async` would build its own connector over the compiled-in
 /// root set only, which leaves this the one upstream path that ignores
@@ -181,10 +182,10 @@ async fn connect_upstream(
 /// The dial itself, budget passed in so a test can use one far shorter
 /// than the deployment default.
 ///
-/// The budget covers the WHOLE dial — DNS, TCP, TLS *and* the WebSocket
-/// handshake exchange — where the HTTP routes' `connect_timeout` stops
-/// at the end of TLS. tokio-tungstenite exposes no seam between those
-/// phases, and the extra phase is the one that matters most here: an
+/// The budget covers the WHOLE dial — DNS, TCP, any proxy tunnel, TLS
+/// *and* the WebSocket handshake exchange — where the HTTP routes'
+/// `connect_timeout` stops at the end of TLS. tokio-tungstenite exposes
+/// no seam between those phases, and the extra phase is the one that matters most here: an
 /// upstream that completes TLS and then never answers the upgrade is as
 /// stuck as one that never answers the SYN, and nothing downstream
 /// bounds it — the session's idle deadline only starts once the socket
@@ -194,10 +195,30 @@ async fn connect_upstream_within(
     budget: Option<Duration>,
     request: tokio_tungstenite::tungstenite::handshake::client::Request,
 ) -> UpstreamDial {
-    let connector =
-        tokio_tungstenite::Connector::Rustls(aisix_gateway::upstream_tls::rustls_client_config());
-    let dial =
-        tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector));
+    let dial = async {
+        let uri = request.uri();
+        let secure = match uri.scheme_str() {
+            Some("wss") => true,
+            Some("ws") => false,
+            _ => {
+                return Err(tokio_tungstenite::tungstenite::Error::Url(
+                    tokio_tungstenite::tungstenite::error::UrlError::UnsupportedUrlScheme,
+                ))
+            }
+        };
+        let host = uri
+            .host()
+            .ok_or(tokio_tungstenite::tungstenite::Error::Url(
+                tokio_tungstenite::tungstenite::error::UrlError::NoHostName,
+            ))?;
+        let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
+        let stream = aisix_gateway::upstream_dial::connect(host, port, secure).await?;
+        let connector = tokio_tungstenite::Connector::Rustls(
+            aisix_gateway::upstream_tls::rustls_client_config(),
+        );
+        tokio_tungstenite::client_async_tls_with_config(request, stream, None, Some(connector))
+            .await
+    };
     let Some(budget) = budget else {
         return dial.await;
     };
@@ -1411,7 +1432,8 @@ mod tests {
         )
         .await
         .expect("the dial must end on its own budget")
-        .expect_err("a silent upstream cannot complete the handshake");
+        .err()
+        .expect("a silent upstream cannot complete the handshake");
         assert!(
             matches!(&err, tokio_tungstenite::tungstenite::Error::Io(e)
                 if e.kind() == std::io::ErrorKind::TimedOut),
