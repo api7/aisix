@@ -344,8 +344,6 @@ jobs:
     name: build aisix (instrumented)
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: "-C instrument-coverage"
-      LLVM_PROFILE_FILE: "coverage/aisix-%p-%m.profraw"
       AISIX_BUILD_VERSION: 0.0.0-ci
     steps:
       - uses: actions/checkout@v6
