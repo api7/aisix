@@ -483,19 +483,51 @@ fn finish_reason(raw: Option<&str>) -> FinishReason {
 /// addressed; an empty value only leaves the recorded provider model
 /// version unset).
 #[derive(Debug, Deserialize)]
+#[serde(try_from = "RawStreamChunk")]
 pub struct OpenAiStreamChunk {
     pub id: String,
-    #[serde(default)]
     pub model: String,
     /// `None` when the key is absent: OpenAI sends such a chunk on
     /// audio-output streams, between the finish and the usage chunk.
-    #[serde(default)]
     pub choices: Option<Vec<OpenAiStreamChoice>>,
-    #[serde(default)]
     pub usage: Option<OpenAiUsage>,
     /// See [`OpenAiResponse::service_tier`].
-    #[serde(default)]
     pub service_tier: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct RawStreamChunk {
+    id: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    choices: Option<Vec<OpenAiStreamChoice>>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+    #[serde(default)]
+    service_tier: Option<serde_json::Value>,
+    #[serde(default)]
+    error: Option<serde::de::IgnoredAny>,
+}
+
+impl TryFrom<RawStreamChunk> for OpenAiStreamChunk {
+    type Error = &'static str;
+
+    /// A frame with an `error` and no `choices` is the provider reporting a
+    /// failure inside the stream, not a chunk: it fails to parse, so the
+    /// caller's in-band error capture takes it.
+    fn try_from(raw: RawStreamChunk) -> Result<Self, Self::Error> {
+        if raw.choices.is_none() && raw.error.is_some() {
+            return Err("an in-band error frame, not a chunk");
+        }
+        Ok(Self {
+            id: raw.id,
+            model: raw.model,
+            choices: raw.choices,
+            usage: raw.usage,
+            service_tier: raw.service_tier,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]

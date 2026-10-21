@@ -462,15 +462,14 @@ async fn download(
             failure,
             redirected_to: (hop > 0).then(|| current.clone()),
         };
-        let resp = match fetch_hop(&current, settings).await {
+        let resp = match fetch_hop(&current, settings, hop < MAX_REDIRECTS).await {
             Ok(Hop::Answered(resp)) => resp,
-            Ok(Hop::Redirect(_)) if hop == MAX_REDIRECTS => {
-                return Err(Failure::TooManyRedirects.into())
-            }
             Ok(Hop::Redirect(next)) => {
                 current = next;
                 continue;
             }
+            // About the whole chain, not one hop.
+            Err(Failure::TooManyRedirects) => return Err(Failure::TooManyRedirects.into()),
             Err(failure) => return Err(at(failure)),
         };
         let content_type = resp
@@ -495,8 +494,12 @@ enum Hop {
 }
 
 /// One hop: checked, sent, and either answered with a success status or
-/// redirected.
-async fn fetch_hop(url: &Url, settings: &MediaFetchSettings) -> Result<Hop, Failure> {
+/// redirected, if `may_redirect`.
+async fn fetch_hop(
+    url: &Url,
+    settings: &MediaFetchSettings,
+    may_redirect: bool,
+) -> Result<Hop, Failure> {
     let route = settings.ssrf.route(url).await?;
     let resp = client(route)?
         .get(url.clone())
@@ -506,6 +509,9 @@ async fn fetch_hop(url: &Url, settings: &MediaFetchSettings) -> Result<Hop, Fail
     let status = resp.status();
     if status.is_redirection() {
         if let Some(location) = resp.headers().get(header::LOCATION) {
+            if !may_redirect {
+                return Err(Failure::TooManyRedirects);
+            }
             let next = location
                 .to_str()
                 .ok()

@@ -845,8 +845,8 @@ where
                     SseEvent::Data(payload) => {
                         let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
                         if let Some(chunk) = stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
-                    yield chunk.with_fallback_service_tier(&header_tier);
-                }
+                            yield chunk.with_fallback_service_tier(&header_tier);
+                        }
                     }
                 }
             }
@@ -1607,6 +1607,21 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
             other => panic!("unexpected: {other:?}"),
         }
         assert!(stream.next().await.is_none());
+    }
+
+    /// An error frame that carries a chunk `id` but no `choices` is still
+    /// the provider's in-band error, not a chunk to drop.
+    #[test]
+    fn parse_stream_chunk_error_frame_with_an_id_is_in_band() {
+        let err = parse_stream_chunk(
+            r#"{"id":"chatcmpl-x","error":{"message":"overloaded","type":"server_error"}}"#,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BridgeError::UpstreamInBand { message, .. } if message == "overloaded"),
+            "{err:?}"
+        );
     }
 
     /// Garbage that is not an error envelope keeps the historical

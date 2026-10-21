@@ -528,8 +528,8 @@ pub(crate) async fn chat_stream(
                     SseEvent::Done => break 'outer,
                     SseEvent::Data(payload) => {
                         if let Some(chunk) = chunk_from(&payload, &mut indexer, &mut minted, &request_id)? {
-                yield chunk;
-            }
+                            yield chunk;
+                        }
                     }
                 }
             }

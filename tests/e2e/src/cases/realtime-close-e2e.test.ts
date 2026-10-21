@@ -140,10 +140,14 @@ describe("/v1/realtime close handshake", () => {
 
   test("a normal upstream close reaches the client as is, with no error event", async (ctx) => {
     if (!ready(ctx)) return;
+    const before = upstream!.closesSeen.length;
     const s = await openSession(app!);
     s.ws.send(JSON.stringify({ type: "test.close", code: 1000, reason: "session over" }));
     expect(await s.closed).toEqual({ code: 1000, reason: "session over" });
     expect(s.events.filter((e) => e.type === "error")).toEqual([]);
+    // The upstream's close is answered too, not left to a reset (1006).
+    await expect.poll(() => upstream!.closesSeen.length).toBe(before + 1);
+    expect(upstream!.closesSeen[before]).toBe(1000);
   });
 
   test("an application close code reaches the client after an error event naming it", async (ctx) => {

@@ -1011,12 +1011,12 @@ async fn run_session(
                         code: f.code.into(),
                         reason: f.reason.to_string().into(),
                     });
-                    close_upstream(&mut up_tx, &mut up_rx, frame).await;
+                    close_upstream(&mut up_tx, &mut up_rx, frame, &mut usage).await;
                     break;
                 }
                 Some(Ok(_)) => {} // ping/pong handled by the transports
                 Some(Err(_)) | None => {
-                    close_upstream(&mut up_tx, &mut up_rx, None).await;
+                    close_upstream(&mut up_tx, &mut up_rx, None, &mut usage).await;
                     break;
                 }
             },
@@ -1082,6 +1082,10 @@ async fn run_session(
             },
         }
     }
+
+    // Every other way out of the loop leaves the upstream half open: send
+    // its Close, or flush the reply to the one it sent.
+    let _ = tokio::time::timeout(UPSTREAM_CLOSE_ACK, up_tx.close()).await;
 
     let elapsed = started.elapsed();
     let total_tokens = usage.input_tokens + usage.output_tokens;
@@ -1238,9 +1242,14 @@ async fn run_session(
 const UPSTREAM_CLOSE_ACK: Duration = Duration::from_secs(2);
 
 /// Close the upstream socket and wait, briefly, for its acknowledgement,
-/// so the upstream sees a completed handshake rather than a reset.
-async fn close_upstream<T, R>(up_tx: &mut T, up_rx: &mut R, frame: Option<TgCloseFrame<'static>>)
-where
+/// so the upstream sees a completed handshake rather than a reset. Usage
+/// in the frames that arrive meanwhile (a response finishing) still counts.
+async fn close_upstream<T, R>(
+    up_tx: &mut T,
+    up_rx: &mut R,
+    frame: Option<TgCloseFrame<'static>>,
+    usage: &mut SessionUsage,
+) where
     T: futures::Sink<TgMessage> + Unpin,
     R: futures::Stream<Item = Result<TgMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
@@ -1249,8 +1258,10 @@ where
     }
     let _ = tokio::time::timeout(UPSTREAM_CLOSE_ACK, async {
         while let Some(Ok(m)) = up_rx.next().await {
-            if matches!(m, TgMessage::Close(_)) {
-                break;
+            match m {
+                TgMessage::Text(text) => usage.absorb(&text),
+                TgMessage::Close(_) => break,
+                _ => {}
             }
         }
     })
@@ -1698,6 +1709,53 @@ mod tests {
         assert_eq!(ev.error_class, "transport", "{ev:?}");
         assert_eq!(ev.model_id, "m-rt");
         assert_eq!(ev.requested_model_id, "m-rt");
+    }
+
+    #[tokio::test]
+    async fn a_response_finishing_while_the_client_closes_still_counts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
+            while let Some(Ok(msg)) = rx.next().await {
+                if let TgMessage::Text(_) = msg {
+                    // Finish the response after the client has hung up.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let done = serde_json::json!({
+                        "type": "response.done",
+                        "response": {"usage": {"input_tokens": 5, "output_tokens": 2}}
+                    });
+                    let _ = tx.send(TgMessage::Text(done.to_string())).await;
+                }
+            }
+        });
+        let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
+        let (addr, _state, mut rx) = serve(snap).await;
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("handshake");
+        let (mut tx, mut client_rx) = ws.split();
+        tx.send(TgMessage::Text(r#"{"type":"response.create"}"#.into()))
+            .await
+            .unwrap();
+        tx.send(TgMessage::Close(None)).await.unwrap();
+        while let Some(Ok(msg)) = client_rx.next().await {
+            if matches!(msg, TgMessage::Close(_)) {
+                break;
+            }
+        }
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("usage event expected")
+            .expect("sink closed");
+        assert_eq!((ev.prompt_tokens, ev.completion_tokens), (5, 2));
     }
 
     #[tokio::test]
