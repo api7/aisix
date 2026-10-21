@@ -16,6 +16,7 @@ dashmap.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 config.workspace = true
+serde_path_to_error.workspace = true
 jsonschema.workspace = true
 regex.workspace = true
 schemars = { workspace = true, features = ["chrono"] }

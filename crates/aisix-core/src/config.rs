@@ -2278,6 +2278,25 @@ const ENV_LIST_PARSE_KEYS: &[&str] = &[
     "outbound.ssrf_protection.allowed_hosts",
 ];
 
+/// The `AISIX_*` variable among `names` that set `key` or a value
+/// containing it (`outbound.ssrf_protection.allowed_hosts[1]` comes from
+/// `AISIX_OUTBOUND__SSRF_PROTECTION__ALLOWED_HOSTS`). The environment
+/// overrides the file, so a match is where the value came from.
+fn env_var_setting<'a>(names: &'a [String], key: &str) -> Option<&'a str> {
+    names
+        .iter()
+        .find(|name| {
+            let lowered = name.to_lowercase();
+            let Some(set) = lowered.strip_prefix("aisix_") else {
+                return false;
+            };
+            let set = set.replace("__", ".");
+            key.strip_prefix(set.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '[']))
+        })
+        .map(String::as_str)
+}
+
 impl Config {
     /// Warnings about `AISIX_*` environment variables that name no
     /// setting and were left out of the load.
@@ -2337,6 +2356,7 @@ impl Config {
         // Pin prefix_separator explicitly so the two shapes are
         // distinct: `AISIX_` strips the prefix, `__` splits keys.
         let overrides = EnvOverrides::from_env();
+        let env_names: Vec<String> = overrides.source.keys().cloned().collect();
         let mut env = Environment::with_prefix("AISIX")
                 .prefix_separator("_")
                 .separator("__")
@@ -2360,8 +2380,16 @@ impl Config {
             .build()
             .map_err(|e| BootstrapError::Config(format!("build: {e}")))?;
 
-        raw.try_deserialize()
-            .map_err(|e| BootstrapError::Config(format!("deserialize: {e}")))
+        serde_path_to_error::deserialize(raw).map_err(|e| {
+            let key = e.path().to_string();
+            BootstrapError::Config(match key.as_str() {
+                "." => format!("deserialize: {}", e.inner()),
+                _ => match env_var_setting(&env_names, &key) {
+                    Some(var) => format!("deserialize: {key} (set by {var}): {}", e.inner()),
+                    None => format!("deserialize: {key}: {}", e.inner()),
+                },
+            })
+        })
     }
 
     fn validate(&self) -> Result<(), BootstrapError> {
@@ -2915,6 +2943,22 @@ admin:
         assert_eq!(kept, ["Aisix_Bedrock_Endpoint_Url", "aisix_proxy__addr"]);
         assert_eq!(overrides.warnings.len(), 1);
         assert!(overrides.warnings[0].starts_with("AISIX_OSS_SERVICE_HOST "));
+    }
+
+    #[test]
+    fn a_deserialize_error_is_traced_to_the_variable_that_set_it() {
+        let names = vec![
+            "AISIX_OUTBOUND__SSRF_PROTECTION__ALLOWED_HOSTS".to_string(),
+            "aisix_shutdown__bogus".to_string(),
+        ];
+        let from = |key| env_var_setting(&names, key);
+        assert_eq!(
+            from("outbound.ssrf_protection.allowed_hosts[1]"),
+            Some("AISIX_OUTBOUND__SSRF_PROTECTION__ALLOWED_HOSTS")
+        );
+        assert_eq!(from("shutdown.bogus"), Some("aisix_shutdown__bogus"));
+        assert_eq!(from("shutdown.bogus_more"), None);
+        assert_eq!(from("shutdown.min_drain_secs"), None);
     }
 
     #[test]
