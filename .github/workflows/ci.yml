@@ -12,6 +12,13 @@ on:
   # runs to the head commit.
   workflow_dispatch:
 
+# A newer push to a pull request cancels that PR's in-flight run. Every other
+# run gets a group of its own (keyed on the run id), so a push to main is never
+# cancelled and never superseded while it waits for a slot.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -204,8 +211,10 @@ jobs:
           components: llvm-tools-preview
       - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
-      - name: install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: install cargo-llvm-cov + cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
       - name: Start the authenticated etcds
         # Not service containers: a user has to be created and
         # `auth enable` called after the server is up, which service
@@ -316,7 +325,10 @@ jobs:
           docker exec redis-auth redis-cli -p 6390 -a aisix-ci-redis ping | grep -q PONG \
             || { echo "::error::Authenticated Redis 6390 did not come up"; exit 1; }
       - name: unit tests with coverage
-        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov-unit.info
+        # nextest runs every test in its own process, test binaries in
+        # parallel. Tests that share external state across binaries are
+        # serialised by the test groups in .config/nextest.toml.
+        run: cargo llvm-cov nextest --workspace --all-features --lcov --output-path lcov-unit.info
       - uses: actions/upload-artifact@v7
         with:
           name: coverage-unit
@@ -353,7 +365,7 @@ jobs:
           retention-days: 1
 
   e2e:
-    name: e2e (vitest, ${{ matrix.serving }}) + coverage
+    name: e2e (vitest, ${{ matrix.serving }}, ${{ matrix.shard }}/4) + coverage
     needs: [build-bin]
     runs-on: ubuntu-latest
     # Explicit, so the job's token stays read-only regardless of the
@@ -369,6 +381,12 @@ jobs:
       # about the other, so neither leg cancels the other.
       fail-fast: false
       matrix:
+        serving: [thread-per-core, work-stealing]
+        # Each serving mode's suite is split across four jobs with
+        # `vitest --shard`; every shard keeps the full per-job setup below
+        # (four etcds, four forks). The `/4` in the job name and in the
+        # `--shard` argument must match the length of this list.
+        shard: [1, 2, 3, 4]
         include:
           # The Linux default, and so the one production runs.
           - serving: thread-per-core
@@ -479,7 +497,7 @@ jobs:
           # from this list (see tests/e2e/vitest.config.ts), and
           # harness/etcd.ts hands each fork its own entry.
           AISIX_E2E_ETCD_ENDPOINTS: http://127.0.0.1:2379,http://127.0.0.1:2380,http://127.0.0.1:2381,http://127.0.0.1:2382
-        run: pnpm test
+        run: pnpm test --shard=${{ matrix.shard }}/4
       - name: tag coverage by leg
         # The gate downloads every leg with `merge-multiple: true`, which
         # flattens same-named files to one — the legs must upload distinct
@@ -487,15 +505,15 @@ jobs:
         if: always()
         run: |
           if [ -f tests/e2e/coverage/lcov.info ]; then
-            mv tests/e2e/coverage/lcov.info "tests/e2e/coverage/lcov-${{ matrix.serving }}.info"
+            mv tests/e2e/coverage/lcov.info "tests/e2e/coverage/lcov-${{ matrix.serving }}-${{ matrix.shard }}.info"
           fi
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           # Per leg: two uploads under one name is a hard conflict the
           # moment the suite starts emitting coverage.
-          name: coverage-e2e-${{ matrix.serving }}
-          path: tests/e2e/coverage/lcov-${{ matrix.serving }}.info
+          name: coverage-e2e-${{ matrix.serving }}-${{ matrix.shard }}
+          path: tests/e2e/coverage/lcov-${{ matrix.serving }}-${{ matrix.shard }}.info
           if-no-files-found: ignore
           retention-days: 7
 

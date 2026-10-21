@@ -1,0 +1,14 @@
+# nextest runs every test in its own process and test binaries in parallel.
+# Tests that share external state with tests in another binary — which plain
+# `cargo test`, running binaries one at a time, kept apart for free — are put
+# in a group here instead.
+
+[test-groups]
+# The short-TTL authenticated etcd (ETCD_AUTH_TTL_TEST_URL). Some of its tests
+# change the cluster's auth store, which stales every token any other test on
+# that cluster is holding.
+etcd-auth-ttl = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary_id(aisix-etcd::auth_token_recovery) | (binary_id(aisix-admin::etcd_integration) & test(=admin_reads_survive_a_token_the_server_forgets))'
+test-group = 'etcd-auth-ttl'
