@@ -111,14 +111,13 @@ jobs:
       # aisix-etcd::loader round-trip so regressions in subkey
       # constants or KV serde shape get caught here, not at runtime.
       #
-      # Use the upstream Quay-hosted image (Bitnami retired the
-      # `bitnami/etcd:3.5` floating tag from Docker Hub in 2025; the
-      # GHA runner's anonymous docker pull fails with "manifest
-      # unknown" against that registry now). The upstream image
-      # honours `ETCD_*` env vars directly so we don't need a
-      # command override.
+      # ghcr.io/api7/etcd tags are copies of quay.io/coreos/etcd; add a
+      # new tag with `docker buildx imagetools create --tag
+      # ghcr.io/api7/etcd:<tag> quay.io/coreos/etcd:<tag>` before
+      # referencing it. The image honours `ETCD_*` env vars directly,
+      # so no command override is needed.
       etcd:
-        image: quay.io/coreos/etcd:v3.5.18
+        image: ghcr.io/api7/etcd:v3.5.18
         ports: ["2379:2379"]
         env:
           ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
@@ -236,7 +235,7 @@ jobs:
             peer=$3
             shift 3
             docker run -d --name "$name" -p "$client:$client" -v /tmp/etcd-jwt:/keys \
-              quay.io/coreos/etcd:v3.5.18 \
+              ghcr.io/api7/etcd:v3.5.18 \
               /usr/local/bin/etcd --name "$name" "$@" \
               --listen-client-urls "http://0.0.0.0:$client" \
               --advertise-client-urls "http://127.0.0.1:$client" \
@@ -403,25 +402,25 @@ jobs:
       # to be up. Raising concurrency means a bigger runner AND another
       # cluster, in that order.
       etcd:
-        image: quay.io/coreos/etcd:v3.5.15
+        image: ghcr.io/api7/etcd:v3.5.15
         env:
           ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
           ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
         ports: ["2379:2379"]
       etcd2:
-        image: quay.io/coreos/etcd:v3.5.15
+        image: ghcr.io/api7/etcd:v3.5.15
         env:
           ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
           ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
         ports: ["2380:2379"]
       etcd3:
-        image: quay.io/coreos/etcd:v3.5.15
+        image: ghcr.io/api7/etcd:v3.5.15
         env:
           ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
           ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
         ports: ["2381:2379"]
       etcd4:
-        image: quay.io/coreos/etcd:v3.5.15
+        image: ghcr.io/api7/etcd:v3.5.15
         env:
           ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
           ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"

@@ -295,7 +295,7 @@ jobs:
           set -eux
           IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
           docker pull "$IMAGE"
-          docker run -d --name smoke-etcd -p 2379:2379 quay.io/coreos/etcd:v3.5.18 \
+          docker run -d --name smoke-etcd -p 2379:2379 ghcr.io/api7/etcd:v3.5.18 \
             etcd --listen-client-urls=http://0.0.0.0:2379 \
                  --advertise-client-urls=http://127.0.0.1:2379
           cat > /tmp/smoke.yaml <<'EOF'
