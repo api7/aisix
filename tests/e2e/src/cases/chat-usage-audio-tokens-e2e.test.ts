@@ -32,7 +32,21 @@ const AUDIO_USAGE = {
   completion_tokens_details: { reasoning_tokens: 0, audio_tokens: 64 },
 };
 const PLAIN_USAGE = { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 };
-const modelName = (kind: "audio" | "plain", stream: boolean) => `usage-${kind}${stream ? "-stream" : ""}`;
+/** What OpenAI sends for a text-only request: every counter, all zero. */
+const ZERO_USAGE = {
+  prompt_tokens: 7,
+  completion_tokens: 3,
+  total_tokens: 10,
+  prompt_tokens_details: { cached_tokens: 0, audio_tokens: 0 },
+  completion_tokens_details: {
+    reasoning_tokens: 0,
+    audio_tokens: 0,
+    accepted_prediction_tokens: 0,
+    rejected_prediction_tokens: 0,
+  },
+};
+type Kind = "audio" | "plain" | "zero";
+const modelName = (kind: Kind, stream: boolean) => `usage-${kind}${stream ? "-stream" : ""}`;
 
 /** The mock streams whenever it has stream events, so each mode gets its own. */
 function upstreamReporting(usage: Record<string, unknown>, stream: boolean) {
@@ -95,6 +109,7 @@ describe("chat completion usage carries the upstream's audio tokens", () => {
     for (const [kind, usage] of [
       ["audio", AUDIO_USAGE],
       ["plain", PLAIN_USAGE],
+      ["zero", ZERO_USAGE],
     ] as const) {
       for (const stream of [false, true]) {
         const name = modelName(kind, stream);
@@ -148,8 +163,17 @@ describe("chat completion usage carries the upstream's audio tokens", () => {
       const usage = await usageOf(modelName("audio", stream), stream);
       expect(usage.prompt_tokens).toBe(120);
       expect(usage.completion_tokens).toBe(80);
-      expect(usage.prompt_tokens_details?.audio_tokens).toBe(100);
-      expect(usage.completion_tokens_details?.audio_tokens).toBe(64);
+      // The objects keep the counters they always carry, as OpenAI sends them.
+      expect(usage.prompt_tokens_details).toEqual({ cached_tokens: 0, audio_tokens: 100 });
+      expect(usage.completion_tokens_details).toEqual({ reasoning_tokens: 0, audio_tokens: 64 });
+    });
+
+    test(`${mode}: an all-zero breakdown adds no details objects`, async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const usage = await usageOf(modelName("zero", stream), stream);
+      expect(usage.prompt_tokens).toBe(7);
+      expect(usage.prompt_tokens_details).toBeUndefined();
+      expect(usage.completion_tokens_details).toBeUndefined();
     });
 
     test(`${mode}: no audio count is invented when the upstream reported none`, async (ctx) => {

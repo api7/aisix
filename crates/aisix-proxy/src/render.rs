@@ -108,13 +108,11 @@ pub struct Usage {
 
 #[derive(Debug, Serialize, Default)]
 pub struct PromptTokensDetails {
-    /// Prompt tokens served from the provider's prompt cache. Absent when
-    /// the object is here only for `audio_tokens`: a `0` would read as
-    /// "the provider reported no cache hit".
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cached_tokens: Option<u32>,
-    /// Audio input tokens, exactly when the upstream reported them — a
-    /// reported `0` included, an unreported count never fabricated.
+    /// Prompt tokens served from the provider's prompt cache. Always
+    /// present on the object, as on api.openai.com, so a client that reads
+    /// it once the object exists never finds it missing.
+    pub cached_tokens: u32,
+    /// Audio input tokens, when the upstream reported a non-zero count.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_tokens: Option<u32>,
     /// Raw OpenAI cache-write counter, kept separate from additive cache creation.
@@ -128,9 +126,9 @@ pub struct PromptTokensDetails {
 #[derive(Debug, Serialize, Default)]
 pub struct CompletionTokensDetails {
     /// o1 / o3 / DeepSeek-R1 reasoning tokens (subset of completion).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_tokens: Option<u32>,
-    /// Audio output tokens, exactly when the upstream reported them.
+    /// Always present on the object, like `cached_tokens`.
+    pub reasoning_tokens: u32,
+    /// Audio output tokens, when the upstream reported a non-zero count.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_tokens: Option<u32>,
 }
@@ -156,7 +154,7 @@ impl Usage {
     ///   increase the caller cannot price
     /// - `reasoning_tokens > 0` → emit
     ///   `completion_tokens_details.reasoning_tokens`
-    /// - an audio count the upstream reported → emit it as
+    /// - a non-zero audio count the upstream reported → emit it as
     ///   `*_tokens_details.audio_tokens`, OpenAI's own names
     /// - DeepSeek-native `prompt_cache_hit_tokens` /
     ///   `prompt_cache_miss_tokens` passed through verbatim when the
@@ -166,15 +164,19 @@ impl Usage {
         let cache_creation_tokens = u.anthropic_cache_creation_input_tokens();
         let cache_detail =
             cached_tokens > 0 || cache_creation_tokens > 0 || u.cache_write_tokens.is_some();
-        let prompt_audio_tokens = u.modality.prompt_audio_tokens;
-        let completion_audio_tokens = u.modality.completion_audio_tokens;
+        // Non-zero only, like the cache and reasoning counters: an OpenAI
+        // upstream reports `audio_tokens: 0` on every text request, and
+        // echoing it would add a details object to responses that have
+        // never carried one.
+        let prompt_audio_tokens = u.modality.prompt_audio_tokens.filter(|&n| n > 0);
+        let completion_audio_tokens = u.modality.completion_audio_tokens.filter(|&n| n > 0);
         Usage {
             prompt_tokens: u.openai_prompt_tokens(),
             completion_tokens: u.completion_tokens,
             total_tokens: u.openai_total_tokens(),
             prompt_tokens_details: (cache_detail || prompt_audio_tokens.is_some()).then_some(
                 PromptTokensDetails {
-                    cached_tokens: cache_detail.then_some(cached_tokens),
+                    cached_tokens,
                     audio_tokens: prompt_audio_tokens,
                     cache_write_tokens: u.cache_write_tokens,
                     cache_creation_tokens: (cache_creation_tokens > 0)
@@ -184,7 +186,7 @@ impl Usage {
             completion_tokens_details: (u.reasoning_tokens > 0
                 || completion_audio_tokens.is_some())
             .then_some(CompletionTokensDetails {
-                reasoning_tokens: (u.reasoning_tokens > 0).then_some(u.reasoning_tokens),
+                reasoning_tokens: u.reasoning_tokens,
                 audio_tokens: completion_audio_tokens,
             }),
             prompt_cache_hit_tokens: u.prompt_cache_hit_tokens,
