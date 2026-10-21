@@ -7,7 +7,6 @@ name: docker-image
 #   - push to main              → :dev + :sha-<shortsha>
 #   - push tag vX.Y.Z           → :X.Y.Z + :latest + :sha-<shortsha>
 #   - push tag vX.Y.Z-rc.N      → :X.Y.Z-rc.N + :sha-<shortsha>  (NO :latest)
-#   - pull request              → build-only (no push), sanity check
 #   - workflow_dispatch         → :sha-<shortsha> + optional tag input
 #
 # A version tag is published in full only — there is no :X.Y or :X
@@ -34,18 +33,6 @@ on:
   push:
     branches: [main]
     tags: ["v*.*.*"]
-  pull_request:
-    branches: [main]
-    paths:
-      - Dockerfile
-      - .dockerignore
-      - .github/workflows/docker-image.yml
-      - Cargo.toml
-      - Cargo.lock
-      - rust-toolchain.toml
-      - "crates/**"
-      - "schemas/**"
-      - "bench/pgo-training/**"
   workflow_dispatch:
     inputs:
       tag:
@@ -96,7 +83,7 @@ jobs:
       - uses: actions/checkout@v6
 
       # PGO build mode (#967). PGO is reserved for the artifact customers
-      # actually run: a STABLE release tag (vX.Y.Z). Everything else — PR,
+      # actually run: a STABLE release tag (vX.Y.Z). Everything else —
       # main/:dev, `-rc.N` candidates, plain dispatch — builds in one compile,
       # because PGO cost ~20 min on every one of the ~40 main pushes per
       # release cycle and bought nothing those images are used for.
@@ -110,13 +97,8 @@ jobs:
       #     three-phase pipeline on that commit. A training-shape regression
       #     surfaces there, after QA. Pre-flight it on the release commit
       #     with `workflow_dispatch` + pgo=true before tagging.
-      #
-      # The PR escape hatch survives and matters more now: it is the only
-      # pre-tag exercise of the PGO path that happens automatically.
       - name: Decide PGO build mode
         id: pgomode
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
         run: |
           set -eu
           mode=off
@@ -134,30 +116,12 @@ jobs:
           if [ "${{ github.event.inputs.pgo }}" = "true" ]; then
             mode=on
           fi
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch --no-tags --depth=1 origin "$BASE_SHA"
-            # Capture the diff as a CHECKED command before matching: inside
-            # an `if` condition a git failure is exempt from `set -e` and
-            # would silently leave mode=off (fail-open). As an assignment,
-            # a diff failure kills the step instead. Captured text also
-            # avoids grep -q closing the pipe under git (SIGPIPE).
-            changed="$(git diff --name-only "$BASE_SHA" HEAD)"
-            # Root build inputs (workspace manifest with [profile.release],
-            # lockfile, toolchain pin) are PGO inputs too: a bump can break
-            # the instrumented/profile-use build or the training run while
-            # the plain PGO=off compile stays green.
-            if printf '%s\n' "$changed" \
-                | grep -qE '^(Dockerfile|\.dockerignore|Cargo\.(toml|lock)|rust-toolchain\.toml|bench/pgo-training/|\.github/workflows/docker-image\.ya?ml)'; then
-              mode=on
-            fi
-          fi
           echo "value=$mode" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
@@ -190,7 +154,6 @@ jobs:
           # `-rc.N` tag cannot move it.
           tags: |
             type=raw,value=dev,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-            type=ref,event=pr
             type=sha,prefix=sha-,format=short
             type=semver,pattern={{version}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
@@ -249,11 +212,7 @@ jobs:
           # manifest list `merge` builds out of both legs. A tag written here
           # would point at a single architecture for as long as the other leg
           # runs, which is exactly the state this workflow exists to prevent.
-          outputs: ${{ github.event_name != 'pull_request' && format('type=image,"name={0}",push-by-digest=true,name-canonical=true,push=true', steps.repos.outputs.value) || '' }}
-          # PR builds aren't pushed; load them into the local daemon so
-          # the smoke test below can run the image.
-          load: ${{ github.event_name == 'pull_request' }}
-          tags: ${{ github.event_name == 'pull_request' && steps.meta.outputs.tags || '' }}
+          outputs: type=image,"name=${{ steps.repos.outputs.value }}",push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BUILD_SHA=${{ steps.shortsha.outputs.value }}
@@ -285,17 +244,12 @@ jobs:
       - name: Verify non-tag image self-reports dev+sha
         if: "!startsWith(github.ref, 'refs/tags/v')"
         env:
-          TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
           SHORT_SHA: ${{ steps.shortsha.outputs.value }}
         run: |
           set -eux
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            IMG="$(printf '%s\n' "$TAGS" | head -n1)"
-          else
-            IMG="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
-            docker pull "$IMG"
-          fi
+          IMG="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          docker pull "$IMG"
           docker run --rm --entrypoint /usr/local/bin/aisix "$IMG" --version | tee /tmp/aisix-version
           test -n "$SHORT_SHA"
           grep -qxF "aisix dev+sha-${SHORT_SHA}" /tmp/aisix-version
@@ -316,16 +270,11 @@ jobs:
       - name: Assert PGO proof marker (#967)
         if: steps.pgomode.outputs.value == 'on' || (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-'))
         env:
-          TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -eux
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            IMG="$(printf '%s\n' "$TAGS" | head -n1)"
-          else
-            IMG="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
-            docker pull "$IMG"
-          fi
+          IMG="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          docker pull "$IMG"
           docker run --rm --entrypoint cat "$IMG" /usr/local/share/aisix/pgo-verified.json \
             | tee /tmp/pgo-verified.json
           shapes="$(jq -r '.shapes | length' /tmp/pgo-verified.json)"
@@ -340,10 +289,12 @@ jobs:
       # network with the proxy on :80 — without the file capability the
       # bind fails and /livez never answers.
       - name: Smoke test — non-root binds :80
-        if: github.event_name == 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -eux
-          IMAGE="$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -n1)"
+          IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          docker pull "$IMAGE"
           docker run -d --name smoke-etcd -p 2379:2379 quay.io/coreos/etcd:v3.5.18 \
             etcd --listen-client-urls=http://0.0.0.0:2379 \
                  --advertise-client-urls=http://127.0.0.1:2379
@@ -395,10 +346,12 @@ jobs:
       # which is what the chart's state volume is for — and this step
       # deliberately does not stand in for a deployment that arranges it.
       - name: Smoke test — numeric USER, and boot under an arbitrary uid
-        if: github.event_name == 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -eux
-          IMAGE="$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -n1)"
+          IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          docker pull "$IMAGE"
           test "$(docker inspect --format '{{.Config.User}}' "$IMAGE")" = "10001"
           mkdir -p /tmp/uid-smoke
           printf '_format_version: "1"\n' > /tmp/uid-smoke/resources.yaml
@@ -434,23 +387,17 @@ jobs:
       # profileable in the field, meaning the symbol table survives into
       # the image (function-level flame graphs). A future strip step,
       # RUSTFLAGS change, or base-image swap would break flame graphs
-      # silently, so pin it here — and print the size so every PR
+      # silently, so pin it here on the release builds that ship — the
+      # PGO'd binary included — and print the size so every release
       # records the real Linux artifact cost.
-      # Also enforced on tag builds since #967: the PGO'd binary that ships
-      # must provably keep the profiling contract, not just the PR variant.
       - name: Verify shipped binary keeps its symbol table (#847)
-        if: github.event_name == 'pull_request' || startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
-          TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -eux
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            IMAGE="$(printf '%s\n' "$TAGS" | head -n1)"
-          else
-            IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
-            docker pull "$IMAGE"
-          fi
+          IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          docker pull "$IMAGE"
           cid="$(docker create "$IMAGE")"
           docker cp "$cid:/usr/local/bin/aisix" /tmp/aisix-shipped
           docker rm "$cid"
@@ -468,7 +415,6 @@ jobs:
       # digest, content is this leg's architecture — the merge job checks
       # it received one of each before it moves a tag.
       - name: Export digest
-        if: github.event_name != 'pull_request'
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
           ARCH: ${{ matrix.arch }}
@@ -478,7 +424,6 @@ jobs:
           printf '%s\n' "$ARCH" > "${{ runner.temp }}/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
-        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v7
         with:
           name: digests-${{ matrix.arch }}
@@ -497,7 +442,7 @@ jobs:
       # the architecture), so one leg uploads it; the choice of leg is
       # arbitrary and `merge` fails by name if the file never arrives.
       - name: Export the tag set
-        if: github.event_name != 'pull_request' && matrix.arch == 'amd64'
+        if: matrix.arch == 'amd64'
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
@@ -506,7 +451,7 @@ jobs:
           printf '%s\n' "$TAGS" > "${{ runner.temp }}/tagset/tags.txt"
 
       - name: Upload the tag set
-        if: github.event_name != 'pull_request' && matrix.arch == 'amd64'
+        if: matrix.arch == 'amd64'
         uses: actions/upload-artifact@v7
         with:
           name: tagset
@@ -521,7 +466,6 @@ jobs:
   # manifest list customers actually pull.
   merge:
     name: merge manifests
-    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 60

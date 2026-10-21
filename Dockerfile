@@ -83,7 +83,7 @@ COPY bench/pgo-training ./bench/pgo-training
 # un-optimized one; opting out is explicit.
 #
 # CI inverts that default and passes PGO=on only for a STABLE release tag
-# (vX.Y.Z). PR, main/:dev and `-rc.N` builds pass PGO=off: PGO cost ~20 min
+# (vX.Y.Z). main/:dev and `-rc.N` builds pass PGO=off: PGO cost ~20 min
 # on every one of the ~40 main pushes per release cycle, and none of those
 # images are the artifact a customer runs. See "Decide PGO build mode" in
 # .github/workflows/docker-image.yml and the PGO section of RELEASING.md.
@@ -182,7 +182,7 @@ RUN apt-get update \
 # specs must add NET_BIND_SERVICE back.
 # The PGO proof marker (#967) ships with the image: written by the builder
 # only after a successful profile-optimized build, asserted by the push
-# workflows before an image is trusted. Absent on PGO=off (PR smoke) builds.
+# workflows before an image is trusted. Absent on PGO=off builds.
 RUN --mount=type=bind,from=builder,source=/usr/local/bin/aisix,target=/mnt/aisix \
     --mount=type=bind,from=builder,source=/usr/local/share/aisix,target=/mnt/aisix-share \
     apt-get update \
