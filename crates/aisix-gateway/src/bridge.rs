@@ -412,11 +412,12 @@ pub enum BridgeError {
     InvalidUpstreamConfig(String),
     /// The caller's request asks for something this provider's bridge
     /// cannot translate (a request field, tool type, or history shape).
-    /// Same 400 `invalid_request_error`, non-retryable handling and
-    /// `invalid_config` telemetry class as [`InvalidUpstreamConfig`]; the
-    /// only difference is the message, which is the sentence itself
+    /// Same 400 `invalid_request_error` and non-retryable handling as
+    /// [`InvalidUpstreamConfig`], but the message is the sentence itself
     /// rather than one prefixed as an upstream misconfiguration, so the
-    /// caller is pointed at the request instead of the ProviderKey/Model.
+    /// caller is pointed at the request instead of the ProviderKey/Model,
+    /// and the telemetry class is `invalid_request_error`, the one every
+    /// refusal of the caller's request records, not `invalid_config`.
     #[error("{0}")]
     InvalidRequest(String),
     /// The request outgrew `proxy.request_body_limit_bytes` once the media

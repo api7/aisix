@@ -6,6 +6,7 @@ import {
   SeedClient,
   spawnApp,
   waitConfigPropagation,
+  waitForLogLine,
   type SpawnedApp,
 } from "../harness/index.js";
 
@@ -18,6 +19,18 @@ import {
 //
 // The refusals are raised while the upstream body is being built, so the
 // upstream here only counts requests; every case asserts it saw none.
+//
+// The records name the refusal the same way the caller's envelope does: the
+// access log's `error_kind` (which the usage event's `error_class` mirrors)
+// is `invalid_request_error`, the class every other refusal of the caller's
+// request records — not `invalid_config`, which points an operator at the
+// target's configuration.
+
+function field(line: string, name: string): string | undefined {
+  const m = new RegExp(`(?:^|\\s)${name}=("(?:[^"\\\\]|\\\\.)*"|\\S+)`).exec(line);
+  if (!m) return undefined;
+  return m[1].startsWith('"') ? (JSON.parse(m[1]) as string) : m[1];
+}
 
 const CALLER_PLAINTEXT = "sk-caller-shape-refusal";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -63,7 +76,8 @@ describe("a refused request shape is described as a request error", () => {
     if (addr === null || typeof addr === "string") throw new Error("no port");
     const baseUrl = `http://127.0.0.1:${addr.port}`;
 
-    app = await spawnApp();
+    // The access log is an INFO line.
+    app = await spawnApp({ logLevel: "info" });
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const vertexPk = await seed.createProviderKey({
       display_name: "refusal-vertex-pk",
@@ -147,6 +161,14 @@ describe("a refused request shape is described as a request error", () => {
     expect(body.error.type).toBe("invalid_request_error");
     expect(body.error.message).not.toMatch(/invalid upstream configuration/i);
     expect(body.error.message).toMatch(mentions);
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    expect(requestId).not.toBe("");
+    const line = await waitForLogLine(
+      app!,
+      (l) => l.includes(requestId) && l.includes("proxy request completed"),
+      `the access log of ${requestId}`,
+    );
+    expect(field(line, "error_kind"), line).toBe("invalid_request_error");
   }
 
   const USER = { role: "user", content: "Weather in Paris?" };

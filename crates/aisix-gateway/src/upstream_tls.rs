@@ -550,32 +550,69 @@ fn root_store(tls: &TlsSettings) -> rustls::RootCertStore {
 
 // ─── AWS SDK (Bedrock) ───────────────────────────────────────────────
 
-/// The smithy builder [`aws_http_client`] starts from, carrying
-/// `upstream.pool_idle_timeout`.
+/// The smithy connector builder [`aws_http_client`] starts from,
+/// carrying `upstream.pool_idle_timeout` and the given proxy setting.
 ///
 /// Split out because `build_https` returns an opaque `SharedHttpClient`:
-/// this builder is the last point at which a test can observe the value.
-/// Without the setting the SDK keeps hyper's own 90s idle lifetime —
+/// this builder is the last point at which a test can observe the values.
+/// Without the idle setting the SDK keeps hyper's own 90s idle lifetime —
 /// longer than a typical hop's idle timeout, which is exactly the stale
 /// pooled connection `upstream.pool_idle_timeout` exists to prevent.
 ///
-/// It is the only one of the `upstream` connection knobs this stack can
-/// take. `pool_max_idle_per_host` and the three `tcp_keepalive_*`
-/// settings have no entry point on the smithy builder or its connector
-/// builder, so they still stop at the reqwest clients — the same shape
-/// as the two `upstream.tls` knobs [`warn_unsupported_for_aws`] calls
-/// out, and worth knowing before assuming the whole block reaches here.
+/// `pool_max_idle_per_host` and the three `tcp_keepalive_*` settings have
+/// no entry point on the smithy builder, so they still stop at the reqwest
+/// clients — the same shape as the two `upstream.tls` knobs
+/// [`warn_unsupported_for_aws`] calls out, and worth knowing before
+/// assuming the whole block reaches here.
 #[cfg(feature = "aws")]
-fn aws_pooled_builder() -> aws_smithy_http_client::Builder {
-    aws_smithy_http_client::Builder::new()
+fn aws_pooled_builder(
+    proxy: aws_smithy_http_client::proxy::ProxyConfig,
+) -> aws_smithy_http_client::ConnectorBuilder {
+    aws_smithy_http_client::Connector::builder()
         .pool_idle_timeout(crate::upstream_http::config().pool_idle_timeout)
+        .proxy_config(proxy)
+}
+
+/// The fixed addresses of the AWS default credential chain's endpoints —
+/// EC2 instance metadata (IPv4 and IPv6), ECS task credentials, and EKS
+/// Pod Identity (IPv4 and IPv6). The chain always reaches them directly,
+/// whatever the proxy environment says — see
+/// [`aws_credential_chain_http_client`].
+#[cfg(feature = "aws")]
+pub const AWS_CREDENTIAL_ENDPOINT_HOSTS: [&str; 5] = [
+    "169.254.169.254",
+    "[fd00:ec2::254]",
+    "169.254.170.2",
+    "169.254.170.23",
+    "[fd00:ec2::23]",
+];
+
+#[cfg(feature = "aws")]
+struct AwsClients {
+    proxied: aws_smithy_runtime_api::client::http::SharedHttpClient,
+    chain: aws_smithy_runtime_api::client::http::SharedHttpClient,
+    direct: aws_smithy_runtime_api::client::http::SharedHttpClient,
+}
+
+#[cfg(feature = "aws")]
+fn aws_clients() -> &'static AwsClients {
+    static CLIENTS: OnceLock<AwsClients> = OnceLock::new();
+    CLIENTS.get_or_init(build_aws_clients)
 }
 
 /// The HTTP client every Bedrock SDK client is built on, carrying the
-/// deployment's extra trust roots and `upstream.pool_idle_timeout`.
+/// deployment's extra trust roots, `upstream.pool_idle_timeout`, and the
+/// proxy environment.
 ///
 /// Built once and shared: the AWS SDK otherwise constructs a connector
 /// per client, and each construction re-reads the platform trust store.
+///
+/// The proxy is `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`,
+/// read through the same matcher reqwest uses for every other upstream
+/// client, so a host is proxied or not the same way on both stacks. The
+/// Bedrock runtime, the Bedrock guardrail and every STS call go through
+/// the proxy like any other upstream; only the default credential chain's
+/// own endpoints do not — see [`aws_credential_chain_http_client`].
 ///
 /// Two of the four `upstream.tls` knobs stop here, because the SDK's
 /// HTTP stack exposes trust roots and nothing else on its stable
@@ -587,9 +624,32 @@ fn aws_pooled_builder() -> aws_smithy_http_client::Builder {
 /// — is fully served by `ca_file`.
 #[cfg(feature = "aws")]
 pub fn aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
-    static CLIENT: OnceLock<aws_smithy_runtime_api::client::http::SharedHttpClient> =
-        OnceLock::new();
-    CLIENT.get_or_init(build_aws_http_client).clone()
+    aws_clients().proxied.clone()
+}
+
+/// The client for the AWS default credential chain: [`aws_http_client`]
+/// (same pool), except that a request for one of
+/// [`AWS_CREDENTIAL_ENDPOINT_HOSTS`], for a loopback host (a local
+/// credential agent), or for the host of
+/// `AWS_CONTAINER_CREDENTIALS_FULL_URI` is sent by a never-proxied client.
+/// Those endpoints are only reachable from the host itself, so an egress
+/// proxy can never serve them, and they were always reached directly
+/// before the AWS client honoured the proxy environment. The chain's STS
+/// calls (web identity, SSO, a profile role) name none of them and stay
+/// on the proxy.
+#[cfg(feature = "aws")]
+pub fn aws_credential_chain_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient
+{
+    aws_clients().chain.clone()
+}
+
+/// The never-proxied client, with the same trust roots: what the default
+/// credential chain's instance-metadata client is built on, so a custom
+/// IMDS endpoint is direct however aws-config resolves it.
+#[cfg(feature = "aws")]
+pub fn aws_credential_endpoint_http_client(
+) -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    aws_clients().direct.clone()
 }
 
 /// The same client, built fresh and therefore carrying its own
@@ -606,6 +666,12 @@ pub fn aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClie
 /// "runtime dropped the dispatch task" instead of reaching the server.
 #[cfg(feature = "aws")]
 pub fn build_aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    build_aws_clients().proxied
+}
+
+#[cfg(feature = "aws")]
+fn build_aws_clients() -> AwsClients {
+    use aws_smithy_http_client::proxy::ProxyConfig;
     use aws_smithy_http_client::tls;
     let tls_cfg = &crate::upstream_http::config().tls;
     warn_unsupported_for_aws(tls_cfg);
@@ -619,12 +685,168 @@ pub fn build_aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHt
         .build()
         .expect("TLS context from a bundle validated at boot");
 
-    aws_pooled_builder()
-        .tls_provider(tls::Provider::rustls(
-            tls::rustls_provider::CryptoMode::AwsLc,
-        ))
-        .tls_context(context)
-        .build_https()
+    // The connector-level builder, because the client-level one has no
+    // proxy setting. Built per connector-settings key and cached by the
+    // returned client, as `Builder::build_https` would.
+    let client = |proxy: ProxyConfig| {
+        let context = context.clone();
+        aws_smithy_http_client::Builder::new().build_with_connector_fn(
+            move |settings, components| {
+                let mut builder = aws_pooled_builder(proxy.clone());
+                builder.set_connector_settings(settings.cloned());
+                if let Some(components) = components {
+                    builder.set_sleep_impl(components.sleep_impl());
+                }
+                builder
+                    .tls_provider(tls::Provider::rustls(
+                        tls::rustls_provider::CryptoMode::AwsLc,
+                    ))
+                    .tls_context(context.clone())
+                    .build()
+            },
+        )
+    };
+    let proxied = client(ProxyConfig::from_env());
+    // A second client because the smithy proxy setting cannot add hosts
+    // to the environment's `NO_PROXY`.
+    let direct = client(ProxyConfig::disabled());
+    let mut hosts: Vec<String> = AWS_CREDENTIAL_ENDPOINT_HOSTS
+        .iter()
+        .map(|h| h.to_string())
+        .collect();
+    // The container-credentials provider reads the same variable; an
+    // `https` URI there may name any host.
+    if let Some(host) = std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+        .ok()
+        .and_then(|uri| container_credentials_host(&uri))
+    {
+        hosts.push(host);
+    }
+    AwsClients {
+        chain: aws_smithy_runtime_api::client::http::SharedHttpClient::new(
+            aws_split::DirectForHosts {
+                proxied: proxied.clone(),
+                direct: direct.clone(),
+                hosts: hosts.into(),
+            },
+        ),
+        proxied,
+        direct,
+    }
+}
+
+/// The host a container-credentials URI names, spelled as a request URI
+/// reports it.
+#[cfg(feature = "aws")]
+fn container_credentials_host(uri: &str) -> Option<String> {
+    uri.parse::<http::Uri>()
+        .ok()
+        .and_then(|uri| uri.host().map(str::to_owned))
+}
+
+#[cfg(feature = "aws")]
+mod aws_split {
+    use std::sync::Arc;
+
+    use aws_smithy_runtime_api::box_error::BoxError;
+    use aws_smithy_runtime_api::client::http::{
+        HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpClient,
+        SharedHttpConnector,
+    };
+    use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
+    use aws_smithy_runtime_api::client::runtime_components::{
+        RuntimeComponents, RuntimeComponentsBuilder,
+    };
+    use aws_smithy_types::config_bag::ConfigBag;
+
+    /// Sends a request for one of `hosts` through `direct`, and every
+    /// other request through `proxied`. Each inner client keeps its own
+    /// per-settings connector cache, so pooling is unchanged.
+    #[derive(Debug)]
+    pub(super) struct DirectForHosts {
+        pub(super) proxied: SharedHttpClient,
+        pub(super) direct: SharedHttpClient,
+        pub(super) hosts: Arc<[String]>,
+    }
+
+    impl HttpClient for DirectForHosts {
+        fn http_connector(
+            &self,
+            settings: &HttpConnectorSettings,
+            components: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(Split {
+                proxied: self.proxied.http_connector(settings, components),
+                direct: self.direct.http_connector(settings, components),
+                hosts: self.hosts.clone(),
+            })
+        }
+
+        fn validate_base_client_config(
+            &self,
+            runtime_components: &RuntimeComponentsBuilder,
+            cfg: &ConfigBag,
+        ) -> Result<(), BoxError> {
+            self.proxied
+                .validate_base_client_config(runtime_components, cfg)?;
+            self.direct
+                .validate_base_client_config(runtime_components, cfg)
+        }
+
+        fn validate_final_config(
+            &self,
+            runtime_components: &RuntimeComponents,
+            cfg: &ConfigBag,
+        ) -> Result<(), BoxError> {
+            self.proxied
+                .validate_final_config(runtime_components, cfg)?;
+            self.direct.validate_final_config(runtime_components, cfg)
+        }
+
+        fn connector_metadata(
+            &self,
+        ) -> Option<aws_smithy_runtime_api::client::connector_metadata::ConnectorMetadata> {
+            self.proxied.connector_metadata()
+        }
+    }
+
+    /// Whether a request for `host` (as a URI spells it: an IPv6 address
+    /// in brackets) bypasses the proxy: one of `hosts`, or loopback.
+    pub(super) fn goes_direct(host: &str, hosts: &[String]) -> bool {
+        if host.eq_ignore_ascii_case("localhost")
+            || hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
+        {
+            return true;
+        }
+        let bare = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        bare.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    }
+
+    #[derive(Debug)]
+    struct Split {
+        proxied: SharedHttpConnector,
+        direct: SharedHttpConnector,
+        hosts: Arc<[String]>,
+    }
+
+    impl HttpConnector for Split {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let direct = request
+                .uri()
+                .parse::<http::Uri>()
+                .ok()
+                .is_some_and(|u| u.host().is_some_and(|host| goes_direct(host, &self.hosts)));
+            if direct {
+                self.direct.call(request)
+            } else {
+                self.proxied.call(request)
+            }
+        }
+    }
 }
 
 /// Say out loud which `upstream.tls` knobs the AWS SDK stack cannot
@@ -740,7 +962,10 @@ mod tests {
         // `Builder`'s fields are private; its derived `Debug` is the only
         // way to read back what was applied. `None` there means the
         // setting never reached the builder.
-        let applied = format!("{:?}", aws_pooled_builder());
+        let applied = format!(
+            "{:?}",
+            aws_pooled_builder(aws_smithy_http_client::proxy::ProxyConfig::from_env())
+        );
         assert!(
             applied.contains(&format!("pool_idle_timeout: Some({:?})", configured)),
             "the configured pool idle timeout did not reach the AWS builder: {applied}"
@@ -750,16 +975,75 @@ mod tests {
         // function body: this test's own text mentions the helper too.
         let src = include_str!("upstream_tls.rs");
         let body = src
-            .split_once("pub fn build_aws_http_client()")
+            .split_once("fn build_aws_clients(")
             .expect("build_aws_http_client is defined in this file")
             .1
             .split_once("\n}\n")
             .expect("its body ends at a top-level brace")
             .0;
         assert!(
-            body.contains("aws_pooled_builder()"),
-            "build_aws_http_client must build on `aws_pooled_builder()`: {body}"
+            body.contains("aws_pooled_builder("),
+            "build_aws_http_client must build on `aws_pooled_builder`: {body}"
         );
+    }
+
+    /// The credential endpoints the AWS client never proxies: EC2
+    /// instance metadata over IPv4 and IPv6, ECS task credentials, and
+    /// EKS Pod Identity over IPv4 and IPv6 — and nothing else, since every
+    /// other AWS call must follow the proxy environment.
+    #[cfg(feature = "aws")]
+    #[test]
+    fn the_aws_client_bypasses_exactly_the_credential_endpoints() {
+        assert_eq!(
+            AWS_CREDENTIAL_ENDPOINT_HOSTS,
+            [
+                "169.254.169.254",
+                "[fd00:ec2::254]",
+                "169.254.170.2",
+                "169.254.170.23",
+                "[fd00:ec2::23]",
+            ]
+        );
+        let hosts: Vec<String> = AWS_CREDENTIAL_ENDPOINT_HOSTS
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+        let direct = |uri: &str| {
+            let parsed: http::Uri = uri.parse().unwrap();
+            aws_split::goes_direct(parsed.host().unwrap(), &hosts)
+        };
+        for host in AWS_CREDENTIAL_ENDPOINT_HOSTS {
+            assert!(direct(&format!("http://{host}/latest/api/token")), "{host}");
+        }
+        // A loopback credential agent, however it is spelled.
+        for uri in [
+            "http://127.0.0.1:51679/creds",
+            "http://127.12.0.3/creds",
+            "http://[::1]:8080/creds",
+            "http://LocalHost/creds",
+        ] {
+            assert!(direct(uri), "{uri}");
+        }
+        // The host of a container-credentials URI, which over https may be
+        // any host, joins the list as the request will spell it.
+        assert_eq!(
+            container_credentials_host("https://creds.example.internal:8443/v1/creds").as_deref(),
+            Some("creds.example.internal")
+        );
+        assert_eq!(
+            container_credentials_host("http://[fd00:ec2::23]/v1/credentials").as_deref(),
+            Some("[fd00:ec2::23]")
+        );
+        // Everything else follows the proxy environment.
+        for uri in [
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/x/converse",
+            "https://sts.amazonaws.com/",
+            "http://169.254.170.3/",
+            "http://[fd00:ec2::2]/",
+            "http://10.0.0.1/",
+        ] {
+            assert!(!direct(uri), "{uri}");
+        }
     }
 
     #[test]

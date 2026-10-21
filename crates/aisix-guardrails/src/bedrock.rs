@@ -22,8 +22,10 @@
 //! | 5xx / IO error                  | false       | Block { "bedrock unavailable" } |
 //! | timeout (`latency_mode=timed`)  | true        | Bypass { "bedrock_timeout" }   |
 //! | timeout (`latency_mode=timed`)  | false       | Block { "bedrock timeout" }    |
-//! | throttle (4xx ThrottlingException) | true     | Bypass { "bedrock_throttled" } |
+//! | throttle (ThrottlingException or 429) | true  | Bypass { "bedrock_throttled" } |
 //! | throttle                        | false       | Block { "bedrock throttled" }  |
+//! | other 4xx, or credentials refused before signing | true | Bypass { "bedrock_config_error" } |
+//! | other 4xx, or credentials refused before signing | false | Block { "bedrock unavailable" } |
 //! | payload refused for its size    | n/a         | re-sent in pieces; only a refusal that cannot be made smaller surfaces, as Bypass { "bedrock_too_large" } / Block |
 //!
 //! `latency_mode=serial` waits unconditionally — the timeout row
@@ -799,11 +801,17 @@ fn assessment_has_hard_block(a: &GuardrailAssessment) -> bool {
 }
 
 /// Failure cause buckets that map onto `guardrail_bypassed_reason`
-/// telemetry tags. `Other` collapses every long-tail SDK error onto
-/// `bedrock_5xx` so an unrecognised AWS error doesn't leak its
-/// internal shape into our wire schema — but it carries the original
-/// SDK error detail for the failure log line so operators can tell a
-/// network blip from an auth/validation error (#106).
+/// telemetry tags. `ConfigError` is every non-`429` `4xx` AWS answered
+/// with (`AccessDeniedException`, `ValidationException`,
+/// `ResourceNotFoundException`, …), and credentials the provider chain
+/// reports missing or refused before the call is signed — a credential,
+/// role, guardrail id or region the operator has to fix, tagged
+/// `bedrock_config_error` like
+/// the other kinds' `_config_error`. `Other` collapses the rest — 5xx,
+/// transport, a response the SDK could not read — onto `bedrock_5xx` so
+/// an unrecognised AWS error doesn't leak its internal shape into our
+/// wire schema. Both carry the original SDK error detail for the failure
+/// log line (#106).
 #[derive(Debug)]
 enum BedrockFailure {
     Timeout,
@@ -816,6 +824,10 @@ enum BedrockFailure {
     TooLarge {
         detail: String,
     },
+    ConfigError {
+        detail: String,
+        source: Option<String>,
+    },
     Other {
         /// Human-readable detail for logs: the modeled service error
         /// (carries the exception code, e.g. AccessDeniedException) or
@@ -824,6 +836,20 @@ enum BedrockFailure {
         /// The underlying cause (hyper/rustls/sigv4) when present.
         source: Option<String>,
     },
+}
+
+/// Whether `err` carries a credential provider's verdict that the
+/// configured credentials are missing or refused.
+fn credentials_refused(err: &(dyn std::error::Error + 'static)) -> bool {
+    use aws_credential_types::provider::error::CredentialsError;
+    let mut cur = Some(err);
+    while let Some(e) = cur {
+        if let Some(c) = e.downcast_ref::<CredentialsError>() {
+            return aisix_gateway::aws_auth::credentials_refused(c);
+        }
+        cur = e.source();
+    }
+    false
 }
 
 impl BedrockFailure {
@@ -842,11 +868,24 @@ impl BedrockFailure {
             if crate::too_large::body_says_too_large(&detail) {
                 return Self::TooLarge { detail };
             }
-            if matches!(svc.err(), ApplyGuardrailError::ThrottlingException(_)) {
+            let status = svc.raw().status().as_u16();
+            if matches!(svc.err(), ApplyGuardrailError::ThrottlingException(_)) || status == 429 {
                 return Self::Throttled;
             }
-            return Self::Other {
-                detail,
+            let source = std::error::Error::source(&err).map(|s| s.to_string());
+            if (400..500).contains(&status) {
+                return Self::ConfigError { detail, source };
+            }
+            return Self::Other { detail, source };
+        }
+        // Missing or refused credentials (a denied sts:AssumeRole, an
+        // empty default chain) never reach ApplyGuardrail: they surface
+        // while the request is being signed, as the credential provider's
+        // own error somewhere in the source chain. The provider bridge
+        // reads the same two variants as a credential problem.
+        if credentials_refused(&err) {
+            return Self::ConfigError {
+                detail: err.to_string(),
                 source: std::error::Error::source(&err).map(|s| s.to_string()),
             };
         }
@@ -864,15 +903,17 @@ impl BedrockFailure {
             Self::Timeout => "bedrock_timeout",
             Self::Throttled => "bedrock_throttled",
             Self::TooLarge { .. } => "bedrock_too_large",
+            Self::ConfigError { .. } => "bedrock_config_error",
             Self::Other { .. } => "bedrock_5xx",
         }
     }
 
     /// Fields for the failure log line: the wire-stable tag plus, for
-    /// `Other`, the captured SDK error detail and underlying source.
+    /// `ConfigError` and `Other`, the captured SDK error detail and
+    /// underlying source.
     fn log_fields(&self) -> (&'static str, Option<&str>, Option<&str>) {
         match self {
-            Self::Other { detail, source } => {
+            Self::ConfigError { detail, source } | Self::Other { detail, source } => {
                 (self.bypass_tag(), Some(detail.as_str()), source.as_deref())
             }
             Self::TooLarge { detail } => (self.bypass_tag(), Some(detail.as_str()), None),
@@ -1233,6 +1274,14 @@ mod tests {
             .bypass_tag(),
             "bedrock_5xx",
         );
+        assert_eq!(
+            BedrockFailure::ConfigError {
+                detail: "x".into(),
+                source: None,
+            }
+            .bypass_tag(),
+            "bedrock_config_error",
+        );
     }
 
     /// #106: the `Other` bucket keeps the wire-stable `bedrock_5xx`
@@ -1242,12 +1291,12 @@ mod tests {
     #[test]
     fn other_failure_log_fields_carry_detail_and_source() {
         let f = BedrockFailure::Other {
-            detail: "AccessDeniedException(...)".into(),
+            detail: "InternalServerException(...)".into(),
             source: Some("dispatch failure: connection refused".into()),
         };
         let (tag, detail, source) = f.log_fields();
         assert_eq!(tag, "bedrock_5xx");
-        assert_eq!(detail, Some("AccessDeniedException(...)"));
+        assert_eq!(detail, Some("InternalServerException(...)"));
         assert_eq!(source, Some("dispatch failure: connection refused"));
 
         let (tag, detail, source) = BedrockFailure::Timeout.log_fields();
@@ -1293,7 +1342,7 @@ mod tests {
         let g = build_test(true);
         let v = g.handle_failure(
             BedrockFailure::Other {
-                detail: "AccessDeniedException(...)".into(),
+                detail: "InternalServerException(...)".into(),
                 source: None,
             },
             g.fail_open,

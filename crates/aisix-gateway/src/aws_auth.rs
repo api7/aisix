@@ -12,6 +12,9 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_config::default_provider::{use_dual_stack, use_fips};
+use aws_config::provider_config::ProviderConfig;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_credential_types::provider::{
     error::CredentialsError, future, ProvideCredentials, SharedCredentialsProvider,
@@ -101,6 +104,18 @@ pub enum AwsAuth {
     Bearer(String),
     /// SigV4 with credentials from this provider.
     SigV4(SharedCredentialsProvider),
+}
+
+/// Whether a credential provider's error says the configured credentials
+/// are missing or refused — the configuration's to fix — rather than that
+/// a credential service failed and may answer the next attempt. Every
+/// Bedrock consumer classifies a credential failure through this, so they
+/// cannot drift.
+pub fn credentials_refused(err: &CredentialsError) -> bool {
+    matches!(
+        err,
+        CredentialsError::CredentialsNotLoaded(_) | CredentialsError::InvalidConfiguration(_)
+    )
 }
 
 /// The authentication for `spec`. Credentials that are fetched rather than
@@ -224,9 +239,47 @@ impl RefreshingCredentials {
                     Some(d) => timeouts = timeouts.connect_timeout(d),
                     None => timeouts = timeouts.disable_connect_timeout(),
                 }
+                let region = Region::new(self.spec.region.clone());
+                // The chain reaches its own credential endpoints directly
+                // and everything else — its STS calls included — through
+                // the proxy environment; its instance-metadata client is
+                // never proxied, wherever aws-config resolves the endpoint
+                // (the default, the IPv6 endpoint mode, or a configured
+                // one). Building the chain here, rather than letting the
+                // loader do it, is what lets it take that client, so the
+                // FIPS / dual-stack settings the loader would have read for
+                // it are read here the same way.
+                let imds = aws_config::imds::Client::builder()
+                    .configure(&ProviderConfig::default().with_http_client(
+                        crate::upstream_tls::aws_credential_endpoint_http_client(),
+                    ))
+                    .build();
+                let conf = ProviderConfig::default()
+                    .with_http_client(crate::upstream_tls::aws_credential_chain_http_client());
+                let use_fips = use_fips::use_fips_provider(&conf).await;
+                let use_dual_stack = use_dual_stack::use_dual_stack_provider(&conf).await;
+                let conf = conf
+                    .with_use_fips(use_fips)
+                    .with_use_dual_stack(use_dual_stack);
+                // A profile's `credential_source = Ec2InstanceMetadata`
+                // builds an instance-metadata provider of its own; this
+                // one replaces it so that call is direct too.
+                let profile_imds =
+                    aws_config::imds::credentials::ImdsCredentialsProvider::builder()
+                        .imds_client(imds.clone())
+                        .configure(&conf)
+                        .build();
+                let chain = DefaultCredentialsChain::builder()
+                    .configure(conf)
+                    .region(region.clone())
+                    .imds_client(imds)
+                    .with_custom_credential_source("Ec2InstanceMetadata", profile_imds)
+                    .build()
+                    .await;
                 aws_config::defaults(BehaviorVersion::latest())
-                    .region(Region::new(self.spec.region.clone()))
+                    .region(region)
                     .http_client(crate::upstream_tls::aws_http_client())
+                    .credentials_provider(chain)
                     .timeout_config(timeouts.build())
                     .load()
                     .await
