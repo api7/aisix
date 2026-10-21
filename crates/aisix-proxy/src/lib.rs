@@ -467,12 +467,12 @@ impl InFlightGuard {
 /// released there would read zero while SSE bytes are still flowing and
 /// let the shutdown coordinator close the listener under exactly the
 /// traffic the drain window exists to protect.
-struct DrainGuard {
+pub(crate) struct DrainGuard {
     livez: std::sync::Arc<health::LivezState>,
 }
 
 impl DrainGuard {
-    fn new(livez: std::sync::Arc<health::LivezState>) -> Self {
+    pub(crate) fn new(livez: std::sync::Arc<health::LivezState>) -> Self {
         livez.enter();
         Self { livez }
     }
@@ -880,8 +880,15 @@ impl axum::body::HttpBody for RequestBodyCounter {
 /// connection-level frame, and the listener sends it when the drain
 /// starts — see `serve_connection` in the aisix-server binary
 /// (AISIX-Cloud#1395).
+///
+/// A 101 is left alone: its `Connection: upgrade` is what completes the
+/// handshake (RFC 6455 §4.1), and the upgraded connection is no longer
+/// HTTP, so there is nothing left for `close` to retire.
 fn retire_connection(version: &axum::http::Version, response: &mut Response) {
-    if *version == axum::http::Version::HTTP_2 || *version == axum::http::Version::HTTP_3 {
+    if *version == axum::http::Version::HTTP_2
+        || *version == axum::http::Version::HTTP_3
+        || response.status() == axum::http::StatusCode::SWITCHING_PROTOCOLS
+    {
         return;
     }
     response

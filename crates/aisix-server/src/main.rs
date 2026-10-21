@@ -994,9 +994,13 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // needs `Metrics`: a usage batch it gives up on is counted against
     // `aisix_usage_event_drops_total`, the same counter the queue's own
     // drops land on.
+    //
+    // It stops on its own signal rather than `cancel`, flipped once the
+    // proxy has finished serving: see `telemetry::stop_after`.
+    let (usage_stop_tx, usage_stop_rx) = watch::channel(false);
     let (usage_sink, telemetry_task) = match telemetry_cfg {
         Some(cfg) => {
-            let (sink, handle) = telemetry::spawn(cfg, (*metrics).clone(), cancel_rx.clone());
+            let (sink, handle) = telemetry::spawn(cfg, (*metrics).clone(), usage_stop_rx);
             (sink, Some(handle))
         }
         None => (aisix_obs::UsageSink::disabled(), None),
@@ -1695,7 +1699,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         Duration::from_secs(cfg.shutdown.min_drain_secs),
     ));
 
-    proxy_serve
+    telemetry::stop_after(proxy_serve, &usage_stop_tx)
         .await
         .map_err(|e| anyhow::anyhow!("proxy serve error: {e}"))?;
     if let Some(handle) = admin_serve_handle {
@@ -3044,10 +3048,24 @@ async fn accept_loop(
     drop(listener);
 
     // The drain has already run every in-flight request to completion, so
-    // what is left here is idle pooled connections; each one's task ends
-    // as soon as `serve_connection` hands it the cancel signal.
+    // what is left here is idle pooled connections, which end as soon as
+    // `serve_connection` hands them the cancel signal, and connections that
+    // have not sent a request yet, which are served first and so are held
+    // for up to `downstream.idle_timeout_secs` (unbounded when it is 0; a
+    // TLS handshake that stalls is not bounded by it either).
     drop(alive);
     let _ = all_connections_ended.recv().await;
+    // A connection that upgraded ends its task at the 101, but its session
+    // is still in flight (a Realtime WebSocket holds a drain guard until
+    // it closes). The drain's own wait is over by now, so this one is what
+    // keeps the listener — and in thread-per-core mode the worker runtime
+    // the session runs on — up until such a session opened after the
+    // drain ended has finished.
+    if let Some(drain) = drain {
+        while drain.in_flight() > 0 {
+            tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+        }
+    }
     Ok(())
 }
 
@@ -3102,13 +3120,53 @@ async fn serve_connection<I, S>(
         Downstream::Http1 => {
             // `with_upgrades` keeps the WebSocket surfaces (`/v1/realtime`)
             // working: hyper cannot upgrade a connection it does not own.
+            // hyper retires an h1 connection that has not read a request
+            // yet by closing it on the spot, and on a TLS connection — or
+            // a plaintext one whose request is still arriving — nothing
+            // has been read at the moment the drain ends. That client is
+            // owed an answer like any other (AISIX-Cloud#1394), so a
+            // connection is retired only between requests, once it has
+            // answered one: the request that arrives is served with
+            // `Connection: close`, and a connection that never sends one
+            // is bounded by `downstream.idle_timeout_secs` exactly as the
+            // version sniff bounds a plaintext one. A pooled connection
+            // idle when the drain ends is retired then, as before.
+            //
+            // Waiting for the answer is also what keeps an upgrade intact:
+            // retiring a connection while its upgrade handler runs makes
+            // hyper stamp `Connection: close` over the 101's `Connection:
+            // upgrade`, which a WebSocket client rejects (RFC 6455 §4.1).
+            // A 101 does not make the connection retirable — it is no
+            // longer HTTP once upgraded.
+            let (retirable_tx, mut retirable) = watch::channel(false);
+            let retirable_tx = std::sync::Arc::new(retirable_tx);
+            let service = hyper::service::service_fn(move |req| {
+                retirable_tx.send_if_modified(|r| std::mem::replace(r, false));
+                let call = hyper::service::Service::call(&service, req);
+                let retirable_tx = retirable_tx.clone();
+                async move {
+                    let response = call.await;
+                    if let Ok(response) = &response {
+                        if response.status() != axum::http::StatusCode::SWITCHING_PROTOCOLS {
+                            retirable_tx.send_if_modified(|r| !std::mem::replace(r, true));
+                        }
+                    }
+                    response
+                }
+            });
             let conn = http1.serve_connection(io, service).with_upgrades();
             tokio::pin!(conn);
             let mut retired = false;
             loop {
                 tokio::select! {
+                    // A pooled connection whose next request is already
+                    // buffered reads it before it can be retired.
+                    biased;
                     served = conn.as_mut() => break served.map_err(|e| e.to_string()),
-                    _ = shutdown.cancelled(), if !retired => {
+                    _ = async {
+                        shutdown.cancelled().await;
+                        let _ = retirable.wait_for(|r| *r).await;
+                    }, if !retired => {
                         conn.as_mut().graceful_shutdown();
                         retired = true;
                     }
@@ -3212,10 +3270,12 @@ async fn serve_http_tpc(
 
     // One slot per worker so no worker blocks reporting its exit.
     let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel::<anyhow::Result<()>>(workers);
+    let all_served = std::sync::Arc::new(tokio::sync::Barrier::new(workers));
     for (worker, listeners) in per_worker.into_iter().enumerate() {
         let router = router.clone();
         let shutdown = shutdown.clone();
         let exit_tx = exit_tx.clone();
+        let all_served = all_served.clone();
         // Every worker raises and lowers the same process-wide count, so
         // the drain heartbeat reports the listener as a whole rather than
         // whichever worker happened to accept.
@@ -3238,6 +3298,7 @@ async fn serve_http_tpc(
                     label,
                     worker,
                     drain,
+                    all_served,
                 ));
             })?;
     }
@@ -3246,13 +3307,15 @@ async fn serve_http_tpc(
     drop(exit_tx);
 
     // A graceful shutdown ends the workers together, but each drains its
-    // own connections on its own clock — an idle worker returns at once
-    // while a sibling may hold an in-flight stream for minutes. Wait for
-    // every worker, so the fastest drain cannot end the process under
-    // the slowest. Everything else stays immediately fatal: an accept
-    // loop failing, a panic unwinding, or a worker stopping without a
-    // shutdown signal has to bring the process down rather than leave it
-    // serving on fewer listeners than it reported binding.
+    // own connections on its own clock — an idle worker is done at once
+    // while a sibling may hold an in-flight stream for minutes. A done
+    // worker waits for the slowest before it drops its runtime (see
+    // `run_tpc_worker`), and this waits for every worker, so the fastest
+    // drain cannot end the process under the slowest. Everything else
+    // stays immediately fatal: an accept loop failing, a panic unwinding,
+    // or a worker stopping without a shutdown signal has to bring the
+    // process down rather than leave it serving on fewer listeners than
+    // it reported binding.
     let shutdown_seen = shutdown.cancel;
     tokio::task::spawn_blocking(move || {
         for _ in 0..workers {
@@ -3295,7 +3358,10 @@ impl Drop for WorkerExit {
 }
 
 /// One thread-per-core worker: its own current-thread runtime, its own
-/// listener, its own upstream connection pool.
+/// listener, its own upstream connection pool for Provider Keys without
+/// a connection override. Every other client pool is process-wide, so an
+/// upstream connection this runtime drives may be serving a sibling's
+/// request — which is why the runtime outlives its own drain.
 #[allow(clippy::too_many_arguments)]
 fn run_tpc_worker(
     listeners: Vec<WorkerListener>,
@@ -3305,6 +3371,7 @@ fn run_tpc_worker(
     label: &'static str,
     worker: usize,
     drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
+    all_served: std::sync::Arc<tokio::sync::Barrier>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3342,7 +3409,23 @@ fn run_tpc_worker(
                 drain.clone(),
             ));
         }
-        join_listeners(serving, label).await
+        let served = join_listeners(serving, label).await;
+        // An upstream connection is driven by a task on the runtime of
+        // the worker that opened it, and every process-wide client pool
+        // (Provider Key overrides, the shared fallback, guardrail, MCP,
+        // ...) hands that connection to whichever worker checks it out
+        // next. Dropping this runtime would kill those tasks under a
+        // sibling's request still in flight on them, which then fails
+        // as "dispatch task is gone" and is retried — a duplicate
+        // upstream call. So a drained worker keeps polling its runtime
+        // until every worker has finished serving, and only then lets it
+        // drop. A failure skips the wait: it ends the process anyway, and
+        // a worker that stopped without a shutdown signal must be
+        // reported rather than parked.
+        if served.is_ok() && *shutdown.cancel.borrow() {
+            all_served.wait().await;
+        }
+        served
     })
 }
 
@@ -4515,6 +4598,21 @@ managed:
                     tokio::time::sleep(Duration::from_millis(1_500)).await;
                     "ok"
                 }),
+            )
+            .route(
+                "/upgrade-slow",
+                axum::routing::get(|| async {
+                    // An upgrade handler that awaits before answering, as
+                    // `/v1/realtime` does whenever authentication has to
+                    // go out (a JWKS fetch, a budget check).
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    axum::http::Response::builder()
+                        .status(axum::http::StatusCode::SWITCHING_PROTOCOLS)
+                        .header("connection", "upgrade")
+                        .header("upgrade", "websocket")
+                        .body(axum::body::Body::empty())
+                        .expect("101")
+                }),
             );
         let serving = tokio::spawn(accept_loop(
             listener,
@@ -4556,6 +4654,97 @@ managed:
         // previous body is read off it.
         response.into_body().collect().await?;
         Ok(())
+    }
+
+    /// A connection accepted before the drain ended that asks to upgrade
+    /// afterwards gets its 101 with `Connection: upgrade` intact. Retiring
+    /// it while the handler is still running would make hyper stamp
+    /// `Connection: close` over it, and a WebSocket client rejects that.
+    #[tokio::test]
+    async fn an_upgrade_after_the_drain_ended_keeps_connection_upgrade() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let harness = drain_harness().await;
+        let mut tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("connect");
+        // Accepted before the listener closes, or the kernel resets it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        harness.retire.send(true).expect("retire");
+        harness.cancel.send(true).expect("cancel");
+        tcp.write_all(
+            b"GET /upgrade-slow HTTP/1.1\r\nhost: 127.0.0.1\r\n\
+              connection: upgrade\r\nupgrade: websocket\r\n\r\n",
+        )
+        .await
+        .expect("write");
+
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut buf))
+                .await
+                .expect("response head in time")
+                .expect("read");
+            assert!(n > 0, "closed before a response head: {head:?}");
+            head.extend_from_slice(&buf[..n]);
+        }
+        let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 101"), "{head}");
+        assert!(head.contains("\r\nconnection: upgrade\r\n"), "{head}");
+        drop(tcp);
+        harness.serving.await.expect("join").expect("serve");
+    }
+
+    /// The same, on a pooled connection that has already served a request
+    /// and asks to upgrade while the drain ends: it is not idle, so it is
+    /// not retired under the running upgrade handler.
+    #[tokio::test]
+    async fn an_upgrade_on_a_pooled_connection_keeps_connection_upgrade_when_the_drain_ends() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn read_head(tcp: &mut tokio::net::TcpStream) -> String {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                let n = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut byte))
+                    .await
+                    .expect("response head in time")
+                    .expect("read");
+                assert!(n > 0, "closed before a response head: {head:?}");
+                head.push(byte[0]);
+            }
+            String::from_utf8_lossy(&head).to_ascii_lowercase()
+        }
+
+        let harness = drain_harness().await;
+        let mut tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("connect");
+        tcp.write_all(b"GET / HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("write");
+        let first = read_head(&mut tcp).await;
+        assert!(first.starts_with("http/1.1 200"), "{first}");
+        let mut body = [0u8; 2];
+        tcp.read_exact(&mut body).await.expect("body");
+
+        tcp.write_all(
+            b"GET /upgrade-slow HTTP/1.1\r\nhost: 127.0.0.1\r\n\
+              connection: upgrade\r\nupgrade: websocket\r\n\r\n",
+        )
+        .await
+        .expect("write");
+        // The handler is now running; the drain ends under it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        harness.retire.send(true).expect("retire");
+        harness.cancel.send(true).expect("cancel");
+
+        let head = read_head(&mut tcp).await;
+        assert!(head.starts_with("http/1.1 101"), "{head}");
+        assert!(head.contains("\r\nconnection: upgrade\r\n"), "{head}");
+        drop(tcp);
+        harness.serving.await.expect("join").expect("serve");
     }
 
     /// The whole of AISIX-Cloud#1395: an HTTP/2 downstream is told to
