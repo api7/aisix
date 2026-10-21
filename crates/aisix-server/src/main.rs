@@ -270,11 +270,12 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
         // pools are constructed once and can't be reconfigured afterwards.
         aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream)?)
             .map_err(|e| anyhow::anyhow!("upstream TLS init failed: {e}"))?;
+        aisix_gateway::ssrf::init(&cfg.outbound.ssrf_protection)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         aisix_gateway::media_fetch::init(
             &cfg.upstream.media_fetch,
             cfg.proxy.request_body_limit_bytes,
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        );
         aisix_provider_bedrock::init_mantle_endpoint(cfg.upstream.bedrock.mantle_endpoint.clone());
         run(cfg).await
     }

@@ -176,6 +176,7 @@ dependencies = [
  "dashmap",
  "futures",
  "http 1.4.0",
+ "hyper-util",
  "rcgen",
  "reqwest 0.12.28",
  "rustls",

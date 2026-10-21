@@ -281,20 +281,29 @@ upstream:
   #   # client_cert_file / client_key_file for mutual TLS
   #   # verify: true   # false accepts ANY certificate — test use only
   # Media URLs an upstream cannot read itself (Bedrock, Claude on Vertex,
-  # http:// toward Anthropic / Gemini) are downloaded and sent inline.
-  # Only publicly routable addresses are reached; allowed_hosts (host or
-  # host:port) is the only exception. A request's downloads count, with
-  # its inbound body, against proxy.request_body_limit_bytes when set.
-  # See config.example.yaml.
+  # http:// toward Anthropic / Gemini) are downloaded and sent inline,
+  # through HTTP(S)_PROXY like any upstream call and verified per
+  # upstream.tls. Which addresses it may reach is outbound.ssrf_protection.
+  # A request's downloads count, with its inbound body, against
+  # proxy.request_body_limit_bytes when set. See config.example.yaml.
   # media_fetch:
   #   enabled: true
-  #   allowed_hosts: []
   #   max_bytes: 52428800
   # Bedrock Mantle, where count_tokens for a Claude model bedrock-runtime
   # cannot count is retried. null derives https://bedrock-mantle.{region}.api.aws
   # from the provider key's region. See config.example.yaml.
   # bedrock:
   #   mantle_endpoint: null
+
+# URLs an API caller supplied (the media download) only reach publicly
+# routable addresses; allowed_hosts (host or host:port) is the exception
+# and enabled: false turns the check off. Behind a fake-ip DNS that maps
+# public names into 198.18.0.0/15, list those hosts or turn it off.
+# See config.example.yaml.
+# outbound:
+#   ssrf_protection:
+#     enabled: true
+#     allowed_hosts: []
 
 # Connection-layer settings for the inbound side. `idle_timeout_secs: 0`
 # (the default) never closes an idle client connection, leaving that to

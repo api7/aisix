@@ -531,22 +531,17 @@ upstream:
   # gateway downloads it and sends the bytes inline. An upstream that
   # reads the URL itself still gets the URL.
   #
-  # The download only reaches publicly routable addresses: loopback,
-  # private (RFC 1918), CGNAT, link-local (including the 169.254.169.254
-  # metadata endpoint), IPv6 unique-local / link-local, multicast and
-  # reserved ranges are refused with a 400, for every address a name
-  # resolves to and for every redirect hop (at most 10). It follows the
-  # request's own upstream timeout, retries a timeout or connection
-  # failure up to 3 attempts in all, and never forwards the caller's
-  # headers.
+  # The URL is the caller's, so which addresses the download may reach is
+  # outbound.ssrf_protection (below). Otherwise it is an ordinary upstream
+  # request: it goes through HTTPS_PROXY / HTTP_PROXY / ALL_PROXY unless
+  # NO_PROXY covers the host, and verifies certificates per upstream.tls
+  # (ca_file, verify) — but never presents the upstream.tls client
+  # certificate. It follows at most 10 redirects, the request's own
+  # upstream timeout, retries a timeout or connection failure up to 3
+  # attempts in all, and never forwards the caller's headers.
   # media_fetch:
   #   # false refuses such parts with a 400 instead of downloading them.
   #   enabled: true
-  #   # Hosts that may be reached although they resolve to a non-public
-  #   # address, as host (any port) or host:port; IPv6 with a port as
-  #   # [addr]:port. There is no switch that turns the address check off.
-  #   allowed_hosts: []
-  #   # e.g. ["media.internal", "10.0.0.5:9000"]
   #   # Largest download accepted per URL, in bytes (default 50 MiB).
   #   # All downloads of one request also count, with its inbound body,
   #   # against proxy.request_body_limit_bytes when that is set (413 past it).
@@ -561,6 +556,36 @@ upstream:
   #   # https://bedrock-mantle.{region}.api.aws; set it for a VPC endpoint or
   #   # GovCloud. One value serves every Bedrock provider key.
   #   mantle_endpoint: null
+
+# Outbound requests to URLs an API caller supplied — today, the media
+# download (upstream.media_fetch). URLs an operator configured (a provider
+# key's api_base, guardrail, MCP and A2A endpoints, JWKS, exporters) are
+# not affected.
+# outbound:
+#   # Server-side request forgery protection. On (the default), such a
+#   # request only reaches publicly routable addresses: loopback, private
+#   # (RFC 1918), CGNAT, link-local (including the 169.254.169.254 metadata
+#   # endpoint), benchmarking (198.18.0.0/15), IPv6 unique-local /
+#   # link-local, multicast and reserved ranges are refused with a 400, for
+#   # every address a name resolves to and for every redirect hop. A direct
+#   # connection goes only to the addresses that were checked. When a
+#   # proxy applies to the URL, the name is resolved and checked locally
+#   # first and the proxy then resolves it again itself.
+#   #
+#   # Behind a fake-ip DNS or a transparent proxy (Clash, sing-box,
+#   # Surge, …) public names resolve into 198.18.0.0/15, so every
+#   # download is refused: list those hosts in allowed_hosts, or turn the
+#   # check off.
+#   ssrf_protection:
+#     # false turns the address check off entirely — no address is
+#     # refused and allowed_hosts is ignored.
+#     enabled: true
+#     # Hosts that may be reached although they resolve to a non-public
+#     # address, as host (any port) or host:port; IPv6 with a port as
+#     # [addr]:port. Env: AISIX_OUTBOUND__SSRF_PROTECTION__ALLOWED_HOSTS
+#     # takes a comma-separated list.
+#     allowed_hosts: []
+#     # e.g. ["media.internal", "10.0.0.5:9000"]
 
 # Connection-layer settings for the inbound side — the clients, or the
 # gateway in front of this one, talking to the listeners above. The

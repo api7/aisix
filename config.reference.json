@@ -77,6 +77,12 @@
       },
       "service_name": "aisix"
     },
+    "outbound": {
+      "ssrf_protection": {
+        "allowed_hosts": [],
+        "enabled": true
+      }
+    },
     "proxy": {
       "addr": "0.0.0.0:3000",
       "listeners": [],
@@ -111,7 +117,6 @@
       },
       "connect_timeout_ms": 5000,
       "media_fetch": {
-        "allowed_hosts": [],
         "enabled": true,
         "max_bytes": 52428800
       },
