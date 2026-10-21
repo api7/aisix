@@ -1065,18 +1065,22 @@ async fn run_session(
                     }
                 }
                 Some(Ok(TgMessage::Close(frame))) => {
-                    // A close frame without a status reads as 1005, which
-                    // may not be sent on; the client gets 1011.
-                    let (code, reason) = frame.map_or((1005, String::new()), |f| {
-                        (f.code.into(), f.reason.to_string())
-                    });
-                    close_client_after_upstream(&mut client_tx, code, &reason).await;
+                    let reason = frame.as_ref().map(|f| f.reason.to_string());
+                    let end = match (&frame, &reason) {
+                        (Some(f), Some(r)) => UpstreamEnd::Close(f.code.into(), r),
+                        _ => UpstreamEnd::NoStatus,
+                    };
+                    close_client_after_upstream(&mut client_tx, end).await;
                     break;
                 }
                 Some(Ok(_)) => {} // ping/pong/raw frames
                 Some(Err(e)) => {
                     tracing::debug!(error = %e, "realtime upstream stream error");
-                    close_client_after_upstream(&mut client_tx, 1006, "upstream error").await;
+                    close_client_after_upstream(
+                        &mut client_tx,
+                        UpstreamEnd::Failed(&e.to_string()),
+                    )
+                    .await;
                     close_status = 502;
                     session_error = Some(ProxyError::Bridge(BridgeError::Transport(
                         aisix_gateway::error_with_causes(&e),
@@ -1084,7 +1088,7 @@ async fn run_session(
                     break;
                 }
                 None => {
-                    close_client_after_upstream(&mut client_tx, 1006, "").await;
+                    close_client_after_upstream(&mut client_tx, UpstreamEnd::Dropped).await;
                     break;
                 }
             },
@@ -1287,20 +1291,72 @@ fn sendable_close_code(code: u16) -> bool {
 /// two-byte code.
 const CLOSE_REASON_MAX_BYTES: usize = 123;
 
+/// How the upstream's half of a session ended.
+enum UpstreamEnd<'a> {
+    /// A Close frame with a status code and reason.
+    Close(u16, &'a str),
+    /// A Close frame without a status code.
+    NoStatus,
+    /// A transport or protocol error, with its description.
+    Failed(&'a str),
+    /// The stream ended without a Close frame.
+    Dropped,
+}
+
+/// tungstenite replaces a received Close whose code may not be sent
+/// (1004, 1016–2999, …) with exactly this frame and drops the original
+/// code, so it is indistinguishable from an upstream sending it itself.
+const LIBRARY_REJECTED_CLOSE: (u16, &str) = (1002, "Protocol violation");
+
 /// Relay the upstream's end of the session to the client: its code and
-/// reason, a code that may not be sent becoming 1011. A close other than a
-/// normal one is preceded by a Realtime `error` event naming it, since
-/// many clients surface only events.
-async fn close_client_after_upstream<S>(client_tx: &mut S, code: u16, reason: &str)
+/// reason when the upstream closed with one that may be sent, 1011
+/// otherwise. An end other than a normal close is preceded by a Realtime
+/// `error` event describing it, since many clients surface only events.
+async fn close_client_after_upstream<S>(client_tx: &mut S, end: UpstreamEnd<'_>)
 where
     S: futures::Sink<AxMessage> + Unpin,
 {
-    if code != 1000 {
-        let message = if reason.is_empty() {
-            format!("upstream websocket closed with code {code}")
-        } else {
-            format!("upstream websocket closed with code {code}: {reason}")
-        };
+    let (code, reason, message) = match end {
+        UpstreamEnd::Close(1000, reason) => (1000, reason, None),
+        UpstreamEnd::Close(code, reason) if (code, reason) == LIBRARY_REJECTED_CLOSE => (
+            1011,
+            "",
+            Some(
+                "upstream websocket sent a close frame the gateway cannot relay: an invalid \
+                 close code, or 1002 \"Protocol violation\""
+                    .to_string(),
+            ),
+        ),
+        UpstreamEnd::Close(code, reason) => (
+            if sendable_close_code(code) {
+                code
+            } else {
+                1011
+            },
+            reason,
+            Some(if reason.is_empty() {
+                format!("upstream websocket closed with code {code}")
+            } else {
+                format!("upstream websocket closed with code {code}: {reason}")
+            }),
+        ),
+        UpstreamEnd::NoStatus => (
+            1011,
+            "",
+            Some("upstream websocket closed without a status code".to_string()),
+        ),
+        UpstreamEnd::Failed(error) => (
+            1011,
+            "upstream error",
+            Some(format!("upstream websocket connection failed: {error}")),
+        ),
+        UpstreamEnd::Dropped => (
+            1011,
+            "",
+            Some("upstream websocket connection ended without a close frame".to_string()),
+        ),
+    };
+    if let Some(message) = message {
         let event = serde_json::json!({
             "type": "error",
             "error": { "type": "server_error", "message": message }
@@ -1313,11 +1369,7 @@ where
     }
     let _ = client_tx
         .send(AxMessage::Close(Some(CloseFrame {
-            code: if sendable_close_code(code) {
-                code
-            } else {
-                1011
-            },
+            code,
             reason: reason[..cut].to_string().into(),
         })))
         .await;
